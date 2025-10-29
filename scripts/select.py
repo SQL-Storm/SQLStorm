@@ -157,11 +157,13 @@ def copy_queries(src_dir, dst_dir, postfix):
             if comment_missing:
                 with open(os.path.join(src_dir, filename), 'r', encoding='utf-8') as original_file:
                     comment = original_file.readline().strip()
+                    comment_available = comment.startswith(f'-- {{"query": "{filename}", ')
 
-                with open(dst_file_path, 'w', encoding='utf-8') as file:
-                    file.write(comment + '\n')
-                    for line in content:
-                        file.write(line)
+                if not comment_available:
+                    with open(dst_file_path, 'w', encoding='utf-8') as file:
+                        file.write(comment + '\n')
+                        for line in content:
+                            file.write(line)
 
             count += 1
 
