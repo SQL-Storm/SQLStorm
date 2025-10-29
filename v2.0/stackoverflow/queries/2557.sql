@@ -1,3 +1,4 @@
+-- {"query": "2557.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1493}
 with RecursiveUserBadges as (
     select u.Id as UserId, u.DisplayName, b.Name as BadgeName, b.Class, b.Date,
            row_number() over(partition by u.Id order by b.Date desc, b.Class) as BadgeRank

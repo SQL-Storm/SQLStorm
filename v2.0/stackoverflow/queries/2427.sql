@@ -1,3 +1,4 @@
+-- {"query": "2427.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1210}
 with RecursiveUserPosts as (
   select u.Id as UserId, u.DisplayName, p.Id as PostId, p.PostTypeId, p.Score, p.CreationDate,
     row_number() over (partition by u.Id order by p.CreationDate desc) as rn

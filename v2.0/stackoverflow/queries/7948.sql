@@ -1,3 +1,4 @@
+-- {"query": "7948.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2596}
 WITH UserPostStats AS (
     SELECT 
         u.Id as UserId,

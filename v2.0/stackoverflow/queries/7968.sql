@@ -1,3 +1,4 @@
+-- {"query": "7968.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3146}
 SELECT 
     u.Id AS UserId,
     u.DisplayName,

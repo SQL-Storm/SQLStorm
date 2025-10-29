@@ -2,17 +2,14 @@
 import argparse
 import asyncio
 import csv
-import json
 import os
 import shutil
 import sys
-import time
-from tempfile import TemporaryDirectory
 
 from llm import llm
 from log import Log
 from prompt import write_query_to_file
-from util import find_keyword_not_in_comments, is_in_comment, smart_open, sort_query_list
+from util import find_keyword_not_in_comments, smart_open, sort_query_list
 
 log = Log()
 
@@ -152,6 +149,20 @@ def copy_queries(src_dir, dst_dir, postfix):
 
             dst_file_path = os.path.join(dst_dir, filename)
             shutil.copy2(src_file_path, dst_file_path)
+
+            with open(dst_file_path, 'r', encoding='utf-8') as file:
+                content = file.readlines()
+                comment_missing = not content[0].startswith(f'-- {{"query": "{filename}", ')
+
+            if comment_missing:
+                with open(os.path.join(src_dir, filename), 'r', encoding='utf-8') as original_file:
+                    comment = original_file.readline().strip()
+
+                with open(dst_file_path, 'w', encoding='utf-8') as file:
+                    file.write(comment + '\n')
+                    for line in content:
+                        file.write(line)
+
             count += 1
 
     return count

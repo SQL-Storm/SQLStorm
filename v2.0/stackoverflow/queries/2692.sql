@@ -1,3 +1,4 @@
+-- {"query": "2692.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1790}
 with recursive RecursiveRelatedQuestions as (
     select p.Id, p.Title, p.Tags, 1 as Level
     from Posts p

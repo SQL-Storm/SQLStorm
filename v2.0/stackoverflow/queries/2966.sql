@@ -1,3 +1,4 @@
+-- {"query": "2966.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1220}
 with RecursiveUserActivity as (
     select u.Id as UserId, u.DisplayName, u.Reputation, u.CreationDate, u.Location,
         coalesce(u.UpVotes,0) - coalesce(u.DownVotes,0) as VoteBalance,

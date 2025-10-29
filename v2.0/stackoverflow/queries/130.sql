@@ -1,3 +1,4 @@
+-- {"query": "130.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3899}
 with params as (
     select 
         cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' as from_date,

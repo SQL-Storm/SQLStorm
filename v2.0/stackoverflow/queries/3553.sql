@@ -1,3 +1,4 @@
+-- {"query": "3553.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2537}
 WITH
 user_base AS (
     SELECT

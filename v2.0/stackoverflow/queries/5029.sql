@@ -1,3 +1,4 @@
+-- {"query": "5029.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 359}
 SELECT
   u.Id AS UserId,
   u.DisplayName AS UserName,

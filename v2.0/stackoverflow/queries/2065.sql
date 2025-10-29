@@ -1,3 +1,4 @@
+-- {"query": "2065.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1514}
 with RecursiveTagCounts as (
     select t.Id, t.TagName, t.Count,
         row_number() over (order by t.Count desc, t.TagName) as rn

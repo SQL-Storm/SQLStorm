@@ -1,3 +1,4 @@
+-- {"query": "1370.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2760}
 WITH UserActivity AS (
     SELECT
         u.Id AS UserId,

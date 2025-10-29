@@ -1,3 +1,4 @@
+-- {"query": "7965.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1895}
 WITH TopUsers AS (
     SELECT u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes,
            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as rn

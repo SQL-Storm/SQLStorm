@@ -1,3 +1,4 @@
+-- {"query": "4392.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1134}
 WITH QuestionMetrics AS (
     SELECT
         p.Id AS QuestionId,

@@ -1,3 +1,4 @@
+-- {"query": "2056.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1381}
 with recursive TagHierarchy(tagid, parentid, level) as (
     select t.Id, cast(null as integer), 1
     from Tags t

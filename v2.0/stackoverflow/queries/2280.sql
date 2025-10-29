@@ -1,3 +1,4 @@
+-- {"query": "2280.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1037}
 WITH RecursiveClosedQuestions AS (
     SELECT p.Id, p.Title, p.CreationDate, p.AcceptedAnswerId, p.OwnerUserId,
            ph.Comment AS CloseReason,

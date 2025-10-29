@@ -1,3 +1,4 @@
+-- {"query": "2035.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1322}
 WITH RECURSIVE RecursiveTagHierarchy (Id, TagName, ParentTagId, Depth) AS (
     SELECT t.Id, t.TagName, CAST(NULL AS INTEGER) AS ParentTagId, 1 AS Depth
     FROM Tags t

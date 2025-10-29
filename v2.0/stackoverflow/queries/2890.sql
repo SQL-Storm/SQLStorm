@@ -1,3 +1,4 @@
+-- {"query": "2890.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1248}
 with recursive RecursiveTags(tagname, depth) as (
     select distinct unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as tagname, 1
     from Posts p

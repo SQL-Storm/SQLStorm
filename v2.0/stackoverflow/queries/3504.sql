@@ -1,3 +1,4 @@
+-- {"query": "3504.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2146}
 WITH 
 user_agg AS (
     SELECT 

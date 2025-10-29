@@ -1,3 +1,4 @@
+-- {"query": "2383.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1203}
 with RecursiveRecentPosts as (
     select p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId,
         p.AcceptedAnswerId, p.ParentId,

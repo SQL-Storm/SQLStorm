@@ -1,3 +1,4 @@
+-- {"query": "566.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2970}
 with recent_users as (
     select
         u.id,

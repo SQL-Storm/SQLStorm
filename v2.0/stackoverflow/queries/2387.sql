@@ -1,3 +1,4 @@
+-- {"query": "2387.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1267}
 WITH RECURSIVE RecursiveTagHierarchy AS (
     SELECT t.Id, t.TagName, t.Count, t.WikiPostId, 0 AS Level
     FROM Tags t
