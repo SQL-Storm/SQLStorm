@@ -1,0 +1,184 @@
+-- {"query": "3754.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2034} 
+
+WITH 
+-- 1. All users (base set)
+base_users AS (
+    SELECT 
+        u.Id                     AS user_id,
+        u.DisplayName            AS display_name,
+        u.Reputation,
+        u.CreationDate           AS user_created,
+        COALESCE(u.Location, '') AS location
+    FROM Users u
+),
+
+-- 2. Posts per user with tag extraction for questions
+user_posts AS (
+    SELECT 
+        p.OwnerUserId                         AS user_id,
+        p.Id                                  AS post_id,
+        p.PostTypeId,
+        p.CreationDate                        AS post_date,
+        p.Score,
+        p.Title,
+        CASE 
+            WHEN p.Tags IS NOT NULL 
+                 THEN regexp_split_to_table(
+                          regexp_replace(p.Tags, '^<|>$', '', 'g'), 
+                          '><')
+            ELSE NULL
+        END                                   AS tag
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+
+-- 3. Aggregate question statistics
+question_stats AS (
+    SELECT 
+        up.user_id,
+        COUNT(*)                                   AS total_questions,
+        AVG(up.Score)                              AS avg_question_score,
+        MIN(up.post_date)                          AS first_question_date,
+        MAX(up.post_date)                          AS last_question_date,
+        COUNT(DISTINCT up.tag)                     AS distinct_question_tags
+    FROM user_posts up
+    WHERE up.PostTypeId = 1          -- Question
+    GROUP BY up.user_id
+),
+
+-- 4. Aggregate answer statistics
+answer_stats AS (
+    SELECT 
+        up.user_id,
+        COUNT(*)                                   AS total_answers,
+        AVG(up.Score)                              AS avg_answer_score,
+        MIN(up.post_date)                          AS first_answer_date,
+        MAX(up.post_date)                          AS last_answer_date
+    FROM user_posts up
+    WHERE up.PostTypeId = 2          -- Answer
+    GROUP BY up.user_id
+),
+
+-- 5. Top tag per user (most used in their questions)
+top_tag_per_user AS (
+    SELECT 
+        qs.user_id,
+        up.tag,
+        ROW_NUMBER() OVER (PARTITION BY qs.user_id 
+                           ORDER BY COUNT(*) DESC, up.tag) AS rn
+    FROM question_stats qs
+    JOIN user_posts up
+          ON qs.user_id = up.user_id
+         AND up.PostTypeId = 1
+         AND up.tag IS NOT NULL
+    GROUP BY qs.user_id, up.tag
+),
+
+-- 6. Badge counts per class (gold=1, silver=2, bronze=3)
+badge_counts AS (
+    SELECT 
+        b.UserId                               AS user_id,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- 7. Recent vote influence (last 30 days) – sum of upvotes minus downvotes
+recent_votes AS (
+    SELECT 
+        v.PostId,
+        p.OwnerUserId                           AS user_id,
+        SUM(CASE 
+                WHEN vt.Id = 2 THEN 1   -- UpMod
+                WHEN vt.Id = 3 THEN -1  -- DownMod
+                ELSE 0
+            END)                               AS recent_vote_score
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    JOIN Posts p ON v.PostId = p.Id
+    WHERE v.CreationDate >= (CURRENT_DATE - INTERVAL '30 days')
+    GROUP BY v.PostId, p.OwnerUserId
+),
+
+-- 8. Consolidated recent vote score per user
+user_recent_votes AS (
+    SELECT 
+        user_id,
+        COALESCE(SUM(recent_vote_score), 0) AS recent_vote_total
+    FROM recent_votes
+    GROUP BY user_id
+),
+
+-- 9. Combined activity score (weighted formula)
+user_activity AS (
+    SELECT 
+        bu.user_id,
+        COALESCE(qs.total_questions,0) * 2 +
+        COALESCE(as_.total_answers,0) * 1.5 +
+        COALESCE(bc.gold_badges,0) * 5 +
+        COALESCE(bc.silver_badges,0) * 3 +
+        COALESCE(bc.bronze_badges,0) * 1 +
+        COALESCE(urv.recent_vote_total,0) * 0.8   AS activity_score
+    FROM base_users bu
+    LEFT JOIN question_stats qs   ON bu.user_id = qs.user_id
+    LEFT JOIN answer_stats as_    ON bu.user_id = as_.user_id
+    LEFT JOIN badge_counts bc    ON bu.user_id = bc.user_id
+    LEFT JOIN user_recent_votes urv ON bu.user_id = urv.user_id
+),
+
+-- 10. Final ranking by reputation and activity (combined metric)
+final_ranking AS (
+    SELECT 
+        ua.user_id,
+        bu.display_name,
+        bu.reputation,
+        ua.activity_score,
+        RANK() OVER (ORDER BY (bu.reputation * 0.6 + ua.activity_score * 0.4) DESC) AS reputation_activity_rank,
+        ROW_NUMBER() OVER (ORDER BY bu.reputation DESC) AS reputation_rank,
+        ROW_NUMBER() OVER (ORDER BY ua.activity_score DESC) AS activity_rank
+    FROM user_activity ua
+    JOIN base_users bu ON ua.user_id = bu.user_id
+)
+
+SELECT 
+    fr.user_id,
+    fr.display_name,
+    fr.reputation,
+    qs.total_questions,
+    as_.total_answers,
+    qs.avg_question_score,
+    as_.avg_answer_score,
+    qs.first_question_date,
+    qs.last_question_date,
+    as_.first_answer_date,
+    as_.last_answer_date,
+    COALESCE(tt.tag, '(none)')               AS top_tag,
+    bc.gold_badges,
+    bc.silver_badges,
+    bc.bronze_badges,
+    urv.recent_vote_total,
+    fr.activity_score,
+    fr.reputation_activity_rank,
+    fr.reputation_rank,
+    fr.activity_rank,
+    -- Example of a correlated sub‑query: latest post title (question or answer)
+    (SELECT p.Title
+       FROM Posts p
+      WHERE p.OwnerUserId = fr.user_id
+      ORDER BY p.CreationDate DESC
+      LIMIT 1)                               AS latest_post_title,
+    -- Example of set operator: users with no posts (from base_users) UNION ALL users with posts
+    CASE 
+        WHEN qs.total_questions IS NULL AND as_.total_answers IS NULL THEN 'NoPosts'
+        ELSE 'HasPosts'
+    END                                     AS post_presence_flag
+FROM final_ranking fr
+LEFT JOIN question_stats qs       ON fr.user_id = qs.user_id
+LEFT JOIN answer_stats as_        ON fr.user_id = as_.user_id
+LEFT JOIN badge_counts bc        ON fr.user_id = bc.user_id
+LEFT JOIN user_recent_votes urv  ON fr.user_id = urv.user_id
+LEFT JOIN top_tag_per_user tt    ON fr.user_id = tt.user_id AND tt.rn = 1
+ORDER BY fr.reputation_activity_rank
+LIMIT 100;

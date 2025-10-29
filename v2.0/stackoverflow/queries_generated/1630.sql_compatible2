@@ -1,0 +1,271 @@
+WITH UserSummary AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(u.DisplayName, 'Anonymous Contributor') AS UserDisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        EXTRACT(DAY FROM (u.LastAccessDate - u.CreationDate)) AS DaysActive,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        AVG(CAST(COALESCE(p.Score, 0) AS NUMERIC)) AS AvgPostScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        NULLIF(TRIM(u.WebsiteUrl), '') AS UserWebsite,
+        u.Views AS UserProfileViews
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.WebsiteUrl, u.Views
+    HAVING COUNT(p.Id) > 5 AND u.Reputation > 100
+),
+PostDetailAndEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS DirectCommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCountFromPost,
+        p.LastEditDate,
+        p.Title,
+        p.Tags,
+        p.ClosedDate,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS TotalFavoritesFromVotes,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        LAG(p.LastEditDate, 1, p.CreationDate) OVER (PARTITION BY p.Id ORDER BY p.LastEditDate) AS PreviousEditDate,
+        (SELECT p_ans.Score FROM Posts p_ans WHERE p_ans.Id = p.AcceptedAnswerId AND p_ans.PostTypeId = 2) AS AcceptedAnswerScore
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY
+        p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount,
+        p.FavoriteCount, p.LastEditDate, p.Title, p.Tags, p.ClosedDate, p.AcceptedAnswerId
+),
+PostHistoryAnomalies AS (
+    SELECT
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 101) THEN 1 END) AS CloseEvents,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) AS ReopenEvents,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (5, 8) THEN 1 END) AS BodyEditEvents,
+        MIN(ph.CreationDate) AS FirstHistoryEvent,
+        MAX(ph.CreationDate) AS LastHistoryEvent,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (10, 101) AND ph.Comment ~ '^[0-9]+$' THEN crt.Name ELSE NULL END) AS LastCloseReasonName,
+        NTILE(4) OVER (ORDER BY COUNT(ph.Id) DESC) AS HistoryEventQuartile
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON (ph.PostHistoryTypeId IN (10, 101) AND ph.Comment = CAST(crt.Id AS VARCHAR))
+    WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 16, 19, 20, 50)
+    GROUP BY ph.PostId
+    HAVING COUNT(ph.Id) > 3 AND COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 101, 11) THEN 1 END) >= 1
+),
+TagExpertiseAndBadges AS (
+    SELECT
+        u.Id AS UserId,
+        tag.value AS TagName,
+        COUNT(p.Id) AS PostsInTag,
+        SUM(p.Score) AS TotalScoreInTag,
+        AVG(CAST(COALESCE(p.Score, 0) AS NUMERIC)) AS AvgScoreInTag,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadgeInTag,
+        COUNT(DISTINCT b.Id) AS TotalBadges
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    CROSS JOIN LATERAL (
+      SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), '><')) AS value
+    ) tag
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.TagBased = TRUE AND b.Name = tag.value
+    WHERE p.PostTypeId IN (1, 2) AND p.Tags IS NOT NULL AND CHAR_LENGTH(TRIM(p.Tags)) > 2
+    GROUP BY u.Id, tag.value
+    HAVING COUNT(p.Id) > 2 AND SUM(p.Score) > 10
+),
+CombinedUserPostMetrics AS (
+    SELECT
+        us.UserId,
+        us.UserDisplayName,
+        us.Reputation,
+        us.TotalPosts,
+        us.TotalQuestions,
+        us.TotalAnswers,
+        us.AvgPostScore,
+        pde.PostId,
+        pde.Title,
+        pde.PostScore,
+        pde.ViewCount,
+        pde.AnswerCount,
+        pde.TotalComments,
+        pde.TotalUpVotes,
+        pde.TotalDownVotes,
+        pde.FavoriteCountFromPost + pde.TotalFavoritesFromVotes AS CombinedFavoriteCount,
+        pde.PreviousEditDate,
+        pde.LastEditDate,
+        pde.AcceptedAnswerScore,
+        pha.CloseEvents,
+        pha.ReopenEvents,
+        pha.BodyEditEvents,
+        pha.LastCloseReasonName,
+        teb.TagName,
+        teb.PostsInTag,
+        teb.TotalScoreInTag,
+        teb.AvgScoreInTag,
+        teb.HasGoldBadgeInTag,
+        teb.TotalBadges,
+        (us.Reputation * 0.15 + us.AvgPostScore * 0.35 + COALESCE(teb.AvgScoreInTag, 0) * 0.30 + (pde.TotalUpVotes - pde.TotalDownVotes) * 0.20) AS WeightedUserPerformance,
+        DENSE_RANK() OVER (ORDER BY (us.Reputation * 0.15 + us.AvgPostScore * 0.35 + COALESCE(teb.AvgScoreInTag, 0) * 0.30 + (pde.TotalUpVotes - pde.TotalDownVotes) * 0.20) DESC, us.TotalPosts DESC) AS OverallUserRank,
+        CASE
+            WHEN us.TotalQuestions > us.TotalAnswers * 1.5 AND us.TotalAnswers > 0 THEN 'Question-Heavy Contributor'
+            WHEN us.TotalAnswers > us.TotalQuestions * 1.5 AND us.TotalQuestions > 0 THEN 'Answer-Heavy Contributor'
+            WHEN us.TotalQuestions = 0 AND us.TotalAnswers = 0 THEN 'Inactive/Unknown'
+            ELSE 'Balanced Contributor'
+        END AS ContributionCategory,
+        COALESCE(us.UserWebsite, 'No Website Provided') AS DisplayWebsite,
+        NULLIF(LOWER(SUBSTRING(pde.Title FROM 1 FOR 5)), 'how t') AS TitlePrefixIfQuestion,
+        (SELECT COUNT(DISTINCT b2.Id) FROM Badges b2 WHERE b2.UserId = us.UserId AND b2.Class = 1) AS UserGoldBadgeCount
+    FROM UserSummary us
+    INNER JOIN PostDetailAndEngagement pde ON us.UserId = pde.OwnerUserId
+    LEFT JOIN PostHistoryAnomalies pha ON pde.PostId = pha.PostId
+    LEFT JOIN TagExpertiseAndBadges teb ON us.UserId = teb.UserId AND pde.Tags LIKE '%' || '<' || teb.TagName || '>' || '%'
+    WHERE
+        us.Reputation > 2000
+        AND us.DaysActive > 730
+        AND pde.PostId IS NOT NULL
+        AND (pde.ClosedDate IS NULL OR pha.ReopenEvents > 0)
+        AND (LOWER(pde.Title) LIKE '%performance%' OR LOWER(pde.Title) LIKE '%optimization%' OR LOWER(pde.Tags) LIKE '%<sql>%' OR LOWER(pde.Tags) LIKE '%<database>%')
+        AND (pde.LastEditDate IS NOT NULL AND pde.PreviousEditDate IS NOT NULL AND (pde.LastEditDate - pde.PreviousEditDate) < INTERVAL '60 days')
+        AND EXISTS (
+            SELECT 1 FROM Comments c
+            WHERE c.PostId = pde.PostId
+              AND c.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180 days')
+              AND c.Score > 0
+        )
+        AND COALESCE(pha.BodyEditEvents, 0) >= 1
+        AND COALESCE(teb.HasGoldBadgeInTag, 0) = 1
+),
+UnderappreciatedPosts AS (
+    SELECT
+        us.UserId,
+        us.UserDisplayName,
+        us.Reputation,
+        us.TotalPosts,
+        us.TotalQuestions,
+        us.TotalAnswers,
+        us.AvgPostScore,
+        pde.PostId,
+        pde.Title,
+        pde.PostScore,
+        pde.ViewCount,
+        pde.AnswerCount,
+        pde.TotalComments,
+        pde.TotalUpVotes,
+        pde.TotalDownVotes,
+        pde.FavoriteCountFromPost + pde.TotalFavoritesFromVotes AS CombinedFavoriteCount,
+        pde.PreviousEditDate,
+        pde.LastEditDate,
+        pde.AcceptedAnswerScore,
+        pha.CloseEvents,
+        pha.ReopenEvents,
+        pha.BodyEditEvents,
+        pha.LastCloseReasonName,
+        'N/A' AS TagName,
+        NULL::INTEGER AS PostsInTag,
+        NULL::INTEGER AS TotalScoreInTag,
+        NULL::NUMERIC AS AvgScoreInTag,
+        0 AS HasGoldBadgeInTag,
+        (SELECT COUNT(DISTINCT b_alt.Id) FROM Badges b_alt WHERE b_alt.UserId = us.UserId) AS TotalBadges,
+        (us.Reputation * 0.05 + pde.ViewCount * 0.0005 - COALESCE(pde.AnswerCount, 0) * 0.05 - COALESCE(pde.PostScore, 0) * 0.01) AS WeightedUserPerformance,
+        DENSE_RANK() OVER (ORDER BY (us.Reputation * 0.05 + pde.ViewCount * 0.0005 - COALESCE(pde.AnswerCount, 0) * 0.05 - COALESCE(pde.PostScore, 0) * 0.01) DESC, pde.ViewCount DESC) AS OverallUserRank,
+        'Underappreciated Content' AS ContributionCategory,
+        COALESCE(us.UserWebsite, 'No Website Provided') AS DisplayWebsite,
+        NULLIF(LOWER(SUBSTRING(pde.Title FROM 1 FOR 5)), 'how t') AS TitlePrefixIfQuestion,
+        (SELECT COUNT(DISTINCT b2.Id) FROM Badges b2 WHERE b2.UserId = us.UserId AND b2.Class = 1) AS UserGoldBadgeCount
+    FROM UserSummary us
+    INNER JOIN PostDetailAndEngagement pde ON us.UserId = pde.OwnerUserId
+    LEFT JOIN PostHistoryAnomalies pha ON pde.PostId = pha.PostId
+    WHERE
+        us.Reputation BETWEEN 500 AND 5000
+        AND pde.ViewCount > 10000
+        AND (pde.AnswerCount IS NULL OR pde.AnswerCount < 3)
+        AND COALESCE(pde.PostScore, 0) < 10
+        AND pde.PostCreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')
+        AND pde.ClosedDate IS NULL
+)
+SELECT
+    UserId,
+    UserDisplayName,
+    Reputation,
+    TotalPosts,
+    TotalQuestions,
+    TotalAnswers,
+    AvgPostScore,
+    PostId,
+    Title,
+    PostScore,
+    ViewCount,
+    AnswerCount,
+    TotalComments,
+    TotalUpVotes,
+    TotalDownVotes,
+    CombinedFavoriteCount,
+    PreviousEditDate,
+    LastEditDate,
+    AcceptedAnswerScore,
+    CloseEvents,
+    ReopenEvents,
+    BodyEditEvents,
+    LastCloseReasonName,
+    TagName,
+    PostsInTag,
+    TotalScoreInTag,
+    AvgScoreInTag,
+    HasGoldBadgeInTag,
+    TotalBadges,
+    WeightedUserPerformance,
+    OverallUserRank,
+    ContributionCategory,
+    DisplayWebsite,
+    TitlePrefixIfQuestion,
+    UserGoldBadgeCount
+FROM CombinedUserPostMetrics
+UNION ALL
+SELECT
+    UserId,
+    UserDisplayName,
+    Reputation,
+    TotalPosts,
+    TotalQuestions,
+    TotalAnswers,
+    AvgPostScore,
+    PostId,
+    Title,
+    PostScore,
+    ViewCount,
+    AnswerCount,
+    TotalComments,
+    TotalUpVotes,
+    TotalDownVotes,
+    CombinedFavoriteCount,
+    PreviousEditDate,
+    LastEditDate,
+    AcceptedAnswerScore,
+    CloseEvents,
+    ReopenEvents,
+    BodyEditEvents,
+    LastCloseReasonName,
+    TagName,
+    PostsInTag,
+    TotalScoreInTag,
+    AvgScoreInTag,
+    HasGoldBadgeInTag,
+    TotalBadges,
+    WeightedUserPerformance,
+    OverallUserRank,
+    ContributionCategory,
+    DisplayWebsite,
+    TitlePrefixIfQuestion,
+    UserGoldBadgeCount
+FROM UnderappreciatedPosts
+ORDER BY OverallUserRank ASC, Reputation DESC, PostId
+LIMIT 2000;

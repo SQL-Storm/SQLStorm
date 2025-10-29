@@ -1,0 +1,144 @@
+WITH
+  QuestionStats AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.ViewCount AS QuestionViewCount,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      COUNT(c.Id) AS CommentCountOnQuestion,
+      AVG(a.Score) AS AvgAnswerScore,
+      MAX(a.Score) AS MaxAnswerScore,
+      MIN(a.Score) AS MinAnswerScore,
+      COUNT(DISTINCT ph.UserId) AS DistinctEditorsOfQuestion,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+      MAX(ph.CreationDate) AS LastEditDate
+    FROM
+      Posts p
+    LEFT JOIN
+      Comments c
+      ON p.Id = c.PostId
+    LEFT JOIN
+      Posts a
+      ON p.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN
+      PostHistory ph
+      ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (1,2,3,4,5,6,7,8,9)
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ClosedDate
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT qs.QuestionId) AS QuestionsAnswered,
+      SUM(qs.AvgAnswerScore) AS TotalAvgAnswerScore,
+      COUNT(b.Id) AS BadgeCount,
+      MAX(b.Date) AS LastBadgeDate,
+      COUNT(DISTINCT c.PostId) AS CommentsMadeCount
+    FROM
+      Users u
+    LEFT JOIN
+      QuestionStats qs
+      ON u.Id = qs.OwnerUserId
+    LEFT JOIN
+      Badges b
+      ON u.Id = b.UserId
+    LEFT JOIN
+      Comments c
+      ON u.Id = c.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  TopQuestions AS (
+    SELECT
+      qs.QuestionId,
+      qs.Title,
+      qs.QuestionScore,
+      qs.QuestionViewCount,
+      qs.AnswerCount,
+      qs.FavoriteCount,
+      qs.CommentCountOnQuestion,
+      qs.AvgAnswerScore,
+      qs.MaxAnswerScore,
+      qs.MinAnswerScore,
+      qs.DistinctEditorsOfQuestion,
+      qs.EditCount,
+      qs.LastEditDate,
+      qs.OwnerUserId,
+      ua.DisplayName AS OwnerDisplayName,
+      ua.Reputation AS OwnerReputation,
+      CASE WHEN qs.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+      CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - qs.QuestionCreationDate)) / 86400 AS INTEGER) AS DaysSinceCreation,
+      ROW_NUMBER() OVER (ORDER BY qs.QuestionScore DESC, qs.QuestionViewCount DESC) AS RankByScoreView
+    FROM
+      QuestionStats qs
+    LEFT JOIN
+      UserActivity ua
+      ON qs.OwnerUserId = ua.UserId
+    WHERE
+      qs.QuestionScore > 100 AND qs.AnswerCount > 5
+  )
+SELECT
+  tq.QuestionId,
+  tq.Title,
+  tq.OwnerDisplayName,
+  tq.OwnerReputation,
+  tq.QuestionScore,
+  tq.QuestionViewCount,
+  tq.AnswerCount,
+  tq.FavoriteCount,
+  tq.CommentCountOnQuestion,
+  tq.AvgAnswerScore,
+  tq.MaxAnswerScore,
+  tq.MinAnswerScore,
+  tq.DistinctEditorsOfQuestion,
+  tq.EditCount,
+  tq.LastEditDate,
+  tq.IsClosed,
+  tq.DaysSinceCreation,
+  tq.RankByScoreView,
+  COALESCE(tq.OwnerReputation, 0) AS CoalescedOwnerReputation,
+  CASE WHEN tq.AvgAnswerScore > 50 THEN 'High Average Answer Score' ELSE 'Standard Average Answer Score' END AS AnswerScoreCategory,
+  CASE
+    WHEN tq.RankByScoreView <= 10 THEN 'Top 10 Question'
+    WHEN tq.RankByScoreView <= 50 THEN 'Top 50 Question'
+    ELSE 'Other Question'
+  END AS QuestionTier,
+  (tq.OwnerDisplayName || ' (' || CAST(ua.UserCreationDate AS VARCHAR) || ')') AS OwnerInfo,
+  (
+    SELECT
+      COUNT(pl.Id)
+    FROM
+      PostLinks pl
+    WHERE
+      pl.PostId = tq.QuestionId AND pl.LinkTypeId = 3
+  ) AS DuplicateLinkCount
+FROM
+  TopQuestions tq
+LEFT JOIN
+  UserActivity ua
+  ON tq.OwnerUserId = ua.UserId
+WHERE
+  tq.OwnerReputation > 10000 OR tq.QuestionScore > 500
+ORDER BY
+  tq.RankByScoreView;

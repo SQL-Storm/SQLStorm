@@ -1,0 +1,132 @@
+-- {"query": "3842.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2623} 
+WITH
+    top_users AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+            COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+            COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+            COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+            COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount
+        FROM Users u
+        LEFT JOIN Badges b     ON b.UserId = u.Id
+        LEFT JOIN Posts p      ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+        HAVING COUNT(*) > 0
+    ),
+    recent_activity AS (
+        SELECT
+            u.Id AS UserId,
+            MAX(p.CreationDate) AS LastPostDate,
+            MAX(v.CreationDate) AS LastVoteDate,
+            MAX(c.CreationDate) AS LastCommentDate
+        FROM Users u
+        LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+        LEFT JOIN Votes    v ON v.UserId = u.Id
+        LEFT JOIN Comments c ON c.UserId = u.Id
+        GROUP BY u.Id
+    ),
+    tag_stats AS (
+        SELECT
+            t.TagName,
+            t.Count AS TagUseCount,
+            COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END), 0) AS TagEdits,
+            ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+        FROM Tags t
+        LEFT JOIN PostHistory ph
+               ON ph.PostId = t.ExcerptPostId OR ph.PostId = t.WikiPostId
+        GROUP BY t.TagName, t.Count
+    ),
+    question_karma AS (
+        SELECT
+            p.Id AS QuestionId,
+            p.Title,
+            p.Score,
+            COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+                              WHEN v.VoteTypeId = 3 THEN -1
+                              ELSE 0 END), 0) AS VoteScore,
+            COUNT(a.Id) AS AnswerCnt,
+            MAX(CASE WHEN a.Id = p.AcceptedAnswerId THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS HasAccepted,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserQuestionRank
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2, 3)
+        LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+        WHERE p.PostTypeId = 1
+        GROUP BY p.Id, p.Title, p.Score, p.OwnerUserId, p.AcceptedAnswerId
+    ),
+    duplicated_questions AS (
+        SELECT
+            ph1.PostId                                   AS DuplicateId,
+            (ph1.Text::json->>'OriginalQuestionIds')::int AS OriginalId,
+            ph2.CreationDate                             AS OriginalCreation
+        FROM PostHistory ph1
+        JOIN PostHistory ph2
+          ON ph2.Id = (ph1.Text::json->>'OriginalQuestionIds')::int
+        WHERE ph1.PostHistoryTypeId = 10
+          AND ph1.Comment ~ '^\d+$'
+    )
+SELECT
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    ra.LastPostDate,
+    ra.LastVoteDate,
+    ra.LastCommentDate,
+    COALESCE(ts.TagName, 'NoTag') AS TopTag,
+    ts.TagUseCount,
+    ts.TagRank,
+    qk.Title,
+    qk.Score,
+    qk.VoteScore,
+    qk.AnswerCnt,
+    qk.HasAccepted,
+    qk.UserQuestionRank,
+    dq.DuplicateId,
+    dq.OriginalId,
+    dq.OriginalCreation
+FROM top_users tu
+LEFT JOIN recent_activity ra   ON ra.UserId = tu.Id
+LEFT JOIN LATERAL (
+        SELECT TagName, TagUseCount, TagRank
+        FROM tag_stats
+        ORDER BY TagRank
+        LIMIT 1
+) ts ON TRUE
+LEFT JOIN question_karma qk
+       ON qk.UserQuestionRank = 1
+      AND qk.QuestionId = (
+          SELECT p.Id
+          FROM Posts p
+          WHERE p.OwnerUserId = tu.Id
+            AND p.PostTypeId = 1
+          ORDER BY p.Score DESC
+          LIMIT 1
+      )
+LEFT JOIN duplicated_questions dq
+       ON dq.DuplicateId = (
+          SELECT ph.PostId
+          FROM PostHistory ph
+          WHERE ph.UserId = tu.Id
+            AND ph.PostHistoryTypeId = 10
+          LIMIT 1
+      )
+WHERE tu.Reputation > 10000
+ORDER BY tu.Reputation DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+
+UNION ALL
+
+SELECT
+    NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL
+LIMIT 0;

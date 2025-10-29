@@ -1,0 +1,121 @@
+-- {"query": "5884.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 871} 
+WITH 
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+TopLinkedQuestions AS (
+  SELECT
+    rp.Id AS QuestionId,
+    COUNT(pl.Id) AS LinkedCount,
+    MAX(pl.CreationDate) AS LastLinkDate
+  FROM Posts rp
+  LEFT JOIN PostLinks pl ON pl.PostId = rp.Id
+  WHERE rp.PostTypeId = 1
+  GROUP BY rp.Id
+),
+QuestionTagStats AS (
+  SELECT
+    p.Id AS QuestionId,
+    t.TagName,
+    t.Count AS TagCount,
+    ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY t.Count DESC) AS rn
+  FROM Posts p
+  JOIN Tags t ON t.WikiPostId = p.Id OR t.ExcerptPostId = p.Id
+  WHERE p.PostTypeId = 1
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    (SELECT COUNT(*) FROM Posts x WHERE x.OwnerUserId = u.Id AND x.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days') AS RecentPosts,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Date > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') AS RecentBadges
+  FROM Users u
+),
+Correlation AS (
+  SELECT
+    rp.Id AS QuestionId,
+    u.UserId AS AnswererId,
+    p.Title AS QuestionTitle,
+    p2.Title AS AnswerTitle,
+    p.CreationDate AS QuestionCreated,
+    p2.CreationDate AS AnswerCreated,
+    p.Score AS QuestionScore,
+    p2.Score AS AnswerScore,
+    p.ViewCount AS QuestionViews,
+    p2.ViewCount AS AnswerViews,
+    ROW_NUMBER() OVER (PARTITION BY rp.Id ORDER BY p2.CreationDate DESC) AS rn
+  FROM Posts rp
+  JOIN Posts p ON p.Id = rp.ParentId OR p.Id = rp.AcceptedAnswerId
+  JOIN Posts p2 ON p2.ParentId = rp.Id
+  WHERE rp.PostTypeId = 1
+),
+Mixed AS (
+  SELECT
+    rp.QuestionId,
+    rp.QuestionTitle,
+    rp.QuestionCreated,
+    rp.QuestionScore,
+    rp.QuestionViews,
+    t.TagName,
+    t.TagCount,
+    ta.rn AS TagRank,
+    ua.UserId AS OwnerUserId,
+    ua.DisplayName AS OwnerDisplayName,
+    ua.Reputation AS OwnerReputation,
+    ca.LinkedCount,
+    ca.LastLinkDate,
+    cb.RecentPosts
+  FROM RecentActivePosts rp
+  LEFT JOIN TopLinkedQuestions ca ON ca.QuestionId = rp.Id
+  LEFT JOIN QuestionTagStats ta ON ta.QuestionId = rp.Id
+  LEFT JOIN UserActivity ua ON ua.UserId = rp.OwnerUserId
+  LEFT JOIN (
+    SELECT
+      rp.Id,
+      ROW_NUMBER() OVER (PARTITION BY rp.Id ORDER BY rp.LastLinkDate DESC) AS rn
+    FROM TopLinkedQuestions rp
+  ) cb ON cb.QuestionId = rp.Id
+)
+SELECT
+  m.QuestionId,
+  m.QuestionTitle,
+  m.QuestionCreated,
+  m.QuestionScore,
+  m.QuestionViews,
+  m.TagName,
+  m.TagCount,
+  m.TagRank,
+  m.OwnerUserId,
+  m.OwnerDisplayName,
+  m.OwnerReputation,
+  m.LinkedCount,
+  m.LastLinkDate,
+  m.RecentPosts
+FROM Mixed m
+WHERE m.TagRank = 1
+ORDER BY m.QuestionCreated DESC
+LIMIT 100
+OFFSET 0;

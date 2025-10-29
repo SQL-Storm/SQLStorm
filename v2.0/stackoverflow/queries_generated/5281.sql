@@ -1,0 +1,108 @@
+-- {"query": "5281.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 818} 
+WITH TopUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(p.Id) AS PostCount,
+    SUM(p.Score) AS ScoreSum,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE u.Reputation > 1000
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagHot AS (
+  SELECT
+    t.TagName,
+    COUNT(p.Id) AS PostCount,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.LastActivityDate) AS LastActivity
+  FROM Tags tg
+  JOIN Posts p ON p.Id = tg.ExcerptPostId
+  JOIN UNNEST(string_to_array(p.Tags, '><')) AS t(tag)
+    ON t.tag = tg.TagName
+  WHERE tg.IsModeratorOnly = 0
+  GROUP BY t.TagName
+),
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.LastActivityDate > NOW() - INTERVAL '7 days'
+),
+Combined AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.CreationDate,
+    r.LastActivityDate,
+    r.OwnerUserId,
+    r.Score,
+    r.ViewCount,
+    r.CommentCount,
+    r.UpVotes,
+    r.DownVotes,
+    NULL AS TagName,
+    NULL AS TagCount
+  FROM RecentActivity r
+  UNION ALL
+  SELECT
+    NULL AS PostId,
+    NULL AS Title,
+    NULL AS CreationDate,
+    NULL AS LastActivityDate,
+    NULL AS OwnerUserId,
+    NULL AS Score,
+    NULL AS ViewCount,
+    NULL AS CommentCount,
+    NULL AS UpVotes,
+    NULL AS DownVotes,
+    tgh.TagName AS TagName,
+    tgh.PostCount AS TagCount
+  FROM TagHot tgh
+)
+SELECT
+  cu.DisplayName AS UserDisplay,
+  cu.Reputation AS UserReputation,
+  tw.TagName AS TopTag,
+  tw.TagCount AS TagPopularity,
+  ra.PostId AS QuestionPostId,
+  ra.Title AS QuestionTitle,
+  ra.CreationDate AS QuestionCreated,
+  ra.LastActivityDate AS QuestionLastActive,
+  ra.Score AS QuestionScore,
+  ra.ViewCount AS QuestionViews,
+  ra.CommentCount AS QuestionComments,
+  ra.UpVotes AS QuestionUpVotes,
+  ra.DownVotes AS QuestionDownVotes,
+  ta.LastActive AS LastActiveTime,
+  fu.Reputation AS ReferrerReputation,
+  fu.DisplayName AS ReferrerName
+FROM Users cu
+LEFT JOIN TopUsers fu ON fu.Id = cu.Id
+LEFT JOIN Posts q ON q.OwnerUserId = cu.Id AND q.PostTypeId = 1
+LEFT JOIN RecentActivity ra ON ra.PostId = q.Id
+LEFT JOIN (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation
+  FROM Users u
+) fu ON fu.Id = cu.Id
+LEFT JOIN TagHot th ON th.TagName = (
+  SELECT unnest(string_to_array(q.Tags, '><')) LIMIT 1
+  FROM Posts q WHERE q.Id = ra.PostId
+)
+ORDER BY cu.Reputation DESC, ra.LastActivityDate DESC
+LIMIT 100;

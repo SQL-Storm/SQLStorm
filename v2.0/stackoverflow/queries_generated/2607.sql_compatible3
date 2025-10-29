@@ -1,0 +1,173 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        coalesce(t.Count, 0) as Count,
+        coalesce(case when t.IsModeratorOnly then 1 else 0 end, 0) as IsModeratorOnly,
+        0 as Level,
+        array[t.Id] as Ancestry
+    from Tags t
+    where (case when t.IsModeratorOnly then 1 else 0 end) = 0
+    union all
+    select
+        t.Id,
+        t.TagName,
+        coalesce(t.Count, 0) as Count,
+        coalesce(case when t.IsModeratorOnly then 1 else 0 end, 0) as IsModeratorOnly,
+        r.Level + 1,
+        r.Ancestry || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1
+    where not t.Id = any(r.Ancestry) and (case when t.IsModeratorOnly then 1 else 0 end) = 0 and r.Level < 3
+),
+UserReputationStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct b.Id) as BadgeCount,
+        max(b.Class) as HighestBadgeClass,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        coalesce(avg(p.Score), 0) as AvgPostScore,
+        coalesce(sum(case when vt.Name = 'UpMod' then 1 else 0 end), 0) as UpVotesCount
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopScoringAnswers as (
+    select
+        p.Id,
+        p.ParentId,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as rn
+    from Posts p
+    where p.PostTypeId = 2
+      and p.Score is not null
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        count(distinct a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 10) as CloseVotesCount,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 11) as ReopenVotesCount,
+        array_agg(distinct coalesce(pl.PostId, 0)) filter (where pl.LinkTypeId = 1) as LinkedPostIds,
+        array_agg(distinct coalesce(pl.RelatedPostId, 0)) filter (where pl.LinkTypeId = 3) as DuplicatePostIds
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId in (10,11)
+    left join PostLinks pl on pl.PostId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.Tags, q.CreationDate, q.Score, q.ViewCount
+),
+UserBadgeEvents as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        b.Date,
+        u.DisplayName
+    from Badges b
+    join Users u on u.Id = b.UserId
+),
+QuestionWithUserStats as (
+    select
+        qas.QuestionId,
+        qas.Title,
+        qas.Tags,
+        qas.CreationDate,
+        qas.QuestionScore,
+        qas.ViewCount,
+        qas.AnswerCount,
+        qas.MaxAnswerScore,
+        qas.MinAnswerScore,
+        qas.AvgAnswerScore,
+        qas.CloseVotesCount,
+        qas.ReopenVotesCount,
+        urs.DisplayName as OwnerDisplayName,
+        urs.Reputation as OwnerReputation,
+        urs.BadgeCount as OwnerBadgeCount,
+        urs.GoldBadges as OwnerGoldBadges,
+        urs.SilverBadges as OwnerSilverBadges,
+        urs.BronzeBadges as OwnerBronzeBadges,
+        urs.AvgPostScore as OwnerAvgPostScore,
+        urs.UpVotesCount as OwnerUpVotes
+    from QuestionAnswerStats qas
+    left join Users u on u.Id = (select p.OwnerUserId from Posts p where p.Id = qas.QuestionId)
+    left join UserReputationStats urs on urs.UserId = u.Id
+)
+select
+    qws.QuestionId,
+    (case when length(qws.Title) <= 80 then qws.Title else substr(qws.Title,1,80) || '...' end) as ShortTitle,
+    qws.ViewCount,
+    qws.QuestionScore,
+    qws.AnswerCount,
+    qws.MaxAnswerScore,
+    qws.MinAnswerScore,
+    qws.AvgAnswerScore,
+    qws.CloseVotesCount,
+    qws.ReopenVotesCount,
+    (coalesce(qws.OwnerDisplayName, '') || ', Reputation: ' || coalesce(cast(qws.OwnerReputation as varchar), '0') || ', Badges(G/S/B): ' ||
+        coalesce(cast(qws.OwnerGoldBadges as varchar), '0') || '/' || coalesce(cast(qws.OwnerSilverBadges as varchar), '0') || '/' || coalesce(cast(qws.OwnerBronzeBadges as varchar), '0')) as OwnerSummary,
+    coalesce((
+        select string_agg(distinct ph2.Comment || ' (Type:' || pht.Name || ')', '; ')
+        from (
+            select ph2_inner.Comment, pht_inner.Name, ph2_inner.CreationDate
+            from PostHistory ph2_inner
+            join PostHistoryTypes pht_inner on pht_inner.Id = ph2_inner.PostHistoryTypeId
+            where ph2_inner.PostId = qws.QuestionId and ph2_inner.PostHistoryTypeId in (4,5,6,10,11)
+            order by ph2_inner.CreationDate desc
+            limit 5
+        ) ph2
+    ), '') as RecentEditsSummary,
+    rank() over (partition by qws.OwnerDisplayName order by qws.ViewCount desc) as OwnerQuestionViewRank,
+    case when qws.ViewCount > 10000 and qws.QuestionScore > 10 and qws.AnswerCount > 5 then 1 else 0 end as IsHotQuestion,
+    case
+        when qws.Tags is null then NULL
+        when position('><' in qws.Tags) > 0 then substr(qws.Tags, 2, position('><' in qws.Tags) - 2)
+        else substr(qws.Tags, 2, length(qws.Tags) - 2)
+    end as FirstTag,
+    (select count(*)
+     from Posts pa
+     join Users ua on ua.Id = pa.OwnerUserId
+     where pa.PostTypeId = 2 and pa.ParentId = qws.QuestionId and ua.Reputation > 10000) as HighRepAnswerCount,
+    (extract(epoch from (timestamp '2024-10-01 12:34:56' - qws.CreationDate))/86400) as DaysSinceCreation,
+    (extract(epoch from (timestamp '2024-10-01 12:34:56' - (select max(LastActivityDate) from Posts where Id = qws.QuestionId)))/86400) as DaysSinceLastActivity
+from QuestionWithUserStats qws
+where qws.AnswerCount > 0 and qws.QuestionScore is not null
+group by
+    qws.QuestionId,
+    qws.Title,
+    qws.ViewCount,
+    qws.QuestionScore,
+    qws.AnswerCount,
+    qws.MaxAnswerScore,
+    qws.MinAnswerScore,
+    qws.AvgAnswerScore,
+    qws.CloseVotesCount,
+    qws.ReopenVotesCount,
+    qws.OwnerDisplayName,
+    qws.OwnerReputation,
+    qws.OwnerGoldBadges,
+    qws.OwnerSilverBadges,
+    qws.OwnerBronzeBadges,
+    qws.Tags,
+    qws.CreationDate
+order by qws.ViewCount desc, qws.QuestionScore desc
+limit 50;

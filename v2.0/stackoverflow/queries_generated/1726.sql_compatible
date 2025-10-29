@@ -1,0 +1,234 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN V.VoteTypeId IN (2, 8) THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN V.VoteTypeId IN (3, 10, 12) THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - U.CreationDate)) AS DaysSinceCreation,
+        AVG(P.Score) FILTER (WHERE P.PostTypeId = 1) AS AvgQuestionScoreOwned,
+        AVG(P.Score) FILTER (WHERE P.PostTypeId = 2) AS AvgAnswerScoreOwned,
+        SUM(P.ViewCount) AS TotalPostViewsOwned
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostActivityMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.CommentCount AS DirectCommentCount,
+        P.FavoriteCount,
+        COUNT(DISTINCT PH.Id) AS TotalPostHistoryEvents,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4,5,6,7,8,9) THEN PH.Id END) AS TotalRevisionEvents,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditorsCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesOnPost,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesOnPost,
+        AVG(COALESCE(C.Score, 0)) AS AvgCommentScoreOnPost,
+        COUNT(C.Id) AS TotalCommentsOnPost,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatePostsCount,
+        (SELECT MIN(A.CreationDate) FROM Posts A WHERE A.ParentId = P.Id AND A.PostTypeId = 2) AS FirstAnswerDate,
+        CASE WHEN P.CreationDate IS NOT NULL AND P.AcceptedAnswerId IS NOT NULL
+             THEN EXTRACT(HOUR FROM ((SELECT CreationDate FROM Posts WHERE Id = P.AcceptedAnswerId) - P.CreationDate)) END AS TimeToAcceptAnswerHours,
+        -- compute TagCount by moving set-returning function to a lateral subquery to avoid SRF inside aggregate
+        (SELECT COUNT(DISTINCT t.tag) FROM (
+             SELECT LOWER(tag_elem) AS tag
+             FROM Posts p2,
+                  LATERAL (
+                      SELECT regexp_split_to_table(SUBSTRING(p2.Tags FROM 2 FOR LENGTH(p2.Tags) - 2), '><') AS tag_elem
+                  ) sub
+             WHERE p2.Id = P.Id AND p2.Tags IS NOT NULL AND LENGTH(p2.Tags) > 2
+         ) t) AS TagCount
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId
+    GROUP BY P.Id, P.PostTypeId, P.CreationDate, P.ClosedDate, P.CommunityOwnedDate, P.LastEditDate,
+             P.LastActivityDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.AcceptedAnswerId
+),
+RecentPostRevisions AS (
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS RevisionDate,
+        PH.PostHistoryTypeId,
+        PHT.Name AS HistoryTypeName,
+        PH.UserId AS RevisionUserId,
+        PH.UserDisplayName AS RevisionUserDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC, PH.Id DESC) AS rn
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+),
+ControversialPosts AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 8 THEN PH.Id END) AS BodyRollbacks,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 9 THEN PH.Id END) AS TagsRollbacks
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    GROUP BY P.Id, P.OwnerUserId
+    HAVING SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) > 10 OR COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 8 THEN PH.Id END) > 3
+),
+AllPostTags AS (
+    SELECT
+        P.Id AS PostId,
+        LOWER(tag_elem) AS TagName,
+        P.CreationDate
+    FROM Posts P,
+         LATERAL (
+             SELECT regexp_split_to_table(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><') AS tag_elem
+         ) t
+    WHERE P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+),
+MonthlyTagUsage AS (
+    SELECT
+        TagName,
+        EXTRACT(YEAR FROM CreationDate) AS TagYear,
+        EXTRACT(MONTH FROM CreationDate) AS TagMonth,
+        COUNT(DISTINCT PostId) AS PostsWithTagCount
+    FROM AllPostTags
+    GROUP BY TagName, TagYear, TagMonth
+)
+SELECT
+    P.Id AS PostID,
+    PT.Name AS PostTypeName,
+    P.Title,
+    P.CreationDate AS PostCreationDate,
+    P.LastActivityDate,
+    P.Score AS PostNetScore,
+    P.ViewCount,
+    P.AnswerCount,
+    P.CommentCount AS PostTableCommentCount,
+    P.FavoriteCount,
+    U.Id AS OwnerUserID,
+    U.DisplayName AS OwnerDisplayName,
+    UES.Reputation AS OwnerReputation,
+    UES.TotalPostsOwned AS OwnerTotalPosts,
+    UES.TotalQuestionsOwned AS OwnerTotalQuestions,
+    UES.TotalAnswersOwned AS OwnerTotalAnswers,
+    PAM.TotalCommentsOnPost,
+    PAM.AvgCommentScoreOnPost,
+    PAM.TotalUpvotesOnPost,
+    PAM.TotalDownvotesOnPost,
+    PAM.TotalRevisionEvents,
+    PAM.UniqueEditorsCount,
+    RPR.RevisionDate AS LastRevisionDate,
+    RPR.HistoryTypeName AS LastRevisionType,
+    RPR.RevisionUserDisplayName AS LastRevisionEditor,
+    COALESCE(PAM.TimeToAcceptAnswerHours, -1) AS TimeToAcceptAnswerHours,
+    PAM.TagCount,
+    P.ClosedDate,
+    CASE
+        WHEN P.ClosedDate IS NOT NULL AND P.CreationDate IS NOT NULL THEN EXTRACT(DAY FROM (P.ClosedDate - P.CreationDate))
+        ELSE NULL
+    END AS DaysUntilClosed,
+    (SELECT COUNT(DISTINCT PL_Inner.RelatedPostId) FROM PostLinks PL_Inner WHERE PL_Inner.PostId = P.Id AND PL_Inner.LinkTypeId = 3) AS DuplicateLinkCount,
+    (SELECT COUNT(DISTINCT PH_Inner.Id) FROM PostHistory PH_Inner WHERE PH_Inner.PostId = P.Id AND PH_Inner.PostHistoryTypeId = 10) AS CloseVoteHistoryCount,
+    UES.GoldBadges,
+    UES.SilverBadges,
+    UES.BronzeBadges,
+    CASE
+        WHEN P.Body ILIKE '%performance%' OR P.Body ILIKE '%optimization%' THEN 'HighPerformanceTopic'
+        WHEN P.Body ILIKE '%bug%' OR P.Body ILIKE '%error%' THEN 'BugReportTopic'
+        ELSE 'GeneralTopic'
+    END AS PostTopicCategory,
+    CASE
+        WHEN P.Tags IS NULL OR P.Tags = '' THEN 'NoTags'
+        WHEN P.Tags LIKE '%<sql>%' OR P.Tags LIKE '%<database>%' OR P.Tags LIKE '%<postgresql>%' THEN 'DatabaseRelated'
+        WHEN P.Tags LIKE '%<javascript>%' OR P.Tags LIKE '%<python>%' THEN 'ProgrammingRelated'
+        ELSE 'OtherTech'
+    END AS TagCategory,
+    DENSE_RANK() OVER (PARTITION BY PT.Name ORDER BY P.Score DESC, P.ViewCount DESC) AS RankInPostType,
+    AVG(P.Score) OVER (PARTITION BY U.Id) AS AvgScoreByOwner,
+    MAX(PAM.TotalUpvotesOnPost) OVER (PARTITION BY PT.Name) AS MaxUpvotesInPostType,
+    COALESCE(
+        (SELECT MTU_Inner.PostsWithTagCount FROM MonthlyTagUsage MTU_Inner
+         WHERE MTU_Inner.TagName = (
+             SELECT tag FROM (
+                 SELECT LOWER(tag_elem) AS tag
+                 FROM Posts p3,
+                      LATERAL (
+                          SELECT regexp_split_to_table(SUBSTRING(p3.Tags FROM 2 FOR LENGTH(p3.Tags) - 2), '><') AS tag_elem
+                      ) sub
+                 WHERE p3.Id = P.Id AND p3.Tags IS NOT NULL AND LENGTH(p3.Tags) > 2
+                 LIMIT 1
+             ) s
+         )
+           AND MTU_Inner.TagYear = EXTRACT(YEAR FROM P.CreationDate)
+           AND MTU_Inner.TagMonth = EXTRACT(MONTH FROM P.CreationDate)
+         LIMIT 1), 0
+    ) AS PrimaryTagMonthlyUsage,
+    (SELECT EXISTS (
+        SELECT 1
+        FROM ControversialPosts CP
+        WHERE CP.OwnerUserId = U.Id
+          AND CP.PostId <> P.Id
+          AND (CP.TotalDownvotes > 20 OR CP.BodyRollbacks > 5)
+    )) AS OwnerHasHighlyControversialOtherPosts
+FROM Posts P
+INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+LEFT JOIN Users U ON P.OwnerUserId = U.Id
+LEFT JOIN UserEngagementSummary UES ON U.Id = UES.UserId
+LEFT JOIN PostActivityMetrics PAM ON P.Id = PAM.PostId
+LEFT JOIN RecentPostRevisions RPR ON P.Id = RPR.PostId AND RPR.rn = 1
+WHERE
+    P.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 year')
+    AND P.PostTypeId IN (1, 2)
+    AND (P.Score > 0 OR PAM.TotalUpvotesOnPost > PAM.TotalDownvotesOnPost)
+    AND (U.Reputation IS NULL OR U.Reputation > 1000)
+    AND (
+        (PAM.TotalCommentsOnPost IS NOT NULL AND PAM.TotalCommentsOnPost >= 3)
+        OR (P.FavoriteCount IS NOT NULL AND P.FavoriteCount > 5)
+        OR (P.ViewCount IS NOT NULL AND P.ViewCount > 1000)
+    )
+    AND (
+        P.ClosedDate IS NULL
+        OR P.ClosedDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+        OR P.CommunityOwnedDate IS NOT NULL
+    )
+    AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    AND EXISTS (
+        SELECT 1
+        FROM AllPostTags TTP
+        WHERE TTP.PostId = P.Id
+          AND TTP.TagName IN (
+              SELECT MTU_Inner.TagName
+              FROM MonthlyTagUsage MTU_Inner
+              WHERE MTU_Inner.TagYear >= EXTRACT(YEAR FROM (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'))
+                AND MTU_Inner.PostsWithTagCount > 50
+              GROUP BY MTU_Inner.TagName
+              HAVING SUM(MTU_Inner.PostsWithTagCount) > 200
+          )
+    )
+ORDER BY
+    P.CreationDate DESC,
+    RankInPostType ASC,
+    P.Score DESC
+LIMIT 1000;

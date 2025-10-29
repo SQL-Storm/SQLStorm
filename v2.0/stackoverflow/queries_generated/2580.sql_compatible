@@ -1,0 +1,219 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    -- Recursive CTE to find tags related by co-occurrence in questions
+    SELECT
+        t1.Id AS Tag1Id,
+        t2.Id AS Tag2Id,
+        1 AS Depth
+    FROM
+        Posts p
+        JOIN Tags t1 ON p.PostTypeId = 1 AND p.Tags LIKE '%' || t1.TagName || '%'
+        JOIN Tags t2 ON p.PostTypeId = 1 AND p.Tags LIKE '%' || t2.TagName || '%'
+    WHERE
+        t1.Id <> t2.Id
+
+    UNION ALL
+
+    SELECT
+        rh.Tag1Id,
+        t3.Id,
+        rh.Depth + 1
+    FROM
+        RecursiveTagHierarchy rh
+        JOIN Tags t3 ON t3.Id <> rh.Tag1Id AND t3.Id <> rh.Tag2Id
+    WHERE
+        rh.Depth < 2
+),
+PostInteractionRanks AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        COALESCE(v.UpVotesCount, 0) AS UpVotes,
+        COALESCE(v.DownVotesCount, 0) AS DownVotes,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC NULLS LAST) AS PostRank,
+        RANK() OVER (ORDER BY SUM(COALESCE(v.UpVotesCount,0)) OVER (PARTITION BY u.Id) DESC) AS UserUpVoteRank
+    FROM
+        Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN (
+            SELECT
+                PostId,
+                SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCount,
+                SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCount
+            FROM Votes
+            GROUP BY PostId
+        ) v ON v.PostId = p.Id
+        LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE
+        u.Reputation > 1000
+    GROUP BY
+        u.Id, u.DisplayName, p.Id, p.PostTypeId, p.Score, p.CreationDate, v.UpVotesCount, v.DownVotesCount
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount,
+        AVG(a.Score) AS AverageAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        MIN(a.Score) AS MinAnswerScore
+    FROM
+        Posts a
+    WHERE
+        a.PostTypeId = 2
+    GROUP BY
+        a.ParentId
+),
+QuestionWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        q.CreationDate,
+        a.AnswerCount,
+        a.AverageAnswerScore,
+        a.MaxAnswerScore,
+        a.MinAnswerScore,
+        ph.PostHistoryTypeId AS LastEditTypeId,
+        pht.Name AS LastEditType,
+        ph.CreationDate AS LastEditDate,
+        ph.UserId AS LastEditorUserId,
+        u.DisplayName AS LastEditorName
+    FROM
+        Posts q
+        LEFT JOIN AnswerStats a ON a.QuestionId = q.Id
+        LEFT JOIN LATERAL (
+            SELECT
+                ph.PostHistoryTypeId,
+                pht.Name,
+                ph.CreationDate,
+                ph.UserId
+            FROM
+                PostHistory ph
+                JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+            WHERE
+                ph.PostId = q.Id
+            ORDER BY
+                ph.CreationDate DESC
+            LIMIT 1
+        ) ph ON true
+        LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE
+        q.PostTypeId = 1
+        AND q.Score > 5
+),
+DuplicatedQuestions AS (
+    SELECT DISTINCT
+        pl.PostId AS DuplicateQuestionId,
+        pl.RelatedPostId AS OriginalQuestionId,
+        pl.CreationDate AS DuplicateCreationDate
+    FROM
+        PostLinks pl
+        JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE
+        lt.Name = 'Duplicate'
+),
+UserBadgeRank AS (
+    SELECT
+        UserId,
+        Name AS BadgeName,
+        Class,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY Date DESC) AS BadgeRecentRank
+    FROM
+        Badges
+),
+QuestionWithComments AS (
+    SELECT
+        q.Id AS QuestionId,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        STRING_AGG(c.Text, ' ||| ' ORDER BY c.CreationDate DESC) AS AllCommentsConcatenated
+    FROM
+        Posts q
+        LEFT JOIN Comments c ON c.PostId = q.Id
+    WHERE
+        q.PostTypeId = 1
+    GROUP BY
+        q.Id
+)
+SELECT
+    qwa.QuestionId,
+    qwa.Title,
+    qwa.Score,
+    qwa.ViewCount,
+    qwa.Tags,
+    qwa.AnswerCount,
+    qwa.AverageAnswerScore,
+    qwa.MaxAnswerScore,
+    qwa.MinAnswerScore,
+    qwa.LastEditType,
+    qwa.LastEditDate,
+    qwa.LastEditorUserId,
+    qwa.LastEditorName,
+    du.DuplicateQuestionId,
+    du.OriginalQuestionId,
+    du.DuplicateCreationDate,
+    pir.DisplayName AS TopScoringUserDisplayName,
+    pir.UserUpVoteRank,
+    pir.GoldBadges,
+    pir.SilverBadges,
+    pir.BronzeBadges,
+    ub.BadgeName AS MostRecentBadgeName,
+    ub.Class AS MostRecentBadgeClass,
+    qc.CommentCount,
+    CASE
+        WHEN qwa.AnswerCount IS NULL OR qwa.AnswerCount = 0 THEN 'Unanswered'
+        WHEN qwa.MaxAnswerScore > qwa.Score THEN 'Strong Answer(s)'
+        ELSE 'Weak/No Strong Answer'
+    END AS AnswerQuality,
+    CASE
+        WHEN qwa.ViewCount > 10000 THEN 'Popular: ' || qwa.ViewCount::text
+        ELSE 'Less Popular: ' || qwa.ViewCount::text
+    END AS PopularityLabel,
+    COALESCE(rh.Depth, 0) AS TagRelationDepth,
+    rh.Tag1Id,
+    rh.Tag2Id,
+    qc.AllCommentsConcatenated,
+    (LENGTH(qwa.Tags) - LENGTH(REPLACE(qwa.Tags, '><', '')) + 1) AS TagCountGuess
+FROM
+    QuestionWithAnswers qwa
+    LEFT JOIN DuplicatedQuestions du ON du.DuplicateQuestionId = qwa.QuestionId
+    LEFT JOIN LATERAL (
+        SELECT
+            pirr.*
+        FROM
+            PostInteractionRanks pirr
+        WHERE
+            pirr.PostId = qwa.QuestionId
+            AND pirr.PostRank = 1
+        ORDER BY
+            pirr.UserUpVoteRank
+        LIMIT 1
+    ) pir ON true
+    LEFT JOIN UserBadgeRank ub ON ub.UserId = pir.UserId AND ub.BadgeRecentRank = 1
+    LEFT JOIN QuestionWithComments qc ON qc.QuestionId = qwa.QuestionId
+    LEFT JOIN LATERAL (
+      SELECT
+        rh2.Depth, rh2.Tag1Id, rh2.Tag2Id
+      FROM
+        RecursiveTagHierarchy rh2
+      WHERE
+        rh2.Tag1Id IN (
+          SELECT t.Id FROM Tags t WHERE qwa.Tags LIKE '%' || t.TagName || '%'
+        )
+      ORDER BY rh2.Depth ASC
+      LIMIT 1
+    ) rh ON true
+WHERE
+    qwa.LastEditDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+ORDER BY
+    qwa.Score DESC NULLS LAST,
+    qwa.AnswerCount DESC NULLS LAST,
+    pir.UserUpVoteRank ASC NULLS LAST
+LIMIT 100;

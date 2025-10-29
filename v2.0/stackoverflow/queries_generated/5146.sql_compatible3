@@ -1,0 +1,34 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS QuestionCount,
+  AVG(p.Score) AS AvgQuestionScore,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+  STRING_AGG(DISTINCT t.Name, ',') AS TagsViewed,
+  MAX(p.CreationDate) AS LastQuestionDate,
+  MAX(p.LastActivityDate) AS LastActivityDate
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN Posts rp ON rp.Id = pl.RelatedPostId
+  LEFT JOIN Tags t ON t.Id IN (
+    SELECT CAST(TRIM(BOTH '<>' FROM x) AS INTEGER)
+    FROM (
+      SELECT UNNEST(string_to_array(p.Tags, ' ')) AS x
+    ) sub
+    WHERE x <> ''
+  )
+WHERE
+  u.Reputation > 1000
+  AND p.Id IS NOT NULL
+  AND (p.ClosedDate IS NULL OR p.ClosedDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days'))
+  AND (v.CreationDate = (SELECT MAX(v2.CreationDate) FROM Votes v2 WHERE v2.PostId = p.Id) OR v.PostId IS NULL)
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation
+ORDER BY
+  AvgQuestionScore DESC NULLS LAST, UpVotesReceived DESC
+LIMIT 100;

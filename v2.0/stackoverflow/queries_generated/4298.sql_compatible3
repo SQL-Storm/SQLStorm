@@ -1,0 +1,109 @@
+WITH QuestionAnswers AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.OwnerUserId AS QuestionOwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        COUNT(a.Id) AS AnswerCount,
+        SUM(CASE WHEN p.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END) AS IsAcceptedAnswer
+    FROM Posts p
+    LEFT JOIN Posts a ON p.Id = a.ParentId
+    WHERE p.PostTypeId = 1
+    GROUP BY
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score
+),
+UserContribution AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 END) AS EditedPostBodyCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (1, 4) THEN 1 END) AS EditedPostTitleCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (3, 6) THEN 1 END) AS EditedTagsCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS PostClosedCount
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCountForTag,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerCountForTag
+    FROM Tags t
+    LEFT JOIN Posts p ON t.TagName = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AND p.PostTypeId IN (1, 2)
+    GROUP BY
+        t.TagName,
+        t.Count
+)
+SELECT
+    qa.QuestionId,
+    qa.QuestionTitle,
+    qa.QuestionCreationDate,
+    qa.QuestionScore,
+    uc.DisplayName AS QuestionOwnerDisplayName,
+    uc.Reputation AS QuestionOwnerReputation,
+    qa.AnswerCount,
+    qa.IsAcceptedAnswer,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = qa.QuestionId AND c.UserId = qa.QuestionOwnerUserId) AS OwnerCommentsOnOwnQuestion,
+    COALESCE(tp.TagCount, 0) AS PrimaryTagCount,
+    COALESCE(tp.QuestionCountForTag, 0) AS QuestionsWithPrimaryTag,
+    COALESCE(tp.AnswerCountForTag, 0) AS AnswersForPrimaryTag,
+    ph.PostHistoryTypeId,
+    ph.Comment AS LastPostHistoryComment,
+    CASE
+        WHEN ph.PostHistoryTypeId = 10 THEN (SELECT Name FROM CloseReasonTypes WHERE Id = CAST(ph.Comment AS INTEGER))
+        ELSE NULL
+    END AS CloseReasonName,
+    CASE
+        WHEN qa.QuestionScore > uc.Reputation * 0.1 THEN 'High Score Relative to Owner Reputation'
+        WHEN qa.AnswerCount > 10 AND qa.IsAcceptedAnswer = 0 THEN 'Many Answers, None Accepted'
+        WHEN COALESCE(uc.EditedPostBodyCount, 0) > 50 AND COALESCE(uc.EditedPostTitleCount, 0) > 10 THEN 'Prolific Editor'
+        WHEN COALESCE(tp.TagCount, 0) > 10000 AND COALESCE(tp.QuestionCountForTag, 0) < 500 THEN 'Popular Tag, Few Questions'
+        ELSE 'Standard'
+    END AS PerformanceCategory
+FROM QuestionAnswers qa
+LEFT JOIN Users uc ON qa.QuestionOwnerUserId = uc.Id
+LEFT JOIN PostHistory ph ON qa.QuestionId = ph.PostId AND ph.PostHistoryTypeId = 10
+LEFT JOIN PostLinks pl ON qa.QuestionId = pl.PostId AND pl.LinkTypeId = 3
+LEFT JOIN TagPopularity tp ON tp.TagName = (
+    SELECT SUBSTRING(Tags FROM 2 FOR POSITION('>' IN SUBSTRING(Tags FROM 2)) - 1)
+    FROM Posts
+    WHERE Id = qa.QuestionId
+)
+WHERE qa.QuestionScore > 0
+  AND qa.QuestionCreationDate >= DATE '2023-01-01'
+  AND pl.Id IS NULL
+GROUP BY
+    qa.QuestionId,
+    qa.QuestionTitle,
+    qa.QuestionCreationDate,
+    qa.QuestionScore,
+    uc.DisplayName,
+    uc.Reputation,
+    qa.AnswerCount,
+    qa.IsAcceptedAnswer,
+    qa.QuestionOwnerUserId,
+    COALESCE(tp.TagCount, 0),
+    COALESCE(tp.QuestionCountForTag, 0),
+    COALESCE(tp.AnswerCountForTag, 0),
+    ph.PostHistoryTypeId,
+    ph.Comment,
+    uc.EditedPostBodyCount,
+    uc.EditedPostTitleCount,
+    tp.TagName,
+    tp.QuestionCountForTag,
+    tp.TagCount
+ORDER BY
+    qa.QuestionScore DESC,
+    qa.AnswerCount DESC
+LIMIT 100;

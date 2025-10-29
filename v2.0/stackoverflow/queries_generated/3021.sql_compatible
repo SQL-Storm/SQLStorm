@@ -1,0 +1,144 @@
+WITH 
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, '')               AS Location,
+        COUNT(DISTINCT p.Id)                  AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL)   AS AvgPostScore,
+        COUNT(b.Id)                           AS BadgeCount,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MIN(u.CreationDate)                   AS FirstSeen,
+        MAX(u.LastAccessDate)                 AS LastSeen
+    FROM Users u
+    LEFT JOIN Posts   p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges  b ON b.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+),
+TopTags AS (
+    SELECT 
+        p.OwnerUserId                                 AS UserId,
+        t.TagName,
+        COUNT(*)                                      AS TagUseCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY COUNT(*) DESC)   AS rn
+    FROM PostHistory ph
+    JOIN Posts p          ON p.Id = ph.PostId
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(
+               substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+    ) AS taglist ON TRUE
+    JOIN Tags t           ON t.TagName = taglist.TagName
+    WHERE ph.PostHistoryTypeId = 3
+    GROUP BY p.OwnerUserId, t.TagName
+),
+UserTagSummary AS (
+    SELECT 
+        UserId,
+        STRING_AGG(TagName || ':' || TagUseCount, ', ') 
+            FILTER (WHERE rn <= 3)                     AS Top3Tags
+    FROM TopTags
+    GROUP BY UserId
+),
+RecentVotes AS (
+    SELECT 
+        v.PostId,
+        vt.Name                              AS VoteName,
+        v.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId 
+                           ORDER BY v.CreationDate DESC) AS rn
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+),
+PostScoreDelta AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY p.CreationDate)            AS PrevScore,
+        p.Score - COALESCE(LAG(p.Score) OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY p.CreationDate), 0)        AS ScoreDelta,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY p.CreationDate DESC)   AS rn
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+RecentCommentCounts AS (
+    SELECT 
+        c.UserId,
+        COUNT(*) AS CommentCnt90d
+    FROM Comments c
+    WHERE c.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90 days'
+    GROUP BY c.UserId
+)
+
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.TotalPosts,
+    us.QuestionCount,
+    us.AnswerCount,
+    ROUND(CAST(us.AvgPostScore AS numeric), 2)             AS AvgScore,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    COALESCE(uts.Top3Tags, '')                     AS TopTags,
+    COALESCE(rv_summary.VoteSummary, 'No recent votes') AS RecentVoteInfo,
+    COALESCE(psd.ScoreDelta, 0)                    AS LatestScoreDelta,
+    CASE 
+        WHEN us.Reputation > 20000 THEN 'Elite'
+        WHEN us.Reputation BETWEEN 10000 AND 20000 THEN 'Pro'
+        WHEN us.Reputation BETWEEN 5000  AND 9999  THEN 'Experienced'
+        ELSE 'Novice'
+    END                                            AS ReputationTier,
+    CASE 
+        WHEN us.Location = '' THEN 'Unknown'
+        ELSE us.Location
+    END                                            AS UserLocation,
+    COALESCE(rcc.CommentCnt90d, 0)                 AS RecentCommentCount
+FROM UserStats us
+LEFT JOIN UserTagSummary uts      ON uts.UserId = us.Id
+LEFT JOIN (
+    SELECT 
+        rv.PostId,
+        STRING_AGG(
+            CASE 
+                WHEN rv.VoteName = 'UpMod'   THEN '👍'
+                WHEN rv.VoteName = 'DownMod' THEN '👎'
+                ELSE rv.VoteName
+            END, '; '
+        ) AS VoteSummary
+    FROM RecentVotes rv
+    WHERE rv.rn = 1
+    GROUP BY rv.PostId
+) rv_summary ON rv_summary.PostId = (
+    SELECT p.Id
+    FROM Posts p
+    WHERE p.OwnerUserId = us.Id
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+)
+LEFT JOIN PostScoreDelta psd ON psd.Id = (
+    SELECT p2.Id
+    FROM Posts p2
+    WHERE p2.OwnerUserId = us.Id
+    ORDER BY p2.CreationDate DESC
+    LIMIT 1
+) AND psd.rn = 1
+LEFT JOIN RecentCommentCounts rcc ON rcc.UserId = us.Id
+WHERE us.Reputation IS NOT NULL
+ORDER BY us.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+FROM generate_series(1,5) g;

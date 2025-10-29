@@ -1,0 +1,102 @@
+WITH RecursiveUserBadges AS (
+    SELECT u.Id AS UserId, u.DisplayName, b.Name AS BadgeName, b.Class AS BadgeClass, b.Date AS BadgeDate,
+        row_number() OVER (PARTITION BY u.Id ORDER BY b.Date DESC) AS rn
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE (b.TagBased = false) OR (b.TagBased IS NULL)
+), LatestBadges AS (
+    SELECT UserId, DisplayName, BadgeName, BadgeClass, BadgeDate
+    FROM RecursiveUserBadges
+    WHERE rn <= 3
+), QuestionAnswerStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        sum(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        sum(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        avg(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score ELSE NULL END) AS AvgPostScore,
+        count(DISTINCT p.AcceptedAnswerId) FILTER (WHERE p.AcceptedAnswerId IS NOT NULL) AS AcceptedAnswersCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY p.OwnerUserId
+), UserVoteImpact AS (
+    SELECT 
+        v.UserId,
+        sum(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotesCount,
+        sum(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotesCount,
+        sum(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS FavoriteVotesCount
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+), PostLinkDuplicates AS (
+    SELECT pl.PostId, count(DISTINCT pl.RelatedPostId) AS DuplicateCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+), HighlyLinkedQuestions AS (
+    SELECT p.Id, p.Title, p.Tags, pl.DuplicateCount,
+        row_number() OVER (ORDER BY pl.DuplicateCount DESC) AS dup_rank
+    FROM Posts p
+    LEFT JOIN PostLinkDuplicates pl ON pl.PostId = p.Id
+    WHERE p.PostTypeId = 1
+), TagUsageStats AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) AS TotalAnswersToTaggedQuestions,
+        coalesce(b.BadgedUsersCount, 0) AS UsersWithBadgeCount
+    FROM Tags t
+    LEFT JOIN (
+        SELECT regexp_replace(p.Tags, '^.*?<([^>]+)>.*$', '\1') AS TagName, sum(p.AnswerCount) AS AnswerCount
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+        GROUP BY regexp_replace(p.Tags, '^.*?<([^>]+)>.*$', '\1')
+    ) p ON p.TagName = t.TagName
+    LEFT JOIN (
+        SELECT b.Name, count(DISTINCT b.UserId) AS BadgedUsersCount
+        FROM Badges b
+        WHERE b.TagBased = true
+        GROUP BY b.Name
+    ) b ON b.Name = t.TagName
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    to_char(u.CreationDate, 'YYYY-MM-DD') AS JoinedDate,
+    coalesce(qas.QuestionsCount, 0) AS TotalQuestions,
+    coalesce(qas.AnswersCount, 0) AS TotalAnswers,
+    round(coalesce(qas.AvgPostScore, 0),2) AS AvgPostScore,
+    coalesce(qas.AcceptedAnswersCount, 0) AS AcceptedAnswers,
+    coalesce(uv.UpVotesCount, 0) AS UpVotesCast,
+    coalesce(uv.DownVotesCount, 0) AS DownVotesCast,
+    coalesce(uv.FavoriteVotesCount, 0) AS FavoriteVotesCast,
+    array_to_string(array_agg(DISTINCT lb.BadgeName) , ', ') AS RecentBadges,
+    hlq.Title AS MostDuplicatedQuestionTitle,
+    hlq.DuplicateCount AS QuestionDuplicateLinks,
+    string_agg(DISTINCT (tus.TagName || ' (Count:' || tus.Count || ', Answers:' || tus.TotalAnswersToTaggedQuestions || ', BadgeUsers:' || tus.UsersWithBadgeCount || ')'), '; ' ORDER BY MAX(tus.Count) DESC) AS TagStatsSummary
+FROM Users u
+LEFT JOIN QuestionAnswerStats qas ON qas.UserId = u.Id
+LEFT JOIN UserVoteImpact uv ON uv.UserId = u.Id
+LEFT JOIN LatestBadges lb ON lb.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT hlq.Title, hlq.DuplicateCount
+    FROM HighlyLinkedQuestions hlq
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.Id = hlq.Id
+    ORDER BY hlq.DuplicateCount DESC
+    LIMIT 1
+) hlq ON true
+LEFT JOIN LATERAL (
+    SELECT tus.TagName, tus.Count, tus.TotalAnswersToTaggedQuestions, tus.UsersWithBadgeCount
+    FROM TagUsageStats tus
+    ORDER BY tus.Count DESC
+    LIMIT 5
+) tus ON true
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate,
+    qas.QuestionsCount, qas.AnswersCount, qas.AvgPostScore, qas.AcceptedAnswersCount,
+    uv.UpVotesCount, uv.DownVotesCount, uv.FavoriteVotesCount,
+    hlq.Title, hlq.DuplicateCount
+ORDER BY u.Reputation DESC
+LIMIT 50;

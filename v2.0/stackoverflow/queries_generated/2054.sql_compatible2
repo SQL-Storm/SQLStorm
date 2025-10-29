@@ -1,0 +1,186 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS AncestorPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+
+    UNION ALL
+
+    SELECT
+        c.Id,
+        c.TagName,
+        c.Count,
+        p.Level + 1,
+        p.AncestorPath || c.TagName
+    FROM Tags c
+    JOIN RecursiveTagHierarchy p ON p.TagName <> c.TagName
+    WHERE array_length(p.AncestorPath, 1) < 3
+      AND NOT c.TagName = ANY(p.AncestorPath)
+      AND c.IsModeratorOnly = false
+      AND c.IsRequired = false
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserAggregateStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(AVG(p.ViewCount), 0) AS AvgPostViews,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COALESCE(MAX(voteUp.CountUpVotes), 0) AS MaxUpVotesOnPost,
+        COALESCE(MIN(voteDown.CountDownVotes), 0) AS MinDownVotesOnPost
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS CountUpVotes
+        FROM Votes v
+        WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+    ) voteUp ON true
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS CountDownVotes
+        FROM Votes v2
+        WHERE v2.PostId = p.Id AND v2.VoteTypeId = 3
+    ) voteDown ON true
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+QuestionAnswerRanks AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        a.Id AS AnswerId,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        row_number() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+CloseReasonsWithCount AS (
+    SELECT
+        crt.Id,
+        crt.Name,
+        COUNT(ph.Id) AS CloseCount
+    FROM CloseReasonTypes crt
+    LEFT JOIN PostHistory ph ON ph.PostHistoryTypeId = 10 AND ph.Comment = CAST(crt.Id AS varchar)
+    GROUP BY crt.Id, crt.Name
+),
+PopularTags AS (
+    SELECT
+       t.Id,
+       t.TagName,
+       t.Count,
+       p.Title AS ExcerptTitle,
+       p.Body AS ExcerptBody
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    WHERE t.Count > 50000
+),
+UserActivityWindow AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.CreationDate,
+        lag(p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS PrevPostDate,
+        lead(p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS NextPostDate,
+        p.PostTypeId,
+        (EXTRACT(EPOCH FROM (p.CreationDate - lag(p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate))) / 3600.0) AS HoursSincePrev,
+        (EXTRACT(EPOCH FROM (lead(p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) - p.CreationDate)) / 3600.0) AS HoursToNext
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+),
+HighActivityUsers AS (
+    SELECT DISTINCT
+        u.Id,
+        u.DisplayName,
+        COUNT(p.Id) AS PostsLast30Days
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(p.Id) > 100
+)
+SELECT DISTINCT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    ubc.Class AS BadgeClass,
+    ubc.BadgeCount,
+    q.Title AS PopularQuestionTitle,
+    q.QuestionCreationDate,
+    a.AnswerId,
+    a.AnswerScore,
+    close.Name AS FrequentCloseReason,
+    close.CloseCount,
+    pt.TagName AS PopularTag,
+    pt.Count AS TagUsageCount,
+    ua.HoursSincePrev,
+    ua.HoursToNext,
+    CASE 
+        WHEN u.Reputation > 10000 AND ubc.BadgeCount > 5 THEN 'HighRepActive'
+        WHEN ua.HoursSincePrev IS NOT NULL AND ua.HoursSincePrev < 1 THEN 'VeryActiveRecently'
+        ELSE 'NormalUser'
+    END AS UserActivityClassification,
+    COALESCE(
+        (
+            SELECT string_agg(DISTINCT tag, ', ' ORDER BY tag)
+            FROM unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS tag
+        ), ''
+    ) AS ParsedTags,
+    COALESCE(
+        (
+            SELECT COUNT(*) 
+            FROM PostLinks pl 
+            WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+        ), 0
+    ) AS DuplicateLinksCount
+FROM Users u
+LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = u.Id AND ubc.Class = 1
+LEFT JOIN QuestionAnswerRanks a ON a.AnswerRank = 1 AND a.AnswerScore >= 10 AND a.QuestionCreationDate > (CAST('2024-10-01' AS date) - INTERVAL '365 days')
+LEFT JOIN Posts q ON q.Id = a.QuestionId
+LEFT JOIN CloseReasonsWithCount close ON close.CloseCount > 1000
+LEFT JOIN PopularTags pt ON pt.TagName = ANY(string_to_array(COALESCE(q.Tags, ''), '><'))
+LEFT JOIN UserActivityWindow ua ON ua.Id = u.Id
+LEFT JOIN HighActivityUsers h ON h.Id = u.Id
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+WHERE u.Reputation > 1000
+  AND (h.PostsLast30Days IS NOT NULL OR ubc.BadgeCount IS NOT NULL)
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    ubc.Class,
+    ubc.BadgeCount,
+    q.Title,
+    q.QuestionCreationDate,
+    a.AnswerId,
+    a.AnswerScore,
+    close.Name,
+    close.CloseCount,
+    pt.TagName,
+    pt.Count,
+    ua.HoursSincePrev,
+    ua.HoursToNext,
+    UserActivityClassification,
+    ParsedTags,
+    DuplicateLinksCount
+ORDER BY u.Reputation DESC, ubc.BadgeCount DESC, a.AnswerScore DESC
+LIMIT 50;

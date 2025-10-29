@@ -1,0 +1,121 @@
+-- {"query": "3932.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2594} 
+WITH UserPostStats AS (
+    SELECT 
+        p.OwnerUserId               AS UserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1)          AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2)          AS AnswerCount,
+        COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 1),0) AS QuestionScoreSum,
+        COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 2),0) AS AnswerScoreSum,
+        MAX(p.CreationDate)                             AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                                 AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 3 WHEN b.Class = 2 THEN 2 ELSE 1 END) AS BadgeWeight,
+        STRING_AGG(DISTINCT b.Name, ',') FILTER (WHERE b.TagBased = 0) AS NamedBadges,
+        STRING_AGG(DISTINCT b.Name, ',') FILTER (WHERE b.TagBased = 1) AS TagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVoteStats AS (
+    SELECT 
+        v.UserId,
+        COUNT(*) FILTER (WHERE vt.Id = 2) AS UpVoteGiven,
+        COUNT(*) FILTER (WHERE vt.Id = 3) AS DownVoteGiven,
+        COUNT(*) FILTER (WHERE vt.Id = 5) AS FavoritesGiven
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.UserId
+),
+UserRecentActivity AS (
+    SELECT 
+        u.Id,
+        (SELECT COUNT(*) FROM Posts p 
+         WHERE p.OwnerUserId = u.Id 
+           AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days') AS RecentPosts30d,
+        (SELECT COUNT(*) FROM Comments c 
+         WHERE c.UserId = u.Id 
+           AND c.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days') AS RecentComments30d
+    FROM Users u
+)
+SELECT
+    u.Id                                                AS UserId,
+    COALESCE(u.DisplayName, 'Anonymous')                AS DisplayName,
+    u.Reputation,
+    ps.QuestionCount,
+    ps.AnswerCount,
+    ps.QuestionScoreSum,
+    ps.AnswerScoreSum,
+    bs.BadgeCount,
+    bs.BadgeWeight,
+    vs.UpVoteGiven,
+    vs.DownVoteGiven,
+    vs.FavoritesGiven,
+    ra.RecentPosts30d,
+    ra.RecentComments30d,
+    /* Composite activity score */
+    (ps.QuestionScoreSum * 1.5
+     + ps.AnswerScoreSum * 2
+     + bs.BadgeWeight * 10
+     + COALESCE(vs.UpVoteGiven,0) * 0.5
+     - COALESCE(vs.DownVoteGiven,0) * 1
+     + COALESCE(ra.RecentPosts30d,0) * 3
+     + COALESCE(ra.RecentComments30d,0) * 1)           AS CompositeScore,
+    /* Rank inside reputation percentile bucket */
+    RANK() OVER (
+        PARTITION BY NTILE(5) OVER (ORDER BY u.Reputation)
+        ORDER BY (ps.QuestionScoreSum * 1.5 + ps.AnswerScoreSum * 2) DESC
+    )                                                  AS ReputationBucketRank,
+    COALESCE(ps.LastPostDate, u.LastAccessDate)         AS LastActiveDate,
+    /* Top three tag‑based badges, if any */
+    CASE
+        WHEN bs.TagBadges IS NULL THEN NULL
+        ELSE (
+            SELECT string_agg(t, ',')
+            FROM (
+                SELECT unnest(string_to_array(bs.TagBadges, ',')) AS t
+                LIMIT 3
+            ) sub
+        )
+    END                                                AS TopTagBadges
+FROM Users u
+LEFT JOIN UserPostStats      ps ON ps.UserId = u.Id
+LEFT JOIN UserBadgeStats     bs ON bs.UserId = u.Id
+LEFT JOIN UserVoteStats      vs ON vs.UserId = u.Id
+LEFT JOIN UserRecentActivity ra ON ra.Id    = u.Id
+WHERE u.Reputation > 1000
+  AND (ps.QuestionCount IS NOT NULL OR bs.BadgeCount IS NOT NULL)
+ORDER BY CompositeScore DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL                                            AS UserId,
+    'Aggregated Totals'                             AS DisplayName,
+    SUM(u.Reputation)                               AS Reputation,
+    SUM(ps.QuestionCount)                           AS QuestionCount,
+    SUM(ps.AnswerCount)                             AS AnswerCount,
+    SUM(ps.QuestionScoreSum)                        AS QuestionScoreSum,
+    SUM(ps.AnswerScoreSum)                          AS AnswerScoreSum,
+    SUM(bs.BadgeCount)                              AS BadgeCount,
+    SUM(bs.BadgeWeight)                             AS BadgeWeight,
+    SUM(vs.UpVoteGiven)                             AS UpVoteGiven,
+    SUM(vs.DownVoteGiven)                           AS DownVoteGiven,
+    SUM(vs.FavoritesGiven)                          AS FavoritesGiven,
+    SUM(ra.RecentPosts30d)                          AS RecentPosts30d,
+    SUM(ra.RecentComments30d)                       AS RecentComments30d,
+    NULL                                            AS CompositeScore,
+    NULL                                            AS ReputationBucketRank,
+    NULL                                            AS LastActiveDate,
+    NULL                                            AS TopTagBadges
+FROM Users u
+LEFT JOIN UserPostStats      ps ON ps.UserId = u.Id
+LEFT JOIN UserBadgeStats     bs ON bs.UserId = u.Id
+LEFT JOIN UserVoteStats      vs ON vs.UserId = u.Id
+LEFT JOIN UserRecentActivity ra ON ra.Id    = u.Id
+WHERE u.Reputation > 1000;

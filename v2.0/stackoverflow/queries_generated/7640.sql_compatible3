@@ -1,0 +1,251 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(DISTINCT CASE WHEN p.Tags IS NOT NULL THEN SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)) END, ', ') AS AllTags,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question without Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeDescription,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        CAST(EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, p.LastActivityDate, TIMESTAMP '2024-10-01 12:34:56') - p.CreationDate)) / 86400 AS INTEGER) AS AgeInDays,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 50 THEN 'Well Voted'
+            WHEN p.Score > 0 THEN 'Positive'
+            WHEN p.Score < 0 THEN 'Negative'
+            ELSE 'Neutral'
+        END AS ScoreCategory,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        NTH_VALUE(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS OverallBestScore,
+        NTILE(4) OVER (ORDER BY p.Score DESC) AS ScoreQuartile,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS ScoreRankWithinUser
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+DetailedBadges AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date AS BadgeDate,
+        b.Class,
+        CASE 
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver'
+            WHEN b.Class = 3 THEN 'Bronze'
+            ELSE 'Unknown'
+        END AS BadgeClass,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Class) AS ClassBadgesCount
+    FROM Badges b
+    WHERE b.TagBased = 0
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.AvgPostScore,
+        us.LastPostDate,
+        us.ReputationRank,
+        us.PostActivityRank,
+        COALESCE(ROUND(CAST(us.AvgPostScore AS numeric), 2), 0) AS RoundedAvgScore,
+        CASE 
+            WHEN us.PostCount > 100 THEN 'Veteran Poster'
+            WHEN us.PostCount > 50 THEN 'Experienced Poster'
+            WHEN us.PostCount > 10 THEN 'Regular Poster'
+            ELSE 'Occasional Poster'
+        END AS PosterActivityLevel,
+        COALESCE(ROUND((CAST(us.CommentCount AS DOUBLE PRECISION) / NULLIF(us.PostCount, 0)) * 100, 2), 0) AS CommentToPostRatio,
+        ARRAY_AGG(DISTINCT CASE WHEN p.Tags IS NOT NULL THEN SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)) END) AS TagArray,
+        CASE 
+            WHEN CHAR_LENGTH(us.AllTags) > 300 THEN (SUBSTRING(us.AllTags FROM 1 FOR 300) || '...')
+            ELSE us.AllTags
+        END AS TrimmedTags
+    FROM UserStats us
+    LEFT JOIN Posts p ON us.UserId = p.OwnerUserId AND p.Tags IS NOT NULL
+    GROUP BY 
+        us.UserId, 
+        us.DisplayName, 
+        us.Reputation, 
+        us.PostCount, 
+        us.CommentCount, 
+        us.BadgeCount, 
+        us.AvgPostScore, 
+        us.LastPostDate, 
+        us.ReputationRank, 
+        us.PostActivityRank,
+        us.AllTags
+),
+TagUsageAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE 
+            WHEN t.Count >= 1000 THEN 'Very Popular'
+            WHEN t.Count >= 100 THEN 'Popular'
+            WHEN t.Count >= 10 THEN 'Moderately Popular'
+            ELSE 'Less Popular'
+        END AS PopularityLevel,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS PopularityRank,
+        RANK() OVER (ORDER BY t.Count DESC) AS CountRank,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) AS PreviousTagCount,
+        t.Count - LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) AS CountDifferenceFromPrevious
+    FROM Tags t
+    WHERE t.Count > 50
+)
+SELECT 
+    cua.UserId,
+    cua.DisplayName,
+    cua.Reputation,
+    cua.PostCount,
+    cua.CommentCount,
+    cua.BadgeCount,
+    cua.AvgPostScore,
+    cua.RoundedAvgScore,
+    cua.PosterActivityLevel,
+    cua.CommentToPostRatio,
+    cua.TrimmedTags,
+    COALESCE(SUM(pa.Score), 0) AS TotalPostScore,
+    COALESCE(MAX(pa.Score), 0) AS HighestPostScore,
+    COALESCE(MIN(pa.Score), 0) AS LowestPostScore,
+    COUNT(pa.PostId) AS PostsWithScore,
+    COALESCE(AVG(CAST(pa.AgeInDays AS DOUBLE PRECISION)), 0) AS AvgPostAge,
+    STRING_AGG(DISTINCT pa.PostTypeDescription, ', ') AS PostTypesUsed,
+    COUNT(DISTINCT CASE WHEN pa.PostTypeId = 1 THEN pa.PostId END) AS QuestionCount,
+    COUNT(DISTINCT CASE WHEN pa.PostTypeId = 2 THEN pa.PostId END) AS AnswerCount,
+    STRING_AGG(DISTINCT CASE WHEN pa.Score > 0 THEN pa.Title END, ' | ') AS PositiveScoreTitles,
+    STRING_AGG(DISTINCT CASE WHEN pa.Score < 0 THEN pa.Title END, ' | ') AS NegativeScoreTitles,
+    STRING_AGG(DISTINCT db.BadgeName, ', ') AS BadgeNames,
+    COUNT(DISTINCT db.BadgeName) AS DistinctBadgeCount,
+    STRING_AGG(DISTINCT CASE 
+        WHEN db.Class = 1 THEN (db.BadgeName || ' (Gold)')
+        WHEN db.Class = 2 THEN (db.BadgeName || ' (Silver)')
+        WHEN db.Class = 3 THEN (db.BadgeName || ' (Bronze)')
+    END, ', ') AS ClassifiedBadges,
+    STRING_AGG(DISTINCT tua.TagName, ', ') AS PopularTags,
+    COUNT(DISTINCT tua.Id) AS TagCount,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN pa.Score > 0 THEN pa.PostId END) > 0 
+        THEN 'Active Poster'
+        WHEN COUNT(DISTINCT CASE WHEN pa.Score < 0 THEN pa.PostId END) > 0 
+        THEN 'Questionable Poster'
+        ELSE 'Passive Poster'
+    END AS PosterStatus,
+    CASE 
+        WHEN COALESCE(SUM(pa.Score), 0) > 1000 THEN 'Highly Engaged'
+        WHEN COALESCE(SUM(pa.Score), 0) > 500 THEN 'Moderately Engaged'
+        WHEN COALESCE(SUM(pa.Score), 0) > 0 THEN 'Slightly Engaged'
+        ELSE 'Unengaged'
+    END AS EngagementLevel,
+    STRING_AGG(CASE WHEN pa.Score > 0 THEN (pa.Title || ' (' || CAST(pa.Score AS text) || ')') ELSE NULL END, ' | ' ORDER BY pa.Score DESC) AS HighScoringPosts,
+    COALESCE(ROUND(COUNT(pa.PostId) * 100.0 / NULLIF(SUM(COUNT(pa.PostId)) OVER (), 0), 2), 0) AS PostPercentageOfAllPosts,
+    LAG(COALESCE(SUM(pa.Score), 0), 1) OVER (ORDER BY cua.Reputation DESC) AS PreviousUserScoreTotal,
+    COALESCE(SUM(pa.Score), 0) - LAG(COALESCE(SUM(pa.Score), 0), 1) OVER (ORDER BY cua.Reputation DESC) AS ScoreChangeFromPrevious,
+    ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(pa.Score), 0) DESC) AS ScoreRank,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = cua.UserId AND p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL) 
+        THEN 'Has Accepted Answers'
+        ELSE 'No Accepted Answers'
+    END AS HasAcceptedAnswers,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Votes v INNER JOIN Posts p ON v.PostId = p.Id WHERE p.OwnerUserId = cua.UserId AND v.VoteTypeId = 2) 
+        THEN 'Has Upvotes'
+        ELSE 'No Upvotes'
+    END AS HasUpvotes,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = cua.UserId AND p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 30) 
+        THEN 'Has Long Tags'
+        ELSE 'No Long Tags'
+    END AS HasLongTags,
+    COUNT(DISTINCT CASE WHEN pa.Score > 100 THEN pa.PostId END) AS SuperHighScorePosts,
+    ROUND(COUNT(DISTINCT CASE WHEN pa.Score > 100 THEN pa.PostId END) * 100.0 / NULLIF(COUNT(pa.PostId), 0), 2) AS HighScorePostPercentage,
+    STRING_AGG(DISTINCT CASE 
+        WHEN pa.Score >= 0 AND pa.Score < 5 THEN 'Low Scoring' 
+        WHEN pa.Score >= 5 AND pa.Score < 20 THEN 'Medium Scoring'
+        WHEN pa.Score >= 20 THEN 'High Scoring'
+        ELSE 'Neutral Scoring'
+    END, ', ') AS ScoreLevelDistribution
+FROM ComplexUserAnalysis cua
+LEFT JOIN PostAnalysis pa ON cua.UserId = pa.OwnerUserId
+LEFT JOIN DetailedBadges db ON cua.UserId = db.UserId
+LEFT JOIN TagUsageAnalysis tua ON EXISTS (
+    SELECT 1 FROM Posts p 
+    WHERE p.OwnerUserId = cua.UserId 
+      AND p.Tags IS NOT NULL 
+      AND (
+        SELECT COUNT(*) 
+        FROM (SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), '><')) AS tag) AS t2
+        WHERE t2.tag = tua.TagName
+      ) > 0
+)
+WHERE cua.PostCount > 0
+GROUP BY 
+    cua.UserId, 
+    cua.DisplayName, 
+    cua.Reputation, 
+    cua.PostCount, 
+    cua.CommentCount, 
+    cua.BadgeCount, 
+    cua.AvgPostScore, 
+    cua.RoundedAvgScore, 
+    cua.PosterActivityLevel, 
+    cua.CommentToPostRatio, 
+    cua.TrimmedTags,
+    cua.ReputationRank
+HAVING 
+    COUNT(pa.PostId) > 0
+    AND (
+        COUNT(pa.PostId) >= 5 
+        OR EXISTS (SELECT 1 FROM DetailedBadges WHERE UserId = cua.UserId)
+        OR EXISTS (
+            SELECT 1
+            FROM TagUsageAnalysis
+            WHERE TagName IN (
+                SELECT trg FROM UNNEST(STRING_TO_ARRAY(cua.TrimmedTags, ',')) AS trg
+                WHERE CHAR_LENGTH(trg) > 3
+            )
+        )
+    )
+ORDER BY COALESCE(SUM(pa.Score), 0) DESC, cua.Reputation DESC, cua.PostCount DESC
+LIMIT 100;

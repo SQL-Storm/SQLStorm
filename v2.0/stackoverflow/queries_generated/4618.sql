@@ -1,0 +1,138 @@
+-- {"query": "4618.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1695} 
+
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        MAX(p.CreationDate) AS LastPostCreationDate,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 5 THEN 1 ELSE 0 END) AS TagWikiCount,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadgeCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND p.Id = ph.PostId
+    LEFT JOIN Comments c ON u.Id = c.UserId AND p.Id = c.PostId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND p.Id = v.PostId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0 -- Exclude system users if any
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN DATEDIFF(day, p.CreationDate, p.ClosedDate) ELSE NULL END AS DaysToClose,
+        COUNT(DISTINCT c.Id) AS CommenterCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVoteCount,
+        STRING_AGG(DISTINCT tag.TagName, ', ') AS Tags,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as PostSequence
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN (
+        SELECT PostId,
+               REPLACE(REPLACE(REPLACE(value, '<', ''), '>', ''), '/', '') AS TagName
+        FROM Posts,
+             unnest(string_to_array(substring(Tags, 2, length(Tags)-2), '><')) AS value
+    ) AS tag ON p.Id = tag.PostId
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+    GROUP BY p.Id, p.Title, p.PostTypeId, pt.Name, p.OwnerUserId, u.DisplayName, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate
+),
+UserRank AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.PostHistoryCount,
+        ua.CommentCount,
+        ua.VoteCount,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.TagWikiCount,
+        ua.AvgPostScore,
+        ua.GoldBadgeCount,
+        ua.SilverBadgeCount,
+        ua.BronzeBadgeCount,
+        CASE WHEN ua.Reputation > 50000 THEN 'Expert'
+             WHEN ua.Reputation > 10000 THEN 'Experienced'
+             WHEN ua.Reputation > 1000 THEN 'Intermediate'
+             ELSE 'Beginner'
+        END AS ReputationLevel,
+        ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC, ua.PostHistoryCount DESC) AS UserRankNum
+    FROM UserActivity ua
+)
+SELECT
+    ur.UserId,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.ReputationLevel,
+    ur.UserRankNum,
+    ua.PostHistoryCount,
+    ua.CommentCount,
+    ua.VoteCount,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TagWikiCount,
+    ua.AvgPostScore,
+    ua.GoldBadgeCount,
+    ua.SilverBadgeCount,
+    ua.BronzeBadgeCount,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = ur.UserId AND PostTypeId = 1) AS TotalQuestionsOwned,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = ur.UserId AND PostTypeId = 2) AS TotalAnswersOwned,
+    pe.PostId,
+    pe.Title,
+    pe.PostTypeName,
+    pe.CreationDate AS PostCreationDate,
+    pe.Score AS PostScore,
+    pe.ViewCount AS PostViewCount,
+    pe.AnswerCount AS PostAnswerCount,
+    pe.CommentCount AS PostCommentCount,
+    pe.FavoriteCount AS PostFavoriteCount,
+    pe.ClosedDate AS PostClosedDate,
+    pe.DaysToClose,
+    pe.CommenterCount,
+    pe.UpVoteCount,
+    pe.DownVoteCount,
+    pe.FavoriteVoteCount,
+    pe.Tags,
+    COALESCE(pe.PostTypeName, 'Unknown') AS ProcessedPostTypeName,
+    NULLIF(pe.Score, 0) AS NonZeroScore,
+    CASE
+        WHEN pe.PostTypeName = 'Question' AND pe.ClosedDate IS NULL THEN 'Open Question'
+        WHEN pe.PostTypeName = 'Question' AND pe.ClosedDate IS NOT NULL THEN 'Closed Question'
+        WHEN pe.PostTypeName = 'Answer' THEN 'Answer'
+        ELSE 'Other'
+    END AS QuestionStatus,
+    IIF(pe.PostTypeName = 'Question',
+        (SELECT COUNT(*) FROM PostLinks WHERE PostId = pe.PostId AND LinkTypeId = 3),
+        0) AS DuplicateLinkCount
+FROM UserRank ur
+JOIN UserActivity ua ON ur.UserId = ua.UserId
+LEFT JOIN PostEngagement pe ON ur.UserId = pe.OwnerUserId
+WHERE ur.UserRankNum <= 100 -- Top 100 users by rank
+  AND pe.PostSequence <= 5 -- Latest 5 posts for each of these users
+  AND (pe.Score > 10 OR pe.CommentCount > 5 OR pe.FavoriteCount > 0) -- Filter for engaging posts
+ORDER BY ur.UserRankNum, pe.PostSequence;

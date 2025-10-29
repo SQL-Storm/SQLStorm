@@ -1,0 +1,277 @@
+WITH RECURSIVE RecursiveUserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Class AS BadgeClass,
+        COUNT(b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, b.Class
+
+    UNION ALL
+
+    SELECT
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        COALESCE(r.BadgeClass, 3) AS BadgeClass,
+        CAST(r.BadgeCount AS INTEGER) AS BadgeCount
+    FROM RecursiveUserBadgeCounts r
+    WHERE r.BadgeClass IS NULL
+),
+FilteredPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        regexp_split_to_table(COALESCE(p.Tags, ''), '<([^>]+)>') AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.Score >= 0
+      AND p.ViewCount > 10
+),
+AnswerRanks AS (
+    SELECT
+        f.PostTypeId,
+        f.Id AS PostId,
+        f.OwnerUserId,
+        f.ParentId,
+        f.CreationDate,
+        f.Score,
+        f.ViewCount,
+        f.Tag,
+        row_number() OVER (PARTITION BY f.ParentId ORDER BY f.Score DESC, f.CreationDate ASC) AS AnswerRank
+    FROM FilteredPosts f
+    WHERE f.PostTypeId = 2
+),
+TopAnswersWithParent AS (
+    SELECT
+        a.PostId,
+        a.OwnerUserId AS AnswerOwnerId,
+        a.ParentId AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerId,
+        a.Score AS AnswerScore,
+        q.Score AS QuestionScore,
+        a.CreationDate AS AnswerCreation,
+        q.CreationDate AS QuestionCreation,
+        a.ViewCount AS AnswerViewCount,
+        q.ViewCount AS QuestionViewCount,
+        a.Tag AS CommonTag
+    FROM AnswerRanks a
+    JOIN FilteredPosts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    WHERE a.AnswerRank <= 3
+),
+UserReputationChanges AS (
+    SELECT
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        row_number() OVER (PARTITION BY ph.UserId ORDER BY ph.CreationDate DESC) AS rn,
+        max(ph.CreationDate) OVER (PARTITION BY ph.UserId) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+),
+UserBadgesAggregated AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+UserBadgesRanked AS (
+    SELECT
+        uba.UserId,
+        uba.DisplayName,
+        uba.GoldBadges,
+        uba.SilverBadges,
+        uba.BronzeBadges,
+        rank() OVER (ORDER BY uba.GoldBadges DESC, uba.SilverBadges DESC, uba.BronzeBadges DESC, uba.DisplayName ASC) AS BadgeRank
+    FROM UserBadgesAggregated uba
+),
+TaggedQuestionsWithDuplicates AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        COALESCE(link.DuplicateCount, 0) AS DuplicateCount,
+        q.Tags,
+        string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags) - 2), '><') AS TagArray
+    FROM Posts q
+    LEFT JOIN (
+        SELECT
+            pl.PostId,
+            count(*) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount
+        FROM PostLinks pl
+        JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+        GROUP BY pl.PostId
+    ) link ON link.PostId = q.Id
+    WHERE q.PostTypeId = 1
+      AND q.Score > 0
+      AND COALESCE(link.DuplicateCount, 0) > 0
+),
+DistinctUsersQuestionsAnswers AS (
+    SELECT DISTINCT
+        u.Id AS UserId,
+        u.DisplayName,
+        pq.QuestionId,
+        pq.Title,
+        pq.QuestionScore,
+        pq.DuplicateCount,
+        pq.TagArray,
+        t.BadgeRank
+    FROM Users u
+    JOIN TaggedQuestionsWithDuplicates pq ON pq.OwnerUserId = u.Id
+    JOIN UserBadgesRanked t ON t.UserId = u.Id
+),
+EnrichedPostsWithVotes AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COALESCE(v.UpVotes,0) AS UpVotes,
+        COALESCE(v.DownVotes,0) AS DownVotes,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed
+    FROM Posts p
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.PostId
+    ) v ON v.PostId = p.Id
+)
+SELECT 
+    euq.UserId,
+    euq.DisplayName,
+    euq.Title,
+    euq.QuestionScore,
+    euq.DuplicateCount,
+    euq.BadgeRank,
+    ep.PostId,
+    ep.PostTypeId,
+    ep.Score AS AnswerScore,
+    ep.UpVotes,
+    ep.DownVotes,
+    ep.ViewCount,
+    ep.HasAcceptedAnswer,
+    ep.IsClosed,
+    ts.TagArray[1] AS FocusTag,
+    phc.PostHistoryTypeId,
+    phc.CreationDate AS LastEditDate,
+    CASE WHEN ep.Score > 10 AND ep.UpVotes > 50 THEN 'HighImpact' ELSE 'Normal' END AS PostImpact,
+    concat(
+        euq.Title, ' [tags: ',
+        array_to_string(array(
+            SELECT DISTINCT t FROM unnest(euq.TagArray) AS t ORDER BY t
+        ), ', '), ']'
+    ) AS TitleWithTags,
+    rank() OVER (PARTITION BY euq.UserId ORDER BY ep.Score DESC) AS AnswerRankPerUser
+FROM DistinctUsersQuestionsAnswers euq
+JOIN EnrichedPostsWithVotes ep ON ep.OwnerUserId = euq.UserId AND ep.PostTypeId = 2
+LEFT JOIN TaggedQuestionsWithDuplicates ts ON ts.QuestionId = ep.PostId
+LEFT JOIN LATERAL (
+    SELECT ph.PostHistoryTypeId, ph.CreationDate
+    FROM PostHistory ph
+    WHERE ph.UserId = euq.UserId
+      AND ph.PostId = ep.PostId
+    ORDER BY ph.CreationDate DESC
+    LIMIT 1
+) phc ON TRUE
+WHERE ep.Score > 5
+  AND (ep.IsClosed = 0 OR ep.IsClosed IS NULL)
+
+UNION
+
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    p.Title,
+    p.Score AS QuestionScore,
+    0 AS DuplicateCount,
+    9999 AS BadgeRank,
+    CAST(NULL AS BIGINT) AS PostId,
+    CAST(NULL AS INTEGER) AS PostTypeId,
+    CAST(NULL AS INTEGER) AS AnswerScore,
+    CAST(NULL AS INTEGER) AS UpVotes,
+    CAST(NULL AS INTEGER) AS DownVotes,
+    CAST(NULL AS INTEGER) AS ViewCount,
+    CAST(NULL AS INTEGER) AS HasAcceptedAnswer,
+    CAST(NULL AS INTEGER) AS IsClosed,
+    CAST(NULL AS TEXT) AS FocusTag,
+    CAST(NULL AS INTEGER) AS PostHistoryTypeId,
+    CAST(NULL AS TIMESTAMP) AS LastEditDate,
+    CAST(NULL AS TEXT) AS PostImpact,
+    concat(
+        p.Title, ' [tags: ',
+        COALESCE(array_to_string(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'), ', '), '')
+        ,']') AS TitleWithTags,
+    CAST(NULL AS INTEGER) AS AnswerRankPerUser
+FROM Posts p
+JOIN Users u ON u.Id = p.OwnerUserId
+WHERE p.PostTypeId = 1
+  AND p.Score > 100
+
+EXCEPT
+
+SELECT 
+    euq.UserId,
+    euq.DisplayName,
+    euq.Title,
+    euq.QuestionScore,
+    euq.DuplicateCount,
+    euq.BadgeRank,
+    ep.PostId,
+    ep.PostTypeId,
+    ep.Score AS AnswerScore,
+    ep.UpVotes,
+    ep.DownVotes,
+    ep.ViewCount,
+    ep.HasAcceptedAnswer,
+    ep.IsClosed,
+    ts.TagArray[1] AS FocusTag,
+    phc.PostHistoryTypeId,
+    phc.CreationDate AS LastEditDate,
+    CASE WHEN ep.Score > 10 AND ep.UpVotes > 50 THEN 'HighImpact' ELSE 'Normal' END AS PostImpact,
+    concat(
+        euq.Title, ' [tags: ',
+        array_to_string(array(
+            SELECT DISTINCT t FROM unnest(euq.TagArray) AS t ORDER BY t
+        ), ', '), ']'
+    ) AS TitleWithTags,
+    rank() OVER (PARTITION BY euq.UserId ORDER BY ep.Score DESC) AS AnswerRankPerUser
+FROM DistinctUsersQuestionsAnswers euq
+JOIN EnrichedPostsWithVotes ep ON ep.OwnerUserId = euq.UserId AND ep.PostTypeId = 2
+LEFT JOIN TaggedQuestionsWithDuplicates ts ON ts.QuestionId = ep.PostId
+LEFT JOIN LATERAL (
+    SELECT ph.PostHistoryTypeId, ph.CreationDate
+    FROM PostHistory ph
+    WHERE ph.UserId = euq.UserId
+      AND ph.PostId = ep.PostId
+    ORDER BY ph.CreationDate DESC
+    LIMIT 1
+) phc ON TRUE
+WHERE ep.Score > 5
+  AND (ep.IsClosed = 0 OR ep.IsClosed IS NULL)
+ORDER BY BadgeRank, UserId, AnswerRankPerUser NULLS LAST
+LIMIT 100;

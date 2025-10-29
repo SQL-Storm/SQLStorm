@@ -1,0 +1,243 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY SUM(p.Score) DESC) as ScoreRank,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as RepRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score >= 10 THEN 'High'
+            WHEN p.Score >= 5 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreCategory,
+        CAST(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400.0 AS NUMERIC) as DaysActive,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 
+                CAST(p.Score AS FLOAT) / NULLIF(p.AnswerCount, 0)
+            ELSE NULL
+        END as ScorePerAnswer,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 2 THEN 
+                CHAR_LENGTH(p.Tags) - CHAR_LENGTH(REPLACE(p.Tags, '><', '')) + 1
+            ELSE 0
+        END as TagCount,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousScore,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousPostDate,
+        ROUND(AVG(p.Score) OVER (PARTITION BY p.OwnerUserId), 2) as AvgUserScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as UserPostSequence,
+        p.OwnerUserId
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2010-01-01' 
+    AND p.CreationDate < TIMESTAMP '2022-01-01'
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Comments,
+        Badges,
+        TotalScore,
+        ScoreRank,
+        PostRank,
+        RepRank
+    FROM UserActivityStats
+    WHERE Reputation > 10000 AND TotalPosts > 50
+),
+TagPerformance AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) as PreviousCount,
+        CASE 
+            WHEN t.Count > (SELECT AVG("Count") FROM Tags) THEN 'AboveAverage'
+            ELSE 'BelowAverage'
+        END as PerformanceLevel
+    FROM Tags t
+    WHERE t.Count > 0
+),
+ComplexJoinQuery AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalPosts,
+        tu.Questions,
+        tu.Answers,
+        tu.Comments,
+        tu.Badges,
+        tu.TotalScore,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.ScoreCategory,
+        pa.DaysActive,
+        pa.ScorePerAnswer,
+        pa.TagCount,
+        pa.PreviousScore,
+        pa.PreviousPostDate,
+        pa.AvgUserScore,
+        pa.UserPostSequence,
+        CASE 
+            WHEN pa.ScorePerAnswer > 10 THEN 'HighlyEngaging'
+            WHEN pa.ScorePerAnswer > 5 THEN 'Engaging'
+            ELSE 'ModeratelyEngaging'
+        END as EngagementLevel,
+        CASE 
+            WHEN pa.TagCount > 3 THEN 'TagRich'
+            WHEN pa.TagCount > 1 THEN 'TagModerate'
+            ELSE 'TagSparse'
+        END as TagLevel,
+        t.TagName,
+        t.Count as TagCountValue,
+        t.PopularityRank,
+        t.PerformanceLevel,
+        CASE 
+            WHEN (pa.Score > (tu.TotalScore / NULLIF(tu.TotalPosts, 0))) 
+                 AND (pa.Score > (SELECT AVG(Score) FROM Posts)) 
+                 THEN 'PremiumPost'
+            ELSE 'StandardPost'
+        END as PostQuality,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - pa.CreationDate)) / 86400.0 AS NUMERIC) as DaysSincePost,
+        LAG(pa.Score, 1) OVER (ORDER BY pa.CreationDate) as PreviousDayScore,
+        CAST((100.0 * (pa.Score - LAG(pa.Score, 1) OVER (ORDER BY pa.CreationDate)) / 
+              NULLIF(LAG(pa.Score, 1) OVER (ORDER BY pa.CreationDate), 0)) AS FLOAT) as ScoreGrowthPct,
+        CASE 
+            WHEN pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+                 AND pa.PostTypeId = 1 THEN 'AboveQuestionAverage'
+            WHEN pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2) 
+                 AND pa.PostTypeId = 2 THEN 'AboveAnswerAverage'
+            ELSE 'BelowAverage'
+        END as ScorePerformance,
+        pa.PostTypeId,
+        pa.CreationDate
+    FROM TopUsers tu
+    INNER JOIN PostAnalysis pa ON tu.UserId = pa.OwnerUserId
+    LEFT JOIN (
+        SELECT 
+            p.Id as PostId,
+            taglist.TagName,
+            taglist.Count,
+            taglist.rn
+        FROM Posts p
+        INNER JOIN (
+            SELECT 
+                TagName,
+                "Count",
+                ROW_NUMBER() OVER (PARTITION BY TagName ORDER BY "Count" DESC) as rn
+            FROM Tags
+            WHERE "Count" > 100
+        ) taglist ON p.Tags IS NOT NULL AND p.Tags LIKE '%' || taglist.TagName || '%'
+        WHERE taglist.rn = 1
+    ) t ON pa.PostId = t.PostId
+    WHERE pa.PostTypeId IN (1, 2)
+    AND pa.CreationDate >= TIMESTAMP '2015-01-01'
+)
+SELECT 
+    cjq.UserId,
+    cjq.DisplayName,
+    cjq.Reputation,
+    cjq.TotalPosts,
+    cjq.Questions,
+    cjq.Answers,
+    cjq.Comments,
+    cjq.Badges,
+    cjq.TotalScore,
+    cjq.PostId,
+    cjq.Title,
+    cjq.Score,
+    cjq.ViewCount,
+    cjq.AnswerCount,
+    cjq.CommentCount,
+    cjq.FavoriteCount,
+    cjq.ScoreCategory,
+    cjq.DaysActive,
+    cjq.ScorePerAnswer,
+    cjq.TagCount,
+    cjq.PreviousScore,
+    cjq.PreviousPostDate,
+    cjq.AvgUserScore,
+    cjq.UserPostSequence,
+    cjq.EngagementLevel,
+    cjq.TagLevel,
+    COALESCE(cjq.TagName, 'NoTags') as TagUsed,
+    COALESCE(cjq.TagCountValue, 0) as TagUseCount,
+    cjq.PopularityRank,
+    cjq.PerformanceLevel,
+    cjq.PostQuality,
+    cjq.DaysSincePost,
+    cjq.PreviousDayScore,
+    ROUND(cjq.ScoreGrowthPct, 2) as ScoreGrowthPercentage,
+    cjq.ScorePerformance,
+    CASE 
+        WHEN cjq.ScoreGrowthPct > 50 THEN 'RapidGrowth'
+        WHEN cjq.ScoreGrowthPct > 10 THEN 'ModerateGrowth'
+        WHEN cjq.ScoreGrowthPct > 0 THEN 'SlowGrowth'
+        WHEN cjq.ScoreGrowthPct < -50 THEN 'RapidDecline'
+        WHEN cjq.ScoreGrowthPct < -10 THEN 'ModerateDecline'
+        ELSE 'Stable'
+    END as GrowthStatus,
+    ROW_NUMBER() OVER (ORDER BY cjq.Score DESC) as OverallRank,
+    DENSE_RANK() OVER (PARTITION BY cjq.ScoreCategory ORDER BY cjq.TotalScore DESC) as CategoryRank,
+    NTILE(4) OVER (ORDER BY cjq.Score) as ScoreQuartile,
+    CASE 
+        WHEN cjq.Reputation > 50000 AND cjq.TotalPosts > 100 THEN 'EliteContributor'
+        WHEN cjq.Reputation > 10000 AND cjq.TotalPosts > 50 THEN 'ExperiencedContributor'
+        WHEN cjq.Reputation > 1000 AND cjq.TotalPosts > 10 THEN 'RegularContributor'
+        ELSE 'NewContributor'
+    END as ContributorTier,
+    ABS(cjq.Score - (SELECT AVG(Score) FROM Posts)) as ScoreDeviationFromMean,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND OwnerUserId = cjq.UserId) as UserQuestionCount,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND OwnerUserId = cjq.UserId) as UserAnswerCount
+FROM ComplexJoinQuery cjq
+WHERE cjq.Score > 0
+AND (cjq.TagCountValue IS NOT NULL OR cjq.TagName IS NOT NULL)
+AND (cjq.PreviousDayScore IS NULL OR cjq.PreviousDayScore > 0)
+ORDER BY cjq.Score DESC, cjq.TotalScore DESC, cjq.UserPostSequence ASC
+LIMIT 1000;

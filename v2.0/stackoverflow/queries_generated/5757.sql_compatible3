@@ -1,0 +1,133 @@
+WITH
+ActiveUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    (
+      EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.LastAccessDate)) / 86400 * -1
+      + COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id), 0)
+      + COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id), 0)
+      + COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id), 0)
+    ) AS ActivityScore
+  FROM Users u
+),
+UserTagBadges AS (
+  SELECT
+    b.UserId,
+    b.Name AS BadgeName,
+    b.Date,
+    b.Class,
+    b.TagBased,
+    t.TagName
+  FROM Badges b
+  LEFT JOIN (
+    SELECT DISTINCT TagName FROM Tags
+  ) t ON 1=1
+  WHERE b.TagBased = 1
+),
+PostHistoryFunnel AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.Text
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10,11,12,16,36,37,38,66,53)
+),
+PostLinkStats AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    lt.Name AS LinkTypeName
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+PostRank AS (
+  SELECT
+    p.Id,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.CreationDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate ASC
+    ) AS PostRankInType
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2)
+),
+RecentComments AS (
+  SELECT
+    c.PostId,
+    COUNT(*) AS RecentCommentCount
+  FROM Comments c
+  WHERE c.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY)
+  GROUP BY c.PostId
+),
+ActiveHistoricPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  WHERE p.LastActivityDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180' DAY)
+    AND (p.Score > 5 OR p.ViewCount > 1000)
+    AND (COALESCE(p.ClosedDate, DATE '1900-01-01') > DATE '1900-01-01') = FALSE
+)
+SELECT
+  au.UserId,
+  au.DisplayName AS UserDisplay,
+  au.Reputation,
+  au.LastAccessDate,
+  aeb.BadgeName AS TagBadge,
+  aeb.TagName,
+  rh.Id AS HeavyPostId,
+  rh.Title AS HeavyPostTitle,
+  rh.Score AS HeavyPostScore,
+  rh.ViewCount AS HeavyPostViews,
+  pr.PostRankInType AS RankInPostType,
+  wc.RecentCommentCount
+FROM ActiveUsers au
+LEFT JOIN UserTagBadges aeb ON aeb.UserId = au.UserId
+LEFT JOIN PostRank pr ON pr.Id = (
+  SELECT p2.Id
+  FROM Posts p2
+  WHERE p2.OwnerUserId = au.UserId
+  ORDER BY p2.LastActivityDate DESC
+  LIMIT 1
+)
+LEFT JOIN (
+  SELECT p.Id, p.Title, p.Score, p.ViewCount
+  FROM Posts p
+  JOIN PostRank pr2 ON pr2.Id = p.Id
+) rh ON rh.Id = pr.Id
+LEFT JOIN RecentComments wc ON wc.PostId = rh.Id
+WHERE
+  au.Reputation > 1000
+  OR (aeb.TagBased = 1 AND aeb.TagName IS NOT NULL)
+GROUP BY
+  au.UserId,
+  au.DisplayName,
+  au.Reputation,
+  au.LastAccessDate,
+  aeb.BadgeName,
+  aeb.TagName,
+  aeb.TagBased,
+  rh.Id,
+  rh.Title,
+  rh.Score,
+  rh.ViewCount,
+  pr.PostRankInType,
+  wc.RecentCommentCount
+ORDER BY au.Reputation DESC, au.LastAccessDate DESC
+LIMIT 50;

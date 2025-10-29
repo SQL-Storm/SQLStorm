@@ -1,0 +1,4 @@
+SELECT *
+FROM BenchmarkOutput
+ORDER BY Reputation DESC, AnswerScore DESC NULLS LAST, UserId
+LIMIT 100;

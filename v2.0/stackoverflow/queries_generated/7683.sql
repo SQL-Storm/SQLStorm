@@ -1,0 +1,208 @@
+-- {"query": "7683.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2126} 
+WITH UserActivityStats AS (
+  SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT c.Id) as Comments,
+    COUNT(DISTINCT b.Id) as Badges,
+    MAX(p.CreationDate) as LastPostDate,
+    RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments c ON u.Id = c.UserId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  WHERE u.Id IS NOT NULL
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+  SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    TotalPosts,
+    Questions,
+    Answers,
+    Comments,
+    Badges,
+    LastPostDate,
+    PostRank,
+    ReputationRank,
+    CASE 
+      WHEN TotalPosts > 1000 THEN 'Elite'
+      WHEN TotalPosts > 500 THEN 'Veteran'
+      WHEN TotalPosts > 100 THEN 'Experienced'
+      WHEN TotalPosts > 10 THEN 'Active'
+      ELSE 'Beginner'
+    END as UserCategory,
+    ROUND((CAST(Answers AS FLOAT) / NULLIF(CAST(Questions AS FLOAT), 0)) * 100, 2) as AnswerRate
+  FROM UserActivityStats
+  WHERE TotalPosts > 0
+),
+PostComplexity AS (
+  SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    u.DisplayName as AuthorName,
+    p.Tags,
+    CASE 
+      WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'), 1)
+      ELSE 0 
+    END as TagCount,
+    CASE 
+      WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Answer'
+      WHEN p.PostTypeId = 1 THEN 'Question'
+      WHEN p.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END as PostTypeCategory,
+    DATEDIFF('day', p.CreationDate, CURRENT_TIMESTAMP) as AgeInDays,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+    LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousScore,
+    AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as UserAverageScore,
+    CASE 
+      WHEN p.Score >= (SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY Score) FROM Posts) THEN 'High'
+      WHEN p.Score >= (SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Score) FROM Posts) THEN 'Above Average'
+      WHEN p.Score >= (SELECT PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY Score) FROM Posts) THEN 'Below Average'
+      ELSE 'Low'
+    END as ScoreCategory
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= '2020-01-01'
+),
+TagAnalysis AS (
+  SELECT 
+    t.TagName,
+    t.Count as TagCount,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    CASE 
+      WHEN t.Count > (SELECT AVG(Count) FROM Tags) THEN 'Popular'
+      WHEN t.Count > (SELECT AVG(Count) * 0.5 FROM Tags) THEN 'Moderate'
+      WHEN t.Count > 0 THEN 'Sparse'
+      ELSE 'Rare'
+    END as PopularityLevel,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+    COUNT(DISTINCT p.Id) as RelatedPosts,
+    AVG(p.Score) as AverageScore,
+    MIN(p.CreationDate) as FirstPostDate,
+    MAX(p.CreationDate) as LastPostDate,
+    STRING_AGG(DISTINCT u.DisplayName, ', ') as TopContributors
+  FROM Tags t
+  LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  WHERE t.TagName IS NOT NULL AND t.TagName != ''
+  GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+QuestionWithDuplicates AS (
+  SELECT 
+    q.Id as QuestionId,
+    q.Title,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.CommentCount,
+    q.CreationDate,
+    q.OwnerUserId,
+    u.DisplayName as AuthorName,
+    q.Tags,
+    COUNT(DISTINCT pl.RelatedPostId) as DuplicateCount,
+    STRING_AGG(DISTINCT pl.RelatedPostId::VARCHAR, ', ') as DuplicateIds,
+    STRING_AGG(DISTINCT p2.Title, ' | ') as DuplicateTitles
+  FROM Posts q
+  LEFT JOIN PostLinks pl ON q.Id = pl.PostId AND pl.LinkTypeId = 3
+  LEFT JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+  LEFT JOIN Users u ON q.OwnerUserId = u.Id
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id, q.Title, q.Score, q.ViewCount, q.AnswerCount, q.CommentCount, q.CreationDate, q.OwnerUserId, u.DisplayName, q.Tags
+),
+AggregatedData AS (
+  SELECT 
+    'User Statistics' as Category,
+    COUNT(*) as RecordCount,
+    NULL as Detail1,
+    NULL as Detail2
+  FROM TopUsers
+  UNION ALL
+  SELECT 
+    'Post Analysis' as Category,
+    COUNT(*) as RecordCount,
+    NULL as Detail1,
+    NULL as Detail2
+  FROM PostComplexity
+  UNION ALL
+  SELECT 
+    'Tag Analysis' as Category,
+    COUNT(*) as RecordCount,
+    NULL as Detail1,
+    NULL as Detail2
+  FROM TagAnalysis
+  UNION ALL
+  SELECT 
+    'Duplicate Questions' as Category,
+    COUNT(*) as RecordCount,
+    NULL as Detail1,
+    NULL as Detail2
+  FROM QuestionWithDuplicates
+  UNION ALL
+  SELECT 
+    'Combined Post Types' as Category,
+    COUNT(*) as RecordCount,
+    CASE WHEN COUNT(*) > 0 THEN 'Questions' ELSE 'None' END as Detail1,
+    CASE WHEN COUNT(*) > 0 THEN 'Answers' ELSE 'None' END as Detail2
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= '2020-01-01'
+)
+SELECT 
+  CONCAT('Analysis for ', 
+    CASE 
+      WHEN a.Category = 'User Statistics' THEN 'Active Users'
+      WHEN a.Category = 'Post Analysis' THEN 'Content Analysis'
+      WHEN a.Category = 'Tag Analysis' THEN 'Tag Popularity'
+      WHEN a.Category = 'Duplicate Questions' THEN 'Question Duplication'
+      ELSE 'General Statistics'
+    END,
+    ': ', 
+    a.RecordCount, 
+    ' records found') as AnalysisSummary,
+  a.Category,
+  CASE 
+    WHEN a.Category = 'User Statistics' THEN CONCAT('Top Users: ', (SELECT COUNT(*) FROM TopUsers))
+    WHEN a.Category = 'Post Analysis' THEN CONCAT('Posts with Tags: ', (SELECT COUNT(*) FROM PostComplexity WHERE TagCount > 0))
+    WHEN a.Category = 'Tag Analysis' THEN CONCAT('Tags with Posts: ', (SELECT COUNT(*) FROM TagAnalysis WHERE RelatedPosts > 0))
+    WHEN a.Category = 'Duplicate Questions' THEN CONCAT('Questions with Duplicates: ', (SELECT COUNT(*) FROM QuestionWithDuplicates WHERE DuplicateCount > 0))
+    ELSE 'Additional Metrics'
+  END as RelatedMetrics,
+  CASE 
+    WHEN a.Category = 'User Statistics' THEN 'User reputation and posting metrics'
+    WHEN a.Category = 'Post Analysis' THEN 'Content scoring and complexity'
+    WHEN a.Category = 'Tag Analysis' THEN 'Tag popularity trends'
+    WHEN a.Category = 'Duplicate Questions' THEN 'Content duplication patterns' 
+    ELSE 'General content statistics'
+  END as CategoryDescription,
+  DENSE_RANK() OVER (ORDER BY a.RecordCount DESC) as PriorityLevel,
+  CONCAT(
+    CASE WHEN a.Category = 'User Statistics' THEN (SELECT STRING_AGG(DISTINCT u.DisplayName, ', ') FROM TopUsers u ORDER BY u.Reputation DESC LIMIT 3) ELSE '' END,
+    CASE WHEN a.Category = 'Post Analysis' THEN (SELECT STRING_AGG(DISTINCT pc.Title, ', ') FROM PostComplexity pc ORDER BY pc.Score DESC LIMIT 3) ELSE '' END,
+    CASE WHEN a.Category = 'Tag Analysis' THEN (SELECT STRING_AGG(DISTINCT ta.TagName, ', ') FROM TagAnalysis ta ORDER BY ta.TagCount DESC LIMIT 3) ELSE '' END
+  ) as SampleRecords
+FROM AggregatedData a
+WHERE a.Category IN ('User Statistics', 'Post Analysis', 'Tag Analysis', 'Duplicate Questions')
+  AND a.RecordCount > 0
+ORDER BY CASE 
+  WHEN a.Category = 'User Statistics' THEN 1
+  WHEN a.Category = 'Post Analysis' THEN 2
+  WHEN a.Category = 'Tag Analysis' THEN 3
+  WHEN a.Category = 'Duplicate Questions' THEN 4
+END,
+a.RecordCount DESC
+LIMIT 100;

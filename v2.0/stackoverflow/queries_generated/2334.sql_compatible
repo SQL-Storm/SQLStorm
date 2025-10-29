@@ -1,0 +1,114 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        coalesce(p.ViewCount, 0) as PostViewCount,
+        1 as Depth
+    from Tags t
+    left join Posts p on p.PostTypeId = 1 and p.Tags like '%' || '<' || t.TagName || '>' || '%'
+    union all
+    select
+        rtc.Id,
+        rtc.TagName,
+        rtc.Count,
+        rtc.IsModeratorOnly,
+        rtc.IsRequired,
+        rtc.PostViewCount / 2,
+        rtc.Depth + 1
+    from RecursiveTagCounts rtc
+    where rtc.Depth < 2
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersCount,
+        coalesce(sum(p.Score), 0) as TotalPostScore,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as UpVotesGiven,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as DownVotesGiven,
+        max(case when p.OwnerUserId = u.Id then p.CreationDate end) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+QuestionAnswerWindow as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        p.CreationDate,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswererId,
+        row_number() over (partition by p.Id order by a.Score desc, a.CreationDate) as AnswerRank
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1
+),
+CloseVoteCounts as (
+    select
+        ph.PostId,
+        count(*) as CloseVotesCount,
+        max(ph.CreationDate) as LastCloseVoteDate,
+        string_agg(distinct crt.Name, ', ') as CloseReasons
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int) and ph.PostHistoryTypeId = 10
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+UserBadgeRanks as (
+    select
+        b.UserId,
+        b.Name,
+        b.Class,
+        count(*) over (partition by b.UserId, b.Class) as BadgeClassCount,
+        row_number() over (partition by b.UserId, b.Class order by b.Date desc) as BadgeRankByDate
+    from Badges b
+)
+select distinct
+    u.Id as UserId,
+    u.DisplayName,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.TotalPostScore,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    ua.LastPostDate,
+    coalesce(cvc.CloseVotesCount, 0) as CloseVotesReceived,
+    cvc.CloseReasons,
+    ta.TagName,
+    sum(rt.PostViewCount) over (partition by ta.TagName) as TotalTagPostViewCounts,
+    max(qa.AnswerScore) filter (where qa.AnswerRank = 1) as TopAnswerScoreForUser,
+    ub.Name as RecentBadgeName,
+    ub.Class as RecentBadgeClass,
+    case
+        when ub.Class = 1 then 'Gold'
+        when ub.Class = 2 then 'Silver'
+        when ub.Class = 3 then 'Bronze'
+        else 'Unknown'
+    end as RecentBadgeClassName,
+    substring(u.AboutMe from 1 for 100) as AboutMeSnippet,
+    case
+        when u.WebsiteUrl is null or length(trim(u.WebsiteUrl)) = 0 then 'No Website'
+        else u.WebsiteUrl
+    end as WebsiteUrlStatus,
+    row_number() over (partition by u.Id order by ua.TotalPostScore desc) as UserScoreRank
+from Users u
+left join UserActivity ua on ua.UserId = u.Id
+left join CloseVoteCounts cvc on cvc.PostId in (
+    select p.Id from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1
+)
+left join RecursiveTagCounts rt on rt.Depth = 1
+left join Tags ta on ta.Id = rt.Id
+left join QuestionAnswerWindow qa on qa.AnswererId = u.Id
+left join UserBadgeRanks ub on ub.UserId = u.Id and ub.BadgeRankByDate = 1
+where ua.TotalPostScore is not null
+  and (u.Id % 5) = 0
+order by ua.TotalPostScore desc nulls last, u.Id
+limit 50;

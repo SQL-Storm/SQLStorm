@@ -1,0 +1,151 @@
+WITH
+UserPostAgg AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN pt.Name = 'Question' THEN p.Score ELSE 0 END)        AS QuestionScore,
+        SUM(CASE WHEN pt.Name = 'Answer'   THEN p.Score ELSE 0 END)        AS AnswerScore,
+        COUNT(CASE WHEN pt.Name = 'Question' THEN 1 END)                  AS QuestionCount,
+        COUNT(CASE WHEN pt.Name = 'Answer'   THEN 1 END)                  AS AnswerCount,
+        MIN(p.CreationDate)                                                AS FirstPostDate,
+        MAX(p.CreationDate)                                                AS LastPostDate
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+BadgeAgg AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*)                                    AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+FirstAnswerDelay AS (
+    SELECT
+        q.OwnerUserId                                    AS UserId,
+        AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 86400.0) AS AvgDaysToFirstAnswer
+    FROM Posts q
+    JOIN PostTypes pt_q ON q.PostTypeId = pt_q.Id AND pt_q.Name = 'Question'
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer')
+    WHERE q.OwnerUserId IS NOT NULL
+    GROUP BY q.OwnerUserId
+),
+UserTagStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT t.tag) AS DistinctTagCount,
+        STRING_AGG(DISTINCT t.tag, ',') AS TagList
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT TRIM(tag) AS tag
+        FROM (
+            SELECT
+                regexp_split_to_table(TRIM(BOTH '<>' FROM p.Tags), '\>\<') AS tag
+        ) s
+    ) t
+    WHERE p.Tags IS NOT NULL AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+Combined AS (
+    SELECT
+        u.Id,
+        COALESCE(u.DisplayName, 'Anonymous')                                          AS DisplayName,
+        u.Reputation,
+        COALESCE(up.QuestionScore,0) + COALESCE(up.AnswerScore,0)                      AS TotalPostScore,
+        COALESCE(up.QuestionCount,0)                                                   AS TotalQuestions,
+        COALESCE(up.AnswerCount,0)                                                     AS TotalAnswers,
+        COALESCE(b.GoldBadges,0)                                                       AS GoldBadges,
+        COALESCE(b.SilverBadges,0)                                                     AS SilverBadges,
+        COALESCE(b.BronzeBadges,0)                                                     AS BronzeBadges,
+        fad.AvgDaysToFirstAnswer,
+        COALESCE(uts.DistinctTagCount,0)                                               AS DistinctTagCount,
+        CASE
+            WHEN u.CreationDate < TIMESTAMP '2010-01-01' THEN 'Veteran'
+            WHEN u.CreationDate >= TIMESTAMP '2010-01-01' AND u.CreationDate < TIMESTAMP '2015-01-01' THEN 'Mid-Era'
+            ELSE 'Newbie'
+        END                                                                          AS UserEra,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(up.QuestionScore,0) + COALESCE(up.AnswerScore,0) DESC) AS ScoreRank
+    FROM Users u
+    LEFT JOIN UserPostAgg up   ON up.UserId   = u.Id
+    LEFT JOIN BadgeAgg b       ON b.UserId    = u.Id
+    LEFT JOIN FirstAnswerDelay fad ON fad.UserId = u.Id
+    LEFT JOIN UserTagStats uts ON uts.UserId = u.Id
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(up.QuestionScore,0),
+        COALESCE(up.AnswerScore,0),
+        COALESCE(up.QuestionCount,0),
+        COALESCE(up.AnswerCount,0),
+        COALESCE(b.GoldBadges,0),
+        COALESCE(b.SilverBadges,0),
+        COALESCE(b.BronzeBadges,0),
+        fad.AvgDaysToFirstAnswer,
+        COALESCE(uts.DistinctTagCount,0),
+        u.CreationDate
+),
+WithNoPosts AS (
+    SELECT
+        u.Id,
+        COALESCE(u.DisplayName, 'Anonymous') AS DisplayName,
+        u.Reputation,
+        0::numeric                             AS TotalPostScore,
+        0::bigint                              AS TotalQuestions,
+        0::bigint                              AS TotalAnswers,
+        COALESCE(b.GoldBadges,0)             AS GoldBadges,
+        COALESCE(b.SilverBadges,0)           AS SilverBadges,
+        COALESCE(b.BronzeBadges,0)           AS BronzeBadges,
+        NULL::double precision               AS AvgDaysToFirstAnswer,
+        0::bigint                             AS DistinctTagCount,
+        'NoPosts'                            AS UserEra,
+        NULL::bigint                         AS ScoreRank
+    FROM Users u
+    LEFT JOIN BadgeAgg b ON b.UserId = u.Id
+    WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(b.GoldBadges,0),
+        COALESCE(b.SilverBadges,0),
+        COALESCE(b.BronzeBadges,0)
+)
+SELECT
+    Id,
+    DisplayName,
+    Reputation,
+    TotalPostScore,
+    TotalQuestions,
+    TotalAnswers,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    AvgDaysToFirstAnswer,
+    DistinctTagCount,
+    UserEra,
+    ScoreRank
+FROM Combined
+WHERE TotalPostScore > 1000
+UNION ALL
+SELECT
+    Id,
+    DisplayName,
+    Reputation,
+    TotalPostScore,
+    TotalQuestions,
+    TotalAnswers,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    AvgDaysToFirstAnswer,
+    DistinctTagCount,
+    UserEra,
+    ScoreRank
+FROM WithNoPosts
+WHERE Reputation > 20000
+ORDER BY ScoreRank NULLS LAST, Reputation DESC
+LIMIT 100;

@@ -1,0 +1,187 @@
+with RecursiveTagCTE as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        array_length(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><'),1) as TagCount,
+        1 as Level
+    from tags t
+    join posts p on p.Tags like '%' || '<' || t.TagName || '>' || '%'
+    where (t.IsModeratorOnly = false OR t.IsModeratorOnly = 0) and p.PostTypeId = 1
+    union all
+    select
+        r.TagId,
+        r.TagName,
+        child.Id,
+        child.OwnerUserId,
+        child.PostTypeId,
+        child.Score,
+        child.ViewCount,
+        child.CreationDate,
+        array_length(string_to_array(substring(child.Tags FROM 2 FOR char_length(child.Tags)-2), '><'),1),
+        r.Level + 1
+    from RecursiveTagCTE r
+    join Posts child on child.ParentId = r.PostId
+    where child.PostTypeId = 2 and r.Level < 3
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        count(distinct b.Id) as TotalBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostScoreRank as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        rank() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as ScoreRank,
+        dense_rank() over (order by p.Score desc) as GlobalScoreRank
+    from Posts p
+    where p.PostTypeId = 1 and p.Score is not null
+),
+PostCloseInfo as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then ph.Comment else null end) as CloseReasonId,
+        max(ph.CreationDate) as CloseDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+TopLinkedQuestions as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) as LinkCount,
+        max(pl.CreationDate) as LastLinkDate
+    from PostLinks pl
+    join Posts p on pl.PostId = p.Id and p.PostTypeId = 1
+    where pl.LinkTypeId = 1
+    group by pl.PostId
+),
+UsersWithTopPosts as (
+    select
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+        coalesce(ub.GoldBadges,0) as GoldBadges,
+        coalesce(ub.SilverBadges,0) as SilverBadges,
+        coalesce(ub.BronzeBadges,0) as BronzeBadges,
+        coalesce(tlq.LinkCount,0) as TotalLinks,
+        ps.Title as TopQuestionTitle,
+        ps.Score as TopQuestionScore,
+        ps.ViewCount as TopQuestionViews,
+        pci.CloseReasonId,
+        pci.CloseDate
+    from Users u
+    left join UserBadgeStats ub on ub.UserId = u.Id
+    left join (
+        select p.OwnerUserId, max(p.Score) as MaxScore
+        from Posts p
+        where p.PostTypeId = 1
+        group by p.OwnerUserId
+    ) maxScore on maxScore.OwnerUserId = u.Id
+    left join PostScoreRank psr on psr.OwnerUserId = u.Id and psr.ScoreRank = 1
+    left join Posts ps on ps.Id = psr.Id
+    left join TopLinkedQuestions tlq on tlq.PostId = ps.Id
+    left join PostCloseInfo pci on pci.PostId = ps.Id
+    where u.Reputation > 500
+),
+CommentsSummary as (
+    select
+        c.UserId,
+        count(*) as CommentCount,
+        avg(c.Score) as AvgCommentScore,
+        sum(case when c.Text is null or length(trim(c.Text)) = 0 then 1 else 0 end) as EmptyComments
+    from Comments c
+    group by c.UserId
+),
+UserActivityDeltas as (
+    select
+        u.Id,
+        u.DisplayName,
+        coalesce(max(p.CreationDate), u.CreationDate) as LastPostDate,
+        u.LastAccessDate,
+        extract(day from u.LastAccessDate - u.CreationDate) as DaysActive,
+        coalesce(cmt.CommentCount, 0) as TotalComments,
+        coalesce(cmt.AvgCommentScore, 0) as AverageCommentScore,
+        coalesce(cmt.EmptyComments, 0) as CommentTextEmptyCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join CommentsSummary cmt on cmt.UserId = u.Id
+    group by u.Id, u.DisplayName, u.CreationDate, u.LastAccessDate, cmt.CommentCount, cmt.AvgCommentScore, cmt.EmptyComments
+),
+EnhancedUserRanking as (
+    select
+        ua.Id,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.DaysActive,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        ua.TotalComments,
+        ua.AverageCommentScore,
+        ua.CommentTextEmptyCount,
+        us.TotalLinks,
+        us.TopQuestionTitle,
+        us.TopQuestionScore,
+        us.TopQuestionViews,
+        us.CloseReasonId,
+        us.CloseDate,
+        row_number() over (order by ua.Reputation desc, us.TotalLinks desc, us.TopQuestionScore desc) as OverallRank,
+        case when us.CloseReasonId is not null then 'Closed' else 'Open' end as TopQuestionStatus,
+        case when ua.DaysActive > 0 then round(cast(ua.Reputation as numeric) / ua.DaysActive, 2) else null end as ReputationPerDay,
+        concat(
+          substring(coalesce(us.TopQuestionTitle,'[No Title]') FROM 1 FOR 50),
+          case when length(coalesce(us.TopQuestionTitle,'')) > 50 then '...' else '' end
+        ) as ShortTopTitle
+    from UserActivityDeltas ua
+    left join UsersWithTopPosts us on us.Id = ua.Id
+)
+select
+    eur.OverallRank,
+    eur.Id as UserId,
+    eur.DisplayName,
+    eur.Reputation,
+    eur.ReputationPerDay,
+    eur.DaysActive,
+    eur.GoldBadges,
+    eur.SilverBadges,
+    eur.BronzeBadges,
+    eur.TotalComments,
+    eur.AverageCommentScore,
+    eur.CommentTextEmptyCount,
+    eur.TotalLinks,
+    eur.ShortTopTitle,
+    eur.TopQuestionScore,
+    eur.TopQuestionViews,
+    eur.TopQuestionStatus,
+    coalesce(
+        (select string_agg(distinct pt.Name, ', ')
+         from PostTypes pt
+         join Posts p on p.PostTypeId = pt.Id and p.OwnerUserId = eur.Id and p.Score > 10
+         where pt.Id in (1,2)
+         limit 3),
+        'None'
+    ) as HighScoredPostTypes,
+    case when eur.TopQuestionStatus = 'Closed' then (
+        select ct.Name from CloseReasonTypes ct where ct.Id = eur.CloseReasonId
+    ) else null end as CloseReasonDescription
+from EnhancedUserRanking eur
+where eur.Reputation > 1000
+order by eur.OverallRank
+limit 50;

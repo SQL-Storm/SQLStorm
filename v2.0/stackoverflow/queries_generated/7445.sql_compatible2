@@ -1,0 +1,180 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        AVG(p.Score) AS AvgPostScore,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, ', ') AS QuestionTitles,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Body END, ' | ') AS AnswerBodies
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        us.UserId,
+        us.Reputation,
+        us.DisplayName,
+        us.Views,
+        us.UpVotes,
+        us.DownVotes,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.LastPostDate,
+        us.LastCommentDate,
+        us.AvgPostScore,
+        us.QuestionTitles,
+        us.AnswerBodies,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.PostCount DESC) AS RankByReputation,
+        DENSE_RANK() OVER (ORDER BY us.BadgeCount DESC) AS RankByBadges,
+        RANK() OVER (PARTITION BY CASE WHEN us.Views > 1000 THEN 'High' ELSE 'Low' END ORDER BY us.UpVotes DESC) AS RankByViews
+    FROM UserStats us
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        COALESCE(p.AcceptedAnswerId, 0) AS HasAcceptedAnswer,
+        CASE 
+            WHEN p.Score > 10 THEN 'High'
+            WHEN p.Score > 5 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                CARDINALITY(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><'))
+            ELSE 0
+        END AS TagCount,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score > 5 AND p.ViewCount > 100 THEN 'Popular Question'
+            WHEN p.PostTypeId = 2 AND p.Score > 10 THEN 'High Value Answer'
+            WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN 'Viral Question'
+            ELSE 'Regular Post'
+        END AS PostClassification
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2020-01-01' AS timestamp)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Hot Tag'
+            WHEN t.Count > 100 THEN 'Popular Tag'
+            WHEN t.Count > 10 THEN 'Common Tag'
+            ELSE 'Rare Tag'
+        END AS TagPopularity,
+        RANK() OVER (ORDER BY t.Count DESC) AS PopularityRank
+    FROM Tags t
+),
+MergedAnalysis AS (
+    SELECT 
+        pu.UserId,
+        pu.DisplayName,
+        pu.Reputation,
+        pu.PostCount,
+        pu.BadgeCount,
+        pu.LastPostDate,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.PostType,
+        pa.ScoreCategory,
+        pa.TagCount,
+        pa.PostClassification,
+        pa.Tags,
+        ta.TagName,
+        ta.TagCount AS TaggedCount,
+        ta.TagPopularity,
+        CASE 
+            WHEN pa.Score > 10 AND pu.Reputation > 5000 THEN 'High Performer'
+            WHEN pa.Score > 5 AND pu.BadgeCount > 5 THEN 'Mid Performer'
+            WHEN pu.PostCount > 100 THEN 'Active Contributor'
+            ELSE 'Regular User'
+        END AS UserPerformanceSegment
+    FROM RankedUsers pu
+    INNER JOIN PostAnalysis pa ON pu.UserId = pa.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON pa.Tags IS NOT NULL 
+        AND POSITION('<' || ta.TagName || '>' IN pa.Tags) > 0
+    WHERE pa.ScoreCategory IN ('High', 'Medium')
+)
+SELECT 
+    COUNT(*) AS TotalRecords,
+    COUNT(DISTINCT ma.UserId) AS UniqueUsers,
+    COUNT(DISTINCT ma.PostId) AS UniquePosts,
+    COUNT(DISTINCT ma.TagName) AS UniqueTags,
+    AVG(ma.Reputation) AS AvgReputation,
+    AVG(ma.PostCount) AS AvgPostCount,
+    AVG(ma.BadgeCount) AS AvgBadgeCount,
+    MAX(ma.LastPostDate) AS LatestPostDate,
+    MIN(ma.LastPostDate) AS EarliestPostDate,
+    STRING_AGG(DISTINCT ma.DisplayName, ', ') AS AllUserNames,
+    STRING_AGG(DISTINCT ma.PostClassification, '; ') AS PostClassifications,
+    STRING_AGG(DISTINCT ma.TagPopularity, ', ') AS TagPopularityLevels,
+    STRING_AGG(DISTINCT ma.UserPerformanceSegment, ', ') AS UserSegments,
+    COUNT(CASE WHEN ma.PostClassification = 'High Value Answer' THEN 1 END) AS HighValueAnswers,
+    COUNT(CASE WHEN ma.PostClassification = 'Popular Question' THEN 1 END) AS PopularQuestions,
+    COUNT(CASE WHEN ma.TagPopularity = 'Hot Tag' THEN 1 END) AS HotTags,
+    COUNT(CASE WHEN ma.UserPerformanceSegment = 'High Performer' THEN 1 END) AS HighPerformers,
+    COUNT(CASE WHEN ma.UserPerformanceSegment = 'Active Contributor' THEN 1 END) AS ActiveContributors
+FROM MergedAnalysis ma
+WHERE ma.Reputation > 1000
+  AND ma.PostCount > 10
+  AND (ma.Score > 5 OR ma.ViewCount > 100)
+  AND (ma.TagCount > 0 OR ma.TagName IS NOT NULL)
+  AND EXISTS (
+    SELECT 1 FROM Posts p 
+    WHERE p.OwnerUserId = ma.UserId 
+      AND p.CreationDate >= CAST('2020-01-01' AS timestamp)
+      AND p.Score > 0
+  )
+  AND (
+    ma.PostClassification IN ('High Value Answer', 'Popular Question', 'Viral Question')
+    OR ma.TagPopularity IN ('Hot Tag', 'Popular Tag')
+    OR ma.UserPerformanceSegment IN ('High Performer', 'Active Contributor')
+  )
+  AND COALESCE(ma.TagCount, 0) + COALESCE(ma.TaggedCount, 0) > 1
+  AND (
+    SELECT COUNT(*) 
+    FROM Votes v 
+    WHERE v.PostId = ma.PostId 
+      AND v.VoteTypeId = 2
+  ) > 0
+  AND (
+    SELECT COUNT(*) 
+    FROM Comments c 
+    WHERE c.PostId = ma.PostId
+  ) BETWEEN 0 AND 50
+  AND (
+    SELECT COUNT(*) 
+    FROM PostHistory ph 
+    WHERE ph.PostId = ma.PostId 
+      AND ph.PostHistoryTypeId IN (1, 2, 3)
+  ) > 0;

@@ -1,0 +1,195 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        SUM(P.Score) AS TotalPostsScoreReceived,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        MAX(B.Date) AS LastBadgeDate,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 8 THEN V.BountyAmount ELSE 0 END) AS TotalBountyGivenAmount
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostRevisionMetrics AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalRevisions,
+        MAX(CASE WHEN PHT.Name IN ('Edit Body', 'Edit Title', 'Edit Tags') THEN PH.CreationDate END) AS LastEditDateFromHistory,
+        MIN(PH.CreationDate) AS FirstRevisionDate,
+        MAX(CASE WHEN PHT.Name = 'Post Closed' THEN PH.CreationDate END) AS ClosedDateFromHistory,
+        COUNT(DISTINCT CASE WHEN PHT.Name IN ('Edit Body', 'Edit Title', 'Edit Tags') THEN PH.UserId END) AS UniqueEditors,
+        MAX(CASE WHEN PHT.Name = 'Community Owned' THEN 1 ELSE 0 END) = 1 AS WasCommunityOwnedEver,
+        SUM(CASE WHEN PH.Comment IS NOT NULL AND LENGTH(TRIM(PH.Comment)) > 10 THEN 1 ELSE 0 END) AS HistoryCommentsCount,
+        AVG(EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate)))) AS AvgTimeBetweenRevisionsSeconds
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    GROUP BY PH.PostId
+),
+QuestionDetails AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.ViewCount,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.CreationDate AS QuestionCreationDate,
+        COALESCE(Q.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        (SELECT AVG(A.Score) FROM Posts A WHERE A.ParentId = Q.Id AND A.PostTypeId = 2 AND A.Score > 0) AS AvgPositiveAnswerScore,
+        (SELECT COUNT(DISTINCT V.UserId) FROM Votes V WHERE V.PostId = Q.Id AND V.VoteTypeId = 5) AS UniqueFavoritedUsers,
+        STRING_TO_ARRAY(SUBSTRING(Q.Tags, 2, LENGTH(Q.Tags)-2), '><') AS TagArray,
+        (SELECT PHT_INNER.Name FROM PostHistory PH_INNER JOIN PostHistoryTypes PHT_INNER ON PH_INNER.PostHistoryTypeId = PHT_INNER.Id WHERE PH_INNER.PostId = Q.Id ORDER BY PH_INNER.CreationDate DESC LIMIT 1) AS LatestHistoryTypeName
+    FROM Posts Q
+    WHERE Q.PostTypeId = 1
+),
+AnswerDetails AS (
+    SELECT
+        A.Id AS AnswerId,
+        A.ParentId AS QuestionId,
+        A.Score AS AnswerScore,
+        A.CreationDate AS AnswerCreationDate,
+        A.OwnerUserId AS AnswerOwnerUserId
+    FROM Posts A
+    WHERE A.PostTypeId = 2
+),
+PostLinkAnalysis AS (
+    SELECT
+        PL.PostId,
+        COUNT(CASE WHEN LT.Name = 'Linked' THEN 1 END) AS LinkedPostsCount,
+        COUNT(CASE WHEN LT.Name = 'Duplicate' THEN 1 END) AS DuplicatePostsCount,
+        MAX(CASE WHEN LT.Name = 'Duplicate' THEN PL.CreationDate END) AS LastDuplicateLinkDate
+    FROM PostLinks PL
+    JOIN LinkTypes LT ON PL.LinkTypeId = LT.Id
+    GROUP BY PL.PostId
+),
+InterestingPostsCandidates AS (
+    SELECT P.Id AS PostId, P.OwnerUserId, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount
+    FROM Posts P
+    WHERE P.PostTypeId = 1
+      AND P.ViewCount > 5000
+      AND P.FavoriteCount > 50
+      AND P.CreationDate >= TIMESTAMP '2023-01-01'
+    UNION ALL
+    SELECT P.Id AS PostId, P.OwnerUserId, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount
+    FROM Posts P
+    WHERE P.PostTypeId = 2
+      AND P.Score > 20
+      AND P.CommentCount > 5
+      AND P.CreationDate >= TIMESTAMP '2023-01-01'
+),
+ProblematicPosts AS (
+    SELECT P.Id AS PostId
+    FROM Posts P
+    JOIN PostRevisionMetrics PRM ON P.Id = PRM.PostId
+    WHERE PRM.TotalRevisions > 5
+      AND P.Score < 5
+      AND P.CreationDate >= TIMESTAMP '2023-01-01'
+      AND (P.ClosedDate IS NOT NULL OR PRM.ClosedDateFromHistory IS NOT NULL)
+)
+SELECT
+    U.DisplayName AS UserName,
+    UE.Reputation,
+    UE.TotalQuestionsOwned,
+    UE.TotalAnswersOwned,
+    UE.TotalCommentsMade,
+    UE.TotalPostsScoreReceived,
+    UE.GoldBadgesCount,
+    UE.TotalBountyGivenAmount,
+    P.Id AS PostId,
+    P.Title AS PostTitle,
+    PT.Name AS PostTypeName,
+    P.Score AS PostScore,
+    P.ViewCount AS PostViewCount,
+    P.CreationDate AS PostCreationDate,
+    P.LastActivityDate AS PostLastActivityDate,
+    COALESCE(P.LastEditDate, PRM.LastEditDateFromHistory) AS PostLastEditDateEffective,
+    PRM.TotalRevisions,
+    PRM.UniqueEditors,
+    PRM.WasCommunityOwnedEver,
+    PRM.HistoryCommentsCount,
+    PRM.AvgTimeBetweenRevisionsSeconds,
+    QD.AvgPositiveAnswerScore,
+    QD.UniqueFavoritedUsers,
+    QD.LatestHistoryTypeName,
+    PLA.LinkedPostsCount,
+    PLA.DuplicatePostsCount,
+    PLA.LastDuplicateLinkDate,
+    COALESCE(P.ClosedDate, PRM.ClosedDateFromHistory) AS EffectiveClosedDate,
+    (EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) / (60 * 60 * 24)) AS PostLifecycleDays,
+    (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 2) AS UpvoteCount,
+    (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 3) AS DownvoteCount,
+    (SELECT COUNT(C.Id) FROM Comments C WHERE C.PostId = P.Id) AS CommentCountOnPost,
+    CAST(NULLIF(P.Score, 0) AS numeric) / CAST(NULLIF(P.ViewCount, 0) AS numeric) AS ScorePerViewRatio,
+    CASE
+        WHEN P.PostTypeId = 1 AND QD.AcceptedAnswerId != -1 THEN 'Accepted'
+        WHEN P.PostTypeId = 1 AND COALESCE(P.ClosedDate, PRM.ClosedDateFromHistory) IS NOT NULL THEN 'Closed'
+        WHEN P.PostTypeId = 1 AND P.AnswerCount = 0 AND P.LastActivityDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 months') THEN 'Unanswered & Stale'
+        WHEN P.PostTypeId = 1 AND P.AnswerCount = 0 THEN 'No Answers'
+        ELSE 'Active'
+    END AS PostStatus,
+    RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate ASC) AS RankInPostTypeByScore,
+    NTILE(10) OVER (ORDER BY P.ViewCount DESC) AS ViewCountDecile,
+    PERCENT_RANK() OVER (ORDER BY UE.Reputation DESC) AS UserReputationPercentRank,
+    CASE
+        WHEN P.ViewCount > 10000 AND P.FavoriteCount > 100 AND P.Score > 50 THEN 'Very Hot'
+        WHEN P.ViewCount > 1000 AND P.FavoriteCount > 10 AND P.Score > 10 THEN 'Hot'
+        WHEN P.ViewCount < 100 AND P.Score < 0 AND P.LastActivityDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months') THEN 'Cold & Unloved'
+        ELSE 'Normal'
+    END AS HotPostIndicator,
+    COALESCE(AD.AnswerScore, 0) AS AcceptedAnswerScore,
+    COALESCE(AU.DisplayName, 'Community') AS AcceptedAnswerOwnerDisplayName,
+    TRIM(UPPER(SUBSTRING(COALESCE(P.Title, P.Body, 'No Content'), 1, 100))) AS TitleOrBodyExcerptUpper,
+    LENGTH(P.Body) AS BodyLength,
+    (NULLIF(LENGTH(TRIM(P.Body)), 0) IS NULL) AS IsBodyEmptyOrWhitespace,
+    QD.TagArray,
+    (
+        SELECT COUNT(DISTINCT A.OwnerUserId)
+        FROM Posts A
+        WHERE A.ParentId = P.Id AND A.PostTypeId = 2
+    ) AS UniqueAnswerersForQuestion,
+    (
+        SELECT SUM(A.Score)
+        FROM Posts A
+        WHERE A.ParentId = P.Id AND A.PostTypeId = 2
+    ) AS TotalAnswerScoreForQuestion,
+    (
+        SELECT STRING_AGG(B.Name, ', ')
+        FROM Badges B
+        WHERE B.UserId = U.Id AND B.Class = 1
+        ORDER BY B.Date DESC
+        LIMIT 3
+    ) AS Top3GoldBadges
+FROM Posts P
+LEFT JOIN PostTypes PT ON P.PostTypeId = PT.Id
+LEFT JOIN Users U ON P.OwnerUserId = U.Id
+LEFT JOIN UserEngagement UE ON U.Id = UE.UserId
+LEFT JOIN PostRevisionMetrics PRM ON P.Id = PRM.PostId
+LEFT JOIN QuestionDetails QD ON P.Id = QD.QuestionId AND P.PostTypeId = 1
+LEFT JOIN AnswerDetails AD ON P.AcceptedAnswerId = AD.AnswerId AND P.PostTypeId = 1
+LEFT JOIN Users AU ON AD.AnswerOwnerUserId = AU.Id
+LEFT JOIN PostLinkAnalysis PLA ON P.Id = PLA.PostId
+WHERE
+    P.Id IN (
+        SELECT PostId FROM InterestingPostsCandidates
+        EXCEPT
+        SELECT PostId FROM ProblematicPosts
+    )
+    AND P.CreationDate >= TIMESTAMP '2023-01-01'
+    AND P.PostTypeId IN (1, 2)
+    AND (U.Reputation IS NULL OR U.Reputation > 50)
+    AND (P.ViewCount > 50 OR P.Score > 10 OR P.CommentCount > 2)
+ORDER BY
+    P.LastActivityDate DESC,
+    UE.Reputation DESC,
+    P.Score DESC
+LIMIT 10000;

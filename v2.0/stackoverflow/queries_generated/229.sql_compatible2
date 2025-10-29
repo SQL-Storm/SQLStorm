@@ -1,0 +1,337 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'unknown.host') as website_host,
+        width_bucket(u.reputation, 0, 100000, 10) as rep_bucket
+    from users u
+    where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '2 year' from users)
+),
+user_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        sum(coalesce(p.score,0)) as post_score,
+        sum(coalesce(p.viewcount,0)) as views,
+        max(p.lastactivitydate) as last_post_activity
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+user_badges as (
+    select
+        b.userid as user_id,
+        count(*) as badges_total,
+        count(*) filter (where b.class = 1) as gold,
+        count(*) filter (where b.class = 2) as silver,
+        count(*) filter (where b.class = 3) as bronze,
+        max(b.date) as last_badge_date,
+        count(*) filter (where b.tagbased = true) as tag_badges
+    from badges b
+    group by b.userid
+),
+recent_questions as (
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.tags,
+        p.title,
+        (p.closeddate is not null) as is_closed
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= (select date_trunc('year', max(creationdate)) - interval '1 year' from posts)
+),
+q_engagement as (
+    select
+        rq.post_id,
+        rq.user_id,
+        rq.creationdate,
+        rq.score,
+        rq.viewcount,
+        rq.answercount,
+        rq.tags,
+        rq.title,
+        rq.is_closed,
+        v_up.upvotes,
+        v_dn.downvotes,
+        v_fav.favorites,
+        a_cnt.answers_total,
+        a_acc.accepted_answer_exists
+    from recent_questions rq
+    left join (
+        select postid, count(*) as upvotes
+        from votes
+        where votetypeid = 2
+        group by postid
+    ) v_up on v_up.postid = rq.post_id
+    left join (
+        select postid, count(*) as downvotes
+        from votes
+        where votetypeid = 3
+        group by postid
+    ) v_dn on v_dn.postid = rq.post_id
+    left join (
+        select postid, count(*) as favorites
+        from votes
+        where votetypeid = 5
+        group by postid
+    ) v_fav on v_fav.postid = rq.post_id
+    left join (
+        select parentid as qid, count(*) as answers_total
+        from posts
+        where posttypeid = 2
+        group by parentid
+    ) a_cnt on a_cnt.qid = rq.post_id
+    left join (
+        select parentid as qid, bool_or(id = any (array[coalesce((select acceptedanswerid from posts p2 where p2.id = parentid), -1)])) as accepted_answer_exists
+        from posts
+        where posttypeid = 2
+        group by parentid
+    ) a_acc on a_acc.qid = rq.post_id
+),
+hotness as (
+    select
+        qe.post_id,
+        qe.user_id,
+        qe.creationdate,
+        qe.score,
+        qe.viewcount,
+        qe.answercount,
+        qe.tags,
+        qe.title,
+        qe.is_closed,
+        coalesce(qe.upvotes,0) as upvotes,
+        coalesce(qe.downvotes,0) as downvotes,
+        coalesce(qe.favorites,0) as favorites,
+        coalesce(qe.answers_total,0) as answers_total,
+        coalesce(qe.accepted_answer_exists,false) as has_accepted,
+        (
+            1.0 * coalesce(qe.upvotes,0)
+            - 0.7 * coalesce(qe.downvotes,0)
+            + 0.2 * coalesce(qe.favorites,0)
+            + 0.15 * coalesce(qe.viewcount,0) * 1.0 / greatest(100, nullif(qe.viewcount,0))
+            + 0.5 * coalesce(qe.answers_total,0)
+            + case when coalesce(qe.accepted_answer_exists,false) then 2 else 0 end
+        )
+        /
+        nullif(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qe.creationdate)) / 86400 + 1, 0)
+        as engagement_score
+    from q_engagement qe
+),
+user_windows as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.creationdate,
+        ru.location,
+        ru.website_host,
+        ru.rep_bucket,
+        coalesce(ua.q_count,0) as q_count,
+        coalesce(ua.a_count,0) as a_count,
+        coalesce(ua.post_score,0) as post_score,
+        coalesce(ua.views,0) as views,
+        ua.last_post_activity,
+        coalesce(ub.badges_total,0) as badges_total,
+        coalesce(ub.gold,0) as gold,
+        coalesce(ub.silver,0) as silver,
+        coalesce(ub.bronze,0) as bronze,
+        coalesce(ub.tag_badges,0) as tag_badges,
+        ub.last_badge_date,
+        row_number() over (partition by ru.rep_bucket order by coalesce(ua.post_score,0) desc, coalesce(ua.views,0) desc, ru.reputation desc) as rn_in_bucket,
+        percentile_cont(0.9) within group (order by coalesce(ua.post_score,0)) over () as p90_post_score_global
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join user_badges ub on ub.user_id = ru.user_id
+),
+topic_tags as (
+    select
+        t.tagname,
+        t.count as tag_total_count,
+        coalesce(t.ismodulatoronly, 0) as mod_only,
+        coalesce(t.isrequired, 0) as is_required,
+        t.excerptpostid,
+        t.wikipostid
+    from tags t
+),
+question_tags as (
+    select
+        h.post_id,
+        unnest(string_to_array(substring(coalesce(h.tags,'<>'), 2, greatest(length(coalesce(h.tags,'<>'))-2,0)), '><')) as tagname
+    from hotness h
+),
+tag_metrics as (
+    select
+        qt.tagname,
+        count(distinct qt.post_id) as questions_in_recent_year,
+        sum(h.score) as tag_score_total,
+        avg(h.engagement_score) as avg_engagement,
+        max(h.engagement_score) as max_engagement
+    from question_tags qt
+    join hotness h on h.post_id = qt.post_id
+    group by qt.tagname
+),
+dupe_graph as (
+    select
+        pl.relatedpostid as canonical_id,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_incoming,
+        count(*) filter (where pl.linktypeid = 1) as linked_incoming
+    from postlinks pl
+    group by pl.relatedpostid
+),
+closed_reasons as (
+    select
+        ph.postid,
+        max(ph.creationdate) as last_closed_date,
+        max(case when ph.posthistorytypeid = 10 then cast(ph.comment as integer) end) as close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid in (10,35)
+    group by ph.postid
+),
+user_top_questions as (
+    select
+        h.user_id,
+        h.post_id,
+        h.title,
+        h.engagement_score,
+        row_number() over (partition by h.user_id order by h.engagement_score desc nulls last) as rn
+    from hotness h
+),
+combined as (
+    select
+        uw.user_id,
+        uw.displayname,
+        uw.reputation,
+        uw.rep_bucket,
+        uw.q_count,
+        uw.a_count,
+        uw.post_score,
+        uw.views,
+        uw.badges_total,
+        uw.gold,
+        uw.silver,
+        uw.bronze,
+        uw.tag_badges,
+        uw.last_post_activity,
+        utq.post_id as top_post_id,
+        utq.title as top_post_title,
+        utq.engagement_score as top_post_engagement,
+        h2.viewcount as top_post_views,
+        h2.score as top_post_score,
+        h2.answercount as top_post_answers,
+        cg.duplicate_incoming,
+        cg.linked_incoming,
+        cr.close_reason_id,
+        case
+            when cr.close_reason_id between 100 and 199 then 'modern-close'
+            when cr.close_reason_id between 1 and 99 then 'legacy-close'
+            when cr.close_reason_id is null then 'open-or-unknown'
+            else 'other'
+        end as close_bucket,
+        tm.tagname as top_tag,
+        tm.avg_engagement as top_tag_avg_engagement,
+        tm.max_engagement as top_tag_max_engagement,
+        tt.tag_total_count as tag_total_count,
+        tt.mod_only as tag_mod_only,
+        tt.is_required as tag_is_required,
+        row_number() over (order by coalesce(uw.post_score,0) desc, coalesce(utq.engagement_score,0) desc, uw.reputation desc) as global_rn,
+        uw.p90_post_score_global
+    from user_windows uw
+    left join user_top_questions utq on utq.user_id = uw.user_id and utq.rn = 1
+    left join hotness h2 on h2.post_id = utq.post_id
+    left join dupe_graph cg on cg.canonical_id = utq.post_id
+    left join closed_reasons cr on cr.postid = utq.post_id
+    left join lateral (
+        select qt.tagname
+        from question_tags qt
+        where qt.post_id = utq.post_id
+        order by qt.tagname
+        limit 1
+    ) first_tag on true
+    left join tag_metrics tm on tm.tagname = first_tag.tagname
+    left join topic_tags tt on tt.tagname = tm.tagname
+)
+select
+    c.user_id,
+    c.displayname,
+    c.reputation,
+    c.rep_bucket,
+    c.q_count,
+    c.a_count,
+    c.post_score,
+    c.views,
+    c.badges_total,
+    c.gold,
+    c.silver,
+    c.bronze,
+    c.tag_badges,
+    to_char(c.last_post_activity, 'YYYY-MM-DD"T"HH24:MI:SS') as last_post_activity_iso,
+    c.top_post_id,
+    coalesce(nullif(c.top_post_title,''), '(untitled)') as top_post_title,
+    round(c.top_post_engagement, 4) as top_post_engagement,
+    c.top_post_views,
+    c.top_post_score,
+    c.top_post_answers,
+    coalesce(c.duplicate_incoming,0) as duplicate_incoming,
+    coalesce(c.linked_incoming,0) as linked_incoming,
+    c.close_bucket,
+    coalesce(c.top_tag, '(no-tag)') as top_tag,
+    round(coalesce(c.top_tag_avg_engagement,0), 4) as top_tag_avg_engagement,
+    round(coalesce(c.top_tag_max_engagement,0), 4) as top_tag_max_engagement,
+    coalesce(c.tag_total_count,0) as tag_total_count,
+    c.tag_mod_only,
+    c.tag_is_required,
+    c.global_rn,
+    c.p90_post_score_global,
+    case
+        when c.post_score >= c.p90_post_score_global then 'top-performer'
+        when c.post_score >= 0.75 * c.p90_post_score_global then 'upper-quartile'
+        when c.post_score is null then 'no-posts'
+        else 'standard'
+    end as performance_band
+from combined c
+where (c.q_count + c.a_count) > 0
+  and (c.top_post_engagement is null or c.top_post_engagement >= 0)
+union all
+select
+    -1 as user_id,
+    '(all users summary)' as displayname,
+    cast(sum(reputation) as integer) as reputation,
+    null as rep_bucket,
+    cast(sum(q_count) as integer) as q_count,
+    cast(sum(a_count) as integer) as a_count,
+    cast(sum(post_score) as integer) as post_score,
+    cast(sum(views) as integer) as views,
+    cast(sum(badges_total) as integer) as badges_total,
+    cast(sum(gold) as integer) as gold,
+    cast(sum(silver) as integer) as silver,
+    cast(sum(bronze) as integer) as bronze,
+    cast(sum(tag_badges) as integer) as tag_badges,
+    null as last_post_activity_iso,
+    null as top_post_id,
+    '(n/a)' as top_post_title,
+    null as top_post_engagement,
+    null as top_post_views,
+    null as top_post_score,
+    null as top_post_answers,
+    null as duplicate_incoming,
+    null as linked_incoming,
+    null as close_bucket,
+    '(n/a)' as top_tag,
+    null as top_tag_avg_engagement,
+    null as top_tag_max_engagement,
+    null as tag_total_count,
+    null as tag_mod_only,
+    null as tag_is_required,
+    0 as global_rn,
+    'summary' as performance_band
+from combined
+order by global_rn nulls last, user_id asc;

@@ -1,0 +1,205 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        STRING_AGG(DISTINCT CAST(p.PostTypeId AS TEXT), ',') as PostTypes,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        UpVotes,
+        DownVotes,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        PostTypes,
+        LastPostDate,
+        LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) as Rank,
+        NTILE(100) OVER (ORDER BY Reputation) as Percentile,
+        LAG(Reputation) OVER (ORDER BY Reputation DESC) as PrevReputation,
+        LEAD(Reputation) OVER (ORDER BY Reputation DESC) as NextReputation
+    FROM UserStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with accepted answer'
+            WHEN p.PostTypeId = 1 THEN 'Question without accepted answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostTypeDescription,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 50 THEN 'Moderately Voted'
+            WHEN p.Score > 0 THEN 'Slightly Voted'
+            ELSE 'No Votes'
+        END as VotingStatus,
+        COALESCE(p.Tags, '') as CleanTags,
+        LENGTH(COALESCE(p.Tags, '')) as TagsLength,
+        TRIM(BOTH '<>' FROM COALESCE(p.Tags, '')) as TrimmedTags,
+        CASE 
+            WHEN LOWER(COALESCE(p.Tags, '')) LIKE '%sql%' THEN 'SQL Related'
+            WHEN LOWER(COALESCE(p.Tags, '')) LIKE '%python%' THEN 'Python Related'
+            WHEN LOWER(COALESCE(p.Tags, '')) LIKE '%javascript%' THEN 'JavaScript Related'
+            ELSE 'Other'
+        END as TopicCategory
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2022-01-01' 
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as Popularity,
+        COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'), 0) as PostsWithTag,
+        COALESCE((SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'), 0) as AvgScoreForTag
+    FROM Tags t
+    WHERE t.Count > 50
+),
+UserActivity AS (
+    SELECT 
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.PostCount,
+        r.CommentCount,
+        r.BadgeCount,
+        r.LastPostDate,
+        r.LastCommentDate,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - r.LastPostDate)) / 86400 AS INTEGER) as DaysSinceLastPost,
+        CASE 
+            WHEN CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - r.LastPostDate)) / 86400 AS INTEGER) < 30 THEN 'Active'
+            WHEN CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - r.LastPostDate)) / 86400 AS INTEGER) < 90 THEN 'Moderately Active'
+            ELSE 'Inactive'
+        END as ActivityStatus
+    FROM RankedUsers r
+    WHERE r.Reputation > 1000
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.PostCount,
+    ua.CommentCount,
+    ua.BadgeCount,
+    ua.LastPostDate,
+    ua.DaysSinceLastPost,
+    ua.ActivityStatus,
+    COALESCE(pa.PostId, 0) as RelatedPostId,
+    pa.Title as PostTitle,
+    pa.Score as PostScore,
+    pa.ViewCount as PostViews,
+    pa.CommentCount as PostComments,
+    pa.PostTypeDescription,
+    pa.TopicCategory,
+    ta.TagName,
+    ta.Count as TagCount,
+    ta.Popularity,
+    CASE 
+        WHEN ua.Reputation > (SELECT AVG(Reputation) FROM UserActivity) THEN 'Above Average'
+        WHEN ua.Reputation < (SELECT AVG(Reputation) FROM UserActivity) THEN 'Below Average'
+        ELSE 'Average'
+    END as ReputationComparison,
+    CASE 
+        WHEN ua.PostCount > (SELECT AVG(PostCount) FROM UserActivity) THEN 'Above Average Posts'
+        WHEN ua.PostCount < (SELECT AVG(PostCount) FROM UserActivity) THEN 'Below Average Posts'
+        ELSE 'Average Posts'
+    END as PostActivityComparison,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ua.UserId AND p.PostTypeId = 1 AND p.Score > 100) as HighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ua.UserId AND p.PostTypeId = 2 AND p.Score > 100) as HighScoreAnswers,
+    CASE 
+        WHEN ua.Reputation > 10000 AND ua.PostCount > 100 THEN 'Veteran Contributor'
+        WHEN ua.Reputation > 5000 AND ua.PostCount > 50 THEN 'Experienced Contributor'
+        WHEN ua.Reputation > 1000 AND ua.PostCount > 10 THEN 'Regular Contributor'
+        ELSE 'New Contributor'
+    END as ContributorTier,
+    'Benchmarking Query' as QueryName,
+    TIMESTAMP '2024-10-01 12:34:56' as BenchmarkDate
+FROM UserActivity ua
+LEFT JOIN PostAnalysis pa ON pa.OwnerUserId = ua.UserId
+LEFT JOIN TagAnalysis ta ON ta.TagName = ANY(string_to_array(LOWER(coalesce(pa.CleanTags, '')), '<>'))
+WHERE ua.ActivityStatus IN ('Active', 'Moderately Active')
+AND (
+    pa.PostTypeId = 1 
+    OR pa.PostTypeId = 2 
+    OR pa.PostTypeId IS NULL
+)
+AND (
+    ta.TagName IS NOT NULL 
+    OR pa.CleanTags IS NULL
+)
+AND (
+    pa.Score > 50 
+    OR pa.Score IS NULL
+)
+AND (
+    pa.ViewCount > 100 
+    OR pa.ViewCount IS NULL
+)
+UNION ALL
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.PostCount,
+    ua.CommentCount,
+    ua.BadgeCount,
+    ua.LastPostDate,
+    ua.DaysSinceLastPost,
+    ua.ActivityStatus,
+    0 as RelatedPostId,
+    'No Posts' as PostTitle,
+    -1 as PostScore,
+    -1 as PostViews,
+    -1 as PostComments,
+    'No Posts' as PostTypeDescription,
+    'None' as TopicCategory,
+    'No Tags' as TagName,
+    -1 as TagCount,
+    'None' as Popularity,
+    -1 as HighScoreQuestions,
+    -1 as HighScoreAnswers,
+    'No Activity' as ContributorTier,
+    'Benchmarking Query' as QueryName,
+    TIMESTAMP '2024-10-01 12:34:56' as BenchmarkDate
+FROM UserActivity ua
+WHERE ua.UserId NOT IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE OwnerUserId IS NOT NULL)
+AND ua.Reputation > 1000
+ORDER BY Reputation DESC, PostCount DESC
+LIMIT 1000000;

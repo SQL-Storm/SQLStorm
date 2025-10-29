@@ -1,0 +1,210 @@
+with recursive Recursive_CTE as (
+    select p.Id as PostId, p.Title, p.CreationDate, 
+           u.Id as UserId, u.DisplayName, u.Reputation,
+           dense_rank() over (partition by p.OwnerUserId order by p.CreationDate) as PostOrder,
+           coalesce(p.Score,0) as PostScore,
+           p.ViewCount,
+           array_length(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'),1) as TagCount,
+           p.Tags
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1 and u.Reputation > 1000 and p.Tags is not null
+    union all
+    select p2.Id, p2.Title, p2.CreationDate,
+           u2.Id, u2.DisplayName, u2.Reputation,
+           r.PostOrder + 1,
+           coalesce(p2.Score,0),
+           p2.ViewCount,
+           array_length(string_to_array(substring(p2.Tags from 2 for length(p2.Tags)-2), '><'),1),
+           p2.Tags
+    from Posts p2
+    inner join Recursive_CTE r on p2.OwnerUserId = r.UserId and p2.CreationDate > r.CreationDate
+    left join Users u2 on p2.OwnerUserId = u2.Id
+    where p2.PostTypeId = 1 and u2.Reputation > 1000 and p2.Tags is not null and r.PostOrder < 3
+),
+BadgesAgg as (
+    select UserId,
+           count(case when Class=1 then 1 end) as GoldBadges,
+           count(case when Class=2 then 1 end) as SilverBadges,
+           count(case when Class=3 then 1 end) as BronzeBadges,
+           bool_or(TagBased) as HasTagBasedBadge
+    from Badges
+    group by UserId
+),
+MaxScoreAnswers as (
+    select ParentId as QuestionId,
+           max(Score) as MaxAnswerScore
+    from Posts
+    where PostTypeId=2
+    group by ParentId
+),
+AnswerDetails as (
+    select a.Id as AnswerId, a.ParentId as QuestionId, a.Score,
+           u.Id as OwnerId, u.Reputation, u.DisplayName,
+           row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2
+),
+PostVotesWindow AS (
+    select p.Id as PostId,
+           p.Title,
+           p.Score,
+           p.ViewCount,
+           COALESCE(vt_up.votes,0) AS UpVotes,
+           COALESCE(vt_down.votes,0) AS DownVotes,
+           row_number() over (partition by p.OwnerUserId order by p.Score desc) as HighScoreRank
+    from Posts p
+    left join (
+       select PostId, count(*) as votes
+       from Votes v
+       where v.VoteTypeId = 2
+       group by PostId
+    ) vt_up on vt_up.PostId = p.Id
+    left join (
+       select PostId, count(*) as votes
+       from Votes v
+       where v.VoteTypeId = 3
+       group by PostId
+    ) vt_down on vt_down.PostId = p.Id
+    where p.PostTypeId in (1,2)
+),
+CloseReasonCounts as (
+    select ph.Comment as CloseReasonId, crt.Name as CloseReasonName, count(ph.Id) as CloseCount
+    from PostHistory ph
+    left join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+    group by ph.Comment, crt.Name
+),
+Duplicates as (
+    select pl.PostId, count(distinct pl.RelatedPostId) as DuplicateCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId
+),
+QuestionTags as (
+    select p.Id as PostId,
+           unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag
+    from Posts p
+    where p.PostTypeId=1 and p.Tags is not null
+),
+TopTags as (
+    select Tag, count(*) as Frequency
+    from QuestionTags
+    group by Tag
+    order by Frequency desc
+    limit 10
+),
+TagQuestionScores as (
+    select qt.Tag, avg(p.Score) as AvgScore, percentile_cont(0.5) within group (order by p.ViewCount) as MedianViewCount
+    from QuestionTags qt
+    join Posts p on qt.PostId = p.Id
+    group by qt.Tag
+),
+UserBadgeRatio as (
+    select u.Id as UserId, u.DisplayName,
+           coalesce(b.GoldBadges,0) as GoldBadges,
+           coalesce(b.SilverBadges,0) as SilverBadges,
+           coalesce(b.BronzeBadges,0) as BronzeBadges,
+           case when coalesce(b.SilverBadges,0) > 0 then (coalesce(b.GoldBadges,0)::double precision)/coalesce(b.SilverBadges,0) else null end as GoldToSilverRatio,
+           case when coalesce(b.BronzeBadges,0) > 0 then (coalesce(b.SilverBadges,0)::double precision)/coalesce(b.BronzeBadges,0) else null end as SilverToBronzeRatio
+    from Users u
+    left join BadgesAgg b on u.Id = b.UserId
+    where u.Reputation > 500
+),
+UserPostAggregate AS (
+    select OwnerUserId as UserId,
+       count(*) as TotalPosts,
+       sum(Score) as TotalPostScore,
+       avg(Score) as AvgPostScore,
+       count(distinct case when PostTypeId=1 then Id end) as QuestionCount,
+       count(distinct case when PostTypeId=2 then Id end) as AnswerCount,
+       bool_or(ClosedDate is not null) as HasClosedPosts
+    from Posts
+    group by OwnerUserId
+    having count(*) > 10
+)
+select 
+    r.PostId,
+    r.Title,
+    r.CreationDate,
+    r.DisplayName as OwnerName,
+    r.Reputation as OwnerReputation,
+    r.PostOrder,
+    r.PostScore,
+    r.ViewCount,
+    r.TagCount,
+    b.GoldBadges, b.SilverBadges, b.BronzeBadges, b.HasTagBasedBadge,
+    coalesce(m.MaxAnswerScore,0) as QuestionMaxAnswerScore,
+    ad.AnswerId,
+    ad.Score as AnswerScore,
+    ad.OwnerId as AnswerOwnerId,
+    ad.DisplayName as AnswerOwnerName,
+    ad.Reputation as AnswerOwnerReputation,
+    pv.UpVotes,
+    pv.DownVotes,
+    cr.CloseReasonName,
+    d.DuplicateCount,
+    ts.Tag as PopularTag,
+    ts.Frequency as PopularTagFrequency,
+    tqs.AvgScore as PopularTagAvgScore,
+    tqs.MedianViewCount as PopularTagMedianView,
+    ubr.GoldToSilverRatio,
+    ubr.SilverToBronzeRatio,
+    upa.TotalPosts,
+    upa.TotalPostScore,
+    upa.AvgPostScore,
+    upa.QuestionCount,
+    upa.AnswerCount,
+    upa.HasClosedPosts
+from Recursive_CTE r
+left join BadgesAgg b on b.UserId = r.UserId
+left join MaxScoreAnswers m on m.QuestionId = r.PostId
+left join AnswerDetails ad on ad.QuestionId = r.PostId and ad.AnswerRank = 1
+left join PostVotesWindow pv on pv.PostId = r.PostId
+left join PostHistory ph on ph.PostId = r.PostId and ph.PostHistoryTypeId = 10
+left join CloseReasonCounts cr on cr.CloseReasonId = ph.Comment
+left join Duplicates d on d.PostId = r.PostId
+left join TopTags ts on ts.Tag = any(string_to_array(substring(r.Tags from 2 for length(r.Tags)-2), '><'))
+left join TagQuestionScores tqs on tqs.Tag = ts.Tag
+left join UserBadgeRatio ubr on ubr.UserId = r.UserId
+left join UserPostAggregate upa on upa.UserId = r.UserId
+where r.PostOrder = 1
+group by
+    r.PostId,
+    r.Title,
+    r.CreationDate,
+    r.DisplayName,
+    r.Reputation,
+    r.PostOrder,
+    r.PostScore,
+    r.ViewCount,
+    r.TagCount,
+    b.GoldBadges,
+    b.SilverBadges,
+    b.BronzeBadges,
+    b.HasTagBasedBadge,
+    m.MaxAnswerScore,
+    ad.AnswerId,
+    ad.Score,
+    ad.OwnerId,
+    ad.DisplayName,
+    ad.Reputation,
+    pv.UpVotes,
+    pv.DownVotes,
+    cr.CloseReasonName,
+    d.DuplicateCount,
+    ts.Tag,
+    ts.Frequency,
+    tqs.AvgScore,
+    tqs.MedianViewCount,
+    ubr.GoldToSilverRatio,
+    ubr.SilverToBronzeRatio,
+    upa.TotalPosts,
+    upa.TotalPostScore,
+    upa.AvgPostScore,
+    upa.QuestionCount,
+    upa.AnswerCount,
+    upa.HasClosedPosts
+order by r.Reputation desc, r.PostScore desc
+limit 100;

@@ -1,0 +1,244 @@
+WITH
+user_agg AS (
+    SELECT
+        u.Id                                   AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id)                             AS total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS question_score_sum,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS answer_score_sum,
+        MAX(p.CreationDate)                    AS newest_post_date,
+        MIN(p.CreationDate)                    AS oldest_post_date,
+        COUNT(DISTINCT v.VoteTypeId)           AS distinct_vote_types,
+        COALESCE(SUM(v.BountyAmount),0)         AS total_bounty_awarded
+    FROM Users u
+    LEFT JOIN Posts p          ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v          ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+badge_summary AS (
+    SELECT
+        b.UserId                                   AS user_id,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)  AS gold_cnt,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)  AS silver_cnt,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)  AS bronze_cnt,
+        MAX(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS has_tag_badge
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+recent_titles AS (
+    SELECT
+        u.Id                                     AS user_id,
+        (SELECT p.Title
+         FROM Posts p
+         WHERE p.OwnerUserId = u.Id
+           AND p.Title IS NOT NULL
+         ORDER BY p.CreationDate DESC
+         FETCH FIRST 1 ROWS ONLY)               AS latest_title
+    FROM Users u
+),
+
+-- Split tags by parsing string without UNNEST: generate tag rows by using recursive CTE
+post_tags AS (
+    SELECT
+        p.OwnerUserId AS owner_user_id,
+        p.Tags,
+        NULL::VARCHAR AS tag,
+        1 AS pos
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+      AND TRIM(BOTH '<>' FROM p.Tags) <> ''
+    UNION ALL
+    SELECT
+        owner_user_id,
+        Tags,
+        CASE
+            WHEN instr_part_next IS NULL THEN NULL
+            ELSE instr_part_next
+        END AS tag,
+        pos + 1
+    FROM (
+        SELECT
+            owner_user_id,
+            Tags,
+            pos,
+            -- extract nth tag: remove leading '<' and split by '><'
+            -- compute substring starting after previous '><' occurrences
+            SUBSTR(
+              TRIM(BOTH '<>' FROM Tags),
+              CASE WHEN pos = 1 THEN 1 ELSE (
+                -- find start index for pos
+                LENGTH(
+                  COALESCE(
+                    NULLIF(
+                      REGEXP_REPLACE(TRIM(BOTH '<>' FROM Tags), '(([^>]*>){' || (pos-1) || '}).*$', '\1'),
+                      ''
+                    ),
+                    ''
+                  )
+                ) + 1
+              ) END
+            ) AS rest_of_tags,
+            -- compute next piece up to next '><'
+            NULL AS instr_part_next
+        FROM (
+            SELECT owner_user_id, Tags, pos
+            FROM (
+                SELECT p.OwnerUserId AS owner_user_id, p.Tags
+                FROM Posts p
+                WHERE p.PostTypeId = 1
+                  AND p.Tags IS NOT NULL
+                  AND TRIM(BOTH '<>' FROM p.Tags) <> ''
+            ) base
+            CROSS JOIN (SELECT 1 AS pos UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10) nums
+        ) t1
+    ) t2
+),
+-- Since recursive splitting with portable functions is complex across dialects, use a safer approach:
+-- Extract tags by replacing delimiters and splitting via a simple numbers table up to a reasonable max tags per post (e.g., 10)
+numbers AS (
+    SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+    UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+),
+post_tag_expanded AS (
+    SELECT
+        p.OwnerUserId AS owner_user_id,
+        TRIM(BOTH '<>' FROM p.Tags) AS tags_clean,
+        n.n
+    FROM Posts p
+    JOIN numbers n ON TRUE
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+      AND TRIM(BOTH '<>' FROM p.Tags) <> ''
+),
+post_tag_parsed AS (
+    SELECT
+        owner_user_id,
+        -- get nth tag by splitting on '><'
+        CASE
+            WHEN n = 1 THEN
+                CASE WHEN POSITION('><' IN tags_clean) = 0 THEN tags_clean
+                     ELSE SUBSTR(tags_clean, 1, POSITION('><' IN tags_clean)-1) END
+            ELSE
+                CASE
+                    WHEN POSITION('><' IN tags_clean) = 0 THEN NULL
+                    ELSE
+                        -- iterative extraction: remove first n-1 tags and take up to next delimiter
+                        CASE
+                            WHEN POSITION('><' IN SUBSTR(tags_clean, start_pos)) = 0 THEN SUBSTR(tags_clean, start_pos)
+                            ELSE SUBSTR(tags_clean, start_pos, POSITION('><' IN SUBSTR(tags_clean, start_pos)) - 1)
+                        END
+                END
+        END AS tag
+    FROM (
+        SELECT
+            owner_user_id,
+            tags_clean,
+            n,
+            -- start_pos: position after first n-1 occurrences of '><'
+            CASE
+                WHEN n = 1 THEN 1
+                ELSE (
+                    -- build pattern to skip n-1 occurrences: find position by repeated searches is not portable; approximate by searching
+                    LENGTH(
+                      COALESCE(
+                        NULLIF(
+                          REGEXP_REPLACE(tags_clean, '(^(([^>]*>){' || (n-1) || '}).*$', '\1'),
+                          ''
+                        ),
+                        ''
+                      )
+                    ) + 1
+                )
+            END AS start_pos
+        FROM post_tag_expanded
+    ) t
+),
+post_tag_final AS (
+    SELECT DISTINCT owner_user_id AS user_id, tag
+    FROM post_tag_parsed
+    WHERE tag IS NOT NULL
+),
+
+user_top_tag AS (
+    SELECT user_id, tag
+    FROM (
+        SELECT
+            ptf.user_id,
+            ptf.tag,
+            ROW_NUMBER() OVER (PARTITION BY ptf.user_id ORDER BY COUNT(*) OVER (PARTITION BY ptf.user_id, ptf.tag) DESC, ptf.tag) AS rn
+        FROM post_tag_final ptf
+    ) t
+    WHERE rn = 1
+),
+
+recent_up_votes AS (
+    SELECT DISTINCT v.UserId
+    FROM Votes v
+    WHERE v.VoteTypeId = 2
+      AND v.CreationDate > (DATE '2024-10-01' - INTERVAL '30' DAY)
+),
+recent_down_votes AS (
+    SELECT DISTINCT v.UserId
+    FROM Votes v
+    WHERE v.VoteTypeId = 3
+      AND v.CreationDate > (DATE '2024-10-01' - INTERVAL '30' DAY)
+),
+active_voters AS (
+    SELECT UserId FROM recent_up_votes
+    INTERSECT
+    SELECT UserId FROM recent_down_votes
+),
+
+final_set AS (
+    SELECT
+        ua.user_id,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.total_posts,
+        ua.question_score_sum,
+        ua.answer_score_sum,
+        ua.newest_post_date,
+        ua.oldest_post_date,
+        ua.distinct_vote_types,
+        ua.total_bounty_awarded,
+        COALESCE(bs.gold_cnt,0)     AS gold_badges,
+        COALESCE(bs.silver_cnt,0)   AS silver_badges,
+        COALESCE(bs.bronze_cnt,0)   AS bronze_badges,
+        CASE WHEN COALESCE(bs.has_tag_badge,0) = 1 THEN 'YES' ELSE 'NO' END AS has_tag_badge,
+        rt.latest_title,
+        COALESCE(utt.tag,'<none>')  AS top_tag,
+        CASE
+            WHEN av.UserId IS NOT NULL THEN 'ACTIVE VOTER'
+            ELSE 'PASSIVE'
+        END                        AS voter_status,
+        ROUND(
+            (ua.question_score_sum * 1.5 +
+             ua.answer_score_sum * 2.0 +
+             ua.total_bounty_awarded * 0.8) /
+            NULLIF(ua.total_posts,0), 2
+        )                         AS engagement_score,
+        ('User#' || ua.user_id || ': ' ||
+            COALESCE(ua.DisplayName, 'Anonymous') || ' | ' ||
+            'Rep ' || ua.Reputation || ' | ' ||
+            'Posts ' || ua.total_posts || ' | ' ||
+            'Gold ' || COALESCE(bs.gold_cnt,0) || ', ' ||
+            'Silver ' || COALESCE(bs.silver_cnt,0) || ', ' ||
+            'Bronze ' || COALESCE(bs.bronze_cnt,0)
+        )                         AS diagnostic_blob
+    FROM user_agg ua
+    LEFT JOIN badge_summary bs          ON bs.user_id = ua.user_id
+    LEFT JOIN recent_titles rt          ON rt.user_id = ua.user_id
+    LEFT JOIN user_top_tag utt          ON utt.user_id = ua.user_id
+    LEFT JOIN active_voters av          ON av.UserId = ua.user_id
+)
+
+SELECT *
+FROM final_set
+WHERE engagement_score > 0
+   AND voter_status = 'ACTIVE VOTER'
+ORDER BY engagement_score DESC
+LIMIT 100;

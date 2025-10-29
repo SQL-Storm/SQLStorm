@@ -1,0 +1,198 @@
+with recursive UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        dense_rank() over (order by u.Reputation desc) as RankByRep
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName, u.Reputation
+),
+TopUsersQuestions as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        coalesce(p.AcceptedAnswerId, -1) as AcceptedAnswerId,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as RN
+    from Posts p
+    join PostTypes pt on p.PostTypeId = pt.Id and pt.Name = 'Question'
+    where p.OwnerUserId in (
+        select UserId from UserBadgeCounts where RankByRep <= 100
+    )
+),
+AnswersWithVotes as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Score,
+        coalesce(v.UpVotes, 0) as UpVotes,
+        coalesce(v.DownVotes, 0) as DownVotes,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    left join (
+        select
+            PostId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on v.VoteTypeId = vt.Id
+        group by PostId
+    ) v on a.Id = v.PostId
+    join PostTypes pt on a.PostTypeId = pt.Id and pt.Name = 'Answer'
+),
+QuestionsWithStats as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.AcceptedAnswerId,
+        ab.AnswerCount,
+        ab.TopAnswerScore,
+        ab.TopAnswerUpVotes,
+        ab.TopAnswerDownVotes,
+        ab.TopAnswerCreationDate,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        u.DisplayName as QuestionOwnerName
+    from TopUsersQuestions q
+    left join (
+        select
+            awv.QuestionId,
+            count(*) filter (where awv.AnswerRank <= 5) as AnswerCount,
+            max(awv.Score) filter (where awv.AnswerRank = 1) as TopAnswerScore,
+            max(awv.UpVotes) filter (where awv.AnswerRank = 1) as TopAnswerUpVotes,
+            max(awv.DownVotes) filter (where awv.AnswerRank = 1) as TopAnswerDownVotes,
+            max(awv.CreationDate) filter (where awv.AnswerRank = 1) as TopAnswerCreationDate
+        from AnswersWithVotes awv
+        group by awv.QuestionId
+    ) ab on q.QuestionId = ab.QuestionId
+    left join UserBadgeCounts ubc on q.OwnerUserId = ubc.UserId
+    left join Users u on q.OwnerUserId = u.Id
+),
+RecentCloseVotes as (
+    select
+        ph.PostId,
+        ph.CreationDate as CloseVoteDate,
+        crt.Name as CloseReason,
+        count(*) over (partition by ph.PostId) as CloseVoteCount
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    where ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+),
+RareTags as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count
+    from Tags t
+    where t.Count < 1000
+),
+QuestionTagsExploded as (
+    select
+        qws.QuestionId,
+        trim(both ' ' from unnest(string_to_array(substring(qws.Tags from 2 for char_length(qws.Tags)-2), '><'))) as Tag
+    from QuestionsWithStats qws
+),
+RareTaggedQuestions as (
+    select distinct
+        qte.QuestionId
+    from QuestionTagsExploded qte
+    join RareTags rt on qte.Tag = rt.TagName
+),
+FinalRankedQuestions as (
+    select
+        qws.QuestionId,
+        qws.Title,
+        qws.OwnerUserId,
+        qws.QuestionCreationDate,
+        qws.QuestionScore,
+        qws.ViewCount,
+        qws.Tags,
+        qws.AcceptedAnswerId,
+        qws.AnswerCount,
+        qws.TopAnswerScore,
+        qws.TopAnswerUpVotes,
+        qws.TopAnswerDownVotes,
+        qws.TopAnswerCreationDate,
+        qws.GoldBadges,
+        qws.SilverBadges,
+        qws.BronzeBadges,
+        qws.QuestionOwnerName,
+        rc.CloseVoteCount,
+        rc.CloseReason,
+        case when rqt.QuestionId is not null then 1 else 0 end as HasRareTag,
+        rank() over (order by qws.QuestionScore desc, qws.AnswerCount desc, qws.ViewCount desc) as GlobalRank
+    from QuestionsWithStats qws
+    left join RecentCloseVotes rc on qws.QuestionId = rc.PostId
+    left join RareTaggedQuestions rqt on qws.QuestionId = rqt.QuestionId
+)
+select
+    frq.GlobalRank,
+    frq.QuestionId,
+    frq.Title,
+    frq.QuestionOwnerName,
+    frq.QuestionCreationDate,
+    frq.QuestionScore,
+    frq.ViewCount,
+    frq.AnswerCount,
+    frq.TopAnswerScore,
+    frq.TopAnswerUpVotes,
+    frq.TopAnswerDownVotes,
+    frq.TopAnswerCreationDate,
+    frq.GoldBadges,
+    frq.SilverBadges,
+    frq.BronzeBadges,
+    frq.CloseVoteCount,
+    frq.CloseReason,
+    frq.HasRareTag,
+    string_agg(distinct
+        case when rt.TagName is not null then concat('[RARE]', rt.TagName)
+             else qte.Tag
+        end, ', ' order by qte.Tag) as TagsWithRareFlags,
+    (
+      frq.QuestionScore
+      + coalesce(frq.AnswerCount, 0) * 1.5
+      + coalesce(frq.GoldBadges, 0) * 5
+      + coalesce(frq.SilverBadges, 0) * 3
+      + coalesce(frq.BronzeBadges, 0) * 1
+      - extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - frq.QuestionCreationDate))/86400 * 0.05
+    ) as AdjustedScore
+from FinalRankedQuestions frq
+left join QuestionTagsExploded qte on frq.QuestionId = qte.QuestionId
+left join RareTags rt on qte.Tag = rt.TagName
+group by
+    frq.GlobalRank,
+    frq.QuestionId,
+    frq.Title,
+    frq.QuestionOwnerName,
+    frq.QuestionCreationDate,
+    frq.QuestionScore,
+    frq.ViewCount,
+    frq.AnswerCount,
+    frq.TopAnswerScore,
+    frq.TopAnswerUpVotes,
+    frq.TopAnswerDownVotes,
+    frq.TopAnswerCreationDate,
+    frq.GoldBadges,
+    frq.SilverBadges,
+    frq.BronzeBadges,
+    frq.CloseVoteCount,
+    frq.CloseReason,
+    frq.HasRareTag
+order by AdjustedScore desc
+limit 100;

@@ -1,0 +1,233 @@
+-- {"query": "1041.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3452} 
+
+WITH UserActivitySummary AS (
+    -- Aggregates various activities for each user, filtering for specific post types
+    SELECT
+        U.Id AS UserId,
+        U.CreationDate AS UserCreationDate,
+        U.Reputation,
+        U.Views,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 2) AS AnswerCount,
+        SUM(COALESCE(P.Score, 0)) FILTER (WHERE P.PostTypeId = 1) AS TotalQuestionScore,
+        SUM(COALESCE(P.Score, 0)) FILTER (WHERE P.PostTypeId = 2) AS TotalAnswerScore,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        MAX(P.CreationDate) AS LastPostDate,
+        MIN(P.CreationDate) AS FirstPostDate
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    GROUP BY U.Id, U.CreationDate, U.Reputation, U.Views, U.UpVotes, U.DownVotes
+    HAVING COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 1) >= 1 -- Only consider users who have asked at least one question
+),
+HighlyEngagedQuestions AS (
+    -- Identifies highly scored questions with an accepted answer within a specific timeframe
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        A.CreationDate AS AcceptedAnswerCreationDate,
+        EXTRACT(EPOCH FROM (A.CreationDate - Q.CreationDate)) / 3600.0 AS TimeToAcceptanceHours -- Time to acceptance in hours
+    FROM Posts AS Q
+    INNER JOIN Posts AS A ON Q.AcceptedAnswerId = A.Id -- Ensure an accepted answer exists
+    WHERE
+        Q.PostTypeId = 1
+        AND Q.AcceptedAnswerId IS NOT NULL
+        AND Q.Score >= 50
+        AND A.Score >= 10
+        AND Q.CreationDate BETWEEN '2020-01-01' AND '2023-06-30' -- Active timeframe for questions
+),
+QuestionCommentEngagement AS (
+    -- Counts comments made by the question owner on their own questions
+    SELECT
+        P.OwnerUserId AS UserId,
+        P.Id AS PostId,
+        COUNT(C.Id) AS NumCommentsByOwnerOnQuestion,
+        SUM(LENGTH(C.Text)) AS TotalCommentLengthByOwner,
+        AVG(C.Score) AS AvgCommentScoreByOwner
+    FROM Posts AS P
+    INNER JOIN Comments AS C ON P.Id = C.PostId AND P.OwnerUserId = C.UserId
+    WHERE P.PostTypeId = 1 -- Focus on comments on questions
+    GROUP BY P.OwnerUserId, P.Id
+    HAVING COUNT(C.Id) >= 2 -- Owner made at least two comments on a single question
+),
+PostHistoricalEdits AS (
+    -- Summarizes significant edits (Title, Body, Tags) for posts
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS SignificantEditCount, -- Count of title, body, or tag edits
+        MAX(PH.CreationDate) AS LastHistoryDate,
+        MIN(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (1, 2, 3)) AS InitialPostHistoryDate,
+        SUM(CASE WHEN PH.Text LIKE '%<a href="%"%' THEN 1 ELSE 0 END) AS LinkInsertionEditCount -- Detect if any edit text contained a new link
+    FROM PostHistory AS PH
+    WHERE PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) -- Initial creation and significant edits
+    GROUP BY PH.PostId
+    HAVING COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) <= 3 -- Limit to questions with few post-initial edits
+),
+MigrationInvolvedUsers AS (
+    -- Identifies users who have had posts migrated (away or here)
+    SELECT DISTINCT
+        PH.UserId
+    FROM PostHistory AS PH
+    WHERE PH.PostHistoryTypeId IN (35, 36) -- Post Migrated Away (35) or Here (36)
+    AND PH.UserId IS NOT NULL
+),
+TopGoldBadgeUsers AS (
+    -- Filters for users with a significant number of gold badges and high reputation
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS GoldBadgeCount,
+        MAX(B.Date) AS LatestGoldBadgeDate
+    FROM Badges AS B
+    INNER JOIN Users AS U ON B.UserId = U.Id
+    WHERE B.Class = 1 -- Gold Badges
+    AND U.Reputation >= 10000 -- Only consider high-reputation users
+    GROUP BY B.UserId
+    HAVING COUNT(B.Id) >= 2 -- At least two gold badges
+)
+-- Main query: Combines and ranks users based on complex criteria, then union with a distinct set of users
+SELECT
+    UAS.UserId,
+    U.DisplayName,
+    U.Location,
+    UAS.UserCreationDate,
+    UAS.Reputation,
+    UAS.QuestionCount,
+    UAS.AnswerCount,
+    UAS.TotalQuestionScore,
+    UAS.TotalCommentScore,
+    HEQ.QuestionId,
+    HEQ.QuestionScore,
+    HEQ.TimeToAcceptanceHours,
+    HEQ.QuestionViewCount,
+    COALESCE(QCE.NumCommentsByOwnerOnQuestion, 0) AS OwnerCommentsOnQuestion,
+    COALESCE(QCE.AvgCommentScoreByOwner, 0.0) AS AvgOwnerCommentScore,
+    PHE.SignificantEditCount,
+    PHE.LinkInsertionEditCount,
+    -- Window function: Densely rank users based on a composite influence score
+    DENSE_RANK() OVER (
+        ORDER BY
+            (UAS.Reputation * 0.4) -- Base reputation contributes significantly
+            + (UAS.TotalQuestionScore * 0.25) -- High question score is good
+            + (UAS.TotalAnswerScore * 0.15) -- Answers also contribute
+            + (COALESCE(HEQ.QuestionScore, 0) * 0.1) -- Specific highly-engaged question score
+            + (COALESCE(HEQ.QuestionViewCount, 0) / 500.0) -- View count contribution
+            + (COALESCE(QCE.NumCommentsByOwnerOnQuestion, 0) * 8) -- Engagement via comments on own questions
+            - (COALESCE(PHE.SignificantEditCount, 0) * 15) -- Penalty for excessive edits
+            + (CASE WHEN U.WebsiteUrl IS NOT NULL THEN 100 ELSE 0 END) -- Bonus for having a website
+            DESC,
+            UAS.LastPostDate DESC -- Tie-breaker: most recent activity
+    ) AS InfluenceRank,
+    (UAS.UpVotes - UAS.DownVotes) AS NetVotes,
+    -- Conditional expression for User Tier classification
+    (CASE
+        WHEN UAS.Reputation > 75000 AND UAS.QuestionCount >= 20 AND UAS.AnswerCount >= 100 THEN 'Legendary Contributor'
+        WHEN UAS.Reputation > 25000 AND UAS.QuestionCount >= 10 AND HEQ.QuestionId IS NOT NULL THEN 'Proactive Influencer'
+        WHEN UAS.Reputation > 5000 AND UAS.AnswerCount >= 50 THEN 'Reliable Answerer'
+        ELSE 'Engaged Participant'
+    END) AS UserTier,
+    TO_CHAR(UAS.UserCreationDate, 'YYYY-MM') AS UserCreationMonth, -- String formatting for creation month
+    LENGTH(COALESCE(U.AboutMe, '')) AS AboutMeLength, -- String length of AboutMe, handling NULL
+    -- Correlated subquery: Average score of answers posted by this user
+    (SELECT AVG(SubP.Score) FROM Posts AS SubP WHERE SubP.OwnerUserId = UAS.UserId AND SubP.PostTypeId = 2) AS AvgUserAnswerScore,
+    -- EXISTS subquery: Check if the user has highly scored questions related to 'sql' tag
+    EXISTS (
+        SELECT 1
+        FROM Posts AS P_TagCheck
+        WHERE P_TagCheck.OwnerUserId = UAS.UserId
+        AND P_TagCheck.PostTypeId = 1
+        AND P_TagCheck.Tags LIKE '%<sql>%'
+        AND P_TagCheck.Score >= 25
+    ) AS HasStrongSqlExpertise
+FROM UserActivitySummary AS UAS
+INNER JOIN Users AS U ON UAS.UserId = U.Id
+LEFT JOIN HighlyEngagedQuestions AS HEQ ON UAS.UserId = HEQ.OwnerUserId
+LEFT JOIN QuestionCommentEngagement AS QCE ON HEQ.QuestionId = QCE.PostId AND UAS.UserId = QCE.UserId
+LEFT JOIN PostHistoricalEdits AS PHE ON HEQ.QuestionId = PHE.PostId
+WHERE
+    U.LastAccessDate >= '2023-01-01' -- Users active in the last year
+    AND UAS.TotalQuestionScore > 150
+    AND UAS.QuestionCount >= 3
+    AND UAS.AnswerCount >= 10
+    AND HEQ.TimeToAcceptanceHours BETWEEN 0.5 AND 120.0 -- Answer accepted within 5 days
+    AND NOT EXISTS (
+        SELECT 1
+        FROM MigrationInvolvedUsers AS MIU
+        WHERE MIU.UserId = UAS.UserId
+    ) -- Exclude users involved in migrations
+    AND (
+        (HEQ.QuestionId IS NOT NULL AND HEQ.QuestionScore > 100 AND HEQ.QuestionViewCount > 10000) -- Very high performing questions
+        OR (UAS.Reputation > 30000 AND UAS.Views > 7500 AND UAS.NetVotes > 200) -- Overall high reputation and activity
+        OR (COALESCE(QCE.NumCommentsByOwnerOnQuestion, 0) > 3 AND COALESCE(QCE.AvgCommentScoreByOwner, 0) > 0.5) -- Engaged positive commenters
+    )
+    -- Complex NULL logic and string predicate
+    AND COALESCE(U.Location, '') NOT LIKE '%[TEST]%' AND COALESCE(U.Location, '') NOT LIKE '%Unknown%'
+    AND (PHE.SignificantEditCount IS NULL OR PHE.SignificantEditCount <= 1) -- Prefer original content, minimal edits
+    AND U.DisplayName IS NOT NULL AND U.EmailHash IS NOT NULL AND U.AboutMe IS NOT NULL -- Complete user profiles
+    AND LENGTH(TRIM(U.AboutMe)) > 50 -- AboutMe is substantial
+
+UNION ALL
+
+-- Second branch: Identify top gold badge users with high reputation, potentially different criteria
+SELECT
+    TGBU.UserId,
+    U.DisplayName,
+    U.Location,
+    U.CreationDate AS UserCreationDate,
+    U.Reputation,
+    COALESCE(UAS_Union.QuestionCount, 0) AS QuestionCount,
+    COALESCE(UAS_Union.AnswerCount, 0) AS AnswerCount,
+    COALESCE(UAS_Union.TotalQuestionScore, 0) AS TotalQuestionScore,
+    COALESCE(UAS_Union.TotalCommentScore, 0) AS TotalCommentScore,
+    NULL AS QuestionId, -- This branch doesn't focus on specific questions
+    NULL AS QuestionScore,
+    NULL AS TimeToAcceptanceHours,
+    NULL AS QuestionViewCount,
+    COALESCE(QCE_Union.NumCommentsByOwnerOnQuestion, 0) AS OwnerCommentsOnQuestion,
+    COALESCE(QCE_Union.AvgCommentScoreByOwner, 0.0) AS AvgOwnerCommentScore,
+    NULL AS SignificantEditCount,
+    NULL AS LinkInsertionEditCount,
+    -- Window function: Densely rank gold badge users
+    DENSE_RANK() OVER (
+        ORDER BY
+            (U.Reputation * 0.6) -- Reputation is primary for badge users
+            + (TGBU.GoldBadgeCount * 150) -- Gold badges add significant weight
+            + (U.UpVotes * 0.1) -- Upvotes contribute
+            + (COALESCE(UAS_Union.TotalAnswerScore, 0) * 0.05) -- Their answer score if available
+            DESC,
+            TGBU.LatestGoldBadgeDate DESC
+    ) AS InfluenceRank,
+    (U.UpVotes - U.DownVotes) AS NetVotes,
+    'Gold Badge Elite' AS UserTier,
+    TO_CHAR(U.CreationDate, 'YYYY-MM') AS UserCreationMonth,
+    LENGTH(COALESCE(U.AboutMe, '')) AS AboutMeLength,
+    (SELECT AVG(SubP.Score) FROM Posts AS SubP WHERE SubP.OwnerUserId = TGBU.UserId AND SubP.PostTypeId = 2) AS AvgUserAnswerScore,
+    -- Check for expertise in a different tag, e.g., 'javascript'
+    EXISTS (
+        SELECT 1
+        FROM Posts AS P_TagCheck
+        WHERE P_TagCheck.OwnerUserId = TGBU.UserId
+        AND P_TagCheck.PostTypeId = 1
+        AND P_TagCheck.Tags LIKE '%<javascript>%'
+        AND P_TagCheck.Score >= 20
+    ) AS HasStrongSqlExpertise -- Re-using column name, conceptually for "strong tag expertise"
+FROM TopGoldBadgeUsers AS TGBU
+INNER JOIN Users AS U ON TGBU.UserId = U.Id
+LEFT JOIN UserActivitySummary AS UAS_Union ON TGBU.UserId = UAS_Union.UserId -- Optional: get general activity if user is also in summary
+LEFT JOIN QuestionCommentEngagement AS QCE_Union ON TGBU.UserId = QCE_Union.UserId -- Check for their comment engagement too
+WHERE
+    U.Reputation >= 20000 -- Higher baseline reputation for gold badge elite
+    AND TGBU.GoldBadgeCount >= 3 -- At least three gold badges
+    AND U.LastAccessDate >= '2023-01-01'
+    AND NOT EXISTS (
+        SELECT 1
+        FROM MigrationInvolvedUsers AS MIU
+        WHERE MIU.UserId = TGBU.UserId
+    ) -- Still exclude migrated users
+    AND (U.WebsiteUrl IS NOT NULL OR LENGTH(COALESCE(U.Location, '')) > 0) -- Must have some external presence
+ORDER BY InfluenceRank ASC, Reputation DESC
+LIMIT 1000; -- Limit the final combined result set

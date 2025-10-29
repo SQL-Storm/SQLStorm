@@ -1,0 +1,290 @@
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         coalesce(nullif(trim(u.websiteurl), ''), 'unknown') as websiteurl_norm,
+         row_number() over (order by u.creationdate desc, u.id desc) as rn
+  from users u
+  where u.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from users)
+),
+tag_splits as (
+  select p.id as post_id,
+         p.owneruserid,
+         p.posttypeid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         lower(t) as tag
+  from posts p
+  cross join lateral unnest(
+    case
+      when p.tags is null then array[]::text[]
+      when length(p.tags) <= 2 then array[]::text[]
+      else string_to_array(substring(p.tags from 2 for length(p.tags)-2), '><')
+    end
+  ) as t
+  where p.posttypeid in (1,2)
+),
+tag_activity as (
+  select ts.owneruserid as user_id,
+         ts.tag,
+         count(*) filter (where ts.posttypeid = 1) as q_cnt,
+         count(*) filter (where ts.posttypeid = 2) as a_cnt,
+         sum(ts.score) as score_sum,
+         avg(ts.score) as score_avg,
+         max(ts.creationdate) as last_post_date
+  from tag_splits ts
+  where ts.owneruserid is not null
+  group by ts.owneruserid, ts.tag
+),
+user_badges as (
+  select b.userid as user_id,
+         count(*) as total_badges,
+         count(*) filter (where b.class = 1) as gold_badges,
+         count(*) filter (where b.class = 2) as silver_badges,
+         count(*) filter (where b.class = 3) as bronze_badges,
+         count(*) filter (where b.tagbased = true) as tag_badges,
+         min(b.date) as first_badge_date,
+         max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+vote_stats as (
+  select p.owneruserid as user_id,
+         count(*) filter (where v.votetypeid = 2) as upvotes_received,
+         count(*) filter (where v.votetypeid = 3) as downvotes_received,
+         count(*) filter (where v.votetypeid = 8) as bounties_started,
+         sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_total
+  from posts p
+  join votes v on v.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+comment_stats as (
+  select p.owneruserid as user_id,
+         count(*) as comments_received,
+         sum(c.score) as comment_score_sum,
+         max(c.creationdate) as last_comment_date
+  from posts p
+  join comments c on c.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+close_events as (
+  select ph.postid,
+         ph.userid as voter_user_id,
+         min(ph.creationdate) as first_close_date,
+         max(ph.creationdate) as last_close_date,
+         count(*) as close_events_cnt,
+         max(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopened_flag
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid, ph.userid
+),
+duplicates as (
+  select pl.postid as dup_post_id,
+         pl.relatedpostid as original_post_id,
+         min(pl.creationdate) as first_link_date,
+         count(*) as dup_link_cnt
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid, pl.relatedpostid
+),
+user_dupe_behavior as (
+  select p.owneruserid as user_id,
+         count(distinct d.dup_post_id) as dup_as_source,
+         count(distinct d.original_post_id) as dup_as_target
+  from duplicates d
+  join posts p on p.id = d.dup_post_id
+  group by p.owneruserid
+),
+post_edit_stats as (
+  select p.owneruserid as user_id,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edits_count,
+         max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as last_edit_date
+  from posts p
+  left join posthistory ph on ph.postid = p.id
+  group by p.owneruserid
+),
+recent_hot as (
+  select p.id as post_id,
+         p.owneruserid as user_id,
+         max(case when ph.posthistorytypeid = 52 then ph.creationdate end) as became_hot_at,
+         max(case when ph.posthistorytypeid = 53 then ph.creationdate end) as removed_hot_at
+  from posts p
+  left join posthistory ph on ph.postid = p.id and ph.posthistorytypeid in (52,53)
+  where p.posttypeid = 1
+  group by p.id, p.owneruserid
+),
+tag_rank as (
+  select ta.user_id,
+         ta.tag,
+         ta.q_cnt,
+         ta.a_cnt,
+         ta.score_sum,
+         row_number() over (partition by ta.user_id order by (ta.q_cnt + ta.a_cnt) desc, ta.score_sum desc, ta.tag) as tag_rank_by_activity
+  from tag_activity ta
+),
+top3_tags as (
+  select tr.user_id,
+         string_agg(tr.tag || ':' || (tr.q_cnt + tr.a_cnt)::text, ', ' order by tr.tag_rank_by_activity) as top_tags_mixed,
+         json_agg(json_build_object('tag', tr.tag, 'posts', tr.q_cnt + tr.a_cnt, 'score', tr.score_sum) order by tr.tag_rank_by_activity) as top3_json
+  from tag_rank tr
+  where tr.tag_rank_by_activity <= 3
+  group by tr.user_id
+),
+activity_window as (
+  select p.owneruserid as user_id,
+         p.id as post_id,
+         p.creationdate,
+         p.score,
+         sum(1) over (partition by p.owneruserid order by p.creationdate rows between unbounded preceding and current row) as running_posts,
+         sum(p.score) over (partition by p.owneruserid order by p.creationdate rows between unbounded preceding and current row) as running_score,
+         avg(p.score) over (partition by p.owneruserid order by p.creationdate rows between 10 preceding and current row) as moving_avg_score_10
+  from posts p
+  where p.owneruserid is not null
+),
+activity_summary as (
+  select aw.user_id,
+         count(*) as total_posts,
+         max(aw.creationdate) as last_post_date,
+         percentile_cont(0.5) within group (order by aw.score) as median_post_score,
+         max(aw.running_posts) as last_running_posts,
+         max(aw.running_score) as last_running_score
+  from activity_window aw
+  group by aw.user_id
+),
+user_quality as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.location,
+         u.views,
+         u.upvotes,
+         u.downvotes,
+         coalesce(vs.upvotes_received, 0) as upvotes_received,
+         coalesce(vs.downvotes_received, 0) as downvotes_received,
+         coalesce(vs.bounty_total, 0) as bounty_total,
+         coalesce(bs.total_badges, 0) as total_badges,
+         coalesce(bs.gold_badges, 0) as gold_badges,
+         coalesce(bs.silver_badges, 0) as silver_badges,
+         coalesce(bs.bronze_badges, 0) as bronze_badges,
+         coalesce(cs.comments_received, 0) as comments_received,
+         coalesce(cs.comment_score_sum, 0) as comment_score_sum,
+         coalesce(dupe.dup_as_source, 0) as dup_as_source,
+         coalesce(dupe.dup_as_target, 0) as dup_as_target,
+         coalesce(pe.edits_count, 0) as edits_count,
+         asu.total_posts,
+         asu.last_post_date,
+         asu.median_post_score,
+         asu.last_running_posts,
+         asu.last_running_score
+  from users u
+  left join vote_stats vs on vs.user_id = u.id
+  left join user_badges bs on bs.user_id = u.id
+  left join comment_stats cs on cs.user_id = u.id
+  left join user_dupe_behavior dupe on dupe.user_id = u.id
+  left join post_edit_stats pe on pe.user_id = u.id
+  left join activity_summary asu on asu.user_id = u.id
+),
+ranked_users as (
+  select uq.*,
+         dense_rank() over (
+           order by
+             coalesce(uq.reputation, 0) desc,
+             coalesce(uq.upvotes_received, 0) - coalesce(uq.downvotes_received, 0) desc,
+             coalesce(uq.total_badges, 0) desc
+         ) as rank_overall,
+         ntile(10) over (order by coalesce(uq.reputation, 0) desc) as reputation_decile
+  from user_quality uq
+),
+stringy as (
+  select ru.user_id,
+         ru.rank_overall,
+         ru.reputation_decile,
+         trim(both ' ' from coalesce(ru.displayname, '[unknown]')) as displayname_norm,
+         case when ru.location is null or length(trim(ru.location)) = 0 then 'N/A' else ru.location end as location_norm,
+         ('Badges G/S/B: ' || ru.gold_badges || '/' || ru.silver_badges || '/' || ru.bronze_badges) as badge_str,
+         concat_ws(' | ',
+           'Reputation: ' || coalesce(ru.reputation, 0),
+           'VotesRec: ' || (coalesce(ru.upvotes_received,0) - coalesce(ru.downvotes_received,0)),
+           'Comments: ' || coalesce(ru.comments_received,0)
+         ) as metrics_str
+  from ranked_users ru
+),
+final_scores as (
+  select ru.user_id,
+         ru.rank_overall,
+         ru.reputation_decile,
+         ru.reputation,
+         ru.total_badges,
+         ru.gold_badges,
+         ru.silver_badges,
+         ru.bronze_badges,
+         ru.upvotes_received,
+         ru.downvotes_received,
+         ru.total_posts,
+         coalesce(ru.median_post_score, 0) as median_post_score,
+         coalesce(ru.last_running_score, 0) as cumulative_post_score,
+         coalesce(ru.edits_count, 0) as edits_count,
+         coalesce(ru.dup_as_source, 0) as dup_as_source,
+         coalesce(ru.dup_as_target, 0) as dup_as_target,
+         (
+           0.50 * ln(1 + greatest(ru.reputation, 0)) +
+           0.20 * ln(1 + greatest(ru.total_badges, 0)) +
+           0.15 * ln(1 + greatest(ru.upvotes_received - ru.downvotes_received, 0)) +
+           0.10 * ln(1 + greatest(ru.total_posts, 0)) +
+           0.05 * ln(1 + greatest(ru.edits_count, 0)) -
+           0.05 * ln(1 + greatest(ru.dup_as_source, 0))
+         ) as composite_score
+  from ranked_users ru
+),
+top_users as (
+  select fs.user_id,
+         fs.rank_overall,
+         fs.reputation_decile,
+         fs.composite_score,
+         row_number() over (order by fs.composite_score desc, fs.rank_overall, fs.user_id) as rn
+  from final_scores fs
+),
+user_recent_summary as (
+  select ru.user_id,
+         count(*) filter (where ph.posthistorytypeid = 24 and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as recent_suggested_edits,
+         count(*) filter (where ph.posthistorytypeid = 10 and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as recent_closes,
+         count(*) filter (where ph.posthistorytypeid = 11 and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as recent_reopens
+  from ranked_users ru
+  left join posts p on p.owneruserid = ru.user_id
+  left join posthistory ph on ph.postid = p.id
+  group by ru.user_id
+)
+select
+  tu.rn as overall_rank,
+  ru.displayname as user_displayname,
+  s.displayname_norm as displayname_normalized,
+  s.location_norm,
+  s.badge_str,
+  s.metrics_str,
+  t3.top_tags_mixed,
+  t3.top3_json,
+  jsonb_build_object(
+    'reputation', fs.reputation,
+    'badges', jsonb_build_object('gold', fs.gold_badges, 'silver', fs.silver_badges, 'bronze', fs.bronze_badges),
+    'votes_received', jsonb_build_object('up', fs.upvotes_received, 'down', fs.downvotes_received),
+    'posts', jsonb_build_object('total', fs.total_posts, 'median_score', fs.median_post_score, 'cum_score', fs.cumulative_post_score),
+    'dupes', jsonb_build_object('as_source', fs.dup_as_source, 'as_target', fs.dup_as_target),
+    'edits', fs.edits_count
+  ) as metrics_json,
+  ur.recent_suggested_edits,
+  ur.recent_closes,
+  ur.recent_reopens,
+  fs.composite_score
+from top_users tu
+join ranked_users ru on ru.user_id = tu.user_id
+left join stringy s on s.user_id = tu.user_id
+left join final_scores fs on fs.user_id = tu.user_id
+left join top3_tags t3 on t3.user_id = tu.user_id
+left join user_recent_summary ur on ur.user_id = tu.user_id
+where tu.rn <= 100
+order by tu.rn;

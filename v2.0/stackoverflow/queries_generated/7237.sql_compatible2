@@ -1,0 +1,218 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as AvgScoreLast3,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score > 10 THEN 'HighlyVotedQuestion'
+            WHEN p.PostTypeId = 2 AND p.Score > 5 THEN 'HighlyVotedAnswer'
+            WHEN p.PostTypeId = 1 AND p.Score <= 0 THEN 'LowScoreQuestion'
+            WHEN p.PostTypeId = 2 AND p.Score <= 0 THEN 'LowScoreAnswer'
+            ELSE 'Neutral'
+        END as PostCategory,
+        NULLIF(p.Tags, '') as CleanTags,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementCount
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2022-01-01'
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        SUM(COALESCE(p.Score, 0)) as TotalScore,
+        AVG(COALESCE(p.Score, 0)) as AvgScore,
+        MAX(p.CreationDate) as LastPostDate,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - MAX(p.CreationDate))) / 86400 AS INTEGER) as DaysSinceLastPost,
+        STRING_AGG(DISTINCT SUBSTRING(p.Title FROM 1 FOR 30) || '... ', ', ') as RecentTitles
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+    HAVING COUNT(p.Id) >= 1 OR COUNT(c.Id) >= 1 OR COUNT(b.Id) >= 1
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count BETWEEN 100 AND 1000 THEN 'Moderate'
+            WHEN t.Count BETWEEN 10 AND 100 THEN 'LessPopular'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) as PrevCount
+    FROM Tags t
+),
+ComplexPostStats AS (
+    SELECT 
+        rp.Id,
+        rp.OwnerUserId,
+        rp.PostTypeId,
+        rp.Score,
+        rp.ViewCount,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.UserPostRank,
+        rp.PrevScore,
+        rp.AvgScoreLast3,
+        rp.PostCategory,
+        rp.CleanTags,
+        rp.EngagementCount,
+        (COALESCE(rp.AnswerCount,0) + COALESCE(rp.CommentCount,0)) * (CASE 
+            WHEN rp.Score > 0 THEN rp.Score 
+            ELSE 1 
+        END) as EngagementScore,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - rp.CreationDate)) / 86400 AS INTEGER) as DaysOld,
+        (rp.Score * 1.0 / NULLIF(rp.ViewCount, 0)) as ScoreToViewRatio,
+        CASE 
+            WHEN rp.Score > 50 THEN 'VeryHigh'
+            WHEN rp.Score > 20 THEN 'High'
+            WHEN rp.Score > 5 THEN 'Medium'
+            WHEN rp.Score > 0 THEN 'Low'
+            ELSE 'Negative'
+        END as ScoreLevel,
+        COALESCE(
+            (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = rp.Id AND ph.PostHistoryTypeId IN (1,2,3)),
+            0
+        ) as EditCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rp.Id AND v.VoteTypeId IN (2,3)),
+            0
+        ) as VoteCount,
+        CASE 
+            WHEN (rp.AnswerCount > 0 OR rp.CommentCount > 0) AND rp.PostTypeId = 1 THEN 'ActiveQuestion'
+            WHEN rp.PostTypeId = 2 AND rp.Score > 0 THEN 'ActiveAnswer'
+            ELSE 'Inactive'
+        END as ActivityStatus
+    FROM RankedPosts rp
+    WHERE rp.CleanTags IS NOT NULL
+),
+FinalAnalysis AS (
+    SELECT 
+        ap.Id,
+        ap.OwnerUserId,
+        ap.PostTypeId,
+        ap.Score,
+        ap.ViewCount,
+        ap.AnswerCount,
+        ap.CommentCount,
+        ap.FavoriteCount,
+        ap.UserPostRank,
+        ap.PrevScore,
+        ap.AvgScoreLast3,
+        ap.PostCategory,
+        ap.CleanTags,
+        ap.EngagementCount,
+        ap.EngagementScore,
+        ap.DaysOld,
+        ap.ScoreToViewRatio,
+        ap.ScoreLevel,
+        ap.EditCount,
+        ap.VoteCount,
+        ap.ActivityStatus,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.AnswerCount as UserAnswerCount,
+        ua.TotalScore,
+        ua.AvgScore,
+        ua.LastPostDate,
+        ta.TagName,
+        ta.Count as TagCount,
+        ta.PopularityLevel,
+        ta.TagRank,
+        CASE 
+            WHEN ap.DaysOld > 365 AND ap.Score < 0 THEN 'StalePoor'
+            WHEN ap.DaysOld > 365 AND ap.Score >= 0 THEN 'StaleGood'
+            WHEN ap.DaysOld <= 365 AND ap.Score >= 0 THEN 'FreshGood'
+            ELSE 'FreshPoor'
+        END as PostAgeScoreStatus,
+        CASE 
+            WHEN ap.ScoreToViewRatio > 0.05 THEN 'HighEngagement'
+            WHEN ap.ScoreToViewRatio > 0.01 THEN 'MediumEngagement'
+            ELSE 'LowEngagement'
+        END as EngagementTier,
+        CASE 
+            WHEN ta.PopularityLevel IN ('Popular', 'Moderate') THEN 'HighPriority'
+            WHEN ta.PopularityLevel = 'LessPopular' THEN 'MediumPriority'
+            ELSE 'LowPriority'
+        END as PriorityLevel,
+        CASE 
+            WHEN ap.PostTypeId = 1 AND ap.AnswerCount = 0 AND ap.DaysOld > 30 THEN 'UnansweredQuestion'
+            WHEN ap.PostTypeId = 2 AND ap.Score = 0 AND ap.DaysOld > 7 THEN 'LowScoreAnswer'
+            ELSE 'Normal'
+        END as SpecialStatus
+    FROM ComplexPostStats ap
+    JOIN UserActivity ua ON ap.OwnerUserId = ua.UserId
+    JOIN TagAnalysis ta ON ap.CleanTags LIKE '%' || COALESCE(ta.TagName, '') || '%'
+    WHERE ap.PostTypeId IN (1, 2)
+)
+SELECT 
+    COUNT(*) as TotalPosts,
+    COUNT(CASE WHEN fa.PostAgeScoreStatus = 'StalePoor' THEN 1 END) as StalePoorPosts,
+    COUNT(CASE WHEN fa.PostAgeScoreStatus = 'StaleGood' THEN 1 END) as StaleGoodPosts,
+    COUNT(CASE WHEN fa.PostAgeScoreStatus = 'FreshGood' THEN 1 END) as FreshGoodPosts,
+    COUNT(CASE WHEN fa.PostAgeScoreStatus = 'FreshPoor' THEN 1 END) as FreshPoorPosts,
+    COUNT(CASE WHEN fa.EngagementTier = 'HighEngagement' THEN 1 END) as HighEngagementPosts,
+    COUNT(CASE WHEN fa.EngagementTier = 'MediumEngagement' THEN 1 END) as MediumEngagementPosts,
+    COUNT(CASE WHEN fa.EngagementTier = 'LowEngagement' THEN 1 END) as LowEngagementPosts,
+    COUNT(CASE WHEN fa.PriorityLevel = 'HighPriority' THEN 1 END) as HighPriorityTags,
+    COUNT(CASE WHEN fa.PriorityLevel = 'MediumPriority' THEN 1 END) as MediumPriorityTags,
+    COUNT(CASE WHEN fa.PriorityLevel = 'LowPriority' THEN 1 END) as LowPriorityTags,
+    COUNT(CASE WHEN fa.SpecialStatus = 'UnansweredQuestion' THEN 1 END) as UnansweredQuestions,
+    COUNT(CASE WHEN fa.SpecialStatus = 'LowScoreAnswer' THEN 1 END) as LowScoreAnswers,
+    AVG(fa.Score) as AvgPostScore,
+    AVG(fa.ViewCount) as AvgViewCount,
+    AVG(fa.AnswerCount) as AvgAnswerCount,
+    AVG(fa.CommentCount) as AvgCommentCount,
+    AVG(fa.FavoriteCount) as AvgFavoriteCount,
+    AVG(fa.DaysOld) as AvgDaysOld,
+    AVG(fa.ScoreToViewRatio) as AvgScoreToViewRatio,
+    MAX(fa.Reputation) as MaxUserReputation,
+    MIN(fa.Reputation) as MinUserReputation,
+    AVG(fa.Reputation) as AvgUserReputation,
+    MIN(fa.LastPostDate) as EarliestPost,
+    MAX(fa.LastPostDate) as LatestPost,
+    COUNT(DISTINCT fa.OwnerUserId) as DistinctPostOwners,
+    COUNT(DISTINCT fa.TagName) as DistinctTags,
+    STRING_AGG(DISTINCT fa.PostAgeScoreStatus, ', ') as PostAgeScoreStatuses,
+    STRING_AGG(DISTINCT fa.EngagementTier, ', ') as EngagementTiers,
+    STRING_AGG(DISTINCT fa.PriorityLevel, ', ') as PriorityLevels,
+    STRING_AGG(DISTINCT fa.SpecialStatus, ', ') as SpecialStatuses
+FROM FinalAnalysis fa
+WHERE fa.DaysOld <= 365
+GROUP BY 
+    CASE WHEN fa.PostTypeId IN (1, 2) THEN 1 ELSE 0 END,
+    CASE WHEN fa.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END,
+    CASE WHEN fa.DaysOld <= 30 THEN 'Recent' ELSE 'Old' END,
+    CASE WHEN fa.Score >= 0 THEN 'Positive' ELSE 'Negative' END
+HAVING COUNT(*) > 0
+ORDER BY COUNT(*) DESC
+LIMIT 1000;

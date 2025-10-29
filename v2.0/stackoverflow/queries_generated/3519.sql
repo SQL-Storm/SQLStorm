@@ -1,0 +1,111 @@
+-- {"query": "3519.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2162} 
+
+/*  Benchmark query – mixes CTEs, window functions, outer joins, correlated subqueries,
+    lateral joins, set operators, string tricks and NULL logic on the StackOverflow schema   */
+
+WITH recent_questions AS (
+    -- latest 30‑day questions with a row number per owner
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.Tags, '') AS Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1                        -- only questions
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+),
+
+user_aggregates AS (
+    -- compute badge counts, vote totals and last activity per user
+    SELECT
+        u.Id                AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b   ON b.UserId = u.Id
+    LEFT JOIN Posts p    ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v    ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+tag_statistics AS (
+    -- usage, score sum and latest use per tag (tags stored as <tag1><tag2>…)
+    SELECT
+        t.TagName,
+        COUNT(*)                               AS TagUsage,
+        SUM(p.Score)                           AS TotalScore,
+        MAX(p.CreationDate)                    AS LatestUse
+    FROM Tags t
+    JOIN Posts p
+      ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+     AND p.PostTypeId = 1                      -- only questions
+    GROUP BY t.TagName
+),
+
+recent_votes AS (
+    -- vote balance (up‑minus‑down) per question in the last week
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+                 WHEN v.VoteTypeId = 3 THEN -1
+                 ELSE 0 END) AS VoteBalance
+    FROM Votes v
+    WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '7 days'
+    GROUP BY v.PostId
+)
+
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.UpVotes,
+    ua.DownVotes,
+    ua.LastPostDate,
+    rq.Id                     AS RecentQuestionId,
+    rq.Title                  AS RecentQuestionTitle,
+    rq.CreationDate           AS RecentQuestionDate,
+    rq.Score                  AS RecentQuestionScore,
+    rq.ViewCount              AS RecentQuestionViews,
+    COALESCE(NULLIF(rq.Tags, ''), NULL) AS RawTags,
+    -- explode tags, keep rows only for tags that actually exist in the Tags table
+    lt.TagExtracted,
+    ts.TagUsage,
+    ts.TotalScore,
+    ts.LatestUse,
+    COALESCE(rv.VoteBalance,0) AS RecentVoteBalance
+FROM user_aggregates ua
+LEFT JOIN recent_questions rq
+       ON rq.OwnerUserId = ua.UserId
+      AND rq.rn = 1                                 -- pick the newest per user
+LEFT JOIN LATERAL (
+        SELECT
+            TRIM(BOTH '<>' FROM UNNEST(string_to_array(rq.Tags, '><'))) AS TagExtracted
+) lt ON TRUE
+LEFT JOIN tag_statistics ts
+       ON ts.TagName = lt.TagExtracted
+LEFT JOIN recent_votes rv
+       ON rv.PostId = rq.Id
+WHERE ua.Reputation > 1000
+  AND (ua.GoldBadges > 0 OR ua.SilverBadges > 5)
+ORDER BY ua.Reputation DESC, rq.CreationDate DESC
+
+UNION ALL
+
+/* fallback row when no high‑rep users exist – demonstrates set operator handling */
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE NOT EXISTS (SELECT 1 FROM Users WHERE Reputation > 1000);

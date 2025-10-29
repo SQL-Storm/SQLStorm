@@ -1,0 +1,175 @@
+-- {"query": "3938.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1892} 
+WITH recent_questions AS (
+    SELECT
+        p.Id                                   AS QuestionId,
+        p.OwnerUserId                         AS QuestionOwnerId,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.Score                               AS QuestionScore,
+        COALESCE(p.FavoriteCount,0)           AS Favorites,
+        COALESCE(p.ViewCount,0)               AS Views,
+        -- explode tags into rows
+        UNNEST(
+            STRING_TO_ARRAY(
+                SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2),
+                '><'
+            )
+        )::VARCHAR(35)                        AS TagName
+    FROM Posts p
+    WHERE p.PostTypeId = 1                     -- only questions
+      AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '180 days'
+),
+gold_badges_per_user AS (
+    SELECT
+        b.UserId,
+        ARRAY_AGG(DISTINCT LOWER(b.Name))      AS GoldBadgeNames
+    FROM Badges b
+    WHERE b.Class = 1                          -- gold
+    GROUP BY b.UserId
+),
+user_answer_stats AS (
+    SELECT
+        a.OwnerUserId                                               AS UserId,
+        COUNT(*)                                                    AS AnswerCount,
+        SUM(a.Score)                                                AS AnswerScoreSum,
+        SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END)  AS AcceptedAnswerCount,
+        MAX(a.CreationDate)                                         AS LastAnswerDate
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId
+    WHERE a.PostTypeId = 2                                          -- answers
+      AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId
+),
+user_comment_stats AS (
+    SELECT
+        c.UserId,
+        COUNT(*)                         AS CommentCount,
+        MAX(c.CreationDate)              AS LastCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+tag_user_match AS (
+    SELECT
+        rq.QuestionId,
+        u.Id                                   AS UserId,
+        rq.TagName,
+        CASE WHEN LOWER(rq.TagName) = ANY(gb.GoldBadgeNames) THEN 1 ELSE 0 END AS TagMatchesGoldBadge
+    FROM recent_questions rq
+    JOIN Users u ON u.Id = rq.QuestionOwnerId
+    LEFT JOIN gold_badges_per_user gb ON gb.UserId = u.Id
+),
+user_tag_score AS (
+    SELECT
+        tum.UserId,
+        SUM(tum.TagMatchesGoldBadge)               AS MatchingGoldTagCount
+    FROM tag_user_match tum
+    GROUP BY tum.UserId
+),
+answer_votes AS (
+    SELECT
+        v.PostId                                   AS AnswerId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)  AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)  AS DownVotes
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2,3)
+    GROUP BY v.PostId
+),
+answer_enhanced AS (
+    SELECT
+        a.Id,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Score,
+        COALESCE(v.UpVotes,0)                      AS UpVotes,
+        COALESCE(v.DownVotes,0)                    AS DownVotes,
+        (a.Score * 2 + COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0)) AS WeightedScore
+    FROM Posts a
+    LEFT JOIN answer_votes v ON v.AnswerId = a.Id
+    WHERE a.PostTypeId = 2
+),
+top_answer_per_user AS (
+    SELECT
+        ae.OwnerUserId                              AS UserId,
+        MAX(ae.WeightedScore)                       AS BestWeightedScore,
+        ROW_NUMBER() OVER (PARTITION BY ae.OwnerUserId
+                           ORDER BY ae.WeightedScore DESC) AS rn
+    FROM answer_enhanced ae
+    GROUP BY ae.OwnerUserId
+),
+final_user_metrics AS (
+    SELECT
+        u.Id                                           AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ua.AnswerCount,0)                     AS AnswerCount,
+        COALESCE(ua.AnswerScoreSum,0)                  AS AnswerScoreSum,
+        COALESCE(ua.AcceptedAnswerCount,0)             AS AcceptedAnswerCount,
+        COALESCE(uc.CommentCount,0)                    AS CommentCount,
+        COALESCE(ut.MatchingGoldTagCount,0)            AS MatchingGoldTagCount,
+        COALESCE(tap.BestWeightedScore,0)              AS BestWeightedScore,
+        -- composite benchmark score
+        (   u.Reputation * 0.3
+          + COALESCE(ua.AnswerScoreSum,0) * 0.4
+          + COALESCE(ua.AcceptedAnswerCount,0) * 5
+          + COALESCE(uc.CommentCount,0) * 0.1
+          + COALESCE(ut.MatchingGoldTagCount,0) * 2
+          + COALESCE(tap.BestWeightedScore,0) * 0.2
+        )                                             AS BenchmarkScore,
+        ROW_NUMBER() OVER (ORDER BY 
+            (   u.Reputation * 0.3
+              + COALESCE(ua.AnswerScoreSum,0) * 0.4
+              + COALESCE(ua.AcceptedAnswerCount,0) * 5
+              + COALESCE(uc.CommentCount,0) * 0.1
+              + COALESCE(ut.MatchingGoldTagCount,0) * 2
+              + COALESCE(tap.BestWeightedScore,0) * 0.2
+            ) DESC
+        )                                             AS RankOverall
+    FROM Users u
+    LEFT JOIN user_answer_stats ua   ON ua.UserId = u.Id
+    LEFT JOIN user_comment_stats uc  ON uc.UserId = u.Id
+    LEFT JOIN user_tag_score ut      ON ut.UserId = u.Id
+    LEFT JOIN top_answer_per_user tap ON tap.UserId = u.Id AND tap.rn = 1
+)
+SELECT
+    fm.UserId,
+    fm.DisplayName,
+    fm.Reputation,
+    fm.AnswerCount,
+    fm.AnswerScoreSum,
+    fm.AcceptedAnswerCount,
+    fm.CommentCount,
+    fm.MatchingGoldTagCount,
+    fm.BestWeightedScore,
+    ROUND(fm.BenchmarkScore,2)           AS BenchmarkScore,
+    fm.RankOverall
+FROM final_user_metrics fm
+WHERE fm.RankOverall <= 10
+ORDER BY fm.RankOverall
+
+UNION ALL
+
+SELECT
+    u.Id                                 AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    0                                    AS AnswerCount,
+    0                                    AS AnswerScoreSum,
+    0                                    AS AcceptedAnswerCount,
+    COALESCE(cc.CommentCount,0)          AS CommentCount,
+    0                                    AS MatchingGoldTagCount,
+    0                                    AS BestWeightedScore,
+    ROUND(u.Reputation * 0.3,2)          AS BenchmarkScore,
+    NULL                                 AS RankOverall
+FROM Users u
+LEFT JOIN (
+    SELECT UserId, COUNT(*) AS CommentCount
+    FROM Comments
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+) cc ON cc.UserId = u.Id
+WHERE u.Id NOT IN (SELECT UserId FROM final_user_metrics)
+  AND COALESCE(cc.CommentCount,0) >= 500
+ORDER BY BenchmarkScore DESC
+LIMIT 5;

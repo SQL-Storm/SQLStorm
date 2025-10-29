@@ -1,0 +1,257 @@
+WITH HotQuestions AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        COALESCE(array_length(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'), 1), 0) AS TagCount,
+        (p.Score * 0.75) + (p.ViewCount * 0.005) + (COALESCE(p.FavoriteCount, 0) * 1.2)
+        + (CASE WHEN p.AnswerCount > 0 THEN p.AnswerCount * 0.5 ELSE 0 END)
+        + (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400.0) * -0.01
+        AS HotnessMetric
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+        AND p.Score >= 5
+        AND p.ViewCount >= 50
+        AND p.LastActivityDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '9 months')
+        AND (p.Tags LIKE '%<sql>%' OR p.Tags LIKE '%<database>%' OR p.Tags LIKE '%<performance>%')
+        AND p.ClosedDate IS NULL
+),
+UserPostStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(p.Score) AS TotalScoreOnOwnedPosts,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoriteCountOnOwnedPosts,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScoreOwned,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScoreOwned,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsOwned,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        SUM(CASE WHEN p.PostTypeId = 2 AND p_q.AcceptedAnswerId = p.Id THEN 1 ELSE 0 END) AS AcceptedAnswersReceived
+    FROM
+        Posts p
+    LEFT JOIN Posts p_q ON p.PostTypeId = 2 AND p.ParentId = p_q.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY
+        p.OwnerUserId
+),
+PostEngagementMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(DISTINCT c.UserId) AS UniqueCommenters,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVoteCount,
+        CAST(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS numeric) / NULLIF(
+            CAST(SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END) AS numeric), 0
+        ) AS UpvoteToTotalVoteRatio
+    FROM
+        Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY
+        p.Id, p.OwnerUserId
+),
+PostEngagementMetricsAggregated AS (
+    SELECT
+        pem.OwnerUserId AS UserId,
+        SUM(pem.CommentCount) AS TotalCommentCount,
+        SUM(pem.UpVoteCount) AS TotalUpVoteCount,
+        SUM(pem.DownVoteCount) AS TotalDownVoteCount,
+        AVG(pem.UpvoteToTotalVoteRatio) FILTER (WHERE pem.UpvoteToTotalVoteRatio IS NOT NULL) AS AverageUpvoteRatio
+    FROM
+        PostEngagementMetrics pem
+    WHERE pem.OwnerUserId IS NOT NULL
+    GROUP BY
+        pem.OwnerUserId
+),
+DuplicatePostInfo AS (
+    SELECT
+        p.Id AS PostId,
+        MAX(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS IsDirectlyLinkedAsDuplicate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IN ('1', '101') THEN 1 ELSE 0 END) AS WasClosedAsDuplicateInHistory,
+        COALESCE(od.OriginalDuplicateQuestions, CAST(ARRAY[] AS text[])) AS OriginalDuplicateQuestions
+    FROM
+        Posts p
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN LATERAL (
+        SELECT ARRAY_AGG(DISTINCT elem) AS OriginalDuplicateQuestions
+        FROM (
+            SELECT json_array_elements_text(js_json) AS elem
+            FROM (
+                SELECT CASE WHEN ph_inner.Text IS NOT NULL THEN CAST(ph_inner.Text AS json) -> 'OriginalQuestionIds' ELSE NULL END AS js_json
+                FROM PostHistory ph_inner
+                WHERE ph_inner.PostId = p.Id
+                  AND ph_inner.PostHistoryTypeId = 10
+                  AND ph_inner.Comment IN ('1', '101')
+            ) ph_docs
+            WHERE ph_docs.js_json IS NOT NULL
+        ) elems
+    ) od ON true
+    WHERE p.PostTypeId = 1
+    GROUP BY
+        p.Id, od.OriginalDuplicateQuestions
+),
+DuplicatePostsAggregated AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        MAX(COALESCE(dpi.IsDirectlyLinkedAsDuplicate, 0)) AS HasDirectlyLinkedDuplicates,
+        MAX(COALESCE(dpi.WasClosedAsDuplicateInHistory, 0)) AS HasBeenClosedAsDuplicate
+    FROM
+        Posts p
+    INNER JOIN DuplicatePostInfo dpi ON p.Id = dpi.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY
+        p.OwnerUserId
+),
+HistoricalAnswerPerformance AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswerOwnerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRankByScore,
+        AVG(a.Score) OVER (PARTITION BY a.ParentId) AS AvgAnswerScoreForQuestion,
+        COUNT(a.Id) OVER (PARTITION BY a.ParentId) AS TotalAnswersForQuestion,
+        (a.Score - AVG(a.Score) OVER (PARTITION BY a.ParentId)) AS ScoreDeviationFromAvg
+    FROM
+        Posts a
+    WHERE
+        a.PostTypeId = 2
+        AND a.ParentId IS NOT NULL
+),
+HistoricalAnswerPerformanceAggregated AS (
+    SELECT
+        hap.AnswerOwnerId AS UserId,
+        AVG(hap.AnswerScore) AS AverageAnswerScoreGiven,
+        AVG(hap.AnswerRankByScore) AS AverageAnswerRankGiven,
+        AVG(hap.ScoreDeviationFromAvg) AS AverageScoreDeviation
+    FROM
+        HistoricalAnswerPerformance hap
+    WHERE hap.AnswerOwnerId IS NOT NULL
+    GROUP BY
+        hap.AnswerOwnerId
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+)
+SELECT
+    U.Id AS UserId,
+    COALESCE(U.DisplayName, 'Unknown User') AS DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    U.LastAccessDate,
+    COALESCE(UPS.QuestionsOwned, 0) AS TotalQuestionsPosted,
+    COALESCE(UPS.AnswersOwned, 0) AS TotalAnswersPosted,
+    COALESCE(UPS.AcceptedAnswersReceived, 0) AS AcceptedAnswersCount,
+    COALESCE(UBS.TotalBadges, 0) AS TotalBadgesCount,
+    COALESCE(UBS.GoldBadges, 0) AS GoldBadgesCount,
+    SUM(COALESCE(HQ.HotnessMetric, 0)) AS TotalHotQuestionContributionScore,
+    COUNT(DISTINCT HQ.PostId) AS NumberOfHotQuestionsInvolved,
+    COALESCE(HAPA.AverageAnswerScoreGiven, 0.0) AS AverageAnswerScoreGiven,
+    COALESCE(HAPA.AverageAnswerRankGiven, 0.0) AS AverageAnswerRankGiven,
+    COALESCE(DPA.HasDirectlyLinkedDuplicates, 0) AS HasDirectlyLinkedDuplicatesFlag,
+    COALESCE(DPA.HasBeenClosedAsDuplicate, 0) AS HasBeenClosedAsDuplicateFlag,
+    COALESCE(PEM_AGG.TotalCommentCount, 0) AS TotalCommentsOnOwnPosts,
+    COALESCE(PEM_AGG.TotalUpVoteCount, 0) AS TotalUpVotesOnOwnPosts,
+    COALESCE(PEM_AGG.TotalDownVoteCount, 0) AS TotalDownVotesOnOwnPosts,
+    COALESCE(PEM_AGG.AverageUpvoteRatio, 0.0) AS AverageUpvoteRatioOnOwnPosts,
+    NTILE(5) OVER (
+        ORDER BY
+            U.Reputation DESC,
+            SUM(COALESCE(HQ.HotnessMetric, 0)) DESC,
+            COALESCE(UBS.GoldBadges, 0) DESC,
+            COALESCE(UPS.AcceptedAnswersReceived, 0) DESC
+    ) AS UserEngagementPercentileRank,
+    (
+        U.Reputation * 0.3
+        + COALESCE(UBS.GoldBadges, 0) * 120
+        + COALESCE(UBS.SilverBadges, 0) * 25
+        + COALESCE(UPS.AcceptedAnswersReceived, 0) * 60
+        + SUM(COALESCE(HQ.HotnessMetric, 0)) * 0.15
+        + (CASE WHEN (TIMESTAMP '2024-10-01 12:34:56' - U.CreationDate) < INTERVAL '1 year' THEN 75 ELSE 0 END)
+        - (CASE WHEN (TIMESTAMP '2024-10-01 12:34:56' - U.LastAccessDate) > INTERVAL '6 months' THEN 30 ELSE 0 END)
+        - (COALESCE(DPA.HasBeenClosedAsDuplicate, 0) * 15)
+        + COALESCE(UPS.AvgQuestionScoreOwned, 0) * 0.7
+        + COALESCE(UPS.AvgAnswerScoreOwned, 0) * 0.9
+        + COALESCE(HAPA.AverageScoreDeviation, 0) * 0.5
+    ) AS CalculatedUserImpactScore,
+    COALESCE(
+        CASE
+            WHEN char_length(U.AboutMe) > 150 THEN substring(U.AboutMe FROM 1 FOR 150) || '...'
+            ELSE U.AboutMe
+        END,
+        'No "About Me" information.'
+    ) AS FormattedAboutMe,
+    EXISTS (
+        SELECT 1
+        FROM Posts p_no_comments
+        WHERE p_no_comments.OwnerUserId = U.Id
+          AND p_no_comments.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+          AND p_no_comments.CommentCount = 0
+          AND p_no_comments.ClosedDate IS NULL
+          AND p_no_comments.CommunityOwnedDate IS NULL
+        LIMIT 1
+    ) AS HasRecentZeroCommentPosts,
+    EXISTS (
+        SELECT 1
+        FROM PostHistory ph_off_topic
+        INNER JOIN Posts p_q_off_topic ON ph_off_topic.PostId = p_q_off_topic.Id
+        WHERE p_q_off_topic.OwnerUserId = U.Id
+          AND ph_off_topic.PostHistoryTypeId = 10
+          AND ph_off_topic.Comment IN ('2', '102')
+          AND ph_off_topic.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+        LIMIT 1
+    ) AS HasRecentOffTopicCloseHistory
+FROM
+    Users U
+LEFT JOIN UserPostStats UPS ON U.Id = UPS.UserId
+LEFT JOIN UserBadgeSummary UBS ON U.Id = UBS.UserId
+LEFT JOIN HotQuestions HQ ON U.Id = HQ.OwnerUserId OR (U.Id = (SELECT pa.OwnerUserId FROM Posts pa WHERE pa.Id = HQ.AcceptedAnswerId AND pa.PostTypeId = 2))
+LEFT JOIN HistoricalAnswerPerformanceAggregated HAPA ON U.Id = HAPA.UserId
+LEFT JOIN DuplicatePostsAggregated DPA ON U.Id = DPA.UserId
+LEFT JOIN PostEngagementMetricsAggregated PEM_AGG ON U.Id = PEM_AGG.UserId
+WHERE
+    U.Reputation > 500
+    AND U.LastAccessDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+GROUP BY
+    U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.AboutMe,
+    COALESCE(UPS.QuestionsOwned, 0), COALESCE(UPS.AnswersOwned, 0), COALESCE(UPS.AcceptedAnswersReceived, 0),
+    COALESCE(UBS.TotalBadges, 0), COALESCE(UBS.GoldBadges, 0), COALESCE(UBS.SilverBadges, 0),
+    COALESCE(HAPA.AverageAnswerScoreGiven, 0.0), COALESCE(HAPA.AverageAnswerRankGiven, 0.0),
+    COALESCE(DPA.HasDirectlyLinkedDuplicates, 0), COALESCE(DPA.HasBeenClosedAsDuplicate, 0),
+    COALESCE(PEM_AGG.TotalCommentCount, 0), COALESCE(PEM_AGG.TotalUpVoteCount, 0),
+    COALESCE(PEM_AGG.TotalDownVoteCount, 0), COALESCE(PEM_AGG.AverageUpvoteRatio, 0.0),
+    COALESCE(UPS.AvgQuestionScoreOwned, 0), COALESCE(UPS.AvgAnswerScoreOwned, 0), COALESCE(HAPA.AverageScoreDeviation, 0)
+HAVING
+    SUM(COALESCE(HQ.HotnessMetric, 0)) > 50
+    OR COALESCE(UBS.GoldBadges, 0) > 0
+    OR COALESCE(UPS.AcceptedAnswersReceived, 0) > 5
+ORDER BY
+    CalculatedUserImpactScore DESC, U.Reputation DESC
+LIMIT 200;

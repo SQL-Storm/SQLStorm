@@ -1,0 +1,220 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeDesc,
+        COALESCE(p.AnswerCount, 0) AS AnswerCountCOALESCE,
+        COALESCE(p.CommentCount, 0) AS CommentCountCOALESCE,
+        CASE 
+            WHEN p.Score >= 100 THEN 'High'
+            WHEN p.Score >= 50 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        CAST(
+            EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400
+            AS INTEGER
+        ) AS DaysSinceCreation,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT ps.PostId) AS TotalPosts,
+        SUM(CASE WHEN ps.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN ps.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(ps.Score) AS AvgScore,
+        MAX(ps.LastActivityDate) AS LastActivityDate
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        CASE 
+            WHEN t.Count >= 1000 THEN 'Popular'
+            WHEN t.Count >= 100 THEN 'Moderate'
+            ELSE 'Rare'
+        END AS PopularityLevel
+    FROM Tags t
+    WHERE t.Count > 0
+),
+ComplexCalculations AS (
+    SELECT 
+        ps.PostId,
+        ps.PostTypeId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCountCOALESCE,
+        ps.CommentCountCOALESCE,
+        ps.ScoreCategory,
+        ps.DaysSinceCreation,
+        ps.UserPostRank,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        CASE 
+            WHEN ps.Score > 0 AND ps.DaysSinceCreation > 0 THEN (ps.Score * 1.0 / ps.DaysSinceCreation)
+            ELSE 0 
+        END AS ScoreEfficiency,
+        CASE 
+            WHEN ps.ViewCount > 0 AND ps.AnswerCountCOALESCE > 0 THEN (ps.ViewCount * 1.0 / ps.AnswerCountCOALESCE)
+            ELSE 0 
+        END AS ViewToAnswerRatio,
+        ROW_NUMBER() OVER (ORDER BY (ps.Score * ps.ViewCount) DESC) AS PostPopularityRank,
+        RANK() OVER (PARTITION BY ps.PostTypeId ORDER BY ps.Score DESC) AS TypeScoreRank,
+        DENSE_RANK() OVER (ORDER BY ps.Score + ps.ViewCount + ps.AnswerCountCOALESCE + ps.CommentCountCOALESCE DESC) AS CombinedRank
+    FROM PostStats ps
+    INNER JOIN UserActivity u ON ps.OwnerUserId = u.UserId
+    WHERE ps.Score IS NOT NULL AND ps.ViewCount IS NOT NULL
+),
+FinalAnalysis AS (
+    SELECT 
+        cc.PostId,
+        cc.PostTypeId,
+        cc.OwnerUserId,
+        cc.Score,
+        cc.ViewCount,
+        cc.AnswerCountCOALESCE,
+        cc.CommentCountCOALESCE,
+        cc.ScoreCategory,
+        cc.DaysSinceCreation,
+        cc.UserPostRank,
+        cc.Reputation,
+        cc.DisplayName,
+        cc.Views,
+        cc.ScoreEfficiency,
+        cc.ViewToAnswerRatio,
+        cc.PostPopularityRank,
+        cc.TypeScoreRank,
+        cc.CombinedRank,
+        COALESCE(
+            CASE WHEN cc.ScoreEfficiency > 10 THEN 'High Efficiency' 
+                 WHEN cc.ScoreEfficiency > 5 THEN 'Medium Efficiency' 
+                 ELSE 'Low Efficiency' END, 
+            'No Data'
+        ) AS EfficiencyLevel,
+        CASE 
+            WHEN cc.ViewToAnswerRatio > 100 THEN 'High Visibility'
+            WHEN cc.ViewToAnswerRatio > 50 THEN 'Medium Visibility'
+            ELSE 'Low Visibility'
+        END AS VisibilityLevel,
+        CASE WHEN cc.PostTypeId = 1 AND cc.AnswerCountCOALESCE > 0 
+             THEN (cc.AnswerCountCOALESCE * 1.0 / NULLIF(cc.CommentCountCOALESCE,0))
+             ELSE NULL END AS AnswerToCommentRatio,
+        -- carry through Tags and CreationDate from PostStats via join
+        ps.Tags AS Tags,
+        ps.CreationDate AS CreationDate
+    FROM ComplexCalculations cc
+    JOIN PostStats ps ON cc.PostId = ps.PostId
+)
+SELECT 
+    fa.PostId,
+    fa.PostTypeId,
+    fa.OwnerUserId,
+    fa.Score,
+    fa.ViewCount,
+    fa.AnswerCountCOALESCE,
+    fa.CommentCountCOALESCE,
+    fa.ScoreCategory,
+    fa.DaysSinceCreation,
+    fa.UserPostRank,
+    fa.Reputation,
+    fa.DisplayName,
+    fa.Views,
+    fa.ScoreEfficiency,
+    fa.ViewToAnswerRatio,
+    fa.PostPopularityRank,
+    fa.TypeScoreRank,
+    fa.CombinedRank,
+    fa.EfficiencyLevel,
+    fa.VisibilityLevel,
+    fa.AnswerToCommentRatio,
+    
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.PostId = fa.PostId) AS CommentCount,
+    
+    (SELECT COUNT(*) + 1 
+     FROM Users u2 
+     WHERE u2.Reputation > fa.Reputation) AS ReputationRank,
+    
+    LAG(fa.Score, 1) OVER (ORDER BY fa.Score DESC) AS PrevScore,
+    LEAD(fa.Score, 1) OVER (ORDER BY fa.Score DESC) AS NextScore,
+    AVG(fa.Score) OVER (PARTITION BY fa.PostTypeId) AS AvgScoreByType,
+    MAX(fa.Score) OVER (PARTITION BY fa.OwnerUserId) AS MaxScorePerUser,
+    
+    UPPER(SUBSTRING(fa.DisplayName FROM 1 FOR 10)) AS DisplayNameShort,
+    CASE 
+        WHEN fa.Tags IS NOT NULL AND fa.Tags <> '' THEN 
+            ('Tags: ' || SUBSTRING(fa.Tags FROM 1 FOR 50))
+        ELSE 'No Tags'
+    END AS TagPreview,
+    
+    CASE WHEN fa.Score IS NULL OR fa.ViewCount IS NULL THEN 'Incomplete Data' ELSE 'Complete' END AS DataCompleteness,
+    COALESCE(fa.ViewToAnswerRatio, 0) AS SafeViewToAnswerRatio,
+    
+    CASE 
+        WHEN fa.Score > 100 AND fa.AnswerCountCOALESCE > 5 THEN 'High Quality Post'
+        WHEN fa.Score > 50 AND fa.Views > 1000 THEN 'Popular Post'
+        ELSE 'Regular Post'
+    END AS PostQualityLevel,
+    
+    CASE 
+        WHEN fa.CombinedRank <= 50 THEN 'Top 50'
+        WHEN fa.CombinedRank <= 200 THEN 'Top 200'
+        ELSE 'Below 200'
+    END AS RankTier,
+    
+    (fa.Score + fa.ViewCount + fa.AnswerCountCOALESCE + fa.CommentCountCOALESCE + 
+     COALESCE(fa.Views, 0) + COALESCE(fa.Reputation, 0)) AS CombinedActivityScore,
+    
+    (EXTRACT(YEAR FROM CAST('2024-10-01 12:34:56' AS timestamp)) - EXTRACT(YEAR FROM fa.CreationDate)) * 12
+      + (EXTRACT(MONTH FROM CAST('2024-10-01 12:34:56' AS timestamp)) - EXTRACT(MONTH FROM fa.CreationDate))
+      AS MonthsSinceCreation,
+    
+    CASE 
+        WHEN fa.ScoreEfficiency >= 10 THEN 
+            CASE 
+                WHEN fa.EfficiencyLevel = 'High Efficiency' THEN 'Excellent Post'
+                ELSE 'Good Post'
+            END
+        ELSE 'Average Post'
+    END AS QualityAssessment,
+    
+    COUNT(*) OVER () AS TotalPostsProcessed,
+    SUM(fa.Score) OVER (ORDER BY fa.CombinedRank ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningScoreSum
+    
+FROM FinalAnalysis fa
+WHERE fa.PostId IS NOT NULL
+  AND (fa.Score > 0 OR fa.ViewCount > 0 OR fa.AnswerCountCOALESCE > 0)
+  AND fa.DaysSinceCreation IS NOT NULL
+ORDER BY fa.CombinedRank ASC,
+         fa.Score DESC,
+         fa.Views DESC
+LIMIT 1000;

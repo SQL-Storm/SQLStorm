@@ -1,0 +1,171 @@
+WITH RECURSIVE
+    user_metrics AS (
+        SELECT
+            u.Id                                      AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(SUM(
+                CASE vt.Name
+                    WHEN 'UpMod'      THEN 1
+                    WHEN 'DownMod'    THEN -1
+                    WHEN 'AcceptedByOriginator' THEN 2
+                    ELSE 0
+                END
+            ), 0)                                      AS vote_balance,
+            COALESCE(SUM(
+                CASE b.Class
+                    WHEN 1 THEN 100
+                    WHEN 2 THEN 50
+                    WHEN 3 THEN 20
+                    ELSE 0
+                END
+            ), 0)                                      AS badge_score,
+            COUNT(DISTINCT b.Id)                      AS badge_count
+        FROM Users u
+        LEFT JOIN Posts p               ON p.OwnerUserId = u.Id
+        LEFT JOIN Votes v               ON v.PostId = p.Id
+        LEFT JOIN VoteTypes vt          ON vt.Id = v.VoteTypeId
+        LEFT JOIN Badges b              ON b.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    recent_activity AS (
+        SELECT
+            ua.user_id,
+            MAX(p.CreationDate)               AS last_post_date,
+            MAX(c.CreationDate)               AS last_comment_date,
+            MAX(v.CreationDate)               AS last_vote_date,
+            ROW_NUMBER() OVER (PARTITION BY ua.user_id ORDER BY MAX(p.CreationDate) DESC) AS post_rn,
+            ROW_NUMBER() OVER (PARTITION BY ua.user_id ORDER BY MAX(c.CreationDate) DESC) AS comment_rn,
+            ROW_NUMBER() OVER (PARTITION BY ua.user_id ORDER BY MAX(v.CreationDate) DESC) AS vote_rn
+        FROM user_metrics ua
+        LEFT JOIN Posts p               ON p.OwnerUserId = ua.user_id
+        LEFT JOIN Comments c            ON c.UserId = ua.user_id
+        LEFT JOIN Votes v               ON v.UserId = ua.user_id
+        GROUP BY ua.user_id
+    ),
+
+    tag_stats AS (
+        SELECT
+            TRIM(BOTH '><' FROM t.TagName)                              AS tag,
+            COUNT(DISTINCT p.Id)                                        AS question_cnt,
+            AVG(p.Score)                                                AS avg_question_score,
+            CASE WHEN COUNT(p.Id) = 0 THEN 0.0
+                 ELSE SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) * 1.0 / COUNT(p.Id)
+            END                                                          AS answer_accept_ratio,
+            MAX(p.CreationDate)                                         AS most_recent_question,
+            SUM(
+                CASE
+                    WHEN p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+                    THEN (p.Score * 2 + p.ViewCount * 0.1)
+                    ELSE 0
+                END
+            )                                                            AS recent_hotness
+        FROM Posts p
+        JOIN LATERAL (
+            SELECT regexp_split_to_table(p.Tags, '><') AS TagName
+        ) t ON TRUE
+        WHERE p.PostTypeId = 1
+        GROUP BY t.TagName
+    ),
+
+    user_tag_influence AS (
+        SELECT
+            um.user_id,
+            ts.tag,
+            COALESCE((
+                SELECT SUM(a.Score)
+                FROM Posts a
+                JOIN Posts q ON q.Id = a.ParentId
+                WHERE a.OwnerUserId = um.user_id
+                  AND a.PostTypeId = 2
+                  AND q.PostTypeId = 1
+                  AND q.Tags LIKE '%' || '<' || ts.tag || '>' || '%'
+            ), 0)                                         AS tag_answer_score,
+            ROW_NUMBER() OVER (PARTITION BY um.user_id ORDER BY COALESCE((
+                    SELECT SUM(a.Score)
+                    FROM Posts a
+                    JOIN Posts q ON q.Id = a.ParentId
+                    WHERE a.OwnerUserId = um.user_id
+                      AND a.PostTypeId = 2
+                      AND q.PostTypeId = 1
+                      AND q.Tags LIKE '%' || '<' || ts.tag || '>' || '%'
+                ),0) DESC)                               AS tag_rank
+        FROM user_metrics um
+        CROSS JOIN tag_stats ts
+    ),
+
+    combined AS (
+        SELECT
+            um.user_id,
+            um.DisplayName,
+            um.Reputation,
+            um.vote_balance,
+            um.badge_score,
+            um.badge_count,
+            ra.last_post_date,
+            ra.last_comment_date,
+            ra.last_vote_date,
+            COALESCE(uti.tag, '<<no-tag>>')               AS top_tag,
+            uti.tag_answer_score,
+            uti.tag_rank,
+            ts.avg_question_score,
+            ts.recent_hotness
+        FROM user_metrics um
+        LEFT JOIN recent_activity ra          ON ra.user_id = um.user_id
+        LEFT JOIN LATERAL (
+            SELECT *
+            FROM user_tag_influence uti
+            WHERE uti.user_id = um.user_id
+            ORDER BY uti.tag_rank
+            FETCH FIRST 1 ROW ONLY
+        ) uti ON TRUE
+        LEFT JOIN tag_stats ts               ON ts.tag = uti.tag
+    )
+
+SELECT
+    c.user_id,
+    c.DisplayName,
+    c.Reputation,
+    c.badge_score,
+    c.vote_balance,
+    c.badge_count,
+    c.last_post_date,
+    c.last_comment_date,
+    c.last_vote_date,
+    c.top_tag,
+    c.tag_answer_score,
+    c.tag_rank,
+    c.avg_question_score,
+    c.recent_hotness,
+    ROUND(
+        (c.Reputation * 0.2) +
+        (c.badge_score * 0.3) +
+        (c.vote_balance * 0.15) +
+        (COALESCE(c.tag_answer_score,0) * 0.15) +
+        (COALESCE(c.recent_hotness,0) * 0.1), 2
+    ) AS performance_score
+FROM combined c
+WHERE c.Reputation > 1000
+   OR c.badge_score > 0
+UNION ALL
+SELECT
+    NULL::bigint AS user_id,
+    NULL::text AS DisplayName,
+    NULL::integer AS Reputation,
+    0    AS badge_score,
+    0    AS vote_balance,
+    0    AS badge_count,
+    NULL::timestamp AS last_post_date,
+    NULL::timestamp AS last_comment_date,
+    NULL::timestamp AS last_vote_date,
+    t.tag AS top_tag,
+    0    AS tag_answer_score,
+    NULL::integer AS tag_rank,
+    t.avg_question_score,
+    t.recent_hotness,
+    0    AS performance_score
+FROM tag_stats t
+WHERE t.question_cnt = 0
+ORDER BY performance_score DESC, top_tag
+LIMIT 100;

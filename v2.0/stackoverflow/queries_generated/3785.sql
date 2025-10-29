@@ -1,0 +1,137 @@
+-- {"query": "3785.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2648} 
+
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+UserTagStats AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        tt.TagName,
+        COUNT(*) AS TagUseCount,
+        MAX(p.Score) AS MaxScoreForTag,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ', ')
+            FILTER (WHERE p.Tags IS NOT NULL) AS AllTags
+    FROM UserStats us
+    JOIN Posts p ON p.OwnerUserId = us.Id AND p.PostTypeId = 1
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS tag
+    ) AS taglist
+    JOIN Tags t ON t.TagName = taglist.tag
+    JOIN TopTags tt ON tt.TagName = t.TagName AND tt.rn <= 5
+    GROUP BY us.Id, us.DisplayName, tt.TagName
+),
+RecentVotes AS (
+    SELECT
+        v.PostId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY v.PostId
+)
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.Location,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.QuestionScore,
+    us.AnswerScore,
+    us.LastPostDate,
+    us.BadgeCount,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    COALESCE(rv.UpVotes, 0) AS RecentUpVotes,
+    COALESCE(rv.DownVotes, 0) AS RecentDownVotes,
+    CASE
+        WHEN us.Reputation > 20000 THEN 'Elite'
+        WHEN us.Reputation > 5000  THEN 'Pro'
+        ELSE 'Member'
+    END AS ReputationTier,
+    STRING_AGG(DISTINCT uts.TagName || ':' || uts.TagUseCount::text, '; ')
+        FILTER (WHERE uts.TagUseCount IS NOT NULL) AS TopTagUsage
+FROM UserStats us
+LEFT JOIN LATERAL (
+    SELECT v.UpVotes, v.DownVotes
+    FROM RecentVotes v
+    WHERE v.PostId = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = us.Id
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    )
+) rv ON TRUE
+LEFT JOIN UserTagStats uts ON uts.Id = us.Id
+WHERE us.Reputation > 1000
+GROUP BY
+    us.Id, us.DisplayName, us.Reputation, us.Location,
+    us.QuestionCount, us.AnswerCount, us.QuestionScore, us.AnswerScore,
+    us.LastPostDate, us.BadgeCount, us.GoldBadges, us.SilverBadges,
+    us.BronzeBadges, rv.UpVotes, rv.DownVotes
+HAVING COUNT(uts.TagName) > 0
+ORDER BY us.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    -1 AS Id,
+    'Aggregate' AS DisplayName,
+    SUM(us.Reputation) AS Reputation,
+    NULL AS Location,
+    SUM(us.QuestionCount) AS QuestionCount,
+    SUM(us.AnswerCount) AS AnswerCount,
+    SUM(us.QuestionScore) AS QuestionScore,
+    SUM(us.AnswerScore) AS AnswerScore,
+    MAX(us.LastPostDate) AS LastPostDate,
+    SUM(us.BadgeCount) AS BadgeCount,
+    SUM(us.GoldBadges) AS GoldBadges,
+    SUM(us.SilverBadges) AS SilverBadges,
+    SUM(us.BronzeBadges) AS BronzeBadges,
+    SUM(COALESCE(rv.UpVotes,0)) AS RecentUpVotes,
+    SUM(COALESCE(rv.DownVotes,0)) AS RecentDownVotes,
+    'Total' AS ReputationTier,
+    NULL AS TopTagUsage
+FROM UserStats us
+LEFT JOIN LATERAL (
+    SELECT v.UpVotes, v.DownVotes
+    FROM RecentVotes v
+    WHERE v.PostId = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = us.Id
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    )
+) rv ON TRUE
+WHERE us.Reputation > 1000;

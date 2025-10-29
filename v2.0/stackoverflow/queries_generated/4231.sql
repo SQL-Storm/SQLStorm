@@ -1,0 +1,153 @@
+-- {"query": "4231.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1599} 
+
+WITH RECURSIVE PostHierarchy AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        CAST(NULL AS INT) AS ParentPostId,
+        0 AS Depth
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Questions
+    UNION ALL
+    SELECT
+        a.Id AS PostId,
+        a.Title,
+        a.OwnerUserId,
+        a.PostTypeId,
+        a.CreationDate,
+        a.Score,
+        a.AnswerCount,
+        a.CommentCount,
+        a.FavoriteCount,
+        a.ClosedDate,
+        ph.PostId AS ParentPostId,
+        ph.Depth + 1 AS Depth
+    FROM Posts a
+    JOIN PostHierarchy ph ON a.ParentId = ph.PostId
+    WHERE a.PostTypeId = 2 -- Answers
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT ph.PostId) AS TotalPosts,
+        SUM(CASE WHEN ph.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN ph.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        AVG(ph.Score) AS AvgPostScore,
+        MAX(ph.CreationDate) AS LastPostDate,
+        SUM(ph.FavoriteCount) AS TotalFavoritesGiven,
+        COUNT(DISTINCT v.Id) AS TotalUpVotesReceived,
+        SUM(CASE WHEN ph.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS TotalClosedPosts
+    FROM Users u
+    LEFT JOIN PostHierarchy ph ON u.Id = ph.OwnerUserId
+    LEFT JOIN Votes v ON ph.PostId = v.PostId AND v.VoteTypeId = 2 -- UpVotes
+    GROUP BY u.Id, u.DisplayName
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS TaggedQuestionCount,
+        SUM(p.AnswerCount) AS TotalAnswersForTag,
+        AVG(p.Score) AS AvgQuestionScoreForTag,
+        MAX(p.CreationDate) AS LastQuestionDateForTag
+    FROM Tags t
+    JOIN Posts p ON p.PostTypeId = 1 -- Questions
+    CROSS APPLY STRING_SPLIT(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ' ') AS TagsSplit
+    WHERE TagsSplit.value = t.TagName
+    GROUP BY t.TagName
+)
+SELECT
+    ph.PostId,
+    ph.Title,
+    ph.Depth,
+    u.DisplayName AS PostOwnerDisplayName,
+    u.Reputation AS PostOwnerReputation,
+    ph.Score AS PostScore,
+    ph.AnswerCount AS PostAnswerCount,
+    ph.CommentCount AS PostCommentCount,
+    ph.FavoriteCount AS PostFavoriteCount,
+    ph.ClosedDate,
+    CASE
+        WHEN ph.ClosedDate IS NOT NULL AND ph.PostTypeId = 1 THEN
+            (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = ph.PostId AND pl.LinkTypeId = 3)
+        ELSE 0
+    END AS DuplicateLinksCount,
+    COALESCE(ups.TotalUpVotesReceived, 0) AS PostUpvotesCount,
+    COALESCE(t.TaggedQuestionCount, 0) AS TaggedQuestionsCount,
+    COALESCE(t.TotalAnswersForTag, 0) AS TotalAnswersForTag,
+    COALESCE(t.AvgQuestionScoreForTag, 0) AS AvgQuestionScoreForTag,
+    CASE
+        WHEN u.Id IS NOT NULL THEN
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) -- Gold Badges
+        ELSE 0
+    END AS UserGoldBadges,
+    CASE
+        WHEN u.Id IS NOT NULL THEN
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) -- Silver Badges
+        ELSE 0
+    END AS UserSilverBadges,
+    CASE
+        WHEN u.Id IS NOT NULL THEN
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) -- Bronze Badges
+        ELSE 0
+    END AS UserBronzeBadges,
+    (
+        SELECT COUNT(ph2.Id)
+        FROM PostHistory ph2
+        WHERE ph2.PostId = ph.PostId
+        AND ph2.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+        AND ph2.UserId IS NOT NULL
+        AND ph2.UserId <> ph.OwnerUserId
+    ) AS OtherUserEditsCount,
+    IIF(u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '', 'HasWebsite', 'NoWebsite') AS UserWebsiteStatus,
+    DATEDIFF(day, u.CreationDate, GETDATE()) AS UserAgeInDays,
+    DATEDIFF(day, ph.CreationDate, COALESCE(ph.ClosedDate, GETDATE())) AS PostAgeWhenClosedOrNow
+FROM PostHierarchy ph
+LEFT JOIN Users u ON ph.OwnerUserId = u.Id
+LEFT JOIN UserPostStats ups ON u.Id = ups.UserId -- This join is not strictly necessary for the SELECT list but good for demonstrating CTE usage
+LEFT JOIN TagPopularity t ON ph.Title LIKE '%' + t.TagName + '%' -- A simplified and potentially inefficient tag join for demonstration
+WHERE ph.Depth <= 2 -- Limit to questions and their direct answers
+AND ph.Score > 10
+AND u.Reputation > 1000
+AND EXISTS (
+    SELECT 1
+    FROM Comments c
+    WHERE c.PostId = ph.PostId
+    AND c.Score < 0
+    AND c.UserId IS NOT NULL
+)
+UNION ALL
+SELECT
+    NULL AS PostId,
+    NULL AS Title,
+    NULL AS Depth,
+    NULL AS PostOwnerDisplayName,
+    NULL AS PostOwnerReputation,
+    NULL AS PostScore,
+    NULL AS PostAnswerCount,
+    NULL AS PostCommentCount,
+    NULL AS PostFavoriteCount,
+    NULL AS ClosedDate,
+    NULL AS DuplicateLinksCount,
+    NULL AS PostUpvotesCount,
+    TagName,
+    NULL AS TotalAnswersForTag,
+    NULL AS AvgQuestionScoreForTag,
+    NULL AS UserGoldBadges,
+    NULL AS UserSilverBadges,
+    NULL AS UserBronzeBadges,
+    NULL AS OtherUserEditsCount,
+    NULL AS UserWebsiteStatus,
+    NULL AS UserAgeInDays,
+    NULL AS PostAgeWhenClosedOrNow
+FROM TagPopularity tp
+WHERE tp.TaggedQuestionCount > 1000
+ORDER BY PostScore DESC;

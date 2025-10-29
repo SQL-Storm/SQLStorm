@@ -1,0 +1,287 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(b.Date) AS LastBadgeDate,
+        MAX(v.CreationDate) AS LastVoteDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 OR COUNT(DISTINCT c.Id) > 0 OR COUNT(DISTINCT b.Id) > 0 OR COUNT(DISTINCT v.Id) > 0 
+            THEN 'Active' 
+            ELSE 'Inactive' 
+        END AS UserStatus,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        NTILE(100) OVER (ORDER BY u.Reputation) AS ReputationPercentile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostPerformanceMetrics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CAST(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400 AS INTEGER) AS AgeInDays,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 25 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'LowVoted'
+            ELSE 'NoVotes'
+        END AS VoteCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'Popular'
+            WHEN p.ViewCount > 100 THEN 'Moderate'
+            WHEN p.ViewCount > 0 THEN 'Low'
+            ELSE 'NoViews'
+        END AS ViewCategory,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS EngagementCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRankPerType,
+        PERCENT_RANK() OVER (ORDER BY p.Score) AS ScorePercentile,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScorePerType,
+        STDDEV(p.Score) OVER (PARTITION BY p.PostTypeId) AS StdDevScorePerType
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagComplexityAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'HighlyUsed'
+            WHEN t.Count > 100 THEN 'ModeratelyUsed'
+            WHEN t.Count > 10 THEN 'LowUsed'
+            ELSE 'Rare'
+        END AS UsageCategory,
+        CASE 
+            WHEN COALESCE(t.IsRequired, FALSE) = TRUE THEN 'Required'
+            WHEN COALESCE(t.IsModeratorOnly, FALSE) = TRUE THEN 'ModeratorOnly'
+            ELSE 'Community'
+        END AS TagType,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS PopularityRank,
+        NTILE(10) OVER (ORDER BY t.Count) AS PopularityDecile
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsRequired, t.IsModeratorOnly
+),
+CommunityEngagement AS (
+    SELECT 
+        'TotalUsers' AS MetricType,
+        COUNT(*) AS Value
+    FROM Users u
+    WHERE u.AccountId IS NOT NULL
+    
+    UNION ALL
+    
+    SELECT 
+        'ActiveUsers' AS MetricType,
+        COUNT(*) AS Value
+    FROM UserActivityStats uas
+    WHERE uas.UserStatus = 'Active'
+    
+    UNION ALL
+    
+    SELECT 
+        'TotalPosts' AS MetricType,
+        COUNT(*) AS Value
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+    
+    UNION ALL
+    
+    SELECT 
+        'TotalComments' AS MetricType,
+        COUNT(*) AS Value
+    FROM Comments c
+    
+    UNION ALL
+    
+    SELECT 
+        'TotalBadges' AS MetricType,
+        COUNT(*) AS Value
+    FROM Badges b
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        pp.PostId AS PostId,
+        pp.Title,
+        pp.Score,
+        pp.ViewCount,
+        pp.AnswerCount,
+        pp.CommentCount,
+        pp.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        pp.CreationDate,
+        CASE 
+            WHEN pp.PostTypeId = 1 THEN 'Question'
+            WHEN pp.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeName,
+        pp.Tags,
+        pp.AgeInDays,
+        pp.VoteCategory,
+        pp.ViewCategory,
+        pp.EngagementCount,
+        pp.ScoreRankPerType,
+        pp.ScorePercentile,
+        pp.AvgScorePerType,
+        pp.StdDevScorePerType,
+        CASE 
+            WHEN pp.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1) 
+                 AND pp.ViewCount > (SELECT AVG(p3.ViewCount) FROM Posts p3 WHERE p3.PostTypeId = 1) 
+                 AND COALESCE(pp.AnswerCount, 0) > 0 THEN 'HighImpact'
+            WHEN pp.Score > (SELECT AVG(p4.Score) FROM Posts p4 WHERE p4.PostTypeId = 1) 
+                 OR pp.ViewCount > (SELECT AVG(p5.ViewCount) FROM Posts p5 WHERE p5.PostTypeId = 1) 
+                 OR COALESCE(pp.AnswerCount, 0) > 0 THEN 'ModerateImpact'
+            ELSE 'LowImpact'
+        END AS ImpactCategory,
+        COALESCE(pp.AnswerCount, 0) AS AnswerCountAdjusted,
+        COALESCE(pp.CommentCount, 0) AS CommentCountAdjusted,
+        CASE 
+            WHEN pp.ViewCount > 0 THEN CAST(pp.Score AS DOUBLE PRECISION) / CAST(pp.ViewCount AS DOUBLE PRECISION)
+            ELSE 0
+        END AS ScorePerViewRatio,
+        DENSE_RANK() OVER (ORDER BY pp.ViewCount DESC) AS RankingByViews,
+        RANK() OVER (ORDER BY pp.Score DESC) AS RankingByScore
+    FROM PostPerformanceMetrics pp
+    LEFT JOIN Users u ON pp.OwnerUserId = u.Id
+),
+TopCommunityPosts AS (
+    SELECT 
+        cpa.PostId,
+        cpa.Title,
+        cpa.PostTypeName,
+        cpa.OwnerName,
+        cpa.Score,
+        cpa.ViewCount,
+        cpa.AnswerCount,
+        cpa.CommentCount,
+        cpa.ScorePerViewRatio,
+        cpa.RankingByViews,
+        cpa.RankingByScore,
+        cpa.ImpactCategory,
+        cpa.VoteCategory,
+        cpa.ViewCategory,
+        cpa.AgeInDays,
+        cpa.ScorePercentile,
+        cpa.AvgScorePerType
+    FROM ComplexPostAnalysis cpa
+    WHERE cpa.RankingByViews <= 1000 OR cpa.RankingByScore <= 1000
+),
+AggregateMetrics AS (
+    SELECT 
+        COUNT(*) AS TotalRecords,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveScorePosts,
+        AVG(CAST(p.Score AS DOUBLE PRECISION)) AS AvgScore,
+        MAX(p.Score) AS MaxScore,
+        MIN(p.Score) AS MinScore,
+        AVG(CAST(p.ViewCount AS DOUBLE PRECISION)) AS AvgViews,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueAuthors,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS AllTags
+    FROM Posts p
+    LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId IN (1, 2)
+)
+SELECT 
+    (SELECT Value FROM CommunityEngagement WHERE MetricType = 'TotalUsers') AS TotalUsers,
+    (SELECT Value FROM CommunityEngagement WHERE MetricType = 'ActiveUsers') AS ActiveUsers,
+    (SELECT Value FROM CommunityEngagement WHERE MetricType = 'TotalPosts') AS TotalPosts,
+    (SELECT Value FROM CommunityEngagement WHERE MetricType = 'TotalComments') AS TotalComments,
+    (SELECT Value FROM CommunityEngagement WHERE MetricType = 'TotalBadges') AS TotalBadges,
+    (SELECT COUNT(*) FROM TopCommunityPosts) AS TopCommunityPosts,
+    (SELECT AVG(Score) FROM TopCommunityPosts) AS AvgScoreOfTopPosts,
+    (SELECT AVG(ViewCount) FROM TopCommunityPosts) AS AvgViewsOfTopPosts,
+    (SELECT MAX(RankingByViews) FROM TopCommunityPosts) AS MaxViewsRanking,
+    (SELECT MIN(RankingByScore) FROM TopCommunityPosts) AS MinScoreRanking,
+    (SELECT COUNT(*) FROM (
+        SELECT OwnerUserId, COUNT(*) AS PostCount
+        FROM Posts
+        WHERE PostTypeId IN (1, 2)
+        GROUP BY OwnerUserId
+        HAVING COUNT(*) > 100
+    ) subquery) AS HighProductivityAuthors,
+    'PerformanceBenchmarkQueryComplete' AS Status,
+    CAST('2024-10-01 12:34:56' AS TIMESTAMP) AS QueryCompletionTime,
+    (
+        SELECT STRING_AGG(
+            'PostId:' || PostId || '|Score:' || Score || '|ViewCount:' || ViewCount, 
+            ';'
+        ) 
+        FROM TopCommunityPosts
+        WHERE RankingByViews <= 100
+    ) AS SampleTopPosts,
+    (
+        SELECT STRING_AGG(
+            'TagName:' || TagName || '|Count:' || Count, 
+            ';'
+        ) 
+        FROM TagComplexityAnalysis
+        WHERE PopularityRank <= 100
+    ) AS SamplePopularTags
+FROM AggregateMetrics am
+INNER JOIN (
+    SELECT 1 AS one
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    INNER JOIN Badges b ON u.Id = b.UserId
+    INNER JOIN Comments c ON u.Id = c.UserId
+    INNER JOIN Votes v ON u.Id = v.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id
+    HAVING COUNT(DISTINCT p.Id) > 0 AND COUNT(DISTINCT c.Id) > 0 AND COUNT(DISTINCT b.Id) > 0 AND COUNT(DISTINCT v.Id) > 0
+    LIMIT 1
+) inner_check ON 1=1
+WHERE EXISTS (
+    SELECT 1 
+    FROM PostHistory ph 
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE pht.Name IN ('Edit Title', 'Edit Body', 'Edit Tags')
+    GROUP BY ph.PostId
+    HAVING COUNT(*) > 3
+)
+AND EXISTS (
+    SELECT 1 
+    FROM Posts p
+    WHERE p.Score > (
+        SELECT AVG(Score) 
+        FROM Posts 
+        WHERE PostTypeId = 1 
+        AND CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    )
+    AND p.PostTypeId = 1
+    AND LENGTH(p.Title) > 10
+    AND EXISTS (
+        SELECT 1 
+        FROM Comments c 
+        WHERE c.PostId = p.Id 
+        AND c.Score > 2
+    )
+)
+GROUP BY am.TotalRecords, am.PositiveScorePosts, am.AvgScore, am.MaxScore, am.MinScore, am.AvgViews, am.TotalViews, am.UniqueAuthors, am.AllTags
+HAVING COUNT(*) > 0
+ORDER BY am.AvgScore DESC
+LIMIT 1;

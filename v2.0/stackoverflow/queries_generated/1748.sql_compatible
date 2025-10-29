@@ -1,0 +1,218 @@
+WITH UserExpertise AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes,
+        U.Views AS UserViews,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        COUNT(B.Id) AS TotalBadges,
+        (CAST(U.Reputation AS numeric) * 0.1) + (CAST(U.UpVotes AS numeric) * 0.5) + (CAST(U.Views AS numeric) * 0.01) AS ExpertScore
+    FROM
+        Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.Views
+    HAVING
+        U.Reputation > 10000
+        AND MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) = 1
+),
+QuestionHistoryAnalysis AS (
+    SELECT
+        PH.PostId,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS ClosedHistoryCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenedHistoryCount,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        MAX(PH.CreationDate) AS LastHistoryDate,
+        (
+            SELECT
+                CR.Name
+            FROM
+                PostHistory PH_Close_Inner
+            INNER JOIN CloseReasonTypes CR ON CR.Id = CAST(PH_Close_Inner.Comment AS int)
+            WHERE
+                PH_Close_Inner.PostId = PH.PostId
+                AND PH_Close_Inner.PostHistoryTypeId = 10
+            ORDER BY
+                PH_Close_Inner.CreationDate DESC
+            LIMIT 1
+        ) AS LastCloseReason
+    FROM
+        PostHistory PH
+    GROUP BY
+        PH.PostId
+    HAVING
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) >= 3
+        AND SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) >= 1
+        AND SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) >= 1
+),
+QuestionStats AS (
+    SELECT
+        P.Id AS QuestionId,
+        P.Title,
+        P.CreationDate AS QuestionCreationDate,
+        P.LastActivityDate,
+        P.Score AS QuestionScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS QuestionCommentCount,
+        P.OwnerUserId,
+        P.AcceptedAnswerId,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.Tags,
+        COALESCE((LENGTH(P.Body) - LENGTH(REPLACE(P.Body, '<code>', '')))/NULLIF(LENGTH('<code>'),0), 0) AS CodeBlockCount,
+        COALESCE(LENGTH(P.Title), 0) AS TitleLength,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL AND P.AcceptedAnswerId IS NULL THEN 'Closed_NoAccepted'
+            WHEN P.ClosedDate IS NOT NULL AND P.AcceptedAnswerId IS NOT NULL THEN 'Closed_Accepted'
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 'Open_Accepted'
+            ELSE 'Open_NoAccepted'
+        END AS QuestionStatus,
+        QHA.EditCount,
+        QHA.ClosedHistoryCount,
+        QHA.ReopenedHistoryCount,
+        QHA.UniqueEditors,
+        QHA.LastHistoryDate,
+        QHA.LastCloseReason
+    FROM
+        Posts P
+    INNER JOIN QuestionHistoryAnalysis QHA ON P.Id = QHA.PostId
+    WHERE
+        P.PostTypeId = 1
+        AND P.ViewCount > 5000 AND P.Score > 100
+),
+TagExplosion AS (
+    SELECT
+        QS.QuestionId,
+        LOWER(TRIM(tag_val)) AS TagName
+    FROM
+        QuestionStats QS,
+        UNNEST(string_to_array(SUBSTRING(QS.Tags, 2, LENGTH(QS.Tags) - 2), '><')) AS tag_val
+    WHERE QS.Tags IS NOT NULL
+),
+TopAnswersPerQuestion AS (
+    SELECT
+        P_A.Id AS AnswerId,
+        P_A.ParentId AS QuestionId,
+        P_A.Score AS AnswerScore,
+        P_A.CreationDate AS AnswerCreationDate,
+        P_A.OwnerUserId AS AnswerOwnerUserId,
+        P_A.CommentCount AS AnswerCommentCount,
+        P_A.Body AS AnswerBody,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        COUNT(C.Id) AS TotalComments,
+        (CAST(P_A.Score AS numeric) * 0.7) + (CAST(COUNT(C.Id) AS numeric) * 0.3) AS AnswerRankScore,
+        ROW_NUMBER() OVER (PARTITION BY P_A.ParentId ORDER BY P_A.Score DESC, P_A.CreationDate ASC) AS rn
+    FROM
+        Posts P_A
+    LEFT JOIN Votes V ON P_A.Id = V.PostId AND V.VoteTypeId IN (2, 3)
+    LEFT JOIN Comments C ON P_A.Id = C.PostId
+    WHERE
+        P_A.PostTypeId = 2
+    GROUP BY
+        P_A.Id, P_A.ParentId, P_A.Score, P_A.CreationDate, P_A.OwnerUserId, P_A.CommentCount, P_A.Body
+),
+TopAnswerCommentStats AS (
+    SELECT
+        TAQ.QuestionId,
+        TAQ.AnswerId,
+        AVG(COALESCE(C.Score, 0)) AS AvgCommentScore,
+        MAX(C.CreationDate) AS LatestCommentDate,
+        COUNT(DISTINCT C.UserId) AS UniqueCommentersOnAnswer,
+        SUM(CASE WHEN C.Text ILIKE '%thank%' OR C.Text ILIKE '%good answer%' THEN 1 ELSE 0 END) AS PositiveCommentCount
+    FROM
+        TopAnswersPerQuestion TAQ
+    INNER JOIN Comments C ON TAQ.AnswerId = C.PostId
+    WHERE TAQ.rn = 1
+    GROUP BY
+        TAQ.QuestionId, TAQ.AnswerId
+),
+QuestionLinkAnalysis AS (
+    SELECT
+        PL.PostId AS QuestionId,
+        COUNT(DISTINCT PL.RelatedPostId) AS LinkedQuestionsCount,
+        MAX(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS HasDuplicateLink,
+        MAX(PL.CreationDate) AS LastLinkDate
+    FROM
+        PostLinks PL
+    WHERE
+        PL.LinkTypeId IN (1, 3)
+    GROUP BY
+        PL.PostId
+)
+SELECT
+    QS.QuestionId,
+    QS.Title,
+    UE_Q.DisplayName AS QuestionOwnerDisplayName,
+    UE_Q.Reputation AS QuestionOwnerReputation,
+    UE_Q.ExpertScore AS QuestionOwnerExpertScore,
+    QS.QuestionCreationDate,
+    QS.QuestionScore,
+    QS.ViewCount,
+    QS.AnswerCount,
+    QS.EditCount,
+    QS.ClosedHistoryCount,
+    QS.ReopenedHistoryCount,
+    QS.QuestionStatus,
+    QS.LastCloseReason,
+    QS.CodeBlockCount,
+    QS.TitleLength,
+    TAQ.AnswerId AS BestAnswerId,
+    AnswerOwner.DisplayName AS BestAnswerOwnerDisplayName,
+    AnswerOwner.Reputation AS BestAnswerOwnerReputation,
+    TAQ.AnswerScore AS BestAnswerScore,
+    TAQ.AnswerRankScore AS BestAnswerCombinedScore,
+    TAQ.UpVoteCount AS BestAnswerUpVotes,
+    TAQ.DownVoteCount AS BestAnswerDownVotes,
+    TAC.AvgCommentScore AS BestAnswerAvgCommentScore,
+    TAC.PositiveCommentCount AS BestAnswerPositiveComments,
+    QLA.LinkedQuestionsCount,
+    QLA.HasDuplicateLink,
+    STRING_AGG(TE.TagName, ', ' ORDER BY TE.TagName) AS TagsList,
+    AVG(P_Sibling.Score) OVER (PARTITION BY UE_Q.UserId) AS AvgScoreByQuestionOwner,
+    NTILE(5) OVER (ORDER BY QS.QuestionScore DESC) AS QuestionScoreQuintile
+FROM
+    QuestionStats QS
+INNER JOIN UserExpertise UE_Q ON QS.OwnerUserId = UE_Q.UserId
+LEFT JOIN TopAnswersPerQuestion TAQ ON QS.QuestionId = TAQ.QuestionId AND TAQ.rn = 1
+LEFT JOIN Users AnswerOwner ON TAQ.AnswerOwnerUserId = AnswerOwner.Id
+LEFT JOIN TopAnswerCommentStats TAC ON TAQ.AnswerId = TAC.AnswerId
+LEFT JOIN QuestionLinkAnalysis QLA ON QS.QuestionId = QLA.QuestionId
+LEFT JOIN TagExplosion TE ON QS.QuestionId = TE.QuestionId
+LEFT JOIN Posts P_Sibling ON UE_Q.UserId = P_Sibling.OwnerUserId AND P_Sibling.PostTypeId = 1
+GROUP BY
+    QS.QuestionId,
+    QS.Title,
+    UE_Q.DisplayName,
+    UE_Q.Reputation,
+    UE_Q.ExpertScore,
+    QS.QuestionCreationDate,
+    QS.LastActivityDate,
+    QS.QuestionScore,
+    QS.ViewCount,
+    QS.AnswerCount,
+    QS.EditCount,
+    QS.ClosedHistoryCount,
+    QS.ReopenedHistoryCount,
+    QS.QuestionStatus,
+    QS.LastCloseReason,
+    QS.CodeBlockCount,
+    QS.TitleLength,
+    TAQ.AnswerId,
+    AnswerOwner.DisplayName,
+    AnswerOwner.Reputation,
+    TAQ.AnswerScore,
+    TAQ.AnswerRankScore,
+    TAQ.UpVoteCount,
+    TAQ.DownVoteCount,
+    TAC.AvgCommentScore,
+    TAC.PositiveCommentCount,
+    QLA.LinkedQuestionsCount,
+    QLA.HasDuplicateLink,
+    UE_Q.UserId
+ORDER BY
+    QS.QuestionScore DESC, QS.LastActivityDate DESC
+LIMIT 1000;

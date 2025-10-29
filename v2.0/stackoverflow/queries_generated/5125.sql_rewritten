@@ -1,0 +1,136 @@
+-- {"query": "5125.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 929} 
+WITH recent_user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+top_tags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC, t.TagName) AS rn
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+hot_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Tags,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    CASE
+      WHEN p.CloseDate IS NOT NULL THEN 1
+      ELSE 0
+    END AS IsClosed
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10 -- post closed events
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+correlated_comments AS (
+  SELECT
+    c.PostId,
+    c.Id AS CommentId,
+    c.Score,
+    c.Text,
+    c.CreationDate,
+    c.UserId,
+    c.UserDisplayName,
+    c.ContentLicense,
+    ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.Score DESC, c.CreationDate) AS rn
+  FROM Comments c
+),
+complex_derived AS (
+  SELECT
+    rp.PostId,
+    rp.CommentId,
+    rp.Score,
+    rp.Text,
+    rp.CreationDate,
+    rp.UserId,
+    rp.UserDisplayName,
+    rp.ContentLicense,
+    p.Title AS PostTitle,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.ViewCount
+  FROM hot_posts rp
+  JOIN Posts p ON p.Id = rp.PostId
+  LEFT JOIN correlated_comments cc ON cc.PostId = rp.PostId AND cc.rn = 1
+  WHERE rp.IsClosed = 0
+),
+normalized AS (
+  SELECT
+    c.PostId,
+    c.CommentId,
+    c.Score,
+    c.Text,
+    c.CreationDate,
+    c.UserId,
+    c.UserDisplayName,
+    c.ContentLicense,
+    p.PostTitle,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.ViewCount
+  FROM complex_derived c
+  LEFT JOIN Posts p ON p.Id = c.PostId
+)
+SELECT
+  u.UserId,
+  u.DisplayName AS UserDisplayName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  u.LastAccessDate,
+  u.Location,
+  u.Views,
+  u.UpVotes,
+  u.DownVotes,
+  u.AccountId,
+  t.TagName,
+  t.Count AS TagCount,
+  hb.PostId,
+  hb.Title AS PostTitle,
+  hb.Score AS PostScore,
+  hb.ViewCount AS PostViews,
+  hb.CreationDate AS PostCreationDate,
+  hb.LastActivityDate AS PostLastActivityDate,
+  hb.OwnerUserId AS PostOwnerUserId,
+  hb.Tags AS PostTags,
+  hb.CommentCount AS PostCommentCount,
+  hb.AnswerCount AS PostAnswerCount,
+  hb.FavoriteCount AS PostFavoriteCount,
+  CASE WHEN hb.IsClosed = 1 THEN TRUE ELSE FALSE END AS IsPostClosed,
+  w.CommentId AS TopCommentId,
+  w.Text AS TopCommentText,
+  w.Score AS TopCommentScore
+FROM normalized hb
+JOIN recent_user_activity u ON u.UserId = hb.OwnerUserId
+LEFT JOIN Top_tags tt ON 1 = 1
+LEFT JOIN (
+  SELECT ROW_NUMBER() OVER (ORDER BY TagCount DESC) AS rn, *
+  FROM top_tags
+) t ON t.rn = 1
+LEFT JOIN correlated_comments w ON w.PostId = hb.PostId AND w.rn = 1
+WHERE u.rn = 1
+ORDER BY u.Reputation DESC, hb.Score DESC
+LIMIT 100;

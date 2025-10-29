@@ -1,0 +1,286 @@
+-- {"query": "1248.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4569} 
+
+WITH UserActivityBase AS (
+    -- Summarize core user activities: posts, comments, votes given, and badge counts
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COALESCE(COUNT(DISTINCT P.Id), 0) AS TotalPostsAuthored,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS TotalQuestionsAuthored,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalAnswersAuthored,
+        COALESCE(COUNT(DISTINCT C.Id), 0) AS TotalCommentsMade,
+        COALESCE(COUNT(DISTINCT B.Id), 0) AS TotalBadgesEarned,
+        COALESCE(SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        COALESCE(SUM(V.BountyAmount) FILTER (WHERE V.VoteTypeId = 8), 0) AS TotalBountyPosted
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        U.Views, U.UpVotes, U.DownVotes
+),
+PostEditActivity AS (
+    -- Detailed post history to identify individual edit events and their sequence
+    SELECT
+        PH.PostId,
+        PH.Id AS PostHistoryId,
+        PH.CreationDate AS EditCreationDate,
+        PH.PostHistoryTypeId,
+        -- Calculate the previous edit date to find the time elapsed between consecutive edits for a post
+        LAG(PH.CreationDate, 1, P.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousEventDate
+    FROM PostHistory PH
+    JOIN Posts P ON PH.PostId = P.Id
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 1, 2, 3) -- Initial post (1,2,3) or explicit edits (4,5,6)
+),
+PostEditHistorySummary AS (
+    -- Summarize post edit frequency, distinct editors, and average time between edits
+    SELECT
+        PH.PostId,
+        COALESCE(COUNT(DISTINCT PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)), 0) AS EditCount,
+        COALESCE(COUNT(DISTINCT PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (7, 8, 9)), 0) AS RollbackCount,
+        COALESCE(COUNT(DISTINCT PH.UserId), 0) AS DistinctEditors,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS LastClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate ELSE NULL END) AS LastReopenedDate,
+        -- Calculate average days between any two consecutive edits/events for this post
+        COALESCE(AVG(EXTRACT(EPOCH FROM (PEA.EditCreationDate - PEA.PreviousEventDate)) / (60 * 60 * 24)) FILTER (WHERE PEA.PreviousEventDate IS NOT NULL AND PEA.EditCreationDate > PEA.PreviousEventDate), 0) AS AvgDaysBetweenEvents
+    FROM PostHistory PH
+    LEFT JOIN PostEditActivity PEA ON PH.PostId = PEA.PostId AND PH.CreationDate = PEA.EditCreationDate AND PH.PostHistoryTypeId = PEA.PostHistoryTypeId
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 10, 11) -- Edit, Rollback, Close, Reopen
+    GROUP BY PH.PostId
+),
+QuestionAnswerEngagement AS (
+    -- Aggregate answer acceptance rate and question-specific metrics, including initial response time
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.LastActivityDate AS QuestionLastActivityDate,
+        Q.ClosedDate,
+        COALESCE(COUNT(DISTINCT A.Id), 0) AS TotalAnswersReceived,
+        COALESCE(COUNT(DISTINCT CASE WHEN Q.AcceptedAnswerId = A.Id THEN A.Id END), 0) AS AcceptedAnswersReceived,
+        MAX(A.Score) AS MaxAnswerScore,
+        SUM(A.Score) AS SumOfAnswerScores,
+        -- Calculate the average time difference between question creation and first answer
+        COALESCE(EXTRACT(EPOCH FROM AVG(A.CreationDate - Q.CreationDate)) / 3600, 0) AS AvgTimeToFirstAnswerHours -- In hours
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    WHERE Q.PostTypeId = 1
+    GROUP BY
+        Q.Id, Q.OwnerUserId, Q.CreationDate, Q.Score, Q.ViewCount,
+        Q.AnswerCount, Q.FavoriteCount, Q.LastActivityDate, Q.ClosedDate
+),
+AnswerDetails AS (
+    -- Details for answers, including if they were accepted, to be used for user-level aggregations
+    SELECT
+        A.Id AS AnswerId,
+        A.OwnerUserId AS AnswerOwnerId,
+        A.ParentId AS QuestionId,
+        A.Score AS AnswerScore,
+        A.CreationDate AS AnswerCreationDate,
+        MAX(CASE WHEN Q.AcceptedAnswerId = A.Id THEN 1 ELSE 0 END) AS IsAccepted
+    FROM Posts A
+    JOIN Posts Q ON A.ParentId = Q.Id AND Q.PostTypeId = 1
+    WHERE A.PostTypeId = 2
+    GROUP BY A.Id, A.OwnerUserId, A.ParentId, A.Score, A.CreationDate
+),
+UserOverallEngagement AS (
+    -- Combine user-level, question-level, and answer-level metrics for a holistic user view
+    SELECT
+        UAB.UserId,
+        UAB.DisplayName,
+        UAB.Reputation,
+        UAB.UserCreationDate,
+        UAB.LastAccessDate,
+        UAB.UserProfileViews,
+        UAB.TotalPostsAuthored,
+        UAB.TotalQuestionsAuthored,
+        UAB.TotalAnswersAuthored,
+        UAB.TotalCommentsMade,
+        UAB.TotalBadgesEarned,
+        UAB.GoldBadges,
+        UAB.SilverBadges,
+        UAB.BronzeBadges,
+        UAB.TotalBountyPosted,
+        COALESCE(SUM(QE.QuestionScore), 0) AS TotalQuestionScore,
+        COALESCE(SUM(QE.ViewCount), 0) AS TotalQuestionViewCount,
+        COALESCE(SUM(AE.AnswerScore), 0) AS TotalAnswerScore,
+        COALESCE(COUNT(DISTINCT AE.AnswerId) FILTER (WHERE AE.IsAccepted = 1), 0) AS TotalAcceptedAnswers,
+        -- Sum up edit/rollback counts and average edit interval across all posts owned by the user
+        COALESCE(SUM(PEHS.EditCount) FILTER (WHERE PEHS.PostId IN (QE.QuestionId) OR PEHS.PostId IN (AE.AnswerId)), 0) AS TotalEditsMadeOnUserPosts,
+        COALESCE(SUM(PEHS.RollbackCount) FILTER (WHERE PEHS.PostId IN (QE.QuestionId) OR PEHS.PostId IN (AE.AnswerId)), 0) AS TotalRollbacksOnUserPosts,
+        COALESCE(AVG(PEHS.AvgDaysBetweenEvents) FILTER (WHERE PEHS.PostId IN (QE.QuestionId) OR PEHS.PostId IN (AE.AnswerId)), NULL) AS AvgDaysBetweenEventsOnUserPosts,
+        COALESCE(AVG(QE.AvgTimeToFirstAnswerHours) FILTER (WHERE QE.QuestionOwnerId = UAB.UserId), NULL) AS AvgResponseTimeForOwnQuestionsHours,
+        COALESCE(MAX(QE.FavoriteCount) FILTER (WHERE QE.QuestionOwnerId = UAB.UserId), 0) AS MaxQuestionFavorites,
+        -- Correlated subquery example: Check if user has at least one highly viewed and highly answered question
+        EXISTS (
+            SELECT 1
+            FROM QuestionAnswerEngagement sq_qe
+            WHERE sq_qe.QuestionOwnerId = UAB.UserId
+              AND sq_qe.ViewCount > 50000 -- More than 50k views
+              AND sq_qe.AnswerCount > 10 -- More than 10 answers
+              AND sq_qe.QuestionScore > 50 -- And a high score
+        ) AS HasViralQuestion
+    FROM UserActivityBase UAB
+    LEFT JOIN QuestionAnswerEngagement QE ON UAB.UserId = QE.QuestionOwnerId
+    LEFT JOIN AnswerDetails AE ON UAB.UserId = AE.AnswerOwnerId
+    LEFT JOIN PostEditHistorySummary PEHS ON (QE.QuestionId = PEHS.PostId OR AE.AnswerId = PEHS.PostId) -- Link edits to either question or answer
+    GROUP BY
+        UAB.UserId, UAB.DisplayName, UAB.Reputation, UAB.UserCreationDate, UAB.LastAccessDate,
+        UAB.UserProfileViews, UAB.TotalPostsAuthored, UAB.TotalQuestionsAuthored,
+        UAB.TotalAnswersAuthored, UAB.TotalCommentsMade, UAB.TotalBadgesEarned,
+        UAB.GoldBadges, UAB.SilverBadges, UAB.BronzeBadges, UAB.TotalBountyPosted
+),
+TagPerformance AS (
+    -- Analyze tag performance and individual user contributions to tags
+    SELECT
+        P.OwnerUserId AS UserId,
+        TRIM(SUBSTRING(unnested_tag, 2, LENGTH(unnested_tag) - 2)) AS TagName,
+        COUNT(DISTINCT P.Id) AS PostsInTag,
+        SUM(P.Score) AS TagScoreSum,
+        AVG(P.Score) AS TagScoreAvg,
+        COALESCE(SUM(P.ViewCount), 0) AS TagViewCount
+    FROM Posts P
+    -- Use LATERAL UNNEST for efficient string splitting of Tags column
+    CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')) AS unnested_tag
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY P.OwnerUserId, TagName
+),
+TopTagsByUsers AS (
+    -- Rank tags for each user based on their summed post scores within that tag
+    SELECT
+        TP.UserId,
+        TP.TagName,
+        TP.PostsInTag,
+        TP.TagScoreSum,
+        TP.TagScoreAvg,
+        TP.TagViewCount,
+        RANK() OVER (PARTITION BY TP.UserId ORDER BY TP.TagScoreSum DESC, TP.PostsInTag DESC) AS UserTagRank
+    FROM TagPerformance TP
+),
+ControversialPosts AS (
+    -- Identify posts with high downvote ratios or significant close/reopen activity
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.Score AS PostScore,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpvotesReceived,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownvotesReceived,
+        COALESCE(SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END), 0) AS CloseVoteCount,
+        COALESCE(SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END), 0) AS ReopenVoteCount,
+        CASE
+            WHEN COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) > 0
+            THEN CAST(COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS NUMERIC) / SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END)
+            ELSE 0
+        END AS DownvoteToUpvoteRatio
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.Score
+    HAVING (COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) > 5 AND COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) > 0) -- High downvotes with some upvotes
+        OR (COALESCE(SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END), 0) > 1) -- More than one close event
+        OR (COALESCE(SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END), 0) > 0 AND COALESCE(SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END), 0) > 0) -- Reopened after being closed
+),
+UserControversySummary AS (
+    -- Summarize controversy metrics for each user based on their posts
+    SELECT
+        CP.OwnerUserId AS UserId,
+        COUNT(DISTINCT CP.PostId) AS TotalControversialPosts,
+        MAX(CP.DownvoteToUpvoteRatio) AS MaxDownvoteRatio,
+        COALESCE(SUM(CP.CloseVoteCount), 0) AS UserTotalCloseEvents,
+        COALESCE(SUM(CP.ReopenVoteCount), 0) AS UserTotalReopenEvents
+    FROM ControversialPosts CP
+    GROUP BY CP.OwnerUserId
+)
+-- Main Query: Combine all insights to rank users based on a comprehensive composite impact score
+SELECT
+    UOE.UserId,
+    COALESCE(UOE.DisplayName, 'Anonymous User') AS UserDisplayName,
+    UOE.Reputation,
+    UOE.UserCreationDate,
+    UOE.LastAccessDate,
+    DATE_PART('day', NOW() - UOE.UserCreationDate) AS DaysSinceAccountCreation,
+    UOE.UserProfileViews,
+    UOE.TotalPostsAuthored,
+    UOE.TotalQuestionsAuthored,
+    UOE.TotalAnswersAuthored,
+    UOE.TotalCommentsMade,
+    UOE.TotalBadgesEarned,
+    UOE.GoldBadges,
+    UOE.SilverBadges,
+    UOE.BronzeBadges,
+    UOE.TotalBountyPosted,
+    UOE.TotalQuestionScore,
+    UOE.TotalQuestionViewCount,
+    UOE.TotalAnswerScore,
+    UOE.TotalAcceptedAnswers,
+    -- Calculate accepted answer rate, gracefully handling division by zero
+    CASE
+        WHEN UOE.TotalAnswersAuthored > 0 THEN CAST(UOE.TotalAcceptedAnswers AS NUMERIC) / UOE.TotalAnswersAuthored
+        ELSE 0
+    END AS AcceptedAnswerRate,
+    UOE.TotalEditsMadeOnUserPosts,
+    UOE.TotalRollbacksOnUserPosts,
+    UOE.AvgDaysBetweenEventsOnUserPosts,
+    UOE.AvgResponseTimeForOwnQuestionsHours,
+    UOE.MaxQuestionFavorites,
+    UOE.HasViralQuestion,
+    COALESCE(UCS.TotalControversialPosts, 0) AS TotalControversialPostsAuthored,
+    COALESCE(UCS.MaxDownvoteRatio, 0.0) AS MaxPostDownvoteRatio,
+    COALESCE(UCS.UserTotalCloseEvents, 0) AS TotalCloseEventsOnUserPosts,
+    COALESCE(UCS.UserTotalReopenEvents, 0) AS TotalReopenEventsOnUserPosts,
+    -- Scalar subquery to aggregate the top 3 tags for each user into a comma-separated string
+    (SELECT STRING_AGG(TTBU.TagName, ', ') FROM TopTagsByUsers TTBU WHERE TTBU.UserId = UOE.UserId AND TTBU.UserTagRank <= 3) AS Top3Tags,
+    -- Composite Impact Score Calculation: a weighted sum of various positive and negative user metrics
+    (
+        UOE.Reputation * 0.1 -- Reputation is a strong indicator
+        + UOE.TotalPostsAuthored * 0.5 -- Contribution quantity
+        + UOE.TotalAcceptedAnswers * 5 -- High value answers
+        + UOE.GoldBadges * 10 -- High recognition
+        + UOE.SilverBadges * 5
+        + UOE.BronzeBadges * 1
+        + UOE.TotalQuestionViewCount * 0.0001 -- Reach of questions
+        + UOE.TotalQuestionScore * 0.2 -- Quality of questions
+        + UOE.TotalAnswerScore * 0.3 -- Quality of answers
+        + (CASE WHEN UOE.HasViralQuestion THEN 50 ELSE 0 END) -- Bonus for viral content
+        - (COALESCE(UCS.TotalControversialPosts, 0) * 2) -- Penalty for controversial posts
+        - (COALESCE(UCS.UserTotalCloseEvents, 0) * 1) -- Penalty for closed posts
+    ) AS CompositeImpactScore,
+    -- Rank users based on their calculated Composite Impact Score
+    RANK() OVER (ORDER BY (
+        UOE.Reputation * 0.1
+        + UOE.TotalPostsAuthored * 0.5
+        + UOE.TotalAcceptedAnswers * 5
+        + UOE.GoldBadges * 10
+        + UOE.SilverBadges * 5
+        + UOE.BronzeBadges * 1
+        + UOE.TotalQuestionViewCount * 0.0001
+        + UOE.TotalQuestionScore * 0.2
+        + UOE.TotalAnswerScore * 0.3
+        + (CASE WHEN UOE.HasViralQuestion THEN 50 ELSE 0 END)
+        - (COALESCE(UCS.TotalControversialPosts, 0) * 2)
+        - (COALESCE(UCS.UserTotalCloseEvents, 0) * 1)
+    ) DESC) AS UserImpactRank
+FROM UserOverallEngagement UOE
+LEFT JOIN UserControversySummary UCS ON UOE.UserId = UCS.UserId
+WHERE
+    UOE.Reputation > 100 -- Filter for reasonably established users
+    AND UOE.TotalPostsAuthored > 5 -- Ensure users have made several contributions
+    AND UOE.LastAccessDate >= (NOW() - INTERVAL '1 year') -- Consider only recently active users
+ORDER BY UserImpactRank ASC, UOE.UserId ASC
+LIMIT 100;

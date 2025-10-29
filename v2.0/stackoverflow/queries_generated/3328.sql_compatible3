@@ -1,0 +1,157 @@
+WITH
+    usr_stats AS (
+        SELECT
+            u.Id                                 AS user_id,
+            u.DisplayName                        AS display_name,
+            COALESCE(u.Reputation, 0)            AS reputation,
+            COUNT(DISTINCT q.Id)                 AS questions_posted,
+            COUNT(DISTINCT a.Id)                 AS answers_posted,
+            COALESCE(SUM(CASE
+                WHEN v.VoteTypeId = 2 THEN  1
+                WHEN v.VoteTypeId = 3 THEN -1
+                ELSE 0
+            END),0)                             AS vote_balance,
+            MAX(u.LastAccessDate)               AS last_seen
+        FROM Users u
+        LEFT JOIN Posts q   ON q.OwnerUserId = u.Id AND q.PostTypeId = 1
+        LEFT JOIN Posts a   ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+        LEFT JOIN Votes v   ON (v.PostId = q.Id OR v.PostId = a.Id) AND v.VoteTypeId IN (2,3)
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    badge_pts AS (
+        SELECT
+            b.UserId                       AS user_id,
+            SUM(CASE b.Class
+                WHEN 1 THEN 1000
+                WHEN 2 THEN 500
+                ELSE 100
+            END)                           AS badge_score
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    top_tags AS (
+        SELECT
+            t.TagName,
+            t.Count,
+            ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS tag_rank
+        FROM Tags t
+        WHERE COALESCE(t.IsModeratorOnly, FALSE) = FALSE
+    ),
+
+    recent_closed AS (
+        SELECT
+            ph.PostId,
+            ph.CreationDate                AS closed_at,
+            CASE
+              WHEN ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS INTEGER)
+              ELSE NULL
+            END                             AS close_reason_id
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10
+          AND ph.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+    ),
+
+    best_answer AS (
+        SELECT
+            q.Id                           AS question_id,
+            a.Id                           AS best_answer_id,
+            a.Score                        AS best_score,
+            a.CreationDate                 AS answered_on
+        FROM Posts q
+        LEFT JOIN LATERAL (
+            SELECT
+                ans.Id,
+                ans.Score,
+                ans.CreationDate
+            FROM Posts ans
+            WHERE ans.ParentId = q.Id
+              AND ans.PostTypeId = 2
+            ORDER BY ans.Score DESC NULLS LAST, ans.CreationDate ASC
+            LIMIT 1
+        ) a ON TRUE
+        WHERE q.PostTypeId = 1
+    ),
+
+    high_impact_posts AS (
+        SELECT
+            p.Id,
+            p.Title,
+            p.Score,
+            p.FavoriteCount,
+            p.OwnerUserId,
+            p.CreationDate
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND (p.Score >= 100 OR COALESCE(p.FavoriteCount,0) >= 10)
+
+        UNION ALL
+
+        SELECT
+            p.Id,
+            p.Title,
+            p.Score,
+            p.FavoriteCount,
+            p.OwnerUserId,
+            p.CreationDate
+        FROM Posts p
+        WHERE p.PostTypeId = 2
+          AND EXISTS (
+                SELECT 1 FROM Votes v
+                WHERE v.PostId = p.Id
+                  AND v.VoteTypeId = 2
+                GROUP BY v.PostId
+                HAVING COUNT(*) >= 50
+          )
+    )
+SELECT
+    us.user_id,
+    us.display_name,
+    us.reputation,
+    us.questions_posted,
+    us.answers_posted,
+    us.vote_balance,
+    COALESCE(bp.badge_score,0)                AS badge_score,
+    (us.reputation * 0.4
+     + us.questions_posted * 5
+     + us.answers_posted   * 10
+     + us.vote_balance    * 2
+     + COALESCE(bp.badge_score,0) * 0.01)    AS activity_index,
+    rc.closed_at,
+    rc.close_reason_id,
+    ba.best_answer_id,
+    ba.best_score,
+    ba.answered_on,
+    STRING_AGG(tt.TagName, ', ') FILTER (WHERE tt.tag_rank <= 3) OVER (PARTITION BY us.user_id) AS top_three_tags,
+    COUNT(hip.Id) FILTER (WHERE hip.OwnerUserId = us.user_id) OVER (PARTITION BY us.user_id) AS high_impact_post_cnt,
+    CASE WHEN us.last_seen < (CAST('2024-10-01' AS DATE) - INTERVAL '90' DAY) THEN 1 ELSE 0 END AS dormant_flag
+FROM usr_stats us
+LEFT JOIN badge_pts bp      ON bp.user_id = us.user_id
+LEFT JOIN recent_closed rc ON rc.PostId = (
+        SELECT q.Id
+        FROM Posts q
+        WHERE q.OwnerUserId = us.user_id
+          AND q.PostTypeId = 1
+        ORDER BY q.CreationDate DESC
+        LIMIT 1
+    )
+LEFT JOIN best_answer ba    ON ba.question_id = (
+        SELECT q.Id
+        FROM Posts q
+        WHERE q.OwnerUserId = us.user_id
+          AND q.PostTypeId = 1
+        ORDER BY q.CreationDate DESC
+        LIMIT 1
+    )
+LEFT JOIN top_tags tt       ON TRUE
+LEFT JOIN high_impact_posts hip ON hip.OwnerUserId = us.user_id
+GROUP BY
+    us.user_id, us.display_name, us.reputation,
+    us.questions_posted, us.answers_posted, us.vote_balance,
+    bp.badge_score, rc.closed_at, rc.close_reason_id,
+    ba.best_answer_id, ba.best_score, ba.answered_on,
+    us.last_seen, tt.TagName, tt.tag_rank
+HAVING COUNT(hip.Id) FILTER (WHERE hip.OwnerUserId = us.user_id) > 0
+ORDER BY activity_index DESC
+LIMIT 100;

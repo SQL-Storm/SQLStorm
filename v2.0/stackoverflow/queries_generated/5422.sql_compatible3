@@ -1,0 +1,120 @@
+WITH q AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.Body,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.PostTypeId,
+    COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+    u.Reputation,
+    u.DisplayName AS UserDisplayName,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate AS UserLastAccessDate,
+    u.Location,
+    u.WebsiteUrl,
+    w.LastEditorUserId AS LastEditorUserId,
+    w.LastEditorDisplayName AS LastEditorDisplayName,
+    w.LastEditDate AS LastEditDate,
+    w.Title AS LastTitle,
+    w.Comment AS LastComment,
+    ROW_NUMBER() OVER (PARTITION BY CAST(p.CreationDate AS DATE) ORDER BY p.Score DESC, p.ViewCount DESC) AS rn_per_day,
+    SUM(p.Score) OVER (PARTITION BY p.OwnerUserId, CAST(p.CreationDate AS DATE)) AS sum_score_per_user_day
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN PostHistory w ON w.PostId = p.Id AND w.PostHistoryTypeId = 5
+  WHERE p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY)
+),
+counts AS (
+  SELECT
+    p.OwnerUserId,
+    COUNT(*) AS total_posts,
+    SUM(p.ViewCount) AS total_views,
+    AVG(p.Score) AS avg_score,
+    MAX(p.CreationDate) AS last_post_date
+  FROM Posts p
+  GROUP BY p.OwnerUserId
+),
+tag_summary AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS post_with_tag,
+    AVG(p.Score) AS avg_score_tag
+  FROM Tags t
+  JOIN Posts p ON p.Id = t.PostId
+  WHERE t.IsModeratorOnly = 0
+  GROUP BY t.TagName
+),
+recent_hot AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.CreationDate,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS hot_rank
+  FROM Posts p
+  WHERE p.LastActivityDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7' DAY)
+  FETCH FIRST 50 ROWS ONLY
+)
+SELECT
+  sub.PostId,
+  sub.Title,
+  sub.CreationDate,
+  sub.OwnerUserId,
+  sub.UserDisplayName AS OwnerDisplayName,
+  sub.Reputation,
+  sub.sum_score_per_user_day AS Sum_Score_Per_User_Day
+FROM (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.CreationDate,
+    q.OwnerUserId,
+    q.UserDisplayName,
+    q.Reputation,
+    q.rn_per_day,
+    q.sum_score_per_user_day,
+    q.ViewCount,
+    q.Score,
+    q.Tags,
+    q.Body,
+    q.LastActivityDate,
+    q.AnswerCount,
+    q.CommentCount,
+    q.FavoriteCount,
+    q.PostTypeId,
+    q.AcceptedAnswerId,
+    q.LastEditorUserId,
+    q.LastEditorDisplayName,
+    q.LastEditDate,
+    q.LastTitle,
+    q.LastComment
+  FROM q
+) AS sub
+LEFT JOIN counts c ON sub.OwnerUserId = c.OwnerUserId
+WHERE sub.rn_per_day = 1
+  AND COALESCE(c.total_posts, 0) > 5
+
+UNION ALL
+
+SELECT
+  NULL AS PostId,
+  ('Tag summary: ' || ts.TagName) AS Title,
+  NULL AS CreationDate,
+  NULL AS OwnerUserId,
+  NULL AS OwnerDisplayName,
+  NULL AS Reputation,
+  ts.avg_score_tag AS Sum_Score_Per_User_Day
+FROM tag_summary ts
+
+ORDER BY 1 NULLS LAST, 7 DESC;

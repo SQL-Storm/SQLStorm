@@ -1,0 +1,101 @@
+-- {"query": "2527.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1119} 
+with RecursivePostHierarchy as (
+    select p.Id, p.PostTypeId, p.ParentId, p.AcceptedAnswerId, p.CreationDate, p.Score, p.ViewCount,
+           p.OwnerUserId, p.Title, p.Tags, 0 as Depth
+    from Posts p
+    where p.PostTypeId = 1 -- questions only, base layer
+    union all
+    select c.Id, c.PostTypeId, c.ParentId, c.AcceptedAnswerId, c.CreationDate, c.Score, c.ViewCount,
+           c.OwnerUserId, c.Title, c.Tags, r.Depth + 1
+    from Posts c
+    join RecursivePostHierarchy r on c.ParentId = r.Id
+), UserBadgeStats as (
+    select b.UserId,
+           count(*) as TotalBadges,
+           count(case when b.Class = 1 then 1 end) as GoldBadges,
+           count(case when b.Class = 2 then 1 end) as SilverBadges,
+           count(case when b.Class = 3 then 1 end) as BronzeBadges,
+           max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+), PostScoreWindow as (
+    select p.Id, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount,
+    row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankByScore,
+    avg(p.Score) over (partition by p.PostTypeId) as AvgScore,
+    sum(p.ViewCount) over () as TotalViewsAllPosts
+    from Posts p
+    where p.PostTypeId in (1, 2)
+), LatestUserActivity as (
+    select u.Id as UserId, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.WebsiteUrl,
+           max(ph.CreationDate) as LastPostEdit,
+           max(c.CreationDate) as LastCommentDate
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.WebsiteUrl
+), DuplicateLinks as (
+    select pl.PostId, pl.RelatedPostId, pl.CreationDate
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where lt.Name = 'Duplicate'
+), TopTagsByPostCount as (
+    select t.TagName, t.Count,
+           dense_rank() over (order by t.Count desc) as TagRank
+    from Tags t
+    where t.Count is not null
+)
+select 
+    rp.Depth,
+    rp.Id as PostId,
+    rp.PostTypeId,
+    rp.Title,
+    coalesce(u.DisplayName, rp.OwnerDisplayName, 'Anonymous') as OwnerName,
+    u.Reputation,
+    us.TotalBadges, us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+    rp.Score,
+    rp.ViewCount,
+    psw.RankByScore,
+    psw.AvgScore,
+    psw.TotalViewsAllPosts,
+    la.LastPostEdit,
+    la.LastCommentDate,
+    case 
+        when exists (
+            select 1 from DuplicateLinks dl where dl.PostId = rp.Id
+        ) then 'HasDuplicates' else 'NoDuplicates' end as DuplicateStatus,
+    string_agg(distinct tt.TagName, ', ') filter (where tt.TagRank <= 5) as Top5Tags,
+    -- Complex expression with NULL logic and string manipulation
+    case 
+        when rp.Tags is null or length(rp.Tags) = 0 then 'NoTags'
+        else
+            upper(
+                replace(
+                    substring(rp.Tags from 2 for char_length(rp.Tags)-2),
+                    '><', ', '
+                )
+            )
+    end as CleanedTags,
+    -- Correlated subquery for recent edits count
+    (
+      select count(*) 
+      from PostHistory ph2 
+      where ph2.PostId = rp.Id and ph2.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+    ) as RecentEditCount,
+    -- Window function for rank within user posts by score
+    row_number() over (
+        partition by rp.OwnerUserId
+        order by rp.Score desc nulls last, rp.ViewCount desc nulls last
+    ) as UserPostRank
+from RecursivePostHierarchy rp
+left join Users u on u.Id = rp.OwnerUserId
+left join UserBadgeStats us on us.UserId = u.Id
+left join PostScoreWindow psw on psw.Id = rp.Id
+left join LatestUserActivity la on la.UserId = u.Id
+left join Tags tt on tt.TagName = any(string_to_array(
+    substring(rp.Tags from 2 for char_length(rp.Tags)-2), '><'))
+where rp.Depth <= 3
+  and (rp.Score > coalesce(
+      (select avg(p2.Score) from Posts p2 where p2.PostTypeId = rp.PostTypeId), 0))
+  and (u.Reputation is null or u.Reputation > 1000)
+order by rp.Depth, rp.Score desc, rp.ViewCount desc
+limit 100;

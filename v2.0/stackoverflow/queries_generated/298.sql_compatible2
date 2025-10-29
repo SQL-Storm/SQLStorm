@@ -1,0 +1,368 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        date_trunc('month', u.creationdate) as cohort_month,
+        row_number() over (order by u.creationdate desc, u.id) as rn_desc_new_users
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+questions as (
+    select
+        p.id as qid,
+        p.owneruserid as asker_id,
+        p.creationdate as q_created,
+        p.score as q_score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        p.closeddate,
+        p.favoritecount,
+        p.commentcount
+    from posts p
+    where p.posttypeid = 1
+),
+answers as (
+    select
+        a.id as aid,
+        a.parentid as qid,
+        a.owneruserid as answerer_id,
+        a.creationdate as a_created,
+        a.score as a_score
+    from posts a
+    where a.posttypeid = 2
+),
+comments_enriched as (
+    select
+        c.postid,
+        c.userid,
+        c.score,
+        c.creationdate,
+        c.text,
+        length(coalesce(c.text,'')) as text_len,
+        (
+            -- use regexp_match for single match (returns text[] in Postgres) handled via array_length guarded by coalesce
+            (array_length(regexp_match(coalesce(c.text,''), '\\m(thanks|thank you|great|nice|helpful)\\M','i')::text[],1) is not null)
+            OR
+            (array_length(regexp_match(coalesce(c.text,''), '(?i)\b(thanks|thank you|great|nice|helpful)\b')::text[],1) is not null)
+        ) as pleasantry_hits
+    from comments c
+),
+votes_agg as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_start,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_close,
+        min(case when v.votetypeid in (8,9) then v.creationdate end) as first_bounty_date
+    from votes v
+    group by v.postid
+),
+postlinks_dup as (
+    select
+        pl.postid as dup_postid,
+        pl.relatedpostid as canonical_qid,
+        pl.linktypeid,
+        pl.creationdate
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+close_reasons as (
+    select
+        ph.postid,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_close_date,
+        cast(max(case
+            when ph.posthistorytypeid = 10 then
+                nullif(trim(regexp_replace(coalesce(ph.comment,''), '[^0-9]', '', 'g')), '')
+            end) as integer) as last_close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+tag_expansion as (
+    select
+        q.qid,
+        unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tag
+    from questions q
+    where q.tags is not null
+),
+tag_rank as (
+    select
+        te.qid,
+        te.tag,
+        dense_rank() over (partition by te.qid order by lower(te.tag)) as tag_rank_alpha
+    from tag_expansion te
+),
+accepted_latency as (
+    select
+        q.qid,
+        q.acceptedanswerid,
+        q.q_created,
+        a.a_created as accepted_created,
+        extract(epoch from (a.a_created - q.q_created)) / 3600.0 as hours_to_accept
+    from questions q
+    left join answers a
+      on a.aid = q.acceptedanswerid
+),
+qa_activity as (
+    select
+        q.qid,
+        q.asker_id,
+        q.q_created,
+        q.q_score,
+        q.viewcount,
+        q.title,
+        q.tags,
+        coalesce(va.upvotes,0) as q_up,
+        coalesce(va.downvotes,0) as q_down,
+        coalesce(va.favorites,0) as q_fav_votes,
+        cr.last_close_date,
+        cr.last_close_reason_id,
+        dl.canonical_qid as duplicate_of,
+        count(distinct a.aid) as answer_count,
+        min(a.a_created) as first_answer_at,
+        max(a.a_created) as last_answer_at,
+        avg(a.a_score) as avg_answer_score,
+        sum(coalesce(vans.upvotes,0)) as ans_upvotes,
+        sum(coalesce(vans.downvotes,0)) as ans_downvotes,
+        sum(coalesce(vans.favorites,0)) as ans_favorites
+    from questions q
+    left join votes_agg va on va.postid = q.qid
+    left join postlinks_dup dl on dl.dup_postid = q.qid
+    left join close_reasons cr on cr.postid = q.qid
+    left join answers a on a.qid = q.qid
+    left join votes_agg vans on vans.postid = a.aid
+    group by q.qid, q.asker_id, q.q_created, q.q_score, q.viewcount, q.title, q.tags,
+             va.upvotes, va.downvotes, va.favorites, cr.last_close_date, cr.last_close_reason_id, dl.canonical_qid
+),
+comment_metrics as (
+    select
+        p.id as postid,
+        count(ce.postid) as comment_count,
+        sum(case when coalesce(ce.pleasantry_hits,false) then 1 else 0 end) as polite_comments,
+        cast(avg(coalesce(ce.text_len,0)) as numeric(18,2)) as avg_comment_len,
+        min(ce.creationdate) as first_comment_at,
+        max(ce.creationdate) as last_comment_at
+    from posts p
+    left join comments_enriched ce on ce.postid = p.id
+    group by p.id
+),
+user_badge_rollup as (
+    select
+        b.userid,
+        sum(case when b.class = 1 then 1 else 0 end) as gold,
+        sum(case when b.class = 2 then 1 else 0 end) as silver,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze,
+        count(*) as total_badges,
+        max(b.date) as last_badge_at
+    from badges b
+    group by b.userid
+),
+question_quality as (
+    select
+        qa.qid,
+        qa.asker_id,
+        qa.q_created,
+        qa.q_score,
+        qa.viewcount,
+        qa.answer_count,
+        qa.avg_answer_score,
+        qa.q_up,
+        qa.q_down,
+        qa.duplicate_of,
+        qa.last_close_reason_id,
+        cm.comment_count as q_comment_count,
+        cm.avg_comment_len as q_avg_comment_len,
+        cm.first_comment_at as q_first_comment_at,
+        cm.last_comment_at as q_last_comment_at,
+        al.hours_to_accept,
+        (
+            coalesce(qa.q_up - qa.q_down, 0) * 2
+            + least(coalesce(qa.viewcount,0), 50000) / 100.0
+            + coalesce(qa.answer_count,0) * 3
+            + coalesce(qa.avg_answer_score,0) * 1.5
+            + case when al.hours_to_accept is null then -2 when al.hours_to_accept <= 1 then 5 when al.hours_to_accept <= 24 then 3 else 1 end
+            - case when qa.duplicate_of is not null then 10 else 0 end
+            - case when qa.last_close_reason_id is not null then 8 else 0 end
+            + coalesce(ln.g,0) * 2
+        )::numeric(18,4) as quality_score
+    from qa_activity qa
+    left join comment_metrics cm on cm.postid = qa.qid
+    left join accepted_latency al on al.qid = qa.qid
+    left join (
+      select qid, ln from (
+        select qid, ln
+        from (
+          select qid, ln
+          from (
+            select qid, ln
+            from (
+              select qid, ln
+              from (
+                select qid, ln
+                from (select qa_inner.qid, log(greatest(coalesce(qa_inner.q_fav_votes,1))) as ln from qa_activity qa_inner) s(qid, ln)
+              ) t(qid, ln)
+            ) u(qid, ln)
+          ) v(qid, ln)
+        ) w(qid, ln)
+      ) x(qid, ln)
+    ) ln on ln.qid = qa.qid
+),
+user_engagement as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.cohort_month,
+        count(distinct case when p.posttypeid = 1 then p.id end) as questions_asked,
+        count(distinct case when p.posttypeid = 2 then p.id end) as answers_given,
+        sum(coalesce(vq.upvotes,0) + coalesce(va.upvotes,0)) as total_upvotes_on_posts,
+        sum(coalesce(vq.downvotes,0) + coalesce(va.downvotes,0)) as total_downvotes_on_posts,
+        sum(coalesce(vq.favorites,0)) as total_favorites_on_questions,
+        max(p.creationdate) as last_post_at
+    from recent_users ru
+    left join posts p on p.owneruserid = ru.user_id
+    left join votes_agg vq on vq.postid = p.id and p.posttypeid = 1
+    left join votes_agg va on va.postid = p.id and p.posttypeid = 2
+    group by ru.user_id, ru.displayname, ru.reputation, ru.cohort_month
+),
+user_qa_blend as (
+    select
+        qe.asker_id as user_id,
+        count(*) filter (where qq.quality_score is not null) as qs_observed,
+        avg(qq.quality_score) as avg_q_quality,
+        percentile_cont(0.9) within group (order by qq.quality_score) as p90_q_quality,
+        sum(case when qq.quality_score >= 20 then 1 else 0 end) as high_quality_qs,
+        sum(case when qq.quality_score < 0 then 1 else 0 end) as poor_quality_qs
+    from question_quality qq
+    join questions qe on qe.qid = qq.qid
+    group by qe.asker_id
+),
+first_tag_per_q as (
+    select
+        tr.qid,
+        tr.tag
+    from tag_rank tr
+    where tr.tag_rank_alpha = 1
+),
+topic_diffusion as (
+    select
+        ft.tag,
+        date_trunc('month', q.q_created) as month,
+        count(*) as q_count,
+        avg(qq.quality_score) as avg_quality
+    from first_tag_per_q ft
+    join questions q on q.qid = ft.qid
+    join question_quality qq on qq.qid = q.qid
+    group by ft.tag, date_trunc('month', q.q_created)
+),
+user_comment_behavior as (
+    select
+        coalesce(ce.userid, p.owneruserid) as actor_id,
+        count(ce.postid) filter (where ce.userid is not null) as comments_made,
+        sum(case when coalesce(ce.pleasantry_hits,false) then 1 else 0 end) as pleasantries_used,
+        cast(avg(coalesce(ce.text_len,0)) as numeric(18,2)) as avg_len_commented,
+        max(ce.creationdate) as last_comment_at
+    from posts p
+    left join comments_enriched ce on ce.postid = p.id
+    group by coalesce(ce.userid, p.owneruserid)
+),
+final_users as (
+    select
+        ue.user_id,
+        ue.displayname,
+        ue.reputation,
+        ue.cohort_month,
+        ue.questions_asked,
+        ue.answers_given,
+        ue.total_upvotes_on_posts,
+        ue.total_downvotes_on_posts,
+        ue.total_favorites_on_questions,
+        coalesce(ub.total_badges,0) as badge_count,
+        coalesce(ub.gold,0) as gold_badges,
+        coalesce(ub.silver,0) as silver_badges,
+        coalesce(ub.bronze,0) as bronze_badges,
+        ub.last_badge_at,
+        uqb.avg_q_quality,
+        uqb.p90_q_quality,
+        uqb.high_quality_qs,
+        uqb.poor_quality_qs,
+        ucb.comments_made,
+        ucb.pleasantries_used,
+        ucb.avg_len_commented,
+        greatest(ue.last_post_at, ub.last_badge_at, ucb.last_comment_at) as last_seen_activity
+    from user_engagement ue
+    left join user_badge_rollup ub on ub.userid = ue.user_id
+    left join user_qa_blend uqb on uqb.user_id = ue.user_id
+    left join user_comment_behavior ucb on ucb.actor_id = ue.user_id
+),
+ranked_users as (
+    select
+        fu.*,
+        row_number() over (
+            partition by fu.cohort_month
+            order by
+                coalesce(fu.avg_q_quality, -999) desc,
+                fu.questions_asked desc,
+                fu.answers_given desc,
+                (fu.total_upvotes_on_posts - fu.total_downvotes_on_posts) desc,
+                fu.badge_count desc,
+                fu.reputation desc,
+                fu.user_id
+        ) as cohort_rank
+    from final_users fu
+)
+select
+    ru.cohort_month,
+    ru.cohort_rank,
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.questions_asked,
+    ru.answers_given,
+    ru.total_upvotes_on_posts,
+    ru.total_downvotes_on_posts,
+    ru.total_favorites_on_questions,
+    ru.badge_count,
+    ru.gold_badges,
+    ru.silver_badges,
+    ru.bronze_badges,
+    round(coalesce(ru.avg_q_quality, 0)::numeric, 3) as avg_q_quality,
+    round(coalesce(ru.p90_q_quality, 0)::numeric, 3) as p90_q_quality,
+    coalesce(ru.high_quality_qs,0) as high_quality_qs,
+    coalesce(ru.poor_quality_qs,0) as poor_quality_qs,
+    coalesce(ru.comments_made,0) as comments_made,
+    coalesce(ru.pleasantries_used,0) as pleasantries_used,
+    ru.avg_len_commented,
+    ru.last_seen_activity,
+    (
+        select ft.tag
+        from questions q2
+        join question_quality qq2 on qq2.qid = q2.qid
+        join first_tag_per_q ft on ft.qid = q2.qid
+        where q2.asker_id = ru.user_id
+        order by qq2.quality_score desc nulls last, q2.q_created desc
+        limit 1
+    ) as signature_tag,
+    (
+        select coalesce(sum(td.q_count),0)
+        from topic_diffusion td
+        where td.tag = (
+            select ft2.tag
+            from questions q3
+            join question_quality qq3 on qq3.qid = q3.qid
+            join first_tag_per_q ft2 on ft2.qid = q3.qid
+            where q3.asker_id = ru.user_id
+            order by qq3.quality_score desc nulls last, q3.q_created desc
+            limit 1
+        )
+          and td.month = ru.cohort_month
+    ) as cohort_signature_tag_volume
+from ranked_users ru
+where ru.cohort_rank <= 50
+order by ru.cohort_month desc, ru.cohort_rank asc;

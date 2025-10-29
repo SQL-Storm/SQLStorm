@@ -1,0 +1,201 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        1 AS Level,
+        ARRAY[t.TagName] AS Ancestry
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+
+    UNION ALL
+
+    SELECT
+        c.Id,
+        c.TagName,
+        r.Level + 1,
+        array_append(r.Ancestry, c.TagName)
+    FROM Tags c
+    JOIN RecursiveTagHierarchy r ON c.Id <> r.Id AND NOT c.TagName = ANY(r.Ancestry)
+    WHERE c.IsModeratorOnly = false AND c.IsRequired = false AND r.Level < 3
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        bool_or(b.TagBased) AS HasTagBasedBadge,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        coalesce(b.GoldBadges,0) AS GoldBadges,
+        coalesce(b.SilverBadges,0) AS SilverBadges,
+        coalesce(b.BronzeBadges,0) AS BronzeBadges,
+        b.HasTagBasedBadge,
+        b.LastBadgeDate,
+        rank() OVER (ORDER BY u.Reputation DESC, u.Views DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN UserBadgeStats b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        COUNT(CASE WHEN a.PostTypeId = 2 THEN 1 END) AS TotalAnswers,
+        AVG(CASE WHEN a.PostTypeId = 2 THEN a.Score END) AS AvgAnswerScore,
+        MAX(CASE WHEN a.PostTypeId = 2 THEN a.Score END) AS MaxAnswerScore,
+        SUM(CASE WHEN a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL THEN 1 ELSE 0 END) AS AnswersWithOwner,
+        bool_or(CASE WHEN a.PostTypeId = 2 AND a.Id = q.AcceptedAnswerId THEN true ELSE false END) AS HasAcceptedAnswer
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.Tags, q.AcceptedAnswerId
+),
+AnswerCommentsStats AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        COUNT(c.Id) AS TotalComments,
+        SUM(c.Score) AS SumCommentScores,
+        AVG(c.Score) AS AvgCommentScore,
+        bool_or(c.UserId IS NOT NULL) AS HasRegisteredCommenters
+    FROM Posts a
+    LEFT JOIN Comments c ON c.PostId = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id, a.ParentId
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        COUNT(*) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS PostsLast30Days,
+        SUM(coalesce(p.Score,0)) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS ScoreLast30Days
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '365 days')
+),
+QuestionsWithTopAnswers AS (
+    SELECT
+        qas.QuestionId,
+        qas.OwnerUserId,
+        qas.QuestionCreation,
+        qas.QuestionScore,
+        qas.TotalAnswers,
+        qas.AvgAnswerScore,
+        qas.MaxAnswerScore,
+        qas.HasAcceptedAnswer,
+        a.Id AS TopAnswerId,
+        a.Score AS TopAnswerScore,
+        ac.TotalComments AS TopAnswerComments,
+        ac.AvgCommentScore AS TopAnswerAvgCommentScore
+    FROM QuestionAnswerStats qas
+    LEFT JOIN LATERAL (
+        SELECT p.*
+        FROM Posts p
+        WHERE p.ParentId = qas.QuestionId AND p.PostTypeId = 2
+        ORDER BY p.Score DESC NULLS LAST, p.CreationDate ASC
+        LIMIT 1
+    ) a ON true
+    LEFT JOIN AnswerCommentsStats ac ON ac.AnswerId = a.Id
+)
+SELECT
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.HasTagBasedBadge,
+    tu.LastBadgeDate,
+    COUNT(DISTINCT qwt.QuestionId) AS QuestionsAsked,
+    COUNT(DISTINCT qwt.TopAnswerId) FILTER (WHERE qwt.TopAnswerScore > 10) AS HighScoringTopAnswers,
+    AVG(qwt.QuestionScore) AS AvgQuestionScore,
+    AVG(qwt.MaxAnswerScore) AS AvgMaxAnswerScore,
+    AVG(qwt.TopAnswerAvgCommentScore) AS AvgTopAnswerCommentScore,
+    MAX(CASE WHEN uw.PostTypeId = 1 THEN uw.ScoreLast30Days END) AS MaxQuestionScoreLast30Days,
+    MAX(CASE WHEN uw.PostTypeId = 2 THEN uw.ScoreLast30Days END) AS MaxAnswerScoreLast30Days,
+    string_agg(DISTINCT substring(t.TagName FROM 1 FOR 10), ',' ORDER BY t.TagName) AS TagsUsed,
+    bool_or(qwt.HasAcceptedAnswer) AS HasAtLeastOneAcceptedAnswer
+FROM TopUsers tu
+LEFT JOIN Posts p ON p.OwnerUserId = tu.Id AND p.PostTypeId = 1
+LEFT JOIN QuestionsWithTopAnswers qwt ON qwt.OwnerUserId = tu.Id
+LEFT JOIN UserActivityWindow uw ON uw.UserId = tu.Id
+LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(coalesce(p.Tags,''), '><')) AS TagName
+) t ON true
+WHERE tu.UserRank <= 100
+GROUP BY tu.Id, tu.DisplayName, tu.Reputation, tu.GoldBadges, tu.SilverBadges, tu.BronzeBadges, tu.HasTagBasedBadge, tu.LastBadgeDate
+HAVING COUNT(DISTINCT qwt.QuestionId) > 5
+
+UNION
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    false AS HasTagBasedBadge,
+    NULL AS LastBadgeDate,
+    0 AS QuestionsAsked,
+    0 AS HighScoringTopAnswers,
+    0.0 AS AvgQuestionScore,
+    0.0 AS AvgMaxAnswerScore,
+    0.0 AS AvgTopAnswerCommentScore,
+    0 AS MaxQuestionScoreLast30Days,
+    0 AS MaxAnswerScoreLast30Days,
+    '' AS TagsUsed,
+    false AS HasAtLeastOneAcceptedAnswer
+FROM Users u
+WHERE u.Reputation < 100
+
+EXCEPT
+
+SELECT
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.HasTagBasedBadge,
+    tu.LastBadgeDate,
+    COUNT(DISTINCT qwt.QuestionId) AS QuestionsAsked,
+    COUNT(DISTINCT qwt.TopAnswerId) FILTER (WHERE qwt.TopAnswerScore > 10) AS HighScoringTopAnswers,
+    AVG(qwt.QuestionScore) AS AvgQuestionScore,
+    AVG(qwt.MaxAnswerScore) AS AvgMaxAnswerScore,
+    AVG(qwt.TopAnswerAvgCommentScore) AS AvgTopAnswerCommentScore,
+    MAX(CASE WHEN uw.PostTypeId = 1 THEN uw.ScoreLast30Days END) AS MaxQuestionScoreLast30Days,
+    MAX(CASE WHEN uw.PostTypeId = 2 THEN uw.ScoreLast30Days END) AS MaxAnswerScoreLast30Days,
+    string_agg(DISTINCT substring(t.TagName FROM 1 FOR 10), ',' ORDER BY t.TagName) AS TagsUsed,
+    bool_or(qwt.HasAcceptedAnswer) AS HasAtLeastOneAcceptedAnswer
+FROM TopUsers tu
+LEFT JOIN Posts p ON p.OwnerUserId = tu.Id AND p.PostTypeId = 1
+LEFT JOIN QuestionsWithTopAnswers qwt ON qwt.OwnerUserId = tu.Id
+LEFT JOIN UserActivityWindow uw ON uw.UserId = tu.Id
+LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(coalesce(p.Tags,''), '><')) AS TagName
+) t ON true
+WHERE tu.UserRank <= 100
+GROUP BY tu.Id, tu.DisplayName, tu.Reputation, tu.GoldBadges, tu.SilverBadges, tu.BronzeBadges, tu.HasTagBasedBadge, tu.LastBadgeDate
+ORDER BY Reputation DESC NULLS LAST, QuestionsAsked DESC NULLS LAST
+LIMIT 50;

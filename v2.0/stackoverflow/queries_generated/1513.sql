@@ -1,0 +1,234 @@
+-- {"query": "1513.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3045} 
+WITH UserEngagement AS (
+    -- Aggregates user-level statistics including badge counts, vote counts, and average answer score.
+    SELECT
+        u.Id AS UserId,
+        u.Reputation AS TotalReputation,
+        COUNT(DISTINCT b_gold.Id) AS GoldBadgeCount,
+        COUNT(DISTINCT b_silver.Id) AS SilverBadgeCount,
+        COUNT(DISTINCT b_bronze.Id) AS BronzeBadgeCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+        MAX(u.LastAccessDate) AS LastUserAccessDate,
+        COUNT(p_ans.Id) AS AnswerCountByUser,
+        AVG(p_ans.Score) AS AvgAnswerScoreByUser
+    FROM
+        Users u
+    LEFT JOIN Badges b_gold ON u.Id = b_gold.UserId AND b_gold.Class = 1
+    LEFT JOIN Badges b_silver ON u.Id = b_silver.UserId AND b_silver.Class = 2
+    LEFT JOIN Badges b_bronze ON u.Id = b_bronze.UserId AND b_bronze.Class = 3
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Posts p_ans ON u.Id = p_ans.OwnerUserId AND p_ans.PostTypeId = 2
+    GROUP BY
+        u.Id, u.Reputation, u.LastAccessDate
+),
+PostHistoricalContext AS (
+    -- Extracts post details, latest history, comment statistics, and uses window functions for activity tracking.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount, -- Handle NULL FavoriteCount
+        p.ClosedDate,
+        p.Tags,
+        pt.Name AS PostTypeName,
+        COALESCE(ph_latest.Text, 'N/A') AS LatestHistoryText,
+        COALESCE(ph_latest.Comment, 'No comment') AS LatestHistoryComment,
+        COALESCE(ph_latest_type.Name, 'Unknown') AS LatestHistoryTypeName,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            WHEN p.LastActivityDate > CURRENT_TIMESTAMP - INTERVAL '30 days' THEN 'Active'
+            ELSE 'Dormant'
+        END AS PostStatus,
+        -- Correlated subquery 1: Count unique commenters
+        (SELECT COUNT(DISTINCT c.UserId) FROM Comments c WHERE c.PostId = p.Id AND c.UserId IS NOT NULL) AS UniqueCommenters,
+        -- Correlated subquery 2: Average score of comments for the post
+        (SELECT AVG(c_sub.Score) FROM Comments c_sub WHERE c_sub.PostId = p.Id AND c_sub.Score IS NOT NULL) AS AvgCommentScore,
+        -- Window function: Find previous post's activity date for the same user
+        LAG(p.LastActivityDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostActivityDate
+    FROM
+        Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN (
+        -- Subquery to get the latest PostHistory entry for specific types
+        SELECT
+            ph_inner.PostId,
+            ph_inner.Text,
+            ph_inner.Comment,
+            ph_inner.PostHistoryTypeId,
+            ROW_NUMBER() OVER (PARTITION BY ph_inner.PostId ORDER BY ph_inner.CreationDate DESC) AS rn
+        FROM
+            PostHistory ph_inner
+        WHERE ph_inner.PostHistoryTypeId IN (5, 6, 10, 11, 12, 13, 35, 36) -- Edit Body, Edit Tags, Post Closed, Post Reopened, Post Deleted, Post Undeleted, Migrated Away/Here
+    ) ph_latest ON p.Id = ph_latest.PostId AND ph_latest.rn = 1
+    LEFT JOIN PostHistoryTypes ph_latest_type ON ph_latest.PostHistoryTypeId = ph_latest_type.Id
+),
+TagMetrics AS (
+    -- Parses tags from the Posts table and aggregates them for each post.
+    SELECT
+        p.Id AS PostId,
+        STRING_AGG(t.TagName, ', ' ORDER BY t.TagName) AS TagsAssociatedWithPost,
+        COUNT(DISTINCT t.Id) AS NumTags
+    FROM
+        Posts p
+    CROSS JOIN LATERAL UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag_name -- Assumes tags are like '<tag1><tag2>'
+    JOIN Tags t ON t.TagName = tag_name
+    WHERE p.Tags IS NOT NULL AND length(p.Tags) > 2
+    GROUP BY p.Id
+),
+DuplicatePostInfo AS (
+    -- Identifies posts that are duplicates.
+    SELECT
+        pl.PostId,
+        COUNT(pl.RelatedPostId) AS DuplicatePostCount
+    FROM
+        PostLinks pl
+    WHERE
+        pl.LinkTypeId = 3 -- Duplicate link type
+    GROUP BY pl.PostId
+),
+BaseQueryResult AS (
+    -- Combines all CTEs and calculates additional metrics using window functions.
+    SELECT
+        u.Id AS UserID,
+        u.DisplayName AS UserName,
+        COALESCE(u.Location, 'Unknown') AS UserLocation,
+        u.CreationDate AS UserCreationDate,
+        ue.TotalReputation,
+        ue.GoldBadgeCount,
+        ue.SilverBadgeCount,
+        ue.BronzeBadgeCount,
+        ue.UpvotesGiven AS UserUpvotesGiven,
+        ue.DownvotesGiven AS UserDownvotesGiven,
+        ue.AnswerCountByUser,
+        ue.AvgAnswerScoreByUser,
+        phc.PostId,
+        phc.PostTypeName,
+        phc.PostTypeId,
+        phc.CreationDate AS PostCreationDate,
+        phc.Score AS PostScore,
+        phc.ViewCount AS PostViewCount,
+        phc.AnswerCount AS PostAnswerCount,
+        phc.CommentCount AS PostCommentCount,
+        phc.FavoriteCount AS PostFavoriteCount,
+        phc.PostStatus,
+        phc.UniqueCommenters,
+        phc.AvgCommentScore,
+        phc.LatestHistoryText,
+        phc.LatestHistoryComment,
+        phc.LatestHistoryTypeName,
+        tm.TagsAssociatedWithPost,
+        tm.NumTags,
+        ROUND(EXTRACT(EPOCH FROM (phc.LastActivityDate - phc.CreationDate)) / 3600 / 24, 2) AS DaysActiveSinceCreation,
+        -- String expression and NULL logic for a unique identifier
+        COALESCE(UPPER(SUBSTRING(u.Location, 1, 3)), 'NON') || '-' || COALESCE(phc.PostTypeName, 'NONE') || '-' || LPAD(COALESCE(u.AccountId::text, '0'), 5, '0') AS UserPostTypeIdentifier,
+        -- Window function: Rank posts by score for each user
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY phc.Score DESC, phc.CreationDate DESC) AS PostRankByUser,
+        -- Window function: Average post score in the user's location
+        AVG(phc.Score) OVER (PARTITION BY u.Location) AS AvgPostScoreInUserLocation,
+        -- Window function: Cumulative favorite count for user's posts
+        SUM(phc.FavoriteCount) OVER (PARTITION BY u.Id ORDER BY phc.CreationDate) AS CumulativeFavoriteCountForUser,
+        -- NULLIF example: User views, if 0, return NULL
+        NULLIF(u.Views, 0) AS UserViewsNonNull,
+        dpi.DuplicatePostCount,
+        -- Complex predicate with NULL logic: Check for long gaps between posts
+        COALESCE(phc.PreviousPostActivityDate < phc.CreationDate - INTERVAL '1 year', FALSE) AS HasLongGapSincePreviousPost,
+        -- Window functions for subsequent filtering in UNION ALL branches
+        SUM(COALESCE(phc.ViewCount, 0)) OVER (PARTITION BY u.Id) AS TotalPostViewsForUser,
+        SUM(phc.FavoriteCount) OVER (PARTITION BY u.Id) AS TotalPostFavoritesForUser
+    FROM
+        Users u
+    JOIN UserEngagement ue ON u.Id = ue.UserId
+    LEFT JOIN PostHistoricalContext phc ON u.Id = phc.OwnerUserId
+    LEFT JOIN TagMetrics tm ON phc.PostId = tm.PostId
+    LEFT JOIN DuplicatePostInfo dpi ON phc.PostId = dpi.PostId
+    WHERE
+        u.Reputation >= 5000 -- Filter for high-reputation users
+        AND (phc.PostTypeId = 1 OR phc.PostTypeId = 2) -- Only Questions or Answers
+        AND phc.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '2 year' -- Posts created in the last 2 years
+        AND phc.Score > 10 -- Only posts with a reasonable score
+        AND (phc.ViewCount IS NULL OR phc.ViewCount > 500 OR phc.PostTypeId = 2) -- View count relevant for questions, answers might not have it
+        AND phc.AvgCommentScore IS NOT NULL -- Posts with comments that have scores
+        AND (u.WebsiteUrl IS NOT NULL OR LENGTH(TRIM(COALESCE(u.AboutMe, ''))) > 100) -- Users with a website or substantial "About Me"
+        AND phc.PostStatus != 'Dormant' -- Exclude dormant posts
+        AND COALESCE(dpi.DuplicatePostCount, 0) < 3 -- Not too many duplicate links
+        AND (phc.LastEditDate IS NULL OR phc.LastEditDate > CURRENT_TIMESTAMP - INTERVAL '6 months') -- Recently edited or never edited
+)
+-- Branch 1: Analyze highly viewed questions by engaged users with Gold badges.
+SELECT
+    bq.UserID,
+    bq.UserName,
+    bq.UserLocation,
+    bq.TotalReputation,
+    bq.GoldBadgeCount,
+    bq.PostId,
+    bq.PostTypeName,
+    bq.PostCreationDate,
+    bq.PostScore,
+    bq.PostViewCount,
+    bq.PostAnswerCount,
+    bq.PostStatus,
+    bq.AvgCommentScore,
+    bq.TagsAssociatedWithPost,
+    bq.DaysActiveSinceCreation,
+    bq.UserPostTypeIdentifier,
+    bq.PostRankByUser,
+    bq.CumulativeFavoriteCountForUser,
+    'QuestionAnalysis' AS AnalysisType, -- Discriminator for UNION ALL
+    bq.HasLongGapSincePreviousPost
+FROM
+    BaseQueryResult bq
+WHERE
+    bq.PostTypeId = 1 -- Selects only Questions
+    AND bq.GoldBadgeCount > 0 -- Users must have at least one Gold badge
+    AND bq.PostScore > 50 -- Highly scored questions
+    AND bq.TotalPostViewsForUser > 10000 -- User's posts must collectively have many views
+ORDER BY
+    bq.TotalReputation DESC,
+    bq.PostScore DESC
+LIMIT 50
+
+UNION ALL
+
+-- Branch 2: Analyze high-impact answers by active users with good average answer scores.
+SELECT
+    bq.UserID,
+    bq.UserName,
+    bq.UserLocation,
+    bq.TotalReputation,
+    bq.GoldBadgeCount,
+    bq.PostId,
+    bq.PostTypeName,
+    bq.PostCreationDate,
+    bq.PostScore,
+    bq.PostViewCount, -- Will be NULL or 0 for answers, but column structure matches
+    bq.PostAnswerCount, -- Will be NULL for answers, but column structure matches
+    bq.PostStatus,
+    bq.AvgCommentScore,
+    bq.TagsAssociatedWithPost,
+    bq.DaysActiveSinceCreation,
+    bq.UserPostTypeIdentifier,
+    bq.PostRankByUser,
+    bq.CumulativeFavoriteCountForUser,
+    'AnswerAnalysis' AS AnalysisType, -- Discriminator for UNION ALL
+    bq.HasLongGapSincePreviousPost
+FROM
+    BaseQueryResult bq
+WHERE
+    bq.PostTypeId = 2 -- Selects only Answers
+    AND bq.AvgAnswerScoreByUser > 15 -- Users with a good average score on their answers
+    AND bq.AvgCommentScore > 3 -- Answers with highly rated comments
+    AND bq.PostRankByUser <= 5 -- Consider only the top 5 answers by score for each user
+    AND bq.TotalPostFavoritesForUser > 100 -- User's posts must collectively be frequently favorited
+ORDER BY
+    bq.AvgAnswerScoreByUser DESC,
+    bq.PostCreationDate DESC
+LIMIT 50;

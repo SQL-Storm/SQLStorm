@@ -1,0 +1,201 @@
+-- {"query": "1556.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3456} 
+
+WITH UserEngagement AS (
+    -- Calculate user-level engagement metrics, including correlated subquery for gold badges
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views,
+        U.UpVotes,
+        U.DownVotes,
+        U.LastAccessDate,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViews,
+        SUM(COALESCE(P.AnswerCount, 0)) AS TotalAnswersToQuestions,
+        SUM(COALESCE(P.CommentCount, 0)) AS TotalCommentsOnPosts,
+        MAX(P.CreationDate) AS LatestPostDate,
+        MIN(P.CreationDate) AS EarliestPostDate,
+        -- Count unique tags used by this user, handling potential NULL Tags
+        COUNT(DISTINCT T.tag_name) AS DistinctTagsUsed,
+        -- Correlated subquery example: get count of gold badges for the user
+        (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) AS GoldBadgeCount
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN LATERAL regexp_split_to_table(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><') AS T(tag_name) ON P.Tags IS NOT NULL
+    WHERE P.PostTypeId IN (1, 2) -- Only consider Questions and Answers
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.LastAccessDate, U.CreationDate
+),
+PostCommentActivity AS (
+    -- Analyze comment activity for each post, including correlated subquery for average comment length
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        COUNT(C.Id) AS TotalCommentsReceived,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        MAX(C.CreationDate) AS LatestCommentDate,
+        -- Correlated subquery for average comment length on this specific post
+        (SELECT AVG(LENGTH(C2.Text)) FROM Comments C2 WHERE C2.PostId = P.Id AND C2.UserId IS NOT NULL) AS AvgCommentLength,
+        -- Check if any comment contains 'thanks' or 'thank you' (case-insensitive)
+        MAX(CASE WHEN LOWER(C.Text) LIKE '%thank you%' OR LOWER(C.Text) LIKE '%thanks%' THEN 1 ELSE 0 END) AS HasGratitudeComment
+    FROM Posts AS P
+    LEFT JOIN Comments AS C ON P.Id = C.PostId
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY P.Id, P.OwnerUserId
+),
+PostEditAndCloseHistory AS (
+    -- Analyze post history for edits and close reasons, using window functions and complicated predicates
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS TotalEdits, -- Title, Body, Tags edits
+        COUNT(DISTINCT PH.UserId) AS DistinctEditors,
+        -- Extract latest close reason ID, handling cases where 'Comment' might not be an INT
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 AND PH.Comment ~ '^[0-9]+$' THEN CAST(PH.Comment AS INT) ELSE NULL END) AS LatestCloseReasonId,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS ClosedDateFromHistory,
+        -- Count specific close reasons from PostHistory (e.g., Duplicate, Off-topic)
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 AND PH.Comment IN ('1', '101') THEN 1 ELSE 0 END) AS DuplicateCloseVotes, -- Old (1) and New (101) duplicate reasons
+        -- Window function: Get the date of the first body edit for each post
+        MIN(CASE WHEN PH.PostHistoryTypeId = 5 THEN PH.CreationDate ELSE NULL END) OVER (PARTITION BY PH.PostId) AS FirstBodyEditDate
+    FROM PostHistory AS PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 10) -- Edit types and Post Closed
+    GROUP BY PH.PostId
+),
+UserPostPerformance AS (
+    -- Combine post-level metrics and calculate user-specific post scores, using window functions for ranking and running averages
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId AS UserId,
+        P.PostTypeId,
+        P.Title,
+        P.CreationDate AS PostCreationDate,
+        COALESCE(P.Score, 0) AS PostScore,
+        COALESCE(P.ViewCount, 0) AS PostViewCount,
+        COALESCE(P.AnswerCount, 0) AS PostAnswerCount,
+        COALESCE(P.FavoriteCount, 0) AS PostFavoriteCount,
+        COALESCE(PCA.TotalCommentsReceived, 0) AS PostTotalCommentsReceived,
+        COALESCE(PCA.TotalCommentScore, 0) AS PostTotalCommentScore,
+        COALESCE(PECH.TotalEdits, 0) AS PostTotalEdits,
+        COALESCE(PECH.DistinctEditors, 0) AS PostDistinctEditors,
+        PECH.LatestCloseReasonId,
+        PECH.DuplicateCloseVotes,
+        PECH.FirstBodyEditDate,
+        -- Calculate a detailed post quality score using complex arithmetic and NULL logic
+        (
+            (COALESCE(P.Score, 0) * 1.5)
+            + (COALESCE(P.ViewCount, 0) / 100.0)
+            + (CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 10 ELSE 0 END) -- Bonus for accepted answer
+            + (COALESCE(P.AnswerCount, 0) * 2)
+            + (COALESCE(PCA.TotalCommentsReceived, 0) * 0.5)
+            + (CASE WHEN PECH.FirstBodyEditDate IS NOT NULL AND PECH.FirstBodyEditDate < P.CreationDate + INTERVAL '1 hour' THEN 5 ELSE 0 END) -- Early edit bonus
+            + (COALESCE(PCA.AvgCommentLength, 0) * 0.1) -- Factor in average comment length
+            - (PECH.DuplicateCloseVotes * 20) -- Penalty for duplicate close votes
+        ) AS PostQualityScore,
+        -- Window function: Rank posts by quality score for each user
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY ((COALESCE(P.Score, 0) * 1.5) + (COALESCE(P.ViewCount, 0) / 100.0) + (CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 10 ELSE 0 END)) DESC, P.CreationDate DESC) AS rn_user_post_quality,
+        -- Window function: Get the average score of posts for this user up to this post's creation date (running average)
+        AVG(COALESCE(P.Score, 0)) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS RunningAvgUserPostScore
+    FROM Posts AS P
+    LEFT JOIN PostCommentActivity AS PCA ON P.Id = PCA.PostId
+    LEFT JOIN PostEditAndCloseHistory AS PECH ON P.Id = PECH.PostId
+    WHERE P.PostTypeId IN (1, 2)
+)
+-- Main query to select the final result, demonstrating various features including subqueries, CTEs, window functions, and NULL/string logic
+SELECT
+    UE.UserId,
+    COALESCE(UE.DisplayName, 'Anonymous User') AS UserDisplayName,
+    UE.Reputation,
+    UE.GoldBadgeCount,
+    UE.TotalPostsOwned,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    UE.TotalPostScore,
+    UE.TotalPostViews,
+    UE.TotalCommentsOnPosts,
+    UE.DistinctTagsUsed,
+    UE.LatestPostDate,
+    UE.LastAccessDate,
+    -- User's "master explainer" score, a complex weighted sum
+    (
+        (UE.Reputation / 1000.0)
+        + (UE.TotalPostScore / 10.0)
+        + (UE.TotalAnswers * 5.0)
+        + (UE.GoldBadgeCount * 50.0)
+        + (UE.TotalCommentsOnPosts / 2.0)
+        + (CASE WHEN UE.LatestPostDate > NOW() - INTERVAL '6 months' THEN 20 ELSE 0 END) -- Bonus for recent activity
+        - (UE.DownVotes / 5.0) -- Penalty for user's own downvotes
+        + (COALESCE(TPP.RunningAvgUserPostScore, 0) * 0.5) -- Factor in user's average post score
+    ) AS MasterExplainerScore,
+    -- Details of the user's top-ranked post (using rn_user_post_quality = 1)
+    TPP.Title AS TopPostTitle,
+    TPP.PostScore AS TopPostScore,
+    TPP.PostViewCount AS TopPostViewCount,
+    TPP.PostTotalEdits AS TopPostEditCount,
+    TPP.PostTotalCommentsReceived AS TopPostCommentCount,
+    TPP.PostQualityScore AS TopPostQualityScore,
+    TPP.PostCreationDate AS TopPostCreationDate,
+    -- Detailed check for duplicate closures on the top post using CASE expression and NULL logic
+    CASE
+        WHEN TPP.LatestCloseReasonId IN (1, 101) THEN 'Closed as Duplicate'
+        WHEN TPP.LatestCloseReasonId IS NOT NULL THEN 'Closed for Other Reason'
+        WHEN TPP.DuplicateCloseVotes > 0 THEN 'Had Duplicate Close Votes'
+        ELSE 'Not Closed as Duplicate'
+    END AS TopPostClosureStatus,
+    CR.Name AS TopPostCloseReasonName,
+    -- Example of complex string expression/concatenation
+    'User joined ' || TO_CHAR(UE.UserCreationDate, 'YYYY-MM-DD') || ' and made ' || UE.TotalPostsOwned || ' posts.' AS UserSummaryText,
+    -- Calculate average reputation per post, handling potential division by zero with NULLIF and COALESCE
+    COALESCE(CAST(UE.Reputation AS NUMERIC) / NULLIF(UE.TotalPostsOwned, 0), 0) AS AvgReputationPerPost,
+    -- Check if user's last access was after their latest post (indicating continued activity)
+    CASE WHEN UE.LastAccessDate > UE.LatestPostDate THEN 'Active After Last Post' ELSE 'Inactive After Last Post' END AS UserActivityStatus,
+    -- Subquery for checking if the user has any links to *their own* posts being duplicates
+    EXISTS (
+        SELECT 1
+        FROM PostLinks PL
+        WHERE PL.PostId = TPP.PostId
+        AND PL.LinkTypeId = 3 -- Duplicate link type
+        AND PL.RelatedPostId IN (SELECT P_Sub.Id FROM Posts P_Sub WHERE P_Sub.OwnerUserId = UE.UserId)
+    ) AS HasInternalDuplicateLink,
+    -- Subquery to find the average score of *all* other posts owned by this user (excluding the top post)
+    (
+        SELECT AVG(P_Other.Score)
+        FROM Posts P_Other
+        WHERE P_Other.OwnerUserId = UE.UserId AND P_Other.Id != TPP.PostId AND P_Other.PostTypeId IN (1,2)
+    ) AS AvgOtherPostScore,
+    -- Example of NULLIF and COALESCE with calculation for comments per edit ratio
+    COALESCE(
+        CAST(TPP.PostTotalCommentsReceived AS NUMERIC) / NULLIF(TPP.PostTotalEdits, 0),
+        0
+    ) AS CommentsPerEditRatio,
+    -- Calculate the ratio of accepted answers to total answers provided by the user
+    COALESCE(
+        CAST(SUM(CASE WHEN P_UserAnswers.AcceptedAnswerId = P_UserAnswers.Id THEN 1 ELSE 0 END) OVER (PARTITION BY UE.UserId) AS NUMERIC)
+        / NULLIF(UE.TotalAnswers, 0),
+        0
+    ) AS AcceptedAnswerRatio
+FROM UserEngagement AS UE
+LEFT JOIN UserPostPerformance AS TPP ON UE.UserId = TPP.UserId AND TPP.rn_user_post_quality = 1 -- Get the top-ranked post for each user
+LEFT JOIN CloseReasonTypes AS CR ON TPP.LatestCloseReasonId = CR.Id
+LEFT JOIN Posts AS P_UserAnswers ON UE.UserId = P_UserAnswers.OwnerUserId AND P_UserAnswers.PostTypeId = 2 -- To calculate accepted answer ratio
+WHERE
+    UE.TotalPostsOwned > 50 -- Minimum number of posts
+    AND UE.Reputation > 10000 -- Significant reputation threshold
+    AND UE.GoldBadgeCount >= 1 -- At least one gold badge indicates mastery
+    AND UE.TotalAnswers > 10 -- Contributed a good number of answers
+    AND COALESCE(TPP.PostTotalCommentsReceived, 0) > 5 -- Top post received good comments
+    AND COALESCE(TPP.DuplicateCloseVotes, 0) = 0 -- Top post was not closed as a duplicate
+    AND UE.LastAccessDate > NOW() - INTERVAL '1 year' -- User was recently active
+    AND UE.UserCreationDate < NOW() - INTERVAL '2 years' -- Exclude very new users (require some history)
+    AND (LOWER(UE.DisplayName) NOT LIKE '%bot%' OR UE.DisplayName IS NULL) -- Exclude bot accounts, case-insensitive
+    AND UE.TotalPostsOwned > UE.TotalQuestions -- User has answers as well as questions
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.GoldBadgeCount, UE.TotalPostsOwned, UE.TotalQuestions, UE.TotalAnswers,
+    UE.TotalPostScore, UE.TotalPostViews, UE.TotalCommentsOnPosts, UE.DistinctTagsUsed, UE.LatestPostDate,
+    UE.LastAccessDate, UE.UserCreationDate, TPP.Title, TPP.PostScore, TPP.PostViewCount, TPP.PostTotalEdits,
+    TPP.PostTotalCommentsReceived, TPP.PostQualityScore, TPP.PostCreationDate, TPP.LatestCloseReasonId,
+    TPP.DuplicateCloseVotes, CR.Name, TPP.RunningAvgUserPostScore
+ORDER BY MasterExplainerScore DESC, UE.Reputation DESC
+LIMIT 100;

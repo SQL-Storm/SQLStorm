@@ -1,0 +1,349 @@
+-- {"query": "807.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3553} 
+with params as (
+    select
+        cast(date_trunc('month', now()) - interval '24 months' as timestamp) as from_dt,
+        cast(now() as timestamp) as to_dt,
+        1::smallint as q_type,
+        2::smallint as a_type,
+        3::smallint as link_linked,
+        3::smallint as link_duplicate,
+        2::smallint as vote_up,
+        3::smallint as vote_down
+),
+active_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl,
+        count(distinct p.id) filter (where p.posttypeid in (select q_type from params)) as questions,
+        count(distinct p.id) filter (where p.posttypeid in (select a_type from params)) as answers,
+        count(distinct c.id) as comments,
+        sum(case when v.votetypeid = (select vote_up from params) then 1 when v.votetypeid = (select vote_down from params) then -1 else 0 end) as net_votes,
+        max(least(u.lastaccessdate, (select to_dt from params))) as last_seen
+    from users u
+    left join posts p on p.owneruserid = u.id
+        and p.creationdate between (select from_dt from params) and (select to_dt from params)
+    left join comments c on c.userid = u.id
+        and c.creationdate between (select from_dt from params) and (select to_dt from params)
+    left join votes v on v.userid = u.id
+        and v.creationdate between (select from_dt from params) and (select to_dt from params)
+    group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.websiteurl, u.lastaccessdate
+),
+tags_expanded as (
+    select
+        p.id as post_id,
+        unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tag
+    from posts p
+    where p.posttypeid = (select q_type from params)
+      and p.tags is not null
+      and p.creationdate between (select from_dt from params) and (select to_dt from params)
+),
+post_quality as (
+    select
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        coalesce(p.answercount, 0) as answercount,
+        coalesce(p.favoritecount, 0) as favoritecount,
+        (length(coalesce(p.body, '')) - length(replace(coalesce(p.body, ''), '<code', ''))) / nullif(length('<code'),0) as code_block_count,
+        -- simple text complexity proxy
+        nullif(array_length(string_to_array(regexp_replace(coalesce(p.title,''), '\s+', ' ', 'g'), ' '), 1),0) as title_word_count,
+        case when p.closeddate is null then 0 else 1 end as is_closed
+    from posts p
+    where p.posttypeid in ((select q_type from params), (select a_type from params))
+      and p.creationdate between (select from_dt from params) and (select to_dt from params)
+),
+linked_graph as (
+    select
+        pl.postid,
+        pl.relatedpostid,
+        pl.linktypeid,
+        min(pl.creationdate) as first_link_date
+    from postlinks pl
+    where pl.creationdate between (select from_dt from params) and (select to_dt from params)
+    group by pl.postid, pl.relatedpostid, pl.linktypeid
+),
+dup_clusters as (
+    select
+        lg.postid as question_id,
+        count(*) filter (where lg.linktypeid = (select link_duplicate from params)) as dup_out_count,
+        count(*) filter (where lg.linktypeid = (select link_linked from params)) as linked_out_count
+    from linked_graph lg
+    join posts p on p.id = lg.postid and p.posttypeid = (select q_type from params)
+    group by lg.postid
+),
+vote_agg as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = (select vote_up from params) then 1 when v.votetypeid = (select vote_down from params) then -1 else 0 end) as net_votes,
+        count(*) filter (where v.votetypeid = (select vote_up from params)) as upvotes,
+        count(*) filter (where v.votetypeid = (select vote_down from params)) as downvotes,
+        min(v.creationdate) as first_vote_at,
+        max(v.creationdate) as last_vote_at
+    from votes v
+    where v.creationdate between (select from_dt from params) and (select to_dt from params)
+    group by v.postid
+),
+comment_agg as (
+    select
+        c.postid,
+        count(*) as comments,
+        max(c.score) as max_comment_score,
+        min(c.creationdate) as first_comment_at,
+        max(c.creationdate) as last_comment_at
+    from comments c
+    where c.creationdate between (select from_dt from params) and (select to_dt from params)
+    group by c.postid
+),
+edits_agg as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+        count(*) filter (where ph.posthistorytypeid in (10)) as close_votes_events,
+        min(ph.creationdate) as first_edit_at,
+        max(ph.creationdate) as last_edit_at
+    from posthistory ph
+    where ph.creationdate between (select from_dt from params) and (select to_dt from params)
+    group by ph.postid
+),
+answers_per_question as (
+    select
+        p.parentid as question_id,
+        count(*) as answers_count,
+        max(a.score) as max_answer_score,
+        avg(a.score::numeric) as avg_answer_score,
+        min(a.creationdate) as first_answer_at,
+        max(a.creationdate) as last_answer_at
+    from posts a
+    join posts p on a.parentid = p.id
+    where a.posttypeid = (select a_type from params)
+      and a.creationdate between (select from_dt from params) and (select to_dt from params)
+    group by p.parentid
+),
+question_metrics as (
+    select
+        q.id as question_id,
+        q.owneruserid as asker_id,
+        q.creationdate as asked_at,
+        q.score as q_score,
+        q.viewcount as q_views,
+        q.answercount as q_answers_count_reported,
+        q.favoritecount as q_favs,
+        q.code_block_count,
+        q.title_word_count,
+        q.is_closed,
+        coalesce(dup.dup_out_count,0) as dup_out_count,
+        coalesce(dup.linked_out_count,0) as linked_out_count,
+        coalesce(vag.net_votes,0) as q_net_votes,
+        coalesce(vag.upvotes,0) as q_upvotes,
+        coalesce(vag.downvotes,0) as q_downvotes,
+        coalesce(cag.comments,0) as q_comments,
+        coalesce(cag.max_comment_score,0) as q_max_comment_score,
+        coalesce(ed.edit_events,0) as q_edit_events,
+        ans.answers_count,
+        ans.max_answer_score,
+        ans.avg_answer_score,
+        ans.first_answer_at,
+        ans.last_answer_at,
+        array_agg(distinct te.tag) filter (where te.tag is not null) as tags
+    from post_quality q
+    left join dup_clusters dup on dup.question_id = q.id
+    left join vote_agg vag on vag.postid = q.id
+    left join comment_agg cag on cag.postid = q.id
+    left join edits_agg ed on ed.postid = q.id
+    left join answers_per_question ans on ans.question_id = q.id
+    left join tags_expanded te on te.post_id = q.id
+    where q.posttypeid = (select q_type from params)
+    group by
+        q.id, q.owneruserid, q.creationdate, q.score, q.viewcount, q.answercount, q.favoritecount,
+        q.code_block_count, q.title_word_count, q.is_closed,
+        dup.dup_out_count, dup.linked_out_count,
+        vag.net_votes, vag.upvotes, vag.downvotes,
+        cag.comments, cag.max_comment_score,
+        ed.edit_events,
+        ans.answers_count, ans.max_answer_score, ans.avg_answer_score, ans.first_answer_at, ans.last_answer_at
+),
+user_badge_tiers as (
+    select
+        b.userid,
+        sum(case when b.class = 1 then 1 else 0 end) as gold,
+        sum(case when b.class = 2 then 1 else 0 end) as silver,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze,
+        count(*) as total_badges,
+        min(b.date) as first_badge_at,
+        max(b.date) as last_badge_at
+    from badges b
+    where b.date between (select from_dt from params) and (select to_dt from params)
+    group by b.userid
+),
+user_activity_rank as (
+    select
+        au.user_id,
+        au.displayname,
+        au.reputation,
+        au.location,
+        au.websiteurl,
+        au.questions,
+        au.answers,
+        au.comments,
+        au.net_votes,
+        au.last_seen,
+        ub.total_badges,
+        ub.gold, ub.silver, ub.bronze,
+        row_number() over (order by coalesce(au.answers,0) desc, coalesce(au.questions,0) desc, coalesce(au.net_votes,0) desc, coalesce(ub.total_badges,0) desc, au.reputation desc, au.user_id) as activity_rank
+    from active_users au
+    left join user_badge_tiers ub on ub.userid = au.user_id
+),
+question_scoring as (
+    select
+        qm.*,
+        -- composite difficulty/engagement score with various null-safe components
+        (
+            coalesce(qm.q_views,0)/100.0
+            + coalesce(qm.q_upvotes - qm.q_downvotes, 0)
+            + coalesce(qm.q_comments,0) * 0.5
+            + coalesce(qm.q_edit_events,0) * 0.3
+            + coalesce(qm.answers_count,0) * 2.0
+            + coalesce(qm.max_answer_score,0) * 0.8
+            + case when qm.is_closed = 1 then -5 else 0 end
+            + coalesce(qm.code_block_count,0) * 0.2
+            + coalesce(qm.title_word_count,0) * 0.1
+            + least(coalesce(qm.linked_out_count,0), 10) * 0.4
+            - least(coalesce(qm.dup_out_count,0), 10) * 0.6
+        )::numeric as composite_score
+    from question_metrics qm
+),
+question_windowed as (
+    select
+        qs.*,
+        count(*) over () as total_questions,
+        row_number() over (order by qs.composite_score desc, qs.q_score desc, qs.q_views desc, qs.question_id) as global_rank,
+        ntile(10) over (order by qs.composite_score desc) as decile,
+        avg(qs.composite_score) over () as avg_score_global,
+        avg(qs.composite_score) over (partition by (case when qs.is_closed=1 then 'closed' else 'open' end)) as avg_score_by_open,
+        lag(qs.composite_score) over (order by qs.composite_score desc) as prev_score,
+        lead(qs.composite_score) over (order by qs.composite_score desc) as next_score
+    from question_scoring qs
+),
+final_set as (
+    select
+        qw.question_id,
+        qw.asker_id,
+        uar.displayname as asker_name,
+        uar.reputation as asker_rep,
+        coalesce(uar.location, 'unknown') as asker_location,
+        qw.asked_at,
+        qw.q_score,
+        qw.q_views,
+        qw.q_answers_count_reported,
+        qw.q_favs,
+        coalesce(qw.answers_count,0) as answers_count,
+        qw.max_answer_score,
+        qw.avg_answer_score,
+        qw.first_answer_at,
+        qw.last_answer_at,
+        qw.q_comments,
+        qw.q_edit_events,
+        qw.is_closed,
+        qw.dup_out_count,
+        qw.linked_out_count,
+        qw.tags,
+        qw.composite_score,
+        qw.global_rank,
+        qw.decile,
+        uar.activity_rank as asker_activity_rank,
+        uar.total_badges,
+        uar.gold, uar.silver, uar.bronze,
+        -- string expressions and null handling
+        trim(both ' ' from coalesce(uar.displayname, 'user-' || qw.asker_id::text)) || ' [' || coalesce(uar.websiteurl, 'n/a') || ']' as asker_label,
+        coalesce(array_to_string(qw.tags, '|'), '(no-tags)') as tags_flat,
+        case
+            when qw.avg_answer_score is null then 'no-answers'
+            when qw.avg_answer_score >= 5 then 'high'
+            when qw.avg_answer_score >= 1 then 'medium'
+            else 'low'
+        end as answer_quality_bucket
+    from question_windowed qw
+    left join user_activity_rank uar on uar.user_id = qw.asker_id
+),
+-- optional contrasting set using set operator to stress engine
+low_signal as (
+    select
+        f.*
+    from final_set f
+    where f.composite_score < (select avg_score_global from question_windowed limit 1)
+),
+high_signal as (
+    select
+        f.*
+    from final_set f
+    where f.composite_score >= (select avg_score_global from question_windowed limit 1)
+),
+unioned as (
+    select *, 'HIGH' as segment from high_signal
+    union all
+    select *, 'LOW' as segment from low_signal
+)
+select
+    u.segment,
+    u.global_rank,
+    u.decile,
+    u.question_id,
+    u.asker_id,
+    u.asker_name,
+    u.asker_rep,
+    u.asker_location,
+    u.asked_at,
+    u.q_score,
+    u.q_views,
+    u.q_answers_count_reported,
+    u.q_favs,
+    u.answers_count,
+    u.max_answer_score,
+    u.avg_answer_score,
+    u.first_answer_at,
+    u.last_answer_at,
+    u.q_comments,
+    u.q_edit_events,
+    u.is_closed,
+    u.dup_out_count,
+    u.linked_out_count,
+    u.tags_flat,
+    u.answer_quality_bucket,
+    u.composite_score,
+    u.asker_activity_rank,
+    u.total_badges,
+    u.gold, u.silver, u.bronze,
+    u.asker_label,
+    -- correlated subquery: recency of latest activity across related items
+    (
+        select max(x.ts)
+        from (
+            select max(v.creationdate) as ts from votes v where v.postid = u.question_id
+            union all
+            select max(c.creationdate) as ts from comments c where c.postid = u.question_id
+            union all
+            select max(ph.creationdate) as ts from posthistory ph where ph.postid = u.question_id
+            union all
+            select max(p2.lastactivitydate) as ts from posts p2 where p2.id = u.question_id
+        ) x
+    ) as last_activity_at,
+    -- complexity: weighted freshness factor
+    exp(-greatest(0, extract(epoch from (now() - u.asked_at)))/86400.0/90.0)::numeric(12,6) as freshness_weight
+from unioned u
+where coalesce(u.asker_rep, 0) >= 1
+  and (u.is_closed = 0 or u.answers_count >= 1)
+  and not exists (
+      select 1
+      from posts pblk
+      where pblk.id = u.question_id
+        and coalesce(pblk.contentlicense, '') ilike any (array['%cc-by-sa 3.0%', '%unknown%'])
+  )
+order by u.segment desc, u.global_rank asc
+limit 500;

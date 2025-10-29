@@ -1,0 +1,124 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR)
+),
+UserPostActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount END) AS AvgAnswersPerQuestion,
+        MAX(p.LastActivityDate) AS LastPostActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId AND p.Id = c.PostId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS PostsWithTag,
+        SUM(p.Score) AS TotalScoreForTag,
+        AVG(p.ViewCount) AS AvgViewCountForTag,
+        (SELECT COUNT(*) FROM Tags tt WHERE tt.TagName LIKE t.TagName || '%' AND tt.TagName <> t.TagName) AS SubTagCount
+    FROM Tags t
+    JOIN Posts p ON (',' || p.Tags || ',') LIKE ('%,' || t.TagName || ',%')
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+LaggedScores AS (
+    SELECT
+        p.Id,
+        p.Score,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS NextScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR)
+),
+RankedVotes AS (
+    SELECT
+        v.UserId,
+        v.PostId,
+        v.VoteTypeId,
+        v.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY v.UserId, v.VoteTypeId ORDER BY v.CreationDate) AS VoteSequence
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3)
+      AND v.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR)
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.PostCreationDate,
+    rp.PostScore,
+    rp.PostViewCount,
+    rp.AnswerCount AS PostAnswerCount,
+    rp.CommentCount AS PostCommentCount,
+    rp.FavoriteCount AS PostFavoriteCount,
+    CASE WHEN rp.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+    upa.DisplayName AS OwnerDisplayName,
+    upa.Reputation AS OwnerReputation,
+    COALESCE(ls.PreviousScore, 0) AS PreviousPostScore,
+    COALESCE(ls.NextScore, 0) AS NextPostScore,
+    (COALESCE(ls.NextScore, 0) - COALESCE(ls.PreviousScore, 0)) AS ScoreDifference,
+    ts.TagName AS TopTag,
+    ts.PostsWithTag,
+    ts.TotalScoreForTag,
+    ts.SubTagCount,
+    COUNT(rv.VoteTypeId) AS VoteCountOnPost,
+    SUM(CASE WHEN rv.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+    SUM(CASE WHEN rv.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.PostId AND c.UserId IS NOT NULL AND c.UserId <> -1 AND c.CreationDate > rp.PostCreationDate) AS CommentsAfterPost,
+    CASE WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = rp.PostId AND pl.LinkTypeId = 3) THEN 'Is Duplicate' ELSE 'Not Duplicate' END AS DuplicateStatus
+FROM RankedPosts rp
+LEFT JOIN UserPostActivity upa ON rp.OwnerUserId = upa.UserId
+LEFT JOIN LaggedScores ls ON rp.PostId = ls.Id
+LEFT JOIN TagStats ts ON EXISTS (
+    SELECT 1
+    FROM Posts p2
+    JOIN Tags t2 ON (',' || p2.Tags || ',') LIKE ('%,' || t2.TagName || ',%')
+    WHERE t2.TagName = ts.TagName AND p2.PostTypeId = 1 AND p2.Id = rp.PostId
+)
+LEFT JOIN RankedVotes rv ON rp.PostId = rv.PostId
+WHERE rp.rn <= 100
+GROUP BY
+    rp.PostId,
+    rp.PostTypeName,
+    rp.PostCreationDate,
+    rp.PostScore,
+    rp.PostViewCount,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.ClosedDate,
+    upa.DisplayName,
+    upa.Reputation,
+    ls.PreviousScore,
+    ls.NextScore,
+    ts.TagName,
+    ts.PostsWithTag,
+    ts.TotalScoreForTag,
+    ts.SubTagCount
+HAVING SUM(CASE WHEN rv.VoteTypeId = 2 THEN 1 ELSE 0 END) > SUM(CASE WHEN rv.VoteTypeId = 3 THEN 1 ELSE 0 END)
+ORDER BY rp.PostCreationDate DESC, rp.PostScore DESC
+LIMIT 1000;

@@ -1,0 +1,247 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserTotalUpVotes,
+        u.DownVotes AS UserTotalDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        COUNT(DISTINCT b_gold.Id) AS GoldBadges,
+        COUNT(DISTINCT b_silver.Id) AS SilverBadges,
+        COUNT(DISTINCT b_bronze.Id) AS BronzeBadges,
+        DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate) AS DaysSinceRegistration,
+        (u.Reputation * 0.7 + COALESCE(u.UpVotes, 0) * 0.1 + COALESCE(u.Views, 0) * 0.05 + COUNT(DISTINCT b_gold.Id) * 100 + COUNT(DISTINCT b_silver.Id) * 20 + COUNT(DISTINCT b_bronze.Id) * 5) AS UserActivityMetric
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b_gold ON u.Id = b_gold.UserId AND b_gold.Class = 1
+    LEFT JOIN Badges b_silver ON u.Id = b_silver.UserId AND b_silver.Class = 2
+    LEFT JOIN Badges b_bronze ON u.Id = b_bronze.UserId AND b_bronze.Class = 3
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostVersionHistory AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS RevisionCount,
+        COUNT(DISTINCT ph.UserId) AS DistinctEditors,
+        MAX(ph.CreationDate) AS LastRevisionDate,
+        MIN(ph.CreationDate) AS FirstRevisionDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate END) AS LastContentEditDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS ClosedHistoryDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS ReopenedHistoryDate,
+        ARRAY_AGG(DISTINCT ph.PostHistoryTypeId) FILTER (WHERE ph.PostHistoryTypeId IS NOT NULL) AS HistoryTypeIds
+    FROM
+        PostHistory ph
+    GROUP BY
+        ph.PostId
+),
+PostInteractionMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.Body,
+        p.OwnerUserId,
+        p.LastEditorUserId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount AS DirectCommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        COALESCE(p.FavoriteCount, 0) + COALESCE(p.CommentCount, 0) + COALESCE(p.AnswerCount, 0) AS EngagementSum,
+        COUNT(DISTINCT v_up.Id) AS UpvoteCount,
+        COUNT(DISTINCT v_down.Id) AS DownvoteCount,
+        SUM(CASE WHEN vt.Name = 'AcceptedByOriginator' THEN 1 ELSE 0 END) AS AcceptedVoteCount,
+        SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS FavoriteVoteCount,
+        (COUNT(DISTINCT v_up.Id) - COUNT(DISTINCT v_down.Id)) AS NetVotes,
+        (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.PostId = p.Id) AS LastCommentOverallDate,
+        (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS LinkedPostsCount,
+        (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicatePostsCount,
+        (SELECT STRING_AGG(t.TagName, ', ') FROM Tags t WHERE POSITION('<' || t.TagName || '>' IN p.Tags) > 0) AS TagNamesCombined,
+        CASE
+            WHEN p.Body LIKE '%<a href="http://example.com/%' OR p.Body LIKE '%<a href="https://example.com/%' THEN TRUE
+            ELSE FALSE
+        END AS ContainsExternalLink
+    FROM
+        Posts p
+    LEFT JOIN Votes v_up ON p.Id = v_up.PostId AND v_up.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'UpMod')
+    LEFT JOIN Votes v_down ON p.Id = v_down.PostId AND v_down.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'DownMod')
+    LEFT JOIN Votes v_all ON p.Id = v_all.PostId
+    LEFT JOIN VoteTypes vt ON v_all.VoteTypeId = vt.Id
+    GROUP BY
+        p.Id, p.PostTypeId, p.ParentId, p.AcceptedAnswerId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId,
+        p.LastEditorUserId, p.LastEditDate, p.LastActivityDate, p.Title, p.Tags, p.AnswerCount, p.CommentCount, p.FavoriteCount,
+        p.ClosedDate, p.CommunityOwnedDate, p.Body
+),
+TagAnalysis AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS TotalPostsWithTag,
+        SUM(p.Score) AS TotalTagScore,
+        AVG(p.Score) AS AverageTagScore,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TaggedQuestions,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TaggedAnswers,
+        MIN(p.CreationDate) AS FirstPostWithTag,
+        MAX(p.CreationDate) AS LastPostWithTag,
+        (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.PostId IN (SELECT p_inner.Id FROM Posts p_inner WHERE p_inner.Tags LIKE '%<' || t.TagName || '>%' AND p_inner.PostTypeId = 1) AND ph.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Closed')) AS ClosedQuestionsWithTag
+    FROM
+        Tags t
+    JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    GROUP BY
+        t.TagName
+),
+TrendingPosts AS (
+    SELECT
+        pim.PostId,
+        pim.PostTypeId,
+        pim.PostScore,
+        pim.ViewCount,
+        pim.EngagementSum,
+        pim.NetVotes,
+        COALESCE(pv.RevisionCount, 0) AS RevisionCount,
+        pim.PostCreationDate,
+        pim.LastActivityDate,
+        DENSE_RANK() OVER (ORDER BY pim.PostScore DESC, pim.ViewCount DESC, pim.EngagementSum DESC) AS GlobalScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY pim.PostTypeId ORDER BY pim.LastActivityDate DESC, pim.PostScore DESC) AS ActivityRankByType,
+        AVG(pim.PostScore) OVER (PARTITION BY EXTRACT(YEAR FROM pim.PostCreationDate), EXTRACT(MONTH FROM pim.PostCreationDate)) AS MonthlyAvgScore,
+        (pim.PostScore * 0.6 + pim.EngagementSum * 0.2 + pim.NetVotes * 0.15 + COALESCE(pv.RevisionCount, 0) * 0.05) AS CombinedPostMetric,
+        'Trending' AS TrendCategory
+    FROM
+        PostInteractionMetrics pim
+    LEFT JOIN PostVersionHistory pv ON pim.PostId = pv.PostId
+    WHERE
+        pim.PostTypeId IN (1, 2)
+        AND pim.PostCreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 year'
+        AND pim.LastActivityDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 month'
+),
+ControversialOrHighlyEditedPosts AS (
+    SELECT
+        pim.PostId,
+        pim.PostTypeId,
+        pim.PostScore,
+        pim.ViewCount,
+        pim.EngagementSum,
+        pim.NetVotes,
+        COALESCE(pv.RevisionCount, 0) AS RevisionCount,
+        pim.PostCreationDate,
+        pim.LastActivityDate,
+        CAST(NULL AS bigint) AS GlobalScoreRank,
+        CAST(NULL AS bigint) AS ActivityRankByType,
+        CAST(NULL AS numeric) AS MonthlyAvgScore,
+        (ABS(pim.NetVotes) * -0.5 + COALESCE(pv.RevisionCount, 0) * 2 + pim.EngagementSum * 0.1) AS CombinedPostMetric,
+        'Controversial' AS TrendCategory
+    FROM
+        PostInteractionMetrics pim
+    JOIN PostVersionHistory pv ON pim.PostId = pv.PostId
+    WHERE
+        pim.PostTypeId = 1
+        AND pim.PostCreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 year'
+        AND COALESCE(pv.RevisionCount, 0) >= 5
+        AND ABS(pim.NetVotes) < pim.UpvoteCount / 2
+)
+SELECT
+    FinalPosts.PostId,
+    pt.Name AS PostTypeName,
+    FinalPosts.PostScore,
+    FinalPosts.ViewCount,
+    FinalPosts.EngagementSum,
+    FinalPosts.NetVotes,
+    FinalPosts.RevisionCount,
+    FinalPosts.GlobalScoreRank,
+    FinalPosts.ActivityRankByType,
+    FinalPosts.MonthlyAvgScore,
+    FinalPosts.CombinedPostMetric,
+    FinalPosts.TrendCategory,
+    pim.Title AS PostTitle,
+    pim.TagNamesCombined,
+    pim.PostCreationDate,
+    pim.LastActivityDate,
+    pim.ClosedDate,
+    ue.DisplayName AS OwnerDisplayName,
+    ue.Reputation AS OwnerReputation,
+    ue.TotalPosts AS OwnerTotalPosts,
+    ue.UserActivityMetric AS OwnerOverallActivity,
+    prnt.Title AS ParentQuestionTitle,
+    acpt.Title AS AcceptedAnswerTitle,
+    acpt_u.DisplayName AS AcceptedAnswerOwnerDisplayName,
+    LAG(FinalPosts.CombinedPostMetric, 1, 0) OVER (PARTITION BY pim.OwnerUserId ORDER BY pim.PostCreationDate) AS PreviousPostMetricByOwner,
+    CASE
+        WHEN pim.ClosedDate IS NOT NULL AND pim.PostTypeId = 1 AND pv.ReopenedHistoryDate IS NULL THEN 'Closed Question'
+        WHEN pim.AcceptedAnswerId IS NOT NULL THEN 'Answered with Accepted'
+        WHEN pim.AnswerCount > 0 AND pim.PostTypeId = 1 THEN 'Answered Question'
+        WHEN pim.PostTypeId = 1 AND pim.AnswerCount = 0 AND pim.LastActivityDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year' THEN 'Stale Unanswered Question'
+        WHEN pim.PostTypeId = 2 AND pim.ParentId IS NULL THEN 'Orphan Answer (Data Anomaly)'
+        ELSE 'Active Post'
+    END AS PostStatusCategory,
+    COALESCE(
+        (SELECT MAX(ph2.CreationDate) FROM PostHistory ph2 WHERE ph2.PostId = FinalPosts.PostId AND ph2.UserId = ue.UserId AND ph2.PostHistoryTypeId IN (4,5,6)),
+        pim.PostCreationDate
+    ) AS OwnerLastEditOfThisPost,
+    EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = ue.UserId AND b.Name LIKE '%Great%' AND b.Class = 1) AS OwnerHasGoldGreatBadge,
+    ta.TotalPostsWithTag AS TopTagTotalPosts,
+    ta.AverageTagScore AS TopTagAvgScore,
+    COALESCE(pv.ClosedHistoryDate, pim.ClosedDate) IS NOT NULL AS IsActuallyClosed,
+    pim.DuplicatePostsCount AS IsDuplicatedByCount,
+    pim.LinkedPostsCount,
+    pim.ContainsExternalLink,
+    (SELECT AVG(c_sub.Score) FROM Comments c_sub WHERE c_sub.PostId = FinalPosts.PostId AND c_sub.CreationDate > FinalPosts.PostCreationDate - INTERVAL '1 month') AS AvgRecentCommentScoreForPost,
+    GREATEST(COALESCE(pim.LastActivityDate, CAST('1900-01-01' AS timestamp)), COALESCE(ue.LastAccessDate, CAST('1900-01-01' AS timestamp)), COALESCE(pv.LastRevisionDate, CAST('1900-01-01' AS timestamp))) AS LastKnownOverallActivityDate,
+    LEAST(COALESCE(pim.PostCreationDate, CAST('2999-01-01' AS timestamp)), COALESCE(ue.UserCreationDate, CAST('2999-01-01' AS timestamp))) AS EarliestAssociatedDate
+FROM
+    (
+        SELECT *, DENSE_RANK() OVER (ORDER BY CombinedPostMetric DESC) AS OverallRank FROM TrendingPosts
+        UNION ALL
+        SELECT *, DENSE_RANK() OVER (ORDER BY CombinedPostMetric DESC) AS OverallRank FROM ControversialOrHighlyEditedPosts
+    ) FinalPosts
+JOIN PostInteractionMetrics pim ON FinalPosts.PostId = pim.PostId
+LEFT JOIN PostTypes pt ON pim.PostTypeId = pt.Id
+LEFT JOIN UserEngagement ue ON pim.OwnerUserId = ue.UserId
+LEFT JOIN PostVersionHistory pv ON FinalPosts.PostId = pv.PostId
+LEFT JOIN Posts prnt ON pim.ParentId = prnt.Id
+LEFT JOIN Posts acpt ON pim.AcceptedAnswerId = acpt.Id
+LEFT JOIN Users acpt_u ON acpt.OwnerUserId = acpt_u.Id
+LEFT JOIN TagAnalysis ta ON ta.TagName = (
+    SELECT t_sub.TagName
+    FROM Tags t_sub
+    WHERE POSITION('<' || t_sub.TagName || '>' IN pim.Tags) > 0
+    ORDER BY t_sub.Count DESC, t_sub.TagName
+    LIMIT 1
+)
+WHERE
+    FinalPosts.CombinedPostMetric > 50
+    AND (ue.UserActivityMetric IS NULL OR ue.Reputation > 2000 OR pim.OwnerUserId IS NULL)
+    AND (
+        pim.ContainsExternalLink = FALSE OR pim.PostScore > 10
+    )
+    AND FinalPosts.OverallRank <= 1000
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory ph_del
+        WHERE ph_del.PostId = FinalPosts.PostId
+          AND ph_del.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Deleted')
+          AND ph_del.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 year'
+    )
+    AND (pim.LastEditorUserId IS NULL OR (SELECT Reputation FROM Users WHERE Id = pim.LastEditorUserId) > 500)
+ORDER BY
+    FinalPosts.TrendCategory DESC, FinalPosts.CombinedPostMetric DESC, FinalPosts.PostCreationDate DESC, FinalPosts.PostId
+LIMIT 750;

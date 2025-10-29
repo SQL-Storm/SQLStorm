@@ -1,0 +1,264 @@
+-- {"query": "1886.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3406} 
+
+WITH UserBaseInfo AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        u.Location,
+        u.AboutMe,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPostsCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestionsCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswersCount,
+        SUM(p.Score) AS TotalPostScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MIN(p.CreationDate) AS FirstPostDate,
+        COUNT(DISTINCT c.Id) AS TotalCommentsCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Reputation >= 1000
+      AND u.LastAccessDate >= (NOW() - INTERVAL '1 year')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes, u.Location, u.AboutMe, u.LastAccessDate
+),
+PostEditAndVoteMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS EditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL THEN 1 ELSE 0 END) AS ClosedHistoryCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS LastClosedDate,
+        SUM(CASE WHEN vt.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCountOnPost,
+        SUM(CASE WHEN vt.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCountOnPost,
+        SUM(CASE WHEN vt.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVoteCountOnPost,
+        SUM(CASE WHEN vt.VoteTypeId IN (4, 12) THEN 1 ELSE 0 END) AS OffensiveSpamVoteCountOnPost
+    FROM Posts p
+    JOIN UserBaseInfo ubi ON p.OwnerUserId = ubi.UserId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Votes vt ON p.Id = vt.PostId
+    GROUP BY p.Id, p.OwnerUserId, p.PostTypeId, p.CreationDate, p.LastEditDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount
+),
+TagInteractionAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Tags,
+        TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))) AS TagNameRaw
+    FROM Posts p
+    JOIN UserBaseInfo ubi ON p.OwnerUserId = ubi.UserId
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+UserAggregatedTagMetrics AS (
+    SELECT
+        tia.OwnerUserId AS UserId,
+        COUNT(DISTINCT tia.TagNameRaw) AS DistinctTagsUsed,
+        SUM(t.Count) AS TotalTagPopularityScore,
+        COUNT(DISTINCT CASE WHEN t.Count > 1000 THEN tia.TagNameRaw END) AS PopularTagsUsedCount,
+        STRING_AGG(DISTINCT tia.TagNameRaw, ', ') AS AllTagsString
+    FROM TagInteractionAnalysis tia
+    LEFT JOIN Tags t ON tia.TagNameRaw = t.TagName
+    GROUP BY tia.OwnerUserId
+),
+BadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Badges b
+    JOIN UserBaseInfo ubi ON b.UserId = ubi.UserId
+    GROUP BY b.UserId
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        p_main.OwnerUserId AS PostOwnerId,
+        p_related.OwnerUserId AS RelatedPostOwnerId,
+        p_related.PostTypeId AS RelatedPostType,
+        p_related.Score AS RelatedPostScore,
+        p_related.CreationDate AS RelatedPostCreationDate
+    FROM PostLinks pl
+    JOIN Posts p_main ON pl.PostId = p_main.Id
+    JOIN Posts p_related ON pl.RelatedPostId = p_related.Id
+    WHERE pl.LinkTypeId = 3
+),
+AnswerAcceptanceRate AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(p.Id) AS TotalAnswersGiven,
+        SUM(CASE WHEN q.AcceptedAnswerId = p.Id THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        CAST(SUM(CASE WHEN q.AcceptedAnswerId = p.Id THEN 1 ELSE 0 END) AS NUMERIC) / NULLIF(COUNT(p.Id), 0) AS AcceptanceRate
+    FROM Posts p
+    JOIN Posts q ON p.ParentId = q.Id
+    WHERE p.PostTypeId = 2
+    GROUP BY p.OwnerUserId
+),
+CombinedPostMetricsAgg AS (
+    SELECT
+        pem.OwnerUserId,
+        AVG(pem.EditCount) AS AvgPostEditCount,
+        AVG(pem.ViewCount) AS AvgPostViewCount,
+        MAX(pem.FavoriteCount) AS MaxPostFavCount,
+        AVG(CASE WHEN (pem.UpVoteCountOnPost + pem.DownVoteCountOnPost) > 0 THEN CAST(pem.OffensiveSpamVoteCountOnPost AS NUMERIC) / (pem.UpVoteCountOnPost + pem.DownVoteCountOnPost) ELSE 0 END) AS AvgOffensiveSpamVotes,
+        SUM(
+            pem.PostScore * (
+                (pem.EditCount * 0.1) +
+                (pem.ClosedHistoryCount * 0.5) +
+                (CASE WHEN pem.LastClosedDate IS NOT NULL AND pem.LastEditDate IS NOT NULL AND pem.LastEditDate > pem.LastClosedDate THEN 0.2 ELSE 0 END)
+            )
+        ) AS PostHistoryActivityScore
+    FROM PostEditAndVoteMetrics pem
+    GROUP BY pem.OwnerUserId
+),
+SegmentedUsers AS (
+    SELECT
+        ub.UserId,
+        ub.DisplayName,
+        ub.Reputation,
+        ub.UserCreationDate,
+        ub.TotalPostsCount,
+        ub.TotalQuestionsCount,
+        ub.TotalAnswersCount,
+        ub.TotalPostScore,
+        ub.TotalCommentsCount,
+        ub.Location,
+        bs.TotalBadges,
+        bs.GoldBadges,
+        uat.DistinctTagsUsed,
+        aat.AcceptanceRate,
+        cpma.AvgPostEditCount,
+        cpma.AvgPostViewCount,
+        cpma.MaxPostFavCount,
+        cpma.AvgOffensiveSpamVotes,
+        cpma.PostHistoryActivityScore,
+        (
+            SELECT COUNT(pla_sub.PostId)
+            FROM PostLinkAnalysis pla_sub
+            WHERE pla_sub.PostOwnerId = ub.UserId
+              AND pla_sub.RelatedPostOwnerId = ub.UserId
+              AND pla_sub.RelatedPostType = 1
+              AND pla_sub.RelatedPostScore > 50
+        ) AS SelfDuplicatedHighScoreQuestions,
+        (
+            SELECT SUM(CASE WHEN ph_sub.Text IS NOT NULL AND LENGTH(ph_sub.Text) > 500 THEN 1 ELSE 0 END)
+            FROM PostHistory ph_sub
+            WHERE ph_sub.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ub.UserId)
+              AND ph_sub.PostHistoryTypeId = 5
+        ) AS MajorBodyEditCount,
+        'EliteQuestioner' AS UserSegmentType,
+        (ub.Reputation * 0.4 + ub.TotalQuestionsCount * 2 + COALESCE(uat.DistinctTagsUsed, 0) * 0.5 + COALESCE(cpma.AvgPostEditCount, 0) * 5) AS CombinedSegmentScore
+    FROM UserBaseInfo ub
+    LEFT JOIN BadgeSummary bs ON ub.UserId = bs.UserId
+    LEFT JOIN UserAggregatedTagMetrics uat ON ub.UserId = uat.UserId
+    LEFT JOIN AnswerAcceptanceRate aat ON ub.UserId = aat.UserId
+    LEFT JOIN CombinedPostMetricsAgg cpma ON ub.UserId = cpma.OwnerUserId
+    WHERE ub.TotalQuestionsCount > 20
+      AND ub.Reputation > 2000
+      AND COALESCE(uat.DistinctTagsUsed, 0) > 5
+      AND ub.Location IS NOT NULL
+      AND ub.AboutMe LIKE '%coding%'
+      AND ub.DisplayName IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        ub.UserId,
+        ub.DisplayName,
+        ub.Reputation,
+        ub.UserCreationDate,
+        ub.TotalPostsCount,
+        ub.TotalQuestionsCount,
+        ub.TotalAnswersCount,
+        ub.TotalPostScore,
+        ub.TotalCommentsCount,
+        ub.Location,
+        bs.TotalBadges,
+        bs.GoldBadges,
+        uat.DistinctTagsUsed,
+        aat.AcceptanceRate,
+        cpma.AvgPostEditCount,
+        cpma.AvgPostViewCount,
+        cpma.MaxPostFavCount,
+        cpma.AvgOffensiveSpamVotes,
+        cpma.PostHistoryActivityScore,
+        (
+            SELECT COUNT(pla_sub.PostId)
+            FROM PostLinkAnalysis pla_sub
+            WHERE pla_sub.PostOwnerId = ub.UserId
+              AND pla_sub.RelatedPostOwnerId = ub.UserId
+              AND pla_sub.RelatedPostType = 1
+              AND pla_sub.RelatedPostScore > 50
+        ) AS SelfDuplicatedHighScoreQuestions,
+        (
+            SELECT SUM(CASE WHEN ph_sub.Text IS NOT NULL AND LENGTH(ph_sub.Text) > 500 THEN 1 ELSE 0 END)
+            FROM PostHistory ph_sub
+            WHERE ph_sub.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ub.UserId)
+              AND ph_sub.PostHistoryTypeId = 5
+        ) AS MajorBodyEditCount,
+        'ValuedAnswerer' AS UserSegmentType,
+        (ub.Reputation * 0.5 + ub.TotalAnswersCount * 3 + COALESCE(aat.AcceptanceRate, 0.0) * 100 + COALESCE(bs.GoldBadges, 0) * 50) AS CombinedSegmentScore
+    FROM UserBaseInfo ub
+    LEFT JOIN BadgeSummary bs ON ub.UserId = bs.UserId
+    LEFT JOIN UserAggregatedTagMetrics uat ON ub.UserId = uat.UserId
+    LEFT JOIN AnswerAcceptanceRate aat ON ub.UserId = aat.UserId
+    LEFT JOIN CombinedPostMetricsAgg cpma ON ub.UserId = cpma.OwnerUserId
+    WHERE ub.TotalAnswersCount > 50
+      AND ub.Reputation > 1000
+      AND COALESCE(aat.AcceptanceRate, 0.0) > 0.3
+      AND ub.DisplayName IS NOT NULL
+      AND ub.LastAccessDate >= (NOW() - INTERVAL '6 months')
+)
+SELECT DISTINCT ON (su.UserId)
+    su.UserId,
+    su.DisplayName,
+    su.Reputation,
+    su.UserCreationDate,
+    su.TotalPostsCount,
+    su.TotalQuestionsCount,
+    su.TotalAnswersCount,
+    su.TotalPostScore,
+    su.TotalCommentsCount,
+    su.Location,
+    su.TotalBadges,
+    su.GoldBadges,
+    su.DistinctTagsUsed,
+    su.AnswerAcceptanceRate,
+    su.AvgPostEditCount,
+    su.AvgPostViewCount,
+    su.MaxPostFavCount,
+    su.AvgOffensiveSpamVotes,
+    su.PostHistoryActivityScore,
+    su.SelfDuplicatedHighScoreQuestions,
+    su.MajorBodyEditCount,
+    su.UserSegmentType,
+    su.CombinedSegmentScore,
+    RANK() OVER (PARTITION BY su.UserSegmentType ORDER BY su.CombinedSegmentScore DESC) AS RankWithinSegment,
+    NTILE(10) OVER (ORDER BY su.CombinedSegmentScore DESC) AS OverallScoreDecile,
+    LAG(su.Reputation, 1, 0) OVER (PARTITION BY su.UserSegmentType ORDER BY su.CombinedSegmentScore DESC) AS PrevSegmentReputation,
+    SUM(su.Reputation) OVER (PARTITION BY su.UserSegmentType) AS TotalReputationInSegment,
+    UPPER(LEFT(COALESCE(su.DisplayName, 'ANONYMOUS'), 3)) || '-' ||
+    REPLACE(LOWER(COALESCE(su.Location, 'unknown')), ' ', '-') || '-' ||
+    TO_CHAR(su.UserCreationDate, 'YYMMDD') AS UserComplexIdentifier,
+    COALESCE(su.AvgPostEditCount, 0.0) * 10 + COALESCE(su.AnswerAcceptanceRate, 0.0) * 50 + (CASE WHEN su.GoldBadges > 0 THEN 100 ELSE 0 END) AS EnhancedActivityScore
+FROM SegmentedUsers su
+WHERE su.Reputation > 1500
+  AND su.DisplayName IS NOT NULL
+ORDER BY su.UserId, su.CombinedSegmentScore DESC
+LIMIT 1000;

@@ -1,0 +1,147 @@
+with RecursiveUserBadgeStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = true then 1 else 0 end) as TagBasedBadges,
+        row_number() over (partition by u.Id order by max(b.Date) desc nulls last) as rn
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopUsers as (
+    select UserId, DisplayName, GoldBadges, SilverBadges, BronzeBadges, TagBasedBadges
+    from RecursiveUserBadgeStats
+    where GoldBadges > 0 and SilverBadges > 5 and BronzeBadges > 10
+),
+PostsWithLinksAndVotes as (
+    select 
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.Title,
+        count(distinct pl.Id) as LinkCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        avg(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) end) as AvgBounty,
+        rank() over (partition by p.OwnerUserId order by p.Score desc) as OwnerScoreRank
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId in (1,2)
+    group by p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.Title
+),
+PostTagExploded as (
+    select 
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag
+    from Posts p
+    where p.Tags is not null and p.PostTypeId = 1
+),
+TagPopularity as (
+    select 
+        Tag,
+        count(distinct PostId) as PostCount,
+        sum(p.Score) as TotalScore
+    from PostTagExploded tte
+    join PostsWithLinksAndVotes p on p.Id = tte.PostId
+    group by Tag
+),
+QuestionsWithAnswerInfo as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.CreationDate as AnswerCreationDate,
+        case 
+            when a.Id = q.AcceptedAnswerId then 1 
+            else 0 
+        end as IsAccepted
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+AnswerRanks as (
+    select 
+        QuestionId,
+        AnswerId,
+        AnswerScore,
+        AnswerCreationDate,
+        row_number() over (partition by QuestionId order by AnswerScore desc, AnswerCreationDate asc) as AnswerRank
+    from QuestionsWithAnswerInfo
+    where AnswerId is not null
+),
+TopAnswers as (
+    select 
+        q.QuestionId,
+        q.Title,
+        q.OwnerUserId as QuestionOwner,
+        q.QuestionScore,
+        q.ViewCount,
+        q.AnswerId,
+        q.AnswerScore,
+        ar.AnswerRank,
+        q.IsAccepted
+    from QuestionsWithAnswerInfo q
+    join AnswerRanks ar on q.QuestionId = ar.QuestionId and q.AnswerId = ar.AnswerId
+),
+UserActivitySummary as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        count(distinct c.Id) as CommentsCount,
+        max(p.CreationDate) as LastPostDate,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 10) as CloseVotesCast,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 11) as ReopenVotesCast,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesGiven,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesGiven
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select 
+    u.UserId,
+    u.DisplayName,
+    u.QuestionsCount,
+    u.AnswersCount,
+    u.CommentsCount,
+    coalesce(u.CloseVotesCast,0) as CloseVotesCast,
+    coalesce(u.ReopenVotesCast,0) as ReopenVotesCast,
+    u.UpVotesGiven,
+    u.DownVotesGiven,
+    tg.GoldBadges,
+    tg.SilverBadges,
+    tg.BronzeBadges,
+    tg.TagBasedBadges,
+    pq.QuestionId,
+    pq.Title as QuestionTitle,
+    pq.QuestionScore,
+    pq.ViewCount,
+    pq.AnswerId,
+    pq.AnswerScore,
+    pq.AnswerRank,
+    pq.IsAccepted,
+    tp.Tag as PopularTag,
+    tp.PostCount as PopularTagPostCount,
+    tp.TotalScore as PopularTagTotalScore
+from UserActivitySummary u
+left join TopUsers tg on tg.UserId = u.UserId
+left join TopAnswers pq on pq.QuestionOwner = u.UserId and pq.AnswerRank = 1
+left join (
+    select Tag, PostCount, TotalScore
+    from TagPopularity
+    order by PostCount desc limit 1
+) tp on true
+where u.QuestionsCount > 0
+order by u.AnswersCount desc, u.QuestionsCount desc
+limit 100;

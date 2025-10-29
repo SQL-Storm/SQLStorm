@@ -1,0 +1,121 @@
+-- {"query": "5184.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 984} 
+WITH
+RecentHot AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    m.Name AS PostTypeName
+  FROM Posts p
+  JOIN PostTypes m ON p.PostTypeId = m.Id
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    AVG(p.Score) AS avg_score,
+    COUNT(*) AS post_count,
+    MAX(p.LastActivityDate) AS last_active
+  FROM Posts p
+  JOIN UNNEST(string_to_array(p.Tags, '><')) AS t(TagName) ON TRUE
+  GROUP BY t.TagName
+  HAVING COUNT(*) > 5
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS posts_created,
+    SUM(COALESCE(p.ViewCount,0)) AS total_views,
+    SUM(COALESCE(v.BountyAmount,0)) AS total_bounties
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 8
+  WHERE u.AccountId IS NOT NULL
+  GROUP BY u.Id, u.DisplayName
+),
+ComplexQuery AS (
+  SELECT
+    rh.PostId,
+    rh.Title,
+    rh.Tags,
+    rh.CreationDate,
+    rh.Score,
+    rh.ViewCount,
+    rh.OwnerUserId,
+    rh.LastActivityDate,
+    rh.CommentCount,
+    rh.AnswerCount,
+    p2.Name AS RelatedPostType,
+    pv.UserId AS VotedUserId,
+    pv.VoteTypeId,
+    CASE
+      WHEN pv.VoteTypeId IN (2,3) THEN 'UpOrDown'
+      WHEN pv.VoteTypeId = 10 THEN 'Deletion'
+      ELSE 'Other'
+    END AS VoteCategory,
+    w1.DisplayName AS LastEditor,
+    w1.LastEditDate
+  FROM RecentHot rh
+  LEFT JOIN Posts p2 ON p2.ParentId = rh.PostId
+  LEFT JOIN Votes pv ON pv.PostId = rh.PostId
+  LEFT JOIN PostTypes w1 ON rh.PostTypeId = w1.Id
+  WHERE rh.Score > 0
+    OR rh.ViewCount > 100
+)
+SELECT
+  cr.PostId,
+  cr.Title,
+  cr.Tags,
+  cr.CreationDate,
+  cr.Score,
+  cr.ViewCount,
+  cr.OwnerUserId,
+  cr.LastActivityDate,
+  cr.CommentCount,
+  cr.AnswerCount,
+  U1.DisplayName AS OwnerDisplayName,
+  U1.Reputation AS OwnerReputation,
+  U2.DisplayName AS LastEditorName,
+  U2.LastEditDate AS LastEditDate,
+  (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = cr.PostId) AS AvgBounty,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = cr.PostId) AS CommentCountAll,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = cr.PostId AND v.VoteTypeId = 2) AS UpVotesOnPost,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = cr.PostId AND v.VoteTypeId = 3) AS DownVotesOnPost,
+  TH.avg_score AS TagRelatedAvgScore,
+  TH.post_count AS TagRelatedPostCount,
+  UA.total_views AS UserTotalViews,
+  UA.posts_created AS UserPostCount
+FROM (
+  SELECT
+    rh.PostId,
+    rh.Title,
+    rh.Tags,
+    rh.CreationDate,
+    rh.Score,
+    rh.ViewCount,
+    rh.OwnerUserId,
+    rh.LastActivityDate,
+    rh.CommentCount,
+    rh.AnswerCount
+  FROM RecentHot rh
+) cr
+LEFT JOIN Users U1 ON cr.OwnerUserId = U1.Id
+LEFT JOIN (SELECT Id, DisplayName, LastEditDate FROM Users) U2 ON 1 = 1
+LEFT JOIN PostTypes PT ON cr.PostId = PT.Id
+LEFT JOIN (
+  SELECT Name, LastEditorDisplayName, LastEditDate
+  FROM Posts
+  WHERE Id = cr.PostId
+) AS w1 ON 1 = 1
+LEFT JOIN TopTags TH ON 1 = 1
+LEFT JOIN UserActivity UA ON cr.OwnerUserId = UA.UserId
+ORDER BY cr.LastActivityDate DESC
+LIMIT 100;

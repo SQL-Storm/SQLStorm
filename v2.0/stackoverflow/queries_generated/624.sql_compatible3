@@ -1,0 +1,279 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'no-domain') as website_domain,
+        date_trunc('month', u.creationdate) as signup_month,
+        row_number() over (partition by coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'no-domain')
+                           order by u.reputation desc, u.id) as rn_in_domain
+    from users u
+    where u.creationdate >= (select max(p.creationdate) - interval '365 days' from posts p)
+),
+top_domain_users as (
+    select *
+    from recent_users
+    where rn_in_domain <= 50
+),
+user_post_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        sum(coalesce(p.score,0)) as total_score,
+        sum(coalesce(p.viewcount,0)) filter (where p.posttypeid = 1) as total_question_views,
+        max(p.lastactivitydate) as last_activity
+    from posts p
+    where p.owneruserid is not null
+      and p.creationdate >= (select max(ph.creationdate) - interval '365 days' from posthistory ph)
+    group by p.owneruserid
+),
+user_post_rollup as (
+    select
+        user_id,
+        sum(q_count) as questions,
+        sum(a_count) as answers,
+        sum(total_score) as score_sum,
+        sum(coalesce(total_question_views,0)) as question_views,
+        max(last_activity) as last_activity
+    from user_post_activity
+    group by user_id
+),
+tag_extracted as (
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tagname
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+      and p.creationdate >= (select max(p2.creationdate) - interval '365 days' from posts p2)
+),
+user_top_tags as (
+    select
+        te.user_id,
+        t.tagname,
+        count(*) as tag_uses,
+        dense_rank() over (partition by te.user_id order by count(*) desc, t.tagname) as tag_rank
+    from tag_extracted te
+    join tags t on t.tagname = te.tagname
+    group by te.user_id, t.tagname
+),
+votes_agg as (
+    select
+        p.owneruserid as user_id,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_received,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_received,
+        sum(case when v.votetypeid in (2,3) then 1 else 0 end) as votes_received
+    from posts p
+    left join votes v on v.postid = p.id
+    where p.owneruserid is not null
+      and p.creationdate >= (select max(v2.creationdate) - interval '365 days' from votes v2)
+    group by p.owneruserid
+),
+badges_agg as (
+    select
+        b.userid as user_id,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        sum(case when b.tagbased = true then 1 else 0 end) as tag_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    where b.date >= (select max(b2.date) - interval '365 days' from badges b2)
+    group by b.userid
+),
+close_events as (
+    select
+        ph.postid,
+        ph.userid as closer_user_id,
+        cast(ph.comment as integer) as close_reason_id,
+        ph.creationdate as closed_at
+    from posthistory ph
+    where ph.posthistorytypeid = 10
+),
+duplicate_map as (
+    select
+        pl.postid as dup_id,
+        pl.relatedpostid as original_id
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+q_quality as (
+    select
+        q.id as question_id,
+        q.owneruserid as user_id,
+        coalesce(q.viewcount,0) as views,
+        coalesce(q.score,0) as score,
+        q.answercount,
+        case when q.acceptedanswerid is not null then 1 else 0 end as has_accepted,
+        case when ce.postid is not null then 1 else 0 end as was_closed,
+        case when dm.dup_id is not null then 1 else 0 end as was_duplicate
+    from posts q
+    left join close_events ce on ce.postid = q.id
+    left join duplicate_map dm on dm.dup_id = q.id
+    where q.posttypeid = 1
+      and q.creationdate >= (select max(p.creationdate) - interval '365 days' from posts p)
+),
+user_q_metrics as (
+    select
+        user_id,
+        count(*) as questions_asked,
+        avg(score) as avg_q_score,
+        percentile_disc(0.5) within group (order by score) as median_q_score,
+        sum(has_accepted) as accepted_count,
+        sum(was_closed) as closed_count,
+        sum(was_duplicate) as duplicate_count,
+        avg(case when answercount > 0 then 1.0 else 0.0 end) as answered_ratio,
+        sum(views) as q_views
+    from q_quality
+    group by user_id
+),
+comment_agg as (
+    select
+        c.userid as user_id,
+        count(*) as comments_made,
+        avg(coalesce(c.score,0)) as avg_comment_score,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    where c.creationdate >= (select max(c2.creationdate) - interval '365 days' from comments c2)
+    group by c.userid
+),
+activity_score as (
+    select
+        u.id as user_id,
+        coalesce(upr.score_sum,0) as post_score_sum,
+        coalesce(va.upvotes_received,0) as up_rcv,
+        coalesce(va.downvotes_received,0) as down_rcv,
+        coalesce(upr.questions,0) as q_cnt,
+        coalesce(upr.answers,0) as a_cnt,
+        coalesce(uqm.accepted_count,0) as acc_cnt,
+        coalesce(uqm.closed_count,0) as cls_cnt,
+        coalesce(uqm.duplicate_count,0) as dup_cnt,
+        coalesce(uqm.q_views,0) as q_views,
+        coalesce(ca.comments_made,0) as comments_made,
+        coalesce(ba.gold_badges,0) as gold,
+        coalesce(ba.silver_badges,0) as silver,
+        coalesce(ba.bronze_badges,0) as bronze,
+        (
+            coalesce(upr.score_sum,0)*2
+            + coalesce(va.upvotes_received,0)
+            - coalesce(va.downvotes_received,0)*2
+            + coalesce(upr.answers,0)*3
+            + coalesce(upr.questions,0)
+            + coalesce(uqm.accepted_count,0)*5
+            - coalesce(uqm.closed_count,0)*4
+            - coalesce(uqm.duplicate_count,0)*2
+            + least(coalesce(uqm.q_views,0)/cast(100 as numeric), 100)
+            + coalesce(ca.comments_made,0)/5
+            + coalesce(ba.gold_badges,0)*10
+            + coalesce(ba.silver_badges,0)*5
+            + coalesce(ba.bronze_badges,0)*2
+        ) as activity_points
+    from users u
+    left join user_post_rollup upr on upr.user_id = u.id
+    left join votes_agg va on va.user_id = u.id
+    left join user_q_metrics uqm on uqm.user_id = u.id
+    left join comment_agg ca on ca.user_id = u.id
+    left join badges_agg ba on ba.user_id = u.id
+),
+domain_peer_stats as (
+    select
+        ru.website_domain,
+        percentile_disc(0.5) within group (order by a.activity_points) as domain_median_points,
+        avg(a.activity_points) as domain_avg_points,
+        count(*) as domain_user_count
+    from top_domain_users ru
+    join activity_score a on a.user_id = ru.user_id
+    group by ru.website_domain
+),
+recent_hot_questions as (
+    select
+        q.id as post_id,
+        q.owneruserid as user_id,
+        q.title,
+        q.creationdate,
+        exists (
+            select 1
+            from posthistory ph
+            where ph.postid = q.id
+              and ph.posthistorytypeid in (52)
+        ) as was_hot
+    from posts q
+    where q.posttypeid = 1
+      and q.creationdate >= (select max(p.creationdate) - interval '180 days' from posts p)
+),
+user_hot_flag as (
+    select
+        user_id,
+        max(case when was_hot then 1 else 0 end) as has_hot_question
+    from recent_hot_questions
+    group by user_id
+),
+final_rank as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.website_domain,
+        a.activity_points,
+        rank() over (partition by ru.website_domain order by a.activity_points desc, ru.user_id) as domain_rank,
+        dense_rank() over (order by a.activity_points desc, ru.user_id) as global_rank
+    from top_domain_users ru
+    join activity_score a on a.user_id = ru.user_id
+)
+select
+    fr.global_rank,
+    fr.domain_rank,
+    fr.user_id,
+    ru.displayname,
+    ru.website_domain,
+    to_char(ru.signup_month, 'YYYY-MM') as signup_month,
+    u.reputation,
+    coalesce(u.location, 'unknown') as location,
+    a.activity_points,
+    dp.domain_median_points,
+    dp.domain_avg_points,
+    dp.domain_user_count,
+    coalesce(upr.questions,0) as questions,
+    coalesce(upr.answers,0) as answers,
+    coalesce(uqm.avg_q_score,0) as avg_q_score,
+    coalesce(uqm.median_q_score,0) as median_q_score,
+    coalesce(uqm.answered_ratio,0) as answered_ratio,
+    coalesce(va.upvotes_received,0) as upvotes_received,
+    coalesce(va.downvotes_received,0) as downvotes_received,
+    coalesce(ba.gold_badges,0) as gold_badges,
+    coalesce(ba.silver_badges,0) as silver_badges,
+    coalesce(ba.bronze_badges,0) as bronze_badges,
+    coalesce(ca.comments_made,0) as comments_made,
+    coalesce(ut.tagname, 'no-tag') as top_tag,
+    coalesce(ut.tag_uses,0) as top_tag_uses,
+    coalesce(uhf.has_hot_question,0) as has_hot_question,
+    upr.last_activity,
+    case
+        when a.activity_points >= dp.domain_avg_points * 1.5 then 'Leader'
+        when a.activity_points >= dp.domain_avg_points then 'AboveAvg'
+        when a.activity_points >= dp.domain_median_points then 'Mid'
+        else 'Rising'
+    end as cohort_band
+from final_rank fr
+join recent_users ru on ru.user_id = fr.user_id
+join users u on u.id = fr.user_id
+left join user_post_rollup upr on upr.user_id = fr.user_id
+left join user_q_metrics uqm on uqm.user_id = fr.user_id
+left join votes_agg va on va.user_id = fr.user_id
+left join badges_agg ba on ba.user_id = fr.user_id
+left join comment_agg ca on ca.user_id = fr.user_id
+left join domain_peer_stats dp on dp.website_domain = fr.website_domain
+left join user_hot_flag uhf on uhf.user_id = fr.user_id
+left join lateral (
+    select tagname, tag_uses
+    from user_top_tags utt
+    where utt.user_id = fr.user_id
+      and utt.tag_rank = 1
+    limit 1
+) ut on true
+where fr.global_rank <= 1000
+order by fr.global_rank, fr.user_id;

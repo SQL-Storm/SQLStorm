@@ -1,0 +1,222 @@
+-- {"query": "1717.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3253} 
+WITH UserBaseStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserRegistrationDate,
+        U.LastAccessDate,
+        U.Views AS ProfileViews,
+        U.UpVotes AS UserTotalUpVotesReceived,
+        U.DownVotes AS UserTotalDownVotesReceived,
+        U.WebsiteUrl,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        AVG(CASE WHEN B.TagBased = TRUE THEN 1 ELSE 0 END) AS AvgTagBasedBadgeRatio
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes, U.WebsiteUrl
+),
+PostDetailedMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        COALESCE(P.Title, 'N/A') AS PostTitle,
+        P.Tags,
+        ARRAY_AGG(DISTINCT SUBSTRING(UNNEST(string_to_array(TRIM(BOTH '<>' FROM P.Tags), '><')), 1, 35)) FILTER (WHERE P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2) AS ParsedTags,
+        LENGTH(P.Body) - LENGTH(REPLACE(P.Body, ' ', '')) + 1 AS WordCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostUpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostDownVotes,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS IsClosedPost,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 16 THEN 1 ELSE 0 END) AS IsCommunityWiki,
+        AVG(C.Score) AS AvgCommentScoreForPost,
+        COUNT(DISTINCT PL.RelatedPostId) AS LinkedPostsCount
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId AND PL.LinkTypeId = 1
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount,
+        P.CommentCount, P.FavoriteCount, P.ClosedDate, P.CommunityOwnedDate, P.Title, P.Tags, P.Body
+),
+UserRecentHistory AS (
+    SELECT
+        PH.Id,
+        PH.PostId,
+        PH.UserId AS CurrentEditorUserId,
+        PH.CreationDate AS HistoryEventDate,
+        PH.PostHistoryTypeId,
+        PH.Comment,
+        LAG(PH.UserId) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate, PH.Id) AS PriorEditorUserId
+    FROM PostHistory PH
+    WHERE PH.UserId IS NOT NULL
+      AND PH.CreationDate >= NOW() - INTERVAL '1 year'
+),
+AggregatedUserRecentHistory AS (
+    SELECT
+        CurrentEditorUserId AS EditorId,
+        COUNT(DISTINCT PostId) AS DistinctPostsEdited,
+        COUNT(Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditActions,
+        SUM(CASE WHEN PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS CloseActions,
+        SUM(CASE WHEN PostHistoryTypeId IN (35, 36) THEN 1 ELSE 0 END) AS MigrationActions,
+        SUM(CASE WHEN PriorEditorUserId IS NOT NULL AND PriorEditorUserId != CurrentEditorUserId THEN 1 ELSE 0 END) AS SuccessiveEditorChanges,
+        MAX(HistoryEventDate) AS LastHistoryActionDate,
+        STRING_AGG(DISTINCT UPPER(Comment), ' ||| ') FILTER (WHERE Comment IS NOT NULL AND LENGTH(Comment) > 0 AND LENGTH(Comment) < 200) AS RepresentativeComments
+    FROM UserRecentHistory
+    GROUP BY CurrentEditorUserId
+),
+OverallTagPerformance AS (
+    SELECT
+        T.TagName,
+        COUNT(DISTINCT PDM.PostId) AS TaggedPostsCount,
+        AVG(PDM.Score) AS AvgTagPostScore,
+        SUM(PDM.ViewCount) AS TotalTagViewCount,
+        MAX(PDM.CreationDate) AS LatestTagPostDate
+    FROM PostDetailedMetrics PDM
+    CROSS JOIN UNNEST(PDM.ParsedTags) AS T(TagName)
+    WHERE PDM.PostTypeId = 1
+    GROUP BY T.TagName
+),
+UserTagContributions AS (
+    SELECT
+        PDM.OwnerUserId AS UserId,
+        T.TagName,
+        COUNT(DISTINCT PDM.PostId) AS UserPostsInTag,
+        SUM(PDM.Score) AS UserScoreInTag,
+        AVG(PDM.ViewCount) AS UserAvgViewCountInTag,
+        DENSE_RANK() OVER (PARTITION BY T.TagName ORDER BY SUM(PDM.Score) DESC, COUNT(DISTINCT PDM.PostId) DESC) AS UserRankForTag
+    FROM PostDetailedMetrics PDM
+    CROSS JOIN UNNEST(PDM.ParsedTags) AS T(TagName)
+    WHERE PDM.PostTypeId = 1
+      AND PDM.OwnerUserId IS NOT NULL
+    GROUP BY PDM.OwnerUserId, T.TagName
+),
+TextualContentAnalysis AS (
+    SELECT
+        P.Id AS ContentEntityId,
+        P.OwnerUserId AS ContentOwnerUserId,
+        P.CreationDate AS ContentCreationDate,
+        'POST' AS ContentType,
+        P.Body AS FullText,
+        P.Title AS OptionalTitle
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2)
+    UNION ALL
+    SELECT
+        C.Id AS ContentEntityId,
+        C.UserId AS ContentOwnerUserId,
+        C.CreationDate AS ContentCreationDate,
+        'COMMENT' AS ContentType,
+        C.Text AS FullText,
+        NULL AS OptionalTitle
+    FROM Comments C
+    WHERE C.UserId IS NOT NULL
+)
+SELECT
+    UBS.UserId,
+    UBS.DisplayName,
+    UBS.Reputation,
+    UBS.UserRegistrationDate,
+    UBS.LastAccessDate,
+    UBS.ProfileViews,
+    UBS.TotalPostsOwned,
+    UBS.TotalCommentsMade,
+    UBS.TotalBadgesEarned,
+    UBS.TotalUpVotesGiven,
+    UBS.TotalDownVotesGiven,
+    ARH.DistinctPostsEdited,
+    ARH.EditActions AS RecentEditActions,
+    ARH.CloseActions AS RecentCloseActions,
+    ARH.MigrationActions AS RecentMigrationActions,
+    ARH.SuccessiveEditorChanges,
+    ARH.LastHistoryActionDate,
+    COALESCE(ARH.RepresentativeComments, 'No recent history comments or comments too long') AS LastHistoryCommentsSummary,
+    SUM(PDM.Score) AS UserOverallPostScore,
+    AVG(PDM.ViewCount) AS UserAveragePostViewCount,
+    COUNT(DISTINCT CASE WHEN PDM.PostTypeId = 1 THEN PDM.PostId END) AS QuestionsOwnedCount,
+    COUNT(DISTINCT CASE WHEN PDM.PostTypeId = 2 THEN PDM.PostId END) AS AnswersOwnedCount,
+    COUNT(DISTINCT CASE WHEN PDM.IsClosedPost = 1 THEN PDM.PostId END) AS ClosedPostsOwnedCount,
+    COUNT(DISTINCT CASE WHEN PDM.IsCommunityWiki = 1 THEN PDM.PostId END) AS CommunityWikiPostsOwnedCount,
+    SUM(PDM.FavoriteCount) AS TotalPostsFavoritedByOthers,
+    COALESCE(
+        CAST(SUM(CASE WHEN PDM.PostTypeId = 1 AND PDM.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS DECIMAL) /
+        NULLIF(SUM(CASE WHEN PDM.PostTypeId = 1 THEN 1 ELSE 0 END), 0),
+        0.0
+    ) AS RatioQuestionsClosed,
+    RANK() OVER (ORDER BY AVG(CASE WHEN PDM.PostTypeId = 1 THEN PDM.Score ELSE NULL END) DESC NULLS LAST, UBS.Reputation DESC) AS UserQuestionScoreRank,
+    (
+        SELECT UTC.TagName
+        FROM UserTagContributions UTC
+        WHERE UTC.UserId = UBS.UserId
+        ORDER BY UTC.UserPostsInTag DESC, UTC.UserScoreInTag DESC
+        LIMIT 1
+    ) AS MostFrequentContributingTag,
+    EXISTS (
+        SELECT 1
+        FROM PostLinks PL
+        INNER JOIN Posts LinkedP ON PL.RelatedPostId = LinkedP.Id
+        WHERE PL.PostId IN (SELECT PDM_sub.PostId FROM PostDetailedMetrics PDM_sub WHERE PDM_sub.OwnerUserId = UBS.UserId)
+          AND LinkedP.ViewCount > 100000
+          AND LinkedP.CreationDate > UBS.UserRegistrationDate - INTERVAL '1 year'
+    ) AS LinksToVeryPopularPosts,
+    STRING_AGG(DISTINCT UTC.TagName || ' (Rank: ' || UTC.UserRankForTag || ')', '; ') FILTER (WHERE UTC.UserRankForTag <= 5 AND UTC.TagName IS NOT NULL) AS Top5RankedTagsSummary,
+    NTILE(10) OVER (ORDER BY SUM(COALESCE(PDM.PostUpVotes, 0)) DESC) AS PostUpvoteDecile,
+    DATE_PART('year', AGE(NOW(), UBS.UserRegistrationDate)) AS YearsActive,
+    COALESCE(SUM(PDM.LinkedPostsCount) / NULLIF(COUNT(PDM.PostId), 0), 0) AS AvgLinkedPostsPerPost,
+    CASE
+        WHEN UBS.Reputation > 50000 AND ARH.CloseActions > 10 THEN 'HighRep_ActiveModerator'
+        WHEN UBS.TotalPostsOwned > 500 AND UBS.TotalCommentsMade > 1000 THEN 'ProdigiousContributor'
+        WHEN (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = UBS.UserId AND B.Class = 1) > 5 THEN 'GoldBadgeVeteran'
+        ELSE 'GeneralContributor'
+    END AS UserCategory,
+    LEFT(TRIM(TRAILING '/' FROM COALESCE(UBS.WebsiteUrl, 'N/A')), 50) AS CleanedWebsiteUrl,
+    ABS(UBS.UserTotalUpVotesReceived - UBS.UserTotalDownVotesReceived) AS VoteDifferentialFromUserTable,
+    (
+        SELECT AVG(OTP.AvgTagPostScore)
+        FROM OverallTagPerformance OTP
+        INNER JOIN UserTagContributions UTC2 ON OTP.TagName = UTC2.TagName
+        WHERE UTC2.UserId = UBS.UserId
+        AND UTC2.UserRankForTag <= 3
+    ) AS AvgTopTagPerformance,
+    SUM(CASE WHEN TCA.FullText ILIKE '%sql%' OR TCA.FullText ILIKE '%database%' THEN 1 ELSE 0 END) AS SQLDatabaseMentionsInContent,
+    LAG(UBS.TotalPostsOwned, 1, 0) OVER (ORDER BY UBS.Reputation DESC) AS PostsOfPrevRepUser,
+    COALESCE(AVG(PDM.AvgCommentScoreForPost), 0) AS AverageCommentScoreOnOwnPosts
+FROM UserBaseStats UBS
+LEFT JOIN PostDetailedMetrics PDM ON UBS.UserId = PDM.OwnerUserId
+LEFT JOIN AggregatedUserRecentHistory ARH ON UBS.UserId = ARH.EditorId
+LEFT JOIN UserTagContributions UTC ON UBS.UserId = UTC.UserId
+LEFT JOIN TextualContentAnalysis TCA ON UBS.UserId = TCA.ContentOwnerUserId AND TCA.ContentCreationDate >= NOW() - INTERVAL '2 years'
+WHERE
+    UBS.Reputation >= 10000
+    AND (UBS.LastAccessDate >= NOW() - INTERVAL '6 months' OR PDM.PostId IS NOT NULL)
+    AND UBS.UserRegistrationDate < NOW() - INTERVAL '2 years'
+GROUP BY
+    UBS.UserId, UBS.DisplayName, UBS.Reputation, UBS.UserRegistrationDate, UBS.LastAccessDate,
+    UBS.ProfileViews, UBS.TotalPostsOwned, UBS.TotalCommentsMade, UBS.TotalBadgesEarned,
+    UBS.TotalUpVotesGiven, UBS.TotalDownVotesGiven, ARH.DistinctPostsEdited, ARH.EditActions,
+    ARH.CloseActions, ARH.MigrationActions, ARH.SuccessiveEditorChanges, ARH.LastHistoryActionDate,
+    ARH.RepresentativeComments, UBS.UserTotalUpVotesReceived, UBS.UserTotalDownVotesReceived, UBS.WebsiteUrl
+HAVING
+    COUNT(PDM.PostId) > 20
+    AND SUM(CASE WHEN PDM.PostTypeId = 1 THEN PDM.ViewCount ELSE 0 END) > 5000
+ORDER BY
+    UserQuestionScoreRank ASC, Reputation DESC, TotalPostsFavoritedByOthers DESC
+LIMIT 50 OFFSET 5;

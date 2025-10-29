@@ -1,0 +1,406 @@
+-- {"query": "604.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3840} 
+with
+-- high-activity users and their key metrics
+user_activity as (
+  select
+    u.id as user_id,
+    coalesce(nullif(trim(u.DisplayName), ''), '(anon)') as display_name,
+    u.Reputation,
+    u.CreationDate,
+    date_part('year', age(now(), u.CreationDate))::int as account_age_years,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views,
+    count(distinct p.id) filter (where p.PostTypeId in (1,2)) as total_posts,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges,
+    max(b.date) as last_badge_date,
+    sum(case when b.TagBased = 1 then 1 else 0 end) as tag_badges
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join Badges b on b.UserId = u.Id
+  group by u.id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes, u.Views
+),
+-- aggregate post-level signals
+post_signals as (
+  select
+    p.Id as post_id,
+    p.OwnerUserId as owner_id,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ClosedDate,
+    p.AcceptedAnswerId,
+    lower(coalesce(p.Title, '')) as title_lc,
+    lower(coalesce(p.Tags, '')) as tags_lc,
+    coalesce(p.ContentLicense, '') as content_license,
+    -- vote-derived metrics
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites,
+    sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as bounty_start,
+    sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as bounty_close,
+    count(*) filter (where v.VoteTypeId in (10,12)) as mod_actions,
+    -- comment signal
+    count(distinct c.Id) as comment_cnt
+  from Posts p
+  left join Votes v on v.PostId = p.Id
+  left join Comments c on c.PostId = p.Id
+  group by p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.CreationDate, p.LastActivityDate, p.ClosedDate, p.AcceptedAnswerId, p.Title, p.Tags, p.ContentLicense
+),
+-- classify questions vs answers, and tag extraction
+post_enriched as (
+  select
+    ps.*,
+    case when ps.PostTypeId = 1 then 1 else 0 end as is_question,
+    case when ps.PostTypeId = 2 then 1 else 0 end as is_answer,
+    (ps.upvotes - ps.downvotes) as net_votes,
+    nullif(ps.tags_lc, '') as raw_tags,
+    -- extract a few tag tokens for predicate complexity
+    string_to_array(substring(ps.tags_lc from 2 for greatest(length(ps.tags_lc)-2,0)), '><') as tag_array
+  from post_signals ps
+),
+-- find duplicates / related via PostLinks and PostHistory (close reasons)
+link_flags as (
+  select
+    p.Id as post_id,
+    max(case when pl.LinkTypeId = 3 then 1 else 0 end) as is_marked_duplicate,
+    count(*) filter (where pl.LinkTypeId = 1) as linked_ref_count,
+    count(*) filter (where pl.LinkTypeId = 3) as duplicate_ref_count
+  from Posts p
+  left join PostLinks pl on pl.PostId = p.Id
+  group by p.Id
+),
+close_events as (
+  select
+    ph.PostId,
+    max(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as was_closed,
+    max(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as was_reopened,
+    max(case when ph.PostHistoryTypeId = 52 then 1 else 0 end) as was_hot,
+    max(case when ph.PostHistoryTypeId = 53 then 1 else 0 end) as was_unhot,
+    -- parse close reason id if numeric in Comment; keep best effort as int
+    max(
+      case
+        when ph.PostHistoryTypeId = 10 and ph.Comment ~ '^[0-9]+$'
+          then ph.Comment::int
+        else null end
+    ) as close_reason_id
+  from PostHistory ph
+  group by ph.PostId
+),
+-- windowed activity per user to get recency and rolling aggregates
+user_post_windows as (
+  select
+    pe.owner_id,
+    pe.post_id,
+    pe.PostTypeId,
+    pe.CreationDate,
+    pe.Score,
+    pe.ViewCount,
+    pe.net_votes,
+    row_number() over (partition by pe.owner_id order by pe.CreationDate desc) as rn_recent,
+    sum(pe.Score) over (partition by pe.owner_id order by pe.CreationDate rows between unbounded preceding and current row) as cum_score,
+    avg(pe.Score) over (partition by pe.owner_id) as avg_score_per_user,
+    percentile_cont(0.9) within group (order by pe.Score) over (partition by pe.owner_id) as p90_score_per_user
+  from post_enriched pe
+),
+-- choose each user's most recent N posts and also top by score
+user_recent_vs_top as (
+  select
+    upw.*,
+    case when upw.rn_recent <= 5 then 1 else 0 end as in_recent5
+  from user_post_windows upw
+),
+-- tag popularity via Tags table for intersection with post tags
+tag_pop as (
+  select
+    lower(t.TagName) as tag_name,
+    t.Count as tag_count,
+    row_number() over (order by t.Count desc, t.TagName) as tag_rank
+  from Tags t
+),
+-- explode tags and map to popularity
+post_tag_map as (
+  select
+    pe.post_id,
+    lower(trim(tag)) as tag_name
+  from post_enriched pe
+  cross join lateral unnest(coalesce(pe.tag_array, array[]::varchar[])) as tag(tag)
+),
+post_tag_stats as (
+  select
+    ptm.post_id,
+    count(*) as tag_count_on_post,
+    max(tp.tag_count) as max_tag_popularity,
+    min(tp.tag_count) as min_tag_popularity,
+    avg(tp.tag_count::numeric) as avg_tag_popularity,
+    max(case when tp.tag_rank <= 100 then 1 else 0 end) as has_top100_tag
+  from post_tag_map ptm
+  left join tag_pop tp on tp.tag_name = ptm.tag_name
+  group by ptm.post_id
+),
+-- combine everything at post granularity
+post_feature as (
+  select
+    pe.*,
+    lf.is_marked_duplicate,
+    lf.linked_ref_count,
+    lf.duplicate_ref_count,
+    ce.was_closed,
+    ce.was_reopened,
+    ce.was_hot,
+    ce.was_unhot,
+    ce.close_reason_id,
+    pts.tag_count_on_post,
+    pts.max_tag_popularity,
+    pts.min_tag_popularity,
+    pts.avg_tag_popularity,
+    pts.has_top100_tag
+  from post_enriched pe
+  left join link_flags lf on lf.post_id = pe.post_id
+  left join close_events ce on ce.PostId = pe.post_id
+  left join post_tag_stats pts on pts.post_id = pe.post_id
+),
+-- user aggregate joined to post features
+user_post as (
+  select
+    ua.user_id,
+    ua.display_name,
+    ua.Reputation,
+    ua.account_age_years,
+    ua.UpVotes,
+    ua.DownVotes,
+    ua.Views,
+    ua.total_posts,
+    ua.gold_badges,
+    ua.silver_badges,
+    ua.bronze_badges,
+    ua.tag_badges,
+    ua.last_badge_date,
+    pf.*
+  from user_activity ua
+  left join post_feature pf on pf.owner_id = ua.user_id
+),
+-- outlier detection windows across posts for benchmarking
+scored as (
+  select
+    up.*,
+    avg(coalesce(up.Score,0)) over () as global_avg_score,
+    stddev_pop(coalesce(up.Score,0)) over () as global_std_score,
+    avg(coalesce(up.ViewCount,0)) over () as global_avg_views,
+    stddev_pop(coalesce(up.ViewCount,0)) over () as global_std_views
+  from user_post up
+),
+-- create several buckets and complicated predicates
+bucketed as (
+  select
+    s.*,
+    case
+      when s.Reputation >= 100000 then 'legend'
+      when s.Reputation >= 25000 then 'expert'
+      when s.Reputation >= 5000 then 'advanced'
+      when s.Reputation >= 1000 then 'intermediate'
+      else 'novice'
+    end as rep_bucket,
+    case
+      when s.Score is null then 'missing'
+      when s.Score >= coalesce(s.global_avg_score,0) + 2*coalesce(nullif(s.global_std_score,0),1) then 'high'
+      when s.Score <= coalesce(s.global_avg_score,0) - 2*coalesce(nullif(s.global_std_score,0),1) then 'low'
+      else 'normal'
+    end as score_outlier,
+    case
+      when s.ViewCount is null then 'missing'
+      when s.ViewCount >= coalesce(s.global_avg_views,0) + 2*coalesce(nullif(s.global_std_views,0),1) then 'high'
+      when s.ViewCount <= coalesce(s.global_avg_views,0) - 2*coalesce(nullif(s.global_std_views,0),1) then 'low'
+      else 'normal'
+    end as view_outlier,
+    case
+      when s.PostTypeId = 1 and s.AnswerCount >= 5 and s.net_votes >= 10 then 1
+      when s.PostTypeId = 2 and s.net_votes >= 5 then 1
+      else 0
+    end as engagement_flag,
+    case when s.closedDate is not null or s.was_closed = 1 then 1 else 0 end as ever_closed
+  from scored s
+),
+-- correlated subquery example: compute accepted answer age vs question
+answer_age as (
+  select
+    q.Id as question_id,
+    a.Id as answer_id,
+    extract(epoch from (a.CreationDate - q.CreationDate))::bigint as seconds_to_answer
+  from Posts q
+  join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  where q.PostTypeId = 1
+),
+accepted_latency as (
+  select
+    q.Id as question_id,
+    extract(epoch from (acc.CreationDate - q.CreationDate))::bigint as seconds_to_accept
+  from Posts q
+  join Posts acc on acc.Id = q.AcceptedAnswerId
+  where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+-- per post latency features joined
+latency as (
+  select
+    pf.post_id,
+    min(aa.seconds_to_answer) as first_answer_secs,
+    avg(aa.seconds_to_answer)::bigint as avg_answer_secs,
+    al.seconds_to_accept
+  from post_feature pf
+  left join answer_age aa on aa.question_id = pf.post_id
+  left join accepted_latency al on al.question_id = pf.post_id
+  group by pf.post_id, al.seconds_to_accept
+),
+-- windowed rank across complex composite score
+ranked as (
+  select
+    b.*,
+    l.first_answer_secs,
+    l.avg_answer_secs,
+    l.seconds_to_accept,
+    -- composite score blending various metrics with null-safety
+    (
+      coalesce(b.Score,0) * 1.0
+      + coalesce(b.net_votes,0) * 2.0
+      + coalesce(b.upvotes,0) * 0.5
+      - coalesce(b.downvotes,0) * 0.75
+      + least(coalesce(b.ViewCount,0)/100.0, 50.0)
+      + case when b.was_hot = 1 then 25 else 0 end
+      - case when b.ever_closed = 1 then 10 else 0 end
+      + case when b.has_top100_tag = 1 then 5 else 0 end
+      + coalesce(50.0 / nullif(b.first_answer_secs,0), 0.0)
+    ) as composite_score
+  from bucketed b
+  left join latency l on l.post_id = b.post_id
+),
+-- window ranks including ties and dense ranking
+final_rank as (
+  select
+    r.*,
+    row_number() over (order by composite_score desc nulls last) as rownum_desc,
+    rank() over (order by composite_score desc nulls last) as rank_desc,
+    dense_rank() over (order by composite_score desc nulls last) as dense_rank_desc,
+    ntile(10) over (order by composite_score desc nulls last) as decile_desc
+  from ranked r
+),
+-- introduce set operators: gather top by different lenses and unify
+top_by_views as (
+  select post_id from final_rank
+  where view_outlier = 'high' and PostTypeId in (1,2)
+  order by ViewCount desc nulls last
+  limit 500
+),
+top_by_score as (
+  select post_id from final_rank
+  where score_outlier = 'high' and PostTypeId in (1,2)
+  order by Score desc nulls last
+  limit 500
+),
+unioned as (
+  select post_id from top_by_views
+  union
+  select post_id from top_by_score
+),
+-- bring back features for the unioned set
+bench_set as (
+  select fr.*
+  from final_rank fr
+  join unioned u on u.post_id = fr.post_id
+),
+-- add a correlated scalar subquery for comment sentiment proxy (length-based)
+bench_enriched as (
+  select
+    b.*,
+    (
+      select avg(length(c.Text))
+      from Comments c
+      where c.PostId = b.post_id
+    ) as avg_comment_length,
+    (
+      select count(*) from Comments c
+      where c.PostId = b.post_id and c.Score > 0
+    ) as positive_comment_count
+  from bench_set b
+)
+select
+  be.post_id,
+  be.owner_id as user_id,
+  be.display_name,
+  be.Reputation,
+  be.rep_bucket,
+  be.account_age_years,
+  be.PostTypeId,
+  be.is_question,
+  be.is_answer,
+  be.Score,
+  be.net_votes,
+  be.ViewCount,
+  be.AnswerCount,
+  be.CommentCount,
+  be.FavoriteCount,
+  be.upvotes,
+  be.downvotes,
+  be.favorites,
+  be.bounty_start,
+  be.bounty_close,
+  be.mod_actions,
+  be.comment_cnt,
+  be.linked_ref_count,
+  be.duplicate_ref_count,
+  be.is_marked_duplicate,
+  be.was_closed,
+  be.was_reopened,
+  be.was_hot,
+  be.was_unhot,
+  be.ever_closed,
+  be.close_reason_id,
+  be.tag_count_on_post,
+  be.max_tag_popularity,
+  be.min_tag_popularity,
+  be.avg_tag_popularity,
+  be.has_top100_tag,
+  be.first_answer_secs,
+  be.avg_answer_secs,
+  be.seconds_to_accept,
+  be.avg_comment_length,
+  be.positive_comment_count,
+  be.composite_score,
+  be.rownum_desc,
+  be.rank_desc,
+  be.dense_rank_desc,
+  be.decile_desc,
+  -- complicated filterable computed expressions
+  case when be.ContentLicense ilike '%by-sa%' then 1 else 0 end as is_cc_by_sa,
+  case when be.title_lc similar to '%(how|why|what|when|where)%' then 1 else 0 end as interrogative_title,
+  case when be.raw_tags is null then 1 else 0 end as has_no_tags,
+  -- string expression: normalized owner name token
+  regexp_replace(coalesce(be.display_name, '(anon)'), '\s+', ' ', 'g') as normalized_display_name
+from bench_enriched be
+where
+  -- complicated predicates for benchmarking
+  (be.PostTypeId in (1,2))
+  and (
+    be.score_outlier in ('high','normal') or (be.view_outlier = 'high' and coalesce(be.Score,0) >= 0)
+  )
+  and (
+    be.is_marked_duplicate = 0
+    or (be.is_marked_duplicate is null and be.was_closed <> 1)
+    or (be.close_reason_id not in (101,1) or be.close_reason_id is null)
+  )
+  and (
+    be.has_top100_tag = 1
+    or (be.tag_count_on_post >= 1 and coalesce(be.avg_tag_popularity,0) > 0)
+  )
+  and (
+    be.ContentLicense is null
+    or be.ContentLicense not ilike '%nc%'
+  )
+order by be.composite_score desc nulls last, be.ViewCount desc nulls last
+limit 300;

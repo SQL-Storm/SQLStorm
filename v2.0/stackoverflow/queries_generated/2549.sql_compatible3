@@ -1,0 +1,225 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        t.Count, 
+        t.ExcerptPostId, 
+        t.WikiPostId,
+        1 AS Level,
+        CAST(t.TagName AS varchar) AS Path
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT 
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy r ON child.WikiPostId = r.ExcerptPostId
+    WHERE r.Level < 3
+),
+PostsWithScoreStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.Reputation AS OwnerReputation,
+        row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate) AS UserPostRank,
+        avg(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+        count(*) OVER (PARTITION BY p.OwnerUserId) AS TotalUserPosts
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+PostAnswerPairs AS (
+    SELECT 
+        q.Id AS QuestionId, q.Title, q.Tags AS QuestionTags, q.Score AS QuestionScore,
+        a.Id AS AnswerId, a.Score AS AnswerScore, a.OwnerUserId AS AnswerOwner,
+        a.CreationDate AS AnswerCreationDate,
+        (CASE WHEN EXISTS (
+            SELECT 1 
+            FROM Votes v 
+            WHERE v.PostId = a.Id AND v.VoteTypeId = 2 AND v.CreationDate > a.CreationDate
+              AND v.CreationDate < a.CreationDate + INTERVAL '7 days'
+            ) THEN TRUE ELSE FALSE END) AS AnswerHasPostAnswerUpvotesWithinWeek
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+BadgeRanks AS (
+    SELECT 
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.Date,
+        dense_rank() OVER (PARTITION BY b.UserId ORDER BY b.Date) AS BadgeSequence,
+        count(*) OVER (PARTITION BY b.UserId, b.Class) AS BadgeClassCount
+    FROM Badges b
+),
+UserBadgeSummary AS (
+    SELECT 
+        UserId,
+        sum(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        sum(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        sum(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        max(BadgeDate) AS LastBadgeDate
+    FROM (
+        SELECT UserId, Class, Date AS BadgeDate FROM Badges
+    ) b
+    GROUP BY UserId
+),
+CloseReasonSummary AS (
+    SELECT 
+        p.Id AS PostId,
+        cht.Name AS HistoryTypeName,
+        cr.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    JOIN PostHistoryTypes cht ON ph.PostHistoryTypeId = cht.Id
+    LEFT JOIN CloseReasonTypes cr ON CAST(ph.Comment AS integer) = cr.Id
+    JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.PostHistoryTypeId = 10
+),
+UserActivityRanking AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(DISTINCT p.Id) AS TotalPosts,
+        count(DISTINCT c.Id) AS TotalComments,
+        count(DISTINCT b.Id) AS TotalBadges,
+        row_number() OVER (ORDER BY u.Reputation DESC, count(DISTINCT p.Id) DESC) AS RankByReputation
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopQuestionsWithAcceptedAnswers AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        acc.Id AS AcceptedAnswerId,
+        acc.Score AS AcceptedAnswerScore,
+        acc.OwnerUserId AS AcceptedAnswerOwner,
+        first_value(acc.CreationDate) OVER (PARTITION BY q.Id ORDER BY acc.CreationDate) AS FirstAcceptedAnswerDate
+    FROM Posts q
+    LEFT JOIN Posts acc ON q.AcceptedAnswerId = acc.Id
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+),
+QuestionsWithoutAcceptedAnswersWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score AS QuestionScore,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwner,
+        a.CreationDate AS AnswerCreationDate
+    FROM Posts q
+    JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NULL
+),
+CombinedQuestionsAndAnswers AS (
+    SELECT 
+        tq.QuestionId, 
+        tq.Title, 
+        tq.QuestionScore, 
+        tq.AcceptedAnswerId AS AnswerId, 
+        tq.AcceptedAnswerScore AS AnswerScore, 
+        tq.AcceptedAnswerOwner AS AnswerOwner,
+        tq.FirstAcceptedAnswerDate AS AnswerCreationDate,
+        'AcceptedAnswer' AS AnswerType
+    FROM TopQuestionsWithAcceptedAnswers tq
+    UNION ALL
+    SELECT 
+        qwa.QuestionId, qwa.Title, qwa.QuestionScore, qwa.AnswerId, qwa.AnswerScore, qwa.AnswerOwner, qwa.AnswerCreationDate,
+        'NonAcceptedAnswer' AS AnswerType
+    FROM QuestionsWithoutAcceptedAnswersWithAnswers qwa
+),
+AnswerRanks AS (
+    SELECT 
+        cqa.*,
+        row_number() OVER (PARTITION BY cqa.QuestionId ORDER BY cqa.AnswerScore DESC, cqa.AnswerCreationDate) AS AnswerRank
+    FROM CombinedQuestionsAndAnswers cqa
+),
+UserQuestionStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestions,
+        count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswers,
+        avg(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        avg(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        max(p.Score) FILTER (WHERE p.PostTypeId = 1) AS MaxQuestionScore,
+        max(p.Score) FILTER (WHERE p.PostTypeId = 2) AS MaxAnswerScore
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.Views,
+    coalesce(ubs.GoldBadges,0) AS GoldBadges,
+    coalesce(ubs.SilverBadges,0) AS SilverBadges,
+    coalesce(ubs.BronzeBadges,0) AS BronzeBadges,
+    us.TotalQuestions,
+    us.TotalAnswers,
+    round(CAST(us.AvgQuestionScore AS numeric),2) AS AvgQuestionScore,
+    round(CAST(us.AvgAnswerScore AS numeric),2) AS AvgAnswerScore,
+    us.MaxQuestionScore,
+    us.MaxAnswerScore,
+    count(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10,11)) AS CloseReopenEvents,
+    count(DISTINCT c.Id) AS CommentCount,
+    max(ph.CreationDate) AS LastPostHistoryChange,
+    sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+    sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+    max(p.CreationDate) AS LastPostCreatedDate,
+    ps.median_score,
+    ps.avg_post_score,
+    ps.max_post_score,
+    ps.min_post_score,
+    string_agg(DISTINCT rth.Path, ' | ') AS RequiredTagPaths,
+    uar.RankByReputation AS rank_by_reputation
+FROM Users u
+LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+LEFT JOIN UserQuestionStats us ON u.Id = us.UserId
+LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+LEFT JOIN Comments c ON c.UserId = u.Id
+LEFT JOIN Votes v ON v.UserId = u.Id
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN RecursiveTagHierarchy rth ON position('<' || rth.TagName || '>' IN coalesce(p.Tags, '')) > 0
+LEFT JOIN (
+    SELECT 
+        OwnerUserId,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY Score) AS median_score,
+        avg(Score) AS avg_post_score,
+        max(Score) AS max_post_score,
+        min(Score) AS min_post_score
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL AND PostTypeId IN (1,2)
+    GROUP BY OwnerUserId
+) ps ON ps.OwnerUserId = u.Id
+LEFT JOIN UserActivityRanking uar ON u.Id = uar.Id
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.Location, u.Views, 
+    ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, 
+    us.TotalQuestions, us.TotalAnswers, us.AvgQuestionScore, us.AvgAnswerScore, us.MaxQuestionScore, us.MaxAnswerScore,
+    ps.median_score, ps.avg_post_score, ps.max_post_score, ps.min_post_score, uar.RankByReputation
+HAVING count(DISTINCT ph.Id) >= 1
+ORDER BY u.Reputation DESC, GoldBadges DESC, us.TotalAnswers DESC
+LIMIT 100;

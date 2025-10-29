@@ -1,0 +1,179 @@
+-- {"query": "2421.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1501} 
+with RecursiveUserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class,
+        count(*) as BadgeCount
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName, b.Class
+
+    union all
+
+    select
+        r.UserId,
+        r.DisplayName,
+        case when r.Class is null then 3 else r.Class + 1 end,
+        0
+    from RecursiveUserBadgeCounts r
+    where r.Class < 3
+),
+FilteredPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId,
+        p.ParentId
+    from Posts p
+    where p.PostTypeId in (1, 2) -- Questions or Answers
+      and p.CreationDate >= cast('2024-10-01' as date) - interval '365 days'
+),
+PostVotesAgg as (
+    select
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        count(distinct v.UserId) as UniqueVoters
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+CommentsWithUser as (
+    select 
+        c.PostId,
+        count(*) as CommentCount,
+        count(distinct c.UserId) as DistinctCommenters,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ' order by c.CreationDate desc) as RecentCommenters
+    from Comments c
+    where c.CreationDate > cast('2024-10-01' as date) - interval '180 days'
+    group by c.PostId
+),
+-- Latest Edit info per Post
+LatestEditAgg as (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as LastEditDate,
+        ph.UserId as LastEditorUserId,
+        ph.UserDisplayName as LastEditorName
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6) -- title/body/tags edits
+    group by ph.PostId, ph.UserId, ph.UserDisplayName
+),
+QuestionsWithAcceptedAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        q.AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AcceptedAnswerOwner,
+        pva.UpVotes as AcceptedAnswerUpVotes,
+        pva.DownVotes as AcceptedAnswerDownVotes
+    from FilteredPosts q
+    left join FilteredPosts a on q.AcceptedAnswerId = a.Id and a.PostTypeId = 2
+    left join PostVotesAgg pva on a.Id = pva.PostId
+    where q.PostTypeId = 1
+),
+UserReputationWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        rank() over (order by u.Reputation desc) as ReputationRank,
+        ntile(5) over (order by u.Reputation desc) as ReputationQuintile
+    from Users u
+),
+PostLinkDuplicates as (
+    select
+        pl.PostId,
+        count(case when lt.Name = 'Duplicate' then 1 end) as DuplicateLinksCount,
+        count(*) as TotalLinksCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+ComplexUserPostMetrics as (
+    select
+        u.Id as UserId,
+        coalesce(count(distinct p.Id),0) as TotalPosts,
+        coalesce(sum(case when p.PostTypeId = 1 then 1 else 0 end),0) as Questions,
+        coalesce(sum(case when p.PostTypeId = 2 then 1 else 0 end),0) as Answers,
+        avg(coalesce(p.Score,0)) as AvgScorePerPost,
+        coalesce(sum(p.ViewCount), 0) as TotalViewsOnPosts
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+    group by u.Id
+),
+FinalRanking as (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.TotalPosts,
+        u.Questions,
+        u.Answers,
+        u.AvgScorePerPost,
+        u.TotalViewsOnPosts,
+        ur.Reputation,
+        ur.ReputationRank,
+        ur.ReputationQuintile,
+        coalesce(rub.BadgeCountGold, 0) as GoldBadges,
+        coalesce(rub.BadgeCountSilver, 0) as SilverBadges,
+        coalesce(rub.BadgeCountBronze, 0) as BronzeBadges
+    from ComplexUserPostMetrics u
+    join UserReputationWindow ur on ur.UserId = u.UserId
+    left join (
+        select 
+            UserId,
+            sum(case when Class=1 then BadgeCount else 0 end) as BadgeCountGold,
+            sum(case when Class=2 then BadgeCount else 0 end) as BadgeCountSilver,
+            sum(case when Class=3 then BadgeCount else 0 end) as BadgeCountBronze
+        from RecursiveUserBadgeCounts
+        group by UserId
+    ) rub on rub.UserId = u.UserId
+)
+select 
+    fr.UserId,
+    fr.DisplayName,
+    fr.Reputation,
+    fr.ReputationRank,
+    fr.ReputationQuintile,
+    fr.TotalPosts,
+    fr.Questions,
+    fr.Answers,
+    fr.AvgScorePerPost,
+    fr.TotalViewsOnPosts,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    pq.Title as SampleQuestionTitle,
+    pq.Score as SampleQuestionScore,
+    pq.ViewCount as SampleQuestionViews,
+    coalesce(pl.DuplicateLinksCount, 0) as DuplicateLinksOnSampleQuestion,
+    cwr.CommentCount as SampleQuestionCommentCount,
+    cwr.DistinctCommenters as SampleQuestionDistinctCommenters,
+    cwr.RecentCommenters as SampleQuestionRecentCommenters
+from FinalRanking fr
+left join (
+    select distinct on (OwnerUserId) Id, Title, Score, ViewCount, OwnerUserId
+    from Posts
+    where PostTypeId = 1 -- questions only
+    order by OwnerUserId, Score desc, ViewCount desc, Id
+) pq on pq.OwnerUserId = fr.UserId
+left join PostLinkDuplicates pl on pl.PostId = pq.Id
+left join CommentsWithUser cwr on cwr.PostId = pq.Id
+where fr.TotalPosts > 10
+order by fr.ReputationRank
+limit 100;

@@ -1,0 +1,189 @@
+-- {"query": "1197.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3009} 
+
+WITH UserEngagement AS (
+    -- Summarizes user activity, reputation tiers, and creation month ranks.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT q.Id) AS TotalQuestions,
+        COUNT(DISTINCT a.Id) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score ELSE NULL END) AS AvgPostScore,
+        MAX(GREATEST(COALESCE(p.LastActivityDate, '1900-01-01'), COALESCE(c.CreationDate, '1900-01-01'))) AS LastInteractionDate,
+        DATE_PART('day', NOW() - u.LastAccessDate) AS DaysSinceLastAccess,
+        NTILE(4) OVER (ORDER BY u.Reputation DESC) AS ReputationQuartile,
+        ROW_NUMBER() OVER (PARTITION BY DATE_TRUNC('month', u.CreationDate) ORDER BY u.Reputation DESC) AS RankByReputationInCreationMonth
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Posts q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostHistoricalContext AS (
+    -- Aggregates post history details like close dates, edit counts, and close reasons.
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS CloseDateFromHistory,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id ELSE NULL END) AS EditHistoryCount,
+        STRING_AGG(DISTINCT crt.Name, '; ' ORDER BY crt.Name) FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL AND TRY_CAST(ph.Comment AS SMALLINT) IS NOT NULL) AS CloseReasons
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND TRY_CAST(ph.Comment AS SMALLINT) = crt.Id -- Attempt to cast comment to CloseReasonId
+    GROUP BY ph.PostId
+),
+PostTagStats AS (
+    -- Extracts and processes tags for posts, identifying relevant tags.
+    SELECT
+        p.Id AS PostId,
+        ARRAY_LENGTH(string_to_array(SUBSTRING(COALESCE(p.Tags, '><'), 2, LENGTH(COALESCE(p.Tags, '><')) - 2), '><'), 1) AS TagCount,
+        CASE
+            WHEN p.Tags LIKE '%<sql>%' OR p.Tags LIKE '%<database>%' OR p.Tags LIKE '%<performance>%' THEN TRUE
+            ELSE FALSE
+        END AS HasRelevantTag,
+        TRIM(UNNEST(string_to_array(SUBSTRING(COALESCE(p.Tags, '><'), 2, LENGTH(COALESCE(p.Tags, '><')) - 2), '><'))) AS TagName
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+TagPopularity AS (
+    -- Calculates popularity and average score for tags.
+    SELECT
+        TagName,
+        COUNT(DISTINCT PostId) AS PostsWithTagCount,
+        AVG(p.Score) AS AvgScoreForTag,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueUsersWithTag
+    FROM PostTagStats pts
+    INNER JOIN Posts p ON pts.PostId = p.Id
+    GROUP BY TagName
+    HAVING COUNT(DISTINCT PostId) > 50 -- Filter for reasonably popular tags
+),
+CommentActivity AS (
+    -- Ranks comments per post to easily retrieve the latest one.
+    SELECT
+        c.PostId,
+        c.Id AS CommentId,
+        c.Text AS CommentText,
+        c.CreationDate AS CommentCreationDate,
+        c.Score AS CommentScore,
+        c.UserId AS CommenterId,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC) AS rn
+    FROM Comments c
+)
+SELECT
+    'Question' AS PostRecordType,
+    ue.UserId,
+    ue.DisplayName AS UserDisplayName,
+    ue.Reputation,
+    ue.ReputationQuartile,
+    p.Id AS PostId,
+    pt.Name AS PostTypeName,
+    p.Title AS PostTitle,
+    p.Score AS PostScore,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CreationDate AS PostCreationDate,
+    p.LastEditDate,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    p_acc_ans.Score AS AcceptedAnswerScore,
+    COALESCE(u_acc_ans.DisplayName, 'Community') AS AcceptedAnswerOwnerDisplayName,
+    phc.CloseDateFromHistory,
+    phc.EditHistoryCount,
+    phc.CloseReasons,
+    pts.TagCount,
+    pts.HasRelevantTag,
+    tp.PostsWithTagCount AS CurrentTagPopularityCount,
+    tp.AvgScoreForTag AS CurrentTagAvgScore,
+    (SELECT ca_sub.CommentText FROM CommentActivity ca_sub WHERE ca_sub.PostId = p.Id AND ca_sub.rn = 1) AS LatestCommentText,
+    (SELECT ca_sub.CommentCreationDate FROM CommentActivity ca_sub WHERE ca_sub.PostId = p.Id AND ca_sub.rn = 1) AS LatestCommentDate,
+    COALESCE(NULLIF(p.Score, 0) * (p.ViewCount + 1), 0) AS EngagementMetric, -- Complex calculation, avoids division by zero
+    DATE_PART('day', NOW() - p.CreationDate) AS PostAgeDays,
+    NULLIF(LENGTH(p.Body), 0) AS PostBodyLength,
+    STRING_AGG(DISTINCT b.Name, '; ' ORDER BY b.Name) AS UserBadges,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY ue.UserId) AS TotalUpvotesReceivedByOwner,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY ue.UserId) AS TotalDownvotesReceivedByOwner,
+    ROW_NUMBER() OVER (PARTITION BY ue.UserId ORDER BY p.Score DESC, p.CreationDate DESC) AS UserPostScoreRank
+FROM Users u
+INNER JOIN UserEngagement ue ON u.Id = ue.UserId
+INNER JOIN Posts p ON u.Id = p.OwnerUserId
+INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN Posts p_acc_ans ON p.AcceptedAnswerId = p_acc_ans.Id
+LEFT JOIN Users u_acc_ans ON p_acc_ans.OwnerUserId = u_acc_ans.Id
+LEFT JOIN PostHistoricalContext phc ON p.Id = phc.PostId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN PostTagStats pts ON p.Id = pts.PostId
+LEFT JOIN TagPopularity tp ON pts.TagName = tp.TagName
+LEFT JOIN Votes v ON p.Id = v.PostId AND v.UserId = ue.UserId -- Votes given by the post owner
+WHERE p.PostTypeId = 1 -- Only questions for this part
+  AND p.CreationDate >= NOW() - INTERVAL '3 years'
+GROUP BY
+    ue.UserId, ue.DisplayName, ue.Reputation, ue.ReputationQuartile, p.Id, pt.Name, p.Title, p.Score,
+    p.ViewCount, p.AnswerCount, p.CreationDate, p.LastEditDate, p.LastActivityDate, p.AcceptedAnswerId,
+    p_acc_ans.Score, u_acc_ans.DisplayName, phc.CloseDateFromHistory, phc.EditHistoryCount, phc.CloseReasons,
+    pts.TagCount, pts.HasRelevantTag, tp.PostsWithTagCount, tp.AvgScoreForTag, p.Body
+HAVING ue.Reputation >= 100 -- Only users with some reputation
+  AND p.Score > 0 -- Only questions with positive score
+  AND (pts.HasRelevantTag IS TRUE OR p.ViewCount > 50) -- Either has a relevant tag or good view count
+
+UNION ALL
+
+SELECT
+    'Answer' AS PostRecordType,
+    ue.UserId,
+    ue.DisplayName AS UserDisplayName,
+    ue.Reputation,
+    ue.ReputationQuartile,
+    p.Id AS PostId,
+    pt.Name AS PostTypeName,
+    p_parent.Title AS PostTitle, -- Title of the parent question
+    p.Score AS PostScore,
+    NULL AS ViewCount, -- Answers don't have direct view counts
+    NULL AS AnswerCount,
+    p.CreationDate AS PostCreationDate,
+    p.LastEditDate,
+    p.LastActivityDate,
+    NULL AS AcceptedAnswerId,
+    NULL AS AcceptedAnswerScore,
+    NULL AS AcceptedAnswerOwnerDisplayName,
+    phc.CloseDateFromHistory,
+    phc.EditHistoryCount,
+    phc.CloseReasons,
+    pts.TagCount,
+    pts.HasRelevantTag,
+    tp.PostsWithTagCount AS CurrentTagPopularityCount,
+    tp.AvgScoreForTag AS CurrentTagAvgScore,
+    (SELECT ca_sub.CommentText FROM CommentActivity ca_sub WHERE ca_sub.PostId = p.Id AND ca_sub.rn = 1) AS LatestCommentText,
+    (SELECT ca_sub.CommentCreationDate FROM CommentActivity ca_sub WHERE ca_sub.PostId = p.Id AND ca_sub.rn = 1) AS LatestCommentDate,
+    COALESCE(NULLIF(p.Score, 0) * (NULLIF(LENGTH(p.Body), 0) / 100.0), 0) AS EngagementMetric, -- Different metric for answers
+    DATE_PART('day', NOW() - p.CreationDate) AS PostAgeDays,
+    NULLIF(LENGTH(p.Body), 0) AS PostBodyLength,
+    STRING_AGG(DISTINCT b.Name, '; ' ORDER BY b.Name) AS UserBadges,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY ue.UserId) AS TotalUpvotesReceivedByOwner,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY ue.UserId) AS TotalDownvotesReceivedByOwner,
+    ROW_NUMBER() OVER (PARTITION BY ue.UserId ORDER BY p.Score DESC, p.CreationDate DESC) AS UserPostScoreRank
+FROM Users u
+INNER JOIN UserEngagement ue ON u.Id = ue.UserId
+INNER JOIN Posts p ON u.Id = p.OwnerUserId
+INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+INNER JOIN Posts p_parent ON p.ParentId = p_parent.Id -- Answers must have a parent question
+LEFT JOIN PostHistoricalContext phc ON p.Id = phc.PostId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN PostTagStats pts ON p_parent.Id = pts.PostId -- Tags from the parent question
+LEFT JOIN TagPopularity tp ON pts.TagName = tp.TagName
+LEFT JOIN Votes v ON p.Id = v.PostId AND v.UserId = ue.UserId -- Votes given by the post owner
+WHERE p.PostTypeId = 2 -- Only answers for this part
+  AND p.CreationDate >= NOW() - INTERVAL '3 years'
+  AND p.Score >= 5 -- Only answers with a decent score
+GROUP BY
+    ue.UserId, ue.DisplayName, ue.Reputation, ue.ReputationQuartile, p.Id, pt.Name, p_parent.Title, p.Score,
+    p.CreationDate, p.LastEditDate, p.LastActivityDate, phc.CloseDateFromHistory, phc.EditHistoryCount, phc.CloseReasons,
+    pts.TagCount, pts.HasRelevantTag, tp.PostsWithTagCount, tp.AvgScoreForTag, p.Body
+HAVING ue.TotalAnswers > 0
+ORDER BY Reputation DESC, PostScore DESC
+LIMIT 50000;

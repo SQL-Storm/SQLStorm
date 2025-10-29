@@ -1,0 +1,174 @@
+-- {"query": "7544.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1850} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) = 0 THEN 'NoPosts'
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'HighActivity'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'MediumActivity'
+            ELSE 'LowActivity'
+        END AS ActivityLevel,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') AS PostTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.ParentId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'QuestionWithAcceptedAnswer'
+            WHEN p.PostTypeId = 1 THEN 'QuestionWithoutAcceptedAnswer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.ViewCount, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextViewCount,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScorePerUser,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'AboveAverage'
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 0.5 THEN 'BelowAverageButNotPoor'
+            ELSE 'Poor'
+        END AS ScoreLevel,
+        COALESCE(p.Tags, '') AS CleanTags,
+        CASE 
+            WHEN p.Tags IS NULL OR p.Tags = '' THEN 'NoTags'
+            WHEN LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '>', '')) < 3 THEN 'FewTags'
+            WHEN LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '>', '')) > 10 THEN 'ManyTags'
+            ELSE 'NormalTags'
+        END AS TagFrequency,
+        ABS(p.Score - LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)) AS ScoreChange,
+        DATEDIFF(DAY, p.CreationDate, COALESCE(p.LastEditDate, p.CreationDate)) AS DaysSinceLastEdit
+    FROM Posts p
+    WHERE p.CreationDate >= '2010-01-01'
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        COALESCE(p.Title, 'NoExcerpt') AS ExcerptTitle,
+        CASE 
+            WHEN t.Count >= 1000 THEN 'Popular'
+            WHEN t.Count >= 100 THEN 'ModeratelyPopular'
+            WHEN t.Count >= 10 THEN 'LessPopular'
+            ELSE 'Rare'
+        END AS PopularityLevel,
+        RANK() OVER (ORDER BY t.Count DESC) AS PopularityRank
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+),
+CombinedAnalysis AS (
+    SELECT 
+        us.UserId,
+        us.Reputation,
+        us.DisplayName,
+        us.Views,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.Tags,
+        pa.DaysSinceLastEdit,
+        pa.ScoreChange,
+        pa.ScoreLevel,
+        pa.PostCategory,
+        pa.PostRank,
+        pa.ScoreRank,
+        ta.TagId,
+        ta.TagName,
+        ta.PopularityLevel,
+        ta.PopularityRank,
+        CASE 
+            WHEN us.Reputation > 100000 AND pa.PostCount > 500 AND pa.ScoreRank <= 10 THEN 'EliteUserWithHighImpactPosts'
+            WHEN us.Reputation > 50000 AND pa.PostCount > 100 THEN 'ActiveUser'
+            WHEN us.Reputation > 10000 AND pa.PostCount > 50 THEN 'RegularUser'
+            WHEN pa.Score > 100 AND pa.ScoreLevel = 'AboveAverage' THEN 'GoodPoster'
+            ELSE 'RegularContributor'
+        END AS UserPostType,
+        CASE 
+            WHEN pa.Score > 1000 THEN 'HighValue'
+            WHEN pa.Score > 100 THEN 'MediumValue'
+            WHEN pa.Score > 10 THEN 'LowValue'
+            ELSE 'MinimalValue'
+        END AS PostValue,
+        CASE 
+            WHEN pa.Tags IS NULL OR pa.Tags = '' THEN 'NoTags'
+            ELSE 'HasTags'
+        END AS TagStatus,
+        CASE 
+            WHEN pa.DaysSinceLastEdit > 30 THEN 'OldContent'
+            WHEN pa.DaysSinceLastEdit > 7 THEN 'RecentMod'
+            ELSE 'RecentlyUpdated'
+        END AS UpdateStatus,
+        CASE 
+            WHEN pa.Score = 0 THEN 'NoUpvotes'
+            WHEN pa.Score > 50 THEN 'ManyUpvotes'
+            WHEN pa.Score > 10 THEN 'SomeUpvotes'
+            ELSE 'FewUpvotes'
+        END AS VoteStatus,
+        CASE 
+            WHEN pa.PostRank <= 1 THEN 'MostRecent'
+            WHEN pa.PostRank <= 10 THEN 'RecentPosts'
+            ELSE 'OlderPosts'
+        END AS Recency
+    FROM UserStats us
+    INNER JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON pa.Tags LIKE CONCAT('%', ta.TagName, '%')
+    WHERE pa.Score > -100 
+    AND pa.CreationDate >= '2010-01-01'
+)
+SELECT 
+    COUNT(DISTINCT UserId) AS TotalUniqueUsers,
+    COUNT(DISTINCT PostId) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN UserPostType = 'EliteUserWithHighImpactPosts' THEN UserId END) AS EliteUsers,
+    COUNT(DISTINCT CASE WHEN PostValue = 'HighValue' THEN PostId END) AS HighValuePosts,
+    COUNT(DISTINCT CASE WHEN TagStatus = 'HasTags' THEN PostId END) AS PostsWithTags,
+    COUNT(DISTINCT CASE WHEN UpdateStatus = 'RecentlyUpdated' THEN PostId END) AS RecentlyUpdatedPosts,
+    AVG(Reputation) AS AvgReputation,
+    AVG(AvgScorePerUser) AS AvgUserScore,
+    MAX(CASE WHEN ScoreLevel = 'AboveAverage' THEN 1 ELSE 0 END) AS AboveAvgPostsCount,
+    MIN(CASE WHEN VoteStatus = 'NoUpvotes' THEN 1 ELSE 0 END) AS NoUpvotesCount,
+    SUM(CASE WHEN PopularityLevel = 'Popular' THEN 1 ELSE 0 END) AS PopularTags,
+    COUNT(DISTINCT CASE WHEN PostCategory = 'QuestionWithAcceptedAnswer' THEN PostId END) AS QuestionsWithAnswers,
+    COUNT(DISTINCT CASE WHEN ScoreChange > 10 THEN PostId END) AS HighScoreChangePosts,
+    COUNT(DISTINCT AccountId) AS DistinctAccounts,
+    COUNT(DISTINCT CASE WHEN Recency = 'MostRecent' THEN PostId END) AS MostRecentPosts,
+    COUNT(*) AS TotalRecords
+FROM CombinedAnalysis
+HAVING COUNT(*) > 10
+ORDER BY TotalUniqueUsers DESC, TotalPosts DESC
+LIMIT 1000;

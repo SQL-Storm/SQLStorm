@@ -1,0 +1,172 @@
+WITH
+recent_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    array_agg(v.VoteTypeId) AS VoteTypesOnPost,
+    max(v.CreationDate) FILTER (WHERE v.VoteTypeId = 2) AS LastUpVoteDate,
+    count(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVoteCount
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.Id, p.Title, p.OwnerUserId, p.PostTypeId, p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount, p.Tags, p.AcceptedAnswerId, p.ParentId
+),
+tag_subactivity AS (
+  SELECT
+    p.Id AS PostId,
+    t.TagName AS TagName,
+    count(*) AS TagActivity
+  FROM Posts p
+  LEFT JOIN LATERAL (
+    SELECT trim(both ' ' FROM tag) AS tag
+    FROM unnest(string_to_array(p.Tags, '<>')) AS tagname(tag)
+  ) tagvals ON true
+  LEFT JOIN Tags t ON t.TagName = tagvals.tag
+  WHERE p.PostTypeId = 1
+  GROUP BY p.Id, t.TagName
+),
+user_stats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    (SELECT COUNT(*) FROM Posts pr WHERE pr.OwnerUserId = u.Id) AS PostsCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS CommentsCount
+  FROM Users u
+),
+complex_filter AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.OwnerUserId,
+    rp.PostTypeId,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.Score AS PostScore,
+    rp.ViewCount,
+    rp.VoteTypesOnPost AS VoteTypesOnPost,
+    CASE
+      WHEN rp.PostTypeId = 1 THEN rp.Tags
+      ELSE NULL
+    END AS TagsField,
+    CASE
+      WHEN rp.PostTypeId = 1 THEN rp.AcceptedAnswerId
+      ELSE NULL
+    END AS AcceptedAnswerId,
+    CASE
+      WHEN rp.ParentId IS NULL THEN true
+      ELSE false
+    END AS IsRootQuestion
+  FROM recent_activity rp
+  LEFT JOIN LATERAL (
+    SELECT tvt FROM unnest(rp.VoteTypesOnPost) AS t(tvt)
+  ) V ON true
+  WHERE rp.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+    AND rp.Score >= 0
+),
+outer_join_example AS (
+  SELECT
+    cp.PostId,
+    cp.Title,
+    cp.OwnerUserId,
+    cp.PostTypeId,
+    cp.CreationDate,
+    cp.LastActivityDate,
+    cp.PostScore,
+    up.UserId AS UpVoterId,
+    u.DisplayName AS UpVoterName,
+    cl_cn.CountClose AS CloseVotesInPast90,
+    ll.RelatedPostId,
+    ll.LinkType,
+    cp.ViewCount,
+    cp.TagsField,
+    cp.AcceptedAnswerId,
+    cp.IsRootQuestion
+  FROM complex_filter cp
+  LEFT JOIN Votes up ON up.PostId = cp.PostId AND up.VoteTypeId = 2
+  LEFT JOIN Users u ON u.Id = up.UserId
+  LEFT JOIN (
+    SELECT
+      v.PostId,
+      COUNT(*) AS CountClose
+    FROM Votes v
+    WHERE v.VoteTypeId = 6
+    GROUP BY v.PostId
+  ) cl_cn ON cl_cn.PostId = cp.PostId
+  LEFT JOIN PostLinks ll ON ll.PostId = cp.PostId
+  WHERE 1=1
+),
+window_analytic AS (
+  SELECT
+    oje.PostId,
+    oje.Title,
+    oje.OwnerUserId,
+    oje.PostTypeId,
+    oje.CreationDate,
+    oje.LastActivityDate,
+    oje.PostScore,
+    oje.ViewCount,
+    oje.UpVoterId,
+    oje.UpVoterName,
+    oje.CloseVotesInPast90,
+    oje.RelatedPostId,
+    oje.LinkType,
+    oje.TagsField,
+    oje.AcceptedAnswerId,
+    oje.IsRootQuestion,
+    ROW_NUMBER() OVER (PARTITION BY oje.OwnerUserId ORDER BY oje.LastActivityDate DESC) AS rn_by_user,
+    SUM(oje.PostScore) OVER (ORDER BY oje.LastActivityDate ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS rolling_30d_score
+  FROM outer_join_example oje
+)
+SELECT
+  wa.OwnerUserId,
+  wa.Title,
+  wa.PostTypeId,
+  wa.LastActivityDate,
+  wa.PostScore,
+  wa.ViewCount,
+  wa.UpVoterName,
+  wa.CloseVotesInPast90,
+  t.TagName,
+  wa.AcceptedAnswerId,
+  wa.IsRootQuestion,
+  wrolling.rolling_30d_score
+FROM window_analytic wa
+LEFT JOIN tag_subactivity t ON t.PostId = wa.PostId
+LEFT JOIN user_stats us ON us.UserId = wa.OwnerUserId
+LEFT JOIN LATERAL (
+  SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS rolling_30d_score
+  FROM Votes v
+  WHERE v.PostId = wa.PostId
+    AND v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+) wrolling ON true
+GROUP BY
+  wa.OwnerUserId,
+  wa.Title,
+  wa.PostTypeId,
+  wa.LastActivityDate,
+  wa.PostScore,
+  wa.ViewCount,
+  wa.UpVoterName,
+  wa.CloseVotesInPast90,
+  t.TagName,
+  wa.AcceptedAnswerId,
+  wa.IsRootQuestion,
+  wrolling.rolling_30d_score,
+  wa.PostId
+ORDER BY wa.LastActivityDate DESC
+LIMIT 100;

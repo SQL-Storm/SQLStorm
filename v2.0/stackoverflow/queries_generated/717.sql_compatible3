@@ -1,0 +1,382 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'unknown') as website_host,
+        row_number() over (partition by coalesce(u.location, 'unknown') order by u.reputation desc, u.id) as rn_loc
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_badge_agg as (
+    select
+        b.userid,
+        count(*) as badge_count,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+        sum(case when b.tagbased = true then 1 else 0 end) as tag_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+user_post_stats as (
+    select
+        p.owneruserid as user_id,
+        sum(case when p.posttypeid = 1 then 1 else 0 end) as questions,
+        sum(case when p.posttypeid = 2 then 1 else 0 end) as answers,
+        sum(coalesce(p.viewcount, 0)) as total_views,
+        sum(coalesce(p.score, 0)) as total_post_score,
+        max(p.lastactivitydate) as last_post_activity,
+        sum(case when p.closeddate is not null then 1 else 0 end) as closed_posts
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+accepted_answers as (
+    select
+        q.owneruserid as asker_id,
+        a.owneruserid as answerer_id,
+        count(*) as accepted_answers_from_to
+    from posts q
+    join posts a on a.id = q.acceptedanswerid
+    where q.posttypeid = 1 and a.posttypeid = 2
+    group by q.owneruserid, a.owneruserid
+),
+vote_agg as (
+    select
+        p.owneruserid as user_id,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_received,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_received,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites_received,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started_amount,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded_amount
+    from posts p
+    left join votes v on v.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+comment_agg as (
+    select
+        c.userid as user_id,
+        count(*) as comment_count,
+        sum(coalesce(c.score,0)) as comment_score,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    where c.userid is not null
+    group by c.userid
+),
+tag_usage as (
+    select
+        p.owneruserid as user_id,
+        unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tagname
+    from posts p
+    where p.posttypeid = 1 and p.tags is not null and p.owneruserid is not null
+),
+top_tags as (
+    select
+        tu.user_id,
+        tu.tagname,
+        count(*) as tag_count,
+        row_number() over (partition by tu.user_id order by count(*) desc, tu.tagname) as rn_tag
+    from tag_usage tu
+    group by tu.user_id, tu.tagname
+),
+dupe_graph as (
+    select
+        pl.postid,
+        pl.relatedpostid,
+        pl.creationdate,
+        row_number() over (partition by pl.postid order by pl.creationdate desc, pl.id desc) as rn
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+question_quality as (
+    select
+        q.id as question_id,
+        q.owneruserid as user_id,
+        q.creationdate,
+        q.score,
+        q.viewcount,
+        q.answercount,
+        coalesce((select sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) from votes v where v.postid = q.id), 0) as net_votes,
+        exists(select 1 from posthistory ph where ph.postid = q.id and ph.posthistorytypeid in (10,35)) as was_closed_or_migrated,
+        case when q.tags ilike '%<discussion>%' then 1 else 0 end as has_discussion_tag
+    from posts q
+    where q.posttypeid = 1
+),
+activity_windows as (
+    select
+        p.owneruserid as user_id,
+        p.id as post_id,
+        p.posttypeid,
+        p.creationdate,
+        sum(1) over (partition by p.owneruserid order by p.creationdate rows between unbounded preceding and current row) as cumulative_posts,
+        avg(coalesce(p.score,0)) over (partition by p.owneruserid order by p.creationdate rows between 10 preceding and current row) as rolling_avg_score_10,
+        lag(p.creationdate) over (partition by p.owneruserid order by p.creationdate) as prev_post_date,
+        extract(epoch from (p.creationdate - lag(p.creationdate) over (partition by p.owneruserid order by p.creationdate))) / 3600.0 as hours_since_prev
+    from posts p
+    where p.owneruserid is not null
+),
+loc_stats as (
+    select
+        coalesce(nullif(trim(location),''), 'unknown') as location_norm,
+        count(*) as users_in_loc,
+        avg(reputation) as avg_rep_loc,
+        percentile_cont(0.9) within group (order by reputation) as p90_rep_loc
+    from users
+    group by coalesce(nullif(trim(location),''), 'unknown')
+),
+recent_close_events as (
+    select
+        ph.postid,
+        ph.creationdate as closed_at,
+        case
+            when ph.comment ~ '^\s*[0-9]+\s*$' then cast(trim(ph.comment) as integer)
+            else null
+        end as close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid = 10
+),
+posttype_map as (
+    select id, lower(name) as name_l from posttypes
+),
+final_users as (
+    select
+        u.user_id,
+        u.displayname,
+        u.reputation,
+        u.location,
+        u.website_host,
+        uba.badge_count,
+        uba.gold_count,
+        uba.silver_count,
+        uba.bronze_count,
+        ups.questions,
+        ups.answers,
+        ups.total_views,
+        ups.total_post_score,
+        va.upvotes_received,
+        va.downvotes_received,
+        va.favorites_received,
+        va.bounty_started_amount,
+        va.bounty_awarded_amount,
+        ca.comment_count,
+        ca.comment_score,
+        tt.tagname as top_tag1,
+        tt.tag_count as top_tag1_count,
+        aw.cumulative_posts as latest_cumulative_posts,
+        aw.rolling_avg_score_10 as latest_rolling_avg_score_10,
+        aw.hours_since_prev as latest_hours_since_prev,
+        ls.users_in_loc,
+        ls.avg_rep_loc,
+        ls.p90_rep_loc
+    from recent_users u
+    left join user_badge_agg uba on uba.userid = u.user_id
+    left join user_post_stats ups on ups.user_id = u.user_id
+    left join vote_agg va on va.user_id = u.user_id
+    left join comment_agg ca on ca.user_id = u.user_id
+    left join lateral (
+        select tagname, tag_count
+        from top_tags
+        where user_id = u.user_id and rn_tag = 1
+    ) tt on true
+    left join lateral (
+        select aw1.cumulative_posts, aw1.rolling_avg_score_10, aw1.hours_since_prev
+        from activity_windows aw1
+        where aw1.user_id = u.user_id
+        order by aw1.creationdate desc
+        limit 1
+    ) aw on true
+    left join loc_stats ls on ls.location_norm = coalesce(nullif(trim(u.location),''), 'unknown')
+    where u.rn_loc <= 100
+),
+question_rollup as (
+    select
+        qq.user_id,
+        count(*) as q_count,
+        avg(qq.score) as avg_q_score,
+        avg(qq.viewcount) as avg_q_views,
+        sum(case when qq.was_closed_or_migrated then 1 else 0 end) as closed_or_migrated_q,
+        sum(qq.has_discussion_tag) as discussion_tag_q
+    from question_quality qq
+    group by qq.user_id
+),
+dupe_latest as (
+    select
+        d.postid as question_id,
+        d.relatedpostid as marked_duplicate_of_id
+    from dupe_graph d
+    where d.rn = 1
+),
+qa_mix as (
+    select
+        p.owneruserid as user_id,
+        sum(case when pt.name_l = 'question' then 1 else 0 end) as q,
+        sum(case when pt.name_l = 'answer' then 1 else 0 end) as a,
+        case when sum(case when pt.name_l = 'answer' then 1 else 0 end) = 0
+             then null
+             else round(cast(sum(case when pt.name_l = 'question' then 1 else 0 end) as numeric)
+                        / nullif(sum(case when pt.name_l = 'answer' then 1 else 0 end),0), 3)
+        end as q_to_a_ratio
+    from posts p
+    join posttype_map pt on pt.id = p.posttypeid
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+engagement as (
+    select
+        fu.user_id,
+        coalesce(fu.total_post_score,0)
+          + coalesce(fu.upvotes_received,0)*2
+          - coalesce(fu.downvotes_received,0)
+          + coalesce(fu.favorites_received,0) as engagement_score_raw
+    from final_users fu
+),
+normalized as (
+    select
+        e.user_id,
+        e.engagement_score_raw,
+        ntile(10) over (order by e.engagement_score_raw nulls first) as engagement_decile
+    from engagement e
+),
+close_reason_breakdown as (
+    select
+        q.owneruserid as user_id,
+        ph.close_reason_id,
+        count(*) as cnt
+    from posts q
+    join recent_close_events ph on ph.postid = q.id
+    where q.posttypeid = 1 and q.owneruserid is not null
+    group by q.owneruserid, ph.close_reason_id
+),
+favorite_bigrams as (
+    select
+        p.owneruserid as user_id,
+        lower(regexp_replace(coalesce(p.title,''), '[^a-zA-Z0-9 ]', ' ', 'g')) as clean_title
+    from posts p
+    where p.posttypeid = 1 and p.owneruserid is not null and p.title is not null
+),
+favorite_bigrams_expanded as (
+    select
+        fb.user_id,
+        trim(split_part(pair, '::', 1)) as bigram,
+        cast(split_part(pair, '::', 2) as integer) as bigram_pos
+    from favorite_bigrams fb
+    cross join lateral (
+        -- split the title into words and generate bigrams without using generate_subscripts
+        select unnest(
+            case
+                when fb.clean_title is null or fb.clean_title = '' then array['::0']
+                else (
+                    select array_agg(w1 || ' ' || w2 || '::' || pos) from (
+                        select w1, w2, row_number() over () as pos from (
+                            select
+                                words[i] as w1,
+                                words[i+1] as w2,
+                                i
+                            from (
+                                select regexp_split_to_array(fb.clean_title, '\s+') as words
+                            ) wordarr,
+                            generate_series(1, (array_length(wordarr.words,1) - 1)) as i
+                        ) pairs
+                    ) constructed
+                )
+            end
+        ) as pair
+    ) s
+),
+user_bigram_top as (
+    select
+        fbe.user_id,
+        fbe.bigram,
+        count(*) as bigram_cnt,
+        row_number() over (partition by fbe.user_id order by count(*) desc, min(fbe.bigram_pos)) as rn_bg
+    from favorite_bigrams_expanded fbe
+    where fbe.bigram is not null and fbe.bigram <> ' '
+    group by fbe.user_id, fbe.bigram
+),
+final as (
+    select
+        fu.*,
+        qr.q_count,
+        qr.avg_q_score,
+        qr.avg_q_views,
+        qr.closed_or_migrated_q,
+        qr.discussion_tag_q,
+        qa.q_to_a_ratio,
+        n.engagement_decile,
+        coalesce(crb.close_reason_id, -1) as last_close_reason_sample,
+        coalesce(crb.cnt, 0) as last_close_reason_count,
+        ubt.bigram as top_bigram,
+        ubt.bigram_cnt as top_bigram_cnt
+    from final_users fu
+    left join question_rollup qr on qr.user_id = fu.user_id
+    left join qa_mix qa on qa.user_id = fu.user_id
+    left join normalized n on n.user_id = fu.user_id
+    left join lateral (
+        select crb1.close_reason_id, crb1.cnt
+        from close_reason_breakdown crb1
+        where crb1.user_id = fu.user_id
+        order by crb1.cnt desc nulls last, crb1.close_reason_id nulls last
+        limit 1
+    ) crb on true
+    left join lateral (
+        select bigram, bigram_cnt
+        from user_bigram_top
+        where user_id = fu.user_id and rn_bg = 1
+    ) ubt on true
+)
+select
+    f.user_id,
+    f.displayname,
+    f.reputation,
+    f.location,
+    f.website_host,
+    f.badge_count,
+    f.gold_count,
+    f.silver_count,
+    f.bronze_count,
+    f.questions,
+    f.answers,
+    f.q_to_a_ratio,
+    f.total_views,
+    f.total_post_score,
+    f.upvotes_received,
+    f.downvotes_received,
+    f.favorites_received,
+    f.bounty_started_amount,
+    f.bounty_awarded_amount,
+    f.comment_count,
+    f.comment_score,
+    f.top_tag1,
+    f.top_tag1_count,
+    f.latest_cumulative_posts,
+    f.latest_rolling_avg_score_10,
+    f.latest_hours_since_prev,
+    f.q_count,
+    f.avg_q_score,
+    f.avg_q_views,
+    f.closed_or_migrated_q,
+    f.discussion_tag_q,
+    f.engagement_decile,
+    f.last_close_reason_sample,
+    f.last_close_reason_count,
+    f.top_bigram,
+    f.top_bigram_cnt
+from final f
+where
+    coalesce(f.answers,0) + coalesce(f.questions,0) >= 10
+    and (
+        coalesce(f.gold_count,0) > 0
+        or (f.avg_q_score is not null and f.avg_q_score >= 1.0)
+        or (f.engagement_decile >= 8)
+    )
+order by
+    coalesce(f.engagement_decile, 0) desc,
+    coalesce(f.total_post_score, 0) desc,
+    f.user_id
+limit 500;

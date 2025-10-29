@@ -1,0 +1,179 @@
+-- {"query": "2558.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1547} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on array_position(r.Path, t.TagName) is null and t.Count < r.Count
+    where r.Level < 3
+),
+TopUsersWithBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges,
+        row_number() over (order by u.Reputation desc nulls last, u.CreationDate asc) as Rnk
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where u.Reputation >= 1000 and u.Location is not null
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+RecentPopularQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        p.OwnerUserId,
+        array_to_string(array(
+            select unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'))
+            order by 1
+            limit 3), ', ') as Top3Tags
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+      and p.ViewCount > 1000
+),
+UserAnswerStats as (
+    select
+        u.Id as UserId,
+        count(pa.Id) as AnswerCount,
+        avg(pa.Score) as AvgAnswerScore,
+        max(pa.Score) as MaxAnswerScore
+    from Users u
+    left join Posts pa on pa.OwnerUserId = u.Id and pa.PostTypeId = 2
+    group by u.Id
+),
+AnswersWithRanks as (
+    select
+        a.Id,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as ScoreRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+QuestionWithCloseInfo as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        coalesce(qcr.CloseReasonName, 'Open') as CloseReason,
+        coalesce(qcr.CloseCount, 0) as CloseVotes
+    from Posts p
+    left join (
+        select PostId, CloseReasonName, max(CloseCount) as CloseCount
+        from QuestionCloseReasons
+        group by PostId, CloseReasonName
+    ) qcr on qcr.PostId = p.Id
+    where p.PostTypeId = 1
+)
+select
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate as UserCreated,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.TagBasedBadges,
+    a.AnswerCount,
+    round(a.AvgAnswerScore::numeric, 2) as AvgAnswerScore,
+    a.MaxAnswerScore,
+    q.Id as QuestionId,
+    q.Title,
+    q.Top3Tags,
+    q.CreationDate as QuestionCreated,
+    q.ViewCount,
+    q.Score as QuestionScore,
+    qci.CloseReason,
+    qci.CloseVotes,
+    r.Score as AnswerScore,
+    r.CreationDate as AnswerCreated,
+    r.ScoreRank,
+    array_to_string(rt.Path, ' > ') as TagHierarchyPath,
+    case
+        when u.Location is null then 'Unknown'
+        when upper(u.Location) similar to '%(USA|US|UNITED STATES)%' then 'US'
+        else 'Other'
+    end as UserRegion,
+    -- Complex calculated field summing scores with conditional logic and null-safe math
+    coalesce(q.Score,0) + coalesce(r.Score,0) * case when a.AnswerCount > 0 then ln(a.AnswerCount + 1) else 1 end / nullif(u.Reputation,0) as PerformanceIndex
+from TopUsersWithBadges u
+join UserAnswerStats a on a.UserId = u.UserId
+join RecentPopularQuestions q on q.OwnerUserId = u.UserId
+left join AnswersWithRanks r on r.QuestionId = q.Id and r.OwnerUserId = u.UserId and r.ScoreRank = 1
+left join RecursiveTagHierarchy rt on rt.TagName = (select unnest(string_to_array(substring(q.Tags from 2 for length(q.Tags)-2), '><')) order by 1 limit 1)
+left join QuestionWithCloseInfo qci on qci.Id = q.Id
+where u.Rnk <= 100
+  and (r.CreationDate >= q.CreationDate or r.CreationDate is null)
+  and (qci.CloseVotes < 5 or qci.CloseVotes is null)
+union
+select
+    u2.DisplayName,
+    u2.Reputation,
+    u2.CreationDate,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    0 as TagBasedBadges,
+    0 as AnswerCount,
+    null as AvgAnswerScore,
+    null as MaxAnswerScore,
+    null as QuestionId,
+    null as Title,
+    null as Top3Tags,
+    null as QuestionCreated,
+    0 as ViewCount,
+    0 as QuestionScore,
+    'No Questions' as CloseReason,
+    0 as CloseVotes,
+    null as AnswerScore,
+    null as AnswerCreated,
+    null as ScoreRank,
+    null as TagHierarchyPath,
+    case
+        when u2.Location is null then 'Unknown'
+        when upper(u2.Location) similar to '%(USA|US|UNITED STATES)%' then 'US'
+        else 'Other'
+    end as UserRegion,
+    0 as PerformanceIndex
+from Users u2
+where u2.Reputation >= 1000
+  and not exists (
+    select 1 from Posts p2 where p2.PostTypeId = 1 and p2.OwnerUserId = u2.Id
+  )
+order by PerformanceIndex desc nulls last, Reputation desc
+limit 50;

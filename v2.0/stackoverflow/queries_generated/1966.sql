@@ -1,0 +1,184 @@
+-- {"query": "1966.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2678} 
+
+WITH UserEngagementSummary AS (
+    -- CTE 1: Aggregates core user engagement metrics, including post counts, comment counts, and various vote statistics.
+    -- It uses LEFT JOINs to ensure all users are included, even if they have no associated posts, comments, or votes.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScoreReceived,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScoreReceived,
+        COUNT(DISTINCT PV.Id) AS UpvotesReceivedOnPosts,
+        COUNT(DISTINCT DV.Id) AS DownvotesReceivedOnPosts,
+        COUNT(DISTINCT UV.Id) AS UpvotesGivenBySelf,
+        COUNT(DISTINCT DDV.Id) AS DownvotesGivenBySelf,
+        MAX(P.LastActivityDate) AS LatestPostActivity,
+        MAX(C.CreationDate) AS LatestCommentActivity,
+        -- Calculates the average score for posts owned by the user, handling cases with no posts.
+        AVG(CASE WHEN P.Id IS NOT NULL THEN P.Score ELSE NULL END) AS AvgPostScore,
+        -- Complex string operation: Extracts and counts unique tags from user's questions using string_to_array and UNNEST.
+        COUNT(DISTINCT TagsArray.Tag) AS UniqueQuestionTagsUsed
+    FROM
+        Users AS U
+    LEFT JOIN
+        Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments AS C ON U.Id = C.UserId
+    LEFT JOIN
+        Votes AS PV ON P.Id = PV.PostId AND PV.VoteTypeId = 2 -- Upvotes on user's posts
+    LEFT JOIN
+        Votes AS DV ON P.Id = DV.PostId AND DV.VoteTypeId = 3 -- Downvotes on user's posts
+    LEFT JOIN
+        Votes AS UV ON U.Id = UV.UserId AND UV.VoteTypeId = 2 -- Upvotes given by the user
+    LEFT JOIN
+        Votes AS DDV ON U.Id = DDV.UserId AND DDV.VoteTypeId = 3 -- Downvotes given by the user
+    LEFT JOIN LATERAL (
+        -- Lateral join to process tags, only for questions (PostTypeId = 1) that have tags.
+        SELECT UNNEST(string_to_array(SUBSTRING(P_tags.Tags FROM 2 FOR LENGTH(P_tags.Tags)-2), '><')) AS Tag
+        FROM Posts AS P_tags
+        WHERE P_tags.OwnerUserId = U.Id
+          AND P_tags.PostTypeId = 1
+          AND P_tags.Tags IS NOT NULL
+    ) AS TagsArray ON TRUE
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostHistoricalMetrics AS (
+    -- CTE 2: Analyzes post historical data, focusing on edits, closed/reopened events, and assigns a rank using a window function.
+    SELECT
+        PH.PostId,
+        P.OwnerUserId,
+        COUNT(DISTINCT PH.Id) AS TotalRevisions,
+        MAX(PH.CreationDate) AS LastEditDate,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS MajorContentEdits, -- Title, Body, Tags edits
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS TimesClosed,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS TimesReopened,
+        -- Window function: Ranks posts by the number of revisions within each owner's set of posts.
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY COUNT(DISTINCT PH.Id) DESC, MAX(PH.CreationDate) DESC) AS PostRevisionRankByOwner
+    FROM
+        PostHistory AS PH
+    JOIN
+        Posts AS P ON PH.PostId = P.Id
+    GROUP BY
+        PH.PostId, P.OwnerUserId
+),
+BadgeProgression AS (
+    -- CTE 3: Tracks user badge acquisition, calculating the time difference between consecutive badges using a window function (LAG).
+    SELECT
+        B.UserId,
+        B.Name AS BadgeName,
+        B.Date AS BadgeDate,
+        B.Class,
+        -- Window function: Calculates the difference in days since the user's previous badge acquisition.
+        -- Uses EXTRACT(EPOCH) for precise time difference.
+        EXTRACT(EPOCH FROM (B.Date - LAG(B.Date, 1, B.Date) OVER (PARTITION BY B.UserId ORDER BY B.Date))) / 86400.0 AS DaysSinceLastBadge,
+        -- Window function: Ranks badges for each user by acquisition date, to easily pick the latest one.
+        ROW_NUMBER() OVER (PARTITION BY B.UserId ORDER BY B.Date DESC) AS LatestBadgeRank
+    FROM
+        Badges AS B
+),
+HighEngagementUsers AS (
+    -- CTE 4: Identifies users who have actively commented AND voted on questions, using an INTERSECT set operator.
+    SELECT DISTINCT C.UserId
+    FROM Comments AS C
+    JOIN Posts AS P ON C.PostId = P.Id
+    WHERE P.PostTypeId = 1 -- Only questions
+    INTERSECT
+    SELECT DISTINCT V.UserId
+    FROM Votes AS V
+    JOIN Posts AS P ON V.PostId = P.Id
+    WHERE P.PostTypeId = 1 AND V.VoteTypeId IN (2, 3) -- Upvote or Downvote on questions
+),
+EliteContributors AS (
+    -- CTE 5: Finds users who possess at least one Gold badge AND have a high reputation, using an INTERSECT set operator.
+    SELECT DISTINCT UserId FROM Badges WHERE Class = 1 -- Gold badges
+    INTERSECT
+    SELECT Id FROM Users WHERE Reputation > 7500 -- High reputation threshold
+)
+-- Main Query: Combines data from various CTEs, applies complex filtering, and includes correlated subqueries
+-- to identify highly engaged and potentially influential users with diverse activity patterns.
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.QuestionsAsked,
+    UES.AnswersProvided,
+    UES.TotalCommentsMade,
+    UES.TotalPostScoreReceived,
+    PHM.TotalRevisions AS MostRevisedPostTotalEdits,
+    PHM.TimesClosed AS MostRevisedPostTimesClosed,
+    BP.BadgeName AS LatestBadgeAcquired,
+    BP.BadgeDate AS LatestBadgeAcquisitionDate,
+    BP.DaysSinceLastBadge,
+    -- Complicated calculation: A weighted score reflecting overall positive engagement.
+    (UES.UpvotesReceivedOnPosts * 2 + UES.UpvotesGivenBySelf * 0.5 - UES.DownvotesReceivedOnPosts * 1.5) AS OverallEngagementScore,
+    -- String expression and NULL logic: Concatenates user's location and website, replacing NULLs with descriptive strings.
+    COALESCE(U.Location, 'Undisclosed') || ' | ' || COALESCE(U.WebsiteUrl, 'No Website Provided') AS UserLocationAndOnlinePresence,
+    -- Complex calculation: Ratio of answers to questions, handling division by zero with NULL logic (COALESCE).
+    CASE
+        WHEN UES.QuestionsAsked > 0 THEN (UES.AnswersProvided::NUMERIC / UES.QuestionsAsked)
+        ELSE NULL -- No questions asked, so ratio is undefined
+    END AS AnswerToQuestionRatio,
+    -- Correlated Subquery 1: Checks if the user has any question posts that were closed as duplicates.
+    EXISTS (
+        SELECT 1
+        FROM Posts AS P_ClosedDup
+        WHERE P_ClosedDup.OwnerUserId = UES.UserId
+          AND P_ClosedDup.PostTypeId = 1 -- Is a question
+          AND P_ClosedDup.ClosedDate IS NOT NULL -- Was closed
+          AND P_ClosedDup.Id IN (
+                SELECT PL.RelatedPostId -- Check if it's a duplicate of another post
+                FROM PostLinks AS PL
+                WHERE PL.PostId = P_ClosedDup.Id
+                  AND PL.LinkTypeId = 3 -- Duplicate link type
+            )
+    ) AS HasDuplicateClosedQuestion,
+    -- Correlated Subquery 2: Checks if the user has provided any answers that were accepted.
+    EXISTS (
+        SELECT 1
+        FROM Posts AS P_AcceptedAns
+        WHERE P_AcceptedAns.OwnerUserId = UES.UserId
+          AND P_AcceptedAns.PostTypeId = 2 -- Is an answer
+          AND P_AcceptedAns.Id = (
+                SELECT Q_Parent.AcceptedAnswerId -- Check if this answer matches the accepted answer for its parent question
+                FROM Posts AS Q_Parent
+                WHERE Q_Parent.Id = P_AcceptedAns.ParentId
+            )
+    ) AS HasAcceptedAnswer
+FROM
+    UserEngagementSummary AS UES
+LEFT JOIN
+    Users AS U ON UES.UserId = U.Id -- Re-join to original Users table for additional profile info
+LEFT JOIN
+    PostHistoricalMetrics AS PHM ON UES.UserId = PHM.OwnerUserId AND PHM.PostRevisionRankByOwner = 1 -- Get the most revised post details for the user
+LEFT JOIN
+    BadgeProgression AS BP ON UES.UserId = BP.UserId AND BP.LatestBadgeRank = 1 -- Get the latest badge details for the user
+WHERE
+    UES.Reputation > 1500 -- Minimum reputation threshold for significance
+    AND (UES.QuestionsAsked > 3 OR UES.AnswersProvided > 8) -- At least some primary contribution type
+    AND UES.TotalCommentsMade > 5 -- Also active in commenting
+    AND UES.LatestPostActivity IS NOT NULL
+    AND UES.LatestPostActivity >= (NOW() - INTERVAL '18 months') -- Active within the last 1.5 years
+    -- Complicated predicate with NULL logic: Users who either rarely edit their own posts OR their most edited post has been closed multiple times.
+    AND (COALESCE(PHM.MajorContentEdits, 0) < 5 OR PHM.TimesClosed > 1)
+    -- Set Operator Integration: Users must either be "High Engagement" or "Elite Contributors".
+    AND (UES.UserId IN (SELECT UserId FROM HighEngagementUsers)
+         OR UES.UserId IN (SELECT UserId FROM EliteContributors))
+    -- NULL Logic: Filter out users whose latest badge suggests an extremely long gap between badges (if more than one badge exists).
+    AND (BP.DaysSinceLastBadge IS NULL OR BP.DaysSinceLastBadge < 730) -- Max 2 years between badges
+    -- Complicated predicate: Users with a notable ratio of downvotes received vs. total votes on their posts.
+    AND (UES.UpvotesReceivedOnPosts + UES.DownvotesReceivedOnPosts) > 0
+    AND (UES.DownvotesReceivedOnPosts::NUMERIC / (UES.UpvotesReceivedOnPosts + UES.DownvotesReceivedOnPosts)) > 0.15 -- At least 15% of votes are downvotes
+    AND UES.UniqueQuestionTagsUsed >= 3 -- Indicates diverse topic engagement
+ORDER BY
+    OverallEngagementScore DESC,
+    UES.Reputation DESC,
+    UES.LastAccessDate DESC
+LIMIT 50;

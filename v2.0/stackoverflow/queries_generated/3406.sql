@@ -1,0 +1,143 @@
+-- {"query": "3406.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1822} 
+
+/*  Benchmark query: multi‑CTE, window functions, outer joins, correlated subqueries,
+    set operators, string parsing, arithmetic, CASE/NULL logic */
+WITH
+/* Recent activity per user (last 90 days) */
+usr_recent AS (
+    SELECT u.Id                           AS user_id,
+           u.DisplayName,
+           MAX(p.CreationDate)           AS last_post_dt,
+           MAX(c.CreationDate)           AS last_comment_dt,
+           GREATEST(
+               COALESCE(MAX(p.CreationDate), '1970-01-01'::timestamp),
+               COALESCE(MAX(c.CreationDate), '1970-01-01'::timestamp)
+           )                             AS last_activity_dt
+    FROM   Users u
+    LEFT   JOIN Posts p      ON p.OwnerUserId = u.Id
+                               AND p.CreationDate >= CURRENT_DATE - INTERVAL '90 day'
+    LEFT   JOIN Comments c   ON c.UserId = u.Id
+                               AND c.CreationDate >= CURRENT_DATE - INTERVAL '90 day'
+    GROUP  BY u.Id, u.DisplayName
+),
+
+/* Aggregate votes per user (both given and received) */
+usr_votes AS (
+    SELECT u.Id                                               AS user_id,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)  AS up_votes_given,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)  AS down_votes_given,
+           COALESCE(SUM(CASE WHEN p.OwnerUserId = u.Id
+                             AND v.VoteTypeId = 2 THEN 1 END),0) AS up_votes_received,
+           COALESCE(SUM(CASE WHEN p.OwnerUserId = u.Id
+                             AND v.VoteTypeId = 3 THEN 1 END),0) AS down_votes_received
+    FROM   Users u
+    LEFT   JOIN Votes v        ON v.UserId = u.Id
+    LEFT   JOIN Posts p        ON p.Id = v.PostId
+    GROUP  BY u.Id
+),
+
+/* Badge summary per user, pivoted by class */
+usr_badges AS (
+    SELECT b.UserId                                          AS user_id,
+           COUNT(*) FILTER (WHERE b.Class = 1)               AS gold_cnt,
+           COUNT(*) FILTER (WHERE b.Class = 2)               AS silver_cnt,
+           COUNT(*) FILTER (WHERE b.Class = 3)               AS bronze_cnt,
+           COUNT(*)                                          AS total_cnt
+    FROM   Badges b
+    GROUP  BY b.UserId
+),
+
+/* Top 5 tags per user based on answer count, using string parsing */
+usr_top_tags AS (
+    SELECT u.Id                                            AS user_id,
+           tag,
+           cnt,
+           ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY cnt DESC) AS rn
+    FROM   Users u
+    JOIN   LATERAL (
+        SELECT unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS tag
+        FROM   Posts p
+        WHERE  p.OwnerUserId = u.Id
+               AND p.PostTypeId = 2            -- answers only
+    ) tags ON TRUE
+    JOIN   LATERAL (
+        SELECT tag, COUNT(*) AS cnt
+        FROM   Posts p2
+        WHERE  p2.PostTypeId = 2
+               AND p2.OwnerUserId = u.Id
+               AND p2.Tags ILIKE '%'||tags.tag||'%'
+        GROUP  BY tag
+    ) t ON t.tag = tags.tag
+    GROUP  BY u.Id, tag, cnt
+),
+
+/* Recent closed questions with duplicate links (set operator example) */
+closed_dupes AS (
+    SELECT p.Id            AS post_id,
+           p.Title,
+           p.CreationDate,
+           ph.Comment      AS close_reason,
+           pl.RelatedPostId AS duplicate_of
+    FROM   Posts p
+    JOIN   PostHistory ph ON ph.PostId = p.Id
+                           AND ph.PostHistoryTypeId = 10   -- Post Closed
+    JOIN   PostLinks pl   ON pl.PostId = p.Id
+                           AND pl.LinkTypeId = 3          -- Duplicate
+    WHERE  p.PostTypeId = 1                                         -- questions
+    UNION ALL
+    SELECT p.Id, p.Title, p.CreationDate,
+           'No close reason recorded'::text,
+           NULL::int
+    FROM   Posts p
+    LEFT   JOIN PostHistory ph ON ph.PostId = p.Id
+                                AND ph.PostHistoryTypeId = 10
+    LEFT   JOIN PostLinks pl   ON pl.PostId = p.Id
+                                AND pl.LinkTypeId = 3
+    WHERE  p.PostTypeId = 1
+      AND  ph.Id IS NULL
+      AND  pl.Id IS NULL
+)
+
+SELECT
+    u.Id                                    AS user_id,
+    u.DisplayName,
+    COALESCE(ur.last_activity_dt, u.CreationDate)                AS last_activity,
+    uv.up_votes_given,
+    uv.down_votes_given,
+    uv.up_votes_received,
+    uv.down_votes_received,
+    COALESCE(ub.gold_cnt,0)    AS gold_badges,
+    COALESCE(ub.silver_cnt,0)  AS silver_badges,
+    COALESCE(ub.bronze_cnt,0)  AS bronze_badges,
+    COALESCE(ub.total_cnt,0)   AS total_badges,
+    /* Reputation adjusted by recent activity */
+    u.Reputation
+      + (CASE WHEN ur.last_post_dt IS NOT NULL THEN 10 ELSE 0 END)
+      + (CASE WHEN ur.last_comment_dt IS NOT NULL THEN 5 ELSE 0 END)
+      - (uv.down_votes_received * 2)                               AS adjusted_rep,
+    /* Concatenate top 3 tags (if any) */
+    COALESCE(
+        STRING_AGG(tt.tag, ', ') FILTER (WHERE tt.rn <= 3),
+        'No tags'
+    )                                           AS top_tags,
+    /* Flag if user has any gold badge and at least one closed duplicate question */
+    CASE
+        WHEN COALESCE(ub.gold_cnt,0) > 0
+         AND EXISTS (SELECT 1 FROM closed_dupes cd WHERE cd.post_id = ANY (
+                        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.Id))
+        THEN 'VIP'
+        ELSE NULL
+    END                                          AS special_flag
+FROM   Users u
+LEFT   JOIN usr_recent ur      ON ur.user_id = u.Id
+LEFT   JOIN usr_votes uv       ON uv.user_id = u.Id
+LEFT   JOIN usr_badges ub      ON ub.user_id = u.Id
+LEFT   JOIN usr_top_tags tt    ON tt.user_id = u.Id
+GROUP  BY u.Id, u.DisplayName, u.Reputation,
+          ur.last_activity_dt, ur.last_post_dt, ur.last_comment_dt,
+          uv.up_votes_given, uv.down_votes_given,
+          uv.up_votes_received, uv.down_votes_received,
+          ub.gold_cnt, ub.silver_cnt, ub.bronze_cnt, ub.total_cnt,
+          adjusted_rep
+ORDER  BY adjusted_rep DESC
+LIMIT  100;

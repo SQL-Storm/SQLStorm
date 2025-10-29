@@ -1,0 +1,238 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LatestPostDate,
+        CAST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / 86400 AS INTEGER) as AccountAgeDays,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 
+            THEN ROUND(CAST(SUM(p.Score) AS numeric) / CAST(COUNT(DISTINCT p.Id) AS numeric), 2)
+            ELSE 0 
+        END as AvgScorePerPost,
+        CASE 
+            WHEN SUM(p.Score) > 0 
+            THEN ROUND(CAST(COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) AS numeric) / NULLIF(CAST(COUNT(DISTINCT p.Id) AS numeric),0) * 100, 2)
+            ELSE 0 
+        END as UpvotePercentage,
+        RANK() OVER (ORDER BY SUM(p.Score) DESC) as ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY u.CreationDate ASC) as SeniorityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostTypeCategory,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 
+                CASE 
+                    WHEN p.Score > 0 AND p.AnswerCount > 1 THEN 'High Engagement'
+                    WHEN p.Score <= 0 AND p.AnswerCount > 1 THEN 'Low Engagement'
+                    ELSE 'Single Answer'
+                END
+            WHEN p.PostTypeId = 2 AND p.Score > 0 THEN 'Valuable Answer'
+            WHEN p.PostTypeId = 2 AND p.Score <= 0 THEN 'Low Quality Answer'
+            ELSE 'Other'
+        END as PostQuality,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRankPerType,
+        RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate) as ChronologicalRank,
+        CASE WHEN LENGTH(p.Body) = 0 THEN NULL ELSE CAST(LENGTH(p.Body) AS numeric) / NULLIF(CHAR_LENGTH(p.Body), 0) END as BodyDensity,
+        COALESCE((
+            SELECT COUNT(*) 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+        ), 0) as EditCount,
+        COALESCE((
+            SELECT COUNT(*) 
+            FROM Votes v 
+            WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3)
+        ), 0) as VoteCount,
+        COALESCE(
+            (SELECT AVG(Score::numeric) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2), 
+            0
+        ) as AvgAnswerScore,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN 
+                COALESCE(LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '<', '')), 0)
+            ELSE 0 
+        END as TagCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+CombinedAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.Views,
+        uas.UpVotes,
+        uas.DownVotes,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.LatestPostDate,
+        uas.AccountAgeDays,
+        uas.TotalScore,
+        uas.TotalViews,
+        uas.AvgScorePerPost,
+        uas.UpvotePercentage,
+        uas.ScoreRank,
+        uas.ReputationRank,
+        uas.SeniorityRank,
+        pa.PostId,
+        pa.Title,
+        pa.Body,
+        pa.Score as PostScore,
+        pa.ViewCount as PostViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.CreationDate as PostCreationDate,
+        pa.PostTypeId,
+        pa.Tags,
+        pa.PostTypeCategory,
+        pa.PostQuality,
+        pa.ScoreRankPerType,
+        pa.ViewRank,
+        pa.ChronologicalRank,
+        pa.BodyDensity,
+        pa.EditCount,
+        pa.VoteCount,
+        pa.AvgAnswerScore,
+        pa.TagCount,
+        (CASE WHEN pa.AnswerCount > 0 THEN 1 ELSE 0 END) as HasAnswers,
+        CASE WHEN pa.Score > 0 THEN 1 ELSE 0 END as HasPositiveScore,
+        CASE WHEN pa.ViewCount > 1000 THEN 1 ELSE 0 END as HighViewPost,
+        CASE WHEN pa.EditCount > 0 THEN 'Edited' ELSE 'Not Edited' END as EditStatus,
+        CASE 
+            WHEN pa.TagCount > 0 AND pa.TagCount < 3 THEN 'Light Tags'
+            WHEN pa.TagCount >= 3 AND pa.TagCount < 6 THEN 'Medium Tags'
+            WHEN pa.TagCount >= 6 THEN 'Heavy Tags'
+            ELSE 'No Tags'
+        END as TagDensityCategory
+    FROM UserActivityStats uas
+    LEFT JOIN PostAnalysis pa ON uas.UserId = pa.OwnerUserId 
+    WHERE uas.TotalPosts > 0 OR pa.PostId IS NOT NULL
+),
+QualifiedPosts AS (
+    SELECT 
+        ca.*,
+        CASE 
+            WHEN ca.ScoreRank <= 100 AND ca.TotalScore > 1000 THEN 'Top Performer'
+            WHEN ca.TotalScore > 100 AND ca.TotalPosts >= 10 THEN 'Active Contributor'
+            WHEN ca.ReputationRank <= 50 THEN 'High Rep User'
+            WHEN ca.AccountAgeDays > 365 AND ca.TotalPosts > 5 THEN 'Established User'
+            ELSE 'Regular User'
+        END as UserCategory,
+        CASE 
+            WHEN ca.PostQuality IN ('High Engagement', 'Valuable Answer', 'Single Answer') THEN 'Quality Post'
+            WHEN ca.PostQuality IN ('Low Engagement', 'Low Quality Answer') THEN 'Low Quality Post'
+            ELSE 'Other Post'
+        END as PostPerformance,
+        CASE 
+            WHEN ca.PostScore <= 0 THEN 'Negative Score'
+            WHEN ca.PostScore > 0 AND ca.PostScore <= 5 THEN 'Low Positive Score'
+            WHEN ca.PostScore > 5 AND ca.PostScore <= 25 THEN 'Moderate Positive Score'
+            WHEN ca.PostScore > 25 THEN 'High Positive Score'
+            ELSE 'Uncategorized'
+        END as ScoreClassification,
+        CASE 
+            WHEN ca.ViewRank <= 100 THEN 'Popular Post'
+            WHEN ca.PostViewCount > 1000 THEN 'High View Post'
+            WHEN ca.PostViewCount > 100 THEN 'Medium View Post'
+            ELSE 'Low View Post'
+        END as PopularityStatus,
+        CASE 
+            WHEN ca.TagCount >= 3 THEN 'Tagged Post'
+            WHEN ca.TagCount = 0 THEN 'Untagged Post'
+            ELSE 'Lightly Tagged Post'
+        END as TaggingStatus,
+        CAST(
+            CASE 
+                WHEN ca.HasAnswers = 1 THEN 100
+                WHEN ca.HasPositiveScore = 1 THEN 50
+                WHEN ca.HighViewPost = 1 THEN 25
+                ELSE 0
+            END + 
+            CASE 
+                WHEN ca.ScoreClassification IN ('High Positive Score', 'Moderate Positive Score') THEN 20
+                WHEN ca.ScoreClassification = 'Low Positive Score' THEN 10
+                ELSE 0
+            END 
+            AS numeric
+        ) as PerformanceScore
+    FROM CombinedAnalysis ca
+    WHERE (ca.PostId IS NOT NULL OR ca.UserId IS NOT NULL)
+)
+SELECT 
+    qp.UserId,
+    qp.DisplayName,
+    qp.Reputation,
+    qp.TotalPosts,
+    qp.Questions,
+    qp.Answers,
+    qp.TotalScore,
+    qp.AvgScorePerPost,
+    qp.ScoreRank,
+    qp.ReputationRank,
+    qp.PostId,
+    qp.Title,
+    qp.PostScore,
+    qp.PostViewCount,
+    qp.AnswerCount,
+    qp.CommentCount,
+    qp.PostQuality,
+    qp.PostPerformance,
+    qp.UserCategory,
+    qp.TagDensityCategory,
+    qp.PopularityStatus,
+    qp.TaggingStatus,
+    qp.PerformanceScore,
+    RANK() OVER (ORDER BY qp.PerformanceScore DESC) as OverallPerformanceRank,
+    ROW_NUMBER() OVER (ORDER BY qp.PostScore DESC, qp.PostViewCount DESC) as PostPerformanceRank,
+    CASE 
+        WHEN qp.PostId IS NOT NULL AND qp.ScoreRank <= 10 THEN 'Top Ranked Post'
+        WHEN qp.PostId IS NOT NULL AND qp.PostScore IS NOT NULL AND qp.PostScore > 10 THEN 'High Value Post'
+        ELSE 'Standard Post'
+    END as PostStatus
+FROM QualifiedPosts qp
+WHERE qp.UserId IS NOT NULL 
+    AND (qp.PostId IS NOT NULL OR qp.PostScore > 0)
+    AND qp.Reputation > 100
+    AND (qp.ScoreRank <= 100 OR qp.ReputationRank <= 50)
+ORDER BY 
+    CASE WHEN qp.PostId IS NOT NULL THEN 1 ELSE 2 END,
+    qp.PerformanceScore DESC,
+    qp.PostScore DESC;

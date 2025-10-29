@@ -1,0 +1,247 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(p.Score) AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ', ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question without Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeDescription,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS EngagementCount,
+        CAST((CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate) AS INTERVAL) AS AgeInterval, -- for portability keep interval; AgeInDays derived below
+        EXTRACT(DAY FROM CAST((CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate) AS INTERVAL)) + 
+            EXTRACT(EPOCH FROM CAST((CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate) AS INTERVAL))/86400 - 
+            FLOOR(EXTRACT(EPOCH FROM CAST((CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate) AS INTERVAL))/86400) AS AgeInDaysFraction,
+        FLOOR(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate))/86400)::bigint AS AgeInDays,
+        NTILE(10) OVER (ORDER BY p.Score DESC) AS ScoreDecile,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        CASE 
+            WHEN p.Score > LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) THEN 1
+            WHEN p.Score < LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) THEN -1
+            ELSE 0
+        END AS ScoreChangeTrend,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High Viewed'
+            WHEN p.ViewCount > 100 THEN 'Medium Viewed'
+            ELSE 'Low Viewed'
+        END AS ViewCategory,
+        TRIM(BOTH '<>' FROM COALESCE(p.Tags, '')) AS CleanTags,
+        (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2) AS AnswerCountIncludingDeleted
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular Tag'
+            WHEN t.Count > 100 THEN 'Moderate Tag'
+            ELSE 'Rare Tag'
+        END AS TagPopularity,
+        RANK() OVER (ORDER BY t.Count DESC) AS TagRank,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) AS PrevCount,
+        t.Count - LAG(t.Count) OVER (ORDER BY t.Count DESC) AS CountDifference
+    FROM Tags t
+    WHERE t.Count > 0
+),
+AdvancedUserAnalysis AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        (u.UpVotes - u.DownVotes) AS NetVotes,
+        CASE 
+            WHEN u.Reputation > 100000 THEN 'Expert'
+            WHEN u.Reputation > 10000 THEN 'Advanced'
+            WHEN u.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS RepLevel,
+        (SELECT COUNT(*) FROM Badges WHERE UserId = u.Id AND "Class" = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges WHERE UserId = u.Id AND "Class" = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges WHERE UserId = u.Id AND "Class" = 3) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 2) AS AnswerCount
+    FROM Users u
+    WHERE u.Reputation BETWEEN 1000 AND 1000000
+),
+FinalAggregation AS (
+    SELECT 
+        'Post Statistics' AS AnalysisType,
+        COUNT(*) AS TotalRecords,
+        COUNT(DISTINCT pa.OwnerUserId) AS UniqueAuthors,
+        AVG(pa.Score) AS AvgScore,
+        MAX(pa.Score) AS MaxScore,
+        MIN(pa.Score) AS MinScore,
+        COUNT(CASE WHEN pa.Score > 0 THEN 1 END) AS PositiveScoreCount,
+        COUNT(CASE WHEN pa.Score < 0 THEN 1 END) AS NegativeScoreCount,
+        SUM(pa.ViewCount) AS TotalViews,
+        AVG(pa.AnswerCountIncludingDeleted) AS AvgAnswerCount,
+        AVG(pa.EngagementCount) AS AvgEngagement,
+        NULL AS CommentData,
+        NULL AS BadgeData,
+        NULL AS TagData
+    FROM PostAnalysis pa
+    
+    UNION ALL
+    
+    SELECT 
+        'User Statistics' AS AnalysisType,
+        COUNT(*) AS TotalRecords,
+        COUNT(DISTINCT usa.Id) AS UniqueAuthors,
+        AVG(usa.Reputation) AS AvgScore,
+        MAX(usa.Reputation) AS MaxScore,
+        MIN(usa.Reputation) AS MinScore,
+        COUNT(CASE WHEN usa.Reputation > 10000 THEN 1 END) AS PositiveScoreCount,
+        COUNT(CASE WHEN usa.Reputation < 1000 THEN 1 END) AS NegativeScoreCount,
+        SUM(usa.UpVotes) AS TotalViews,
+        SUM(usa.DownVotes) AS AvgAnswerCount,
+        AVG(usa.NetVotes) AS AvgEngagement,
+        SUM(usa.GoldBadges) AS CommentData,
+        NULL AS BadgeData,
+        NULL AS TagData
+    FROM AdvancedUserAnalysis usa
+    
+    UNION ALL
+    
+    SELECT 
+        'Tag Statistics' AS AnalysisType,
+        COUNT(*) AS TotalRecords,
+        NULL AS UniqueAuthors,
+        AVG(ta.Count) AS AvgScore,
+        MAX(ta.Count) AS MaxScore,
+        MIN(ta.Count) AS MinScore,
+        NULL AS PositiveScoreCount,
+        NULL AS NegativeScoreCount,
+        NULL AS TotalViews,
+        NULL AS AvgAnswerCount,
+        NULL AS AvgEngagement,
+        NULL AS CommentData,
+        NULL AS BadgeData,
+        NULL AS TagData
+    FROM TagAnalysis ta
+)
+SELECT 
+    fa.AnalysisType,
+    fa.TotalRecords,
+    fa.UniqueAuthors AS UniqueAuthorsOrUsers,
+    fa.AvgScore AS AvgScoreOrReputation,
+    fa.MaxScore AS MaxScoreOrReputation,
+    fa.MinScore AS MinScoreOrReputation,
+    fa.PositiveScoreCount AS HighReputationUsersOrPositiveScores,
+    fa.NegativeScoreCount AS LowReputationUsersOrNegativeScores,
+    fa.TotalViews AS TotalViewsOrUpVotes,
+    fa.AvgAnswerCount AS AvgAnswerCountOrDownVotes,
+    fa.AvgEngagement AS AvgEngagementOrNetVotes,
+    CASE 
+        WHEN fa.AnalysisType = 'Post Statistics' THEN (
+            SELECT STRING_AGG('Tag: ' || ta.TagName || ' Count: ' || ta.Count::text, '; ')
+            FROM (
+                SELECT TagName, Count
+                FROM TagAnalysis
+                ORDER BY Count DESC
+                LIMIT 5
+            ) ta
+        )
+        WHEN fa.AnalysisType = 'User Statistics' THEN (
+            SELECT STRING_AGG('User: ' || usa.DisplayName || ' Rep: ' || usa.Reputation::text, '; ')
+            FROM (
+                SELECT DisplayName, Reputation
+                FROM AdvancedUserAnalysis
+                ORDER BY Reputation DESC
+                LIMIT 5
+            ) usa
+        )
+        ELSE (
+            SELECT STRING_AGG('Post: ' || pa.Title || ' Score: ' || pa.Score::text, '; ')
+            FROM (
+                SELECT Title, Score
+                FROM PostAnalysis
+                ORDER BY Score DESC
+                LIMIT 5
+            ) pa
+        )
+    END AS TopItems,
+    CASE 
+        WHEN fa.AnalysisType = 'Post Statistics' THEN (
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.OwnerUserId IN (SELECT Id FROM Users WHERE Reputation > 100000)
+        )
+        WHEN fa.AnalysisType = 'User Statistics' THEN (
+            SELECT COUNT(*) 
+            FROM Users u 
+            WHERE u.Id IN (SELECT UserId FROM Badges WHERE "Class" = 1)
+        )
+        ELSE (
+            SELECT COUNT(*) 
+            FROM Tags t 
+            WHERE t.Count > 1000
+        )
+    END AS SpecialCount,
+    COALESCE(
+        (SELECT COUNT(*) FROM UserStats us WHERE us.Reputation > 10000),
+        (SELECT COUNT(*) FROM Posts p WHERE p.Score > 1000),
+        (SELECT COUNT(*) FROM Tags t WHERE t.Count > 1000)
+    ) AS ConditionalCount,
+    (SELECT COUNT(*) FROM Votes v JOIN Posts p ON v.PostId = p.Id WHERE v.VoteTypeId = 2 AND p.Score > 100) AS HighScoreUpvotes,
+    RANK() OVER (ORDER BY fa.TotalRecords DESC) AS CategoryRank,
+    ROW_NUMBER() OVER (ORDER BY fa.AvgScore DESC) AS ScoreRank,
+    NTILE(4) OVER (ORDER BY COALESCE(fa.UniqueAuthors,0)) AS UserPopulationQuartile,
+    CASE 
+        WHEN fa.TotalRecords > (SELECT AVG(TotalRecords) FROM FinalAggregation) THEN 'Above Average'
+        ELSE 'Below Average'
+    END AS PerformanceCategory,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId IN (SELECT Id FROM Posts WHERE Score > 100)) AS HighScorePostHistoryCount,
+    CASE 
+        WHEN fa.AnalysisType = 'Post Statistics' THEN (
+            SELECT STRING_AGG(pa.Title, ', ') 
+            FROM PostAnalysis pa 
+            WHERE pa.Score > (SELECT AVG(Score) FROM PostAnalysis) AND pa.AgeInDays > 30
+        )
+        ELSE NULL
+    END AS QualifiedPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 1 AND p.AnswerCount > 0) AS QuestionWithAnswers,
+    (SELECT AVG(AnswerCountIncludingDeleted) FROM PostAnalysis) AS OverallAvgAnswerDepth,
+    (SELECT COUNT(*) FROM Posts p WHERE p.Score > (SELECT AVG(Score) FROM Posts)) AS AboveAverageScorePosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.ViewCount > (SELECT AVG(ViewCount) FROM Posts)) AS AboveAverageViewPosts
+FROM FinalAggregation fa
+WHERE fa.AnalysisType IN ('Post Statistics', 'User Statistics', 'Tag Statistics')
+    AND fa.TotalRecords > 0
+ORDER BY fa.AnalysisType, fa.TotalRecords DESC, fa.AvgScore DESC;

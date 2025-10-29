@@ -1,0 +1,136 @@
+-- {"query": "4055.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1183} 
+
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      pt.Name AS PostTypeName,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+    FROM Posts AS p
+    JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    WHERE
+      p.Score > 100 AND p.CreationDate > '2023-01-01'
+  ),
+  UserPostActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS NumQuestions,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS NumAnswers,
+      AVG(CAST(p.Score AS FLOAT)) AS AvgPostScore,
+      MAX(p.CreationDate) AS LatestPostDate
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    WHERE
+      u.Reputation > 5000
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  CommentAnalysis AS (
+    SELECT
+      c.PostId,
+      COUNT(c.Id) AS NumComments,
+      SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveComments,
+      AVG(CAST(c.Score AS FLOAT)) AS AvgCommentScore,
+      MAX(c.CreationDate) AS LatestCommentDate
+    FROM Comments AS c
+    WHERE
+      c.CreationDate > '2023-06-01'
+    GROUP BY
+      c.PostId
+  ),
+  PostDetails AS (
+    SELECT
+      p.Id,
+      p.Title,
+      p.Tags,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.AnswerCount = 0 THEN 'No Answers'
+        WHEN p.FavoriteCount > 100 THEN 'Popular'
+        ELSE 'Active'
+      END AS PostStatus,
+      COALESCE(ca.NumComments, 0) AS TotalComments,
+      COALESCE(ca.PositiveComments, 0) AS PosComments
+    FROM Posts AS p
+    LEFT JOIN CommentAnalysis AS ca
+      ON p.Id = ca.PostId
+    WHERE
+      p.PostTypeId = 1 AND p.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+  )
+SELECT
+  pd.Id AS PostID,
+  pd.Title AS PostTitle,
+  pd.PostStatus,
+  upa.DisplayName AS OwnerDisplayName,
+  upa.NumQuestions,
+  upa.NumAnswers,
+  upa.AvgPostScore,
+  pd.Score AS PostScore,
+  pd.TotalComments,
+  pd.PosComments,
+  pd.FavoriteCount,
+  pd.ClosedDate,
+  CASE
+    WHEN pd.OwnerUserId = (
+      SELECT
+        OwnerUserId
+      FROM Posts
+      WHERE
+        Id = pd.Id
+    ) THEN 'Primary Owner'
+    ELSE 'Other'
+  END AS OwnerType,
+  SUBSTRING(pd.Tags, 2, CHARINDEX('>', pd.Tags, 2) - 2) AS FirstTag,
+  CASE
+    WHEN RANK() OVER (ORDER BY pd.Score DESC) <= 10 THEN 'Top 10'
+    WHEN RANK() OVER (ORDER BY pd.Score DESC) BETWEEN 11 AND 50 THEN 'Top 50'
+    ELSE 'Others'
+  END AS ScoreRank,
+  upa.LatestPostDate,
+  pd.PosComments * 1.0 / NULLIF(pd.TotalComments, 0) AS PositiveCommentRatio
+FROM PostDetails AS pd
+JOIN UserPostActivity AS upa
+  ON pd.OwnerUserId = upa.UserId
+WHERE
+  pd.Score > 50 OR pd.TotalComments > 20
+  AND pd.OwnerUserId IS NOT NULL
+UNION
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.PostTypeName AS PostStatus,
+  NULL AS OwnerDisplayName,
+  NULL AS NumQuestions,
+  NULL AS NumAnswers,
+  NULL AS AvgPostScore,
+  rp.Score AS PostScore,
+  NULL AS TotalComments,
+  NULL AS PosComments,
+  NULL AS FavoriteCount,
+  NULL AS ClosedDate,
+  'System/Community' AS OwnerType,
+  NULL AS FirstTag,
+  'Top 1000' AS ScoreRank,
+  rp.CreationDate AS LatestPostDate,
+  NULL AS PositiveCommentRatio
+FROM RankedPosts AS rp
+WHERE
+  rp.rn <= 1000
+ORDER BY
+  PostScore DESC,
+  OwnerDisplayName NULLS FIRST;

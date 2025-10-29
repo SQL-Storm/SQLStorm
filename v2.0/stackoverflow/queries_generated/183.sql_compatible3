@@ -1,0 +1,367 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        coalesce(nullif(trim(split_part(coalesce(u.location,''), ',', 1)), ''), 'Unknown') as country_guess,
+        row_number() over (order by u.creationdate desc, u.id) as rn_desc
+    from users u
+    where u.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from users)
+),
+ranked_posts as (
+    select
+        p.id as post_id,
+        p.posttypeid,
+        p.owneruserid,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.creationdate,
+        p.title,
+        p.tags,
+        dense_rank() over (partition by p.owneruserid order by p.score desc nulls last, p.viewcount desc nulls last, p.id) as score_rank_per_user,
+        row_number() over (partition by p.owneruserid order by p.creationdate desc, p.id desc) as recency_rank_per_user
+    from posts p
+    where p.posttypeid in (1,2)
+),
+user_badge_agg as (
+    select
+        b.userid,
+        count(*) as total_badges,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        max(b.date) as last_badge_date,
+        sum(case when b.tagbased = true then 1 else 0 end) as tag_badges
+    from badges b
+    group by b.userid
+),
+vote_agg as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+        min(v.creationdate) as first_vote_at,
+        max(v.creationdate) as last_vote_at
+    from votes v
+    group by v.postid
+),
+comment_agg as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        max(c.score) as max_comment_score,
+        min(c.creationdate) as first_comment_at,
+        max(c.creationdate) as last_comment_at
+    from comments c
+    group by c.postid
+),
+question_tag_expanded as (
+    select
+        p.id as question_id,
+        unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tag_name
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+      and length(p.tags) > 2
+),
+tag_stats as (
+    select
+        qte.tag_name,
+        count(distinct qte.question_id) as questions_with_tag,
+        sum(coalesce(p.score,0)) as total_score_for_tag
+    from question_tag_expanded qte
+    join posts p on p.id = qte.question_id
+    group by qte.tag_name
+),
+dup_links as (
+    select
+        pl.postid,
+        sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_links,
+        sum(case when pl.linktypeid = 1 then 1 else 0 end) as generic_links
+    from postlinks pl
+    group by pl.postid
+),
+close_events as (
+    select
+        ph.postid,
+        sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as close_votes_events,
+        bool_or(ph.posthistorytypeid = 11) as has_reopen_event,
+        max(case when ph.posthistorytypeid in (10,11) then ph.creationdate else null end) as last_close_or_reopen_at,
+        max(
+            case
+                when ph.posthistorytypeid = 10 then
+                    nullif(regexp_replace(coalesce(ph.comment,''), '[^0-9]', '', 'g'), '')
+                else null
+            end
+        ) as close_reason_raw
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+answers_per_question as (
+    select
+        p.parentid as question_id,
+        count(*) as answers_count,
+        max(p.score) as max_answer_score,
+        max(p.creationdate) as last_answer_at,
+        sum(case when p.score > 0 then 1 else 0 end) as positive_answers
+    from posts p
+    where p.posttypeid = 2
+    group by p.parentid
+),
+user_activity_window as (
+    select
+        p.owneruserid as user_id,
+        p.id as post_id,
+        p.creationdate,
+        sum(case when p.posttypeid = 1 then 1 else 0 end) over (partition by p.owneruserid order by p.creationdate rows between unbounded preceding and current row) as cum_questions,
+        sum(case when p.posttypeid = 2 then 1 else 0 end) over (partition by p.owneruserid order by p.creationdate rows between unbounded preceding and current row) as cum_answers
+    from posts p
+    where p.owneruserid is not null
+),
+user_quality_score as (
+    select
+        rp.owneruserid as user_id,
+        percentile_cont(0.5) within group (order by coalesce(v.upvotes,0) - coalesce(v.downvotes,0)) as median_net_votes,
+        avg(coalesce(v.upvotes,0) - coalesce(v.downvotes,0)) as avg_net_votes,
+        stddev_pop(coalesce(v.upvotes,0) - coalesce(v.downvotes,0)) as stddev_net_votes
+    from ranked_posts rp
+    left join vote_agg v on v.postid = rp.post_id
+    group by rp.owneruserid
+),
+post_activity_buckets as (
+    select
+        p.id as post_id,
+        case
+            when p.viewcount is null then 'unknown'
+            when p.viewcount < 100 then 'low'
+            when p.viewcount < 1000 then 'medium'
+            when p.viewcount < 10000 then 'high'
+            else 'viral'
+        end as view_bucket,
+        case
+            when coalesce(v.upvotes,0) + coalesce(v.downvotes,0) = 0 then 'no_votes'
+            when coalesce(v.downvotes,0) = 0 then 'only_up'
+            when coalesce(v.upvotes,0) = 0 then 'only_down'
+            when coalesce(v.upvotes,0) >= coalesce(v.downvotes,0) then 'more_up'
+            else 'more_down'
+        end as vote_mix
+    from posts p
+    left join vote_agg v on v.postid = p.id
+),
+candidate_posts as (
+    select
+        rp.post_id,
+        rp.owneruserid as user_id,
+        rp.posttypeid,
+        rp.creationdate,
+        rp.score,
+        rp.viewcount,
+        rp.answercount,
+        rp.title,
+        rp.tags,
+        rp.score_rank_per_user,
+        rp.recency_rank_per_user
+    from ranked_posts rp
+    where (rp.posttypeid = 1 and rp.score_rank_per_user <= 5)
+       or (rp.posttypeid = 2 and rp.recency_rank_per_user <= 3)
+),
+normalized_title as (
+    select
+        cp.post_id,
+        lower(regexp_replace(coalesce(cp.title,''), '\s+', ' ', 'g')) as title_norm,
+        length(coalesce(cp.title,'')) as title_len
+    from candidate_posts cp
+),
+user_recent_flag as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.country_guess,
+        case when ru.rn_desc <= 1000 then true else false end as is_recent_top_1k
+    from recent_users ru
+),
+final_scores as (
+    select
+        cp.post_id,
+        cp.user_id,
+        cp.posttypeid,
+        coalesce(va.upvotes,0) as upvotes,
+        coalesce(va.downvotes,0) as downvotes,
+        coalesce(va.favorites,0) as favorites,
+        coalesce(va.bounty_total,0) as bounty_total,
+        coalesce(ca.comment_count,0) as comment_count,
+        coalesce(apq.answers_count, 0) as answers_count,
+        coalesce(apq.max_answer_score, 0) as max_answer_score,
+        coalesce(dl.duplicate_links, 0) as duplicate_links,
+        coalesce(ce.close_votes_events, 0) as close_events,
+        case when coalesce(ce.has_reopen_event, false) then 1 else 0 end as has_reopen,
+        case
+            when coalesce(ce.close_reason_raw, '') ~ '^[0-9]+$' then cast(coalesce(ce.close_reason_raw, '') as integer)
+            else null
+        end as close_reason_id,
+        nt.title_len,
+        pb.view_bucket,
+        pb.vote_mix,
+        (
+            1.0 * coalesce(va.upvotes,0)
+          - 1.5 * coalesce(va.downvotes,0)
+          + 0.2 * coalesce(va.favorites,0)
+          + 0.05 * coalesce(cp.viewcount,0)
+          + 2.0 * coalesce(apq.answers_count, 0)
+          + 0.1 * coalesce(apq.max_answer_score, 0)
+          - 5.0 * coalesce(ce.close_votes_events, 0)
+          - 3.0 * coalesce(dl.duplicate_links, 0)
+          + 0.001 * coalesce(va.bounty_total,0)
+          + case when cp.posttypeid = 1 then 3 else 1 end
+          + case when pb.vote_mix = 'only_up' then 2 when pb.vote_mix = 'more_up' then 1 else 0 end
+          - case when pb.vote_mix = 'only_down' then 3 when pb.vote_mix = 'more_down' then 1 else 0 end
+        ) as composite_post_score
+    from candidate_posts cp
+    left join vote_agg va on va.postid = cp.post_id
+    left join comment_agg ca on ca.postid = cp.post_id
+    left join answers_per_question apq on apq.question_id = case when cp.posttypeid = 1 then cp.post_id else null end
+    left join dup_links dl on dl.postid = cp.post_id
+    left join close_events ce on ce.postid = cp.post_id
+    left join normalized_title nt on nt.post_id = cp.post_id
+    left join post_activity_buckets pb on pb.post_id = cp.post_id
+),
+user_enriched as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.views as user_profile_views,
+        coalesce(uba.total_badges,0) as total_badges,
+        coalesce(uba.gold_badges,0) as gold_badges,
+        coalesce(uba.silver_badges,0) as silver_badges,
+        coalesce(uba.bronze_badges,0) as bronze_badges,
+        uba.last_badge_date,
+        coalesce(uba.tag_badges,0) as tag_badges,
+        coalesce(uqs.median_net_votes,0) as median_net_votes,
+        coalesce(uqs.avg_net_votes,0) as avg_net_votes,
+        coalesce(uqs.stddev_net_votes,0) as stddev_net_votes,
+        urf.is_recent_top_1k,
+        urf.country_guess
+    from users u
+    left join user_badge_agg uba on uba.userid = u.id
+    left join user_quality_score uqs on uqs.user_id = u.id
+    left join user_recent_flag urf on urf.user_id = u.id
+),
+top_tags_per_user as (
+    select
+        rp.owneruserid as user_id,
+        qte.tag_name,
+        count(*) as tag_post_count,
+        row_number() over (partition by rp.owneruserid order by count(*) desc, min(rp.post_id)) as tag_rank
+    from ranked_posts rp
+    join question_tag_expanded qte on qte.question_id = rp.post_id and rp.posttypeid = 1
+    group by rp.owneruserid, qte.tag_name
+),
+user_top3_tags as (
+    select
+        t.user_id,
+        string_agg(t.tag_name, ', ' order by t.tag_rank) as top3_tags
+    from top_tags_per_user t
+    where t.tag_rank <= 3
+    group by t.user_id
+),
+cross_user_similarity as (
+    select
+        ue1.user_id as user_a,
+        ue2.user_id as user_b,
+        case
+            when ue1.user_id = ue2.user_id then 1.0
+            else greatest(0.0,
+                1.0
+                - abs(coalesce(ue1.avg_net_votes,0) - coalesce(ue2.avg_net_votes,0)) / nullif((abs(coalesce(ue1.avg_net_votes,0)) + abs(coalesce(ue2.avg_net_votes,0)) + 1),0)
+                - abs(coalesce(ue1.reputation,0) - coalesce(ue2.reputation,0)) / nullif((abs(coalesce(ue1.reputation,0)) + abs(coalesce(ue2.reputation,0)) + 1),0)
+            )
+        end as similarity_score
+    from user_enriched ue1
+    join user_enriched ue2 on ue1.user_id < ue2.user_id
+),
+best_peer_per_user as (
+    select
+        user_a as user_id,
+        user_b as peer_id,
+        similarity_score,
+        row_number() over (partition by user_a order by similarity_score desc, user_b) as rn
+    from (
+        select user_a, user_b, similarity_score from cross_user_similarity
+        union all
+        select user_b as user_a, user_a as user_b, similarity_score from cross_user_similarity
+    ) x
+),
+final as (
+    select
+        cp.post_id,
+        cp.user_id,
+        ue.displayname,
+        ue.reputation,
+        ue.gold_badges,
+        ue.silver_badges,
+        ue.bronze_badges,
+        ue.median_net_votes,
+        ue.avg_net_votes,
+        ue.stddev_net_votes,
+        ue.is_recent_top_1k,
+        ue.country_guess,
+        coalesce(tt.top3_tags, '(none)') as top3_tags,
+        fs.upvotes,
+        fs.downvotes,
+        fs.favorites,
+        fs.bounty_total,
+        fs.comment_count,
+        fs.answers_count,
+        fs.max_answer_score,
+        fs.duplicate_links,
+        fs.close_events,
+        fs.has_reopen,
+        fs.close_reason_id,
+        fs.title_len,
+        fs.view_bucket,
+        fs.vote_mix,
+        fs.composite_post_score,
+        bp.peer_id as best_peer_user_id,
+        bp.similarity_score as best_peer_similarity
+    from candidate_posts cp
+    left join final_scores fs on fs.post_id = cp.post_id
+    left join user_enriched ue on ue.user_id = cp.user_id
+    left join user_top3_tags tt on tt.user_id = cp.user_id
+    left join best_peer_per_user bp on bp.user_id = cp.user_id and bp.rn = 1
+)
+select
+    f.*,
+    dense_rank() over (order by f.composite_post_score desc, f.upvotes desc, f.post_id) as composite_rank,
+    (
+        select extract(epoch from (min(c.creationdate) - p.creationdate))
+        from comments c
+        join posts p on p.id = f.post_id
+        where c.postid = f.post_id
+    ) as secs_to_first_comment,
+    (
+        select count(*) from (
+            select v.userid as person_id from votes v where v.postid = f.post_id and v.userid is not null
+            union
+            select c.userid as person_id from comments c where c.postid = f.post_id and c.userid is not null
+        ) z
+    ) as unique_engaged_users
+from final f
+where (
+        (f.posttypeid = 1 and f.upvotes - f.downvotes >= 0)
+     or (f.posttypeid = 2 and f.answers_count is not null)
+     or (coalesce(f.close_events,0) > 0 and coalesce(f.has_reopen,0) = 1)
+)
+and coalesce(f.title_len, 0) >= 10
+and (
+    f.country_guess not ilike '%antarctica%'
+    or f.country_guess is null
+)
+order by f.composite_post_score desc, f.upvotes desc, f.post_id
+limit 500;

@@ -1,0 +1,50 @@
+-- {"query": "1388.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 775} 
+WITH UserEngagement AS (
+    -- Summarize core user engagement metrics from various tables.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        (u.UpVotes - u.DownVotes) AS NetVotesGiven,
+        EXTRACT(DAY FROM (u.LastAccessDate - u.CreationDate)) AS DaysSinceCreation,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpvotesGiven, -- UpMod votes given by user
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownvotesGiven -- DownMod votes given by user
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostHistoricalAnalysis AS (
+    -- Analyze post-specific historical metrics including edits, closes, and linked duplicates.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        LENGTH(p.Body) AS BodyLength,
+        COUNT(ph_edit.Id) FILTER (WHERE ph_edit.PostHistoryTypeId IN (4, 5, 6)) AS EditCount, -- Title, Body, Tags edits by any user
+        COUNT(ph_reopen.Id) FILTER (WHERE ph_reopen.PostHistoryTypeId = 11) AS ReopenCount,
+        MAX(ph_close.CreationDate) AS LastCloseDate,
+        MAX(ph_delete.CreationDate) AS LastDeleteDate,
+        (SELECT COUNT(DISTINCT pl.RelatedPostId)
+         FROM PostLinks pl
+         WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3 -- Duplicate links (correlated subquery)
+         AND pl.RelatedPostId IN (SELECT sub_p.Id FROM Posts sub_p WHERE sub_p.OwnerUserId IS NOT NULL)
+        ) AS DuplicateLinkCount,
+        STRING_AGG(DISTINCT crt.Name, ' | ') FILTER (WHERE ph_close.

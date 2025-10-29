@@ -1,0 +1,99 @@
+-- {"query": "5896.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 740} 
+WITH
+RecentActiveQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.AcceptedAnswerId,
+    p.CommentCount,
+    p.FavoriteCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn_owner
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.ClosedDate IS NULL
+),
+TopTags AS (
+  SELECT
+    t.TagName AS Tag,
+    AVG(p.Score) AS AvgQuestionScore,
+    SUM(p.ViewCount) AS TotalViews,
+    COUNT(*) AS QuestionCount
+  FROM Posts p
+  CROSS APPLY (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS t
+  ) AS x
+  JOIN Tags tt ON tt.TagName = x.t
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+  HAVING COUNT(*) >= 5
+),
+CorrelatedActivity AS (
+  SELECT
+    ra.PostId,
+    ra.Title,
+    ra.Tags,
+    ra.CreationDate,
+    ra.LastActivityDate,
+    ra.Score,
+    ra.ViewCount,
+    ru.Reputation AS OwnerReputation,
+    ru.DisplayName AS OwnerDisplayName,
+    CASE
+      WHEN v2.Id IS NOT NULL THEN v2.VoteTypeId
+      ELSE NULL
+    END AS LastVoteType,
+    MAX(CASE WHEN v.VoteTypeId = 2 THEN v.CreationDate END) OVER () AS GlobalLastUpvoteDate
+  FROM RecentActiveQuestions ra
+  LEFT JOIN Users ru ON ra.OwnerUserId = ru.Id
+  LEFT JOIN Votes v ON v.PostId = ra.PostId
+  LEFT JOIN Votes v2 ON v2.PostId = ra.PostId
+  WHERE ra.rn_owner = 1
+),
+AdvancedFiltering AS (
+  SELECT
+    ca.*,
+    CASE
+      WHEN ca.OwnerReputation >= 10000 THEN 'Elite'
+      WHEN ca.OwnerReputation >= 1000 THEN 'Regular'
+      ELSE 'New'
+    END AS OwnerTier,
+    CASE
+      WHEN ca.LastVoteType IN (2,16) THEN 'Active'
+      ELSE 'Dormant'
+    END AS ActivityBucket
+  FROM CorrelatedActivity ca
+  LEFT JOIN PostLinks pl ON pl.PostId = ca.PostId
+  LEFT JOIN LinkTypes lit ON lit.Id = pl.LinkTypeId
+  WHERE ca.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+    OR ca.ViewCount > 1000
+)
+SELECT
+  af.PostId,
+  af.Title,
+  af.Tags,
+  af.CreationDate,
+  af.LastActivityDate,
+  af.Score,
+  af.ViewCount,
+  af.OwnerDisplayName,
+  af.OwnerReputation,
+  af.OwnerTier,
+  af.LastVoteType,
+  af.GlobalLastUpvoteDate,
+  tt.AvgQuestionScore AS TagAvgScore,
+  tt.TotalViews AS TagTotalViews,
+  tt.QuestionCount AS TagQuestionCount,
+  CASE
+    WHEN af.ActivityBucket = 'Active' THEN 1
+    ELSE 0
+  END AS IsHighlyActive
+FROM AdvancedFiltering af
+LEFT JOIN TopTags tt ON af.Title ILIKE '%' || tt.Tag || '%'
+ORDER BY af.LastActivityDate DESC
+LIMIT 100;

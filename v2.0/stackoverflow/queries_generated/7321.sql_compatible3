@@ -1,0 +1,205 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalUserPosts,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'QuestionWithAnswers'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'QuestionNoAnswers'
+            ELSE 'Other'
+        END AS PostTypeCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'HighlyViewed'
+            WHEN p.ViewCount > 100 THEN 'ModeratelyViewed'
+            WHEN p.ViewCount > 10 THEN 'LowViewed'
+            ELSE 'VeryLowViewed'
+        END AS ViewCategory,
+        CAST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / 86400 AS INTEGER) AS DaysSinceCreation
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(SUM(ps.Score), 0) AS TotalScore,
+        COUNT(ps.PostId) AS TotalPosts,
+        AVG(ps.Score) AS AvgPostScore,
+        MAX(ps.CreationDate) AS LastPostDate,
+        COUNT(CASE WHEN ps.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN ps.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        COUNT(CASE WHEN ps.Score > 0 THEN 1 END) AS PositiveScoreCount,
+        COUNT(CASE WHEN ps.Score < 0 THEN 1 END) AS NegativeScoreCount,
+        COALESCE(COUNT(CASE WHEN ps.Score > 10 THEN 1 END), 0) AS HighScorePosts
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopPosts AS (
+    SELECT 
+        ps.PostId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.Title,
+        ps.Tags,
+        ps.PostTypeCategory,
+        ps.ViewCategory,
+        ps.DaysSinceCreation,
+        ps.UserPostRank,
+        ps.TotalUserPosts,
+        ps.AvgUserScore,
+        ROW_NUMBER() OVER (ORDER BY ps.Score DESC) AS GlobalScoreRank,
+        RANK() OVER (PARTITION BY ps.PostTypeId ORDER BY ps.Score DESC) AS TypeSpecificRank,
+        ps.PostTypeId
+    FROM PostStats ps
+    WHERE ps.Score > 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        CASE 
+            WHEN t.Count > 1000 THEN 'ExtremelyPopular'
+            WHEN t.Count > 100 THEN 'VeryPopular'
+            WHEN t.Count > 50 THEN 'Popular'
+            WHEN t.Count > 10 THEN 'Moderate'
+            ELSE 'Rare'
+        END AS PopularityLevel,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS PostsWithTagCount,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS AvgScoreWithTag
+    FROM Tags t
+),
+PostWithRelatedData AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        COALESCE(u.DisplayName, 'Anonymous') AS AuthorName,
+        u.Reputation AS AuthorReputation,
+        u.Views AS AuthorViews,
+        u.UpVotes AS AuthorUpvotes,
+        u.DownVotes AS AuthorDownvotes,
+        tp.GlobalScoreRank,
+        tp.TypeSpecificRank,
+        tp.ViewCategory,
+        tp.PostTypeCategory,
+        tp.DaysSinceCreation,
+        ta.PopularityLevel,
+        ta.AvgScoreWithTag,
+        CASE WHEN MAX(CASE WHEN v.Id IS NOT NULL THEN 1 ELSE 0 END) = 1 THEN 1 ELSE 0 END AS HasVotes,
+        COALESCE(COUNT(b.UserId), 0) AS BadgeCount,
+        CASE 
+            WHEN COUNT(ph.Id) > 0 THEN 'HasHistory'
+            ELSE 'NoHistory'
+        END AS HistoryStatus,
+        COUNT(DISTINCT c.Id) AS CommentCountIncludingDeleted
+    FROM Posts p
+    INNER JOIN PostStats ps ON p.Id = ps.PostId
+    LEFT JOIN TopPosts tp ON p.Id = tp.PostId
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Badges b ON b.UserId = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN TagAnalysis ta ON p.Tags LIKE '%' || ta.TagName || '%'
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY 
+        p.Id, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount,
+        p.CommentCount, p.FavoriteCount, p.CreationDate, p.LastActivityDate,
+        p.Title, p.Tags, p.AcceptedAnswerId, u.DisplayName, u.Reputation,
+        u.Views, u.UpVotes, u.DownVotes, tp.GlobalScoreRank, tp.TypeSpecificRank,
+        tp.ViewCategory, tp.PostTypeCategory, tp.DaysSinceCreation, 
+        ta.PopularityLevel, ta.AvgScoreWithTag
+)
+SELECT 
+    'Query Result Set' AS ResultType,
+    COUNT(*) AS TotalPosts,
+    AVG(Score) AS AvgScore,
+    AVG(ViewCount) AS AvgViews,
+    AVG(AnswerCount) AS AvgAnswerCount,
+    AVG(CommentCount) AS AvgCommentCount,
+    AVG(FavoriteCount) AS AvgFavoriteCount,
+    COUNT(DISTINCT OwnerUserId) AS DistinctAuthors,
+    COUNT(CASE WHEN GlobalScoreRank <= 10 THEN 1 END) AS Top10ScorePosts,
+    COUNT(CASE WHEN TypeSpecificRank <= 5 THEN 1 END) AS Top5TypePosts,
+    COUNT(CASE WHEN ViewCategory = 'HighlyViewed' THEN 1 END) AS HighlyViewedPosts,
+    COUNT(CASE WHEN PostTypeCategory = 'QuestionWithAnswers' THEN 1 END) AS QuestionsWithAnswers,
+    COUNT(CASE WHEN HistoryStatus = 'HasHistory' THEN 1 END) AS PostsWithHistory,
+    AVG(AvgScoreWithTag) AS AvgScoreWithTags,
+    COUNT(CASE WHEN AuthorReputation > 10000 THEN 1 END) AS HighReputationAuthors
+FROM PostWithRelatedData
+WHERE PostTypeId IN (1, 2) AND Score > 10
+GROUP BY 'Query Result Set'
+HAVING COUNT(*) > 0
+UNION ALL
+SELECT 
+    'Aggregated Performance Metrics' AS ResultType,
+    AVG(Reputation) AS TotalPosts,
+    AVG(Views) AS AvgScore,
+    AVG(UpVotes) AS AvgViews,
+    AVG(DownVotes) AS AvgAnswerCount,
+    AVG(DaysSinceCreation) AS AvgCommentCount,
+    0 AS AvgFavoriteCount,
+    COUNT(*) AS DistinctAuthors,
+    COUNT(*) AS Top10ScorePosts,
+    COUNT(*) AS Top5TypePosts,
+    COUNT(*) AS HighlyViewedPosts,
+    COUNT(*) AS QuestionsWithAnswers,
+    COUNT(*) AS PostsWithHistory,
+    AVG(AvgScoreWithTag) AS AvgScoreWithTags,
+    COUNT(*) AS HighReputationAuthors
+FROM UserActivity ua
+WHERE ua.TotalPosts > 0
+UNION ALL
+SELECT 
+    'Tag-Based Statistics' AS ResultType,
+    AVG(TagCount) AS TotalPosts,
+    AVG(PostsWithTagCount) AS AvgScore,
+    AVG(AvgScoreWithTag) AS AvgViews,
+    COUNT(*) AS DistinctAuthors,
+    0 AS Top10ScorePosts,
+    0 AS Top5TypePosts,
+    0 AS HighlyViewedPosts,
+    0 AS QuestionsWithAnswers,
+    0 AS PostsWithHistory,
+    0 AS AvgScoreWithTags,
+    0 AS HighReputationAuthors
+FROM TagAnalysis ta
+WHERE ta.TagCount > 0;

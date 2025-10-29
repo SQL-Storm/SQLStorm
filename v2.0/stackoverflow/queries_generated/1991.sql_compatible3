@@ -1,0 +1,238 @@
+WITH UserActivityMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(SUM(CASE WHEN p.Id IS NOT NULL THEN 1 ELSE 0 END), 0) AS TotalPostsOwned,
+        COALESCE(SUM(CASE WHEN c.Id IS NOT NULL THEN 1 ELSE 0 END), 0) AS TotalCommentsMade,
+        COALESCE(AVG(p.Score), 0.0) AS AvgOwnedPostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalOwnedPostViews,
+        COALESCE(COUNT(DISTINCT ph_edited.PostId), 0) AS PostsEditedCount,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) AS DaysSinceCreation,
+        u.Views AS UserProfileViews
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph_edited ON u.Id = ph_edited.UserId AND ph_edited.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views
+),
+PostDetailedMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount,
+        COALESCE(
+            (CASE
+                WHEN p.Tags IS NULL THEN 0
+                ELSE array_length(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><'), 1)
+            END),
+            0
+        ) AS TagCount,
+        p.ClosedDate,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS OwnerPostRank,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScoreByOwner,
+        CASE
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question_AcceptedAnswered'
+            WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 'Question_Closed'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 AND p.FavoriteCount = 0 THEN 'Question_Unanswered_Unfavorited'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Question_Answered'
+            WHEN p.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Posts qa WHERE qa.Id = p.ParentId AND qa.AcceptedAnswerId = p.Id) THEN 'Answer_Accepted'
+            WHEN p.PostTypeId = 2 THEN 'Answer_General'
+            ELSE 'OtherPostType'
+        END AS PostStatusCategory,
+        (SELECT COUNT(pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS LinkedPostCount,
+        substring(coalesce(p.Title, p_parent.Title, ''), 1, 50) AS TruncatedTitle,
+        p.LastActivityDate,
+        p.Tags
+    FROM Posts p
+    LEFT JOIN Posts p_parent ON p.ParentId = p_parent.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId IN (1, 2)
+),
+BadgeAchievementStats AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date AS BadgeDate,
+        b.Class,
+        b.TagBased,
+        COUNT(b.Id) OVER (PARTITION BY b.UserId ORDER BY b.Date ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS TotalBadgesForUserCumulative,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date DESC) AS LatestBadgeOfTypeRank,
+        LAG(b.Date, 1) OVER (PARTITION BY b.UserId ORDER BY b.Date) AS PreviousBadgeDate
+    FROM Badges b
+    WHERE b.Class IN (1, 2)
+),
+CommentQualityIndicators AS (
+    SELECT
+        c.PostId,
+        AVG(c.Score) AS AvgCommentScore,
+        COUNT(c.Id) AS TotalCommentsForPost,
+        SUM(CASE WHEN u.Reputation >= 1000 THEN 1 ELSE 0 END) AS HighRepUserCommentCount,
+        MAX(char_length(c.Text)) AS MaxCommentLength,
+        (SELECT COALESCE(SUM(v.BountyAmount), 0) FROM Votes v WHERE v.PostId = c.PostId AND v.VoteTypeId = 8) AS PostBountyAmount
+    FROM Comments c
+    LEFT JOIN Users u ON c.UserId = u.Id
+    GROUP BY c.PostId
+),
+PostHistoryEngagement AS (
+    SELECT
+        ph.PostId,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS CloseEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEvents,
+        MAX(ph.CreationDate) AS LastHistoryModification,
+        MIN(ph.CreationDate) AS FirstHistoryModification,
+        (SELECT COUNT(DISTINCT ph_inner.UserId) FROM PostHistory ph_inner WHERE ph_inner.PostId = ph.PostId AND ph_inner.PostHistoryTypeId IN (4,5,6)) AS UniqueEditorsCount,
+        COALESCE(
+            MAX(ph.CreationDate) - LAG(MAX(ph.CreationDate), 1) OVER (PARTITION BY ph.PostId ORDER BY MAX(ph.CreationDate)),
+            INTERVAL '0 seconds'
+        ) AS TimeSincePrevModification
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 101, 102, 103, 104, 105)
+    GROUP BY ph.PostId
+),
+QuestionAnalysis AS (
+    SELECT
+        UAM.UserId,
+        UAM.Reputation,
+        UAM.DaysSinceCreation,
+        PDM.PostId,
+        PDM.PostScore,
+        PDM.ViewCount,
+        PDM.PostStatusCategory,
+        PDM.TagCount,
+        PDM.OwnerPostRank,
+        BAS.BadgeName,
+        BAS.TotalBadgesForUserCumulative,
+        CQI.AvgCommentScore,
+        CQI.TotalCommentsForPost,
+        CQI.PostBountyAmount,
+        PHE.CloseEvents,
+        PHE.ReopenEvents,
+        PHE.UniqueEditorsCount,
+        (UAM.TotalPostsOwned * PDM.PostScore * 0.1 + UAM.TotalCommentsMade * COALESCE(CQI.AvgCommentScore, 0.0) * 0.05 + UAM.UserProfileViews * 0.01) AS UserEngagementIndex,
+        PDM.TruncatedTitle,
+        EXTRACT(HOUR FROM PDM.LastActivityDate) AS LastActivityHour,
+        CASE
+            WHEN UAM.Reputation > 10000 AND PDM.PostScore > 50 THEN 'High Impact User Question'
+            WHEN UAM.Reputation > 5000 AND PDM.ViewCount > 1000 THEN 'Mid Tier Popular Question'
+            WHEN PDM.ClosedDate IS NOT NULL AND PHE.ReopenEvents = 0 THEN 'Permanently Closed Question'
+            ELSE 'General Question'
+        END AS PostCategorization,
+        (PDM.PostCreationDate BETWEEN UAM.UserCreationDate AND UAM.LastAccessDate) AS PostWithinUserActivityPeriod,
+        (
+            SELECT t.TagName
+            FROM Tags t
+            WHERE t.Id = (
+                SELECT CAST(trim(el) AS INTEGER)
+                FROM unnest(string_to_array(substring(PDM.Tags FROM 2 FOR length(PDM.Tags)-2), '><')) AS el
+                WHERE trim(el) ~ '^[0-9]+$'
+                LIMIT 1
+            )
+            LIMIT 1
+        ) AS FirstTag,
+        'Question' AS PostType
+    FROM
+        UserActivityMetrics UAM
+    JOIN
+        PostDetailedMetrics PDM ON UAM.UserId = PDM.OwnerUserId
+    LEFT JOIN
+        BadgeAchievementStats BAS ON UAM.UserId = BAS.UserId AND BAS.LatestBadgeOfTypeRank = 1
+    LEFT JOIN
+        CommentQualityIndicators CQI ON PDM.PostId = CQI.PostId
+    LEFT JOIN
+        PostHistoryEngagement PHE ON PDM.PostId = PHE.PostId
+    WHERE
+        PDM.PostTypeId = 1
+        AND UAM.Reputation >= 100
+        AND PDM.TagCount > 1
+        AND (
+            (CQI.AvgCommentScore IS NULL OR (CQI.AvgCommentScore < 1.5 AND CQI.TotalCommentsForPost < 5))
+            OR
+            (PDM.PostScore > 10 AND PDM.FavoriteCount > 0 AND PDM.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months')
+        )
+        AND PDM.TruncatedTitle IS NOT NULL AND char_length(trim(PDM.TruncatedTitle)) > 5
+        AND PHE.CloseEvents IS NOT NULL
+        AND PHE.TimeSincePrevModification IS NOT NULL AND PHE.TimeSincePrevModification < INTERVAL '1 hour'
+        AND PDM.PrevPostScoreByOwner IS NOT NULL AND PDM.PostScore > PDM.PrevPostScoreByOwner * 1.2
+),
+AnswerAnalysis AS (
+    SELECT
+        UAM.UserId,
+        UAM.Reputation,
+        UAM.DaysSinceCreation,
+        PDM.PostId,
+        PDM.PostScore,
+        PDM.ViewCount,
+        PDM.PostStatusCategory,
+        PDM.TagCount,
+        PDM.OwnerPostRank,
+        BAS.BadgeName,
+        BAS.TotalBadgesForUserCumulative,
+        CQI.AvgCommentScore,
+        CQI.TotalCommentsForPost,
+        CQI.PostBountyAmount,
+        PHE.CloseEvents,
+        PHE.ReopenEvents,
+        PHE.UniqueEditorsCount,
+        (UAM.TotalPostsOwned * PDM.PostScore * 0.15 + UAM.TotalCommentsMade * COALESCE(CQI.AvgCommentScore, 0.0) * 0.07 + UAM.UserProfileViews * 0.005) AS UserEngagementIndex,
+        PDM.TruncatedTitle,
+        EXTRACT(HOUR FROM PDM.LastActivityDate) AS LastActivityHour,
+        CASE
+            WHEN PDM.PostStatusCategory = 'Answer_Accepted' THEN 'High Value Accepted Answer'
+            WHEN UAM.Reputation > 7500 AND PDM.PostScore > 30 THEN 'Highly Scored Answer'
+            WHEN PDM.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months' THEN 'Recently Active Answer'
+            ELSE 'General Answer'
+        END AS PostCategorization,
+        (PDM.PostCreationDate BETWEEN UAM.UserCreationDate AND UAM.LastAccessDate) AS PostWithinUserActivityPeriod,
+        (
+            SELECT t.TagName
+            FROM Tags t
+            JOIN Posts p_parent ON p_parent.Id = PDM.ParentId
+            WHERE t.Id = (
+                SELECT CAST(trim(el) AS INTEGER)
+                FROM unnest(string_to_array(substring(p_parent.Tags FROM 2 FOR length(p_parent.Tags)-2), '><')) AS el
+                WHERE trim(el) ~ '^[0-9]+$'
+                LIMIT 1
+            )
+            LIMIT 1
+        ) AS FirstTag,
+        'Answer' AS PostType
+    FROM
+        UserActivityMetrics UAM
+    JOIN
+        PostDetailedMetrics PDM ON UAM.UserId = PDM.OwnerUserId
+    LEFT JOIN
+        BadgeAchievementStats BAS ON UAM.UserId = BAS.UserId AND BAS.LatestBadgeOfTypeRank = 1
+    LEFT JOIN
+        CommentQualityIndicators CQI ON PDM.PostId = CQI.PostId
+    LEFT JOIN
+        PostHistoryEngagement PHE ON PDM.PostId = PHE.PostId
+    WHERE
+        PDM.PostTypeId = 2
+        AND PDM.ParentId IS NOT NULL
+        AND UAM.Reputation >= 50
+        AND PDM.PostScore > 5
+        AND (
+            PDM.AcceptedAnswerId IS NOT NULL
+            OR (PDM.PostScore > 10 AND PDM.PostCreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+        )
+        AND PHE.UniqueEditorsCount IS NOT NULL AND PHE.UniqueEditorsCount > 0
+        AND PDM.PrevPostScoreByOwner IS NOT NULL AND PDM.PostScore > PDM.PrevPostScoreByOwner
+)
+SELECT * FROM QuestionAnalysis
+UNION ALL
+SELECT * FROM AnswerAnalysis
+ORDER BY
+    UserEngagementIndex DESC,
+    PostScore DESC,
+    LastActivityHour DESC
+LIMIT 2000 OFFSET 0;

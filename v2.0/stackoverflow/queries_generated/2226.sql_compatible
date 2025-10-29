@@ -1,0 +1,195 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        u.Reputation,
+        u.DisplayName,
+        row_number() over (partition by t.Id order by p.Score desc, p.ViewCount desc) as rn_top_post
+    from Tags t
+    join Posts p on p.Tags like '%' || '<' || t.TagName || '>' || '%'
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+), UserBadgeStats as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+), UserPostStats as (
+    select
+        u.Id as UserId,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgPostScore,
+        max(p.CreationDate) filter (where p.PostTypeId in (1,2)) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+), UserRanking as (
+    select
+        ups.UserId,
+        ups.QuestionsCount,
+        ups.AnswersCount,
+        ups.AvgPostScore,
+        ups.LastPostDate,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalBadges,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        dense_rank() over (order by ups.AnswersCount desc, ups.QuestionsCount desc, u.Reputation desc) as UserRank
+    from UserPostStats ups
+    left join UserBadgeStats ub on ub.UserId = ups.UserId
+    join Users u on u.Id = ups.UserId
+), LatestCloseVotes as (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as LastCloseVoteDate,
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseVoteCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, ph.Comment, crt.Name
+), AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore,
+        sum(case when a.Score >= 10 then 1 else 0 end) as TopScoringAnswers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+), ComplexPostsSelection as (
+    select 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        ur.UserRank,
+        s.AnswerCount,
+        s.AvgAnswerScore,
+        s.MaxAnswerScore,
+        s.MinAnswerScore,
+        s.TopScoringAnswers,
+        lv.LastCloseVoteDate,
+        lv.CloseReasonName,
+        case 
+            when p.ClosedDate is not null then true 
+            else false
+        end as IsClosed,
+        regexp_replace(
+            coalesce(p.Title, '') || ' ' || coalesce(p.Tags, ''),
+            '[^a-zA-Z0-9\s]', '', 'g'
+        ) as SearchableText
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join UserRanking ur on ur.UserId = p.OwnerUserId
+    left join AnswerStats s on s.QuestionId = p.Id
+    left join LatestCloseVotes lv on lv.PostId = p.Id
+    where p.PostTypeId = 1
+), PostRelations as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.Score as PostScore,
+        p2.Score as RelatedPostScore,
+        case when p2.PostTypeId = 1 then true else false end as RelatedIsQuestion,
+        case when p2.PostTypeId = 2 then true else false end as RelatedIsAnswer
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where p1.PostTypeId = 1 and p2.PostTypeId in (1,2)
+), UserActivityWindow as (
+    select
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        count(*) over (partition by ph.UserId order by ph.CreationDate rows between 30 preceding and current row) as EditsLast30Days
+    from PostHistory ph
+    where ph.UserId is not null
+), HighlyActiveEditors as (
+    select distinct
+        u.Id as UserId,
+        u.DisplayName,
+        sum(case when uaw.EditsLast30Days > 5 then 1 else 0 end) as ActiveEditDaysCount
+    from Users u
+    join UserActivityWindow uaw on uaw.UserId = u.Id
+    group by u.Id, u.DisplayName
+    having sum(case when uaw.EditsLast30Days > 5 then 1 else 0 end) > 3
+), SearchQuestions as (
+    select cps.*
+    from ComplexPostsSelection cps
+    where cps.SearchableText ilike '%sql%'
+       or cps.SearchableText ilike '%join%'
+       or cps.SearchableText ilike '%performance%'
+), UnionQuestions as (
+    select Id, Title, OwnerName, Score, ViewCount, CreationDate, 'FromComplex' as Source from SearchQuestions
+    union
+    select p.Id, p.Title, u.DisplayName as OwnerName, p.Score, p.ViewCount, p.CreationDate, 'FromPosts' as Source
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+      and p.Title is not null
+      and p.CreationDate > (cast('2024-10-01' as date) - interval '1 year')
+      and (p.Title ilike '%sql%' or p.Title ilike '%join%' or p.Tags ilike '%<performance>%')
+    except
+    select Id, Title, OwnerName, Score, ViewCount, CreationDate, Source from SearchQuestions
+)
+select 
+    q.Id as QuestionId,
+    q.Title,
+    q.OwnerName,
+    q.Score,
+    q.ViewCount,
+    q.CreationDate,
+    q.IsClosed,
+    q.CloseReasonName,
+    q.AnswerCount,
+    q.AvgAnswerScore,
+    q.MaxAnswerScore,
+    q.TopScoringAnswers,
+    pr.LinkTypeName,
+    pr.RelatedPostId,
+    pr.RelatedIsQuestion,
+    pr.RelatedIsAnswer,
+    ur.UserRank as OwnerUserRank,
+    hb.GoldBadges,
+    hb.SilverBadges,
+    hb.BronzeBadges,
+    ha.ActiveEditDaysCount,
+    row_number() over (partition by q.OwnerName order by q.Score desc, q.ViewCount desc) as OwnerQuestionRank,
+    case 
+        when q.IsClosed = true and q.CloseReasonName ilike '%duplicate%' then 'Duplicate'
+        when q.IsClosed = true then 'OtherClosed'
+        else 'Open'
+    end as QuestionStatusCategory
+from UnionQuestions q
+left join PostRelations pr on pr.PostId = q.Id and pr.LinkTypeName = 'Duplicate'
+left join UserRanking ur on ur.DisplayName = q.OwnerName
+left join UserBadgeStats hb on hb.UserId = ur.UserId
+left join HighlyActiveEditors ha on ha.UserId = ur.UserId
+where q.Score > 5
+order by q.Score desc, q.ViewCount desc
+limit 100;

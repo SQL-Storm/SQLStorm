@@ -1,0 +1,116 @@
+WITH PostEditCounts AS (
+    SELECT
+        OwnerUserId,
+        COUNT(Id) AS EditCount
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+),
+UserPostActivity AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(CASE WHEN pt.Name = 'Question' THEN p.Id END) AS QuestionCount,
+        COUNT(CASE WHEN pt.Name = 'Answer' THEN p.Id END) AS AnswerCount,
+        SUM(p.ViewCount) AS TotalViews,
+        SUM(p.CommentCount) AS TotalComments,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(p.Score) AS AverageScore
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserBadgeDistribution AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentPostHistory AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastHistoryDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (2, 5, 8)
+    GROUP BY ph.PostId
+),
+TopVoters AS (
+    SELECT UserId
+    FROM Votes
+    WHERE VoteTypeId = 2
+      AND CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY)
+    GROUP BY UserId
+    ORDER BY COUNT(*) DESC
+    LIMIT 100
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    COALESCE(upa.TotalPosts, 0) AS TotalPosts,
+    COALESCE(upa.QuestionCount, 0) AS TotalQuestions,
+    COALESCE(upa.AnswerCount, 0) AS TotalAnswers,
+    COALESCE(pec.EditCount, 0) AS TotalEdits,
+    COALESCE(ubd.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubd.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubd.BronzeBadges, 0) AS BronzeBadges,
+    upa.TotalViews,
+    upa.TotalComments,
+    upa.AverageScore,
+    CASE
+        WHEN upa.LastPostDate IS NULL THEN 'Never Posted'
+        WHEN upa.LastPostDate < (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365' DAY) THEN 'Inactive'
+        ELSE 'Active'
+    END AS UserActivityStatus,
+    CASE
+        WHEN rph.LastHistoryDate IS NOT NULL AND rph.LastHistoryDate > upa.LastPostDate THEN 1
+        ELSE 0
+    END AS HadRecentBodyEdits,
+    AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AveragePostScoreForUser,
+    SUM(p.ViewCount) OVER (PARTITION BY p.OwnerUserId) AS TotalViewsForUser,
+    COUNT(p.Id) OVER (PARTITION BY p.OwnerUserId) AS PostCountForUser,
+    p.Title AS SamplePostTitle,
+    p.Tags AS SamplePostTags,
+    p.Score AS SamplePostScore,
+    p.CreationDate AS SamplePostCreationDate,
+    p.ClosedDate AS SamplePostClosedDate
+FROM Users u
+LEFT JOIN UserPostActivity upa ON u.Id = upa.OwnerUserId
+LEFT JOIN PostEditCounts pec ON u.Id = pec.OwnerUserId
+LEFT JOIN UserBadgeDistribution ubd ON u.Id = ubd.UserId
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+LEFT JOIN RecentPostHistory rph ON p.Id = rph.PostId
+JOIN TopVoters tv ON u.Id = tv.UserId
+WHERE u.DisplayName NOT LIKE '%[^a-zA-Z0-9 ]%' 
+  AND p.Id IS NOT NULL
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COALESCE(upa.TotalPosts, 0),
+    COALESCE(upa.QuestionCount, 0),
+    COALESCE(upa.AnswerCount, 0),
+    COALESCE(pec.EditCount, 0),
+    COALESCE(ubd.GoldBadges, 0),
+    COALESCE(ubd.SilverBadges, 0),
+    COALESCE(ubd.BronzeBadges, 0),
+    upa.TotalViews,
+    upa.TotalComments,
+    upa.AverageScore,
+    upa.LastPostDate,
+    rph.LastHistoryDate,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.CreationDate,
+    p.ClosedDate,
+    p.Id
+ORDER BY u.Reputation DESC, u.Id
+LIMIT 50;

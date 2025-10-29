@@ -1,0 +1,166 @@
+-- {"query": "7758.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1914} 
+SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName as OwnerName,
+    u.Reputation,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        ELSE 'Other'
+    END as PostType,
+    COALESCE(p.Tags, '') as Tags,
+    COALESCE(p.AnswerCount, 0) as AnswerCount,
+    COALESCE(p.CommentCount, 0) as CommentCount,
+    COALESCE(p.FavoriteCount, 0) as FavoriteCount,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+    END as Status,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) as Upvotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) as Downvotes,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) as CommentCountNew,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) THEN 'Has Duplicates'
+        ELSE 'No Duplicates'
+    END as DuplicateStatus,
+    (SELECT STRING_AGG(b.Name, ', ') 
+     FROM Badges b 
+     WHERE b.UserId = p.OwnerUserId 
+     AND b.Class = 1 
+     AND b.Date >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))) as RecentGoldBadges,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = p.Id 
+     AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) as EditCount,
+    (SELECT AVG(CAST(v.Score AS FLOAT)) 
+     FROM Votes v 
+     WHERE v.PostId = p.Id 
+     AND v.VoteTypeId IN (2, 3)
+     AND v.CreationDate >= DATEADD(month, -6, cast('2024-10-01 12:34:56' as timestamp))) as RecentAverageScore,
+    (SELECT MAX(ph.CreationDate) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = p.Id) as LastEditDate,
+    DATEDIFF(day, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as AgeInDays,
+    CASE 
+        WHEN DATEDIFF(day, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) > 30 THEN 'Old Post'
+        WHEN DATEDIFF(day, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) > 7 THEN 'Recent Post'
+        ELSE 'New Post'
+    END as PostAgeCategory,
+    RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRankWithinType,
+    DENSE_RANK() OVER (ORDER BY p.Score DESC) as GlobalScoreRank,
+    ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC, p.Score DESC) as ViewScoreRank,
+    NTILE(10) OVER (ORDER BY p.Score) as ScoreDecile,
+    LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) as PreviousScore,
+    LEAD(p.Score, 1) OVER (ORDER BY p.Score DESC) as NextScore,
+    p.Score - LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) as ScoreDifferenceFromPrevious,
+    SUM(p.Score) OVER (ORDER BY p.CreationDate ROWS UNBOUNDED PRECEDING) as CumulativeScore,
+    AVG(p.Score) OVER (ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as MovingAverage10,
+    NTILE(4) OVER (ORDER BY p.ViewCount) as ViewQuartile,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 5) > 0 THEN 'Bookmarked'
+        ELSE 'Not Bookmarked'
+    END as BookmarkStatus,
+    (SELECT STRING_AGG(CONCAT(' ', t.TagName), ' ') 
+     FROM (
+         SELECT TRIM(value) as TagName
+         FROM STRING_SPLIT(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ' ')
+         WHERE value != ''
+     ) t
+    ) as CleanedTags,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = p.Id 
+     AND ph.PostHistoryTypeId = 10) as CloseCount,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = p.Id 
+     AND ph.PostHistoryTypeId = 11) as ReopenCount,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = p.Id 
+     AND ph.PostHistoryTypeId IN (12, 13)) as DeleteUndeleteCount,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM PostHistory ph 
+            WHERE ph.PostId = p.Id 
+            AND ph.PostHistoryTypeId = 10 
+            AND ph.Comment LIKE '%101%' -- Duplicate reason
+        ) THEN 'Duplicate Post'
+        WHEN EXISTS (
+            SELECT 1 FROM PostHistory ph 
+            WHERE ph.PostId = p.Id 
+            AND ph.PostHistoryTypeId = 10 
+            AND ph.Comment LIKE '%102%' -- Off-topic reason
+        ) THEN 'Off-topic Post'
+        ELSE 'Other Close Reason'
+    END as CloseReasonCategory,
+    COALESCE((
+        SELECT TOP 1 ph.Comment 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId IN (10, 11, 12, 13)
+        ORDER BY ph.CreationDate DESC
+    ), 'No History') as RecentPostHistory,
+    (SELECT 
+        STRING_AGG(CONCAT(v.VoteTypeId, ':', COUNT(*)), ', ')
+        FROM Votes v 
+        WHERE v.PostId = p.Id 
+        AND v.UserId IS NOT NULL
+        GROUP BY v.VoteTypeId
+    ) as VoteSummary,
+    CASE 
+        WHEN p.OwnerUserId IS NULL AND p.PostTypeId <> 1 THEN 'Community Wiki'
+        WHEN p.OwnerUserId IS NULL THEN 'Deleted User'
+        ELSE 'User Owned'
+    END as OwnershipStatus,
+    p.ContentLicense,
+    (SELECT COUNT(DISTINCT ph.UserId) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = p.Id) as UniqueEditorsCount,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.ParentId = p.Id 
+     AND p2.PostTypeId = 2 
+     AND p2.DeletedDate IS NULL) as AnswerCountWithoutDeleted,
+    (SELECT AVG(LEN(p3.Body)) 
+     FROM Posts p3 
+     WHERE p3.ParentId = p.Id 
+     AND p3.PostTypeId = 2) as AvgAnswerLength,
+    (SELECT AVG(LEN(p4.Body)) 
+     FROM Posts p4 
+     WHERE p4.OwnerUserId = p.OwnerUserId 
+     AND p4.PostTypeId = 1) as AvgQuestionLengthByOwner
+FROM Posts p
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+LEFT JOIN (
+    SELECT PostId, COUNT(*) as EditCount
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+    GROUP BY PostId
+) ph_stats ON ph_stats.PostId = p.Id
+WHERE p.PostTypeId IN (1, 2)
+  AND (p.CreationDate >= DATEADD(year, -2, cast('2024-10-01 12:34:56' as timestamp)) OR p.CreationDate IS NULL)
+  AND (p.Score > 0 OR p.Score IS NULL)
+  AND (CHARINDEX('sql', LOWER(p.Title)) > 0 OR CHARINDEX('database', LOWER(p.Title)) > 0)
+  AND (
+    EXISTS (
+        SELECT 1 FROM Tags t 
+        WHERE t.TagName IN ('sql', 'database', 'postgresql')
+        AND (
+            CHARINDEX('<' + t.TagName + '>', p.Tags) > 0 OR
+            CHARINDEX('<' + t.TagName + '>', p.Tags) = 1 OR
+            CHARINDEX('<' + t.TagName + '>', p.Tags) = LEN(p.Tags) - LENGTH(t.TagName) - 1
+        )
+    ) OR p.Tags IS NULL
+  )
+  AND (CASE WHEN p.ParentId IS NOT NULL THEN (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) ELSE 1 END > 0)
+HAVING 
+    COALESCE(p.Score, 0) + COALESCE(p.ViewCount, 0) > 100
+   OR EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.CreationDate >= DATEADD(month, -1, cast('2024-10-01 12:34:56' as timestamp)))
+ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC;

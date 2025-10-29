@@ -1,0 +1,208 @@
+-- {"query": "1108.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3001} 
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS TotalQuestionsPosted,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalAnswersPosted,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalCommentsMade,
+        COALESCE(AVG(p.Score), 0) AS AvgPostScore,
+        MAX(CASE WHEN p.Id IS NOT NULL THEN p.LastActivityDate WHEN c.Id IS NOT NULL THEN c.CreationDate ELSE u.LastAccessDate END) AS LastOverallActivityDate,
+        DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate) AS DaysSinceUserCreation,
+        (SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = u.Id) AS TotalBadges,
+        (SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        COALESCE(u.Location, 'Unknown') AS UserLocation,
+        CASE
+            WHEN u.AboutMe IS NOT NULL AND LENGTH(TRIM(u.AboutMe)) > 150 THEN 'Verbose Bio'
+            WHEN u.AboutMe IS NOT NULL AND LENGTH(TRIM(u.AboutMe)) BETWEEN 1 AND 150 THEN 'Concise Bio'
+            ELSE 'No Bio Provided'
+        END AS AboutMeCategory,
+        NULLIF(u.UpVotes, 0) AS NullableUpVotes -- Example of NULLIF
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+        u.Views, u.UpVotes, u.DownVotes, u.Location, u.AboutMe
+),
+PostEditAndAnswerMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN 1 ELSE 0 END), 0) AS TotalEditsIncludingRollbacks,
+        COALESCE(COUNT(DISTINCT ph.UserId), 0) AS DistinctEditors,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN ph.CreationDate ELSE NULL END) AS LastEditDate,
+        (SELECT s.Score FROM Posts s WHERE s.Id = p.AcceptedAnswerId) AS AcceptedAnswerScore,
+        (SELECT COUNT(com.Id) FROM Comments com WHERE com.PostId = p.AcceptedAnswerId) AS AcceptedAnswerCommentCount,
+        (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) AS AvgBountyAmount,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><') AS ParsedTags
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+    GROUP BY
+        p.Id, p.PostTypeId, p.Title, p.Tags, p.CreationDate, p.Score, p.ViewCount,
+        p.AnswerCount, p.CommentCount, p.OwnerUserId, p.AcceptedAnswerId
+),
+UserInfluenceRanking AS (
+    SELECT
+        ues.UserId,
+        ues.DisplayName,
+        ues.Reputation,
+        ues.TotalQuestionsPosted,
+        ues.TotalAnswersPosted,
+        ues.AvgPostScore,
+        ues.LastOverallActivityDate,
+        ues.TotalBadges,
+        ues.GoldBadges,
+        ues.SilverBadges,
+        ues.BronzeBadges,
+        ues.UserLocation,
+        ues.AboutMeCategory,
+        RANK() OVER (ORDER BY ues.Reputation DESC, ues.TotalQuestionsPosted DESC, ues.AvgPostScore DESC) AS GlobalReputationRank,
+        NTILE(10) OVER (ORDER BY ues.Reputation DESC) AS ReputationDecile,
+        LAG(ues.LastOverallActivityDate, 1, '1970-01-01'::timestamp) OVER (PARTITION BY ues.UserLocation ORDER BY ues.CreationDate) AS PrevUserActivityInLocation,
+        COALESCE(CAST(ues.UpVotes AS DECIMAL) / NULLIF(ues.DownVotes, 0), 0) AS UpvoteDownvoteRatio
+    FROM UserEngagementSummary ues
+    WHERE ues.TotalQuestionsPosted > 0 AND ues.Reputation > 5000 AND ues.DisplayName IS NOT NULL AND ues.AboutMeCategory != 'No Bio Provided'
+),
+QuestionPerformanceSnapshot AS (
+    SELECT
+        pem.PostId,
+        pem.OwnerUserId,
+        pem.Title,
+        pem.PostCreationDate,
+        pem.PostScore,
+        pem.ViewCount,
+        pem.AnswerCount,
+        pem.TotalEditsIncludingRollbacks,
+        pem.DistinctEditors,
+        pem.AcceptedAnswerScore,
+        pem.AcceptedAnswerCommentCount,
+        pem.AvgBountyAmount,
+        pem.ParsedTags,
+        COALESCE(CAST(pem.AnswerCount AS DECIMAL) / NULLIF(pem.ViewCount, 0), 0) AS AnswerViewRatio,
+        COALESCE(CAST(pem.TotalEditsIncludingRollbacks AS DECIMAL) / NULLIF(DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - pem.PostCreationDate), 0), 0) AS EditsPerDaySinceCreation,
+        RANK() OVER (PARTITION BY pem.OwnerUserId ORDER BY pem.PostScore DESC, pem.ViewCount DESC, pem.PostCreationDate ASC) AS RankByScoreForUser,
+        CASE
+            WHEN pem.ViewCount > 100000 AND pem.AnswerCount > 20 THEN 'Viral Question'
+            WHEN pem.ViewCount > 10000 AND pem.AnswerCount > 10 THEN 'Popular Question'
+            ELSE 'Standard Question'
+        END AS QuestionPopularityCategory
+    FROM PostEditAndAnswerMetrics pem
+    WHERE pem.PostTypeId = 1 -- Only questions
+)
+SELECT
+    uir.UserId,
+    COALESCE(uir.DisplayName, 'Unknown User') AS UserDisplayName,
+    uir.Reputation,
+    uir.TotalQuestionsPosted,
+    uir.TotalAnswersPosted,
+    uir.AvgPostScore,
+    uir.LastOverallActivityDate,
+    uir.GoldBadges,
+    uir.SilverBadges,
+    uir.BronzeBadges,
+    uir.GlobalReputationRank,
+    uir.ReputationDecile,
+    uir.UserLocation,
+    uir.AboutMeCategory,
+    uir.UpvoteDownvoteRatio,
+    uir.PrevUserActivityInLocation,
+    qps.PostId AS TopQuestionId,
+    qps.Title AS TopQuestionTitle,
+    qps.PostCreationDate AS TopQuestionCreationDate,
+    qps.PostScore AS TopQuestionScore,
+    qps.ViewCount AS TopQuestionViewCount,
+    qps.AnswerCount AS TopQuestionAnswerCount,
+    qps.TotalEditsIncludingRollbacks AS TopQuestionTotalEdits,
+    qps.DistinctEditors AS TopQuestionDistinctEditors,
+    qps.AcceptedAnswerScore,
+    qps.AcceptedAnswerCommentCount,
+    qps.AvgBountyAmount,
+    qps.AnswerViewRatio,
+    qps.EditsPerDaySinceCreation,
+    qps.QuestionPopularityCategory,
+    EXTRACT(HOUR FROM qps.PostCreationDate) AS TopQuestionCreationHour,
+    DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - qps.PostCreationDate) AS DaysSinceTopQuestionCreated,
+    COALESCE(
+        (
+            SELECT ph.Comment
+            FROM PostHistory ph
+            WHERE ph.PostId = qps.PostId
+              AND ph.PostHistoryTypeId = 10 -- Post Closed
+              AND ph.Comment IS NOT NULL
+            ORDER BY ph.CreationDate DESC
+            LIMIT 1
+        ),
+        'Not Explicitly Closed'
+    ) AS LatestCloseReasonComment,
+    COALESCE(
+        (
+            SELECT crt.Name
+            FROM PostHistory ph
+            JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+            WHERE ph.PostId = qps.PostId
+              AND ph.PostHistoryTypeId = 10
+            ORDER BY ph.CreationDate DESC
+            LIMIT 1
+        ),
+        'N/A'
+    ) AS LatestCloseReasonTypeName,
+    qps.PostScore * (1.0 + COALESCE(qps.TotalEditsIncludingRollbacks, 0) * 0.05 + COALESCE(qps.DistinctEditors, 0) * 0.1) AS DynamicQuestionInfluenceScore,
+    STRING_AGG(DISTINCT apt.TagName, ' | ') AS TopQuestionTagsAggregate,
+    (
+        SELECT
+            AVG(c.Score)
+        FROM Comments c
+        WHERE c.PostId = qps.AcceptedAnswerId AND c.UserId IS NOT NULL
+    ) AS AcceptedAnswerAvgCommentScore,
+    (
+        SELECT
+            ph_initial.CreationDate
+        FROM PostHistory ph_initial
+        WHERE ph_initial.PostId = qps.PostId AND ph_initial.PostHistoryTypeId = 2 -- Initial Body
+        ORDER BY ph_initial.CreationDate ASC
+        LIMIT 1
+    ) AS InitialBodyCreationDate,
+    DENSE_RANK() OVER (ORDER BY qps.AnswerViewRatio DESC, qps.PostScore DESC, qps.TotalEditsIncludingRollbacks DESC) AS GlobalQuestionPerformanceRank,
+    (
+        SELECT COUNT(pl.Id)
+        FROM PostLinks pl
+        WHERE pl.PostId = qps.PostId AND pl.LinkTypeId = 3 -- Duplicates
+    ) AS DuplicateCountForTopQuestion
+FROM UserInfluenceRanking uir
+JOIN QuestionPerformanceSnapshot qps ON uir.UserId = qps.OwnerUserId
+LEFT JOIN (SELECT unnest(ParsedTags) AS TagName, PostId FROM PostEditAndAnswerMetrics WHERE PostTypeId = 1) AS apt ON qps.PostId = apt.PostId
+WHERE qps.RankByScoreForUser = 1 -- Select only the top question by score for each influential user
+  AND uir.TotalQuestionsPosted >= 1
+  AND uir.Reputation >= 10000 -- Focus on highly influential users
+  AND qps.PostCreationDate < '2023-01-01' -- Filter for older, established questions for historical analysis
+  AND LOWER(uir.DisplayName) NOT LIKE '%bot%' -- Exclude potential bot accounts
+  AND LENGTH(qps.Title) BETWEEN 15 AND 100 -- Filter for reasonable title lengths
+GROUP BY
+    uir.UserId, uir.DisplayName, uir.Reputation, uir.TotalQuestionsPosted, uir.TotalAnswersPosted, uir.AvgPostScore,
+    uir.LastOverallActivityDate, uir.GoldBadges, uir.SilverBadges, uir.BronzeBadges, uir.GlobalReputationRank,
+    uir.ReputationDecile, uir.UserLocation, uir.AboutMeCategory, uir.UpvoteDownvoteRatio, uir.PrevUserActivityInLocation,
+    qps.PostId, qps.Title, qps.PostCreationDate, qps.PostScore, qps.ViewCount, qps.AnswerCount,
+    qps.TotalEditsIncludingRollbacks, qps.DistinctEditors, qps.AcceptedAnswerScore, qps.AcceptedAnswerCommentCount,
+    qps.AvgBountyAmount, qps.AnswerViewRatio, qps.EditsPerDaySinceCreation, qps.QuestionPopularityCategory
+ORDER BY
+    GlobalReputationRank ASC, GlobalQuestionPerformanceRank ASC
+LIMIT 500;

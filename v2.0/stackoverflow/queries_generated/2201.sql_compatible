@@ -1,0 +1,134 @@
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        array[t.Id] as Ancestors
+    from Tags t
+    where t.IsModeratorOnly = false
+    union all
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Ancestors || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = any (r.Ancestors)
+    where array_length(r.Ancestors,1) < 3
+),
+UserBadgeRanks as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        sum(case when b.Class = 1 then 3 else 0 end) + sum(case when b.Class = 2 then 2 else 0 end) + sum(case when b.Class = 3 then 1 else 0 end) as BadgeRankScore,
+        count(distinct b.Name) as DistinctBadgeCount
+    from Users u
+    left join Badges b on b.UserId = u.Id and b.TagBased = 0
+    group by u.Id, u.DisplayName
+),
+UserPostStats as (
+    select 
+        p.OwnerUserId as UserId,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgPostScore,
+        sum(p.ViewCount) filter (where p.PostTypeId = 1) as TotalQuestionViews,
+        max(p.CreationDate) as LastPostDate
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+TopAnswerersPerTag as (
+    select
+        t.TagName,
+        p.OwnerUserId as UserId,
+        count(p.Id) as AnswersPerTag,
+        row_number() over (partition by t.TagName order by count(p.Id) desc) as rn
+    from Posts p
+    cross join lateral unnest(string_to_array(substring(coalesce(p.Tags,''), 2, length(coalesce(p.Tags,''))-2), '><')) as t(TagName)
+    join Tags tg on tg.TagName = t.TagName
+    where p.PostTypeId = 2
+    group by t.TagName, p.OwnerUserId
+    having count(p.Id) > 5
+),
+FinalUserStats as (
+    select 
+        u.Id,
+        u.DisplayName,
+        coalesce(ups.QuestionCount,0) as QuestionCount,
+        coalesce(ups.AnswerCount,0) as AnswerCount,
+        coalesce(ups.AvgPostScore,0) as AvgPostScore,
+        coalesce(ups.TotalQuestionViews,0) as TotalQuestionViews,
+        coalesce(ubr.BadgeRankScore,0) as BadgeRankScore,
+        coalesce(ubr.DistinctBadgeCount,0) as DistinctBadgeCount,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        lag(u.LastAccessDate) over (order by u.Reputation desc) as PrevUserLastAccess,
+        lead(u.LastAccessDate) over (order by u.Reputation desc) as NextUserLastAccess
+    from Users u
+    left join UserPostStats ups on ups.UserId = u.Id
+    left join UserBadgeRanks ubr on ubr.UserId = u.Id
+    where u.Reputation > 1000
+),
+UserBadgeInfo as (
+    select 
+        b.UserId,
+        string_agg(b.Name || ':' || coalesce(to_char(b.Date, 'YYYY-MM-DD'), 'N/A'), '; ' order by b.Date desc) as Badges,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId
+),
+ClosedQuestionCounts as (
+    select
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotesCount,
+        max(ph.CreationDate) as LastCloseDate,
+        min(c.Id) as CloseReasonId,
+        max(c.Name) as CloseReasonName
+    from PostHistory ph
+    left join CloseReasonTypes c on cast(c.Id as integer) = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+)
+select 
+    fus.Id as UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.QuestionCount,
+    fus.AnswerCount,
+    round(cast(fus.AvgPostScore as numeric), 2) as AvgPostScore,
+    fus.TotalQuestionViews,
+    fus.BadgeRankScore,
+    fus.DistinctBadgeCount,
+    coalesce(ubi.Badges,'') as BadgeDetails,
+    fus.Location,
+    to_char(fus.CreationDate, 'YYYY-MM-DD') as UserCreationDate,
+    to_char(fus.PrevUserLastAccess, 'YYYY-MM-DD') as PrevUserLastAccessDate,
+    to_char(fus.NextUserLastAccess, 'YYYY-MM-DD') as NextUserLastAccessDate,
+    coalesce(cqc.CloseVotesCount,0) as ClosedQuestions,
+    cqc.CloseReasonName,
+    string_agg(distinct top.TagName || '(' || top.AnswersPerTag || ')', ', ') filter (where top.rn = 1) as TopTagsAnswered,
+    phs.PostId,
+    phs.PostHistoryTypeId,
+    phs.CreationDate as PostHistoryDate,
+    phs.UserDisplayName as Editor,
+    left(phs.Comment, 50) as EditCommentSnippet
+from FinalUserStats fus
+left join UserBadgeInfo ubi on ubi.UserId = fus.Id
+left join ClosedQuestionCounts cqc on cqc.PostId in (
+    select p.Id from Posts p where p.OwnerUserId = fus.Id and p.PostTypeId = 1
+)
+left join TopAnswerersPerTag top on top.UserId = fus.Id
+left join LATERAL (
+    select ph1.PostId, ph1.PostHistoryTypeId, ph1.CreationDate, ph1.UserDisplayName, ph1.Comment
+    from PostHistory ph1
+    join Posts p1 on p1.Id = ph1.PostId
+    where p1.OwnerUserId = fus.Id
+    order by ph1.CreationDate desc
+    limit 1
+) phs on true
+where fus.QuestionCount > 0 and fus.AnswerCount > 0
+group by fus.Id, fus.DisplayName, fus.Reputation, fus.QuestionCount, fus.AnswerCount, fus.AvgPostScore, fus.TotalQuestionViews, fus.BadgeRankScore, fus.DistinctBadgeCount, ubi.Badges, fus.Location, fus.CreationDate, fus.PrevUserLastAccess, fus.NextUserLastAccess, cqc.CloseVotesCount, cqc.CloseReasonName, phs.PostId, phs.PostHistoryTypeId, phs.CreationDate, phs.UserDisplayName, phs.Comment
+order by fus.Reputation desc, fus.AnswerCount desc
+limit 50;

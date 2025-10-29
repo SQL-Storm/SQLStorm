@@ -1,0 +1,197 @@
+-- {"query": "1340.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3163} 
+
+WITH UserPostStats AS (
+    -- Aggregates various post-related statistics for each user, including average body length and parent post score influence
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViewCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE NULL END) AS MaxQuestionViewCount,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        -- Count accepted answers where the user is the author of the answer
+        COALESCE(SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AcceptedAnswerCount,
+        AVG(LENGTH(p.Body)) AS AvgPostBodyLength,
+        -- Sum of scores of questions that this user's answers are associated with
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN (SELECT q.Score FROM Posts q WHERE q.Id = p.ParentId) ELSE 0 END), 0) AS TotalParentQuestionScore
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId AND p.OwnerUserId = c.UserId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserHistoryAggregates AS (
+    -- Summarizes post history events for each user, including different types of edits and close votes
+    SELECT
+        ph.UserId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edit
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteCount, -- Post Closed
+        MAX(ph.CreationDate) AS LastHistoryActivity,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.PostId ELSE NULL END) AS UniquePostsEdited,
+        -- Check for a specific historical comment pattern
+        COUNT(CASE WHEN LOWER(ph.Comment) LIKE '%revert%' OR LOWER(ph.Comment) LIKE '%undo%' THEN 1 ELSE 0 END) AS RollbackRelatedHistory
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+EliteUsersByReputationAndAcceptedAnswers AS (
+    -- Identifies users with high reputation and a recent accepted answer to a question *they asked*
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        'HighReputationWithSelfAcceptedAnswer' AS EliteCriteria,
+        NTILE(5) OVER (ORDER BY u.Reputation DESC) AS ReputationTier
+    FROM Users u
+    JOIN Posts q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1 -- Questions asked by user
+    JOIN Posts a ON q.AcceptedAnswerId = a.Id AND a.OwnerUserId = u.Id -- User also answered and accepted their own answer
+    WHERE q.CreationDate >= NOW() - INTERVAL '1 year' -- Recent questions
+      AND u.Reputation > 7500
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+EliteUsersByBadgesAndHighEngagement AS (
+    -- Identifies users with many gold badges and significant engagement (upvotes, views, comments)
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        'ManyGoldBadgesAndHighEngagement' AS EliteCriteria,
+        NTILE(5) OVER (ORDER BY u.UpVotes DESC) AS UpVotesTier
+    FROM Users u
+    JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN UserPostStats ups ON u.Id = ups.UserId
+    WHERE b.Class = 1 -- Gold badges
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes
+    HAVING COUNT(b.Id) >= 5 -- At least 5 gold badges
+       AND u.UpVotes > 2000
+       AND COALESCE(SUM(ups.TotalCommentsMade), 0) > 50 -- At least 50 comments
+),
+CombinedEliteUsers AS (
+    -- Combines elite users identified by different criteria using UNION ALL, ensuring uniqueness
+    SELECT DISTINCT UserId, DisplayName, Reputation, EliteCriteria, Tier
+    FROM EliteUsersByReputationAndAcceptedAnswers
+    UNION ALL
+    SELECT DISTINCT UserId, DisplayName, Reputation, EliteCriteria, Tier
+    FROM EliteUsersByBadgesAndHighEngagement
+),
+TrendingTagsRanking AS (
+    -- Ranks tags based on recent high-scoring questions and their associated answer counts
+    SELECT
+        TagName,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        COALESCE(AVG(p.AnswerCount), 0) AS AvgAnswerCount,
+        RANK() OVER (ORDER BY AVG(p.Score) DESC, COUNT(DISTINCT p.Id) DESC, COALESCE(AVG(p.AnswerCount), 0) DESC) AS TagScoreRank
+    FROM Posts p
+    -- Split tags using the provided helper function in the schema description
+    CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS Tag(TagName)
+    WHERE p.PostTypeId = 1 -- Questions only
+      AND p.CreationDate >= NOW() - INTERVAL '9 months' -- Recent questions
+      AND p.Score > 10
+      AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    GROUP BY TagName
+    HAVING COUNT(DISTINCT p.Id) >= 20 -- Only consider tags with at least 20 recent high-scoring questions
+),
+UserTagActivity AS (
+    -- Calculates user activity for trending tags
+    SELECT
+        u.Id AS UserId,
+        ttr.TagName,
+        COUNT(DISTINCT p.Id) AS PostsInTag,
+        COALESCE(SUM(p.Score), 0) AS ScoreInTag,
+        MAX(p.CreationDate) AS LastPostInTag
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS PostTag(TagName)
+    JOIN TrendingTagsRanking ttr ON PostTag.TagName = ttr.TagName
+    WHERE ttr.TagScoreRank <= 10 -- Top 10 trending tags
+      AND p.CreationDate >= NOW() - INTERVAL '1 year'
+    GROUP BY u.Id, ttr.TagName
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.WebsiteUrl,
+    u.Location,
+    u.Views AS UserProfileViews,
+    u.UpVotes AS UserTotalUpVotes,
+    u.DownVotes AS UserTotalDownVotes,
+    COALESCE(ups.TotalPosts, 0) AS TotalUserPosts,
+    COALESCE(ups.QuestionCount, 0) AS UserQuestionCount,
+    COALESCE(ups.AnswerCount, 0) AS UserAnswerCount,
+    COALESCE(ups.TotalPostScore, 0) AS UserTotalPostScore,
+    COALESCE(ups.TotalParentQuestionScore, 0) AS UserTotalParentQuestionScore,
+    COALESCE(ups.TotalViewCount, 0) AS UserTotalPostViewCount,
+    COALESCE(ups.AvgQuestionScore, 0.0) AS UserAvgQuestionScore,
+    COALESCE(ups.MaxQuestionViewCount, 0) AS UserMaxQuestionViewCount,
+    COALESCE(ups.AvgPostBodyLength, 0.0) AS UserAvgPostBodyLength,
+    COALESCE(uha.EditCount, 0) AS UserEditCount,
+    COALESCE(uha.CloseVoteCount, 0) AS UserCloseVoteCount,
+    COALESCE(uha.UniquePostsEdited, 0) AS UniquePostsEditedByUser,
+    COALESCE(uha.RollbackRelatedHistory, 0) AS UserRollbackHistoryCount,
+    COALESCE(ceu.EliteCriteria, 'NotElite') AS EliteUserStatus,
+    ceu.Tier AS EliteUserTier,
+    (EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / (60 * 60 * 24))::INT AS AccountAgeDays, -- Account age in days
+    -- Correlated subquery: Find the user's highest scored answer to a question asked by another user within the last 2 years
+    (
+        SELECT MAX(ans.Score)
+        FROM Posts ans
+        WHERE ans.OwnerUserId = u.Id
+          AND ans.PostTypeId = 2 -- Is an answer
+          AND ans.ParentId IS NOT NULL
+          AND (SELECT q.OwnerUserId FROM Posts q WHERE q.Id = ans.ParentId) != u.Id -- Answer to another user's question
+          AND ans.CreationDate >= NOW() - INTERVAL '2 years'
+    ) AS MaxScoreOnOtherUsersQuestion,
+    -- Complex string expression for website domain and NULL handling
+    COALESCE(
+        SUBSTRING(u.WebsiteUrl,
+                  CASE WHEN POSITION('//' IN u.WebsiteUrl) > 0 THEN POSITION('//' IN u.WebsiteUrl) + 2 ELSE 1 END,
+                  CASE WHEN POSITION('/' IN SUBSTRING(u.WebsiteUrl, CASE WHEN POSITION('//' IN u.WebsiteUrl) > 0 THEN POSITION('//' IN u.WebsiteUrl) + 2 ELSE 1 END)) > 0
+                       THEN POSITION('/' IN SUBSTRING(u.WebsiteUrl, CASE WHEN POSITION('//' IN u.WebsiteUrl) > 0 THEN POSITION('//' IN u.WebsiteUrl) + 2 ELSE 1 END)) - 1
+                       ELSE LENGTH(SUBSTRING(u.WebsiteUrl, CASE WHEN POSITION('//' IN u.WebsiteUrl) > 0 THEN POSITION('//' IN u.WebsiteUrl) + 2 ELSE 1 END))
+                  END),
+        'NoWebsiteProvided'
+    ) AS WebsiteDomain,
+    -- Window function: Average total post score for users within their respective 500-reputation band
+    AVG(COALESCE(ups.TotalPostScore, 0)) OVER (PARTITION BY (u.Reputation / 500)) AS AvgPostScoreInRepBand,
+    -- More complex calculation: ratio of unique posts edited to total posts
+    CASE
+        WHEN COALESCE(ups.TotalPosts, 0) > 0 THEN CAST(COALESCE(uha.UniquePostsEdited, 0) AS NUMERIC) / ups.TotalPosts
+        ELSE 0.0
+    END AS UniqueEditRatio,
+    -- Check if user's location or about me contains specific programming language keywords (case-insensitive)
+    (LOWER(u.Location) LIKE '%london%' OR LOWER(u.Location) LIKE '%ny%' OR LOWER(u.AboutMe) ILIKE '%python%' OR LOWER(u.AboutMe) ILIKE '%java%' OR LOWER(u.AboutMe) ILIKE '%sql%') AS IsTechHubUserOrDeveloper,
+    -- Correlated subquery: Has the user answered any of the top 5 trending tags within the last 6 months with a score > 5?
+    EXISTS (
+        SELECT 1
+        FROM UserTagActivity uta
+        WHERE uta.UserId = u.Id
+          AND uta.ScoreInTag > 5
+          AND uta.LastPostInTag >= NOW() - INTERVAL '6 months'
+        LIMIT 1
+    ) AS ActiveInTrendingTag,
+    -- Window function: Row number within a user's country/region based on their reputation
+    ROW_NUMBER() OVER (PARTITION BY SUBSTRING(u.Location, 1, POSITION(',' IN u.Location || ',') - 1) ORDER BY u.Reputation DESC) AS RankInLocationRegion
+FROM Users u
+LEFT JOIN UserPostStats ups ON u.Id = ups.UserId
+LEFT JOIN UserHistoryAggregates uha ON u.Id = uha.UserId
+LEFT JOIN CombinedEliteUsers ceu ON u.Id = ceu.UserId
+WHERE
+    u.Reputation > 1000 -- Minimum reputation for analysis
+    AND u.LastAccessDate >= NOW() - INTERVAL '6 months' -- Recently active users
+    AND COALESCE(ups.TotalPosts, 0) > 10 -- Users with at least 10 posts
+    AND (u.Location IS NOT NULL AND u.Location != '' AND u.Location NOT LIKE '%(deleted user)%') -- Valid location for regional analysis
+    AND u.DisplayName IS NOT NULL AND LENGTH(u.DisplayName) > 2 -- Valid display name
+    -- Predicate involving complex date arithmetic and NULL checking
+    AND (u.CreationDate <= NOW() - INTERVAL '1 year' OR ceu.UserId IS NOT NULL) -- Account older than 1 year OR is an elite user
+ORDER BY
+    u.Reputation DESC,
+    UserTotalPostScore DESC,
+    u.LastAccessDate DESC
+LIMIT 5000;

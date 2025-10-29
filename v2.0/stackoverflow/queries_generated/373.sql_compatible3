@@ -1,0 +1,532 @@
+with recent_questions as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.Tags,
+        q.Score,
+        q.ViewCount,
+        q.CreationDate,
+        coalesce(q.AnswerCount, 0) as AnswerCount
+    from Posts q
+    where q.PostTypeId = 1
+      and q.CreationDate >= (select max(CreationDate) - interval '180 days' from Posts)
+),
+answers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreation
+    from Posts a
+    where a.PostTypeId = 2
+),
+first_answer as (
+    select distinct on (QuestionId)
+        QuestionId,
+        AnswerId,
+        AnswerOwnerId,
+        AnswerScore,
+        AnswerCreation
+    from answers
+    order by QuestionId, AnswerCreation
+),
+user_activity as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate as UserCreated,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views as ProfileViews,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes, u.Views
+),
+q_votes as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpCnt,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownCnt,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as FavCnt
+    from Votes v
+    group by v.PostId
+),
+q_comments as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        max(c.CreationDate) as LastCommentAt,
+        sum(case when c.Score > 0 then 1 else 0 end) as PosComments
+    from Comments c
+    group by c.PostId
+),
+dup_links as (
+    select
+        pl.PostId,
+        count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinks,
+        count(*) filter (where pl.LinkTypeId = 1) as LinkedLinks
+    from PostLinks pl
+    group by pl.PostId
+),
+closures as (
+    select
+        ph.PostId,
+        min(ph.CreationDate) as FirstClosedAt,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenedAt,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseEvents,
+        count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenEvents,
+        array_agg(distinct cast(nullif(ph.Comment, '') as integer)) filter (where ph.PostHistoryTypeId = 10 and ph.Comment ~ '^[0-9]+$') as CloseReasonsRaw
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11)
+    group by ph.PostId
+),
+tag_expanded as (
+    select
+        rq.QuestionId,
+        unnest(string_to_array(substring(coalesce(rq.Tags, ''), 2, greatest(length(coalesce(rq.Tags, '')),2)-2), '><')) as TagName
+    from recent_questions rq
+    where rq.Tags is not null and rq.Tags like '<%>'
+),
+tag_stats as (
+    select
+        te.QuestionId,
+        count(*) as TagCount,
+        string_agg(te.TagName, ',' order by te.TagName) as TagList,
+        sum(case when t.IsModeratorOnly then 1 else 0 end) as ModOnlyCount,
+        sum(case when t.IsRequired then 1 else 0 end) as RequiredCount,
+        sum(coalesce(t.Count,0)) as TagPopularity
+    from tag_expanded te
+    left join Tags t on lower(t.TagName) = lower(te.TagName)
+    group by te.QuestionId
+),
+activity_windows as (
+    select
+        rq.QuestionId,
+        rq.CreationDate,
+        rq.Score,
+        rq.ViewCount,
+        rq.AnswerCount,
+        qv.UpCnt,
+        qv.DownCnt,
+        qv.FavCnt,
+        qc.CommentCount,
+        qc.LastCommentAt,
+        qc.PosComments,
+        dl.DuplicateLinks,
+        dl.LinkedLinks,
+        cl.FirstClosedAt,
+        cl.LastReopenedAt,
+        cl.CloseEvents,
+        cl.ReopenEvents,
+        ts.TagCount,
+        ts.TagList,
+        ts.ModOnlyCount,
+        ts.RequiredCount,
+        ts.TagPopularity,
+        row_number() over (order by rq.ViewCount desc nulls last) as rn_views,
+        row_number() over (order by rq.Score desc nulls last) as rn_score,
+        ntile(10) over (order by coalesce(qv.UpCnt,0) - coalesce(qv.DownCnt,0) desc) as vote_decile,
+        null as median_views_overall
+    from recent_questions rq
+    left join q_votes qv on qv.PostId = rq.QuestionId
+    left join q_comments qc on qc.PostId = rq.QuestionId
+    left join dup_links dl on dl.PostId = rq.QuestionId
+    left join closures cl on cl.PostId = rq.QuestionId
+    left join tag_stats ts on ts.QuestionId = rq.QuestionId
+),
+owner_join as (
+    select
+        aw.QuestionId,
+        aw.CreationDate,
+        aw.Score,
+        aw.ViewCount,
+        aw.AnswerCount,
+        aw.UpCnt,
+        aw.DownCnt,
+        aw.FavCnt,
+        aw.CommentCount,
+        aw.LastCommentAt,
+        aw.PosComments,
+        aw.DuplicateLinks,
+        aw.LinkedLinks,
+        aw.FirstClosedAt,
+        aw.LastReopenedAt,
+        aw.CloseEvents,
+        aw.ReopenEvents,
+        aw.TagCount,
+        aw.TagList,
+        aw.ModOnlyCount,
+        aw.RequiredCount,
+        aw.TagPopularity,
+        aw.rn_views,
+        aw.rn_score,
+        aw.vote_decile,
+        aw.median_views_overall,
+        u.Reputation as OwnerReputation,
+        u.UpVotes as OwnerUpVotes,
+        u.DownVotes as OwnerDownVotes,
+        u.ProfileViews as OwnerProfileViews,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges
+    from activity_windows aw
+    left join recent_questions rq on rq.QuestionId = aw.QuestionId
+    left join user_activity u on u.UserId = rq.OwnerUserId
+),
+answer_enrichment as (
+    select
+        oj.QuestionId,
+        oj.CreationDate,
+        oj.Score,
+        oj.ViewCount,
+        oj.AnswerCount,
+        oj.UpCnt,
+        oj.DownCnt,
+        oj.FavCnt,
+        oj.CommentCount,
+        oj.LastCommentAt,
+        oj.PosComments,
+        oj.DuplicateLinks,
+        oj.LinkedLinks,
+        oj.FirstClosedAt,
+        oj.LastReopenedAt,
+        oj.CloseEvents,
+        oj.ReopenEvents,
+        oj.TagCount,
+        oj.TagList,
+        oj.ModOnlyCount,
+        oj.RequiredCount,
+        oj.TagPopularity,
+        oj.rn_views,
+        oj.rn_score,
+        oj.vote_decile,
+        oj.median_views_overall,
+        oj.OwnerReputation,
+        oj.OwnerUpVotes,
+        oj.OwnerDownVotes,
+        oj.OwnerProfileViews,
+        oj.GoldBadges,
+        oj.SilverBadges,
+        oj.BronzeBadges,
+        fa.AnswerId as FirstAnswerId,
+        fa.AnswerOwnerId,
+        fa.AnswerScore as FirstAnswerScore,
+        fa.AnswerCreation as FirstAnswerAt,
+        case
+            when fa.AnswerId is null then null
+            else cast(extract(epoch from (fa.AnswerCreation - oj.CreationDate)) as bigint)
+        end as FirstAnswerLagSeconds
+    from owner_join oj
+    left join first_answer fa on fa.QuestionId = oj.QuestionId
+),
+dup_self_ref as (
+    select
+        ae.QuestionId,
+        ae.CreationDate,
+        ae.Score,
+        ae.ViewCount,
+        ae.AnswerCount,
+        ae.UpCnt,
+        ae.DownCnt,
+        ae.FavCnt,
+        ae.CommentCount,
+        ae.LastCommentAt,
+        ae.PosComments,
+        ae.DuplicateLinks,
+        ae.LinkedLinks,
+        ae.FirstClosedAt,
+        ae.LastReopenedAt,
+        ae.CloseEvents,
+        ae.ReopenEvents,
+        ae.TagCount,
+        ae.TagList,
+        ae.ModOnlyCount,
+        ae.RequiredCount,
+        ae.TagPopularity,
+        ae.rn_views,
+        ae.rn_score,
+        ae.vote_decile,
+        ae.median_views_overall,
+        ae.OwnerReputation,
+        ae.OwnerUpVotes,
+        ae.OwnerDownVotes,
+        ae.OwnerProfileViews,
+        ae.GoldBadges,
+        ae.SilverBadges,
+        ae.BronzeBadges,
+        ae.FirstAnswerId,
+        ae.AnswerOwnerId,
+        ae.FirstAnswerScore,
+        ae.FirstAnswerAt,
+        ae.FirstAnswerLagSeconds,
+        case
+            when ae.DuplicateLinks > 0 then 1
+            when exists (
+                select 1
+                from PostLinks d
+                where d.PostId = ae.QuestionId
+                  and d.LinkTypeId = 3
+            ) then 1
+            else 0
+        end as IsDuplicateFlag
+    from answer_enrichment ae
+),
+quality_score as (
+    select
+        ds.QuestionId,
+        ds.CreationDate,
+        ds.Score,
+        ds.ViewCount,
+        ds.AnswerCount,
+        ds.UpCnt,
+        ds.DownCnt,
+        ds.FavCnt,
+        ds.CommentCount,
+        ds.LastCommentAt,
+        ds.PosComments,
+        ds.DuplicateLinks,
+        ds.LinkedLinks,
+        ds.FirstClosedAt,
+        ds.LastReopenedAt,
+        ds.CloseEvents,
+        ds.ReopenEvents,
+        ds.TagCount,
+        ds.TagList,
+        ds.ModOnlyCount,
+        ds.RequiredCount,
+        ds.TagPopularity,
+        ds.rn_views,
+        ds.rn_score,
+        ds.vote_decile,
+        ds.median_views_overall,
+        ds.OwnerReputation,
+        ds.OwnerUpVotes,
+        ds.OwnerDownVotes,
+        ds.OwnerProfileViews,
+        ds.GoldBadges,
+        ds.SilverBadges,
+        ds.BronzeBadges,
+        ds.FirstAnswerId,
+        ds.AnswerOwnerId,
+        ds.FirstAnswerScore,
+        ds.FirstAnswerAt,
+        ds.FirstAnswerLagSeconds,
+        ds.IsDuplicateFlag,
+        (
+            coalesce(ds.Score,0) * 2
+            + coalesce(ds.UpCnt,0) * 1
+            - coalesce(ds.DownCnt,0) * 2
+            + coalesce(ds.FavCnt,0) * 3
+            + least(coalesce(ds.ViewCount,0) / 100.0, 100)
+            + coalesce(ds.OwnerReputation,0) / 100.0
+            + coalesce(ds.GoldBadges,0) * 5
+            + coalesce(ds.SilverBadges,0) * 2
+            + coalesce(ds.BronzeBadges,0) * 1
+            + case when ds.IsDuplicateFlag = 1 then -25 else 0 end
+            + case when ds.FirstClosedAt is not null then -15 else 0 end
+            + case when ds.ModOnlyCount > 0 then 3 else 0 end
+            + case when ds.RequiredCount > 0 then 2 else 0 end
+            + least(coalesce(ds.TagPopularity,0) / 1000.0, 50)
+            - coalesce(ds.ReopenEvents,0) * 2
+            - coalesce(ds.CloseEvents,0) * 2
+        ) as QualityScore
+    from dup_self_ref ds
+),
+ranked as (
+    select
+        qs.QuestionId,
+        qs.CreationDate,
+        qs.Score,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.UpCnt,
+        qs.DownCnt,
+        qs.FavCnt,
+        qs.CommentCount,
+        qs.LastCommentAt,
+        qs.PosComments,
+        qs.DuplicateLinks,
+        qs.LinkedLinks,
+        qs.FirstClosedAt,
+        qs.LastReopenedAt,
+        qs.CloseEvents,
+        qs.ReopenEvents,
+        qs.TagCount,
+        qs.TagList,
+        qs.ModOnlyCount,
+        qs.RequiredCount,
+        qs.TagPopularity,
+        qs.rn_views,
+        qs.rn_score,
+        qs.vote_decile,
+        qs.median_views_overall,
+        qs.OwnerReputation,
+        qs.OwnerUpVotes,
+        qs.OwnerDownVotes,
+        qs.OwnerProfileViews,
+        qs.GoldBadges,
+        qs.SilverBadges,
+        qs.BronzeBadges,
+        qs.FirstAnswerId,
+        qs.AnswerOwnerId,
+        qs.FirstAnswerScore,
+        qs.FirstAnswerAt,
+        qs.FirstAnswerLagSeconds,
+        qs.IsDuplicateFlag,
+        qs.QualityScore,
+        dense_rank() over (order by qs.QualityScore desc nulls last) as dr_quality,
+        rank() over (order by coalesce(qs.ViewCount,0) desc) as r_views,
+        rank() over (order by coalesce(qs.Score,0) desc) as r_score,
+        coalesce(qs.FirstAnswerLagSeconds, 999999999) as FirstAnswerLagForSort
+    from quality_score qs
+),
+filtering as (
+    select
+        r.QuestionId,
+        r.CreationDate,
+        r.Score,
+        r.ViewCount,
+        r.AnswerCount,
+        r.UpCnt,
+        r.DownCnt,
+        r.FavCnt,
+        r.CommentCount,
+        r.LastCommentAt,
+        r.PosComments,
+        r.DuplicateLinks,
+        r.LinkedLinks,
+        r.FirstClosedAt,
+        r.LastReopenedAt,
+        r.CloseEvents,
+        r.ReopenEvents,
+        r.TagCount,
+        r.TagList,
+        r.ModOnlyCount,
+        r.RequiredCount,
+        r.TagPopularity,
+        r.rn_views,
+        r.rn_score,
+        r.vote_decile,
+        r.median_views_overall,
+        r.OwnerReputation,
+        r.OwnerUpVotes,
+        r.OwnerDownVotes,
+        r.OwnerProfileViews,
+        r.GoldBadges,
+        r.SilverBadges,
+        r.BronzeBadges,
+        r.FirstAnswerId,
+        r.AnswerOwnerId,
+        r.FirstAnswerScore,
+        r.FirstAnswerAt,
+        r.FirstAnswerLagSeconds,
+        r.IsDuplicateFlag,
+        r.QualityScore,
+        r.dr_quality,
+        r.r_views,
+        r.r_score,
+        r.FirstAnswerLagForSort,
+        case
+            when r.TagCount is null or r.TagCount = 0 then 'untagged'
+            when r.TagCount = 1 then 'single-tag'
+            when r.TagCount between 2 and 4 then 'multi-tag'
+            else 'many-tags'
+        end as TagBucket,
+        case
+            when r.OwnerReputation is null then 'anon-or-deleted'
+            when r.OwnerReputation < 100 then '<100'
+            when r.OwnerReputation < 1000 then '100-999'
+            when r.OwnerReputation < 10000 then '1k-9,999'
+            else '10k+'
+        end as RepBucket
+    from ranked r
+),
+median_values as (
+    select
+        (select percentile_disc(0.5) within group (order by ViewCount) from recent_questions) as median_views_overall,
+        (select percentile_disc(0.9) within group (order by QualityScore) from quality_score) as p90_quality,
+        (select percentile_disc(0.75) within group (order by QualityScore) from quality_score) as p75_quality,
+        (select percentile_disc(0.5) within group (order by QualityScore) from quality_score) as p50_quality
+)
+select
+    f.QuestionId,
+    coalesce(p.Title, cast(f.QuestionId as varchar)) as TitleOrId,
+    f.TagList,
+    f.TagBucket,
+    f.RepBucket,
+    f.ViewCount,
+    f.Score,
+    f.UpCnt,
+    f.DownCnt,
+    f.FavCnt,
+    f.CommentCount,
+    f.PosComments,
+    f.DuplicateLinks,
+    f.LinkedLinks,
+    f.IsDuplicateFlag,
+    f.CloseEvents,
+    f.ReopenEvents,
+    date_trunc('day', f.CreationDate) as CreatedDay,
+    f.FirstClosedAt,
+    f.LastReopenedAt,
+    f.FirstAnswerId,
+    f.FirstAnswerScore,
+    f.FirstAnswerLagSeconds,
+    f.OwnerReputation,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    f.rn_views as rn_deprecated_placeholder,
+    mv.median_views_overall,
+    f.QualityScore,
+    f.dr_quality,
+    f.r_views,
+    f.r_score,
+    f.vote_decile,
+    case
+        when f.QualityScore >= mv.p90_quality then 'top10%'
+        when f.QualityScore >= mv.p75_quality then 'top25%'
+        when f.QualityScore >= mv.p50_quality then 'top50%'
+        else 'bottom50%'
+    end as QualityBucket
+from (
+    select fsub.*, cast(null as integer) as vrn
+    from filtering fsub
+) f
+cross join median_values mv
+left join Posts p on p.Id = f.QuestionId
+where (
+    (coalesce(f.UpCnt,0) - coalesce(f.DownCnt,0)) >= 0
+    or (f.Score >= 0 and coalesce(f.FavCnt,0) > 0)
+    or (
+        f.CloseEvents = 0 and (
+            f.TagCount >= 3
+            or (f.TagCount is null and f.ViewCount >= mv.median_views_overall)
+        )
+    )
+)
+and (
+    (f.FirstAnswerLagSeconds is null and f.AnswerCount = 0)
+    or (f.FirstAnswerLagSeconds is not null and f.FirstAnswerLagSeconds < 86400)
+    or (f.FirstClosedAt is null and f.IsDuplicateFlag = 0)
+)
+and (
+    lower(coalesce(p.Title, '')) like any (select unnest(array['%how to%','%best way%','%performance%','%optimiz%']))
+    or exists (
+        select 1
+        from tag_expanded te2
+        where te2.QuestionId = f.QuestionId
+          and lower(te2.TagName) in ('sql','postgresql','performance','tuning')
+    )
+)
+order by
+    f.dr_quality,
+    f.r_views,
+    f.FirstAnswerLagForSort
+limit 500;

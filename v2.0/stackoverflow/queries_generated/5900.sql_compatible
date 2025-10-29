@@ -1,0 +1,76 @@
+WITH RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.PostTypeId,
+    p.ParentId
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+),
+TagAggregates AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS PostCount,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.ViewCount) AS TotalViews,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM RecentActivePosts p
+  JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+  ) t ON TRUE
+  GROUP BY t.TagName
+),
+TopTags AS (
+  SELECT
+    TagName,
+    PostCount,
+    AvgScore,
+    TotalViews,
+    LastActive,
+    RANK() OVER (ORDER BY PostCount DESC, AvgScore DESC, TotalViews DESC) AS rnk
+  FROM TagAggregates
+)
+SELECT
+  tt.TagName,
+  tt.PostCount,
+  tt.AvgScore,
+  tt.TotalViews,
+  tt.LastActive,
+  p.Title AS SampleQuestionTitle,
+  p.Id AS SampleQuestionId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END AS UpvoteIndicator,
+  CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END AS DownvoteIndicator
+FROM TopTags tt
+JOIN LATERAL (
+  SELECT *
+  FROM Posts p
+  WHERE p.Tags LIKE '%' || tt.TagName || '%' AND p.PostTypeId = 1
+  ORDER BY p.LastActivityDate DESC
+  LIMIT 1
+) p ON TRUE
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+WHERE tt.rnk <= 50
+GROUP BY
+  tt.TagName,
+  tt.PostCount,
+  tt.AvgScore,
+  tt.TotalViews,
+  tt.LastActive,
+  p.Title,
+  p.Id,
+  u.DisplayName,
+  u.Reputation,
+  v.VoteTypeId,
+  tt.rnk
+ORDER BY tt.rnk, tt.TotalViews DESC;

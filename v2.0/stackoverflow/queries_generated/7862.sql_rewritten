@@ -1,0 +1,343 @@
+-- {"query": "7862.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3204} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                DATEDIFF(DAY, MIN(p.CreationDate), MAX(p.CreationDate))
+            ELSE 0 
+        END AS ActiveDays,
+        AVG(p.Score) AS AvgPostScore,
+        STRING_AGG(
+            CASE 
+                WHEN p.PostTypeId = 1 THEN CONCAT('Q:', p.Title)
+                WHEN p.PostTypeId = 2 THEN CONCAT('A:', LEFT(p.Body, 50))
+                ELSE NULL 
+            END, 
+            '; '
+        ) AS RecentActivity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostComplexityAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        pt.Name AS PostTypeName,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'), 1)
+            ELSE 0 
+        END AS TagCount,
+        CASE 
+            WHEN p.Body IS NOT NULL THEN 
+                LENGTH(p.Body) - LENGTH(REPLACE(LOWER(p.Body), 'code', '')) 
+            ELSE 0 
+        END AS CodeBlocks,
+        CASE 
+            WHEN p.Body IS NOT NULL THEN 
+                LENGTH(p.Body) - LENGTH(REPLACE(LOWER(p.Body), '<p>', '')) 
+            ELSE 0 
+        END AS ParagraphCount,
+        CASE 
+            WHEN p.Body IS NOT NULL THEN 
+                (LENGTH(p.Body) - LENGTH(REPLACE(LOWER(p.Body), '<img', '')))
+            ELSE 0 
+        END AS ImageCount
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+),
+UserPostPerformance AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.ActiveDays,
+        uas.AvgPostScore,
+        uas.RecentActivity,
+        pca.PostId,
+        pca.Title,
+        pca.Score,
+        pca.ViewCount,
+        pca.AnswerCount AS PostAnswerCount,
+        pca.CommentCount AS PostCommentCount,
+        pca.CreationDate,
+        pca.PostTypeName,
+        pca.TagCount,
+        pca.CodeBlocks,
+        pca.ParagraphCount,
+        pca.ImageCount,
+        ROW_NUMBER() OVER (PARTITION BY uas.UserId ORDER BY pca.Score DESC) AS ScoreRank,
+        RANK() OVER (ORDER BY pca.Score DESC) AS GlobalScoreRank,
+        DENSE_RANK() OVER (ORDER BY pca.CreationDate DESC) AS PostRecencyRank,
+        CASE 
+            WHEN pca.Score >= (
+                SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY Score) 
+                FROM Posts 
+                WHERE PostTypeId = 1
+            ) THEN 'Top 5%'
+            WHEN pca.Score >= (
+                SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Score) 
+                FROM Posts 
+                WHERE PostTypeId = 1
+            ) THEN 'Top 25%'
+            WHEN pca.Score >= (
+                SELECT PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY Score) 
+                FROM Posts 
+                WHERE PostTypeId = 1
+            ) THEN 'Top 50%'
+            ELSE 'Below Median'
+        END AS PerformanceTier,
+        CASE 
+            WHEN uas.QuestionCount > 0 THEN 
+                CAST(pca.AnswerCount AS FLOAT) / uas.QuestionCount 
+            ELSE 0 
+        END AS AvgAnswersPerQuestion,
+        CASE 
+            WHEN uas.QuestionCount > 0 THEN 
+                CAST(pca.ViewCount AS FLOAT) / uas.QuestionCount 
+            ELSE 0 
+        END AS AvgViewsPerQuestion,
+        CASE 
+            WHEN uas.CommentCount > 0 THEN 
+                CAST(pca.CommentCount AS FLOAT) / uas.CommentCount 
+            ELSE 0 
+        END AS AvgCommentsPerUserComment,
+        NULLIF(pca.CodeBlocks, 0) AS NonZeroCodeBlocks,
+        NULLIF(pca.ParagraphCount, 0) AS NonZeroParagraphs,
+        NULLIF(pca.ImageCount, 0) AS NonZeroImages
+    FROM UserActivityStats uas
+    LEFT JOIN PostComplexityAnalysis pca ON uas.UserId = pca.OwnerUserId
+),
+HighValuePosts AS (
+    SELECT 
+        upp.*,
+        CASE 
+            WHEN upp.Reputation >= 10000 AND upp.Score >= 100 THEN 'Elite Contributor'
+            WHEN upp.Reputation >= 5000 AND upp.Score >= 50 THEN 'Veteran Contributor'
+            WHEN upp.Reputation >= 1000 AND upp.Score >= 25 THEN 'Regular Contributor'
+            ELSE 'Standard Contributor'
+        END AS ContributorTier,
+        CASE 
+            WHEN upp.PostTypeId = 1 AND upp.AnswerCount = 0 THEN 'Unanswered Question'
+            WHEN upp.PostTypeId = 2 AND upp.Score <= 0 THEN 'Low Value Answer'
+            ELSE 'Standard Post'
+        END AS PostCategory,
+        CASE 
+            WHEN upp.GlobalScoreRank <= 10 THEN 'Top 10'
+            WHEN upp.GlobalScoreRank <= 50 THEN 'Top 50'
+            WHEN upp.GlobalScoreRank <= 100 THEN 'Top 100'
+            ELSE 'Other'
+        END AS GlobalRankCategory,
+        CASE 
+            WHEN upp.ViewCount > 1000 THEN 'High Visibility'
+            WHEN upp.ViewCount > 500 THEN 'Medium Visibility'
+            WHEN upp.ViewCount > 100 THEN 'Low Visibility'
+            ELSE 'Very Low Visibility'
+        END AS VisibilityCategory
+    FROM UserPostPerformance upp
+),
+UserStatsWithRankings AS (
+    SELECT 
+        hvp.*,
+        DENSE_RANK() OVER (ORDER BY hvp.Reputation DESC) AS UserReputationRank,
+        DENSE_RANK() OVER (ORDER BY hvp.TotalPosts DESC) AS TotalPostsRank,
+        DENSE_RANK() OVER (ORDER BY hvp.QuestionCount DESC) AS QuestionCountRank,
+        DENSE_RANK() OVER (ORDER BY hvp.AnswerCount DESC) AS AnswerCountRank,
+        DENSE_RANK() OVER (ORDER BY hvp.CommentCount DESC) AS CommentCountRank,
+        DENSE_RANK() OVER (ORDER BY hvp.BadgeCount DESC) AS BadgeCountRank,
+        AVG(hvp.Score) OVER (PARTITION BY hvp.UserId) AS AvgScorePerUser,
+        STDDEV(hvp.Score) OVER (PARTITION BY hvp.UserId) AS ScoreStdDevPerUser,
+        PERCENT_RANK() OVER (ORDER BY hvp.Reputation) * 100 AS ReputationPercentile,
+        PERCENT_RANK() OVER (ORDER BY hvp.TotalPosts) * 100 AS PostsPercentile,
+        LAG(hvp.Score, 1) OVER (PARTITION BY hvp.UserId ORDER BY hvp.CreationDate) AS PreviousScore,
+        LEAD(hvp.Score, 1) OVER (PARTITION BY hvp.UserId ORDER BY hvp.CreationDate) AS NextScore,
+        SUM(hvp.Score) OVER (PARTITION BY hvp.UserId ORDER BY hvp.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS ScoreRollingSum10,
+        COUNT(*) OVER (PARTITION BY hvp.UserId) AS TotalPostsByUser,
+        ROW_NUMBER() OVER (PARTITION BY hvp.UserId ORDER BY hvp.CreationDate) AS PostSequenceNumber,
+        CASE 
+            WHEN hvp.UserId IN (
+                SELECT UserId 
+                FROM Badges 
+                WHERE Class = 1 
+                GROUP BY UserId 
+                HAVING COUNT(*) >= 5
+            ) THEN 1
+            ELSE 0 
+        END AS HasMultipleGoldBadges,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 
+                FROM Posts 
+                WHERE OwnerUserId = hvp.UserId 
+                AND PostTypeId = 1 
+                AND Score >= 100
+            ) THEN 1
+            ELSE 0 
+        END AS HasHighScoringQuestion
+    FROM HighValuePosts hvp
+)
+SELECT 
+    uswr.UserId,
+    uswr.DisplayName,
+    uswr.Reputation,
+    uswr.ReputationPercentile,
+    uswr.TotalPosts,
+    uswr.TotalPostsRank,
+    uswr.QuestionCount,
+    uswr.AnswerCount,
+    uswr.CommentCount,
+    uswr.BadgeCount,
+    uswr.ActiveDays,
+    uswr.AvgPostScore,
+    uswr.ContributorTier,
+    uswr.PostCategory,
+    uswr.GlobalRankCategory,
+    uswr.VisibilityCategory,
+    uswr.PostId,
+    uswr.Title,
+    uswr.PostTypeId,
+    uswr.Score,
+    uswr.ViewCount,
+    uswr.AnswerCount AS PostAnswerCount,
+    uswr.CommentCount AS PostCommentCount,
+    uswr.CreationDate,
+    uswr.PostTypeName,
+    uswr.TagCount,
+    uswr.CodeBlocks,
+    uswr.ParagraphCount,
+    uswr.ImageCount,
+    uswr.ScoreRank,
+    uswr.GlobalScoreRank,
+    uswr.PostRecencyRank,
+    uswr.PerformanceTier,
+    uswr.AvgAnswersPerQuestion,
+    uswr.AvgViewsPerQuestion,
+    uswr.AvgCommentsPerUserComment,
+    uswr.NonZeroCodeBlocks,
+    uswr.NonZeroParagraphs,
+    uswr.NonZeroImages,
+    uswr.UserReputationRank,
+    uswr.AvgScorePerUser,
+    uswr.ScoreStdDevPerUser,
+    uswr.PreviousScore,
+    uswr.NextScore,
+    uswr.ScoreRollingSum10,
+    uswr.TotalPostsByUser,
+    uswr.PostSequenceNumber,
+    uswr.HasMultipleGoldBadges,
+    uswr.HasHighScoringQuestion,
+    CASE 
+        WHEN uswr.Score > (SELECT AVG(Score) FROM Posts) THEN 'Above Average'
+        WHEN uswr.Score < (SELECT AVG(Score) FROM Posts) THEN 'Below Average'
+        ELSE 'Average'
+    END AS ScoreComparison,
+    CASE 
+        WHEN uswr.ViewCount > (SELECT AVG(ViewCount) FROM Posts) THEN 'Above Average Views'
+        WHEN uswr.ViewCount < (SELECT AVG(ViewCount) FROM Posts) THEN 'Below Average Views'
+        ELSE 'Average Views'
+    END AS ViewComparison,
+    CASE 
+        WHEN uswr.AnswerCount + uswr.CommentCount > (
+            SELECT AVG(AnswerCount + CommentCount) 
+            FROM Posts 
+            WHERE PostTypeId = 1
+        ) THEN 'Active Contributor'
+        ELSE 'Passive Contributor'
+    END AS EngagementLevel,
+    CONCAT(
+        'UserRank:', uswr.UserReputationRank,
+        '|PostRank:', uswr.TotalPostsRank,
+        '|Score:', uswr.Score,
+        '|Views:', uswr.ViewCount
+    ) AS ActivitySummary,
+    ROUND(
+        (uswr.QuestionCount * 0.3 + 
+         uswr.AnswerCount * 0.4 + 
+         uswr.CommentCount * 0.1 + 
+         uswr.BadgeCount * 0.2) / 
+        CASE 
+            WHEN uswr.TotalPosts > 0 THEN uswr.TotalPosts 
+            ELSE 1 
+        END, 2
+    ) AS UserEngagementScore,
+    CASE 
+        WHEN uswr.Reputation > 10000 AND uswr.Score > 100 THEN 'Elite'
+        WHEN uswr.Reputation > 5000 AND uswr.Score > 50 THEN 'Advanced'
+        WHEN uswr.Reputation > 1000 AND uswr.Score > 25 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS SkillLevel,
+    CASE 
+        WHEN uswr.ActiveDays > 365 THEN 'Seasoned User'
+        WHEN uswr.ActiveDays > 30 THEN 'Active User'
+        WHEN uswr.ActiveDays > 0 THEN 'New User'
+        ELSE 'Inactive User'
+    END AS UserStatus,
+    IIF(
+        uswr.HasMultipleGoldBadges = 1 AND uswr.HasHighScoringQuestion = 1,
+        'High Achiever',
+        CASE 
+            WHEN uswr.Reputation >= 10000 THEN 'Notable Contributor'
+            WHEN uswr.Reputation >= 5000 THEN 'Contributor'
+            WHEN uswr.Reputation >= 1000 THEN 'Community Member'
+            ELSE 'New Member'
+        END
+    ) AS CommunityStatus,
+    CASE 
+        WHEN uswr.TagCount > 5 THEN 'Tag Heavy'
+        WHEN uswr.TagCount > 2 THEN 'Tag Moderate'
+        WHEN uswr.TagCount > 0 THEN 'Tag Light'
+        ELSE 'No Tags'
+    END AS TaggingStyle,
+    CASE 
+        WHEN uswr.CodeBlocks > 5 THEN 'Heavy Coder'
+        WHEN uswr.CodeBlocks > 2 THEN 'Moderate Coder'
+        WHEN uswr.CodeBlocks > 0 THEN 'Light Coder'
+        ELSE 'Non-Coder'
+    END AS CodingInclination,
+    CASE 
+        WHEN uswr.ParagraphCount > 10 THEN 'Verbose Writer'
+        WHEN uswr.ParagraphCount > 5 THEN 'Medium Writer'
+        WHEN uswr.ParagraphCount > 0 THEN 'Brief Writer'
+        ELSE 'No Content'
+    END AS WritingStyle,
+    CASE 
+        WHEN uswr.ImageCount > 3 THEN 'Image Heavy'
+        WHEN uswr.ImageCount > 1 THEN 'Image Moderate'
+        WHEN uswr.ImageCount > 0 THEN 'Image Light'
+        ELSE 'No Images'
+    END AS VisualContentPreference
+FROM UserStatsWithRankings uswr
+WHERE uswr.Reputation > 0 
+    AND uswr.PostTypeName IN ('Question', 'Answer')
+    AND uswr.CreationDate >= DATEADD(MONTH, -12, cast('2024-10-01 12:34:56' as timestamp))
+ORDER BY uswr.Reputation DESC, uswr.Score DESC
+OFFSET 0 ROWS
+FETCH NEXT 10000 ROWS ONLY;

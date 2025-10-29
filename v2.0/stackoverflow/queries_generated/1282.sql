@@ -1,0 +1,194 @@
+-- {"query": "1282.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3017} 
+
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswersOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScoreOwned,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceivedOnPosts,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceivedOnPosts,
+        COUNT(DISTINCT b.Id) AS TotalBadgesAwarded,
+        SUM(CASE WHEN b.Class = 1 THEN 3 WHEN b.Class = 2 THEN 2 ELSE 1 END) AS BadgeClassScore,
+        (SELECT MAX(ph_mod.CreationDate) FROM PostHistory ph_mod WHERE ph_mod.UserId = u.Id AND ph_mod.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15)) AS LastModerationActivityDate, -- Correlated Subquery
+        EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / (3600 * 24) AS DaysActiveSinceCreation
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3) -- UpMod, DownMod
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostQualityAndLifecycle AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Body,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount, -- Only for PostTypeId = 1
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.Tags,
+        COALESCE(p.Title, CONCAT('Post-', p.Id)) AS DisplayTitle,
+        COALESCE(ARRAY_LENGTH(string_to_array(substring(COALESCE(p.Tags, '||'), 2, GREATEST(0, length(COALESCE(p.Tags, '||'))-2)), '><'), 1), 0) AS TagCount,
+        CASE
+            WHEN p.ViewCount IS NULL OR p.ViewCount = 0 THEN 0
+            ELSE (CAST(p.Score AS NUMERIC) * 5 + COALESCE(p.AnswerCount, 0) * 10 + COALESCE(p.CommentCount, 0) * 2 + COALESCE(p.FavoriteCount, 0) * 8) / p.ViewCount
+        END AS EngagementRatio,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        (SELECT COUNT(DISTINCT pl_dup.RelatedPostId)
+         FROM PostLinks pl_dup
+         WHERE pl_dup.PostId = p.Id AND pl_dup.LinkTypeId = 3) AS DuplicateLinkedCount, -- Correlated Subquery
+        cr.Name AS CloseReasonName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId, p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS UserPostRankByScore,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS AvgScoreLast30PostsOfType,
+        COUNT(DISTINCT c.Id) OVER (PARTITION BY p.Id) AS TotalCommentsOnPost, -- Window function for total comments on a post
+        NULLIF(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS PostUpvoteCount, -- Use NULLIF for potential division by zero later
+        NULLIF(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS PostDownvoteCount
+    FROM
+        Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (10, 11) -- Closed, Reopened
+    LEFT JOIN CloseReasonTypes cr ON ph.Comment IS NOT NULL AND ph.PostHistoryTypeId = 10 AND cr.Id = CAST(ph.Comment AS SMALLINT)
+    LEFT JOIN Comments c ON p.Id = c.PostId -- For TotalCommentsOnPost window function
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2,3)
+    WHERE p.PostTypeId IN (1, 2) -- Only Questions and Answers
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.Body, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.AcceptedAnswerId, p.LastActivityDate, p.ClosedDate, p.Tags, cr.Name
+),
+TagPerformance AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS TaggedPostCount,
+        SUM(p.Score) AS TagTotalScore,
+        AVG(p.Score) AS TagAvgScore,
+        COUNT(DISTINCT p.OwnerUserId) AS TaggedUserCount
+    FROM
+        Tags t
+    JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    WHERE p.PostTypeId = 1 -- Only questions for tag performance
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 50 AND AVG(p.Score) > 1
+),
+CombinedPostHistoryAnalysis AS (
+    SELECT
+        ph.PostId,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 1 THEN ph.CreationDate END) AS InitialTitleDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 4 THEN ph.CreationDate END) AS LastTitleEditDate,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 2 THEN ph.CreationDate END) AS InitialBodyDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.CreationDate END) AS LastBodyEditDate,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 3 THEN ph.CreationDate END) AS InitialTagsDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 6 THEN ph.CreationDate END) AS LastTagsEditDate,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS TotalEdits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10) THEN ph.Id END) AS CloseEvents,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (11) THEN ph.Id END) AS ReopenEvents
+    FROM
+        PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11)
+    GROUP BY
+        ph.PostId
+),
+UserTopTagRanked AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        t.TagName,
+        AVG(p.Score) AS UserTagAvgScore,
+        COUNT(p.Id) AS UserTagPostCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY AVG(p.Score) DESC, COUNT(p.Id) DESC) AS rn
+    FROM
+        Posts p
+    JOIN Tags t ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, t.TagName
+)
+-- Main Query - Branch 1: Highly engaged questions from high-reputation users, focused on performance/optimization.
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    pq.PostId,
+    pq.PostTypeId,
+    pq.DisplayTitle,
+    pq.PostScore,
+    pq.ViewCount,
+    pq.AnswerCount AS RelatedAnswerCount,
+    pq.PostCommentCount,
+    pq.FavoriteCount,
+    pq.EngagementRatio,
+    cpha.TotalEdits AS PostEditCount,
+    cpha.CloseEvents,
+    cpha.ReopenEvents,
+    uttr.TagName AS TopContributingTagName,
+    uttr.UserTagAvgScore AS TopContributingTagAvgScore,
+    EXTRACT(EPOCH FROM (pq.LastActivityDate - pq.PostCreationDate)) / (3600 * 24) AS DaysSinceCreationToLastActivity,
+    'HighEngagementQuestion' AS AnalysisCategory,
+    COALESCE(pq.PostUpvoteCount / NULLIF(pq.PostUpvoteCount + pq.PostDownvoteCount, 0), 0) AS UpvoteRatio
+FROM
+    UserEngagement ue
+INNER JOIN PostQualityAndLifecycle pq ON ue.UserId = pq.OwnerUserId
+LEFT JOIN CombinedPostHistoryAnalysis cpha ON pq.PostId = cpha.PostId
+LEFT JOIN UserTopTagRanked uttr ON ue.UserId = uttr.UserId AND uttr.rn = 1
+WHERE
+    ue.Reputation >= 15000
+    AND ue.TotalQuestionsOwned > 20
+    AND pq.PostTypeId = 1
+    AND pq.EngagementRatio > (SELECT AVG(EngagementRatio) * 1.5 FROM PostQualityAndLifecycle WHERE PostTypeId = 1)
+    AND (LOWER(pq.Title) LIKE '%performance%' OR LOWER(pq.Tags) LIKE '%<optimization>%' OR LOWER(pq.Tags) LIKE '%<benchmark>%')
+    AND EXTRACT(YEAR FROM pq.PostCreationDate) IN (2021, 2022, 2023)
+    AND pq.WasClosed = 0
+    AND pq.TagCount > 1
+    AND pq.PostScore > 50
+UNION ALL
+-- Main Query - Branch 2: Highly upvoted answers from users who primarily answer, for questions that were not closed.
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    pq.PostId,
+    pq.PostTypeId,
+    pq.DisplayTitle,
+    pq.PostScore,
+    pq.ViewCount,
+    (SELECT COUNT(DISTINCT q.Id) FROM Posts q WHERE q.AcceptedAnswerId = pq.PostId AND q.ClosedDate IS NULL) AS AcceptedAnswerForCount, -- Correlated Subquery, only for open questions
+    pq.PostCommentCount,
+    pq.FavoriteCount,
+    pq.EngagementRatio,
+    cpha.TotalEdits AS PostEditCount,
+    cpha.CloseEvents,
+    cpha.ReopenEvents,
+    uttr.TagName AS TopContributingTagName,
+    uttr.UserTagAvgScore AS TopContributingTagAvgScore,
+    EXTRACT(EPOCH FROM (pq.LastActivityDate - pq.PostCreationDate)) / (3600 * 24) AS DaysSinceCreationToLastActivity,
+    'HighUpvotedAnswer' AS AnalysisCategory,
+    COALESCE(pq.PostUpvoteCount / NULLIF(pq.PostUpvoteCount + pq.PostDownvoteCount, 0), 0) AS UpvoteRatio
+FROM
+    UserEngagement ue
+INNER JOIN PostQualityAndLifecycle pq ON ue.UserId = pq.OwnerUserId
+LEFT JOIN CombinedPostHistoryAnalysis cpha ON pq.PostId = cpha.PostId
+LEFT JOIN UserTopTagRanked uttr ON ue.UserId = uttr.UserId AND uttr.rn = 1
+WHERE
+    ue.Reputation >= 10000
+    AND ue.TotalAnswersOwned > 100
+    AND ue.TotalQuestionsOwned < 10
+    AND pq.PostTypeId = 2
+    AND pq.PostScore > 25
+    AND pq.PostCommentCount > 5
+    AND pq.CreationDate > '2020-01-01'
+    AND EXISTS (SELECT 1 FROM Posts acc_q WHERE acc_q.AcceptedAnswerId = pq.PostId

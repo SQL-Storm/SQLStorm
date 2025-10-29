@@ -1,0 +1,386 @@
+with recent_questions as (
+  select
+    p.Id as QuestionId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    coalesce(p.Title, '') as Title,
+    coalesce(p.AnswerCount, 0) as AnswerCount
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (
+      select date_trunc('month', max(CreationDate)) - interval '6 months'
+      from Posts
+      where PostTypeId = 1
+    )
+),
+tag_expanded as (
+  select
+    rq.QuestionId,
+    lower(trim(tg)) as TagName
+  from recent_questions rq,
+  lateral unnest(string_to_array(substring(coalesce(rq.Tags, ''), 2, greatest(length(coalesce(rq.Tags, ''))-2,0)), '><')) as tg
+),
+top_tags as (
+  select TagName, count(*) as q_cnt
+  from tag_expanded
+  group by TagName
+  having count(*) >= 5
+),
+user_activity as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views,
+    u.LastAccessDate,
+    u.Location,
+    u.DisplayName,
+    coalesce(nullif(trim(u.WebsiteUrl), ''), 'n/a') as WebsiteUrlNorm
+  from Users u
+),
+answers as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId as AnswererId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreated,
+    row_number() over (partition by a.ParentId order by a.Score desc nulls last, a.CreationDate asc) as rn_by_score,
+    count(*) over (partition by a.ParentId) as total_answers
+  from Posts a
+  where a.PostTypeId = 2
+),
+question_votes as (
+  select
+    v.PostId as QuestionId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites,
+    sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as bounty_amount
+  from Votes v
+  join Posts p on p.Id = v.PostId and p.PostTypeId = 1
+  group by v.PostId
+),
+close_events as (
+  select
+    ph.PostId as QuestionId,
+    min(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as first_closed_at,
+    max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as last_reopened_at,
+    sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as close_votes_count
+  from PostHistory ph
+  group by ph.PostId
+),
+dup_links as (
+  select
+    pl.PostId as DuplicateId,
+    pl.RelatedPostId as OriginalId,
+    min(pl.CreationDate) as first_link_date
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+  group by pl.PostId, pl.RelatedPostId
+),
+accepted_map as (
+  select
+    q.Id as QuestionId,
+    q.AcceptedAnswerId
+  from Posts q
+  where q.PostTypeId = 1
+),
+answerer_badges as (
+  select
+    b.UserId,
+    sum(case when b.Class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.Class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.Class = 3 then 1 else 0 end) as bronze_badges,
+    sum(case when coalesce(b.TagBased,0) = 1 then 1 else 0 end) as tag_badges
+  from Badges b
+  group by b.UserId
+),
+questioner_badges as (
+  select
+    b.UserId,
+    count(*) as total_badges
+  from Badges b
+  group by b.UserId
+),
+comment_stats as (
+  select
+    c.PostId,
+    count(*) as comment_count,
+    max(c.Score) as max_comment_score,
+    avg(c.Score * 1.0) as avg_comment_score
+  from Comments c
+  group by c.PostId
+),
+tag_stats as (
+  select
+    te.QuestionId,
+    count(*) as tag_count,
+    min(te.TagName) as alpha_first_tag,
+    max(te.TagName) as alpha_last_tag,
+    string_agg(distinct te.TagName, '|' order by te.TagName) as tag_list
+  from tag_expanded te
+  group by te.QuestionId
+),
+question_enriched as (
+  select
+    rq.QuestionId,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.OwnerUserId,
+    rq.Tags,
+    rq.Title,
+    rq.AnswerCount,
+    qs.upvotes,
+    qs.downvotes,
+    qs.favorites,
+    qs.bounty_amount,
+    cs.comment_count,
+    cs.max_comment_score,
+    cs.avg_comment_score,
+    tg.tag_count,
+    tg.alpha_first_tag,
+    tg.alpha_last_tag,
+    tg.tag_list,
+    ce.first_closed_at,
+    ce.last_reopened_at,
+    ce.close_votes_count,
+    am.AcceptedAnswerId,
+    dl.OriginalId as DuplicateOfId,
+    dl.first_link_date as DuplicateLinkedAt
+  from recent_questions rq
+  left join question_votes qs on qs.QuestionId = rq.QuestionId
+  left join comment_stats cs on cs.PostId = rq.QuestionId
+  left join tag_stats tg on tg.QuestionId = rq.QuestionId
+  left join close_events ce on ce.QuestionId = rq.QuestionId
+  left join accepted_map am on am.QuestionId = rq.QuestionId
+  left join dup_links dl on dl.DuplicateId = rq.QuestionId
+),
+best_answers as (
+  select
+    a.QuestionId,
+    a.AnswerId as TopAnswerId,
+    a.AnswererId,
+    a.AnswerScore,
+    a.AnswerCreated,
+    a.total_answers
+  from answers a
+  where a.rn_by_score = 1
+),
+answerer_enriched as (
+  select
+    ba.QuestionId,
+    ba.TopAnswerId,
+    ba.AnswererId,
+    ba.AnswerScore,
+    ba.AnswerCreated,
+    ba.total_answers,
+    ua.Reputation as AnswererReputation,
+    ua.UpVotes as AnswererUpVotes,
+    ua.DownVotes as AnswererDownVotes,
+    coalesce(ab.gold_badges,0) as AnswererGoldBadges,
+    coalesce(ab.silver_badges,0) as AnswererSilverBadges,
+    coalesce(ab.bronze_badges,0) as AnswererBronzeBadges,
+    coalesce(ab.tag_badges,0) as AnswererTagBadges
+  from best_answers ba
+  left join user_activity ua on ua.UserId = ba.AnswererId
+  left join answerer_badges ab on ab.UserId = ba.AnswererId
+),
+questioner_enriched as (
+  select
+    qe.QuestionId as Id,
+    qe.CreationDate,
+    qe.Score,
+    qe.ViewCount,
+    qe.OwnerUserId,
+    qe.Tags,
+    qe.Title,
+    qe.AnswerCount,
+    qe.upvotes,
+    qe.downvotes,
+    qe.favorites,
+    qe.bounty_amount,
+    qe.tag_list,
+    qe.tag_count,
+    qe.first_closed_at,
+    qe.last_reopened_at,
+    qe.close_votes_count,
+    qe.AcceptedAnswerId,
+    qe.DuplicateOfId,
+    qe.DuplicateLinkedAt,
+    ua.Reputation as AskerReputation,
+    ua.UpVotes as AskerUpVotes,
+    ua.DownVotes as AskerDownVotes,
+    qb.total_badges as AskerTotalBadges,
+    ua.Location as AskerLocation,
+    ua.DisplayName as AskerDisplayName
+  from question_enriched qe
+  left join user_activity ua on ua.UserId = qe.OwnerUserId
+  left join questioner_badges qb on qb.UserId = qe.OwnerUserId
+),
+question_quality as (
+  select
+    qe.Id as QuestionId,
+    cast(
+    (
+     coalesce(qe.Score,0) * 2
+     + coalesce(qe.upvotes,0)
+     - coalesce(qe.downvotes,0) * 1.5
+     + coalesce(qe.favorites,0) * 1.25
+     + case when qe.AnswerCount >= 1 then 2 else -1 end
+     + case when qe.AcceptedAnswerId is not null then 3 else 0 end
+     + least(coalesce(qe.ViewCount,0) / 100.0, 20)
+     - case when qe.first_closed_at is not null then 5 else 0 end
+     + coalesce(qe.bounty_amount,0) / 100.0
+     + coalesce(qe.avg_comment_score,0)
+    ) as numeric(18,4)
+    ) as quality_score
+  from (
+    select q.*, cs.avg_comment_score
+    from questioner_enriched q
+    left join comment_stats cs on cs.PostId = q.Id
+  ) qe
+),
+tag_popularity as (
+  select
+    te.TagName,
+    count(distinct te.QuestionId) as RecentTagQuestions
+  from tag_expanded te
+  group by te.TagName
+),
+selected_tags as (
+  select tt.TagName
+  from top_tags tt
+  union
+  select tp.TagName from tag_popularity tp where tp.RecentTagQuestions >= 10
+),
+final as (
+  select
+    qe.Id as QuestionId,
+    qe.Title,
+    qe.CreationDate,
+    qe.OwnerUserId as AskerId,
+    qe.AskerDisplayName,
+    qe.AskerLocation,
+    qe.AskerReputation,
+    qe.AskerUpVotes,
+    qe.AskerDownVotes,
+    qe.AskerTotalBadges,
+    qe.Score as QuestionScore,
+    qe.ViewCount,
+    qe.AnswerCount,
+    qe.upvotes,
+    qe.downvotes,
+    qe.favorites,
+    qe.bounty_amount,
+    qe.tag_list,
+    qe.tag_count,
+    qe.first_closed_at,
+    qe.last_reopened_at,
+    qe.close_votes_count,
+    qe.AcceptedAnswerId,
+    qe.DuplicateOfId,
+    qe.DuplicateLinkedAt,
+    ae.TopAnswerId,
+    ae.AnswererId,
+    ae.AnswerScore,
+    ae.AnswerCreated,
+    ae.total_answers,
+    ae.AnswererReputation,
+    ae.AnswererUpVotes,
+    ae.AnswererDownVotes,
+    ae.AnswererGoldBadges,
+    ae.AnswererSilverBadges,
+    ae.AnswererBronzeBadges,
+    ae.AnswererTagBadges,
+    qq.quality_score,
+    dense_rank() over (order by qq.quality_score desc nulls last) as dr_quality,
+    row_number() over (partition by coalesce(qe.DuplicateOfId, qe.Id) order by qq.quality_score desc nulls last) as rn_per_cluster,
+    count(*) over () as total_rows,
+    sum(case when qe.AcceptedAnswerId is not null then 1 else 0 end) over () as total_with_accepted,
+    avg(coalesce(ae.AnswerScore,0)) over () as avg_top_answer_score_global
+  from questioner_enriched qe
+  left join answerer_enriched ae on ae.QuestionId = qe.Id
+  join question_quality qq on qq.QuestionId = qe.Id
+  where exists (
+    select 1
+    from tag_expanded te
+    join selected_tags st on st.TagName = te.TagName
+    where te.QuestionId = qe.Id
+  )
+    and (
+      qe.ViewCount is null
+      or qe.ViewCount >= 0
+      or qe.ViewCount < 0
+    )
+    and (
+      (qe.Score is not null and qe.Score >= 0)
+      or (qe.Score is null and qe.ViewCount is not null)
+    )
+)
+select
+  f.QuestionId,
+  f.Title,
+  f.CreationDate,
+  f.AskerId,
+  f.AskerDisplayName,
+  f.AskerLocation,
+  f.AskerReputation,
+  f.AskerUpVotes,
+  f.AskerDownVotes,
+  f.AskerTotalBadges,
+  f.QuestionScore,
+  f.ViewCount,
+  f.AnswerCount,
+  f.upvotes,
+  f.downvotes,
+  f.favorites,
+  f.bounty_amount,
+  f.tag_list,
+  f.tag_count,
+  f.first_closed_at,
+  f.last_reopened_at,
+  f.close_votes_count,
+  f.AcceptedAnswerId,
+  f.DuplicateOfId,
+  f.DuplicateLinkedAt,
+  f.TopAnswerId,
+  f.AnswererId,
+  f.AnswerScore,
+  f.AnswerCreated,
+  f.total_answers,
+  f.AnswererReputation,
+  f.AnswererUpVotes,
+  f.AnswererDownVotes,
+  f.AnswererGoldBadges,
+  f.AnswererSilverBadges,
+  f.AnswererBronzeBadges,
+  f.AnswererTagBadges,
+  f.quality_score,
+  f.dr_quality,
+  f.rn_per_cluster,
+  f.total_rows,
+  f.total_with_accepted,
+  f.avg_top_answer_score_global,
+  case
+    when f.AcceptedAnswerId is not null then 'accepted'
+    when f.AnswerCount = 0 then 'unanswered'
+    when f.AnswerScore >= 5 then 'high-signal'
+    else 'answered'
+  end as answer_status_bucket,
+  case
+    when f.DuplicateOfId is not null then 'duplicate'
+    when f.first_closed_at is not null then 'closed'
+    else 'open'
+  end as state_bucket,
+  substring(coalesce(f.tag_list,''), 1, 120) as preview_tags,
+  coalesce(nullif(btrim(regexp_replace(lower(f.Title), '\s+', ' ', 'g')), ''), '(no title)') as normalized_title
+from final f
+where f.rn_per_cluster = 1
+order by f.dr_quality, f.CreationDate desc, f.QuestionId
+limit 500;

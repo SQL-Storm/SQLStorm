@@ -1,0 +1,126 @@
+-- {"query": "5587.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 861} 
+WITH RecentHot AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.ViewCount,
+    p.Score,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.PostTypeId,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC, p.Score DESC, p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.ClosedDate IS NULL
+    AND p.CreationDate >= NOW() - INTERVAL '90 days'
+),
+Agg AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.Tags,
+    r.ViewCount,
+    r.Score,
+    r.CreationDate,
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Location,
+    (CASE WHEN v2.Id IS NULL THEN 0 ELSE 1 END) AS HasUpvote,
+    (CASE WHEN b.Id IS NULL THEN 0 ELSE 1 END) AS HasBronze
+  FROM RecentHot r
+  LEFT JOIN Users u ON u.Id = r.OwnerUserId
+  LEFT JOIN Votes v2 ON v2.PostId = r.PostId AND v2.VoteTypeId = 2
+  LEFT JOIN Badges b ON b.UserId = u.Id AND b.Class = 3
+  WHERE r.rn = 1
+),
+W AS (
+  SELECT
+    a.PostId,
+    a.Title,
+    a.Tags,
+    a.ViewCount,
+    a.Score,
+    a.CreationDate,
+    a.UserId,
+    a.UserName,
+    a.Reputation,
+    a.UserCreationDate,
+    a.LastAccessDate,
+    a.Location,
+    a.HasUpvote,
+    a.HasBronze,
+    COUNT(*) OVER () AS TotalTopPosts
+  FROM Agg a
+  LEFT JOIN PostLinks pl ON pl.PostId = a.PostId
+  LEFT JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+),
+Filtered AS (
+  SELECT
+    w.PostId,
+    w.Title,
+    w.Tags,
+    w.ViewCount,
+    w.Score,
+    w.CreationDate,
+    w.UserId,
+    w.UserName,
+    w.Reputation,
+    w.UserCreationDate,
+    w.LastAccessDate,
+    w.Location,
+    w.HasUpvote,
+    w.HasBronze,
+    w.TotalTopPosts
+  FROM W w
+  WHERE (w.HasUpvote = 1 OR w.HasBronze = 1)
+    AND (w.ViewCount > 50 OR w.Score > 5)
+),
+Final AS (
+  SELECT
+    f.PostId,
+    f.Title,
+    f.Tags,
+    f.ViewCount,
+    f.Score,
+    f.CreationDate,
+    f.UserId,
+    f.UserName,
+    f.Reputation,
+    f.UserCreationDate,
+    f.LastAccessDate,
+    f.Location,
+    f.HasUpvote,
+    f.HasBronze,
+    (SELECT AVG(v.CreationDate) FROM Votes v WHERE v.PostId = f.PostId AND v.VoteTypeId = 2) AS AvgUpvoteDate,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = f.PostId) AS CommentCount,
+    (SELECT STRING_AGG(CASE WHEN bt.Name IS NULL THEN 'Unknown' ELSE bt.Name END, ', ') 
+     FROM Tags t JOIN Posts p3 ON p3.Id = t.Id
+     LEFT JOIN Badges bt ON bt.Id = t.Id
+    ) AS TagMeta
+  FROM Filtered f
+)
+SELECT
+  PostId,
+  Title,
+  Tags,
+  ViewCount,
+  Score,
+  CreationDate,
+  UserId,
+  UserName,
+  Reputation,
+  UserCreationDate,
+  LastAccessDate,
+  Location,
+  HasUpvote,
+  HasBronze,
+  AvgUpvoteDate,
+  CommentCount,
+  TagMeta
+FROM Final
+ORDER BY CreationDate DESC
+LIMIT 100;

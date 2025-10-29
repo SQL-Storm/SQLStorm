@@ -1,0 +1,174 @@
+WITH RECURSIVE RecursiveBadgesCTE AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        b.Date,
+        1 AS BadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE b.Date >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+
+    UNION ALL
+
+    SELECT
+        r.UserId,
+        r.DisplayName,
+        b2.Name,
+        b2.Class,
+        b2.Date,
+        r.BadgeCount + 1
+    FROM RecursiveBadgesCTE r
+    JOIN Badges b2 ON r.UserId = b2.UserId AND b2.Date > r.Date
+    WHERE b2.Date < r.Date + INTERVAL '1 month'
+),
+TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesCount,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerCount
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostStats AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        u.DisplayName AS OwnerName,
+        dense_rank() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        lag(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PrevScore,
+        lead(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS NextScore,
+        length(p.Body) AS BodyLength,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        (SELECT string_agg(DISTINCT ph.Name, ', ')
+         FROM PostHistory phistory
+         JOIN PostHistoryTypes ph ON ph.Id = phistory.PostHistoryTypeId
+         WHERE phistory.PostId = p.Id AND ph.Name LIKE '%Edit%'
+        ) AS EditTypes,
+        (SELECT count(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountTotal
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+),
+DuplicatePostPairs AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pt1.Name AS PostTypeName,
+        pt2.Name AS RelatedPostTypeName,
+        pl.LinkTypeId,
+        lt.Name AS LinkTypeName,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    JOIN PostTypes pt1 ON pt1.Id = p1.PostTypeId
+    JOIN PostTypes pt2 ON pt2.Id = p2.PostTypeId
+    WHERE lt.Name = 'Duplicate'
+),
+UserBadgeSummary AS (
+    SELECT
+        UserId,
+        BadgeClass,
+        count(*) AS BadgeCount
+    FROM Badges
+    GROUP BY UserId, BadgeClass
+),
+PostActivityWindow AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PostSeqNum,
+        lag(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostDate,
+        extract(epoch FROM (p.CreationDate - lag(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)))/3600.0 AS HoursBetweenPosts
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+UserPostGaps AS (
+    SELECT
+        OwnerUserId,
+        avg(case when HoursBetweenPosts IS NOT NULL then HoursBetweenPosts end) AS AvgHoursBetweenPosts,
+        min(case when HoursBetweenPosts IS NOT NULL then HoursBetweenPosts end) AS MinHoursBetweenPosts,
+        max(case when HoursBetweenPosts IS NOT NULL then HoursBetweenPosts end) AS MaxHoursBetweenPosts,
+        count(*) AS TotalPosts
+    FROM PostActivityWindow
+    GROUP BY OwnerUserId
+),
+RecursiveTagSearch(tag, level) AS (
+    SELECT
+        lower(trim(unnest(string_to_array(substring(Tags FROM 2 FOR char_length(Tags)-2), '><')))) AS tag,
+        1
+    FROM Posts
+    WHERE PostTypeId = 1 AND Tags IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        lower(trim(unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')))),
+        r.level + 1
+    FROM Posts p
+    JOIN RecursiveTagSearch r ON r.tag = ANY(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><'))
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND r.level < 3
+)
+SELECT DISTINCT
+    tu.DisplayName AS UserDisplayName,
+    tu.Reputation,
+    tu.UpVotesCount,
+    tu.DownVotesCount,
+    tu.TotalBadges,
+    COALESCE(MAX(CASE WHEN ubs.BadgeClass = 1 THEN ubs.BadgeCount END), 0) AS GoldBadges,
+    COALESCE(MAX(CASE WHEN ubs.BadgeClass = 2 THEN ubs.BadgeCount END), 0) AS SilverBadges,
+    COALESCE(MAX(CASE WHEN ubs.BadgeClass = 3 THEN ubs.BadgeCount END), 0) AS BronzeBadges,
+    ps.Id AS PostId,
+    ps.Title AS PostTitle,
+    ps.PostTypeId,
+    ps.Score,
+    ps.ViewCount,
+    ps.IsClosed,
+    ps.EditTypes,
+    ps.CommentCountTotal,
+    dup.LinkTypeName AS DuplicateType,
+    dup.RelatedPostId,
+    dup.RelatedPostTitle,
+    gap.AvgHoursBetweenPosts,
+    gap.MinHoursBetweenPosts,
+    gap.MaxHoursBetweenPosts,
+    gap.TotalPosts,
+    string_agg(DISTINCT rts.tag, ', ') AS RelatedTags
+FROM TopUsers tu
+JOIN PostStats ps ON ps.OwnerUserId = tu.Id
+LEFT JOIN DuplicatePostPairs dup ON dup.PostId = ps.Id
+LEFT JOIN UserBadgeSummary ubs ON ubs.UserId = tu.Id
+LEFT JOIN UserPostGaps gap ON gap.OwnerUserId = tu.Id
+LEFT JOIN RecursiveTagSearch rts ON rts.tag = ANY(string_to_array(substring(ps.Tags FROM 2 FOR char_length(ps.Tags)-2), '><'))
+WHERE tu.Reputation > 1500
+  AND (ps.Score > 10 OR ps.ViewCount > 1000 OR ps.IsClosed = 1)
+GROUP BY
+    tu.DisplayName, tu.Reputation, tu.UpVotesCount, tu.DownVotesCount, tu.TotalBadges,
+    ps.Id, ps.Title, ps.PostTypeId, ps.Score, ps.ViewCount,
+    ps.IsClosed, ps.EditTypes, ps.CommentCountTotal, dup.LinkTypeName, dup.RelatedPostId,
+    dup.RelatedPostTitle, gap.AvgHoursBetweenPosts, gap.MinHoursBetweenPosts,
+    gap.MaxHoursBetweenPosts, gap.TotalPosts
+ORDER BY tu.Reputation DESC, ps.Score DESC
+LIMIT 100;

@@ -1,0 +1,102 @@
+-- {"query": "4728.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1376} 
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.Comment,
+        ph.Text AS EditDetails,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+),
+UserPostActivity AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.ViewCount) AS AverageViewCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY p.OwnerUserId
+),
+HighActivityUsers AS (
+    SELECT
+        upa.OwnerUserId
+    FROM UserPostActivity upa
+    WHERE upa.TotalPosts > 1000 AND upa.TotalScore > 5000
+),
+PostsWithTags AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Score,
+        p.ViewCount,
+        CASE
+            WHEN p.Tags IS NULL THEN 'No Tags'
+            ELSE SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2)
+        END AS CleanTags,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+),
+PostTagInfo AS (
+    SELECT
+        pwt.PostId,
+        pwt.Title,
+        pwt.OwnerUserId,
+        pwt.CreationDate,
+        pwt.AnswerCount,
+        pwt.FavoriteCount,
+        pwt.Score,
+        pwt.ViewCount,
+        t.TagName,
+        pwt.PreviousPostScore,
+        pwt.NextPostScore,
+        CASE WHEN LENGTH(pwt.CleanTags) > 0 THEN LENGTH(pwt.CleanTags) - LENGTH(REPLACE(pwt.CleanTags, '><', '')) + 1 ELSE 0 END AS NumberOfTags
+    FROM PostsWithTags pwt
+    CROSS APPLY STRING_SPLIT(REPLACE(REPLACE(pwt.CleanTags, '>', '<'), '<', '>'), '>') AS s
+    JOIN Tags t ON t.TagName = s.value
+    WHERE t.TagName IS NOT NULL AND LEN(t.TagName) > 0
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    COALESCE(COUNT(DISTINCT ph.PostId), 0) AS TotalEditedPosts,
+    SUM(CASE WHEN rpe.rn = 1 THEN 1 ELSE 0 END) AS FirstEditCount,
+    SUM(CASE WHEN rpe.rn > 1 THEN 1 ELSE 0 END) AS SubsequentEditCount,
+    AVG(DATEDIFF(day, u.CreationDate, pti.CreationDate)) AS AvgDaysToFirstPost,
+    SUM(CASE WHEN pti.Score > 0 THEN 1 ELSE 0 END) AS PostsWithPositiveScore,
+    SUM(CASE WHEN pti.Score < 0 THEN 1 ELSE 0 END) AS PostsWithNegativeScore,
+    MAX(pti.NumberOfTags) AS MaxTagsInAPost,
+    SUM(CASE WHEN pti.NextPostScore > pti.PreviousPostScore THEN 1 ELSE 0 END) AS PostsWithIncreasingScoreTrend,
+    SUM(pti.FavoriteCount) AS TotalFavoriteCount,
+    CASE
+        WHEN COUNT(DISTINCT rpe.PostId) > 0 THEN
+            ROUND(CAST(SUM(CASE WHEN rpe.rn = 1 THEN 1 ELSE 0 END) AS FLOAT) / COUNT(DISTINCT rpe.PostId) * 100, 2)
+        ELSE 0
+    END AS PercentageOfFirstEdits,
+    UPPER(LEFT(u.Location, 3)) AS LocationPrefix,
+    CASE WHEN u.WebsiteUrl LIKE '%github.com%' THEN 'GitHub' ELSE 'Other' END AS SourcePlatform,
+    CASE
+        WHEN DATEDIFF(day, u.LastAccessDate, GETDATE()) < 30 THEN 'Active'
+        WHEN DATEDIFF(day, u.LastAccessDate, GETDATE()) BETWEEN 30 AND 365 THEN 'Infrequent'
+        ELSE 'Dormant'
+    END AS UserActivityStatus,
+    SUM(CASE WHEN c.UserId = u.Id THEN 1 ELSE 0 END) AS UserCommentsCount
+FROM Users u
+LEFT JOIN RankedPostEdits rpe ON u.Id = rpe.UserId
+LEFT JOIN PostTagInfo pti ON u.Id = pti.OwnerUserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+WHERE u.Id IN (SELECT OwnerUserId FROM HighActivityUsers)
+GROUP BY u.Id, u.DisplayName, u.CreationDate, u.LastAccessDate, u.Location, u.WebsiteUrl
+HAVING COUNT(DISTINCT rpe.PostId) > 10 OR SUM(CASE WHEN pti.Score > 0 THEN 1 ELSE 0 END) > 50
+ORDER BY UserActivityStatus DESC, PercentageOfFirstEdits DESC, TotalFavoriteCount DESC;

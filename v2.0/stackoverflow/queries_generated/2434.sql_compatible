@@ -1,0 +1,123 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.WikiPostId = r.Id
+    where r.Level < 3
+),
+PostVotesSummary as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as UpVotes,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as DownVotes,
+        count(distinct v.UserId) as UniqueVoters,
+        max(v.CreationDate) as LastVoteDate
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(distinct case when b.TagBased = 1 then b.Name else null end) as TagBasedBadges
+    from Badges b
+    group by b.UserId
+),
+OwnerPostsWithRank as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        row_number() over (
+            partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc, p.CreationDate desc
+        ) as RankByScore
+    from Posts p
+    where p.PostTypeId = 1 and p.OwnerUserId is not null
+),
+QualifiedUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        ubc.TagBasedBadges
+    from Users u
+    left join UserBadgeCounts ubc on ubc.UserId = u.Id
+    where u.Reputation > 5000 and u.Views > 10000
+),
+ClosedQuestionsWithReason as (
+    select distinct
+        ph.PostId,
+        ph.CreationDate as ClosedDate,
+        crt.Name as CloseReasonName,
+        ph.UserId as ClosedByUserId
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer) and ph.PostHistoryTypeId = 10
+    where ph.PostId in (select Id from Posts where PostTypeId = 1)
+)
+select
+    q.Id as UserId,
+    q.DisplayName,
+    q.Reputation,
+    q.Location,
+    q.GoldBadges,
+    q.SilverBadges,
+    q.BronzeBadges,
+    ap.Id as TopQuestionId,
+    ap.Title as TopQuestionTitle,
+    ap.Score as TopQuestionScore,
+    ap.ViewCount as TopQuestionViews,
+    phc.ClosedDate,
+    phc.CloseReasonName,
+    phc.ClosedByUserId,
+    pvs.UpVotes as TopQuestionUpVotes,
+    pvs.DownVotes as TopQuestionDownVotes,
+    pvs.UniqueVoters,
+    ts.TagsUsed,
+    concat_ws(' | ', array_agg(distinct rt.TagName order by rt.Level asc, rt.Count desc)) as RelatedTags,
+    avg(ap2.Score) over (partition by q.Id) as AvgTop5QuestionScore
+from QualifiedUsers q
+left join OwnerPostsWithRank ap on ap.OwnerUserId = q.Id and ap.RankByScore <= 5
+left join PostVotesSummary pvs on pvs.PostId = ap.Id
+left join ClosedQuestionsWithReason phc on phc.PostId = ap.Id
+left join lateral (
+    select 
+        string_agg(distinct unnest(string_to_array(
+            regexp_replace(coalesce(ap.Tags, ''), '[<>]', ',', 'g'), ',')) , ',') as TagsUsed
+) ts on true
+left join RecursiveTagHierarchy rt on (',' || coalesce(ap.Tags, '') || ',') like ('%<' || rt.TagName || '>%')
+left join OwnerPostsWithRank ap2 on ap2.OwnerUserId = q.Id and ap2.RankByScore <= 5
+where q.GoldBadges >= 1 
+group by
+    q.Id, q.DisplayName, q.Reputation, q.Location, q.GoldBadges, q.SilverBadges, q.BronzeBadges,
+    ap.Id, ap.Title, ap.Score, ap.ViewCount, phc.ClosedDate, phc.CloseReasonName, phc.ClosedByUserId,
+    pvs.UpVotes, pvs.DownVotes, pvs.UniqueVoters, ts.TagsUsed, AvgTop5QuestionScore
+order by AvgTop5QuestionScore desc nulls last
+limit 50;

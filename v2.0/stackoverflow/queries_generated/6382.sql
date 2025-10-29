@@ -1,0 +1,58 @@
+-- {"query": "6382.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 448} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    b.Class AS BadgeClass,
+    t.TagName,
+    ph.RevisionGUID,
+    ph.CreationDate AS LastRevisionDate,
+    ph.Comment,
+    (
+        SELECT COUNT(*)
+        FROM Votes v
+        WHERE v.PostId = p.Id
+    ) AS TotalVotes,
+    (
+        SELECT STRING_AGG(cl.Name, ', ')
+        FROM CloseReasonTypes cl
+        WHERE cl.Id = (
+            SELECT Comment
+            FROM PostHistory ph2
+            WHERE ph2.PostId = p.Id
+            AND ph2.PostHistoryTypeId = 10
+        )
+    ) AS CloseReason
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+WHERE 
+    u.Reputation > 1000
+    AND p.Score > 0
+    AND p.LastActivityDate > p.CreationDate
+    AND u.Id IN (
+        SELECT UserId
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY UserId
+        HAVING COUNT(*) > 5
+    )
+GROUP BY 
+    u.Id, b.Class
+HAVING 
+    AVG(p.Score) > 10
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC;

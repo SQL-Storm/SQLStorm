@@ -1,0 +1,172 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        CAST(NULL AS INTEGER) AS ParentTagId,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+    UNION ALL
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        parent.Id AS ParentTagId,
+        rh.Depth + 1
+    FROM Tags child
+    JOIN RecursiveTagHierarchy rh ON rh.TagName LIKE '%' || child.TagName || '%'
+    JOIN Tags parent ON parent.Id = rh.Id
+    WHERE child.Id <> rh.Id
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserPostActivity AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionsAsked,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswersProvided,
+        AVG(CASE WHEN p.PostTypeId IN (1, 2) THEN p.Score END) AS AvgPostScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY p.OwnerUserId
+),
+UserActivityRank AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ubc.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubc.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubc.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(upa.QuestionsAsked, 0) AS QuestionsAsked,
+        COALESCE(upa.AnswersProvided, 0) AS AnswersProvided,
+        COALESCE(upa.AvgPostScore, 0) AS AvgPostScore,
+        COALESCE(upa.TotalQuestionViews, 0) AS TotalQuestionViews,
+        COALESCE(upa.LastPostDate, u.CreationDate) AS LastActivity,
+        RANK() OVER (ORDER BY u.Reputation DESC, COALESCE(upa.TotalQuestionViews, 0) DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc ON u.Id = ubc.UserId
+    LEFT JOIN UserPostActivity upa ON u.Id = upa.UserId
+),
+TopTagsWithActivity AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        COUNT(DISTINCT p.OwnerUserId) FILTER (WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1) AS DistinctUsers,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        MAX(p.CreationDate) FILTER (WHERE p.PostTypeId = 1) AS LastQuestionDate
+    FROM Tags t
+    LEFT JOIN Posts p ON POSITION('<' || t.TagName || '>' IN p.Tags) > 0 AND p.PostTypeId = 1
+    GROUP BY t.Id, t.TagName, t.Count
+),
+QuestionDuplicatesCTE AS (
+    SELECT
+        pl.PostId AS DuplicateQuestionId,
+        pl.RelatedPostId AS OriginalQuestionId,
+        pl.CreationDate AS LinkCreationDate,
+        u.DisplayName AS DuplicateOwner,
+        orig.DisplayName AS OriginalOwner,
+        q.Title AS DuplicateTitle,
+        origq.Title AS OriginalTitle
+    FROM PostLinks pl
+    JOIN Posts q ON pl.PostId = q.Id AND q.PostTypeId = 1
+    JOIN Posts origq ON pl.RelatedPostId = origq.Id AND origq.PostTypeId = 1
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    LEFT JOIN Users orig ON origq.OwnerUserId = orig.Id
+    WHERE pl.LinkTypeId = 3
+),
+BadgesWithNullLogic AS (
+    SELECT
+        b.UserId,
+        b.Name,
+        b.Class,
+        CASE
+            WHEN b.TagBased = 1 THEN 'Tag-based'
+            WHEN b.TagBased = 0 THEN 'Named'
+            ELSE 'Unknown'
+        END AS BadgeType,
+        COALESCE(b.Date, DATE '2024-10-01') AS AwardedDate
+    FROM Badges b
+    WHERE b.Name IS NOT NULL AND b.Name <> ''
+),
+RecentCommentActivity AS (
+    SELECT
+        c.UserId,
+        COUNT(*) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(DISTINCT COALESCE(c.UserDisplayName, 'Anonymous'), ', ') AS CommentersDisplayNames
+    FROM Comments c
+    WHERE c.CreationDate > (DATE '2024-10-01' - INTERVAL '90 days')
+    GROUP BY c.UserId
+)
+SELECT
+    uar.Id AS UserId,
+    uar.DisplayName,
+    uar.Reputation,
+    uar.GoldBadges,
+    uar.SilverBadges,
+    uar.BronzeBadges,
+    uar.QuestionsAsked,
+    uar.AnswersProvided,
+    ROUND(uar.AvgPostScore::numeric, 2) AS AvgPostScore,
+    uar.TotalQuestionViews,
+    uar.LastActivity,
+    tta.TagName AS FavoriteTag,
+    tta.Count AS TagUsageCount,
+    tta.DistinctUsers AS TagDistinctUserCount,
+    ROUND(tta.AvgQuestionScore::numeric, 2) AS AvgTagQuestionScore,
+    qd.DuplicateQuestionId,
+    qd.OriginalQuestionId,
+    qd.LinkCreationDate,
+    qd.DuplicateOwner,
+    qd.OriginalOwner,
+    qd.DuplicateTitle,
+    qd.OriginalTitle,
+    bwnl.BadgeType,
+    TO_CHAR(bwnl.AwardedDate, 'YYYY-MM-DD') AS BadgeAwardDate,
+    rca.CommentCount,
+    rca.LastCommentDate,
+    rca.CommentersDisplayNames,
+    ROW_NUMBER() OVER (PARTITION BY uar.Id ORDER BY bwnl.AwardedDate DESC) AS BadgeRecencyRank,
+    CASE 
+      WHEN uar.Reputation > 10000 THEN 'Expert'
+      WHEN uar.Reputation BETWEEN 5000 AND 10000 THEN 'Intermediate'
+      WHEN uar.Reputation BETWEEN 1000 AND 4999 THEN 'Novice'
+      ELSE 'Newbie'
+    END AS UserLevel,
+    CASE
+        WHEN uar.LastActivity < (DATE '2024-10-01' - INTERVAL '1 year') THEN TRUE
+        ELSE FALSE
+    END AS IsInactiveOverYear
+FROM UserActivityRank uar
+LEFT JOIN LATERAL (
+    SELECT
+        tta.TagName,
+        tta.Count,
+        tta.DistinctUsers,
+        tta.AvgQuestionScore
+    FROM TopTagsWithActivity tta
+    WHERE POSITION('<' || tta.TagName || '>' IN (
+        SELECT p.Tags FROM Posts p WHERE p.OwnerUserId = uar.Id AND p.PostTypeId = 1 ORDER BY p.CreationDate DESC LIMIT 1
+    )) > 0
+    ORDER BY tta.Count DESC
+    LIMIT 1
+) tta ON TRUE
+LEFT JOIN QuestionDuplicatesCTE qd ON qd.DuplicateOwner = uar.DisplayName
+LEFT JOIN BadgesWithNullLogic bwnl ON bwnl.UserId = uar.Id
+LEFT JOIN RecentCommentActivity rca ON rca.UserId = uar.Id
+WHERE uar.Reputation IS NOT NULL
+  AND (uar.GoldBadges + uar.SilverBadges + uar.BronzeBadges) >= 3
+  AND (rca.CommentCount IS NULL OR rca.CommentCount > 5)
+ORDER BY uar.UserRank, uar.Reputation DESC, uar.LastActivity DESC;

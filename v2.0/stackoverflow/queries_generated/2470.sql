@@ -1,0 +1,190 @@
+-- {"query": "2470.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1791} 
+WITH UserBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COALESCE(SUM(v.VoteWeight),0) AS VoteWeightSum,
+        MAX(p.LastActivityDate) AS LastPostActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            v.Id,
+            v.PostId,
+            v.UserId,
+            CASE 
+                WHEN vt.Name = 'UpMod' THEN 1
+                WHEN vt.Name = 'DownMod' THEN -1
+                WHEN vt.Name = 'BountyClose' THEN COALESCE(v.BountyAmount,0)
+                ELSE 0
+            END AS VoteWeight
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    ) v ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+TopTagsPerUser AS (
+    SELECT
+        pb.UserId,
+        t.TagName,
+        COUNT(*) AS PostsWithTag
+    FROM Posts p
+    JOIN LATERAL unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><')) AS t(TagName) ON TRUE
+    JOIN Badges pb ON pb.UserId = p.OwnerUserId
+    JOIN Tags t2 ON t2.TagName = t.TagName
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId = 1
+    GROUP BY pb.UserId, t.TagName
+),
+UserTopTagRanks AS (
+    SELECT
+        UserId,
+        TagName,
+        PostsWithTag,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY PostsWithTag DESC, TagName) AS TagRank
+    FROM TopTagsPerUser
+),
+UserWithTopTags AS (
+    SELECT
+        ubc.UserId,
+        ubc.DisplayName,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        ubc.TotalBadges,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        ua.VoteWeightSum,
+        ua.LastPostActivityDate,
+        COALESCE(string_agg(utt.TagName || '(' || utt.PostsWithTag || ')', ', ' ORDER BY utt.TagRank), '') AS TopTags
+    FROM UserBadgeCounts ubc
+    INNER JOIN UserActivity ua ON ua.UserId = ubc.UserId
+    LEFT JOIN UserTopTagRanks utt ON utt.UserId = ubc.UserId AND utt.TagRank <= 3
+    GROUP BY ubc.UserId, ubc.DisplayName, ubc.GoldBadges, ubc.SilverBadges, ubc.BronzeBadges, ubc.TotalBadges, ua.QuestionCount, ua.AnswerCount, ua.CommentCount, ua.VoteWeightSum, ua.LastPostActivityDate
+),
+HighScorePosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 AND (p.Score > 50 OR p.ViewCount > 10000)
+),
+RecentEditsWithHistory AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId AS EditorUserId,
+        u.DisplayName AS EditorName,
+        ph.PostHistoryTypeId,
+        pht.Name AS HistoryTypeName,
+        ph.CreationDate AS EditDate,
+        ph.Comment,
+        ph.Text,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS EditRank
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId IN (4,5,6) -- Edit Title, Edit Body, Edit Tags
+),
+PostLinkDuplicates AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        p.Title AS PostTitle,
+        rp.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    JOIN Posts p ON p.Id = pl.PostId
+    JOIN Posts rp ON rp.Id = pl.RelatedPostId
+    WHERE lt.Name IN ('Duplicate')
+),
+UserSummary AS (
+    SELECT 
+        ut.UserId,
+        ut.DisplayName,
+        ut.GoldBadges,
+        ut.SilverBadges,
+        ut.BronzeBadges,
+        ut.TotalBadges,
+        ut.QuestionCount,
+        ut.AnswerCount,
+        ut.CommentCount,
+        ut.VoteWeightSum,
+        ut.LastPostActivityDate,
+        ut.TopTags,
+        COALESCE(hp.PostTitle, '-') AS TopQuestionTitle,
+        COALESCE(hp.Score, 0) AS TopQuestionScore,
+        COALESCE(hp.ViewCount, 0) AS TopQuestionViews
+    FROM UserWithTopTags ut
+    LEFT JOIN HighScorePosts hp ON hp.OwnerUserId = ut.UserId AND hp.PostRank = 1
+)
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.TotalBadges,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.CommentCount,
+    us.VoteWeightSum,
+    us.LastPostActivityDate,
+    us.TopTags,
+    us.TopQuestionTitle,
+    us.TopQuestionScore,
+    us.TopQuestionViews,
+    JSON_AGG(
+        JSON_BUILD_OBJECT(
+            'PostId', re.PostId,
+            'EditorUserId', re.EditorUserId,
+            'EditorName', re.EditorName,
+            'HistoryType', re.HistoryTypeName,
+            'EditDate', re.EditDate,
+            'Comment', re.Comment,
+            'EditRank', re.EditRank
+        )
+        ORDER BY re.EditDate DESC
+    ) FILTER (WHERE re.PostId IS NOT NULL) AS RecentEdits,
+    COALESCE((
+        SELECT json_agg(json_build_object(
+            'PostId', pld.PostId,
+            'PostTitle', pld.PostTitle,
+            'RelatedPostId', pld.RelatedPostId,
+            'RelatedPostTitle', pld.RelatedPostTitle,
+            'LinkType', pld.LinkTypeName
+        ))
+        FROM PostLinkDuplicates pld
+        WHERE pld.PostId IN (
+            SELECT p.Id FROM Posts p WHERE p.OwnerUserId = us.UserId LIMIT 5
+        )
+    ), '[]'::json) AS SampleDuplicateLinks
+FROM UserSummary us
+LEFT JOIN RecentEditsWithHistory re ON re.PostId IN (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = us.UserId ORDER BY p.CreationDate DESC LIMIT 3
+)
+GROUP BY us.UserId, us.DisplayName, us.GoldBadges, us.SilverBadges, us.BronzeBadges, us.TotalBadges, us.QuestionCount, us.AnswerCount, us.CommentCount, us.VoteWeightSum, us.LastPostActivityDate, us.TopTags, us.TopQuestionTitle, us.TopQuestionScore, us.TopQuestionViews
+ORDER BY us.TotalBadges DESC, us.GoldBadges DESC, us.QuestionCount DESC
+LIMIT 50;

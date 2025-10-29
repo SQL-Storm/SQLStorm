@@ -1,0 +1,110 @@
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(p.PostCnt, 0)                 AS PostCnt,
+           COALESCE(p.AnsCnt, 0)                  AS AnswerCnt,
+           COALESCE(p.QuesCnt, 0)                 AS QuestionCnt,
+           COALESCE(b.GoldCnt, 0)                 AS GoldBadges,
+           COALESCE(b.SilverCnt, 0)               AS SilverBadges,
+           COALESCE(b.BronzeCnt, 0)               AS BronzeBadges,
+           COALESCE(v.UpV, 0) - COALESCE(v.DownV, 0) AS VoteDiff,
+           p.LastActDate
+    FROM Users u
+    LEFT JOIN (
+        SELECT OwnerUserId,
+               COUNT(*)                                   AS PostCnt,
+               SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnsCnt,
+               SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuesCnt,
+               MAX(LastActivityDate)                      AS LastActDate
+        FROM Posts
+        WHERE OwnerUserId IS NOT NULL
+        GROUP BY OwnerUserId
+    ) p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCnt,
+               SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCnt,
+               SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCnt
+        FROM Badges
+        GROUP BY UserId
+    ) b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpV,
+               SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownV
+        FROM Votes
+        GROUP BY UserId
+    ) v ON v.UserId = u.Id
+),
+TopUserTags AS (
+    SELECT us.Id,
+           STRING_AGG(t.TagName, ', ' ORDER BY tag_use_cnt DESC) AS TopTags
+    FROM UserStats us
+    JOIN Posts p ON p.OwnerUserId = us.Id AND p.PostTypeId = 1
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(p.Tags, '[><]') AS Tag
+    ) split_tag
+    JOIN Tags t ON t.TagName = split_tag.Tag
+    GROUP BY us.Id
+),
+RecentClosedQuestions AS (
+    SELECT p.OwnerUserId,
+           SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS Closed30d,
+           SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS Reopened30d
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id
+                         AND ph.PostHistoryTypeId IN (10, 11)
+    WHERE p.PostTypeId = 1
+      AND ph.CreationDate >= DATE '2024-10-01' - INTERVAL '30' DAY
+    GROUP BY p.OwnerUserId
+),
+MainResult AS (
+    SELECT us.Id,
+           us.DisplayName,
+           us.Reputation,
+           us.PostCnt,
+           us.QuestionCnt,
+           us.AnswerCnt,
+           us.GoldBadges,
+           us.SilverBadges,
+           us.BronzeBadges,
+           us.VoteDiff,
+           us.LastActDate,
+           COALESCE(tut.TopTags, '')               AS TopTags,
+           COALESCE(rc.Closed30d, 0)               AS ClosedLast30d,
+           COALESCE(rc.Reopened30d, 0)             AS ReopenedLast30d,
+           CASE
+               WHEN us.Reputation > 100000 THEN 'Legendary'
+               WHEN us.Reputation > 20000  THEN 'Veteran'
+               WHEN us.Reputation > 5000   THEN 'Experienced'
+               ELSE 'Newbie'
+           END                                     AS ReputationTier,
+           ROW_NUMBER() OVER (ORDER BY us.Reputation DESC) AS RankByRep
+    FROM UserStats us
+    LEFT JOIN TopUserTags tut ON tut.Id = us.Id
+    LEFT JOIN RecentClosedQuestions rc ON rc.OwnerUserId = us.Id
+    WHERE (us.PostCnt > 0 OR us.GoldBadges > 0)
+)
+SELECT *
+FROM MainResult
+ORDER BY Reputation DESC
+LIMIT 100
+UNION ALL
+SELECT CAST(NULL AS BIGINT)   AS Id,
+       CAST(NULL AS VARCHAR)  AS DisplayName,
+       CAST(NULL AS INTEGER)  AS Reputation,
+       CAST(NULL AS INTEGER)  AS PostCnt,
+       CAST(NULL AS INTEGER)  AS QuestionCnt,
+       CAST(NULL AS INTEGER)  AS AnswerCnt,
+       CAST(NULL AS INTEGER)  AS GoldBadges,
+       CAST(NULL AS INTEGER)  AS SilverBadges,
+       CAST(NULL AS INTEGER)  AS BronzeBadges,
+       CAST(NULL AS INTEGER)  AS VoteDiff,
+       CAST(NULL AS TIMESTAMP)AS LastActDate,
+       CAST(NULL AS VARCHAR)  AS TopTags,
+       CAST(NULL AS INTEGER)  AS ClosedLast30d,
+       CAST(NULL AS INTEGER)  AS ReopenedLast30d,
+       CAST(NULL AS VARCHAR)  AS ReputationTier,
+       CAST(NULL AS INTEGER)  AS RankByRep
+WHERE FALSE;

@@ -1,0 +1,107 @@
+-- {"query": "7715.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1114} 
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COALESCE(SUM(p.Score), 0) AS TotalScore,
+    COALESCE(AVG(p.Score), 0) AS AverageScore,
+    COUNT(DISTINCT b.Id) AS BadgesReceived,
+    COUNT(DISTINCT c.Id) AS CommentsMade,
+    COUNT(DISTINCT ph.Id) AS PostHistoryEntries,
+    COUNT(DISTINCT pl.Id) AS PostLinks,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+        THEN CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS FLOAT) / CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS FLOAT)
+        ELSE 0 
+    END AS AnswerToQuestionRatio,
+    
+    -- Correlated subquery for calculating reputation rank
+    (SELECT COUNT(*) + 1 
+     FROM Users u2 
+     WHERE u2.Reputation > u.Reputation) AS ReputationRank,
+    
+    -- Window function for ranking by reputation
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRankWindow,
+    
+    -- Complex predicate with string manipulation
+    CASE 
+        WHEN LENGTH(TRIM(u.Location)) > 0 AND u.Location IS NOT NULL 
+        THEN UPPER(SUBSTRING(u.Location, 1, 1)) + LOWER(SUBSTRING(u.Location, 2, LENGTH(u.Location) - 1))
+        ELSE 'Unknown Location'
+    END AS FormattedLocation,
+    
+    -- Set operator to combine different badge types
+    (SELECT COUNT(*) FROM Badges b1 WHERE b1.UserId = u.Id AND b1.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) FROM Badges b3 WHERE b3.UserId = u.Id AND b3.Class = 3) AS BronzeBadges,
+    
+    -- NULL logic with COALESCE
+    COALESCE(u.WebsiteUrl, 'No Website') AS WebsiteInfo,
+    
+    -- CTE to calculate user activity metrics
+    (WITH UserActivity AS (
+        SELECT 
+            u2.Id AS UserId,
+            COUNT(DISTINCT p2.Id) AS PostCount,
+            COUNT(DISTINCT c2.Id) AS CommentCount,
+            COUNT(DISTINCT ph2.Id) AS HistoryCount
+        FROM Users u2
+        LEFT JOIN Posts p2 ON p2.OwnerUserId = u2.Id
+        LEFT JOIN Comments c2 ON c2.UserId = u2.Id
+        LEFT JOIN PostHistory ph2 ON ph2.UserId = u2.Id
+        WHERE u2.Id = u.Id
+        GROUP BY u2.Id
+    )
+    SELECT PostCount + CommentCount + HistoryCount FROM UserActivity) AS TotalActivity,
+    
+    -- Complex date calculations
+    DATEDIFF(DAY, u.CreationDate, NOW()) AS DaysSinceRegistration,
+    CASE 
+        WHEN DATEDIFF(DAY, u.CreationDate, NOW()) > 365 
+        THEN 'Veteran'
+        WHEN DATEDIFF(DAY, u.CreationDate, NOW()) > 180 
+        THEN 'Regular'
+        ELSE 'New'
+    END AS UserTenureCategory
+    
+FROM Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN Comments c ON c.UserId = u.Id
+LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+LEFT JOIN PostLinks pl ON pl.PostId = p.Id OR pl.RelatedPostId = p.Id
+
+WHERE 
+    u.Reputation > 100
+    AND (u.LastAccessDate >= DATEADD(MONTH, -6, NOW()) OR u.LastAccessDate IS NULL)
+    AND (
+        EXISTS (SELECT 1 FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1)
+        OR EXISTS (SELECT 1 FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2)
+        OR EXISTS (SELECT 1 FROM Comments c2 WHERE c2.UserId = u.Id)
+        OR EXISTS (SELECT 1 FROM Badges b2 WHERE b2.UserId = u.Id)
+    )
+    
+GROUP BY 
+    u.Id, 
+    u.DisplayName, 
+    u.Reputation, 
+    u.Location, 
+    u.WebsiteUrl, 
+    u.CreationDate, 
+    u.LastAccessDate
+    
+HAVING 
+    COUNT(DISTINCT p.Id) >= 5
+    AND (
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0
+        OR COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0
+    )
+    
+ORDER BY 
+    u.Reputation DESC,
+    TotalPosts DESC,
+    AverageScore DESC
+LIMIT 1000;

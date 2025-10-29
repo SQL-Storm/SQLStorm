@@ -1,0 +1,111 @@
+-- {"query": "4329.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1273} 
+
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        pht.Name AS HistoryTypeName,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE pht.Id IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+),
+UserPostContribution AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS QuestionsAnswered,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsPosted,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersPosted
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserPostActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(upc.QuestionsPosted, 0) AS TotalQuestions,
+        COALESCE(upc.AnswersPosted, 0) AS TotalAnswers,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND c.Score > 5) AS HighlyScoredComments,
+        (
+            SELECT COUNT(DISTINCT ph.PostId)
+            FROM PostHistory ph
+            JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+            WHERE ph.UserId = u.Id AND pht.Id IN (4, 5, 6) -- Edits
+        ) AS PostsEdited,
+        CASE
+            WHEN u.WebsiteUrl IS NULL THEN 'No Website'
+            WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'SO Related'
+            ELSE 'External'
+        END AS WebsiteCategory,
+        COALESCE(u.Views, 0) AS TotalViews,
+        COALESCE(u.UpVotes, 0) AS TotalUpVotes,
+        COALESCE(u.DownVotes, 0) AS TotalDownVotes
+    FROM Users u
+    LEFT JOIN UserPostContribution upc ON u.Id = upc.OwnerUserId
+    WHERE u.Reputation > 1000
+)
+SELECT
+    upa.DisplayName,
+    upa.Reputation,
+    upa.TotalQuestions,
+    upa.TotalAnswers,
+    upa.GoldBadges,
+    upa.SilverBadges,
+    upa.BronzeBadges,
+    upa.HighlyScoredComments,
+    upa.PostsEdited,
+    upa.WebsiteCategory,
+    upa.TotalViews,
+    upa.TotalUpVotes,
+    upa.TotalDownVotes,
+    CASE
+        WHEN upa.TotalAnswers > 0 THEN ROUND((CAST(upa.TotalAnswers AS NUMERIC) / upa.TotalQuestions), 2)
+        ELSE 0
+    END AS AnswerToQuestionRatio,
+    COALESCE(COUNT(DISTINCT rpe.PostId), 0) AS DistinctPostsEditedByMe,
+    MAX(rpe.CreationDate) AS LastEditDateForUser
+FROM UserPostActivity upa
+LEFT JOIN RankedPostEdits rpe ON upa.UserId = rpe.UserId AND rpe.rn = 1
+GROUP BY
+    upa.DisplayName,
+    upa.Reputation,
+    upa.TotalQuestions,
+    upa.TotalAnswers,
+    upa.GoldBadges,
+    upa.SilverBadges,
+    upa.BronzeBadges,
+    upa.HighlyScoredComments,
+    upa.PostsEdited,
+    upa.WebsiteCategory,
+    upa.TotalViews,
+    upa.TotalUpVotes,
+    upa.TotalDownVotes
+HAVING upa.Reputation > 5000
+UNION
+SELECT
+    'Community User' AS DisplayName,
+    0 AS Reputation,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    COUNT(DISTINCT CASE WHEN c.Score > 5 THEN c.Id END) AS HighlyScoredComments,
+    COUNT(DISTINCT ph.PostId) AS PostsEdited,
+    'Community Driven' AS WebsiteCategory,
+    SUM(p.ViewCount) AS TotalViews,
+    SUM(p.Score) AS TotalUpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS TotalDownVotes
+FROM Posts p
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId = 3 -- Downvotes
+WHERE p.OwnerUserId IS NULL OR p.OwnerUserId = -1
+GROUP BY p.OwnerUserId
+HAVING COUNT(DISTINCT p.Id) > 100;

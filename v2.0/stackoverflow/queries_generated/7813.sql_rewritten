@@ -1,0 +1,214 @@
+-- {"query": "7813.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2159} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(p.Score) AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) FILTER (WHERE p.Tags IS NOT NULL), ', ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        LastPostDate,
+        AvgPostScore,
+        AllTags,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) AS RankByReputation,
+        ROW_NUMBER() OVER (ORDER BY PostCount DESC, Reputation DESC) AS RankByPostCount
+    FROM UserActivityStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        u.DisplayName AS OwnerDisplayName,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'Tag Wiki Excerpt'
+            WHEN p.PostTypeId = 5 THEN 'Tag Wiki'
+            WHEN p.PostTypeId = 6 THEN 'Moderator Nomination'
+            WHEN p.PostTypeId = 7 THEN 'Wiki Placeholder'
+            WHEN p.PostTypeId = 8 THEN 'Privilege Wiki'
+        END AS PostType,
+        COALESCE(p.AnswerCount, 0) AS AnswerCountCoalesced,
+        COALESCE(p.CommentCount, 0) AS CommentCountCoalesced,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCountCoalesced,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 THEN 
+                ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'), 1)
+            ELSE 0 
+        END AS TagCount,
+        COALESCE(p.Score, 0) + COALESCE(p.ViewCount, 0) * 0.1 + COALESCE(p.AnswerCountCoalesced, 0) * 2 AS WeightedScore,
+        DATEDIFF('day', p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceCreation,
+        CASE 
+            WHEN p.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days' THEN 'Active'
+            WHEN p.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' THEN 'Moderately Active'
+            WHEN p.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days' THEN 'Inactive'
+            ELSE 'Very Inactive'
+        END AS ActivityStatus,
+        LAG(p.Score) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score) OVER (ORDER BY p.CreationDate) AS NextScore
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= '2015-01-01'
+      AND p.PostTypeId IN (1, 2)
+),
+TopPosts AS (
+    SELECT 
+        PostId,
+        Title,
+        Score,
+        ViewCount,
+        CreationDate,
+        OwnerUserId,
+        ParentId,
+        PostType,
+        TagCount,
+        WeightedScore,
+        DaysSinceCreation,
+        ActivityStatus,
+        PreviousScore,
+        NextScore,
+        ROW_NUMBER() OVER (ORDER BY WeightedScore DESC) AS RowNum
+    FROM PostAnalysis
+),
+CombinedAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.CommentCount,
+        tu.BadgeCount,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.LastPostDate,
+        tu.AvgPostScore,
+        tu.AllTags,
+        tu.RankByReputation,
+        tu.RankByPostCount,
+        tp.PostId,
+        tp.Title,
+        tp.Score,
+        tp.ViewCount,
+        tp.CreationDate,
+        tp.ParentId,
+        tp.PostType,
+        tp.TagCount,
+        tp.WeightedScore,
+        tp.DaysSinceCreation,
+        tp.ActivityStatus,
+        tp.PreviousScore,
+        tp.NextScore,
+        tp.RowNum,
+        CASE 
+            WHEN tu.BadgeCount > 50 AND tu.Reputation > 10000 THEN 'Elite'
+            WHEN tu.BadgeCount > 25 AND tu.Reputation > 5000 THEN 'Veteran'
+            WHEN tu.Reputation > 1000 THEN 'Experienced'
+            ELSE 'Regular'
+        END AS UserCategory,
+        CASE 
+            WHEN tp.WeightedScore > 1000 THEN 'High Impact'
+            WHEN tp.WeightedScore > 500 THEN 'Medium Impact'
+            WHEN tp.WeightedScore > 100 THEN 'Low Impact'
+            ELSE 'Minimal Impact'
+        END AS PostImpact,
+        CASE 
+            WHEN tp.ActivityStatus = 'Active' AND tp.Score > 10 THEN 'Highly Active and Valuable'
+            WHEN tp.ActivityStatus IN ('Active', 'Moderately Active') AND tp.Score > 5 THEN 'Active and Valuable'
+            ELSE 'Not Particularly Active'
+        END AS ActivityValue
+    FROM TopUsers tu
+    FULL OUTER JOIN TopPosts tp ON tu.UserId = tp.OwnerUserId
+    WHERE (tu.UserId IS NOT NULL AND tu.PostCount > 0) OR (tp.PostId IS NOT NULL)
+)
+SELECT 
+    CONCAT('User: ', COALESCE(ca.DisplayName, 'Unknown'), ' (ID: ', COALESCE(CAST(ca.UserId AS VARCHAR), 'N/A'), ')') AS UserSummary,
+    CONCAT('Post: ', COALESCE(ca.Title, 'No Title'), ' (ID: ', COALESCE(CAST(ca.PostId AS VARCHAR), 'N/A'), ')') AS PostSummary,
+    COALESCE(ca.Reputation, 0) AS UserReputation,
+    COALESCE(ca.Score, 0) AS PostScore,
+    COALESCE(ca.ViewCount, 0) AS PostViews,
+    COALESCE(ca.WeightedScore, 0) AS PostWeightedScore,
+    COALESCE(ca.TagCount, 0) AS TagCount,
+    COALESCE(ca.PostType, 'Unknown') AS PostType,
+    COALESCE(ca.ActivityStatus, 'Unknown') AS ActivityStatus,
+    COALESCE(ca.UserCategory, 'Regular') AS UserCategory,
+    COALESCE(ca.PostImpact, 'Minimal Impact') AS PostImpact,
+    COALESCE(ca.ActivityValue, 'Not Particularly Active') AS ActivityValue,
+    CASE 
+        WHEN ca.PostId IS NOT NULL AND ca.WeightedScore > (SELECT AVG(WeightedScore) FROM CombinedAnalysis WHERE PostId IS NOT NULL) THEN 'Above Average Post'
+        WHEN ca.PostId IS NOT NULL AND ca.WeightedScore <= (SELECT AVG(WeightedScore) FROM CombinedAnalysis WHERE PostId IS NOT NULL) THEN 'Below Average Post'
+        ELSE 'No Post Information'
+    END AS PostPerformance,
+    COALESCE(ca.AllTags, 'No Tags') AS AllTags,
+    COALESCE(CAST(ca.LastPostDate AS VARCHAR), 'Never') AS LastPostDate,
+    COALESCE(CAST(ca.DaysSinceCreation AS VARCHAR), 'N/A') AS DaysSinceCreation,
+    CASE 
+        WHEN ca.UserId IS NOT NULL AND ca.UserId IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE OwnerUserId IS NOT NULL GROUP BY OwnerUserId HAVING COUNT(*) > 100) THEN 'High Volume Author'
+        WHEN ca.UserId IS NOT NULL AND ca.UserId IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE OwnerUserId IS NOT NULL GROUP BY OwnerUserId HAVING COUNT(*) BETWEEN 10 AND 100) THEN 'Medium Volume Author'
+        WHEN ca.UserId IS NOT NULL AND ca.UserId IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE OwnerUserId IS NOT NULL GROUP BY OwnerUserId HAVING COUNT(*) < 10) THEN 'Low Volume Author'
+        ELSE 'No Author Data'
+    END AS AuthorVolumeCategory,
+    CASE 
+        WHEN ca.PostId IS NOT NULL THEN 
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ca.PostId) - 
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ca.PostId AND v.VoteTypeId IN (3, 10))
+        ELSE 0
+    END AS NetCommentPlusVoting
+FROM CombinedAnalysis ca
+WHERE (ca.UserId IS NOT NULL OR ca.PostId IS NOT NULL)
+GROUP BY 
+    ca.UserId, 
+    ca.DisplayName, 
+    ca.Reputation, 
+    ca.Score, 
+    ca.ViewCount,
+    ca.WeightedScore,
+    ca.TagCount,
+    ca.PostType,
+    ca.ActivityStatus,
+    ca.UserCategory,
+    ca.PostImpact,
+    ca.ActivityValue,
+    ca.AllTags,
+    ca.LastPostDate,
+    ca.DaysSinceCreation,
+    ca.PostId,
+    ca.Title
+ORDER BY 
+    CASE WHEN ca.PostId IS NOT NULL THEN ca.WeightedScore ELSE ca.Reputation END DESC,
+    ca.UserId ASC,
+    ca.PostId ASC
+LIMIT 500;

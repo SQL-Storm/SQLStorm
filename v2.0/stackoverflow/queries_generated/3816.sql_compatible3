@@ -1,0 +1,191 @@
+WITH
+    RecentQuestions AS (
+        SELECT p.Id AS QId,
+               p.OwnerUserId,
+               p.CreationDate,
+               p.Tags,
+               p.Score
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+    ),
+    AnswersByTag AS (
+        SELECT t.TagName,
+               a.OwnerUserId,
+               a.Score,
+               a.CreationDate,
+               a.Id AS AnswerId,
+               q.QId,
+               q.Score AS QuestionScore,
+               ROW_NUMBER() OVER (PARTITION BY t.TagName, a.OwnerUserId ORDER BY a.Score DESC) AS rn
+        FROM RecentQuestions q
+        JOIN Posts a ON a.PostTypeId = 2 AND a.ParentId = q.QId
+        CROSS JOIN LATERAL (
+            -- split tags like '<tag1><tag2>' into rows using standard SQL: generate_series-like approach is not portable,
+            -- so unnest string_split emulation: here use a recursive CTE to split tags
+            SELECT tag
+            FROM (
+                WITH RECURSIVE split(tagstr, rest) AS (
+                    SELECT
+                        CASE
+                            WHEN trim(both '<>' FROM q.Tags) = '' THEN NULL
+                            ELSE NULL
+                        END,
+                        trim(both '<>' FROM q.Tags)
+                    UNION ALL
+                    SELECT
+                        CASE
+                            WHEN rest = '' THEN NULL
+                            ELSE
+                                CASE
+                                    WHEN position('><' IN rest) = 0 THEN rest
+                                    ELSE substr(rest, 1, position('><' IN rest) - 1)
+                                END
+                        END,
+                        CASE
+                            WHEN rest = '' THEN ''
+                            WHEN position('><' IN rest) = 0 THEN ''
+                            ELSE substr(rest, position('><' IN rest) + 2)
+                        END
+                    FROM split
+                    WHERE rest IS NOT NULL AND rest <> ''
+                )
+                SELECT tag FROM split WHERE tag IS NOT NULL
+            ) s
+        ) AS taglist(tag)
+        JOIN Tags t ON t.TagName = taglist.tag
+    ),
+    TopAnswers AS (
+        SELECT *
+        FROM AnswersByTag
+        WHERE rn = 1
+    ),
+    UserBadgeCounts AS (
+        SELECT u.Id AS UserId,
+               COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+               COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+               COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+        FROM Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        GROUP BY u.Id
+    ),
+    DuplicateLinkStats AS (
+        SELECT pl.PostId,
+               COUNT(*) AS DuplicateCount,
+               MAX(pl.CreationDate) AS LastDuplicateDate
+        FROM PostLinks pl
+        WHERE pl.LinkTypeId = 3
+        GROUP BY pl.PostId
+    ),
+    UserActivity AS (
+        SELECT u.Id AS UserId,
+               MAX(p.LastActivityDate) AS LastPostActivity,
+               MAX(c.CreationDate) AS LastCommentActivity,
+               COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS UpVoteCount,
+               COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS DownVoteCount
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN Comments c ON c.UserId = u.Id
+        LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId IN (2,3)
+        GROUP BY u.Id
+    ),
+    -- split tags for scalar subquery: take first tag from Posts.Tags for a given question Id
+    FirstTagPerPost AS (
+        SELECT p.Id AS PostId,
+               (SELECT tag FROM (
+                    WITH RECURSIVE split(tagstr, rest) AS (
+                        SELECT
+                            CASE
+                                WHEN trim(both '<>' FROM p.Tags) = '' THEN NULL
+                                ELSE NULL
+                            END,
+                            trim(both '<>' FROM p.Tags)
+                        UNION ALL
+                        SELECT
+                            CASE
+                                WHEN rest = '' THEN NULL
+                                ELSE
+                                    CASE
+                                        WHEN position('><' IN rest) = 0 THEN rest
+                                        ELSE substr(rest, 1, position('><' IN rest) - 1)
+                                    END
+                            END,
+                            CASE
+                                WHEN rest = '' THEN ''
+                                WHEN position('><' IN rest) = 0 THEN ''
+                                ELSE substr(rest, position('><' IN rest) + 2)
+                            END
+                        FROM split
+                        WHERE rest IS NOT NULL AND rest <> ''
+                    )
+                    SELECT tag FROM split WHERE tag IS NOT NULL LIMIT 1
+               ) t) AS FirstTag
+        FROM Posts p
+    )
+SELECT
+    t.TagName,
+    u.DisplayName,
+    u.Reputation,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ta.Score AS TopAnswerScore,
+    ta.QuestionScore,
+    ta.CreationDate AS AnswerCreated,
+    ua.UpVoteCount,
+    ua.DownVoteCount,
+    COALESCE(dls.DuplicateCount,0) AS QuestionDuplicateCount,
+    dls.LastDuplicateDate,
+    CASE
+        WHEN ua.LastPostActivity IS NULL THEN 'Never posted'
+        ELSE CAST(ua.LastPostActivity AS date)
+    END AS LastPostActivityDate,
+    CASE
+        WHEN u.Location IS NULL OR trim(u.Location) = '' THEN 'Unknown'
+        ELSE u.Location
+    END AS UserLocation,
+    EXISTS (
+        SELECT 1
+        FROM PostHistory ph
+        WHERE ph.PostId = ta.AnswerId
+          AND ph.PostHistoryTypeId = 10
+          AND ph.Comment IS NOT NULL
+          AND (
+                CASE
+                  WHEN ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS integer)
+                  ELSE NULL
+                END
+              ) = 101
+    ) AS AnswerEverClosedAsDuplicate
+FROM TopAnswers ta
+JOIN Users u ON u.Id = ta.OwnerUserId
+LEFT JOIN UserBadgeCounts ub ON ub.UserId = u.Id
+LEFT JOIN UserActivity ua ON ua.UserId = u.Id
+LEFT JOIN DuplicateLinkStats dls ON dls.PostId = ta.QId
+JOIN Tags t ON t.TagName = (
+        SELECT FirstTag
+        FROM FirstTagPerPost ftp
+        WHERE ftp.PostId = ta.QId
+    )
+WHERE u.Reputation > 1000
+GROUP BY
+    t.TagName,
+    u.DisplayName,
+    u.Reputation,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ta.Score,
+    ta.QuestionScore,
+    ta.CreationDate,
+    ua.UpVoteCount,
+    ua.DownVoteCount,
+    dls.DuplicateCount,
+    dls.LastDuplicateDate,
+    ua.LastPostActivity,
+    u.Location,
+    ta.AnswerId,
+    ta.OwnerUserId,
+    ta.QId
+ORDER BY t.TagName, ta.Score DESC
+LIMIT 100;

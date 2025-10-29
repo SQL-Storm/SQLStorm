@@ -1,0 +1,233 @@
+-- {"query": "1863.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3457} 
+
+WITH
+    -- CTE 1: Summarize user engagement and calculate various metrics and ratios
+    UserEngagementSummary AS (
+        SELECT
+            U.Id AS UserId,
+            U.DisplayName,
+            U.Reputation,
+            U.CreationDate,
+            U.LastAccessDate,
+            U.Views AS UserProfileViews,
+            U.UpVotes AS TotalUpVotesGiven,
+            U.DownVotes AS TotalDownVotesGiven,
+            COUNT(DISTINCT P.Id) AS TotalPostsByOwner,
+            COUNT(CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionCountByOwner,
+            COUNT(CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswerCountByOwner,
+            COUNT(DISTINCT C.Id) AS TotalCommentsByOwner,
+            SUM(COALESCE(P.Score, 0)) AS TotalPostScoreAggregate,
+            NULLIF(CAST(SUM(CASE WHEN P.PostTypeId = 2 AND P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS NUMERIC) / COUNT(CASE WHEN P.PostTypeId = 2 THEN P.Id END), 0) AS AnswerAcceptanceRate,
+            AVG(COALESCE(P.ViewCount, 0)) FILTER (WHERE P.PostTypeId = 1) AS AvgQuestionViews,
+            COUNT(DISTINCT B.Id) FILTER (WHERE B.Class = 1) AS GoldBadgesCount, -- Count of Gold badges
+            COUNT(DISTINCT B.Id) FILTER (WHERE B.TagBased = TRUE) AS TagBasedBadgesCount, -- Count of tag-based badges
+            MAX(P.LastActivityDate) AS LastPostActivityDate
+        FROM Users U
+        LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+        LEFT JOIN Comments C ON U.Id = C.UserId
+        LEFT JOIN Badges B ON U.Id = B.UserId
+        GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+        HAVING COUNT(P.Id) >= 10 AND U.Reputation > 500
+    ),
+
+    -- CTE 2: Aggregate post history for key events and editors, including correlated subquery for last close reason
+    PostEventHistory AS (
+        SELECT
+            PH.PostId,
+            MAX(PH.CreationDate) AS LastHistoryEntryDate,
+            SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditCount, -- Title, Body, Tags edits
+            MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS LastClosedDate,
+            MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate ELSE NULL END) AS LastReopenedDate,
+            MAX(CASE WHEN PH.PostHistoryTypeId = 35 THEN 1 ELSE 0 END) AS WasMigratedAwayFlag,
+            MAX(CASE WHEN PH.PostHistoryTypeId = 36 THEN 1 ELSE 0 END) AS WasMigratedHereFlag,
+            STRING_AGG(DISTINCT COALESCE(U.DisplayName, PH.UserDisplayName), '; ' ORDER BY COALESCE(U.DisplayName, PH.UserDisplayName)) AS AllUniqueHistoryContributors,
+            -- Correlated subquery to find the name of the last close reason
+            (
+                SELECT CRT.Name
+                FROM PostHistory PH_INNER
+                LEFT JOIN CloseReasonTypes CRT ON PH_INNER.Comment::smallint = CRT.Id -- Assuming Comment stores CloseReasonId for type 10
+                WHERE PH_INNER.PostId = PH.PostId AND PH_INNER.PostHistoryTypeId = 10 AND PH_INNER.Comment IS NOT NULL
+                ORDER BY PH_INNER.CreationDate DESC
+                LIMIT 1
+            ) AS LastCloseReasonName
+        FROM PostHistory PH
+        LEFT JOIN Users U ON PH.UserId = U.Id
+        WHERE PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 35, 36) -- Various history types
+        GROUP BY PH.PostId
+    ),
+
+    -- CTE 3: Analyze global tag popularity and associated wiki/excerpt posts
+    GlobalTagStats AS (
+        SELECT
+            TRIM(LOWER(T.TagName)) AS TagNameNormalized,
+            T.Id AS TagId,
+            T.Count AS TotalTagUseCount,
+            T.ExcerptPostId,
+            T.WikiPostId,
+            SUM(P.Score) FILTER (WHERE P.PostTypeId = 1) AS TaggedQuestionsTotalScore,
+            AVG(P.ViewCount) FILTER (WHERE P.PostTypeId = 1) AS TaggedQuestionsAvgViewCount,
+            MAX(P.LastActivityDate) AS LastTaggedPostActivity
+        FROM Tags T
+        JOIN Posts P ON T.TagName LIKE '%' || unnest(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) || '%'
+        WHERE P.PostTypeId = 1 -- Focus on tags from questions
+        GROUP BY T.Id, T.TagName, T.Count, T.ExcerptPostId, T.WikiPostId
+        HAVING T.Count > 500
+    ),
+
+    -- CTE 4: Identify posts with high comment engagement
+    PostsWithSignificantComments AS (
+        SELECT
+            C.PostId,
+            COUNT(C.Id) AS TotalComments,
+            SUM(C.Score) AS AggregateCommentScore,
+            MAX(C.CreationDate) AS LatestCommentDate,
+            -- Window function to get the text of the highest scored comment
+            MAX(CASE WHEN rn = 1 THEN C.Text END) AS TopScoredCommentText,
+            MAX(CASE WHEN rn = 1 THEN C.Score END) AS TopScoredCommentScore,
+            STRING_AGG(DISTINCT COALESCE(U.DisplayName, C.UserDisplayName), '; ' ORDER BY COALESCE(U.DisplayName, C.UserDisplayName)) AS AllCommenters
+        FROM (
+            SELECT
+                C_inner.*,
+                U_inner.DisplayName,
+                ROW_NUMBER() OVER (PARTITION BY C_inner.PostId ORDER BY C_inner.Score DESC, C_inner.CreationDate DESC) AS rn
+            FROM Comments C_inner
+            LEFT JOIN Users U_inner ON C_inner.UserId = U_inner.Id
+        ) C
+        GROUP BY C.PostId
+        HAVING COUNT(C.Id) > 5 AND SUM(C.Score) >= 10
+    ),
+
+    -- CTE 5: Combine interesting questions and answers using UNION ALL
+    CombinedInterestingPosts AS (
+        -- Highly viewed and scored questions
+        SELECT
+            P.Id AS PostId,
+            'HighViewQuestion' AS InterestingCategory,
+            P.Score,
+            P.CreationDate,
+            P.OwnerUserId,
+            P.ViewCount
+        FROM Posts P
+        WHERE P.PostTypeId = 1 AND P.ViewCount > 10000 AND P.Score > 100
+
+        UNION ALL
+
+        -- Highly scored answers by users with high reputation
+        SELECT
+            P.Id AS PostId,
+            'HighScoreAnswerFromReputableUser' AS InterestingCategory,
+            P.Score,
+            P.CreationDate,
+            P.OwnerUserId,
+            P.ViewCount
+        FROM Posts P
+        JOIN Users U ON P.OwnerUserId = U.Id
+        WHERE P.PostTypeId = 2 AND P.Score > 50 AND U.Reputation > 5000 AND P.AcceptedAnswerId IS NOT NULL
+
+        UNION ALL
+
+        -- Questions that were closed and then reopened
+        SELECT
+            P.Id AS PostId,
+            'ClosedAndReopenedQuestion' AS InterestingCategory,
+            P.Score,
+            P.CreationDate,
+            P.OwnerUserId,
+            P.ViewCount
+        FROM Posts P
+        JOIN PostEventHistory PEH ON P.Id = PEH.PostId
+        WHERE P.PostTypeId = 1 AND PEH.LastClosedDate IS NOT NULL AND PEH.LastReopenedDate IS NOT NULL AND PEH.LastReopenedDate > PEH.LastClosedDate
+    )
+
+-- Main query: Joins all CTEs and applies complex filtering, window functions, and string/null logic
+SELECT
+    UES.DisplayName AS AuthorDisplayName,
+    UES.Reputation,
+    UES.TotalPostsByOwner,
+    UES.QuestionCountByOwner,
+    UES.AnswerCountByOwner,
+    UES.AvgQuestionViews,
+    UES.GoldBadgesCount,
+    UES.TagBasedBadgesCount,
+    P.Id AS PostId,
+    PT.Name AS PostTypeName,
+    COALESCE(P.Title, 'Untitled Post') AS PostTitle,
+    P.CreationDate AS PostCreationDate,
+    P.Score AS PostScore,
+    COALESCE(P.ViewCount, 0) AS PostViewCount,
+    COALESCE(P.AnswerCount, 0) AS PostAnswerCount,
+    COALESCE(P.FavoriteCount, 0) AS PostFavoriteCount,
+    P.LastActivityDate,
+    COALESCE(P.ClosedDate, PEH.LastClosedDate) AS EffectiveClosedTimestamp,
+    PEH.TotalEditCount,
+    PEH.LastCloseReasonName,
+    PEH.AllUniqueHistoryContributors,
+    PSC.TotalComments AS PostTotalComments,
+    PSC.AggregateCommentScore AS PostAggregateCommentScore,
+    PSC.TopScoredCommentText,
+    PSC.TopScoredCommentScore,
+    -- Lateral join to find the most popular associated tag for this specific post
+    MostPopularPostTag.TagNameNormalized AS MostImpactfulTag,
+    MostPopularPostTag.TotalTagUseCount AS MostImpactfulTagGlobalCount,
+    MostPopularPostTag.TaggedQuestionsTotalScore AS MostImpactfulTagScore,
+    -- Window function: Rank posts by score within each user and post type
+    RANK() OVER (PARTITION BY UES.UserId, P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS UserPostRankByScore,
+    -- Window function: Calculate the cumulative sum of scores for posts by a user over time
+    SUM(P.Score) OVER (PARTITION BY UES.UserId ORDER BY P.CreationDate) AS CumulativeUserPostScore,
+    -- String manipulations and conditional logic on post body/title
+    UPPER(SUBSTRING(COALESCE(P.Title, 'N/A'), 1, 1)) AS FirstCharOfTitle,
+    CASE
+        WHEN P.Body ILIKE '%performance%' AND P.Body ILIKE '%optimization%' AND P.Body ILIKE '%speed%' THEN 'Triple Threat Performance'
+        WHEN P.Body ILIKE '%security%' AND P.Body ILIKE '%vulnerability%' THEN 'Critical Security Concern'
+        WHEN P.Body ILIKE '%error%' AND (P.Body ILIKE '%exception%' OR P.Body ILIKE '%bug%') THEN 'Specific Error/Bug Report'
+        WHEN P.Body IS NULL OR LENGTH(P.Body) < 100 OR P.Body NOT LIKE '%<p>%' THEN 'Minimal/Invalid Body Content'
+        ELSE 'General Technical Discussion'
+    END AS PostContentCategory,
+    -- Correlated subquery: Check if the post has any 'Linked' posts (LinkTypeId = 1)
+    (
+        SELECT COUNT(1)
+        FROM PostLinks PL
+        WHERE PL.PostId = P.Id AND PL.LinkTypeId = 1
+    ) AS HasLinkedPostsCount,
+    -- Check if the post appears in any of the 'interesting' categories
+    CIP.InterestingCategory AS OverallInterestingPostClassification,
+    -- NULL logic using COALESCE for display names and a complex calculation
+    COALESCE(P.OwnerDisplayName, UES.DisplayName, 'Community User') AS EffectiveOwnerDisplayName,
+    COALESCE(P.LastEditorDisplayName, (SELECT U_inner.DisplayName FROM Users U_inner WHERE U_inner.Id = P.LastEditorUserId), 'No Editor') AS EffectiveLastEditorDisplayName,
+    -- Calculate days since last activity versus creation, with NULL handling
+    EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) / (60 * 60 * 24) AS DaysSinceCreationToLastActivity,
+    NULLIF(CAST(P.Score AS NUMERIC) * COALESCE(P.ViewCount, 1) / (EXTRACT(EPOCH FROM (NOW() - P.CreationDate)) / (60 * 60 * 24) + 1), 0) AS PostEngagementMetric
+FROM Users U
+JOIN UserEngagementSummary UES ON U.Id = UES.UserId
+JOIN Posts P ON U.Id = P.OwnerUserId
+JOIN PostTypes PT ON P.PostTypeId = PT.Id
+LEFT JOIN PostEventHistory PEH ON P.Id = PEH.PostId
+LEFT JOIN PostsWithSignificantComments PSC ON P.Id = PSC.PostId
+LEFT JOIN LATERAL ( -- Lateral join to dynamically find the most impactful tag for THIS post
+    SELECT GTS.TagNameNormalized, GTS.TotalTagUseCount, GTS.TaggedQuestionsTotalScore
+    FROM GlobalTagStats GTS
+    WHERE P.Tags IS NOT NULL
+      AND P.Tags LIKE '%' || GTS.TagNameNormalized || '%' -- Match tags from the post's tag string
+    ORDER BY GTS.TotalTagUseCount DESC, GTS.TaggedQuestionsTotalScore DESC
+    LIMIT 1
+) AS MostPopularPostTag ON TRUE
+LEFT JOIN CombinedInterestingPosts CIP ON P.Id = CIP.PostId
+WHERE
+    UES.Reputation > 10000 -- Focus on highly reputable users
+    AND P.CreationDate > NOW() - INTERVAL '5 years' -- Posts from the last 5 years
+    AND P.Score > 50 -- Only highly scored posts
+    AND P.PostTypeId IN (1, 2) -- Only Questions and Answers
+    AND (
+        (P.AcceptedAnswerId IS NOT NULL AND P.PostTypeId = 1) OR -- Questions with an accepted answer
+        (PEH.TotalEditCount > 5 AND PEH.LastClosedDate IS NOT NULL AND PEH.LastReopenedDate IS NOT NULL AND PEH.LastReopenedDate > PEH.LastClosedDate) OR -- Heavily edited, closed, and then reopened posts
+        (PSC.TotalComments > 15 AND PSC.AggregateCommentScore > 30 AND PSC.LatestCommentDate > NOW() - INTERVAL '1 year') OR -- Posts with significant recent comment activity
+        (CIP.InterestingCategory IS NOT NULL) -- Include posts identified as 'interesting' by previous CTEs
+    )
+    AND P.Body IS NOT NULL AND LENGTH(P.Body) > 200 AND P.Body LIKE '%<p>%' -- Ensure substantial and well-formatted body content
+    AND P.Title IS NOT NULL AND LENGTH(P.Title) > 10
+ORDER BY
+    UES.Reputation DESC,
+    P.LastActivityDate DESC,
+    P.Score DESC,
+    PostEngagementMetric DESC
+LIMIT 7500;

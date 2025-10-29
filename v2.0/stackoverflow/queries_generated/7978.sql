@@ -1,0 +1,279 @@
+-- {"query": "7978.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2855} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as RepRank,
+        DENSE_RANK() OVER (ORDER BY u.Views DESC) as ViewRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        AvgPostScore,
+        LastPostDate,
+        RepRank,
+        ViewRank,
+        CASE 
+            WHEN RepRank <= 10 THEN 'Top 10'
+            WHEN RepRank <= 50 THEN 'Top 50'
+            WHEN RepRank <= 100 THEN 'Top 100'
+            ELSE 'Others'
+        END as RepTier
+    FROM UserStats
+    WHERE PostCount > 0
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        COALESCE(p.ParentId, 0) as ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'High Impact'
+            WHEN p.Score > 10 THEN 'Medium Impact'
+            ELSE 'Low Impact'
+        END as ImpactLevel,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'Viral'
+            WHEN p.ViewCount > 100 THEN 'Popular'
+            WHEN p.ViewCount > 10 THEN 'Noticeable'
+            ELSE 'Obscure'
+        END as Popularity,
+        STRING_AGG(t.TagName, ', ') as TagList,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 1 THEN ph.CreationDate END) as InitialTitleDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 2 THEN ph.CreationDate END) as InitialBodyDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) as ClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 12 THEN ph.CreationDate END) as DeletedDate
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN (
+        SELECT 
+            Id, 
+            unnest(string_to_array(substring(Tags, 2, length(Tags)-2), '><')) as TagName
+        FROM Posts
+        WHERE Tags IS NOT NULL AND Tags != ''
+    ) t ON p.Id = t.Id
+    WHERE p.CreationDate >= '2022-01-01'::timestamp
+    GROUP BY p.Id, p.PostTypeId, p.Title, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Tags, p.ParentId
+),
+UserPostSummary AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId IN (3, 5) THEN p.Id END) as WikiCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE NULL END) as AvgQuestionViews,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.ViewCount ELSE NULL END) as AvgAnswerViews,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, '; ') as QuestionTitles,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Title END, '; ') as AnswerTitles,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as UpVotesReceived,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) as DownVotesReceived,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) as FavoriteCount,
+        MAX(p.CreationDate) as LatestPostDate,
+        MAX(v.CreationDate) as LatestVoteDate,
+        EXTRACT(EPOCH FROM (MAX(p.CreationDate) - MIN(p.CreationDate))) / 86400 as DaysActive,
+        PERCENT_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id)) as ActivityPercentile,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Active'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Moderate'
+            ELSE 'Passive'
+        END as ActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE u.Reputation > 5000 
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.PostCount,
+    tu.CommentCount,
+    tu.BadgeCount,
+    tu.AvgPostScore,
+    tu.LastPostDate,
+    tu.RepTier,
+    tu.RepRank,
+    tu.ViewRank,
+    pa.PostId,
+    pa.Title,
+    pa.PostType,
+    pa.ImpactLevel,
+    pa.Popularity,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.Tags,
+    pa.TagList,
+    pa.InitialTitleDate,
+    pa.InitialBodyDate,
+    pa.ClosedDate,
+    pa.DeletedDate,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.WikiCount,
+    ups.TotalQuestionScore,
+    ups.TotalAnswerScore,
+    ups.AvgQuestionViews,
+    ups.AvgAnswerViews,
+    ups.QuestionTitles,
+    ups.AnswerTitles,
+    ups.VoteCount,
+    ups.UpVotesReceived,
+    ups.DownVotesReceived,
+    ups.FavoriteCount,
+    ups.LatestPostDate,
+    ups.LatestVoteDate,
+    ups.DaysActive,
+    ups.ActivityPercentile,
+    ups.ActivityLevel,
+    CASE 
+        WHEN tu.BadgeCount >= 50 THEN 'Elite'
+        WHEN tu.BadgeCount >= 25 THEN 'Veteran'
+        WHEN tu.BadgeCount >= 10 THEN 'Experienced'
+        ELSE 'Beginner'
+    END as BadgeTier,
+    CASE 
+        WHEN tu.Reputation >= 100000 THEN 'Legendary'
+        WHEN tu.Reputation >= 50000 THEN 'Master'
+        WHEN tu.Reputation >= 10000 THEN 'Expert'
+        WHEN tu.Reputation >= 1000 THEN 'Intermediate'
+        ELSE 'Novice'
+    END as ReputationTier,
+    CASE 
+        WHEN pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 1.5 THEN 'Outstanding'
+        WHEN pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 1.2 THEN 'Above Average'
+        WHEN pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 0.8 THEN 'Below Average'
+        ELSE 'Poor'
+    END as PerformanceCategory,
+    CASE 
+        WHEN pa.AnswerCount > 0 THEN ROUND(100.0 * pa.AnswerCount / NULLIF(pa.AnswerCount + pa.CommentCount, 0), 2)
+        ELSE 0.0
+    END as AnswerPercentage,
+    CASE 
+        WHEN ups.QuestionCount > 0 THEN ROUND(100.0 * ups.AnswerCount / NULLIF(ups.QuestionCount, 0), 2)
+        ELSE 0.0
+    END as AnswerToQuestionRatio,
+    ROW_NUMBER() OVER (ORDER BY tu.Reputation DESC, pa.Score DESC) as OverallRanking,
+    RANK() OVER (PARTITION BY tu.RepTier ORDER BY pa.Score DESC) as TierRanking,
+    DENSE_RANK() OVER (ORDER BY pa.ViewCount DESC) as ViewRanking,
+    CASE 
+        WHEN pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts) * 2 THEN 'Viral Content'
+        WHEN pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts) * 1.5 THEN 'High Traffic'
+        WHEN pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts) * 1.0 THEN 'Standard Traffic'
+        ELSE 'Low Traffic'
+    END as TrafficLevel,
+    CASE 
+        WHEN pa.ViewCount > 1000 AND pa.Score > 50 THEN 'Golden Post'
+        WHEN pa.ViewCount > 500 AND pa.Score > 25 THEN 'Solid Post'
+        WHEN pa.ViewCount > 100 AND pa.Score > 10 THEN 'Good Post'
+        ELSE 'Regular Post'
+    END as PostQuality,
+    CASE 
+        WHEN ups.VoteCount > 0 THEN ROUND(100.0 * ups.UpVotesReceived / NULLIF(ups.VoteCount, 0), 2)
+        ELSE 0.0
+    END as UpVotePercentage,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = tu.UserId AND PostTypeId = 1) > 0 
+        THEN ROUND(1.0 * COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) / 
+                 NULLIF((SELECT COUNT(*) FROM Posts WHERE OwnerUserId = tu.UserId), 0), 3)
+        ELSE 0.0
+    END as QuestionContribution,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = tu.UserId AND PostTypeId = 2) > 0 
+        THEN ROUND(1.0 * COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) / 
+                 NULLIF((SELECT COUNT(*) FROM Posts WHERE OwnerUserId = tu.UserId), 0), 3)
+        ELSE 0.0
+    END as AnswerContribution,
+    (SELECT COUNT(*) FROM Votes WHERE PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = tu.UserId) AND VoteTypeId = 2) as TotalUpvotesReceived,
+    (SELECT COUNT(*) FROM Votes WHERE PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = tu.UserId) AND VoteTypeId = 3) as TotalDownvotesReceived,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = tu.UserId AND AnswerCount > 0) as PostsWithAnswers,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = tu.UserId AND CommentCount > 0) as PostsWithComments,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = tu.UserId AND FavoriteCount > 0) as PostsWithFavorites
+FROM TopUsers tu
+INNER JOIN PostAnalysis pa ON tu.UserId = pa.OwnerUserId
+LEFT JOIN UserPostSummary ups ON tu.UserId = ups.UserId
+LEFT JOIN Posts p ON tu.UserId = p.OwnerUserId
+WHERE tu.UserId IN (
+    SELECT UserId FROM (
+        SELECT UserId, COUNT(*) as PostCount 
+        FROM Posts 
+        WHERE PostTypeId = 1 
+        GROUP BY UserId 
+        HAVING COUNT(*) > 0
+    ) ranked
+    WHERE PostCount > (
+        SELECT AVG(PostCount) 
+        FROM (
+            SELECT UserId, COUNT(*) as PostCount 
+            FROM Posts 
+            WHERE PostTypeId = 1 
+            GROUP BY UserId
+        ) avg_calc
+    )
+)
+AND pa.Score > (
+    SELECT AVG(Score) 
+    FROM Posts 
+    WHERE PostTypeId = 1
+)
+AND (pa.ViewCount > (
+    SELECT AVG(ViewCount) 
+    FROM Posts 
+    WHERE PostTypeId = 1
+) OR pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 1.5)
+AND tu.Reputation > (
+    SELECT AVG(Reputation) 
+    FROM Users
+)
+AND (
+    ups.QuestionCount > 5 OR ups.AnswerCount > 10 OR ups.WikiCount > 2
+)
+ORDER BY 
+    tu.Reputation DESC, 
+    pa.Score DESC, 
+    pa.ViewCount DESC,
+    tu.LastPostDate DESC
+LIMIT 1000
+OFFSET 0;

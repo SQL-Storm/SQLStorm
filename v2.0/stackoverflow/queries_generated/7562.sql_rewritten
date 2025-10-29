@@ -1,0 +1,228 @@
+-- {"query": "7562.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1950} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            WHEN u.Reputation >= 100 THEN 'Novice'
+            ELSE 'Beginner'
+        END AS UserLevel,
+        ROUND(
+            CAST(COUNT(DISTINCT p.Id) AS FLOAT) / NULLIF(DATEDIFF(DAY, u.CreationDate, cast('2024-10-01 12:34:56' as timestamp)), 0) * 30, 2
+        ) AS AvgPostsPerMonth
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        u.DisplayName AS Author,
+        u.Reputation AS AuthorReputation,
+        STRING_AGG(
+            CASE 
+                WHEN p.Tags IS NOT NULL THEN SUBSTRING(p.Tags, 2, LEN(p.Tags) - 2)
+                ELSE ''
+            END, 
+            ' | '
+        ) AS TagsList,
+        (p.Score + p.ViewCount) AS CombinedScore,
+        ROW_NUMBER() OVER (ORDER BY (p.Score + p.ViewCount) DESC) AS RankInCombinedScore
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 
+        AND p.Score > 0 
+        AND p.ViewCount > 0
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.CreationDate, u.DisplayName, u.Reputation
+),
+QuestionAnalysis AS (
+    SELECT 
+        tq.QuestionId,
+        tq.Title,
+        tq.Score,
+        tq.ViewCount,
+        tq.AnswerCount,
+        tq.CommentCount,
+        tq.Author,
+        tq.AuthorReputation,
+        tq.TagsList,
+        tu.UserLevel,
+        tu.AvgPostsPerMonth,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM PostHistory ph 
+             WHERE ph.PostId = tq.QuestionId 
+               AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15)
+            ), 
+            0
+        ) AS ActivityCount,
+        CASE 
+            WHEN tq.Score > 10 THEN 'Popular'
+            WHEN tq.Score > 5 THEN 'Moderate'
+            WHEN tq.Score > 0 THEN 'Weak'
+            ELSE 'Inactive'
+        END AS PopularityCategory,
+        CASE 
+            WHEN tq.AnswerCount > 0 THEN 
+                CAST(tq.CommentCount AS FLOAT) / NULLIF(tq.AnswerCount, 0)
+            ELSE 0 
+        END AS AvgCommentsPerAnswer
+    FROM TopQuestions tq
+    JOIN UserStats tu ON tq.Author = tu.DisplayName
+    WHERE tu.Reputation > 1000
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) AS HistoryCount,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        STRING_AGG(
+            CASE 
+                WHEN ph.PostHistoryTypeId = 10 THEN 'Closed'
+                WHEN ph.PostHistoryTypeId = 11 THEN 'Reopened'
+                WHEN ph.PostHistoryTypeId = 12 THEN 'Deleted'
+                WHEN ph.PostHistoryTypeId = 13 THEN 'Undeleted'
+                ELSE 'Other'
+            END, 
+            ', '
+        ) AS HistoryTypes,
+        COUNT(
+            CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN 1 END
+        ) AS CloseReopenCount,
+        COUNT(
+            CASE WHEN ph.PostHistoryTypeId IN (12, 13) THEN 1 END
+        ) AS DeleteUndeleteCount
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+PostAnalysis AS (
+    SELECT 
+        q.QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.Author,
+        q.AuthorReputation,
+        q.TagsList,
+        q.UserLevel,
+        q.AvgPostsPerMonth,
+        q.ActivityCount,
+        q.PopularityCategory,
+        q.AvgCommentsPerAnswer,
+        ph.HistoryCount,
+        ph.LastHistoryDate,
+        ph.HistoryTypes,
+        ph.CloseReopenCount,
+        ph.DeleteUndeleteCount,
+        CASE 
+            WHEN q.Score > 5 AND q.ViewCount > 100 AND q.AnswerCount >= 1 THEN 'Active Q&A'
+            WHEN q.Score > 0 AND q.ViewCount > 50 THEN 'Engaged'
+            WHEN q.Score > 0 THEN 'Simple'
+            ELSE 'Basic'
+        END AS EngagementLevel
+    FROM QuestionAnalysis q
+    LEFT JOIN PostHistorySummary ph ON q.QuestionId = ph.PostId
+),
+ComplexFilter AS (
+    SELECT 
+        pa.QuestionId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.Author,
+        pa.AuthorReputation,
+        pa.TagsList,
+        pa.UserLevel,
+        pa.AvgPostsPerMonth,
+        pa.ActivityCount,
+        pa.PopularityCategory,
+        pa.AvgCommentsPerAnswer,
+        pa.HistoryCount,
+        pa.LastHistoryDate,
+        pa.HistoryTypes,
+        pa.CloseReopenCount,
+        pa.DeleteUndeleteCount,
+        pa.EngagementLevel,
+        DENSE_RANK() OVER (
+            PARTITION BY pa.PopularityCategory 
+            ORDER BY pa.Score DESC, pa.ViewCount DESC
+        ) AS CategoryRank,
+        NTILE(10) OVER (ORDER BY pa.Score DESC) AS ScoreDecile,
+        ROW_NUMBER() OVER (ORDER BY pa.ViewCount DESC) AS ViewRank
+    FROM PostAnalysis pa
+    WHERE pa.Score > 0 
+        AND pa.AnswerCount > 0
+        AND pa.AuthorReputation > 500
+        AND pa.ActivityCount > 0
+)
+SELECT TOP 1000
+    cf.QuestionId AS [Question ID],
+    cf.Title AS [Question Title],
+    cf.Score AS [Votes],
+    cf.ViewCount AS [Views],
+    cf.AnswerCount AS [Answers],
+    cf.CommentCount AS [Comments],
+    cf.Author AS [Author Name],
+    cf.AuthorReputation AS [Author Rep],
+    cf.TagsList AS [Tags],
+    cf.UserLevel AS [User Level],
+    ISNULL(cf.AvgPostsPerMonth, 0) AS [Avg Posts/Month],
+    cf.ActivityCount AS [Activity Events],
+    cf.PopularityCategory AS [Popularity],
+    ROUND(cf.AvgCommentsPerAnswer, 2) AS [Avg Comments/Answer],
+    cf.HistoryCount AS [History Events],
+    cf.LastHistoryDate AS [Last Activity],
+    cf.HistoryTypes AS [Activity Types],
+    cf.CloseReopenCount AS [Close/Reopen],
+    cf.DeleteUndeleteCount AS [Delete/Undelete],
+    cf.EngagementLevel AS [Engagement],
+    cf.CategoryRank AS [Per Category Rank],
+    cf.ScoreDecile AS [Score Decile],
+    cf.ViewRank AS [View Rank],
+    CASE 
+        WHEN cf.Score > 100 THEN 'High'
+        WHEN cf.Score > 50 THEN 'Medium'
+        WHEN cf.Score > 10 THEN 'Low'
+        ELSE 'Very Low'
+    END AS [Score Category],
+    CASE 
+        WHEN cf.ViewCount > 1000 THEN 'Viral'
+        WHEN cf.ViewCount > 500 THEN 'Popular'
+        WHEN cf.ViewCount > 100 THEN 'Noticeable'
+        ELSE 'Obscure'
+    END AS [View Category],
+    DATEDIFF(DAY, cf.LastHistoryDate, cast('2024-10-01 12:34:56' as timestamp)) AS [Days Since Last Act],
+    CASE 
+        WHEN cf.HistoryTypes LIKE '%Closed%' AND cf.HistoryTypes LIKE '%Reopened%' THEN 'Closed-Reopened'
+        WHEN cf.HistoryTypes LIKE '%Closed%' THEN 'Closed'
+        WHEN cf.HistoryTypes LIKE '%Deleted%' THEN 'Deleted'
+        ELSE 'Stable'
+    END AS [Post Status]
+FROM ComplexFilter cf
+WHERE cf.ViewRank <= 500
+    AND (cf.CloseReopenCount > 0 OR cf.DeleteUndeleteCount > 0 OR cf.HistoryCount > 5)
+    AND cf.AnswerCount >= 2
+ORDER BY cf.ViewCount DESC, cf.Score DESC, cf.LastHistoryDate DESC;

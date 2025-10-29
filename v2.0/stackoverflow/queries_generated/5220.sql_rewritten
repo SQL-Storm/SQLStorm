@@ -1,0 +1,118 @@
+-- {"query": "5220.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 843} 
+WITH recent_user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.AccountId,
+    -- rank users by last activity
+    ROW_NUMBER() OVER (ORDER BY COALESCE(u.LastAccessDate, u.CreationDate) DESC) AS rn
+  FROM Users u
+),
+popular_tags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.IsModeratorOnly,
+    t.IsRequired,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+  FROM Tags t
+  WHERE t.Count IS NOT NULL
+),
+extensive_post_metrics AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    COALESCE(a.Id, 0) AS AcceptedAnswerId,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount,
+    COALESCE(p.CommentCount, 0) AS CommentCount,
+    -- derived numeric expression: engagement score
+    (COALESCE(p.ViewCount,0) * 0.5 + COALESCE(p.Score,0) * 2 + COALESCE(p.CommentCount,0) * 3 + COALESCE(p.AnswerCount,0) * 4) AS EngagementScore
+  FROM Posts p
+  LEFT JOIN Posts a ON p.AcceptedAnswerId = a.Id
+  -- include only questions with at least one tag and recent activity
+  WHERE p.PostTypeId = 1
+    AND p.Tags IS NOT NULL
+    AND p.LastActivityDate > cast('2024-10-01' as date) - INTERVAL '180 days'
+),
+cross_joined AS (
+  SELECT
+    e.PostId,
+    e.Title,
+    e.Tags,
+    e.Score,
+    e.ViewCount,
+    e.CreationDate,
+    e.LastActivityDate,
+    e.OwnerUserId,
+    e.OwnerDisplayName,
+    e.AcceptedAnswerId,
+    e.AnswerCount,
+    e.CommentCount,
+    e.EngagementScore,
+    u.Reputation,
+    u.Location,
+    b.Name AS BadgeName,
+    v.VoteTypeId
+  FROM extensive_post_metrics e
+  CROSS JOIN LATERAL (
+    SELECT TOP 1 b.Name
+    FROM Badges b
+    WHERE b.UserId = e.OwnerUserId
+    ORDER BY b.Date DESC
+  ) b
+  LEFT JOIN Users u ON u.Id = e.OwnerUserId
+  LEFT JOIN Votes v ON v.PostId = e.PostId
+  WHERE u.Reputation IS NOT NULL
+),
+final_series AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.Tags,
+    c.Score,
+    c.ViewCount,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.OwnerUserId,
+    c.OwnerDisplayName,
+    c.AcceptedAnswerId,
+    c.AnswerCount,
+    c.CommentCount,
+    c.EngagementScore,
+    c.Reputation,
+    c.Location,
+    c.BadgeName,
+    c.VoteTypeId,
+    -- windowed metrics: running average engagement by owner and by post type
+    AVG(c.EngagementScore) OVER (PARTITION BY c.OwnerUserId) AS AvgEngagementByUser,
+    SUM(c.EngagementScore) OVER (PARTITION BY c.PostTypeId) AS SumEngagementByType
+  FROM cross_joined c
+)
+SELECT
+  PostId,
+  Title,
+  Tags,
+  Score,
+  ViewCount,
+  CreationDate,
+  LastActivityDate,
+  OwnerDisplayName,
+  Reputation,
+  BadgeName,
+  VoteTypeId,
+  AvgEngagementByUser,
+  SumEngagementByType
+FROM final_series
+ORDER BY EngagementScore DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

@@ -1,0 +1,109 @@
+-- {"query": "5814.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 756} 
+WITH TopQuestions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.LastActivityDate,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+TagStats AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS QuestionCount,
+    AVG(p.Score) AS AvgScore,
+    AVG(p.ViewCount) AS AvgViews,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM TopQuestions q
+  CROSS APPLY (SELECT value AS TagName
+               FROM string_to_table(q.Tags, '<>')) AS t
+  GROUP BY t.TagName
+),
+ActivityWindow AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.LastEditDate,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesInWindow,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesInWindow
+  FROM Posts p
+  LEFT JOIN Votes v
+    ON v.PostId = p.Id
+   AND v.CreationDate >= NOW() - INTERVAL '30 days'
+  WHERE p.PostTypeId = 1
+  GROUP BY
+    p.Id, p.OwnerUserId, p.LastActivityDate, p.LastEditDate,
+    p.CreationDate, p.Score, p.ViewCount, p.Title, p.Tags
+),
+ComplexMetrics AS (
+  SELECT
+    a.PostId,
+    a.OwnerUserId,
+    a.LastActivityDate,
+    a.LastEditDate,
+    a.Title,
+    a.Tags,
+    a.Score,
+    a.ViewCount,
+    a.UpVotesInWindow,
+    a.DownVotesInWindow,
+    CASE
+      WHEN a.ViewCount = 0 THEN NULL
+      ELSE (a.Score::decimal / NULLIF(a.ViewCount,0))
+    END AS ScorePerView,
+    CASE
+      WHEN a.UpVotesInWindow + a.DownVotesInWindow = 0 THEN NULL
+      ELSE (a.UpVotesInWindow - a.DownVotesInWindow)
+    END AS NetVoteDelta,
+    ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId ORDER BY a.LastActivityDate DESC) AS RN
+  FROM ActivityWindow a
+),
+Filtered AS (
+  SELECT
+    c.*,
+    tt.QuestionCount,
+    tt.AvgScore,
+    tt.AvgViews,
+    tt.LastActive
+  FROM ComplexMetrics c
+  LEFT JOIN TagStats tt
+    ON POSITION(',' || tt.TagName || ',' IN ',' || c.Tags || ',') > 0
+  WHERE c.RN = 1
+)
+SELECT
+  f.PostId,
+  f.Title,
+  f.Tags,
+  f.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  f.LastActivityDate,
+  f.LastEditDate,
+  f.Score,
+  f.ViewCount,
+  f.UpVotesInWindow,
+  f.DownVotesInWindow,
+  f.ScorePerView,
+  f.NetVoteDelta,
+  f.AvgScore,
+  f.AvgViews,
+  f.LastActive,
+  f.QuestionCount
+FROM Filtered f
+LEFT JOIN Users u ON u.Id = f.OwnerUserId
+ORDER BY f.LastActivityDate DESC
+LIMIT 100;

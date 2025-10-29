@@ -1,0 +1,201 @@
+WITH RECURSIVE TagHierarchy AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    t.Id AS RootTagId,
+    0 AS Depth,
+    t.TagName || ' (Root)' AS HierarchyPath
+  FROM Tags AS t
+  WHERE
+    t.TagName IN ('sql', 'performance', 'optimization', 'database', 'query')
+  UNION ALL
+  SELECT
+    th.TagId,
+    t.TagName,
+    th.RootTagId,
+    th.Depth + 1,
+    th.HierarchyPath || ' -> ' || t.TagName
+  FROM TagHierarchy AS th
+  JOIN Posts AS p
+    ON REPLACE(REPLACE(REPLACE(p.Tags, '><', ''), '<', ''), '>', '') LIKE '%' || th.TagName || '%'
+  JOIN Posts AS p_related
+    ON p_related.Id = p.Id
+  JOIN Tags AS t
+    ON REPLACE(REPLACE(REPLACE(p_related.Tags, '><', ''), '<', ''), '>', '') LIKE '%' || t.TagName || '%'
+  WHERE
+    t.TagName NOT IN ('sql', 'performance', 'optimization', 'database', 'query')
+    AND th.Depth < 3
+), RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ClosedDate,
+    ph.PostHistoryTypeId,
+    pht.Name AS PostHistoryTypeName,
+    ph.CreationDate AS HistoryCreationDate,
+    ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn
+  FROM Posts AS p
+  JOIN PostTypes AS pt
+    ON p.PostTypeId = pt.Id
+  LEFT JOIN Users AS u
+    ON p.OwnerUserId = u.Id
+  LEFT JOIN PostHistory AS ph
+    ON p.Id = ph.PostId
+  LEFT JOIN PostHistoryTypes AS pht
+    ON ph.PostHistoryTypeId = pht.Id
+  WHERE
+    p.PostTypeId IN (1, 2)
+), LatestPostEdits AS (
+  SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.OwnerDisplayName,
+    rp.Title,
+    rp.CreationDate AS PostCreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.ClosedDate,
+    rp.HistoryCreationDate AS LastEditDate,
+    rp.PostHistoryTypeName,
+    CASE
+      WHEN rp.PostHistoryTypeName IN ('Edit Title', 'Edit Body', 'Edit Tags') THEN TRUE
+      ELSE FALSE
+    END AS WasEdited,
+    rp.OwnerUserId,
+    rp.PostHistoryTypeId
+  FROM RankedPosts AS rp
+  WHERE
+    rp.rn = 1
+    AND rp.PostHistoryTypeId IN (4, 5, 6, 1, 2, 3)
+), UserPostActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    AVG(p.Score) AS AverageScore,
+    MAX(p.CreationDate) AS LastPostDate
+  FROM Users AS u
+  JOIN Posts AS p
+    ON u.Id = p.OwnerUserId
+  WHERE
+    p.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+  GROUP BY
+    u.Id,
+    u.DisplayName
+), TagPostCounts AS (
+  SELECT
+    t.TagName,
+    COUNT(DISTINCT p.Id) AS PostCount
+  FROM Tags AS t
+  JOIN Posts AS p
+    ON REPLACE(REPLACE(REPLACE(p.Tags, '><', ''), '<', ''), '>', '') LIKE '%' || t.TagName || '%'
+  WHERE
+    p.PostTypeId = 1 AND p.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '3 months')
+  GROUP BY
+    t.TagName
+)
+SELECT
+  lpe.PostId,
+  lpe.Title,
+  lpe.PostTypeName,
+  lpe.OwnerDisplayName,
+  lpe.PostCreationDate,
+  lpe.Score,
+  lpe.ViewCount,
+  lpe.AnswerCount,
+  lpe.CommentCount,
+  lpe.FavoriteCount,
+  lpe.ClosedDate,
+  lpe.LastEditDate,
+  lpe.PostHistoryTypeName,
+  lpe.WasEdited,
+  upa.TotalPosts AS OwnerTotalPosts,
+  upa.TotalQuestions AS OwnerTotalQuestions,
+  upa.TotalAnswers AS OwnerTotalAnswers,
+  upa.AverageScore AS OwnerAverageScore,
+  upa.LastPostDate AS OwnerLastPostDate,
+  STRING_AGG(DISTINCT th.TagName, ', ') AS RelatedTags,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments AS c
+    WHERE
+      c.PostId = lpe.PostId AND c.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '1 week')
+  ) AS RecentCommentCount,
+  CASE
+    WHEN lpe.Score > 1000 THEN 'High Score'
+    WHEN lpe.Score > 100 THEN 'Medium Score'
+    ELSE 'Low Score'
+  END AS ScoreCategory,
+  CASE
+    WHEN lpe.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN lpe.FavoriteCount > 50 THEN 'Popular'
+    ELSE 'Active'
+  END AS PostStatus,
+  CASE
+    WHEN u.Reputation > 100000 THEN 'Expert'
+    WHEN u.Reputation > 50000 THEN 'Experienced'
+    ELSE 'Novice'
+  END AS OwnerReputationLevel
+FROM LatestPostEdits AS lpe
+LEFT JOIN UserPostActivity AS upa
+  ON lpe.OwnerUserId = upa.UserId
+LEFT JOIN Users AS u
+  ON lpe.OwnerUserId = u.Id
+JOIN Tags AS root_tag
+  ON root_tag.TagName = 'sql'
+LEFT JOIN TagHierarchy AS th
+  ON th.RootTagId = root_tag.Id
+  AND EXISTS (
+    SELECT 1
+    FROM Posts p_check
+    WHERE p_check.Id = lpe.PostId
+      AND REPLACE(REPLACE(REPLACE(p_check.Tags, '><', ''), '<', ''), '>', '') LIKE '%' || th.TagName || '%'
+  )
+WHERE
+  lpe.WasEdited = TRUE
+  AND lpe.PostCreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '6 months')
+  AND u.DownVotes < u.UpVotes * 0.1
+GROUP BY
+  lpe.PostId,
+  lpe.Title,
+  lpe.PostTypeName,
+  lpe.OwnerDisplayName,
+  lpe.PostCreationDate,
+  lpe.Score,
+  lpe.ViewCount,
+  lpe.AnswerCount,
+  lpe.CommentCount,
+  lpe.FavoriteCount,
+  lpe.ClosedDate,
+  lpe.LastEditDate,
+  lpe.PostHistoryTypeName,
+  lpe.WasEdited,
+  upa.TotalPosts,
+  upa.TotalQuestions,
+  upa.TotalAnswers,
+  upa.AverageScore,
+  upa.LastPostDate,
+  u.Reputation,
+  u.DownVotes,
+  u.UpVotes,
+  th.TagName
+ORDER BY
+  lpe.Score DESC,
+  lpe.FavoriteCount DESC
+LIMIT 100;

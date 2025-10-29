@@ -1,0 +1,189 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserTotalUpVotes,
+        U.DownVotes AS UserTotalDownVotes,
+        U.CreationDate AS UserCreationDate,
+        MAX(U.LastAccessDate) AS UserLastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalOwnedPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersGiven,
+        COALESCE(SUM(P.Score), 0) AS TotalOwnedPostScore,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE 0 END), 0) AS TotalQuestionViewsGenerated,
+        MIN(P.CreationDate) AS FirstPostDate,
+        MAX(P.CreationDate) AS LastPostDate,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END) AS AvgQuestionScorePerUser,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score END) AS AvgAnswerScorePerUser
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.CreationDate
+),
+HighQualityQuestionsWithHistory AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.Title,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        Q.AnswerCount AS QuestionAnswerCount,
+        Q.FavoriteCount AS QuestionFavoriteCount,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.LastActivityDate AS QuestionLastActivityDate,
+        COUNT(DISTINCT PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS BodyTitleTagEditCount,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScoreOnQuestion,
+        COUNT(C.Id) AS TotalCommentsOnQuestion,
+        CAST(
+            EXTRACT(EPOCH FROM (MAX(CASE WHEN A.Id = Q.AcceptedAnswerId THEN A.CreationDate END) - Q.CreationDate)) / 86400
+            AS INTEGER
+        ) AS DaysToAcceptedAnswer,
+        CASE WHEN EXISTS (
+            SELECT 1
+            FROM Posts SelfAnswer
+            WHERE SelfAnswer.ParentId = Q.Id
+              AND SelfAnswer.OwnerUserId = Q.OwnerUserId
+              AND SelfAnswer.PostTypeId = 2
+        ) THEN TRUE ELSE FALSE END AS HasSelfAnsweredQuestion,
+        COALESCE(
+            (SELECT T.TagName FROM Tags T WHERE T.TagName = (CASE
+                WHEN Q.Tags IS NULL OR LENGTH(Q.Tags) < 2 THEN NULL
+                ELSE (REGEXP_SPLIT_TO_TABLE(SUBSTRING(Q.Tags FROM 2 FOR (LENGTH(Q.Tags) - 2)), '><'))::text
+            END)::text LIMIT 1),
+            'untagged'
+        ) AS PrimaryTagOfQuestion,
+        ROW_NUMBER() OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.Score DESC, Q.CreationDate DESC) AS UserQuestionRankByScore
+    FROM Posts Q
+    LEFT JOIN PostHistory PH ON Q.Id = PH.PostId
+    LEFT JOIN Comments C ON Q.Id = C.PostId
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    WHERE Q.PostTypeId = 1
+      AND Q.Score >= 15
+      AND Q.ViewCount >= 2500
+      AND Q.AnswerCount >= 3
+      AND Q.ClosedDate IS NULL
+      AND Q.CommunityOwnedDate IS NULL
+    GROUP BY Q.Id, Q.OwnerUserId, Q.Title, Q.Score, Q.ViewCount, Q.AnswerCount, Q.FavoriteCount, Q.CreationDate, Q.LastActivityDate, Q.Tags
+    HAVING COUNT(DISTINCT PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) >= 5
+),
+TopBadgesPerUser AS (
+    SELECT
+        B.UserId,
+        B.Name AS TopBadgeName,
+        B.Class AS TopBadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY B.UserId ORDER BY B.Class ASC, B.Date DESC) AS rn
+    FROM Badges B
+)
+SELECT
+    UAS.DisplayName AS UserName,
+    UAS.Reputation,
+    UAS.TotalQuestionsAsked,
+    UAS.TotalAnswersGiven,
+    UAS.TotalOwnedPostScore,
+    UAS.TotalQuestionViewsGenerated,
+    UAS.AvgQuestionScorePerUser,
+    UAS.AvgAnswerScorePerUser,
+    HQ.QuestionId,
+    HQ.Title AS TopQuestionTitle,
+    HQ.QuestionScore,
+    HQ.QuestionViewCount,
+    HQ.QuestionAnswerCount,
+    HQ.BodyTitleTagEditCount AS TopQuestionEditCount,
+    HQ.DaysToAcceptedAnswer,
+    HQ.HasSelfAnsweredQuestion,
+    COALESCE(HQ.PrimaryTagOfQuestion, 'N/A') AS TopQuestionPrimaryTag,
+    COALESCE(TBU.TopBadgeName, 'No Badges') AS HighestClassBadge,
+    COALESCE(TBU.TopBadgeClass, 99) AS HighestBadgeClassCode,
+    UPPER(COALESCE(Users.Location, 'Unknown Location')) || ' :: ' || COALESCE(Users.WebsiteUrl, 'No Website URL') AS UserContactInfo,
+    CASE
+        WHEN NULLIF(CAST(Users.DownVotes AS NUMERIC), 0) IS NULL THEN NULL
+        ELSE NULLIF(CAST(Users.UpVotes AS NUMERIC), 0) / NULLIF(CAST(Users.DownVotes AS NUMERIC), 0)
+    END AS UpVoteDownVoteRatio,
+    CASE
+        WHEN UAS.Reputation >= 150000 THEN 'Legendary Contributor'
+        WHEN UAS.Reputation >= 50000 THEN 'Distinguished Expert'
+        WHEN UAS.Reputation >= 10000 THEN 'Experienced Member'
+        WHEN UAS.Reputation >= 2000 THEN 'Active Participant'
+        ELSE 'Emerging User'
+    END AS ReputationTier,
+    (
+        SELECT COUNT(DISTINCT PL.PostId)
+        FROM PostLinks PL
+        WHERE PL.PostId IN (SELECT P.Id FROM Posts P WHERE P.OwnerUserId = UAS.UserId)
+          AND PL.LinkTypeId = 1
+    ) AS CountOfLinkedPostsByOwner,
+    UAS.UserLastAccessDate
+FROM UserActivitySummary UAS
+JOIN Users ON UAS.UserId = Users.Id
+LEFT JOIN HighQualityQuestionsWithHistory HQ ON UAS.UserId = HQ.OwnerUserId AND HQ.UserQuestionRankByScore = 1
+LEFT JOIN (SELECT UserId, TopBadgeName, TopBadgeClass FROM TopBadgesPerUser WHERE rn = 1) TBU ON UAS.UserId = TBU.UserId
+WHERE UAS.TotalQuestionsAsked >= 5
+  AND UAS.TotalAnswersGiven >= 1
+  AND UAS.Reputation > 750
+  AND EXISTS (
+      SELECT 1
+      FROM PostHistory PH_Filter
+      WHERE PH_Filter.UserId = UAS.UserId
+        AND PH_Filter.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+      GROUP BY PH_Filter.UserId
+      HAVING COUNT(PH_Filter.Id) > 10
+  )
+
+UNION ALL
+
+SELECT
+    UAS.DisplayName AS UserName,
+    UAS.Reputation,
+    UAS.TotalQuestionsAsked,
+    UAS.TotalAnswersGiven,
+    UAS.TotalOwnedPostScore,
+    UAS.TotalQuestionViewsGenerated,
+    UAS.AvgQuestionScorePerUser,
+    UAS.AvgAnswerScorePerUser,
+    NULL AS QuestionId,
+    'N/A - Answer-Focused User' AS TopQuestionTitle,
+    NULL AS QuestionScore,
+    NULL AS QuestionViewCount,
+    NULL AS QuestionAnswerCount,
+    NULL AS TopQuestionEditCount,
+    NULL AS DaysToAcceptedAnswer,
+    FALSE AS HasSelfAnsweredQuestion,
+    'N/A' AS PrimaryTagOfQuestion,
+    COALESCE(TBU.TopBadgeName, 'No Badges') AS HighestClassBadge,
+    COALESCE(TBU.TopBadgeClass, 99) AS HighestBadgeClassCode,
+    UPPER(COALESCE(Users.Location, 'Unknown Location')) || ' :: ' || COALESCE(Users.WebsiteUrl, 'No Website URL') AS UserContactInfo,
+    CASE
+        WHEN NULLIF(CAST(Users.DownVotes AS NUMERIC), 0) IS NULL THEN NULL
+        ELSE NULLIF(CAST(Users.UpVotes AS NUMERIC), 0) / NULLIF(CAST(Users.DownVotes AS NUMERIC), 0)
+    END AS UpVoteDownVoteRatio,
+    CASE
+        WHEN UAS.Reputation >= 150000 THEN 'Legendary Contributor'
+        WHEN UAS.Reputation >= 50000 THEN 'Distinguished Expert'
+        WHEN UAS.Reputation >= 10000 THEN 'Experienced Member'
+        WHEN UAS.Reputation >= 2000 THEN 'Active Participant'
+        ELSE 'Emerging User'
+    END AS ReputationTier,
+    (
+        SELECT COUNT(DISTINCT PL.PostId)
+        FROM PostLinks PL
+        WHERE PL.PostId IN (SELECT P.Id FROM Posts P WHERE P.OwnerUserId = UAS.UserId)
+          AND PL.LinkTypeId = 1
+    ) AS CountOfLinkedPostsByOwner,
+    UAS.UserLastAccessDate
+FROM UserActivitySummary UAS
+JOIN Users ON UAS.UserId = Users.Id
+LEFT JOIN (SELECT UserId, TopBadgeName, TopBadgeClass FROM TopBadgesPerUser WHERE rn = 1) TBU ON UAS.UserId = TBU.UserId
+WHERE UAS.TotalAnswersGiven > UAS.TotalQuestionsAsked * 3
+  AND UAS.Reputation > 2000
+  AND (
+      SELECT COUNT(AcceptedAnswers.Id)
+      FROM Posts AcceptedAnswers
+      WHERE AcceptedAnswers.OwnerUserId = UAS.UserId
+        AND AcceptedAnswers.PostTypeId = 2
+        AND AcceptedAnswers.Id = (
+            SELECT Q_Check.AcceptedAnswerId FROM Posts Q_Check WHERE Q_Check.Id = AcceptedAnswers.ParentId
+        )
+  ) >= 5
+ORDER BY Reputation DESC, UserLastAccessDate DESC
+LIMIT 150;

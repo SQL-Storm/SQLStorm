@@ -1,0 +1,221 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        SUM(COALESCE(p.Score, 0)) as TotalScore,
+        AVG(COALESCE(p.Score, 0)) as AvgScore,
+        MAX(p.CreationDate) as LastPostDate,
+        STRING_AGG(DISTINCT p.Tags, '; ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        ups.*,
+        ROW_NUMBER() OVER (ORDER BY ups.TotalScore DESC, ups.Reputation DESC) as ScoreRank,
+        RANK() OVER (ORDER BY ups.TotalPosts DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY ups.Reputation DESC) as RepRank
+    FROM UserPostStats ups
+),
+TopUsers AS (
+    SELECT * FROM RankedUsers WHERE ScoreRank <= 100
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) as TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) as GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) as SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) as BronzeBadges,
+        STRING_AGG(b.Name, ', ') as BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostActivity AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) as AnswerCount,
+        -- replace DATEDIFF('day', a, b) with (b::date - a::date) in standard SQL use CAST to date and subtract
+        CAST(p.LastActivityDate AS date) - CAST(p.CreationDate AS date) as DaysActive,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Highly Voted'
+            WHEN p.Score >= 50 THEN 'Well Voted'
+            WHEN p.Score >= 10 THEN 'Moderately Voted'
+            ELSE 'Low Voted'
+        END as VoteCategory,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevPostDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PostSequence
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(STRING_AGG(DISTINCT p.Title, ', '), '') as SampleQuestions,
+        AVG(p.Score) as AvgQuestionScore,
+        STRING_AGG(DISTINCT CAST(p.OwnerUserId AS text), ', ') as UserIds
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%' AND p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+ComplexPostMetrics AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.OwnerUserId,
+        pa.OwnerName,
+        pa.Score,
+        pa.ViewCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.AnswerCount,
+        pa.PostType,
+        pa.VoteCategory,
+        pa.DaysActive,
+        pa.PrevScore,
+        pa.PrevPostDate,
+        pa.PostSequence,
+        CASE 
+            WHEN pa.PrevScore IS NOT NULL AND pa.Score > pa.PrevScore THEN 'Improved'
+            WHEN pa.PrevScore IS NOT NULL AND pa.Score < pa.PrevScore THEN 'Declined'
+            WHEN pa.PrevScore IS NOT NULL AND pa.Score = pa.PrevScore THEN 'Maintained'
+            ELSE 'New'
+        END as PerformanceChange,
+        CASE 
+            WHEN pa.DaysActive > 30 AND pa.Score > 50 THEN 'Highly Active'
+            WHEN pa.DaysActive > 30 THEN 'Active'
+            WHEN pa.Score > 50 THEN 'Engaged'
+            ELSE 'Passive'
+        END as EngagementLevel,
+        NTILE(4) OVER (ORDER BY pa.Score) as ScoreQuartile,
+        PERCENT_RANK() OVER (ORDER BY pa.Score) as ScorePercentile,
+        CUME_DIST() OVER (ORDER BY pa.Score) as ScoreCumulativeDist
+    FROM PostActivity pa
+),
+FinalAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalPosts,
+        tu.Questions,
+        tu.Answers,
+        tu.TotalScore,
+        tu.AvgScore,
+        tu.LastPostDate,
+        tu.AllTags,
+        tu.ScoreRank,
+        tu.PostRank,
+        tu.RepRank,
+        ub.TotalBadges,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.BadgeNames,
+        COUNT(cpm.PostId) as ActivePosts,
+        AVG(cpm.Score) as AvgActivePostScore,
+        MAX(cpm.Score) as MaxPostScore,
+        STRING_AGG(CASE WHEN cpm.PostType = 'Question' THEN cpm.Title ELSE NULL END, '; ') as QuestionTitles,
+        STRING_AGG(CASE WHEN cpm.PostType = 'Answer' THEN cpm.Title ELSE NULL END, '; ') as AnswerTitles,
+        STRING_AGG(CASE WHEN cpm.PerformanceChange = 'Improved' THEN cpm.Title ELSE NULL END, '; ') as ImprovedPosts,
+        STRING_AGG(CASE WHEN cpm.EngagementLevel = 'Highly Active' THEN cpm.Title ELSE NULL END, '; ') as HighlyActivePosts,
+        STRING_AGG(CASE WHEN cpm.VoteCategory = 'Highly Voted' THEN cpm.Title ELSE NULL END, '; ') as HighlyVotedPosts,
+        STRING_AGG(DISTINCT cpm.OwnerName, ', ') as Collaborators
+    FROM TopUsers tu
+    LEFT JOIN UserBadges ub ON tu.UserId = ub.UserId
+    LEFT JOIN ComplexPostMetrics cpm ON tu.UserId = cpm.OwnerUserId
+    WHERE tu.UserId IS NOT NULL
+    GROUP BY 
+        tu.UserId, tu.DisplayName, tu.Reputation, tu.TotalPosts, tu.Questions, 
+        tu.Answers, tu.TotalScore, tu.AvgScore, tu.LastPostDate, tu.AllTags, 
+        tu.ScoreRank, tu.PostRank, tu.RepRank, ub.TotalBadges, ub.GoldBadges, 
+        ub.SilverBadges, ub.BronzeBadges, ub.BadgeNames
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.TotalPosts,
+    fa.Questions,
+    fa.Answers,
+    fa.TotalScore,
+    fa.AvgScore,
+    fa.LastPostDate,
+    fa.AllTags,
+    fa.ScoreRank,
+    fa.PostRank,
+    fa.RepRank,
+    fa.TotalBadges,
+    fa.GoldBadges,
+    fa.SilverBadges,
+    fa.BronzeBadges,
+    fa.BadgeNames,
+    fa.ActivePosts,
+    fa.AvgActivePostScore,
+    fa.MaxPostScore,
+    fa.QuestionTitles,
+    fa.AnswerTitles,
+    fa.ImprovedPosts,
+    fa.HighlyActivePosts,
+    fa.HighlyVotedPosts,
+    fa.Collaborators,
+    CASE 
+        WHEN fa.TotalBadges > 0 THEN 'Badge Holder'
+        ELSE 'No Badges'
+    END as BadgeStatus,
+    CASE 
+        WHEN fa.Reputation > 10000 THEN 'Expert'
+        WHEN fa.Reputation > 5000 THEN 'Advanced'
+        WHEN fa.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END as RepLevel,
+    CASE 
+        WHEN fa.TotalPosts > 100 THEN 'Elite'
+        WHEN fa.TotalPosts > 50 THEN 'Veteran'
+        WHEN fa.TotalPosts > 10 THEN 'Regular'
+        ELSE 'New'
+    END as ActivityLevel,
+    COALESCE(fa.QuestionTitles, '') || COALESCE(fa.AnswerTitles, '') as AllPostTitles,
+    COALESCE(fa.ImprovedPosts, '') || COALESCE(fa.HighlyActivePosts, '') as HighlightedPosts,
+    -- replace DATEADD('month', -6, date) and DATEADD('year', -1, date) with standard DATE calculations
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = fa.UserId AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '6 months')) as RecentPostsLast6Months,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = fa.UserId) as TotalComments,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = fa.UserId AND v.VoteTypeId IN (2,3)) as TotalVotes,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = fa.UserId AND b.Date >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')) as RecentBadges,
+    (SELECT STRING_AGG(t.TagName, ', ') FROM Tags t JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%' WHERE p.OwnerUserId = fa.UserId GROUP BY t.TagName LIMIT 10) as PopularTags,
+    CASE 
+        WHEN fa.Reputation > 1000 AND fa.TotalPosts > 50 AND fa.TotalBadges > 5 THEN 'Power User'
+        WHEN fa.Reputation > 100 AND fa.TotalPosts > 10 THEN 'Regular User'
+        ELSE 'Standard User'
+    END as UserClassification
+FROM FinalAnalysis fa
+WHERE fa.UserId IS NOT NULL
+  AND (fa.TotalPosts > 0 OR fa.TotalBadges > 0)
+ORDER BY fa.TotalScore DESC, fa.Reputation DESC, fa.PostRank ASC
+LIMIT 500;

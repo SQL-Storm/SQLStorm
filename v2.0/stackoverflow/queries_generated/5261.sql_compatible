@@ -1,0 +1,131 @@
+WITH ranked_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.CommentCount,
+    p.Tags,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    COUNT(v.Id) FILTER (WHERE vt.Name = 'UpMod') OVER () AS total_upvotes,
+    COUNT(v.Id) FILTER (WHERE vt.Name = 'DownMod') OVER () AS total_downvotes,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.ViewCount DESC, p.Score DESC, p.CreationDate DESC
+    ) AS rn_by_owner
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+correlated_body AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.CreationDate,
+    q.ViewCount,
+    q.Score,
+    q.AnswerCount,
+    q.CommentCount,
+    q.Tags,
+    q.OwnerUserId,
+    q.OwnerName,
+    q.total_upvotes,
+    q.total_downvotes,
+    q.rn_by_owner,
+    (SELECT MAX(p2.CreationDate) FROM Posts p2 WHERE p2.OwnerUserId = q.OwnerUserId) AS last_activity_by_owner,
+    (SELECT AVG(p3.Score) FROM Posts p3 WHERE p3.OwnerUserId = q.OwnerUserId) AS avg_score_by_owner
+  FROM ranked_questions q
+  WHERE q.rn_by_owner = 1
+),
+window_calc AS (
+  SELECT
+    cb.PostId,
+    cb.Title,
+    cb.CreationDate,
+    cb.ViewCount,
+    cb.Score,
+    cb.AnswerCount,
+    cb.CommentCount,
+    cb.Tags,
+    cb.OwnerUserId,
+    cb.OwnerName,
+    cb.total_upvotes,
+    cb.total_downvotes,
+    cb.last_activity_by_owner,
+    cb.avg_score_by_owner,
+    SUM(cb.ViewCount) OVER (ORDER BY cb.ViewCount DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_views,
+    MAX(cb.Score) OVER () AS global_max_score,
+    COUNT(*) OVER () AS total_questions
+  FROM correlated_body cb
+),
+complex_pred AS (
+  SELECT
+    w.PostId,
+    w.Title,
+    w.CreationDate,
+    w.ViewCount,
+    w.Score,
+    w.AnswerCount,
+    w.CommentCount,
+    w.Tags,
+    w.OwnerUserId,
+    w.OwnerName,
+    w.total_upvotes,
+    w.total_downvotes,
+    w.last_activity_by_owner,
+    w.avg_score_by_owner,
+    w.running_views,
+    w.global_max_score,
+    w.total_questions,
+    (CASE
+       WHEN w.ViewCount > 1000 THEN 1
+       WHEN w.ViewCount BETWEEN 500 AND 1000 THEN 2
+       ELSE 3
+     END) AS view_tier,
+    (CASE
+       WHEN w.Score >= 100 THEN 'A'
+       WHEN w.Score >= 50 THEN 'B'
+       WHEN w.Score >= 0 THEN 'C'
+       ELSE 'D'
+     END) AS score_tier,
+    (EXISTS (
+       SELECT 1
+       FROM PostLinks pl
+       WHERE pl.PostId = w.PostId
+         AND pl.RelatedPostId = w.PostId
+         AND pl.LinkTypeId = 1
+     )) AS has_self_link
+  FROM window_calc w
+)
+SELECT
+  (CAST(c.PostId AS VARCHAR(50)) || '|' || COALESCE(c.Title, '') || '|' || TO_CHAR(CAST(c.CreationDate AS TIMESTAMP), 'YYYY-MM-DD"T"HH24:MI:SS')) AS heavy_row_key,
+  c.PostId,
+  c.Title,
+  c.CreationDate,
+  c.ViewCount,
+  c.Score,
+  c.AnswerCount,
+  c.CommentCount,
+  c.Tags,
+  c.OwnerUserId,
+  c.OwnerName,
+  c.total_upvotes,
+  c.total_downvotes,
+  c.last_activity_by_owner,
+  c.avg_score_by_owner,
+  c.running_views,
+  c.global_max_score,
+  c.total_questions,
+  c.view_tier,
+  c.score_tier,
+  CASE WHEN c.has_self_link THEN 'Y' ELSE 'N' END AS has_self_link_flag,
+  (SELECT COUNT(*) FROM Comments co WHERE co.PostId = c.PostId) AS comment_count_for_post
+FROM complex_pred c
+ORDER BY c.running_views DESC, c.Score DESC, c.CreationDate DESC
+LIMIT 100;

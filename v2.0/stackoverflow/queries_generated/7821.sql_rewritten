@@ -1,0 +1,281 @@
+-- {"query": "7821.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2441} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        MAX(p.CreationDate) as LastPostDate,
+        AVG(p.Score) as AvgPostScore,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        STRING_AGG(DISTINCT b.Name, ', ') as BadgeNames,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 1000 THEN 'Elite'
+            WHEN COUNT(DISTINCT p.Id) > 500 THEN 'Veteran'
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Contributor'
+            ELSE 'Member'
+        END as UserTier,
+        LAG(u.Reputation) OVER (ORDER BY u.Reputation DESC) - u.Reputation as RepDifferenceFromNext,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as RepRank,
+        NTILE(100) OVER (ORDER BY u.Reputation DESC) as RepPercentile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.ParentId IS NOT NULL THEN 'Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Upvoted'
+            WHEN p.Score > 50 THEN 'Upvoted'
+            WHEN p.Score >= 0 THEN 'Neutral'
+            WHEN p.Score < 0 THEN 'Downvoted'
+        END as ScoreCategory,
+        EXTRACT(DAYS FROM (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate)) as DaysSinceCreation,
+        COALESCE(p.Tags, '') as Tags,
+        ARRAY_LENGTH(STRING_TO_ARRAY(COALESCE(p.Tags, ''), '><')) as TagCount,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 10 THEN 'Has Tags'
+            ELSE 'No Tags'
+        END as TagStatus,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+        LAG(p.Score) OVER (ORDER BY p.Score DESC) - p.Score as ScoreDeltaFromHigher,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as OwnerAvgScore
+    FROM Posts p
+    WHERE p.CreationDate > '2020-01-01'
+),
+ComplexMetrics AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Body,
+        pa.Score,
+        pa.ViewCount,
+        pa.OwnerUserId,
+        pa.ScoreCategory,
+        pa.DaysSinceCreation,
+        pa.TagCount,
+        pa.TagStatus,
+        pa.ScoreRank,
+        pa.ViewRank,
+        pa.ScorePercentile,
+        pa.OwnerAvgScore,
+        CASE 
+            WHEN pa.OwnerAvgScore > 50 THEN 'Active Contributor'
+            WHEN pa.OwnerAvgScore > 20 THEN 'Regular Poster'
+            WHEN pa.OwnerAvgScore > 0 THEN 'Occasional Poster'
+            ELSE 'Inactive'
+        END as PostingActivity,
+        CASE 
+            WHEN pa.ViewCount > 1000 THEN 'Viral'
+            WHEN pa.ViewCount > 500 THEN 'Popular'
+            WHEN pa.ViewCount > 100 THEN 'Notable'
+            ELSE 'Regular'
+        END as Popularity,
+        COALESCE(
+            CASE 
+                WHEN pa.TagCount >= 3 THEN 'Multi-tagged'
+                WHEN pa.TagCount = 2 THEN 'Dual-tagged'
+                WHEN pa.TagCount = 1 THEN 'Single-tagged'
+                ELSE 'Untagged'
+            END,
+            'Unknown'
+        ) as TagClassification,
+        (pa.Score * pa.ViewCount) as ScoreViewProduct,
+        (pa.Score + pa.ViewCount + pa.CommentCount + pa.FavoriteCount) as EngagementScore,
+        (pa.DaysSinceCreation / NULLIF(pa.Score, 0)) as EfficiencyRatio
+    FROM PostAnalysis pa
+),
+UserPostStats AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.AvgPostScore,
+        us.BadgeCount,
+        us.UserTier,
+        us.RepRank,
+        us.RepPercentile,
+        us.RepDifferenceFromNext,
+        ARRAY_AGG(pa.PostId) as UserPostIds,
+        STRING_AGG(pa.Title, '; ') as UserPostTitles,
+        AVG(pa.Score) as AveragePostScore,
+        MAX(pa.Score) as MaxPostScore,
+        MIN(pa.Score) as MinPostScore,
+        SUM(pa.ViewCount) as TotalViews,
+        SUM(pa.CommentCount) as TotalComments,
+        COUNT(DISTINCT pa.ScoreCategory) as ScoreCategories,
+        COUNT(DISTINCT pa.PostType) as PostTypes,
+        STRING_AGG(DISTINCT pa.PostType, ', ') as PostTypesList
+    FROM UserStats us
+    LEFT JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+    WHERE us.PostCount > 0
+    GROUP BY 
+        us.UserId, us.DisplayName, us.Reputation, us.PostCount, 
+        us.QuestionCount, us.AnswerCount, us.AvgPostScore, us.BadgeCount, 
+        us.UserTier, us.RepRank, us.RepPercentile, us.RepDifferenceFromNext
+),
+FinalAnalysis AS (
+    SELECT 
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.PostCount,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.AvgPostScore,
+        ups.BadgeCount,
+        ups.UserTier,
+        ups.RepRank,
+        ups.RepPercentile,
+        ups.RepDifferenceFromNext,
+        ups.UserPostIds,
+        ups.UserPostTitles,
+        ups.AveragePostScore,
+        ups.MaxPostScore,
+        ups.MinPostScore,
+        ups.TotalViews,
+        ups.TotalComments,
+        ups.ScoreCategories,
+        ups.PostTypes,
+        ups.PostTypesList,
+        cm.PostId,
+        cm.Title,
+        cm.Body,
+        cm.Score,
+        cm.ViewCount,
+        cm.ScoreCategory,
+        cm.DaysSinceCreation,
+        cm.TagCount,
+        cm.TagStatus,
+        cm.ScoreRank,
+        cm.ViewRank,
+        cm.ScorePercentile,
+        cm.OwnerAvgScore,
+        cm.PostingActivity,
+        cm.Popularity,
+        cm.TagClassification,
+        cm.ScoreViewProduct,
+        cm.EngagementScore,
+        cm.EfficiencyRatio,
+        CASE 
+            WHEN cm.EfficiencyRatio > 100 THEN 'Highly Efficient'
+            WHEN cm.EfficiencyRatio > 50 THEN 'Efficient'
+            WHEN cm.EfficiencyRatio > 10 THEN 'Moderately Efficient'
+            ELSE 'Low Efficiency'
+        END as EfficiencyLevel,
+        CASE 
+            WHEN cm.EfficiencyRatio > 100 AND cm.Score > 100 THEN 'Exceptional Performance'
+            WHEN cm.EfficiencyRatio > 50 AND cm.Score > 50 THEN 'Good Performance'
+            WHEN cm.EfficiencyRatio > 10 AND cm.Score > 0 THEN 'Average Performance'
+            ELSE 'Poor Performance'
+        END as PerformanceLevel,
+        (cm.Score * cm.ViewCount * cm.CommentCount) as ComplexEngagement,
+        ROW_NUMBER() OVER (PARTITION BY ups.UserId ORDER BY cm.Score DESC) as PostRank,
+        RANK() OVER (ORDER BY cm.ViewCount DESC) as ViewRanking,
+        NTILE(5) OVER (ORDER BY cm.Score DESC) as ScoreQuintile,
+        CASE 
+            WHEN cm.Score > (SELECT AVG(Score) FROM PostAnalysis) THEN 'AboveAverage'
+            WHEN cm.Score < (SELECT AVG(Score) FROM PostAnalysis) THEN 'BelowAverage'
+            ELSE 'Average'
+        END as ScoreComparison,
+        DENSE_RANK() OVER (ORDER BY cm.EfficiencyRatio DESC) as EfficiencyRank,
+        LAG(cm.Score) OVER (ORDER BY cm.Score DESC) - cm.Score as ScoreDiff,
+        LAG(cm.ViewCount) OVER (ORDER BY cm.ViewCount DESC) - cm.ViewCount as ViewDiff
+    FROM UserPostStats ups
+    LEFT JOIN ComplexMetrics cm ON ups.UserId = cm.OwnerUserId
+    WHERE ups.PostCount > 0
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.PostCount,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.AvgPostScore,
+    fa.BadgeCount,
+    fa.UserTier,
+    fa.RepRank,
+    fa.RepPercentile,
+    fa.RepDifferenceFromNext,
+    fa.UserPostIds,
+    fa.UserPostTitles,
+    fa.AveragePostScore,
+    fa.MaxPostScore,
+    fa.MinPostScore,
+    fa.TotalViews,
+    fa.TotalComments,
+    fa.ScoreCategories,
+    fa.PostTypes,
+    fa.PostTypesList,
+    fa.PostId,
+    fa.Title,
+    fa.Body,
+    fa.Score,
+    fa.ViewCount,
+    fa.ScoreCategory,
+    fa.DaysSinceCreation,
+    fa.TagCount,
+    fa.TagStatus,
+    fa.ScoreRank,
+    fa.ViewRank,
+    fa.ScorePercentile,
+    fa.OwnerAvgScore,
+    fa.PostingActivity,
+    fa.Popularity,
+    fa.TagClassification,
+    fa.ScoreViewProduct,
+    fa.EngagementScore,
+    fa.EfficiencyRatio,
+    fa.EfficiencyLevel,
+    fa.PerformanceLevel,
+    fa.ComplexEngagement,
+    fa.PostRank,
+    fa.ViewRanking,
+    fa.ScoreQuintile,
+    fa.ScoreComparison,
+    fa.EfficiencyRank,
+    fa.ScoreDiff,
+    fa.ViewDiff
+FROM FinalAnalysis fa
+WHERE fa.RepPercentile BETWEEN 1 AND 10
+  AND fa.ScoreQuintile IN (1, 2, 3)
+  AND (fa.EfficiencyRatio > 0 OR fa.EfficiencyRatio IS NULL)
+  AND (fa.Score > 0 OR fa.Score IS NULL)
+  AND fa.PostType IS NOT NULL
+  AND UPPER(fa.DisplayName) LIKE UPPER('%user%')
+  AND LENGTH(fa.Title) > 10
+  AND REGEXP_REPLACE(fa.Body, '[^a-zA-Z0-9]', '', 'g') IS NOT NULL
+ORDER BY fa.RepRank DESC, fa.Score DESC, fa.ViewCount DESC, fa.PostRank
+LIMIT 10000;

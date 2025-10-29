@@ -1,0 +1,162 @@
+-- {"query": "2974.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1617} 
+with RankedAnswers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+QuestionsWithStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        coalesce(q.Tags, '') as Tags,
+        coalesce(bd.BadgeCount, 0) as OwnerBadgeCount,
+        coalesce(ans.TotalAnswers, 0) as AnswerCount,
+        coalesce(acc.AnswerScore, 0) as AcceptedAnswerScore,
+        rr.Name as CloseReasonName
+    from Posts q
+    left join (
+        select UserId, count(*) as BadgeCount
+        from Badges
+        group by UserId
+    ) bd on bd.UserId = q.OwnerUserId
+    left join (
+        select ParentId, count(*) as TotalAnswers
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) ans on ans.ParentId = q.Id
+    left join Posts acc on acc.Id = q.AcceptedAnswerId
+    left join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes rr on rr.Id = cast(ph.Comment as int)
+    where q.PostTypeId = 1
+),
+UserActivityCTE as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct ph.Id) as TotalEdits,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as TotalUpVotes,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as TotalDownVotes,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate,
+        case when u.Location is null or trim(u.Location) = '' then 'UNKNOWN' else u.Location end as UserLocation,
+        length(coalesce(u.AboutMe, '')) as AboutMeLength
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.Location, u.AboutMe
+),
+DuplicatedQuestions as (
+    select distinct p1.Id as QuestionId1, p2.Id as QuestionId2
+    from Posts p1
+    inner join PostLinks pl on pl.PostId = p1.Id and pl.LinkTypeId = 3
+    inner join Posts p2 on p2.Id = pl.RelatedPostId
+    where p1.PostTypeId = 1 and p2.PostTypeId = 1
+),
+ComplexTagGrouping as (
+    select
+        unnest(string_to_array(substring(Tags from 2 for length(Tags)-2), '><')) as Tag,
+        count(*) as QuestionCount
+    from Posts
+    where PostTypeId = 1 and Tags is not null
+    group by Tag
+    having count(*) > 1000
+),
+RankedComments as (
+    select
+        c.Id,
+        c.PostId,
+        c.UserId,
+        c.CreationDate,
+        c.Score,
+        rank() over (partition by c.PostId order by c.Score desc, c.CreationDate asc) as CommentRank
+    from Comments c
+),
+FinalSelection as (
+    select
+        qws.QuestionId,
+        qws.Title,
+        substr(qws.Tags, 1, 100) as TagsSample,
+        qws.QuestionScore,
+        qws.ViewCount,
+        qws.OwnerBadgeCount,
+        qws.AnswerCount,
+        qws.AcceptedAnswerScore,
+        case when qws.CloseReasonName is null then 'Open' else qws.CloseReasonName end as Status,
+        ua.DisplayName as QuestionOwnerName,
+        ua.Reputation as QuestionOwnerReputation,
+        ua.UserLocation,
+        ua.TotalEdits,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ua.LastPostDate,
+        ua.LastCommentDate,
+        dtq.QuestionId2 as DuplicateOf,
+        (select count(*) 
+         from RankedComments rc 
+         where rc.PostId = qws.QuestionId and rc.CommentRank <= 3) as TopCommentsCount,
+        array_agg(distinct ctg.Tag) filter (where ctg.Tag is not null) as PopularTags
+    from QuestionsWithStats qws
+    left join UserActivityCTE ua on ua.UserId = qws.OwnerUserId
+    left join DuplicatedQuestions dtq on dtq.QuestionId1 = qws.QuestionId
+    left join ComplexTagGrouping ctg on position(ctg.Tag in qws.Tags) > 0
+    group by
+        qws.QuestionId, qws.Title, qws.Tags, qws.QuestionScore, qws.ViewCount,
+        qws.OwnerBadgeCount, qws.AnswerCount, qws.AcceptedAnswerScore, qws.CloseReasonName,
+        ua.DisplayName, ua.Reputation, ua.UserLocation, ua.TotalEdits, ua.TotalUpVotes,
+        ua.TotalDownVotes, ua.LastPostDate, ua.LastCommentDate, dtq.QuestionId2
+)
+select
+    fs.QuestionId,
+    fs.Title,
+    fs.TagsSample,
+    fs.QuestionScore,
+    fs.ViewCount,
+    fs.OwnerBadgeCount,
+    fs.AnswerCount,
+    fs.AcceptedAnswerScore,
+    fs.Status,
+    fs.QuestionOwnerName,
+    fs.QuestionOwnerReputation,
+    fs.UserLocation,
+    fs.TotalEdits,
+    fs.TotalUpVotes,
+    fs.TotalDownVotes,
+    to_char(fs.LastPostDate, 'YYYY-MM-DD') as LastPostDate,
+    to_char(fs.LastCommentDate, 'YYYY-MM-DD') as LastCommentDate,
+    fs.DuplicateOf,
+    fs.TopCommentsCount,
+    array_to_string(fs.PopularTags, ', ') as PopularTagsList,
+    (select count(*) from Votes v where v.PostId = fs.QuestionId and v.VoteTypeId = 8) as BountiesStarted,
+    (select sum(v.BountyAmount) from Votes v where v.PostId = fs.QuestionId and v.VoteTypeId = 9) as TotalBountyAmount,
+    case 
+        when fs.ViewCount > 100000 then 'Very High Traffic'
+        when fs.ViewCount between 10000 and 100000 then 'High Traffic'
+        when fs.ViewCount between 1000 and 10000 then 'Medium Traffic'
+        else 'Low Traffic'
+    end as TrafficCategory,
+    case
+        when fs.QuestionScore < 0 or fs.AnswerCount = 0 then 'Needs Attention'
+        when fs.AcceptedAnswerScore > 10 then 'Well Answered'
+        else 'Normal'
+    end as QualityIndicator
+from FinalSelection fs
+where fs.QuestionScore > 0
+  and fs.AnswerCount > 0
+  and (fs.TotalUpVotes - fs.TotalDownVotes) > 10
+  and (fs.LastPostDate is null or fs.LastPostDate > cast('2024-10-01' as date) - interval '1 year')
+order by fs.QuestionScore desc, fs.ViewCount desc
+limit 100;

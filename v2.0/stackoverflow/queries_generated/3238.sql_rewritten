@@ -1,0 +1,147 @@
+-- {"query": "3238.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2088} 
+WITH
+    -- Base user statistics
+    usr_stats AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate,
+            u.LastAccessDate,
+            COALESCE(pcnt.total_posts,0)          AS total_posts,
+            COALESCE(pcnt.q_posts,0)              AS question_posts,
+            COALESCE(pcnt.a_posts,0)              AS answer_posts,
+            COALESCE(pcnt.avg_score,0)            AS avg_score,
+            COALESCE(bcnt.badge_cnt,0)            AS badge_cnt
+        FROM Users u
+        LEFT JOIN (
+            SELECT
+                OwnerUserId                                    AS uid,
+                COUNT(*)                                       AS total_posts,
+                SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS q_posts,
+                SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS a_posts,
+                AVG(Score)                                     AS avg_score
+            FROM Posts
+            GROUP BY OwnerUserId
+        ) pcnt ON pcnt.uid = u.Id
+        LEFT JOIN (
+            SELECT
+                UserId,
+                COUNT(*) AS badge_cnt
+            FROM Badges
+            GROUP BY UserId
+        ) bcnt ON bcnt.UserId = u.Id
+    ),
+
+    -- Rank users by reputation and avg_score
+    ranked_users AS (
+        SELECT
+            *,
+            ROW_NUMBER() OVER (ORDER BY Reputation DESC, avg_score DESC) AS rnk
+        FROM usr_stats
+    ),
+
+    -- Recent vote activity (last 30 days)
+    recent_votes AS (
+        SELECT
+            UserId,
+            COUNT(*) AS votes_30d
+        FROM Votes
+        WHERE CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 day'
+        GROUP BY UserId
+    ),
+
+    -- Tag aggregates with conditional counts
+    tag_agg AS (
+        SELECT
+            t.TagName,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS q_cnt,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS a_cnt,
+            SUM(p.Score)                                 AS total_score,
+            ROW_NUMBER() OVER (ORDER BY COUNT(p.Id) DESC) AS tag_rnk
+        FROM Tags t
+        LEFT JOIN Posts p
+            ON p.Tags LIKE '%' || t.TagName || '%'
+        GROUP BY t.TagName
+        HAVING COUNT(p.Id) > 0
+    ),
+
+    -- Enrich ranked users with recent votes and badge lists
+    enriched_users AS (
+        SELECT
+            ru.Id,
+            ru.DisplayName,
+            ru.Reputation,
+            ru.total_posts,
+            ru.question_posts,
+            ru.answer_posts,
+            ru.avg_score,
+            ru.badge_cnt,
+            COALESCE(rv.votes_30d,0)                       AS recent_votes,
+            CASE
+                WHEN ru.LastAccessDate > ru.CreationDate + INTERVAL '1 year' THEN 'Active'
+                ELSE 'Dormant'
+            END                                            AS activity_status,
+            STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', ') 
+                FILTER (WHERE b.Class = 1) OVER (PARTITION BY ru.Id) AS gold_badges,
+            STRING_AGG(DISTINCT CASE WHEN b.Class = 2 THEN b.Name END, ', ') 
+                FILTER (WHERE b.Class = 2) OVER (PARTITION BY ru.Id) AS silver_badges,
+            STRING_AGG(DISTINCT CASE WHEN b.Class = 3 THEN b.Name END, ', ') 
+                FILTER (WHERE b.Class = 3) OVER (PARTITION BY ru.Id) AS bronze_badges
+        FROM ranked_users ru
+        LEFT JOIN recent_votes rv ON rv.UserId = ru.Id
+        LEFT JOIN Badges b       ON b.UserId = ru.Id
+        WHERE ru.rnk <= 100
+    )
+
+/* Final result set: active top users + top tags */
+SELECT
+    eu.Id,
+    eu.DisplayName,
+    eu.Reputation,
+    eu.total_posts,
+    eu.question_posts,
+    eu.answer_posts,
+    eu.avg_score,
+    eu.badge_cnt,
+    eu.recent_votes,
+    eu.activity_status,
+    eu.gold_badges,
+    eu.silver_badges,
+    eu.bronze_badges,
+    NULL::VARCHAR      AS tag_name,
+    NULL::INT          AS tag_questions,
+    NULL::INT          AS tag_answers,
+    NULL::INT          AS tag_total_score,
+    NULL::INT          AS tag_rank
+FROM enriched_users eu
+WHERE eu.activity_status = 'Active'
+
+UNION ALL
+
+SELECT
+    NULL AS Id,
+    '--- TOP TAGS ---' AS DisplayName,
+    NULL AS Reputation,
+    NULL AS total_posts,
+    NULL AS question_posts,
+    NULL AS answer_posts,
+    NULL AS avg_score,
+    NULL AS badge_cnt,
+    NULL AS recent_votes,
+    NULL AS activity_status,
+    NULL AS gold_badges,
+    NULL AS silver_badges,
+    NULL AS bronze_badges,
+    t.TagName   AS tag_name,
+    t.q_cnt     AS tag_questions,
+    t.a_cnt     AS tag_answers,
+    t.total_score,
+    t.tag_rnk   AS tag_rank
+FROM tag_agg t
+WHERE t.tag_rnk <= 10
+
+ORDER BY
+    Reputation DESC NULLS LAST,
+    recent_votes DESC NULLS LAST,
+    tag_rank ASC NULLS LAST;

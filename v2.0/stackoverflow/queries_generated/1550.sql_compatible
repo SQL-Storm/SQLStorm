@@ -1,0 +1,203 @@
+WITH UserActivityMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScore,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT PH.Id) AS TotalPostHistoryEntries,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(B.Class) AS HighestBadgeClass,
+        MIN(B.Class) AS MostPrestigiousBadgeClass,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        AVG(P.CommentCount) AS AvgCommentCountPerPost,
+        -- Replace ordered-set aggregate with median approximation using percentile_disc (supported in many systems) or median via windowed row_number on ordered scores.
+        -- Implement median per user by computing row_number over posts ordered by score and selecting middle value.
+        -- Compute median via subquery join:
+        (
+            SELECT AVG(t.score_val)
+            FROM (
+                SELECT p2.Score AS score_val,
+                       ROW_NUMBER() OVER (PARTITION BY p2.OwnerUserId ORDER BY p2.Score, p2.Id) AS rn_asc,
+                       ROW_NUMBER() OVER (PARTITION BY p2.OwnerUserId ORDER BY p2.Score DESC, p2.Id DESC) AS rn_desc
+                FROM Posts p2
+                WHERE p2.OwnerUserId = U.Id
+            ) t
+            WHERE t.rn_asc = t.rn_desc OR t.rn_asc + 1 = t.rn_desc OR t.rn_asc = t.rn_desc + 1
+        ) AS MedianPostScore
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN PostHistory PH ON U.Id = PH.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes
+    HAVING COUNT(DISTINCT P.Id) > 5 AND COUNT(DISTINCT B.Id) > 1
+),
+PostLifecycleEvents AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.ClosedDate,
+        P.AcceptedAnswerId,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.Title,
+        P.Tags,
+        P.Body,
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate END) AS FirstEditDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate END) AS LastEditDate,
+        COALESCE(P.LastEditDate, P.CreationDate) AS EffectiveLastEditOrCreationDate,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS EditCount,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate DESC) AS UserPostRankDesc
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.ClosedDate, P.AcceptedAnswerId, P.Score, P.ViewCount, P.Title, P.Tags, P.Body, P.LastEditDate
+    HAVING COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) >= 1
+),
+TagPerformance AS (
+    SELECT
+        T.TagName,
+        T.Id AS TagId,
+        COUNT(P.Id) AS PostsWithTagCount,
+        SUM(P.Score) AS TotalTagScore,
+        AVG(P.Score) AS AvgTagScore,
+        RANK() OVER (ORDER BY COUNT(P.Id) DESC, SUM(P.Score) DESC) AS TagPopularityRank,
+        LAG(COUNT(P.Id), 1, 0) OVER (ORDER BY COUNT(P.Id) DESC) AS PrevTagPostCount
+    FROM Tags T
+    JOIN Posts P ON P.Tags LIKE '%' || T.TagName || '%'
+    WHERE P.PostTypeId = 1 AND P.CreationDate >= DATE '2020-01-01'
+    GROUP BY T.Id, T.TagName
+    HAVING COUNT(P.Id) > 50
+),
+ModeratorActionAnalysis AS (
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 END) AS CloseEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 END) AS ReopenEvents,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS LastCloseDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS LastReopenDate
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (10, 11)
+    GROUP BY PH.PostId
+    HAVING COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 END) > 0 OR COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 END) > 0
+),
+RecentHighImpactPosts AS (
+    SELECT
+        P.Id AS PostId,
+        P.Title,
+        P.OwnerUserId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        (
+            SELECT COUNT(C.Id)
+            FROM Comments C
+            WHERE C.PostId = P.Id
+              AND C.CreationDate > P.LastActivityDate - INTERVAL '60 days'
+        ) AS RecentCommentCount,
+        SUM(V.BountyAmount) AS TotalBountyAmount
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId IN (8,9)
+    WHERE P.CreationDate >= DATE '2024-10-01' - INTERVAL '2 year'
+      AND P.Score > 20
+      AND EXISTS (SELECT 1 FROM UserActivityMetrics UAM WHERE UAM.UserId = P.OwnerUserId AND UAM.Reputation > 5000)
+    GROUP BY P.Id, P.Title, P.OwnerUserId, P.Score, P.ViewCount, P.CreationDate, P.LastActivityDate
+),
+AnswerAcceptanceRatio AS (
+    SELECT
+        Q.OwnerUserId,
+        COUNT(Q.Id) AS TotalQuestionsByOwner,
+        COUNT(Q.AcceptedAnswerId) AS AcceptedAnswerCountByOwner,
+        CAST(COUNT(Q.AcceptedAnswerId) AS DECIMAL) / NULLIF(COUNT(Q.Id), 0) AS AcceptanceRatio
+    FROM Posts Q
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.OwnerUserId
+),
+CombinedPostVoteMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+        SUM(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVotes,
+        (CAST(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS DECIMAL) / NULLIF(SUM(CASE WHEN V.VoteTypeId IN (2,3) THEN 1 ELSE 0 END),0)) AS UpVoteRatio
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    GROUP BY P.Id
+),
+QuestionAcceptedAnswerInfo AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.AcceptedAnswerId,
+        A.OwnerUserId AS AcceptedAnswerOwnerUserId,
+        A.CreationDate AS AcceptedAnswerCreationDate,
+        A.Score AS AcceptedAnswerScore,
+        CHAR_LENGTH(A.Body) AS AcceptedAnswerBodyLength,
+        (EXTRACT(EPOCH FROM (A.CreationDate - Q.CreationDate)) / 3600.0) AS TimeToAcceptedAnswerHours
+    FROM Posts Q
+    INNER JOIN Posts A ON Q.AcceptedAnswerId = A.Id
+    WHERE Q.PostTypeId = 1 AND A.PostTypeId = 2
+)
+SELECT
+    UAM.UserId,
+    UAM.DisplayName,
+    UAM.Reputation,
+    UAM.TotalPosts,
+    UAM.TotalQuestions,
+    UAM.TotalAnswers,
+    UAM.TotalBadges,
+    UAM.MostPrestigiousBadgeClass,
+    PLC.PostId,
+    PLC.Title AS PostTitle,
+    PLC.PostCreationDate,
+    PLC.PostScore,
+    PLC.ViewCount,
+    PLC.EditCount,
+    PLC.FirstEditDate,
+    PLC.LastEditDate,
+    MAA.CloseEvents,
+    MAA.ReopenEvents,
+    TP.TagName AS PrimaryTag,
+    TP.AvgTagScore,
+    RHP.Title AS RecentHighImpactPostTitle,
+    RHP.RecentCommentCount,
+    RHP.TotalBountyAmount,
+    AAR.AcceptanceRatio,
+    (SELECT T2.TagName FROM TagPerformance T2 ORDER BY T2.TagPopularityRank LIMIT 1) AS OverallTopTag,
+    COALESCE(PLC.ClosedDate, PLC.LastEditDate, PLC.PostCreationDate) AS LastSignificantDate,
+    CASE
+        WHEN PLC.PostScore > 75 AND PLC.ViewCount > 20000 THEN 'Highly Viral'
+        WHEN PLC.PostScore > 25 AND PLC.EditCount >= 5 AND CHAR_LENGTH(PLC.Body) > 1000 THEN 'Thoroughly Refined Long Post'
+        WHEN PLC.ClosedDate IS NOT NULL AND MAA.ReopenEvents > 0 AND (EXTRACT(EPOCH FROM (MAA.LastReopenDate - MAA.LastCloseDate)) / 3600) < 24 * 7 THEN 'Quickly Reopened Controversial'
+        WHEN QAA.AcceptedAnswerId IS NOT NULL THEN 'Answered Question'
+        ELSE 'Standard Activity'
+    END AS PostStatusCategory,
+    DENSE_RANK() OVER (ORDER BY UAM.Reputation DESC, UAM.TotalPosts DESC, PLC.PostScore DESC) AS UserPostGlobalRank,
+    (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - PLC.PostCreationDate)) / 86400.0) AS DaysSinceCreation,
+    LOWER(REPLACE(REPLACE(REPLACE(SUBSTRING(COALESCE(PLC.Tags, 'no-tag') FROM 1 FOR 100), '<', ''), '>', ' '), '-', '_')) AS CleanedTagsSnippet,
+    (
+        SELECT AVG(SubQ.PostScore)
+        FROM PostLifecycleEvents SubQ
+        WHERE SubQ.OwnerUserId = UAM.UserId
+          AND SubQ.PostCreationDate >= PLC.PostCreationDate - INTERVAL '180 days'
+          AND SubQ.PostCreationDate < PLC.PostCreationDate
+    ) AS AvgScoreLast180DaysPrior
+FROM UserActivityMetrics UAM
+LEFT JOIN PostLifecycleEvents PLC ON UAM.UserId = PLC.OwnerUserId
+LEFT JOIN ModeratorActionAnalysis MAA ON PLC.PostId = MAA.PostId
+LEFT JOIN TagPerformance TP ON TP.TagId = (
+    SELECT T3.TagId FROM TagPerformance T3 ORDER BY T3.TagPopularityRank LIMIT 1
+)
+LEFT JOIN RecentHighImpactPosts RHP ON PLC.PostId = RHP.PostId
+LEFT JOIN AnswerAcceptanceRatio AAR ON AAR.OwnerUserId = UAM.UserId
+LEFT JOIN QuestionAcceptedAnswerInfo QAA ON QAA.QuestionId = PLC.PostId
+WHERE UAM.UserId IS NOT NULL;

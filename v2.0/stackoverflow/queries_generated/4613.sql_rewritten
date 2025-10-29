@@ -1,0 +1,198 @@
+-- {"query": "4613.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2170} 
+WITH
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS PostCount,
+      SUM(p.Score) AS TotalScore,
+      AVG(p.ViewCount) AS AverageViewCount,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserCommentActivity AS (
+    SELECT
+      c.UserId,
+      COUNT(c.Id) AS CommentCount,
+      SUM(c.Score) AS TotalCommentScore
+    FROM Comments AS c
+    WHERE
+      c.UserId IS NOT NULL
+    GROUP BY
+      c.UserId
+  ),
+  UserVoteActivity AS (
+    SELECT
+      v.UserId,
+      COUNT(CASE WHEN vt.Name = 'UpMod' THEN v.Id ELSE NULL END) AS UpVoteCount,
+      COUNT(CASE WHEN vt.Name = 'DownMod' THEN v.Id ELSE NULL END) AS DownVoteCount,
+      COUNT(CASE WHEN vt.Name = 'Favorite' THEN v.Id ELSE NULL END) AS FavoriteCount
+    FROM Votes AS v
+    JOIN VoteTypes AS vt
+      ON v.VoteTypeId = vt.Id
+    WHERE
+      v.UserId IS NOT NULL
+    GROUP BY
+      v.UserId
+  ),
+  UserBadgeSummary AS (
+    SELECT
+      b.UserId,
+      COUNT(CASE WHEN b.Class = 1 THEN b.Id ELSE NULL END) AS GoldBadgeCount,
+      COUNT(CASE WHEN b.Class = 2 THEN b.Id ELSE NULL END) AS SilverBadgeCount,
+      COUNT(CASE WHEN b.Class = 3 THEN b.Id ELSE NULL END) AS BronzeBadgeCount,
+      MAX(CASE WHEN b.Name = 'Tumbleweed' THEN b.Date ELSE NULL END) AS TumbleweedDate
+    FROM Badges AS b
+    GROUP BY
+      b.UserId
+  ),
+  UserPostHistory AS (
+    SELECT
+      ph.UserId,
+      COUNT(CASE WHEN pht.Name = 'Edit Body' THEN ph.Id ELSE NULL END) AS BodyEditCount,
+      COUNT(CASE WHEN pht.Name = 'Edit Title' THEN ph.Id ELSE NULL END) AS TitleEditCount,
+      COUNT(CASE WHEN pht.Name = 'Post Closed' THEN ph.Id ELSE NULL END) AS CloseVoteCount,
+      MAX(ph.CreationDate) AS LastHistoryDate
+    FROM PostHistory AS ph
+    JOIN PostHistoryTypes AS pht
+      ON ph.PostHistoryTypeId = pht.Id
+    WHERE
+      ph.UserId IS NOT NULL
+    GROUP BY
+      ph.UserId
+  ),
+  UserRank AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views AS UserViews,
+      COALESCE(upa.PostCount, 0) AS TotalPosts,
+      COALESCE(upa.TotalScore, 0) AS TotalPostScore,
+      COALESCE(upa.AverageViewCount, 0) AS AvgPostViews,
+      COALESCE(uca.CommentCount, 0) AS TotalComments,
+      COALESCE(uca.TotalCommentScore, 0) AS TotalCommentScore,
+      COALESCE(uva.UpVoteCount, 0) AS TotalUpvotes,
+      COALESCE(uva.DownVoteCount, 0) AS TotalDownvotes,
+      COALESCE(uva.FavoriteCount, 0) AS TotalFavorites,
+      COALESCE(ubs.GoldBadgeCount, 0) AS GoldBadges,
+      COALESCE(ubs.SilverBadgeCount, 0) AS SilverBadges,
+      COALESCE(ubs.BronzeBadgeCount, 0) AS BronzeBadges,
+      CASE
+        WHEN ubs.TumbleweedDate IS NOT NULL THEN 'Has Tumbleweed'
+        ELSE 'No Tumbleweed'
+      END AS TumbleweedStatus,
+      COALESCE(uph.BodyEditCount, 0) AS BodyEdits,
+      COALESCE(uph.TitleEditCount, 0) AS TitleEdits,
+      COALESCE(uph.CloseVoteCount, 0) AS CloseVotesCast,
+      CASE
+        WHEN upa.LastPostDate > uca.LastCommentDate OR uca.LastCommentDate IS NULL THEN upa.LastPostDate
+        ELSE uca.LastCommentDate
+      END AS LastActivityTimestamp
+    FROM Users AS u
+    LEFT OUTER JOIN UserPostActivity AS upa
+      ON u.Id = upa.OwnerUserId
+    LEFT OUTER JOIN UserCommentActivity AS uca
+      ON u.Id = uca.UserId
+    LEFT OUTER JOIN UserVoteActivity AS uva
+      ON u.Id = uva.UserId
+    LEFT OUTER JOIN UserBadgeSummary AS ubs
+      ON u.Id = ubs.UserId
+    LEFT OUTER JOIN UserPostHistory AS uph
+      ON u.Id = uph.UserId
+    LEFT OUTER JOIN (
+      SELECT
+        UserId,
+        MAX(CreationDate) AS LastCommentDate
+      FROM Comments
+      GROUP BY
+        UserId
+    ) AS uca_last
+      ON u.Id = uca_last.UserId
+    LEFT OUTER JOIN (
+      SELECT
+        UserId,
+        MAX(CreationDate) AS LastPostHistoryDate
+      FROM PostHistory
+      GROUP BY
+        UserId
+    ) AS uph_last
+      ON u.Id = uph_last.UserId
+  )
+SELECT
+  CASE
+    WHEN ur.TotalPosts > 1000 AND ur.Reputation > 10000 THEN 'Power User'
+    WHEN ur.TotalPosts > 100 AND ur.Reputation > 1000 THEN 'Experienced User'
+    WHEN ur.TotalPosts > 10 THEN 'Regular User'
+    ELSE 'New User'
+  END AS UserCategory,
+  ur.DisplayName,
+  ur.Reputation,
+  ur.UserViews,
+  ur.TotalPosts,
+  ur.TotalComments,
+  ur.TotalUpvotes,
+  ur.TotalDownvotes,
+  ur.GoldBadges,
+  ur.SilverBadges,
+  ur.BronzeBadges,
+  ur.TumbleweedStatus,
+  ur.BodyEdits,
+  ur.TitleEdits,
+  ur.CloseVotesCast,
+  DATEDIFF(day, ur.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceCreation,
+  CASE
+    WHEN ur.LastActivityTimestamp IS NULL THEN 'Never Active'
+    ELSE FORMAT(ur.LastActivityTimestamp, 'yyyy-MM-dd HH:mm:ss')
+  END AS LastActivityFormatted,
+  UPPER(SUBSTRING(ur.DisplayName, 1, 3)) AS DisplayNamePrefix,
+  ROW_NUMBER() OVER (ORDER BY ur.Reputation DESC, ur.TotalPosts DESC) AS RankByReputation,
+  RANK() OVER (ORDER BY ur.TotalComments DESC) AS RankByComments,
+  DENSE_RANK() OVER (ORDER BY ur.GoldBadges DESC) AS RankByGoldBadges
+FROM UserRank AS ur
+WHERE
+  ur.Reputation >= 0
+  AND ur.TotalPosts > 0
+  AND ur.DisplayName IS NOT NULL
+  AND LEFT(ur.DisplayName, 1) <> 'a'
+UNION
+SELECT
+  'Community Contributor' AS UserCategory,
+  'Community' AS DisplayName,
+  0 AS Reputation,
+  SUM(p.ViewCount) AS UserViews,
+  COUNT(p.Id) AS TotalPosts,
+  COUNT(c.Id) AS TotalComments,
+  COUNT(CASE WHEN vt.Name = 'UpMod' THEN v.Id ELSE NULL END) AS TotalUpvotes,
+  COUNT(CASE WHEN vt.Name = 'DownMod' THEN v.Id ELSE NULL END) AS TotalDownvotes,
+  0 AS GoldBadges,
+  0 AS SilverBadges,
+  0 AS BronzeBadges,
+  'N/A' AS TumbleweedStatus,
+  COUNT(CASE WHEN pht.Name = 'Edit Body' THEN ph.Id ELSE NULL END) AS BodyEdits,
+  COUNT(CASE WHEN pht.Name = 'Edit Title' THEN ph.Id ELSE NULL END) AS TitleEdits,
+  COUNT(CASE WHEN pht.Name = 'Post Closed' THEN ph.Id ELSE NULL END) AS CloseVotesCast,
+  DATEDIFF(day, MIN(p.CreationDate), cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceCreation,
+  FORMAT(MAX(p.LastActivityDate), 'yyyy-MM-dd HH:mm:ss') AS LastActivityFormatted,
+  'COM' AS DisplayNamePrefix,
+  0 AS RankByReputation,
+  0 AS RankByComments,
+  0 AS RankByGoldBadges
+FROM Posts AS p
+LEFT OUTER JOIN Comments AS c
+  ON p.Id = c.PostId AND c.UserDisplayName = 'Community'
+LEFT OUTER JOIN Votes AS v
+  ON p.Id = v.PostId AND v.UserId IS NULL AND v.VoteTypeId IN (2, 3)
+LEFT OUTER JOIN PostHistory AS ph
+  ON p.Id = ph.PostId AND ph.UserId IS NULL AND ph.PostHistoryTypeId IN (5, 4)
+LEFT OUTER JOIN VoteTypes AS vt
+  ON v.VoteTypeId = vt.Id
+WHERE
+  p.OwnerUserId = -1 OR p.OwnerDisplayName = 'Community'
+GROUP BY
+  p.OwnerUserId,
+  p.OwnerDisplayName;

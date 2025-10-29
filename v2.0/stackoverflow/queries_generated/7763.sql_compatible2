@@ -1,0 +1,350 @@
+WITH PostAnalytics AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostTypeLabel,
+        COALESCE(p.Tags, '') as CleanTags,
+        COALESCE(p.Title, '') as CleanTitle,
+        CASE 
+            WHEN p.Score >= 100 THEN 'HighlyVoted'
+            WHEN p.Score >= 50 THEN 'ModeratelyVoted'
+            WHEN p.Score >= 10 THEN 'LowVoted'
+            ELSE 'NoVotes'
+        END as VoteCategory,
+        CAST((CAST(p.LastActivityDate AS DATE) - CAST(p.CreationDate AS DATE)) AS INTEGER) as DaysSinceLastActivity,
+        ROUND(p.Score * 1.0 / NULLIF(p.ViewCount, 0), 4) as ScorePerViewRatio,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as RankInUserPosts,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousScore,
+        FIRST_VALUE(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as UserMaxScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as UserAvgScore,
+        NTILE(4) OVER (ORDER BY p.Score) as ScoreQuartile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+      AND p.CreationDate >= TIMESTAMP '2015-01-01 00:00:00'
+),
+UserActivitySummary AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore,
+        MAX(p.LastActivityDate) as LastActivityDate,
+        MAX(p.CreationDate) as LastPostCreationDate,
+        CAST((CAST(MAX(p.CreationDate) AS DATE) - CAST(MIN(p.CreationDate) AS DATE)) AS INTEGER) as ActiveDays,
+        COUNT(DISTINCT c.Id) as TotalComments,
+        (u.UpVotes - u.DownVotes) as NetVotes,
+        COALESCE(NULLIF(u.Views, 0), 1) as ViewsPerPost,
+        CASE 
+            WHEN u.Reputation >= 100000 THEN 'Elite'
+            WHEN u.Reputation >= 10000 THEN 'Veteran'
+            WHEN u.Reputation >= 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END as ReputationTier,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) >= 100 THEN 'HighlyActive'
+            WHEN COUNT(DISTINCT p.Id) >= 50 THEN 'Active'
+            WHEN COUNT(DISTINCT p.Id) >= 10 THEN 'Moderate'
+            ELSE 'Casual'
+        END as ActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01 00:00:00'
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TagComplexityAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count >= 500 THEN 'Popular'
+            WHEN t.Count >= 100 THEN 'Moderate'
+            WHEN t.Count >= 10 THEN 'Niche'
+            ELSE 'Specialized'
+        END as PopularityLevel,
+        CASE 
+            WHEN t.TagName LIKE '%-%' OR t.TagName LIKE '%.%' THEN 'ComplexFormat'
+            WHEN LENGTH(t.TagName) > 15 THEN 'LongTagName'
+            ELSE 'StandardFormat'
+        END as TagNamingStyle,
+        t.Count * 1.0 / NULLIF((SELECT AVG(Count) FROM Tags), 0) as NormalizedCount,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as TagRank,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) as PreviousTagCount,
+        ((t.Count - LAG(t.Count, 1) OVER (ORDER BY t.Count DESC)) * 100.0 / NULLIF(LAG(t.Count, 1) OVER (ORDER BY t.Count DESC), 0)) as PercentageChangeFromPrev
+    FROM Tags t
+),
+EnhancedPostMetrics AS (
+    SELECT 
+        pa.PostId,
+        pa.PostTypeId,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.Title,
+        pa.Tags,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.LastActivityDate,
+        pa.PostTypeLabel,
+        pa.CleanTags,
+        pa.CleanTitle,
+        pa.VoteCategory,
+        pa.DaysSinceLastActivity,
+        pa.ScorePerViewRatio,
+        pa.RankInUserPosts,
+        pa.PreviousScore,
+        pa.UserMaxScore,
+        pa.UserAvgScore,
+        pa.ScoreQuartile,
+        CASE 
+            WHEN pa.Score > pa.UserAvgScore THEN 'AboveAverage'
+            WHEN pa.Score < pa.UserAvgScore THEN 'BelowAverage'
+            ELSE 'Average'
+        END as ScoreVsUserAvg,
+        CASE 
+            WHEN pa.Score >= pa.UserMaxScore THEN 'TopScore'
+            WHEN pa.Score >= pa.UserMaxScore * 0.75 THEN 'HighScore'
+            WHEN pa.Score >= pa.UserMaxScore * 0.5 THEN 'ModerateScore'
+            ELSE 'LowScore'
+        END as ScoreLevel,
+        ROW_NUMBER() OVER (ORDER BY pa.Score DESC) as OverallRank,
+        PERCENT_RANK() OVER (ORDER BY pa.Score) as ScorePercentile,
+        CUME_DIST() OVER (ORDER BY pa.Score) as ScoreCumulativeDistribution
+    FROM PostAnalytics pa
+),
+CombinedMetrics AS (
+    SELECT 
+        epm.PostId,
+        epm.PostTypeId,
+        epm.Score,
+        epm.ViewCount,
+        epm.CreationDate,
+        epm.OwnerUserId,
+        epm.Title,
+        epm.Tags,
+        epm.AnswerCount,
+        epm.CommentCount,
+        epm.FavoriteCount,
+        epm.LastActivityDate,
+        epm.PostTypeLabel,
+        epm.CleanTags,
+        epm.CleanTitle,
+        epm.VoteCategory,
+        epm.DaysSinceLastActivity,
+        epm.ScorePerViewRatio,
+        epm.RankInUserPosts,
+        epm.PreviousScore,
+        epm.UserMaxScore,
+        epm.UserAvgScore,
+        epm.ScoreQuartile,
+        epm.ScoreVsUserAvg,
+        epm.ScoreLevel,
+        epm.OverallRank,
+        epm.ScorePercentile,
+        epm.ScoreCumulativeDistribution,
+        uas.TotalPosts,
+        uas.TotalQuestions,
+        uas.TotalAnswers,
+        uas.TotalQuestionScore,
+        uas.TotalAnswerScore,
+        uas.AvgQuestionScore,
+        uas.AvgAnswerScore,
+        uas.LastActivityDate as UserLastActivity,
+        uas.ActiveDays,
+        uas.ViewsPerPost,
+        uas.ReputationTier,
+        uas.ActivityLevel,
+        ta.TagCount,
+        ta.PopularityLevel,
+        ta.TagNamingStyle,
+        ta.NormalizedCount,
+        ta.TagRank,
+        CASE 
+            WHEN epm.Score > 50 AND epm.ViewCount > 100 AND epm.CommentCount > 5 THEN 'HighImpact'
+            WHEN epm.Score > 20 AND epm.ViewCount > 50 AND epm.CommentCount > 2 THEN 'MediumImpact'
+            WHEN epm.Score > 5 AND epm.ViewCount > 20 AND epm.CommentCount > 1 THEN 'LowImpact'
+            ELSE 'MinimalImpact'
+        END as PostImpactLevel,
+        0.0 as AnswerToQuestionRatio,
+        LAG(epm.Score, 1) OVER (ORDER BY epm.CreationDate) as PrevPostScore,
+        CASE 
+            WHEN epm.Score > LAG(epm.Score, 1) OVER (ORDER BY epm.CreationDate) THEN 'Growth'
+            WHEN epm.Score < LAG(epm.Score, 1) OVER (ORDER BY epm.CreationDate) THEN 'Decline'
+            ELSE 'Stable'
+        END as ScoreTrend,
+        (epm.Score * 1.0 / NULLIF(uas.Reputation, 0)) as ScorePerReputation,
+        (epm.ViewCount * 1.0 / NULLIF(epm.AnswerCount, 0)) as ViewsPerAnswer,
+        COALESCE(eom.TotalAnswers, 0) as EOM_TotalAnswers,
+        COALESCE(eom.TotalQuestions, 0) as EOM_TotalQuestions
+    FROM EnhancedPostMetrics epm
+    LEFT JOIN UserActivitySummary uas ON epm.OwnerUserId = uas.UserId
+    LEFT JOIN TagComplexityAnalysis ta ON EXISTS (
+        SELECT 1 FROM (SELECT epm.CleanTags) ct WHERE ct.CleanTags LIKE '%' || ta.TagName || '%'
+    )
+    LEFT JOIN (
+        SELECT p.OwnerUserId,
+               SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as TotalAnswers,
+               SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as TotalQuestions
+        FROM Posts p
+        GROUP BY p.OwnerUserId
+    ) eom ON eom.OwnerUserId = epm.OwnerUserId
+),
+FinalAnalysis AS (
+    SELECT 
+        cm.PostId,
+        cm.PostTypeId,
+        cm.Score,
+        cm.ViewCount,
+        cm.CreationDate,
+        cm.OwnerUserId,
+        cm.Title,
+        cm.Tags,
+        cm.AnswerCount,
+        cm.CommentCount,
+        cm.FavoriteCount,
+        cm.LastActivityDate,
+        cm.PostTypeLabel,
+        cm.CleanTags,
+        cm.CleanTitle,
+        cm.VoteCategory,
+        cm.DaysSinceLastActivity,
+        cm.ScorePerViewRatio,
+        cm.RankInUserPosts,
+        cm.PreviousScore,
+        cm.UserMaxScore,
+        cm.UserAvgScore,
+        cm.ScoreQuartile,
+        cm.ScoreVsUserAvg,
+        cm.ScoreLevel,
+        cm.OverallRank,
+        cm.ScorePercentile,
+        cm.ScoreCumulativeDistribution,
+        cm.TotalPosts,
+        cm.TotalQuestions,
+        cm.TotalAnswers,
+        cm.TotalQuestionScore,
+        cm.TotalAnswerScore,
+        cm.AvgQuestionScore,
+        cm.AvgAnswerScore,
+        cm.UserLastActivity,
+        cm.ActiveDays,
+        cm.ViewsPerPost,
+        cm.ReputationTier,
+        cm.ActivityLevel,
+        cm.TagCount,
+        cm.PopularityLevel,
+        cm.TagNamingStyle,
+        cm.NormalizedCount,
+        cm.TagRank,
+        cm.PostImpactLevel,
+        CASE 
+            WHEN cm.EOM_TotalAnswers > 0 AND cm.EOM_TotalQuestions > 0 THEN (cm.EOM_TotalAnswers * 1.0 / NULLIF(cm.EOM_TotalQuestions, 0))
+            ELSE 0
+        END as AnswerToQuestionRatio,
+        cm.PrevPostScore,
+        cm.ScoreTrend,
+        cm.ScorePerReputation,
+        cm.ViewsPerAnswer,
+        CASE 
+            WHEN cm.Score >= 100 AND cm.ViewCount >= 1000 THEN 'ElitePerformer'
+            WHEN cm.Score >= 50 AND cm.ViewCount >= 500 THEN 'SolidPerformer'
+            WHEN cm.Score >= 10 AND cm.ViewCount >= 100 THEN 'GoodPerformer'
+            ELSE 'Standard'
+        END as PerformanceCategory,
+        CASE 
+            WHEN cm.DaysSinceLastActivity <= 30 THEN 'RecentlyActive'
+            WHEN cm.DaysSinceLastActivity <= 90 THEN 'ModeratelyActive'
+            WHEN cm.DaysSinceLastActivity <= 365 THEN 'InfrequentlyActive'
+            ELSE 'Inactive'
+        END as ActivityStatus,
+        RANK() OVER (PARTITION BY cm.ReputationTier ORDER BY cm.Score DESC) as TierRank,
+        PERCENT_RANK() OVER (PARTITION BY cm.ReputationTier ORDER BY cm.Score) as TierPercentile,
+        ROW_NUMBER() OVER (PARTITION BY cm.OwnerUserId ORDER BY cm.Score DESC) as RankInUser,
+        CASE 
+            WHEN cm.Score > 0 AND cm.ViewCount > 0 AND cm.CommentCount > 0 THEN 'Engagement'
+            ELSE 'LowEngagement'
+        END as EngagementLevel,
+        CAST((CAST(TIMESTAMP '2024-10-01 12:34:56' AS DATE) - CAST(cm.CreationDate AS DATE)) AS INTEGER) as DaysSinceCreation
+    FROM CombinedMetrics cm
+)
+SELECT 
+    fa.PostId,
+    fa.OwnerUserId,
+    fa.Title,
+    fa.Score,
+    fa.ViewCount,
+    fa.LastActivityDate,
+    fa.PostTypeLabel,
+    fa.VoteCategory,
+    fa.DaysSinceLastActivity,
+    fa.ScorePerViewRatio,
+    fa.UserMaxScore,
+    fa.UserAvgScore,
+    fa.ReputationTier,
+    fa.ActivityLevel,
+    fa.TagCount,
+    fa.PopularityLevel,
+    fa.ScoreLevel,
+    fa.ScoreVsUserAvg,
+    fa.PostImpactLevel,
+    fa.AnswerToQuestionRatio,
+    fa.PerformanceCategory,
+    fa.ActivityStatus,
+    fa.TierRank,
+    fa.TierPercentile,
+    fa.RankInUser,
+    fa.EngagementLevel,
+    fa.DaysSinceCreation,
+    CASE 
+        WHEN (fa.Score * 1.0 / NULLIF(fa.UserAvgScore, 0)) > 2 THEN 'ExceptionalPerformance'
+        WHEN (fa.Score * 1.0 / NULLIF(fa.UserAvgScore, 0)) > 1.5 THEN 'AboveAveragePerformance'
+        WHEN (fa.Score * 1.0 / NULLIF(fa.UserAvgScore, 0)) > 1 THEN 'AveragePerformance'
+        ELSE 'BelowAveragePerformance'
+    END as PerformanceRelativeToUser,
+    CASE 
+        WHEN fa.DaysSinceLastActivity > 365 THEN 'Archived'
+        WHEN fa.ScorePerViewRatio > 0.1 THEN 'HighROI'
+        WHEN fa.ScorePerViewRatio > 0.01 THEN 'ModerateROI'
+        ELSE 'LowROI'
+    END as ROI_Category
+FROM FinalAnalysis fa
+WHERE fa.Score IS NOT NULL
+  AND fa.ViewCount IS NOT NULL
+  AND fa.LastActivityDate IS NOT NULL
+  AND fa.PostTypeLabel IN ('Question', 'Answer')
+  AND fa.DaysSinceCreation BETWEEN 1 AND 365
+  AND fa.ReputationTier IN ('Elite', 'Veteran')
+ORDER BY 
+    fa.Score DESC,
+    fa.ViewCount DESC,
+    fa.LastActivityDate DESC
+LIMIT 10000;

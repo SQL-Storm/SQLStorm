@@ -1,0 +1,137 @@
+WITH
+  QuestionDetails AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title AS QuestionTitle,
+      p.OwnerUserId,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.ViewCount AS QuestionViewCount,
+      p.AnswerCount,
+      p.FavoriteCount,
+      pt.Name AS PostTypeName,
+      u.DisplayName AS OwnerDisplayName,
+      (
+        SELECT COUNT(ph.Id)
+        FROM PostHistory ph
+        WHERE ph.PostId = p.Id
+          AND ph.PostHistoryTypeId IN (4, 5, 6)
+      ) AS EditCount,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+      COALESCE(p.CommunityOwnedDate, TIMESTAMP '1900-01-01 00:00:00') AS CommunityOwnedTimestamp,
+      LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousQuestionScore,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS QuestionNumberForUser
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+      AND p.OwnerUserId > 0
+      AND p.CreationDate BETWEEN TIMESTAMP '2023-01-01 00:00:00' AND TIMESTAMP '2023-12-31 23:59:59'
+  ),
+  AnswerDetails AS (
+    SELECT
+      p.Id AS AnswerId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.CreationDate AS AnswerCreationDate,
+      p.Score AS AnswerScore,
+      u.DisplayName AS AnswererDisplayName,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRankForQuestion
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 2
+      AND p.ParentId IS NOT NULL
+  ),
+  UserBadges AS (
+    SELECT
+      b.UserId,
+      b.Name AS BadgeName,
+      b.Class,
+      ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS LatestBadgeRank
+    FROM Badges b
+    WHERE b.Class IN (1, 2)
+  )
+SELECT
+  q.QuestionId,
+  q.QuestionTitle,
+  q.OwnerDisplayName AS QuestionOwner,
+  q.QuestionCreationDate,
+  q.QuestionScore,
+  q.QuestionViewCount,
+  q.AnswerCount AS TotalAnswers,
+  q.FavoriteCount,
+  q.EditCount,
+  q.IsClosed,
+  CASE WHEN q.CommunityOwnedTimestamp > TIMESTAMP '2000-01-01 00:00:00' THEN 'Community Wiki' ELSE 'User Owned' END AS OwnershipType,
+  COALESCE(a.AnswerId, -1) AS BestAnswerId,
+  COALESCE(a.AnswererDisplayName, 'N/A') AS BestAnswerer,
+  COALESCE(a.AnswerScore, 0) AS BestAnswerScore,
+  q.PreviousQuestionScore,
+  q.QuestionNumberForUser,
+  ub.BadgeName AS UserTopBadgeName,
+  ub.Class AS UserTopBadgeClass,
+  CONCAT(
+    SUBSTRING(q.QuestionTitle FROM 1 FOR 10),
+    ' | ',
+    UPPER(SUBSTRING(q.PostTypeName FROM 1 FOR 1)),
+    '-',
+    CAST(q.QuestionScore AS VARCHAR),
+    '-',
+    TO_CHAR(q.QuestionCreationDate, 'YYYYMMDD')
+  ) AS CompositeQuestionIdentifier,
+  SUM(CASE WHEN a.AnswerScore > 50 THEN 1 ELSE 0 END) AS HighScoringAnswersCount,
+  AVG(a.AnswerScore) AS AverageAnswerScore,
+  (
+    SELECT COUNT(*)
+    FROM Comments c
+    WHERE c.PostId = q.QuestionId
+      AND c.CreationDate > q.QuestionCreationDate + INTERVAL '1 day'
+      AND c.UserId <> q.OwnerUserId
+  ) AS CommentsAfterFirstDayFromOtherUsers
+FROM QuestionDetails q
+LEFT JOIN AnswerDetails a
+  ON q.QuestionId = a.QuestionId
+  AND a.AnswerRankForQuestion = 1
+LEFT JOIN UserBadges ub
+  ON q.OwnerUserId = ub.UserId
+  AND ub.LatestBadgeRank = 1
+WHERE
+  q.QuestionScore > 0
+  OR q.AnswerCount > 0
+GROUP BY
+  q.QuestionId,
+  q.QuestionTitle,
+  q.OwnerDisplayName,
+  q.QuestionCreationDate,
+  q.QuestionScore,
+  q.QuestionViewCount,
+  q.AnswerCount,
+  q.FavoriteCount,
+  q.EditCount,
+  q.IsClosed,
+  CASE WHEN q.CommunityOwnedTimestamp > TIMESTAMP '2000-01-01 00:00:00' THEN 'Community Wiki' ELSE 'User Owned' END,
+  COALESCE(a.AnswerId, -1),
+  COALESCE(a.AnswererDisplayName, 'N/A'),
+  COALESCE(a.AnswerScore, 0),
+  q.PreviousQuestionScore,
+  q.QuestionNumberForUser,
+  ub.BadgeName,
+  ub.Class,
+  CONCAT(
+    SUBSTRING(q.QuestionTitle FROM 1 FOR 10),
+    ' | ',
+    UPPER(SUBSTRING(q.PostTypeName FROM 1 FOR 1)),
+    '-',
+    CAST(q.QuestionScore AS VARCHAR),
+    '-',
+    TO_CHAR(q.QuestionCreationDate, 'YYYYMMDD')
+  ),
+  q.OwnerUserId,
+  q.PostTypeName
+HAVING
+  COUNT(q.QuestionId) > 0
+ORDER BY
+  q.QuestionCreationDate DESC,
+  q.QuestionScore DESC
+LIMIT 100;

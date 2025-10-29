@@ -1,0 +1,105 @@
+-- {"query": "3022.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1978} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadgeCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadgeCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadgeCount,
+        (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastPostDate
+    FROM Users u
+),
+TagQuestionAgg AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.ViewCount) AS MaxViews,
+        STRING_AGG(DISTINCT p.Title, '; ') FILTER (WHERE p.Title IS NOT NULL) AS SampleTitles
+    FROM Posts p
+    JOIN Tags t 
+        ON t.Id = CAST(NULLIF(
+               split_part(
+                   regexp_replace(p.Tags, '^<|>$', ''), 
+                   '><', 
+                   1
+               ), 
+               ''
+           ) AS int)
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 10
+),
+RecentVotes AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        MAX(v.CreationDate) AS LatestVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY v.PostId
+)
+
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.NetVotes,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.GoldBadgeCount,
+    us.SilverBadgeCount,
+    us.BronzeBadgeCount,
+    COALESCE(rv.UpVoteCount, 0) AS RecentUpVotes,
+    COALESCE(rv.DownVoteCount, 0) AS RecentDownVotes,
+    ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.NetVotes DESC) AS ReputationRank,
+    CASE 
+        WHEN us.LastPostDate IS NULL THEN 'Never posted'
+        WHEN us.LastPostDate < CURRENT_DATE - INTERVAL '1 year' THEN 'Inactive >1yr'
+        ELSE 'Active'
+    END AS ActivityStatus
+FROM UserStats us
+LEFT JOIN RecentVotes rv 
+    ON rv.PostId = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = us.Id
+          AND p.PostTypeId = 1
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    )
+WHERE us.Reputation > 1000
+  AND (us.QuestionCount + us.AnswerCount) > 0
+
+UNION ALL
+
+SELECT 
+    NULL AS Id,
+    t.TagName AS DisplayName,
+    NULL AS Reputation,
+    NULL AS NetVotes,
+    t.QuestionCount,
+    NULL AS AnswerCount,
+    NULL AS GoldBadgeCount,
+    NULL AS SilverBadgeCount,
+    NULL AS BronzeBadgeCount,
+    NULL AS RecentUpVotes,
+    NULL AS RecentDownVotes,
+    ROW_NUMBER() OVER (ORDER BY t.QuestionCount DESC) AS ReputationRank,
+    CASE 
+        WHEN t.AvgScore > 5 THEN 'HotTag'
+        ELSE 'ColdTag'
+    END AS ActivityStatus
+FROM TagQuestionAgg t
+WHERE t.AvgScore IS NOT NULL
+
+ORDER BY ReputationRank NULLS LAST, ActivityStatus
+LIMIT 100;

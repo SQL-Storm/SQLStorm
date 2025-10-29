@@ -1,0 +1,197 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT CASE WHEN V.VoteTypeId = 2 THEN V.Id END) AS TotalUpvotesGiven,
+        COUNT(DISTINCT CASE WHEN V.VoteTypeId = 3 THEN V.Id END) AS TotalDownvotesGiven,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        MAX(P.CreationDate) AS LatestPostDate,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score END) AS AvgAnswerScore,
+        (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) AS GoldBadges,
+        (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 2) AS SilverBadges,
+        (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 3) AS BronzeBadges,
+        EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / (60 * 60 * 24) AS AccountAgeDays
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostPerformance AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Title,
+        P.Body,
+        P.CreationDate AS PostCreationDate,
+        P.OwnerUserId,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.LastActivityDate,
+        (CASE WHEN P.Tags IS NULL THEN NULL ELSE regexp_split_to_array(substring(P.Tags FROM 2 FOR (char_length(P.Tags) - 2)), '><') END) AS ParsedTags,
+        (
+            SELECT MIN(PH.CreationDate)
+            FROM PostHistory PH
+            WHERE PH.PostId = P.Id
+            AND PH.PostHistoryTypeId IN (4, 5, 6, 24)
+        ) AS FirstEditAppliedDate,
+        (
+            SELECT MAX(PH.CreationDate)
+            FROM PostHistory PH
+            WHERE PH.PostId = P.Id
+            AND PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105)
+        ) AS ClosedDateFromHistory,
+        (
+            SELECT COUNT(DISTINCT C_inner.Id)
+            FROM Comments C_inner
+            WHERE C_inner.PostId = P.Id
+            AND C_inner.CreationDate > P.CreationDate + INTERVAL '1 hour'
+            AND C_inner.Score >= 5
+        ) AS HighScoreCommentsAfterFirstHour,
+        LAG(P.Score, 1, 0) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PrevPostScoreByOwner,
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS PostTypeScoreRank,
+        DENSE_RANK() OVER (PARTITION BY P.OwnerUserId ORDER BY P.ViewCount DESC) AS OwnerViewRank,
+        COUNT(DISTINCT CASE WHEN V.VoteTypeId = 2 THEN V.Id END) OVER (PARTITION BY P.Id) AS PostUpvoteCount,
+        COUNT(DISTINCT CASE WHEN V.VoteTypeId = 3 THEN V.Id END) OVER (PARTITION BY P.Id) AS PostDownvoteCount
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    WHERE P.PostTypeId IN (1, 2)
+    AND P.CreationDate >= TIMESTAMP '2022-01-01'
+),
+ProblematicContentAnalysis AS (
+    SELECT
+        PP.PostId,
+        PP.PostTypeId,
+        PP.Title,
+        PP.Body,
+        PP.PostCreationDate,
+        PP.OwnerUserId,
+        PP.PostScore,
+        PP.ViewCount,
+        PP.FavoriteCount,
+        PP.ClosedDateFromHistory,
+        PP.HighScoreCommentsAfterFirstHour,
+        COALESCE(PP.FirstEditAppliedDate, PP.PostCreationDate) AS EffectiveLastEditConsidered,
+        (SELECT COUNT(1) FROM PostLinks PL WHERE PL.PostId = PP.PostId AND PL.LinkTypeId = 3) > 0 AS IsDuplicateSource,
+        (SELECT COUNT(1) FROM PostHistory PH WHERE PH.PostId = PP.PostId AND PH.PostHistoryTypeId = 11) > 0 AS WasReopened,
+        CASE
+            WHEN PP.PostTypeId = 1 AND COALESCE(PP.AnswerCount, 0) = 0 AND PP.LastActivityDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months') THEN 'Unanswered Stale Question'
+            WHEN PP.PostTypeId = 1 AND PP.ClosedDateFromHistory IS NOT NULL THEN 'Closed Question'
+            WHEN PP.PostTypeId = 2 AND PP.PostScore < -5 THEN 'Highly Downvoted Answer'
+            ELSE 'Normal Post'
+        END AS PostStatusCategory,
+        CASE
+            WHEN (PP.Title IS NOT NULL AND lower(PP.Title) LIKE '%performance%') OR (PP.Body IS NOT NULL AND lower(PP.Body) LIKE '%benchmark%') THEN 'Performance/Benchmark Related'
+            WHEN EXISTS (
+                SELECT 1
+                FROM unnest(COALESCE(PP.ParsedTags, ARRAY[]::text[])) AS tag
+                WHERE lower(tag) LIKE 'sql%' OR lower(tag) LIKE 'database%'
+            ) THEN 'SQL/Database Tag Related'
+            ELSE 'General'
+        END AS ContentKeywordCategory
+    FROM PostPerformance PP
+    WHERE PP.PostScore < 0 OR PP.ViewCount > 10000 OR PP.FavoriteCount > 100
+    OR PP.ClosedDateFromHistory IS NOT NULL
+)
+SELECT
+    PCA.PostId,
+    PCA.PostTypeId,
+    PCA.Title,
+    PCA.PostCreationDate,
+    PCA.OwnerUserId,
+    UE.DisplayName AS OwnerDisplayName,
+    COALESCE(UE.Reputation, 0) AS OwnerReputation,
+    PCA.PostScore,
+    PCA.ViewCount,
+    COALESCE(PCA.FavoriteCount, 0) AS FavoriteCount,
+    PCA.ClosedDateFromHistory,
+    PCA.HighScoreCommentsAfterFirstHour,
+    PCA.IsDuplicateSource,
+    PCA.WasReopened,
+    PCA.PostStatusCategory,
+    PCA.ContentKeywordCategory,
+    UE.AccountAgeDays,
+    COALESCE(UE.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UE.SilverBadges, 0) AS SilverBadges,
+    COALESCE(UE.BronzeBadges, 0) AS BronzeBadges,
+    PP.PostTypeScoreRank,
+    PP.OwnerViewRank,
+    PP.PostUpvoteCount,
+    PP.PostDownvoteCount,
+    CASE
+        WHEN (PP.PostUpvoteCount + PP.PostDownvoteCount) > 0
+        THEN (CAST(PP.PostUpvoteCount AS NUMERIC) / (PP.PostUpvoteCount + PP.PostDownvoteCount))
+        ELSE 0
+    END AS UpvoteRatio,
+    (PCA.PostScore * (1 + (COALESCE(PCA.FavoriteCount, 0) / 10.0)) - (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - PCA.PostCreationDate)) / (3600.0 * 24 * 365.25 * 0.1)))
+    / (LOG(GREATEST(COALESCE(PCA.ViewCount, 0), 1)) + 1 + (CASE WHEN PCA.EffectiveLastEditConsidered > PCA.PostCreationDate + INTERVAL '1 day' THEN 0.5 ELSE 0 END)) AS WeightedInfluenceScore,
+    COALESCE(SUBSTRING(PCA.Body FROM 1 FOR 150), 'No body text available') AS PostBodyExcerpt,
+    (SELECT COUNT(DISTINCT T.Id) FROM Tags T WHERE T.TagName = ANY(COALESCE(PP.ParsedTags, ARRAY[]::text[]))) AS MatchedTagsCount,
+    (SELECT AVG(C_sub.Score) FROM Comments C_sub WHERE C_sub.PostId = PCA.PostId AND C_sub.UserId IS NOT NULL) AS AvgCommentScoreByRegisteredUser
+FROM ProblematicContentAnalysis PCA
+LEFT JOIN UserEngagement UE ON PCA.OwnerUserId = UE.UserId
+INNER JOIN PostPerformance PP ON PCA.PostId = PP.PostId
+WHERE PCA.PostStatusCategory != 'Normal Post'
+OR (UE.Reputation IS NOT NULL AND UE.Reputation < 500 AND PCA.PostScore < 0)
+OR (PCA.ContentKeywordCategory ILIKE '%sql%')
+ORDER BY WeightedInfluenceScore DESC, PCA.PostCreationDate DESC
+LIMIT 500
+
+UNION ALL
+
+SELECT
+    NULL AS PostId,
+    NULL AS PostTypeId,
+    NULL AS Title,
+    CAST(NULL AS timestamp) AS PostCreationDate,
+    UE.UserId AS OwnerUserId,
+    UE.DisplayName AS OwnerDisplayName,
+    COALESCE(UE.Reputation, 0) AS OwnerReputation,
+    P_low_engage.Score AS PostScore,
+    P_low_engage.ViewCount AS ViewCount,
+    COALESCE(P_low_engage.FavoriteCount, 0) AS FavoriteCount,
+    P_low_engage.ClosedDate AS ClosedDateFromHistory,
+    NULL AS HighScoreCommentsAfterFirstHour,
+    FALSE AS IsDuplicateSource,
+    FALSE AS WasReopened,
+    'UserAnomaly: LowEngagementHighPoster' AS PostStatusCategory,
+    'UserCentric' AS ContentKeywordCategory,
+    UE.AccountAgeDays,
+    COALESCE(UE.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UE.SilverBadges, 0) AS SilverBadges,
+    COALESCE(UE.BronzeBadges, 0) AS BronzeBadges,
+    NULL AS PostTypeScoreRank,
+    NULL AS OwnerViewRank,
+    NULL AS PostUpvoteCount,
+    NULL AS PostDownvoteCount,
+    NULL AS UpvoteRatio,
+    (UE.TotalPosts * 1.0 / GREATEST(UE.AccountAgeDays, 1, 0.001)) - (UE.TotalUpvotesGiven * 0.5) AS WeightedInfluenceScore,
+    COALESCE(SUBSTRING(P_low_engage.Body FROM 1 FOR 150), 'No associated post body') AS PostBodyExcerpt,
+    NULL AS MatchedTagsCount,
+    NULL AS AvgCommentScoreByRegisteredUser
+FROM UserEngagement UE
+LEFT JOIN LATERAL (
+    SELECT P_inner.*
+    FROM Posts P_inner
+    WHERE P_inner.OwnerUserId = UE.UserId
+    AND P_inner.PostTypeId IN (1, 2)
+    ORDER BY P_inner.Score ASC, P_inner.ViewCount DESC
+    LIMIT 1
+) P_low_engage ON TRUE
+WHERE UE.TotalPosts > 50
+AND COALESCE(UE.AvgQuestionScore, 0) < 3
+AND UE.TotalUpvotesGiven < UE.TotalPosts * 1.5
+AND COALESCE(UE.Reputation, 0) < 750
+AND UE.AccountAgeDays > 30
+ORDER BY WeightedInfluenceScore DESC, UE.Reputation ASC
+LIMIT 100;

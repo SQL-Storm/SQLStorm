@@ -1,0 +1,138 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) AS WikiPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    COUNT(DISTINCT b.Id) AS BadgesCount,
+    STRING_AGG(DISTINCT b.Name, ', ') AS BadgeNames,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(DISTINCT p.Id), 0) AS QuestionPercentage,
+    COALESCE(SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(p.Id), 0), 0) AS PositiveScorePercentage,
+    (
+        SELECT COUNT(DISTINCT ph.PostId) 
+        FROM PostHistory ph 
+        WHERE ph.UserId = u.Id 
+        AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+    ) AS EditCount,
+    (
+        SELECT STRING_AGG(CONCAT('Q', p2.Id, ':', p2.Title), '; ' ORDER BY p2.CreationDate DESC)
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+        AND p2.PostTypeId = 1
+        AND p2.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1' YEAR)
+        LIMIT 5
+    ) AS RecentQuestions,
+    (
+        SELECT p3.Title
+        FROM Posts p3 
+        WHERE p3.OwnerUserId = u.Id 
+        AND p3.PostTypeId = 1
+        AND EXISTS (
+            SELECT 1 FROM PostHistory ph2 
+            WHERE ph2.PostId = p3.Id 
+            AND ph2.UserId = u.Id
+            AND ph2.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+        )
+        ORDER BY p3.CreationDate DESC
+        LIMIT 1
+    ) AS LastEditedQuestion,
+    (
+        SELECT COUNT(p4.Id)
+        FROM Posts p4 
+        WHERE p4.OwnerUserId = u.Id 
+        AND p4.PostTypeId = 2
+        AND EXISTS (
+            SELECT 1 FROM Votes v 
+            WHERE v.PostId = p4.Id 
+            AND v.VoteTypeId = 1
+        )
+    ) AS AcceptedAnswerCount,
+    (
+        SELECT STRING_AGG(CONCAT('B', b2.Id, ':', b2.Name, ' (', b2.Date, ')'), ', ' ORDER BY b2.Date DESC)
+        FROM Badges b2 
+        WHERE b2.UserId = u.Id 
+        AND b2.Date >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY)
+    ) AS RecentBadges,
+    ROW_NUMBER() OVER (ORDER BY SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) DESC, u.Id) AS RankByQuestionScore,
+    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC, u.Id) AS RankByPostCount,
+    NTILE(10) OVER (ORDER BY u.Reputation DESC) AS ReputationDecile,
+    CASE 
+        WHEN u.Reputation >= 10000 THEN 'Elite'
+        WHEN u.Reputation >= 5000 THEN 'Veteran'
+        WHEN u.Reputation >= 1000 THEN 'Regular'
+        ELSE 'Newbie'
+    END AS ReputationTier,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p5 
+        WHERE p5.PostTypeId = 1 
+        AND p5.OwnerUserId = u.Id 
+        AND (
+            p5.ViewCount < 10 OR p5.ViewCount IS NULL
+        ) 
+        AND (
+            p5.AnswerCount = 0 OR p5.AnswerCount IS NULL
+        )
+    ) AS LowViewsNoAnswersCount,
+    (
+        SELECT STRING_AGG(CONCAT('T', t.TagName, ' (', t.Count, ')'), ', ' ORDER BY t.Count DESC)
+        FROM Tags t 
+        INNER JOIN (
+            SELECT DISTINCT SUBSTRING(p6.Tags FROM 2 FOR (CHAR_LENGTH(p6.Tags) - 2)) AS Tags
+            FROM Posts p6 
+            WHERE p6.OwnerUserId = u.Id 
+            AND p6.PostTypeId = 1
+        ) tag_list ON tag_list.Tags LIKE '%' || t.TagName || '%'
+        WHERE t.Count > 100
+        LIMIT 3
+    ) AS PopularTags,
+    (
+        SELECT COUNT(DISTINCT ph3.PostId)
+        FROM PostHistory ph3
+        INNER JOIN Posts p7 ON ph3.PostId = p7.Id
+        WHERE ph3.UserId = u.Id 
+        AND ph3.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+        AND p7.PostTypeId = 1
+    ) AS QuestionEditingActivity,
+    (
+        SELECT COALESCE(SUM(ph4.BountyAmount), 0)
+        FROM PostHistory ph4
+        INNER JOIN Posts p8 ON ph4.PostId = p8.Id
+        WHERE ph4.UserId = u.Id 
+        AND ph4.PostHistoryTypeId = 8
+        AND p8.PostTypeId = 1
+    ) AS TotalBountyAmount,
+    (
+        SELECT COUNT(DISTINCT p9.Id)
+        FROM Posts p9
+        INNER JOIN Comments c ON c.PostId = p9.Id
+        WHERE p9.OwnerUserId = u.Id 
+        AND p9.PostTypeId = 1
+        AND c.UserId IS NOT NULL
+    ) AS QuestionsWithComments,
+    (
+        SELECT STRING_AGG(CONCAT('P', p10.Id, ':', p10.Title, ' (', p10.Score, ')'), ', ' ORDER BY p10.Score DESC)
+        FROM Posts p10 
+        WHERE p10.OwnerUserId = u.Id 
+        AND p10.PostTypeId = 2
+        AND p10.Score >= 10
+        LIMIT 3
+    ) AS TopScoringAnswers
+FROM Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+WHERE u.Reputation >= 1000 
+AND u.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5' YEAR)
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) >= 5
+ORDER BY TotalQuestionScore DESC, Reputation DESC;

@@ -1,0 +1,362 @@
+with recent_questions as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        coalesce(q.AnswerCount, 0) as AnswerCount
+    from Posts q
+    where q.PostTypeId = 1
+      and q.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts)
+),
+answers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerUserId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate
+    from Posts a
+    where a.PostTypeId = 2
+),
+first_answer as (
+    select
+        a.QuestionId,
+        min(a.AnswerCreationDate) as FirstAnswerDate
+    from answers a
+    group by a.QuestionId
+),
+answer_stats as (
+    select
+        a.QuestionId,
+        count(*) as TotalAnswers,
+        avg(a.AnswerScore) as AvgAnswerScore,
+        sum(case when a.AnswerScore > 0 then 1 else 0 end) as PosAnswers,
+        sum(case when a.AnswerScore < 0 then 1 else 0 end) as NegAnswers
+    from answers a
+    group by a.QuestionId
+),
+question_votes as (
+    select
+        v.PostId as QuestionId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites
+    from Votes v
+    join Posts p on p.Id = v.PostId and p.PostTypeId = 1
+    where v.CreationDate >= (select max(CreationDate) - interval '365 days' from Votes)
+    group by v.PostId
+),
+user_stats as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.UpVotes as UserUpVotes,
+        u.DownVotes as UserDownVotes,
+        coalesce(nullif(trim(split_part(coalesce(u.Location,''), ',', 1)), ''), 'Unknown') as CountryGuess,
+        (u.UpVotes - u.DownVotes) as NetVotes,
+        width_bucket(u.Reputation, 0, 100000, 10) as RepBucket
+    from Users u
+),
+tag_expansion as (
+    select
+        q.QuestionId,
+        unnest(string_to_array(substring(q.Tags from 2 for length(q.Tags)-2), '><')) as TagName
+    from recent_questions q
+    where q.Tags is not null and q.Tags like '<%>'
+),
+tag_with_meta as (
+    select
+        t.QuestionId,
+        t.TagName,
+        tg.Count as TagGlobalCount,
+        coalesce(tg.IsModeratorOnly, 0) as IsModOnly,
+        coalesce(tg.IsRequired, 0) as IsRequired
+    from tag_expansion t
+    left join Tags tg on tg.TagName = t.TagName
+),
+question_tag_rank as (
+    select
+        QuestionId,
+        TagName,
+        TagGlobalCount,
+        rank() over (partition by QuestionId order by coalesce(TagGlobalCount, -1) desc, TagName) as TagPopRank
+    from tag_with_meta
+),
+question_closed as (
+    select
+        ph.PostId as QuestionId,
+        min(ph.CreationDate) as FirstClosedDate,
+        max(case when ph.PostHistoryTypeId = 10 then cast(ph.Comment as integer) else null end) as CloseReasonId
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10, 11)
+    group by ph.PostId
+),
+duplicate_links as (
+    select
+        pl.PostId as QuestionId,
+        count(case when pl.LinkTypeId = 3 then 1 end) as DuplicateCount,
+        count(case when pl.LinkTypeId = 1 then 1 end) as LinkedCount
+    from PostLinks pl
+    group by pl.PostId
+),
+bounty_info as (
+    select
+        v.PostId as QuestionId,
+        sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as BountyStarted,
+        sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as BountyAwarded
+    from Votes v
+    group by v.PostId
+),
+owner_activity as (
+    select
+        p.OwnerUserId as UserId,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionsAuthored,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswersAuthored,
+        avg(p.Score) as AvgPostScore,
+        max(p.LastActivityDate) as LastPostActivity
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+comment_summary as (
+    select
+        c.PostId as QuestionId,
+        count(*) as CommentCount,
+        avg(c.Score) as AvgCommentScore,
+        max(case when c.Score > 5 then 1 else 0 end) as HasHotComment
+    from Comments c
+    group by c.PostId
+),
+accepted_answer as (
+    select
+        q.Id as QuestionId,
+        q.AcceptedAnswerId
+    from Posts q
+    where q.PostTypeId = 1
+),
+answerer_badges as (
+    select
+        a.QuestionId,
+        a.AnswerUserId as UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges
+    from answers a
+    left join Badges b on b.UserId = a.AnswerUserId
+    group by a.QuestionId, a.AnswerUserId
+),
+answerer_badge_agg as (
+    select
+        QuestionId,
+        max(GoldBadges) as MaxGoldBadgesAmongAnswerers,
+        max(SilverBadges) as MaxSilverBadgesAmongAnswerers,
+        max(BronzeBadges) as MaxBronzeBadgesAmongAnswerers
+    from answerer_badges
+    group by QuestionId
+),
+question_activity as (
+    select
+        q.Id as QuestionId,
+        q.CreationDate,
+        q.LastActivityDate,
+        extract(epoch from (q.LastActivityDate - q.CreationDate)) as LifetimeSeconds
+    from Posts q
+    where q.PostTypeId = 1
+),
+hotness as (
+    select
+        rq.QuestionId,
+        (
+            coalesce(qv.UpVotes,0) * 2
+            - coalesce(qv.DownVotes,0)
+            + coalesce(rq.ViewCount,0) / nullif(1 + extract(epoch from (timestamp '2024-10-01 12:34:56' - rq.CreationDate)) / 86400, 0)
+        ) as HotScore
+    from recent_questions rq
+    left join question_votes qv on qv.QuestionId = rq.QuestionId
+),
+dense_vote_timeline as (
+    select
+        v.PostId as QuestionId,
+        v.CreationDate,
+        sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end)
+            over (partition by v.PostId order by v.CreationDate rows between unbounded preceding and current row) as RunningNetVotes
+    from Votes v
+    join Posts p on p.Id = v.PostId and p.PostTypeId = 1
+),
+question_engagement as (
+    select
+        dt.QuestionId,
+        max(dt.RunningNetVotes) as PeakNetVotes,
+        percentile_cont(0.5) within group (order by dt.RunningNetVotes) as MedianNetVotes
+    from dense_vote_timeline dt
+    group by dt.QuestionId
+),
+owner_enrichment as (
+    select
+        rq.QuestionId,
+        u.Id as OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        us.Reputation,
+        us.NetVotes as OwnerNetVotes,
+        oa.QuestionsAuthored,
+        oa.AnswersAuthored,
+        coalesce(oa.AvgPostScore, 0) as OwnerAvgPostScore,
+        us.CountryGuess,
+        us.RepBucket
+    from recent_questions rq
+    left join Users u on u.Id = rq.OwnerUserId
+    left join user_stats us on us.UserId = u.Id
+    left join owner_activity oa on oa.UserId = u.Id
+),
+final_ranked as (
+    select
+        rq.QuestionId,
+        rq.Title,
+        rq.CreationDate,
+        rq.Score as QuestionScore,
+        rq.ViewCount,
+        rq.AnswerCount,
+        qv.UpVotes,
+        qv.DownVotes,
+        qv.Favorites,
+        asx.TotalAnswers,
+        asx.AvgAnswerScore,
+        asx.PosAnswers,
+        asx.NegAnswers,
+        fa.FirstAnswerDate,
+        aa.AcceptedAnswerId,
+        cs.CommentCount,
+        cs.AvgCommentScore,
+        cs.HasHotComment,
+        qc.FirstClosedDate,
+        crt.Name as CloseReasonName,
+        dl.DuplicateCount,
+        dl.LinkedCount,
+        bi.BountyStarted,
+        bi.BountyAwarded,
+        ae.MaxGoldBadgesAmongAnswerers,
+        ae.MaxSilverBadgesAmongAnswerers,
+        ae.MaxBronzeBadgesAmongAnswerers,
+        qa.LifetimeSeconds,
+        ho.HotScore,
+        qe.PeakNetVotes,
+        qe.MedianNetVotes,
+        oe.OwnerUserId,
+        oe.OwnerDisplayName,
+        oe.Reputation as OwnerReputation,
+        oe.OwnerNetVotes,
+        oe.QuestionsAuthored,
+        oe.AnswersAuthored,
+        oe.OwnerAvgPostScore,
+        oe.CountryGuess,
+        oe.RepBucket,
+        qtr.TagName as TopTagByGlobalCount,
+        qtr.TagGlobalCount as TopTagGlobalCount
+    from recent_questions rq
+    left join question_votes qv on qv.QuestionId = rq.QuestionId
+    left join answer_stats asx on asx.QuestionId = rq.QuestionId
+    left join first_answer fa on fa.QuestionId = rq.QuestionId
+    left join accepted_answer aa on aa.QuestionId = rq.QuestionId
+    left join comment_summary cs on cs.QuestionId = rq.QuestionId
+    left join question_closed qc on qc.QuestionId = rq.QuestionId
+    left join CloseReasonTypes crt on crt.Id = qc.CloseReasonId
+    left join duplicate_links dl on dl.QuestionId = rq.QuestionId
+    left join bounty_info bi on bi.QuestionId = rq.QuestionId
+    left join answerer_badge_agg ae on ae.QuestionId = rq.QuestionId
+    left join question_activity qa on qa.QuestionId = rq.QuestionId
+    left join hotness ho on ho.QuestionId = rq.QuestionId
+    left join question_engagement qe on qe.QuestionId = rq.QuestionId
+    left join owner_enrichment oe on oe.QuestionId = rq.QuestionId
+    left join lateral (
+        select qtr_inner.TagName, qtr_inner.TagGlobalCount
+        from question_tag_rank qtr_inner
+        where qtr_inner.QuestionId = rq.QuestionId and qtr_inner.TagPopRank = 1
+        order by qtr_inner.TagName
+        limit 1
+    ) qtr on true
+),
+normalized as (
+    select
+        fr.*,
+        case when AnswerCount is null or AnswerCount = 0 then null
+             else round((cast(TotalAnswers as numeric) / cast(AnswerCount as numeric)) * 100, 2) end as AnswerCountConsistencyPct,
+        coalesce(BountyAwarded,0) - coalesce(BountyStarted,0) as BountyDelta,
+        case when FirstAnswerDate is not null then extract(epoch from (FirstAnswerDate - CreationDate)) end as TimeToFirstAnswerSec,
+        case when Favorites is not null and ViewCount > 0 then round((cast(Favorites as numeric) / cast(ViewCount as numeric))*1000, 3) end as FavesPerKViews,
+        case when UpVotes is not null and DownVotes is not null and (UpVotes + DownVotes) > 0
+             then round((cast(UpVotes as numeric) / (UpVotes + DownVotes)) * 100, 2) end as UpvoteRatioPct,
+        case when OwnerReputation is null then 'Anonymous/Deleted'
+             when OwnerReputation >= 100000 then 'Legend'
+             when OwnerReputation >= 25000 then 'Elite'
+             when OwnerReputation >= 5000 then 'Pro'
+             when OwnerReputation >= 1000 then 'Established'
+             else 'Rookie' end as OwnerTier,
+        case when FirstClosedDate is not null then 1 else 0 end as IsClosedFlag
+    from final_ranked fr
+),
+ranked as (
+    select
+        n.*,
+        row_number() over (
+            order by
+                coalesce(HotScore, 0) desc,
+                coalesce(UpvoteRatioPct, 0) desc,
+                coalesce(ViewCount, 0) desc,
+                coalesce(TotalAnswers, 0) desc,
+                coalesce(Favorites, 0) desc,
+                coalesce(PeakNetVotes, 0) desc
+        ) as OverallRank
+    from normalized n
+)
+select
+    r.OverallRank,
+    r.QuestionId,
+    r.Title,
+    r.OwnerDisplayName,
+    r.OwnerReputation,
+    r.OwnerTier,
+    r.CountryGuess,
+    r.CreationDate,
+    r.QuestionScore,
+    r.ViewCount,
+    r.UpVotes,
+    r.DownVotes,
+    r.UpvoteRatioPct,
+    r.Favorites,
+    r.FavesPerKViews,
+    r.TotalAnswers,
+    r.AvgAnswerScore,
+    r.TimeToFirstAnswerSec,
+    r.AcceptedAnswerId,
+    r.CommentCount,
+    r.HasHotComment,
+    r.IsClosedFlag,
+    coalesce(r.CloseReasonName, 'N/A') as CloseReasonName,
+    r.DuplicateCount,
+    r.LinkedCount,
+    r.BountyStarted,
+    r.BountyAwarded,
+    r.BountyDelta,
+    r.TopTagByGlobalCount,
+    r.TopTagGlobalCount,
+    r.MaxGoldBadgesAmongAnswerers,
+    r.MaxSilverBadgesAmongAnswerers,
+    r.MaxBronzeBadgesAmongAnswerers,
+    r.HotScore,
+    r.PeakNetVotes,
+    r.MedianNetVotes
+from ranked r
+where (
+        (r.IsClosedFlag = 0 and coalesce(r.UpvoteRatioPct, 0) >= 60)
+     or (r.IsClosedFlag = 1 and coalesce(r.DuplicateCount, 0) >= 1)
+     or (r.BountyDelta <> 0)
+     or (r.TopTagByGlobalCount is not null and r.TopTagByGlobalCount ~ '^[a-z0-9\\-\\.]+$')
+     )
+  and coalesce(r.OwnerDisplayName, '') not ilike any (array['%bot%','%community%'])
+  and (r.ViewCount is null or r.ViewCount >= 0)
+order by r.OverallRank
+limit 250;

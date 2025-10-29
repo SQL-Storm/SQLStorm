@@ -1,0 +1,168 @@
+-- {"query": "3986.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3415} 
+WITH
+/* ------------------------------------------------------------------
+   Aggregate basic user statistics (questions, answers, reputation)   */
+user_stats AS (
+    SELECT
+        u.id                                    AS user_id,
+        COALESCE(u.displayname, 'Anonymous')    AS display_name,
+        u.reputation,
+        COUNT(p.id) FILTER (WHERE p.posttypeid = 1) AS question_cnt,
+        COUNT(p.id) FILTER (WHERE p.posttypeid = 2) AS answer_cnt
+    FROM users u
+    LEFT JOIN posts p
+           ON p.owneruserid = u.id
+    GROUP BY u.id, u.displayname, u.reputation
+),
+
+/* ------------------------------------------------------------------
+   Count badges per class for each user                                   */
+badge_counts AS (
+    SELECT
+        b.userid,
+        SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+        SUM(CASE WHEN b.class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+        SUM(CASE WHEN b.class = 3 THEN 1 ELSE 0 END) AS bronze_cnt
+    FROM badges b
+    GROUP BY b.userid
+),
+
+/* ------------------------------------------------------------------
+   Latest edit (post‑history) per post – row_number for correlation      */
+latest_edits AS (
+    SELECT
+        ph.userid,
+        ph.postid,
+        ph.creationdate,
+        ROW_NUMBER() OVER (PARTITION BY ph.postid
+                           ORDER BY ph.creationdate DESC) AS rn
+    FROM posthistory ph
+    WHERE ph.posthistorytypeid IN (4,5,6)          -- title, body, tags edits
+),
+
+/* ------------------------------------------------------------------
+   Total edit counts per user (only counting the most recent edit per post) */
+user_edit_counts AS (
+    SELECT
+        le.userid,
+        COUNT(*) FILTER (WHERE le.rn = 1) AS recent_edit_flag,
+        COUNT(*)                         AS total_edits
+    FROM latest_edits le
+    GROUP BY le.userid
+),
+
+/* ------------------------------------------------------------------
+   Sum of up‑votes and down‑votes per user                              */
+vote_summaries AS (
+    SELECT
+        p.owneruserid                               AS user_id,
+        SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) AS down_votes
+    FROM posts p
+    JOIN votes v
+         ON v.postid = p.id
+    WHERE v.votetypeid IN (2,3)
+    GROUP BY p.owneruserid
+),
+
+/* ------------------------------------------------------------------
+   Tag‑level score per user (answers only) – window rank to get top 3   */
+tag_user_score AS (
+    SELECT
+        t.tagname,
+        p.owneruserid                               AS user_id,
+        SUM(p.score)                                AS tag_score,
+        ROW_NUMBER() OVER (PARTITION BY t.tagname
+                           ORDER BY SUM(p.score) DESC) AS tag_rank
+    FROM posts p
+    /* split the '<tag1><tag2>' string into rows */
+    CROSS JOIN LATERAL
+         UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.tags), '><')) AS t(tagname)
+    WHERE p.posttypeid = 2                         -- only answers
+    GROUP BY t.tagname, p.owneruserid
+)
+
+SELECT
+    us.user_id,
+    us.display_name ||
+    ' (ID:' || us.user_id || ')'                 AS user_label,
+    us.reputation,
+    us.question_cnt,
+    us.answer_cnt,
+    COALESCE(bc.gold_cnt,0)   AS gold_badges,
+    COALESCE(bc.silver_cnt,0) AS silver_badges,
+    COALESCE(bc.bronze_cnt,0) AS bronze_badges,
+    COALESCE(vs.up_votes,0)   AS up_votes,
+    COALESCE(vs.down_votes,0) AS down_votes,
+    COALESCE(uec.total_edits,0) AS total_edits,
+    CASE
+        WHEN COALESCE(bc.gold_cnt,0) > 0 THEN 'Veteran'
+        WHEN COALESCE(bc.silver_cnt,0) > 0 THEN 'Experienced'
+        ELSE 'Newcomer'
+    END                                            AS user_tier,
+    STRING_AGG(DISTINCT
+               tu.tagname || ':' || tu.tag_score,
+               '; '
+              ) FILTER (WHERE tu.tag_rank <= 3)   AS top_tags
+FROM user_stats us
+LEFT JOIN badge_counts bc
+       ON bc.userid = us.user_id
+LEFT JOIN vote_summaries vs
+       ON vs.user_id = us.user_id
+LEFT JOIN user_edit_counts uec
+       ON uec.userid = us.user_id
+LEFT JOIN tag_user_score tu
+       ON tu.user_id = us.user_id
+WHERE us.reputation > 1000
+GROUP BY
+    us.user_id, us.display_name, us.reputation,
+    us.question_cnt, us.answer_cnt,
+    bc.gold_cnt, bc.silver_cnt, bc.bronze_cnt,
+    vs.up_votes, vs.down_votes,
+    uec.total_edits
+
+HAVING COUNT(*) FILTER (WHERE bc.gold_cnt IS NOT NULL) > 0
+
+UNION ALL
+
+SELECT
+    us.user_id,
+    us.display_name ||
+    ' (ID:' || us.user_id || ')'                 AS user_label,
+    us.reputation,
+    us.question_cnt,
+    us.answer_cnt,
+    COALESCE(bc.gold_cnt,0)   AS gold_badges,
+    COALESCE(bc.silver_cnt,0) AS silver_badges,
+    COALESCE(bc.bronze_cnt,0) AS bronze_badges,
+    COALESCE(vs.up_votes,0)   AS up_votes,
+    COALESCE(vs.down_votes,0) AS down_votes,
+    COALESCE(uec.total_edits,0) AS total_edits,
+    CASE
+        WHEN COALESCE(bc.gold_cnt,0) > 0 THEN 'Veteran'
+        WHEN COALESCE(bc.silver_cnt,0) > 0 THEN 'Experienced'
+        ELSE 'Newcomer'
+    END                                            AS user_tier,
+    STRING_AGG(DISTINCT
+               tu.tagname || ':' || tu.tag_score,
+               '; '
+              ) FILTER (WHERE tu.tag_rank <= 3)   AS top_tags
+FROM user_stats us
+LEFT JOIN badge_counts bc
+       ON bc.userid = us.user_id
+LEFT JOIN vote_summaries vs
+       ON vs.user_id = us.user_id
+LEFT JOIN user_edit_counts uec
+       ON uec.userid = us.user_id
+LEFT JOIN tag_user_score tu
+       ON tu.user_id = us.user_id
+WHERE us.reputation BETWEEN 500 AND 1000
+  AND COALESCE(bc.gold_cnt,0) = 0
+GROUP BY
+    us.user_id, us.display_name, us.reputation,
+    us.question_cnt, us.answer_cnt,
+    bc.gold_cnt, bc.silver_cnt, bc.bronze_cnt,
+    vs.up_votes, vs.down_votes,
+    uec.total_edits
+
+ORDER BY reputation DESC, user_tier;

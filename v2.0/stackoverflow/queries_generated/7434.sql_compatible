@@ -1,0 +1,321 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) as TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) as TotalAnswerScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) as TotalQuestionViews,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), ', ') as AllTagsUsed,
+        ROUND(AVG(CAST(p.Score AS NUMERIC)), 2) as AvgPostScore,
+        CASE WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            DATE_PART('day', MAX(p.CreationDate) - MIN(p.CreationDate)) 
+        END as DaysActive
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        UpVotes,
+        DownVotes,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        LastPostDate,
+        LastCommentDate,
+        LastBadgeDate,
+        TotalQuestionScore,
+        TotalAnswerScore,
+        TotalQuestionViews,
+        AllTagsUsed,
+        AvgPostScore,
+        DaysActive,
+        ROW_NUMBER() OVER (ORDER BY TotalQuestionScore DESC, Reputation DESC) as ScoreRank,
+        RANK() OVER (ORDER BY PostCount DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY BadgeCount DESC) as BadgeRank,
+        NTILE(100) OVER (ORDER BY Reputation DESC) as ReputationPercentile
+    FROM UserActivity
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        UpVotes,
+        DownVotes,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        LastPostDate,
+        LastCommentDate,
+        LastBadgeDate,
+        TotalQuestionScore,
+        TotalAnswerScore,
+        TotalQuestionViews,
+        AllTagsUsed,
+        AvgPostScore,
+        DaysActive,
+        ScoreRank,
+        PostRank,
+        BadgeRank,
+        ReputationPercentile,
+        LAG(DisplayName) OVER (ORDER BY Reputation DESC) as NextHigherReputationUser,
+        LEAD(DisplayName) OVER (ORDER BY Reputation DESC) as NextLowerReputationUser,
+        FIRST_VALUE(DisplayName) OVER (ORDER BY Reputation DESC) as TopReputationUser,
+        LAST_VALUE(DisplayName) OVER (ORDER BY Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as LowestReputationUser,
+        AVG(Reputation) OVER (ORDER BY Reputation DESC ROWS BETWEEN 10 PRECEDING AND 10 FOLLOWING) as AvgReputationInWindow,
+        COUNT(*) OVER () as TotalUsers
+    FROM RankedUsers
+    WHERE Reputation > 1000
+),
+ComplexAnalytics AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.Views,
+        tu.UpVotes,
+        tu.DownVotes,
+        tu.PostCount,
+        tu.CommentCount,
+        tu.BadgeCount,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.LastPostDate,
+        tu.LastCommentDate,
+        tu.LastBadgeDate,
+        tu.TotalQuestionScore,
+        tu.TotalAnswerScore,
+        tu.TotalQuestionViews,
+        tu.AllTagsUsed,
+        tu.AvgPostScore,
+        tu.DaysActive,
+        tu.ScoreRank,
+        tu.PostRank,
+        tu.BadgeRank,
+        tu.ReputationPercentile,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = tu.UserId AND p2.PostTypeId = 2), 
+            0
+        ) as NumAnswersToSelf,
+        CASE 
+            WHEN tu.CommentCount > 0 THEN 
+                (tu.PostCount * 100.0 / tu.CommentCount)
+            ELSE 
+                NULL 
+        END as PostToCommentRatio,
+        CASE 
+            WHEN tu.QuestionCount > 0 THEN 
+                (tu.AnswerCount * 100.0 / tu.QuestionCount)
+            ELSE 
+                NULL 
+        END as AnswerToQuestionRatio,
+        CASE 
+            WHEN tu.Reputation > 10000 THEN 'Elite'
+            WHEN tu.Reputation > 5000 THEN 'Veteran'
+            WHEN tu.Reputation > 1000 THEN 'Expert'
+            ELSE 'Novice'
+        END as ReputationTier,
+        CASE 
+            WHEN tu.QuestionCount > 10 AND tu.AnswerCount > 5 THEN 'Active Contributor'
+            WHEN tu.PostCount > 50 AND tu.CommentCount > 100 THEN 'Highly Engaged'
+            WHEN tu.BadgeCount > 5 THEN 'Achievement Seeker'
+            ELSE 'Regular User'
+        END as UserEngagementType,
+        CASE 
+            WHEN tu.DaysActive > 365 THEN 'Long Term User'
+            WHEN tu.DaysActive > 180 THEN 'Medium Term User'
+            ELSE 'New User'
+        END as TenureCategory,
+        COALESCE(
+            (SELECT MAX(ph.CreationDate) FROM PostHistory ph 
+             WHERE ph.UserId = tu.UserId AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15)), 
+            DATE '1900-01-01'
+        ) as LastModeratorActionDate,
+        CASE 
+            WHEN tu.BadgeCount > 0 THEN 
+                (SELECT STRING_AGG(b.Name || ' (' || b.Class || ')', ', ') 
+                 FROM Badges b 
+                 WHERE b.UserId = tu.UserId AND b.Class = 1)
+            ELSE NULL 
+        END as GoldBadges,
+        CASE 
+            WHEN tu.PostCount > 0 THEN 
+                RANK() OVER (ORDER BY tu.PostCount DESC ROWS BETWEEN 100 PRECEDING AND 100 FOLLOWING)
+            ELSE 0 
+        END as PostCountRank,
+        DENSE_RANK() OVER (ORDER BY tu.PostCount DESC NULLS LAST) as PostCountDenseRank,
+        ROW_NUMBER() OVER (ORDER BY tu.BadgeCount DESC) as BadgeRankNumber,
+        ROW_NUMBER() OVER (ORDER BY tu.Reputation DESC) as RepRank
+    FROM TopUsers tu
+),
+AggregatedResults AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        UpVotes,
+        DownVotes,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        LastPostDate,
+        LastCommentDate,
+        LastBadgeDate,
+        TotalQuestionScore,
+        TotalAnswerScore,
+        TotalQuestionViews,
+        AllTagsUsed,
+        AvgPostScore,
+        DaysActive,
+        ScoreRank,
+        PostRank,
+        BadgeRank,
+        ReputationPercentile,
+        NumAnswersToSelf,
+        PostToCommentRatio,
+        AnswerToQuestionRatio,
+        ReputationTier,
+        UserEngagementType,
+        TenureCategory,
+        LastModeratorActionDate,
+        GoldBadges,
+        PostCountRank,
+        PostCountDenseRank,
+        BadgeRankNumber,
+        RepRank
+    FROM ComplexAnalytics
+    WHERE PostCount > 0
+),
+FinalAnalysis AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        UpVotes,
+        DownVotes,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        LastPostDate,
+        LastCommentDate,
+        LastBadgeDate,
+        TotalQuestionScore,
+        TotalAnswerScore,
+        TotalQuestionViews,
+        AllTagsUsed,
+        AvgPostScore,
+        DaysActive,
+        ScoreRank,
+        PostRank,
+        BadgeRank,
+        ReputationPercentile,
+        NumAnswersToSelf,
+        PostToCommentRatio,
+        AnswerToQuestionRatio,
+        ReputationTier,
+        UserEngagementType,
+        TenureCategory,
+        LastModeratorActionDate,
+        GoldBadges,
+        PostCountRank,
+        PostCountDenseRank,
+        BadgeRankNumber,
+        RepRank,
+        CASE WHEN ReputationTier = 'Elite' AND UserEngagementType = 'Active Contributor' THEN 1 ELSE 0 END as EliteActiveContributor,
+        CASE WHEN ReputationTier = 'Veteran' AND UserEngagementType = 'Highly Engaged' THEN 1 ELSE 0 END as VeteranHighlyEngaged,
+        CASE WHEN ReputationTier = 'Expert' AND UserEngagementType = 'Achievement Seeker' THEN 1 ELSE 0 END as ExpertAchievementSeeker
+    FROM AggregatedResults
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.PostCount,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.BadgeCount,
+    fa.TotalQuestionScore,
+    fa.TotalAnswerScore,
+    fa.AvgPostScore,
+    fa.PostToCommentRatio,
+    fa.AnswerToQuestionRatio,
+    fa.ReputationTier,
+    fa.UserEngagementType,
+    fa.TenureCategory,
+    fa.ReputationPercentile,
+    fa.ScoreRank,
+    fa.PostRank,
+    fa.BadgeRank,
+    fa.NumAnswersToSelf,
+    fa.LastModeratorActionDate,
+    fa.GoldBadges,
+    fa.PostCountRank,
+    fa.PostCountDenseRank,
+    fa.BadgeRankNumber,
+    fa.RepRank,
+    CASE 
+        WHEN fa.ScoreRank < 50 AND fa.RepRank < 50 THEN 'Top Performer'
+        WHEN fa.ScoreRank < 100 AND fa.RepRank < 100 THEN 'High Performer'
+        WHEN fa.ScoreRank < 500 AND fa.RepRank < 500 THEN 'Mid Performer'
+        ELSE 'Regular Performer'
+    END as PerformanceCategory,
+    ROW_NUMBER() OVER (ORDER BY fa.Reputation DESC) as OverallRanking,
+    LAG(fa.Reputation) OVER (ORDER BY fa.Reputation DESC) as RepOfPreviousUser,
+    LEAD(fa.Reputation) OVER (ORDER BY fa.Reputation DESC) as RepOfNextUser,
+    (SELECT COUNT(*) FROM FinalAnalysis) as TotalFinalAnalysisUsers,
+    (SELECT AVG(Reputation) FROM FinalAnalysis) as AvgReputationFinal,
+    ABS(fa.Reputation - (SELECT AVG(Reputation) FROM FinalAnalysis)) as RepDeviationFromAvg,
+    CASE 
+        WHEN fa.PostCount > (SELECT AVG(PostCount) FROM FinalAnalysis) * 1.5 THEN 1 
+        ELSE 0 
+    END as AboveAveragePostCount,
+    CASE 
+        WHEN fa.BadgeCount > (SELECT AVG(BadgeCount) FROM FinalAnalysis) * 1.5 THEN 1 
+        ELSE 0 
+    END as AboveAverageBadgeCount,
+    CASE 
+        WHEN fa.Reputation > (SELECT AVG(Reputation) FROM FinalAnalysis) * 1.2 THEN 1 
+        ELSE 0 
+    END as AboveAverageReputation,
+    CASE 
+        WHEN fa.Reputation > (SELECT MAX(Reputation) FROM FinalAnalysis) * 0.8 THEN 1 
+        ELSE 0 
+    END as NearTopReputation,
+    ('User:' || fa.UserId || ':' || fa.Reputation) as UserReputationSummary
+FROM FinalAnalysis fa
+WHERE fa.Reputation > 1000
+    AND (fa.PostCount > 0 OR fa.CommentCount > 0 OR fa.BadgeCount > 0)
+    AND fa.UserEngagementType IN ('Active Contributor', 'Highly Engaged', 'Achievement Seeker')
+ORDER BY fa.Reputation DESC, fa.PostCount DESC, fa.BadgeCount DESC
+LIMIT 10000;

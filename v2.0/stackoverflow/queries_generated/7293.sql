@@ -1,0 +1,255 @@
+-- {"query": "7293.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2404} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgUserScore,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreLevel,
+        COALESCE(p.Title, 'No Title') as CleanTitle,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN 
+                STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')
+            ELSE ARRAY[]::varchar[]
+        END as TagArray
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as TotalAnswers,
+        SUM(p.Score) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        MAX(p.CreationDate) as LastPostDate,
+        COUNT(DISTINCT b.Id) as TotalBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') as BadgeList,
+        COUNT(DISTINCT c.Id) as TotalComments,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as TotalUpvotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) as TotalDownvotes
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostTagAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        unnest(TagArray) as Tag,
+        CASE WHEN unnest(TagArray) LIKE '%sql%' THEN 'SQL Related' ELSE 'Other' END as TagCategory,
+        CASE WHEN unnest(TagArray) IN ('python', 'java', 'javascript') THEN 'Programming' ELSE 'Other' END as ProgrammingCategory
+    FROM RankedPosts p
+    WHERE p.TagArray IS NOT NULL AND array_length(p.TagArray, 1) > 0
+),
+ComplexAnalysis AS (
+    SELECT 
+        rp.PostId,
+        rp.OwnerUserId,
+        rp.Title,
+        rp.Score,
+        rp.ViewCount,
+        rp.ScoreLevel,
+        rp.UserPostRank,
+        rp.AvgUserScore,
+        rp.PrevScore,
+        rp.CreationDate,
+        rp.LastActivityDate,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.TotalQuestions,
+        uas.TotalAnswers,
+        uas.TotalScore,
+        uas.AvgScore,
+        uas.LastPostDate,
+        uas.TotalBadges,
+        uas.BadgeList,
+        uas.TotalComments,
+        CASE 
+            WHEN uas.TotalPosts > 100 AND uas.AvgScore > 50 THEN 'Elite Contributor'
+            WHEN uas.TotalPosts > 50 AND uas.AvgScore > 25 THEN 'Active Contributor'
+            WHEN uas.TotalPosts > 10 THEN 'Regular Contributor'
+            ELSE 'New Contributor'
+        END as ContributorTier,
+        CASE 
+            WHEN rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 1.5 THEN 'Exceptional'
+            WHEN rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average'
+            WHEN rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 0.5 THEN 'Average'
+            ELSE 'Below Average'
+        END as PerformanceLevel,
+        EXTRACT(YEAR FROM rp.CreationDate) as CreationYear,
+        EXTRACT(MONTH FROM rp.CreationDate) as CreationMonth,
+        CASE 
+            WHEN rp.CreationDate >= '2023-01-01'::timestamp THEN '2023'
+            WHEN rp.CreationDate >= '2022-01-01'::timestamp THEN '2022'
+            WHEN rp.CreationDate >= '2021-01-01'::timestamp THEN '2021'
+            ELSE 'Older'
+        END as PostAgeGroup,
+        -- Complex calculation including window functions and conditional logic
+        ROUND(
+            (rp.Score * 0.3 + 
+             rp.ViewCount * 0.2 + 
+             COALESCE(rp.AnswerCount, 0) * 0.4 + 
+             COALESCE(rp.CommentCount, 0) * 0.1) / 
+            NULLIF((rp.UserPostRank + 1), 0) *
+            (CASE 
+                WHEN rp.ScoreLevel = 'High' THEN 1.2
+                WHEN rp.ScoreLevel = 'Medium' THEN 1.0
+                ELSE 0.8
+            END), 2
+        ) as ComplexScoreMetric
+    FROM RankedPosts rp
+    INNER JOIN UserActivityStats uas ON rp.OwnerUserId = uas.UserId
+    WHERE rp.Score IS NOT NULL AND rp.ViewCount IS NOT NULL AND rp.UserPostRank <= 5
+),
+FinalRanking AS (
+    SELECT 
+        ca.PostId,
+        ca.OwnerUserId,
+        ca.Title,
+        ca.Score,
+        ca.ViewCount,
+        ca.ScoreLevel,
+        ca.ComplexScoreMetric,
+        ca.ContributorTier,
+        ca.PerformanceLevel,
+        ca.CreationYear,
+        ca.CreationMonth,
+        ca.PostAgeGroup,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.TotalPosts,
+        ca.AvgScore,
+        ca.LastPostDate,
+        ca.TotalBadges,
+        ca.BadgeList,
+        ca.TotalComments,
+        ca.TotalUpvotes,
+        ca.TotalDownvotes,
+        ROW_NUMBER() OVER (ORDER BY ca.ComplexScoreMetric DESC, ca.Score DESC) as OverallRank,
+        RANK() OVER (PARTITION BY ca.PostAgeGroup ORDER BY ca.ComplexScoreMetric DESC) as AgeGroupRank,
+        DENSE_RANK() OVER (ORDER BY ca.Reputation DESC, ca.ComplexScoreMetric DESC) as RepRank,
+        PERCENT_RANK() OVER (ORDER BY ca.ComplexScoreMetric DESC) as PercentileRank,
+        NTILE(100) OVER (ORDER BY ca.ComplexScoreMetric DESC) as PercentileBucket,
+        LAG(ca.ComplexScoreMetric) OVER (ORDER BY ca.ComplexScoreMetric DESC) as PrevScoreMetric,
+        LEAD(ca.ComplexScoreMetric) OVER (ORDER BY ca.ComplexScoreMetric DESC) as NextScoreMetric,
+        AVG(ca.ComplexScoreMetric) OVER () as AvgComplexScore,
+        MAX(ca.ComplexScoreMetric) OVER () as MaxComplexScore,
+        MIN(ca.ComplexScoreMetric) OVER () as MinComplexScore,
+        COUNT(*) OVER () as TotalRankedPosts,
+        CASE 
+            WHEN ca.ComplexScoreMetric > (SELECT AVG(ComplexScoreMetric) FROM FinalRanking) THEN 'Above Average'
+            WHEN ca.ComplexScoreMetric > (SELECT AVG(ComplexScoreMetric) FROM FinalRanking) - (SELECT STDDEV(ComplexScoreMetric) FROM FinalRanking) THEN 'Near Average'
+            ELSE 'Below Average'
+        END as ScoreComparison,
+        -- String manipulation with complex expressions
+        CONCAT(
+            'Post: ', 
+            SUBSTRING(ca.Title, 1, 50), 
+            ' | Author: ', 
+            UPPER(SUBSTRING(ca.DisplayName, 1, 20)), 
+            ' | Score: ', 
+            ca.Score, 
+            ' | Reput: ', 
+            ca.Reputation,
+            ' | Rank: ', 
+            ca.OverallRank,
+            ' | Category: ', 
+            ca.PerformanceLevel
+        ) as PostSummary,
+        -- Complex predicates including multiple conditions
+        CASE 
+            WHEN (ca.TotalPosts > 10 AND ca.AvgScore > 50 AND ca.TotalBadges > 5)
+                 OR (ca.ContributorTier = 'Elite Contributor')
+                 OR (ca.Reputation > 50000 AND ca.ComplexScoreMetric > 50)
+                 THEN 'Premium User'
+            ELSE 'Standard User'
+        END as UserClassification,
+        -- Set operators and aggregation
+        STRING_AGG(DISTINCT 
+            CASE 
+                WHEN ca.BadgeList IS NOT NULL THEN 
+                    SUBSTRING(ca.BadgeList, 1, 100)
+                ELSE 'No Badges'
+            END, 
+            ' | '
+        ) as UserBadgeSummary,
+        -- Correlated subqueries
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = ca.OwnerUserId AND p2.CreationDate > ca.CreationDate) as RecentPostsCount
+    FROM ComplexAnalysis ca
+    WHERE ca.Score IS NOT NULL AND 
+          ca.ViewCount IS NOT NULL AND 
+          ca.ComplexScoreMetric IS NOT NULL
+)
+SELECT 
+    fr.PostId,
+    fr.OwnerUserId,
+    fr.Title,
+    fr.Score,
+    fr.ViewCount,
+    fr.ScoreLevel,
+    fr.ComplexScoreMetric,
+    fr.ContributorTier,
+    fr.PerformanceLevel,
+    fr.CreationYear,
+    fr.CreationMonth,
+    fr.PostAgeGroup,
+    fr.DisplayName,
+    fr.Reputation,
+    fr.TotalPosts,
+    fr.AvgScore,
+    fr.LastPostDate,
+    fr.TotalBadges,
+    fr.BadgeList,
+    fr.TotalComments,
+    fr.TotalUpvotes,
+    fr.TotalDownvotes,
+    fr.OverallRank,
+    fr.AgeGroupRank,
+    fr.RepRank,
+    fr.PercentileRank,
+    fr.PercentileBucket,
+    fr.AvgComplexScore,
+    fr.MaxComplexScore,
+    fr.MinComplexScore,
+    fr.TotalRankedPosts,
+    fr.ScoreComparison,
+    fr.PostSummary,
+    fr.UserClassification,
+    fr.UserBadgeSummary,
+    fr.RecentPostsCount
+FROM FinalRanking fr
+WHERE fr.ComplexScoreMetric > (
+    SELECT AVG(ComplexScoreMetric) 
+    FROM FinalRanking fr2 
+    WHERE fr2.PostAgeGroup IN ('2023', '2022', '2021')
+)
+ORDER BY fr.ComplexScoreMetric DESC, fr.OverallRank ASC
+LIMIT 1000;

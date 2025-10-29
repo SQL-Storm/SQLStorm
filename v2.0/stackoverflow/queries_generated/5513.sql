@@ -1,0 +1,115 @@
+-- {"query": "5513.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1011} 
+WITH recent_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ParentId,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+tag_summary AS (
+  SELECT
+    unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS tag,
+    p.Id AS post_id
+  FROM recent_posts p
+),
+tag_rank AS (
+  SELECT
+    tag,
+    COUNT(*) AS post_count,
+    SUM(COALESCE(p.Score,0)) AS score_sum
+  FROM tag_summary ts
+  JOIN Posts p ON p.Id = ts.post_id
+  GROUP BY tag
+),
+top_tags AS (
+  SELECT tag
+  FROM tag_rank
+  ORDER BY score_sum DESC, post_count DESC
+  LIMIT 10
+),
+related_posts AS (
+  SELECT
+    rp.Id AS RelatedPostId,
+    rp.Title AS RelatedTitle,
+    rp.OwnerUserId AS RelatedOwner,
+    rp.LastActivityDate AS RelatedLastActivity,
+    rp.Score AS RelatedScore
+  FROM Posts rp
+  JOIN tag_summary t ON t.post_id = rp.Id
+  WHERE t.tag IN (SELECT tag FROM top_tags)
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY rp.Id ORDER BY rp.LastActivityDate DESC) = 1
+),
+activity_window AS (
+  SELECT
+    rp.RelatedPostId,
+    rp.RelatedTitle,
+    rp.RelatedOwner,
+    rp.RelatedLastActivity,
+    rp.RelatedScore,
+    v2. CreationDate AS VoteDate,
+    v2.VoteTypeId,
+    u.DisplayName AS VoterName
+  FROM related_posts rp
+  LEFT JOIN Votes v2 ON v2.PostId = rp.RelatedPostId
+  LEFT JOIN Users u ON u.Id = v2.UserId
+  WHERE v2.VoteDate >= NOW() - INTERVAL '14 days'
+),
+complex_pred AS (
+  SELECT
+    rp.RelatedPostId,
+    rp.RelatedTitle,
+    rp.RelatedOwner,
+    rp.RelatedLastActivity,
+    rp.RelatedScore,
+    MAX(CASE WHEN v2.VoteTypeId = 2 THEN 1 ELSE 0 END) AS HasUpvoteInWindow,
+    MAX(CASE WHEN v2.VoteTypeId = 3 THEN 1 ELSE 0 END) AS HasDownvoteInWindow,
+    COUNT(v2.Id) AS TotalVotesWindow,
+    SUM(CASE WHEN v2.VoteTypeId = 8 THEN v2.BountyAmount ELSE 0 END) AS BountyAccumulated
+  FROM related_posts rp
+  LEFT JOIN Votes v2 ON v2.PostId = rp.RelatedPostId
+  GROUP BY rp.RelatedPostId, rp.RelatedTitle, rp.RelatedOwner, rp.RelatedLastActivity, rp.RelatedScore
+)
+SELECT
+  p.Id AS BenchmarkPostId,
+  p.Title,
+  p.OwnerUserId,
+  p.CreationDate,
+  p.Score AS PostScore,
+  p.ViewCount,
+  p.Tags,
+  p.LastActivityDate,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS Upvotes,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS Downvotes,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountForPost,
+  (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) AS AvgBounty,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id) AS LinkedCount,
+  (SELECT EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 3)) AS IsDuplicateLink,
+  a.RelatedPostId,
+  a.RelatedTitle,
+  a.RelatedOwner,
+  a.RelatedLastActivity,
+  a.RelatedScore,
+  a.TotalVotesWindow,
+  a.BountyAccumulated,
+  CASE
+    WHEN a.TotalVotesWindow > 20 THEN 'Hot'
+    WHEN a.TotalVotesWindow > 5 THEN 'Active'
+    ELSE 'Rising'
+  END AS ActivityTier
+FROM Posts p
+LEFT JOIN complex_pred a ON a.RelatedPostId = p.Id
+ORDER BY p.LastActivityDate DESC, p.Score DESC
+LIMIT 100;

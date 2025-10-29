@@ -1,0 +1,215 @@
+-- {"query": "1050.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3346} 
+
+WITH UserActivitySummary AS (
+    -- Aggregates core user activities including post counts, scores, comments, and badges.
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViewCount,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p.OwnerUserId = u.Id THEN 1 ELSE 0 END) AS AcceptedAnswersForMyQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 AND p.AcceptedAnswerId IS NOT NULL AND p.ParentId IS NOT NULL AND (SELECT q.AcceptedAnswerId FROM Posts q WHERE q.Id = p.ParentId) = p.Id THEN 1 ELSE 0 END) AS MyAnswersAccepted,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        MIN(b.Date) AS FirstBadgeDate,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(c.CreationDate) AS LastCommentActivity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostHistoryDetails AS (
+    -- Analyzes individual post history events, focusing on edits and close/reopen actions.
+    SELECT
+        ph.PostId,
+        ph.UserId AS EditorUserId, -- The user who performed the history action (not necessarily post owner)
+        COUNT(ph.Id) AS TotalHistoryEventsOnPost,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditorsOnPost,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate END) AS LastEditDateOnPost,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCountOnPost,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEventsOnPost,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEventsOnPost,
+        -- Detects if a post was ever closed immediately followed by a reopen event
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 AND LAG(ph.PostHistoryTypeId, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) = 10 THEN 1 ELSE 0 END) AS WasClosedThenReopenedFlag
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL -- Exclude community edits if not linked to a user
+    GROUP BY ph.PostId, ph.UserId -- Group by the post and the specific editor
+),
+PostHistoryUserAggs AS (
+    -- Aggregates post history details for each *post owner*, summarizing activity on their posts.
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT ph.PostId) AS TotalOwnedPostsWithHistory,
+        SUM(ph.EditCountOnPost) AS TotalEditsReceivedOnMyPosts,
+        SUM(ph.CloseEventsOnPost) AS TotalCloseEventsOnMyOwnedPosts,
+        SUM(ph.ReopenEventsOnPost) AS TotalReopenEventsOnMyOwnedPosts,
+        SUM(ph.WasClosedThenReopenedFlag) AS OwnedPostsClosedThenReopened
+    FROM Posts p
+    JOIN PostHistoryDetails ph ON p.Id = ph.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+TagPerformance AS (
+    -- Calculates average score and number of questions for popular tags.
+    SELECT
+        TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))) AS TagName,
+        AVG(p.Score) AS AvgTagScore,
+        COUNT(DISTINCT p.Id) AS QuestionsWithTag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    GROUP BY TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')))
+    HAVING COUNT(DISTINCT p.Id) > 100 -- Focus on tags used in more than 100 questions
+),
+TopTagsByUser AS (
+    -- Identifies the top 3 most frequently used tags for each user based on their questions.
+    SELECT
+        p.OwnerUserId AS UserId,
+        TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))) AS TagName,
+        COUNT(p.Id) AS TagUsageCount,
+        AVG(p.Score) AS AvgScoreForTag,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY COUNT(p.Id) DESC, AVG(p.Score) DESC) AS TagRank
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    GROUP BY p.OwnerUserId, TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')))
+),
+UserOverallEngagement AS (
+    -- Combines all summary data and calculates complex engagement metrics and ranks.
+    SELECT
+        uas.UserId,
+        u.DisplayName,
+        u.Location,
+        u.AboutMe,
+        uas.Reputation,
+        uas.UserCreationDate,
+        uas.LastAccessDate,
+        EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - uas.UserCreationDate)) / (3600 * 24 * 365.25) AS YearsOnPlatform, -- Years since creation
+        uas.TotalPostsOwned,
+        uas.QuestionsAsked,
+        uas.AnswersGiven,
+        uas.TotalPostScore,
+        uas.TotalPostViewCount,
+        uas.AcceptedAnswersForMyQuestions,
+        uas.MyAnswersAccepted,
+        uas.TotalCommentsMade,
+        uas.TotalCommentScore,
+        uas.TotalBadges,
+        uas.GoldBadges,
+        uas.FirstBadgeDate,
+        uas.LastPostActivity,
+        uas.LastCommentActivity,
+        COALESCE(NULLIF(uas.TotalPostScore, 0) / NULLIF(uas.TotalPostsOwned, 0), 0.0) AS AvgPostScorePerPost,
+        COALESCE(NULLIF(uas.UserUpVotes, 0) / NULLIF(uas.UserDownVotes, 0), 0.0) AS UpDownVoteRatio,
+        (uas.QuestionsAsked + uas.AnswersGiven + uas.TotalCommentsMade) AS TotalContributions,
+        COALESCE(phua.OwnedPostsClosedThenReopened, 0) AS PostsClosedAndReopenedByUser,
+        COALESCE(phua.TotalEditsReceivedOnMyPosts, 0) AS TotalEditsReceivedOnMyPosts,
+        -- Correlated subquery: count of unique top-3 tags for this user that are also highly popular/well-scored overall.
+        (
+            SELECT COUNT(DISTINCT tt.TagName)
+            FROM TopTagsByUser tt
+            WHERE tt.UserId = uas.UserId AND tt.TagRank <= 3
+            AND tt.TagName IN (SELECT tp.TagName FROM TagPerformance tp WHERE tp.QuestionsWithTag > 500 AND tp.AvgTagScore > 5)
+        ) AS PopularTopTagsCount,
+        -- Window function: Rank users by a composite engagement score.
+        RANK() OVER (ORDER BY
+            (uas.Reputation * 0.4) +
+            (uas.TotalPostScore * 0.2) +
+            (uas.TotalCommentsMade * 0.1) +
+            (uas.TotalBadges * 0.1) +
+            (uas.QuestionsAsked * 0.05) +
+            (uas.AnswersGiven * 0.05) +
+            (uas.MyAnswersAccepted * 0.1) DESC,
+            uas.LastAccessDate DESC
+        ) AS GlobalUserEngagementRank,
+        -- Window function: Divide users into quartiles based on their total contributions.
+        NTILE(4) OVER (ORDER BY (uas.QuestionsAsked + uas.AnswersGiven + uas.TotalCommentsMade) DESC) AS ContributionQuartile
+    FROM UserActivitySummary uas
+    JOIN Users u ON uas.UserId = u.Id
+    LEFT JOIN PostHistoryUserAggs phua ON uas.UserId = phua.UserId
+)
+-- Final selection, applying complex filters and presenting various derived user attributes.
+SELECT
+    uoe.UserId,
+    COALESCE(uoe.DisplayName, 'Anonymous User') AS DisplayName,
+    LOWER(SUBSTRING(COALESCE(uoe.Location, 'Unknown Location'), 1, 20)) AS LocationSnippet, -- String manipulation
+    uoe.Reputation,
+    uoe.YearsOnPlatform,
+    CASE -- Complex CASE expression for reputation tiers
+        WHEN uoe.Reputation >= 100000 THEN 'Legendary'
+        WHEN uoe.Reputation >= 25000 THEN 'Highly Respected'
+        WHEN uoe.Reputation >= 5000 THEN 'Very Active'
+        WHEN uoe.Reputation >= 1000 THEN 'Active Contributor'
+        ELSE 'Newbie/Infrequent'
+    END AS ReputationTier,
+    uoe.TotalPostsOwned,
+    uoe.QuestionsAsked,
+    uoe.AnswersGiven,
+    uoe.TotalCommentsMade,
+    uoe.TotalBadges,
+    uoe.GoldBadges,
+    uoe.AvgPostScorePerPost,
+    uoe.UpDownVoteRatio,
+    uoe.TotalContributions,
+    uoe.PopularTopTagsCount,
+    uoe.PostsClosedAndReopenedByUser,
+    uoe.TotalEditsReceivedOnMyPosts,
+    uoe.GlobalUserEngagementRank,
+    uoe.ContributionQuartile,
+    -- String expression: Checks for keywords in the AboutMe section, handling NULLs and length.
+    CASE
+        WHEN uoe.AboutMe IS NOT NULL AND (POSITION('developer' IN LOWER(uoe.AboutMe)) > 0 OR POSITION('engineer' IN LOWER(uoe.AboutMe)) > 0) THEN 'Has Dev/Eng Bio'
+        WHEN uoe.AboutMe IS NOT NULL AND (POSITION('student' IN LOWER(uoe.AboutMe)) > 0 OR POSITION('learning' IN LOWER(uoe.AboutMe)) > 0) THEN 'Has Learning Bio'
+        WHEN uoe.AboutMe IS NOT NULL AND LENGTH(uoe.AboutMe) > 100 THEN 'Detailed Bio'
+        ELSE 'Concise/No Bio'
+    END AS AboutMeCategory,
+    -- Complex date calculation: Days since the user's last known activity (post, comment, or last access).
+    EXTRACT(DAY FROM (CURRENT_TIMESTAMP - GREATEST(COALESCE(uoe.LastPostActivity, uoe.LastAccessDate), COALESCE(uoe.LastCommentActivity, uoe.LastAccessDate), uoe.LastAccessDate))) AS DaysSinceLastActivity,
+    -- Correlated Subquery in SELECT: Finds the title of the user's highest-scored question.
+    (
+        SELECT p.Title
+        FROM Posts p
+        WHERE p.OwnerUserId = uoe.UserId AND p.PostTypeId = 1
+        ORDER BY p.Score DESC, p.CreationDate DESC
+        LIMIT 1
+    ) AS TopQuestionTitle,
+    -- Another correlated subquery: Counts the distinct vote types received on any of this user's posts.
+    (
+        SELECT COUNT(DISTINCT v.VoteTypeId)
+        FROM Votes v
+        WHERE v.PostId IN (SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = uoe.UserId)
+    ) AS DistinctVoteTypesOnMyPosts,
+    -- Nested CTE/Subquery: Calculates the average score of accepted answers for questions owned by the user.
+    (
+        SELECT AVG(ans.Score)
+        FROM Posts q
+        JOIN Posts ans ON q.AcceptedAnswerId = ans.Id
+        WHERE q.OwnerUserId = uoe.UserId AND q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+    ) AS AvgAcceptedAnswerScoreForMyQuestions
+FROM UserOverallEngagement uoe
+WHERE
+    uoe.Reputation > 1000 -- Filter for users with a minimum reputation
+    AND uoe.TotalContributions > 10 -- And a reasonable number of overall contributions
+    AND uoe.YearsOnPlatform > 1 -- Must have been on the platform for more than a year
+    AND uoe.ContributionQuartile IN (1, 2) -- Focus on users in the top 50% by contribution volume
+    AND uoe.LastAccessDate > CURRENT_TIMESTAMP - INTERVAL '180 days' -- Active in the last 6 months
+    AND ( -- Complex predicate combining multiple conditions
+        (uoe.QuestionsAsked > 0 AND uoe.AnswersGiven > 0) OR -- Has both asked and answered
+        (uoe.TotalCommentsMade > 50 AND uoe.AvgPostScorePerPost > 5) -- Or is a prolific commenter with decent post score
+    )
+ORDER BY
+    uoe.GlobalUserEngagementRank ASC,
+    uoe.Reputation DESC,
+    uoe.LastAccessDate DESC
+LIMIT 1000;

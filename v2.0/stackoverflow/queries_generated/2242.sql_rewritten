@@ -1,0 +1,154 @@
+-- {"query": "2242.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1468} 
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.ExcerptPostId, t.WikiPostId, 1 as Level
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select t2.Id, t2.TagName, t2.ExcerptPostId, t2.WikiPostId, r.Level + 1
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> r.Id
+    where r.Level < 2
+),
+UserPostStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        coalesce(sum(p.Score),0) as TotalScore,
+        coalesce(sum(case when p.PostTypeId = 1 then p.ViewCount else 0 end),0) as QuestionViews,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+RecentBadgeCounts as (
+    select 
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    where b.Date > cast('2024-10-01' as date) - interval '180 day'
+    group by b.UserId
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        count(c.Id) as CommentCount,
+        row_number() over (
+            partition by p.OwnerUserId order by p.CreationDate desc, p.Score desc
+        ) as UserPostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevPostScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextPostScore
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    where p.OwnerUserId is not null
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate
+),
+DuplicateQuestionPairs as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        pl.CreationDate as LinkCreatedAt,
+        u.DisplayName as DuplicateOwner,
+        po.DisplayName as OriginalOwner
+    from PostLinks pl
+    join Posts dup on dup.Id = pl.PostId and dup.PostTypeId = 1
+    join Posts orig on orig.Id = pl.RelatedPostId and orig.PostTypeId = 1
+    left join Users u on u.Id = dup.OwnerUserId
+    left join Users po on po.Id = orig.OwnerUserId
+    where pl.LinkTypeId = 3
+),
+HighImpactComments as (
+    select 
+        c.Id,
+        c.PostId,
+        c.Score,
+        c.CreationDate,
+        substring(c.Text from 1 for 100) as ShortText,
+        u.DisplayName as Commenter,
+        p.Title as PostTitle,
+        row_number() over (partition by c.PostId order by c.Score desc, c.CreationDate desc) as CommentRank
+    from Comments c
+    left join Users u on u.Id = c.UserId
+    left join Posts p on p.Id = c.PostId
+    where c.Score > 5
+),
+AggregatedUserInfo as (
+    select
+        ups.UserId,
+        ups.DisplayName,
+        ups.QuestionsCount,
+        ups.AnswersCount,
+        ups.TotalScore,
+        ups.QuestionViews,
+        coalesce(rbc.GoldBadges,0) as GoldBadges,
+        coalesce(rbc.SilverBadges,0) as SilverBadges,
+        coalesce(rbc.BronzeBadges,0) as BronzeBadges,
+        ups.LastPostDate,
+        rbc.LastBadgeDate,
+        case 
+            when ups.QuestionViews > 100000 then 'High'
+            when ups.QuestionViews > 10000 then 'Medium'
+            else 'Low'
+        end as VisibilityCategory,
+        case 
+            when ups.AnswersCount = 0 then null
+            else round(1.0 * ups.TotalScore / ups.AnswersCount,2)
+        end as AvgAnswerScore,
+        case 
+            when rbc.GoldBadges >= 5 then 'Elite'
+            when rbc.GoldBadges > 0 then 'Influencer'
+            else 'Regular'
+        end as UserTier
+    from UserPostStats ups
+    left join RecentBadgeCounts rbc on rbc.UserId = ups.UserId
+)
+select 
+    aui.UserId,
+    aui.DisplayName,
+    aui.UserTier,
+    aui.VisibilityCategory,
+    aui.QuestionsCount,
+    aui.AnswersCount,
+    aui.TotalScore,
+    aui.AvgAnswerScore,
+    aui.GoldBadges,
+    aui.SilverBadges,
+    aui.BronzeBadges,
+    aui.LastPostDate,
+    aui.LastBadgeDate,
+    daq.DuplicateQuestionId,
+    daq.OriginalQuestionId,
+    daq.LinkCreatedAt,
+    daq.DuplicateOwner,
+    daq.OriginalOwner,
+    paw.Id as RecentPostId,
+    paw.PostTypeId,
+    paw.Score as RecentPostScore,
+    paw.ViewCount as RecentPostViews,
+    paw.CommentCount as RecentPostComments,
+    paw.UserPostRank,
+    paw.PrevPostScore,
+    paw.NextPostScore,
+    hic.Id as HighCommentId,
+    hic.Score as HighCommentScore,
+    hic.ShortText as HighCommentExcerpt,
+    hic.Commenter,
+    hic.PostTitle
+from AggregatedUserInfo aui
+left join DuplicateQuestionPairs daq on daq.DuplicateOwner = aui.DisplayName
+left join PostActivityWindow paw on paw.OwnerUserId = aui.UserId and paw.UserPostRank <= 3
+left join HighImpactComments hic on hic.PostId = paw.Id and hic.CommentRank = 1
+where aui.QuestionsCount > 0
+  and (aui.LastPostDate > cast('2024-10-01' as date) - interval '365 day' or aui.LastBadgeDate > cast('2024-10-01' as date) - interval '365 day')
+  and (paw.Score is null or paw.Score >= 0)
+order by aui.UserTier desc, aui.TotalScore desc, paw.CreationDate desc
+limit 100;

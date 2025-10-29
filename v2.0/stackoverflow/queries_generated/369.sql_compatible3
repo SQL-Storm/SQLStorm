@@ -1,0 +1,411 @@
+with
+recent_questions as (
+  select
+    p.Id as QuestionId,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    coalesce(p.AnswerCount, 0) as AnswerCount,
+    extract(isodow from coalesce(p.CreationDate, cast('2024-10-01 12:34:56' as timestamp))) as dow
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+),
+tag_expansion as (
+  select
+    rq.QuestionId,
+    lower(trim(tg)) as tag
+  from recent_questions rq,
+  lateral (
+    select unnest(
+      case
+        when rq.Tags is null then (select array[]::varchar[] from (select 1) as _dummy where false)
+        else string_to_array(substring(rq.Tags, 2, length(rq.Tags)-2), '><')
+      end
+    ) as tg
+  ) t
+),
+question_stats as (
+  select
+    rq.QuestionId,
+    rq.OwnerUserId,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.AnswerCount,
+    rq.Title,
+    rq.dow,
+    count(distinct te.tag) as tag_count,
+    min(case when te.tag is not null then te.tag end) as first_tag,
+    max(case when te.tag is not null then te.tag end) as last_tag
+  from recent_questions rq
+  left join tag_expansion te on te.QuestionId = rq.QuestionId
+  group by rq.QuestionId, rq.OwnerUserId, rq.CreationDate, rq.Score, rq.ViewCount, rq.AnswerCount, rq.Title, rq.dow
+),
+answerers as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId as AnswererId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerDate
+  from Posts a
+  where a.PostTypeId = 2
+),
+accepted_map as (
+  select
+    q.Id as QuestionId,
+    q.AcceptedAnswerId
+  from Posts q
+  where q.PostTypeId = 1
+),
+votes_agg as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites,
+    sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as bounty_total,
+    count(*) as total_votes,
+    max(v.CreationDate) as last_vote_at
+  from Votes v
+  group by v.PostId
+),
+comment_agg as (
+  select
+    c.PostId,
+    count(*) as comment_count,
+    max(c.CreationDate) as last_comment_at,
+    sum(case when c.Score > 0 then 1 else 0 end) as pos_comments
+  from Comments c
+  group by c.PostId
+),
+user_activity as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.CreationDate as UserCreated,
+    u.DisplayName,
+    u.Location,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views as ProfileViews,
+    coalesce(nullif(trim(u.WebsiteUrl), ''), 'n/a') as WebsiteUrlNorm
+  from Users u
+),
+badge_agg as (
+  select
+    b.UserId,
+    count(*) as badges_total,
+    sum(case when b.Class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.Class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.Class = 3 then 1 else 0 end) as bronze_badges,
+    min(b.Date) as first_badge_at,
+    max(b.Date) as last_badge_at
+  from Badges b
+  group by b.UserId
+),
+post_history_flags as (
+  select
+    ph.PostId,
+    max(case when ph.PostHistoryTypeId in (10,35) then 1 else 0 end) as was_closed_or_migrated,
+    max(case when ph.PostHistoryTypeId in (11,13) then 1 else 0 end) as was_reopened_or_undeleted,
+    max(case when ph.PostHistoryTypeId = 50 then 1 else 0 end) as community_bump,
+    max(case when ph.PostHistoryTypeId = 52 then 1 else 0 end) as became_hot,
+    max(case when ph.PostHistoryTypeId = 53 then 1 else 0 end) as removed_hot,
+    max(case when ph.PostHistoryTypeId in (10,11,12,13,14,15,35,50,52,53) then ph.CreationDate end) as last_moderation_event_at
+  from PostHistory ph
+  group by ph.PostId
+),
+dup_links as (
+  select
+    pl.PostId as QuestionId,
+    sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as dup_link_count,
+    sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as linked_count,
+    max(pl.CreationDate) as last_link_at
+  from PostLinks pl
+  group by pl.PostId
+),
+week_bins as (
+  select
+    qs.QuestionId,
+    date_trunc('week', coalesce(qs.CreationDate, cast('2024-10-01 12:34:56' as timestamp))) as week_start
+  from question_stats qs
+),
+question_rank as (
+  select
+    qs.QuestionId,
+    qs.OwnerUserId,
+    qs.CreationDate,
+    qs.Score,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.Title,
+    qs.tag_count,
+    qs.first_tag,
+    qs.last_tag,
+    qs.dow,
+    wa.week_start,
+    row_number() over (partition by wa.week_start order by coalesce(qs.Score,0) desc, coalesce(qs.ViewCount,0) desc, qs.QuestionId) as rn_week_score,
+    dense_rank() over (order by coalesce(qs.ViewCount,0) desc) as dr_global_views,
+    percent_rank() over (order by coalesce(qs.AnswerCount,0)) as pr_answers
+  from question_stats qs
+  join week_bins wa on wa.QuestionId = qs.QuestionId
+),
+answer_latencies as (
+  select
+    a.QuestionId,
+    min(extract(epoch from (a.AnswerDate - q.CreationDate))) as first_answer_secs,
+    max(extract(epoch from (a.AnswerDate - q.CreationDate))) as last_answer_secs,
+    count(*) as total_answers
+  from answerers a
+  join Posts q on q.Id = a.QuestionId
+  group by a.QuestionId
+),
+accepted_details as (
+  select
+    am.QuestionId,
+    am.AcceptedAnswerId,
+    a.AnswererId as accepted_user_id,
+    a.AnswerScore as accepted_score,
+    extract(epoch from (a.AnswerDate - q.CreationDate)) as accept_latency_secs
+  from accepted_map am
+  left join Posts q on q.Id = am.QuestionId
+  left join answerers a on a.AnswerId = am.AcceptedAnswerId
+),
+normalized as (
+  select
+    qr.QuestionId,
+    qr.OwnerUserId,
+    qr.CreationDate,
+    qr.Score,
+    qr.ViewCount,
+    qr.AnswerCount,
+    qr.Title,
+    qr.tag_count,
+    qr.first_tag,
+    qr.last_tag,
+    qr.dow,
+    qr.week_start,
+    qr.rn_week_score,
+    qr.dr_global_views,
+    qr.pr_answers,
+    coalesce(va.upvotes,0) as upvotes,
+    coalesce(va.downvotes,0) as downvotes,
+    coalesce(va.favorites,0) as favorites,
+    coalesce(va.bounty_total,0) as bounty_total,
+    va.last_vote_at,
+    coalesce(ca.comment_count,0) as comment_count,
+    ca.last_comment_at,
+    ph.was_closed_or_migrated,
+    ph.was_reopened_or_undeleted,
+    ph.community_bump,
+    ph.became_hot,
+    ph.removed_hot,
+    ph.last_moderation_event_at,
+    dl.dup_link_count,
+    dl.linked_count,
+    dl.last_link_at,
+    al.first_answer_secs,
+    al.last_answer_secs,
+    al.total_answers,
+    ad.AcceptedAnswerId,
+    ad.accepted_user_id,
+    ad.accepted_score,
+    ad.accept_latency_secs
+  from question_rank qr
+  left join votes_agg va on va.PostId = qr.QuestionId
+  left join comment_agg ca on ca.PostId = qr.QuestionId
+  left join post_history_flags ph on ph.PostId = qr.QuestionId
+  left join dup_links dl on dl.QuestionId = qr.QuestionId
+  left join answer_latencies al on al.QuestionId = qr.QuestionId
+  left join accepted_details ad on ad.QuestionId = qr.QuestionId
+),
+user_enriched as (
+  select
+    n.*,
+    ua.DisplayName as owner_name,
+    ua.Reputation as owner_rep,
+    ua.UserCreated as owner_created,
+    ua.Location as owner_location,
+    ua.UpVotes as owner_upvotes,
+    ua.DownVotes as owner_downvotes,
+    ua.ProfileViews as owner_profile_views,
+    ua.WebsiteUrlNorm as owner_website,
+    ba.badges_total as owner_badges_total,
+    ba.gold_badges as owner_gold,
+    ba.silver_badges as owner_silver,
+    ba.bronze_badges as owner_bronze,
+    ba.first_badge_at as owner_first_badge_at,
+    ba.last_badge_at as owner_last_badge_at
+  from normalized n
+  left join user_activity ua on ua.UserId = n.OwnerUserId
+  left join badge_agg ba on ba.UserId = n.OwnerUserId
+),
+accepted_user_enriched as (
+  select
+    ue.*,
+    aua.DisplayName as accepted_user_name,
+    aua.Reputation as accepted_user_rep,
+    aba.badges_total as accepted_user_badges
+  from user_enriched ue
+  left join user_activity aua on aua.UserId = ue.accepted_user_id
+  left join badge_agg aba on aba.UserId = ue.accepted_user_id
+),
+tag_popularity as (
+  select
+    te.tag,
+    count(distinct te.QuestionId) as tag_q_count,
+    sum(qs.ViewCount) as tag_views,
+    sum(qs.Score) as tag_scores
+  from tag_expansion te
+  join question_stats qs on qs.QuestionId = te.QuestionId
+  group by te.tag
+),
+scored as (
+  select
+    aue.*,
+    (coalesce(aue.upvotes,0)*2 + coalesce(aue.favorites,0)*1.5 + coalesce(aue.comment_count,0)*0.5
+      - coalesce(aue.downvotes,0)*1
+      + case when aue.became_hot = 1 then 25 else 0 end
+      + least(coalesce(aue.ViewCount,0)/1000.0, 50)
+      + case when aue.first_answer_secs is null then 0 else greatest(0, 24*3600 - aue.first_answer_secs)/3600.0 end
+    ) as engagement_score,
+    case
+      when aue.was_closed_or_migrated = 1 and coalesce(aue.Score,0) < 0 then 'controversial'
+      when aue.became_hot = 1 then 'hot'
+      when aue.dup_link_count > 0 then 'duplicate-linked'
+      else 'normal'
+    end as status_bucket,
+    coalesce(tp.tag_q_count,0) as first_tag_pop_qs,
+    coalesce(tp.tag_views,0) as first_tag_pop_views,
+    coalesce(tp.tag_scores,0) as first_tag_pop_score
+  from accepted_user_enriched aue
+  left join tag_popularity tp on tp.tag = aue.first_tag
+),
+ranked as (
+  select
+    s.*,
+    ntile(10) over (order by s.engagement_score desc) as decile_engagement,
+    row_number() over (partition by s.week_start order by s.engagement_score desc, s.Score desc, s.ViewCount desc, s.QuestionId) as rn_week_engagement
+  from scored s
+),
+top_weekly as (
+  select * from ranked where rn_week_engagement <= 20
+),
+high_rep_owners as (
+  select * from ranked where owner_rep >= 10000
+),
+unioned as (
+  select 'TOP_WEEKLY' as cohort, tw.*
+  from top_weekly tw
+  union all
+  select 'HIGH_REP' as cohort, hro.*
+  from high_rep_owners hro
+),
+final_filtered as (
+  select *
+  from unioned u
+  where
+    coalesce(u.tag_count,0) between 1 and 5
+    and ( (lower(coalesce(u.owner_location, '')) like '%united%') or u.owner_location is null or u.owner_location = '')
+    and ( (lower(coalesce(u.Title, '')) like '%performance%' OR lower(coalesce(u.Title, '')) like '%optimiz%' OR lower(coalesce(u.Title, '')) like '%index%') or u.Title is null )
+    and not (u.was_closed_or_migrated = 1 and u.was_reopened_or_undeleted = 0)
+    and (u.accepted_score is null or u.accepted_score >= -2)
+),
+final_with_rownum as (
+  select
+    ff.cohort,
+    ff.week_start,
+    ff.QuestionId,
+    ff.Title,
+    ff.owner_name,
+    ff.owner_rep,
+    ff.owner_location,
+    ff.first_tag,
+    ff.tag_count,
+    ff.Score,
+    ff.ViewCount,
+    ff.AnswerCount,
+    ff.upvotes,
+    ff.downvotes,
+    ff.favorites,
+    ff.comment_count,
+    ff.bounty_total,
+    ff.dup_link_count,
+    ff.status_bucket,
+    ff.engagement_score,
+    ff.decile_engagement,
+    ff.rn_week_engagement,
+    ff.first_answer_secs,
+    ff.accept_latency_secs,
+    ff.accepted_user_name,
+    ff.accepted_user_rep,
+    ff.first_tag_pop_qs,
+    ff.first_tag_pop_views,
+    ff.first_tag_pop_score,
+    (
+      select min(length(c.Text))
+      from Comments c
+      where c.PostId = ff.QuestionId
+        and c.Score > 0
+    ) as min_helpful_comment_len,
+    (
+      select max(p2.ViewCount)
+      from PostLinks pl
+      join Posts p2 on p2.Id = pl.RelatedPostId
+      where pl.PostId = ff.QuestionId
+    ) as max_related_views,
+    lower(
+      regexp_replace(
+        coalesce(ff.Title, 'untitled'),
+        '[^a-zA-Z0-9]+',
+        '-',
+        'g'
+      )
+    ) as title_slug,
+    row_number() over (
+      partition by ff.cohort, ff.week_start
+      order by ff.engagement_score desc, ff.ViewCount desc, ff.Score desc, ff.QuestionId
+    ) as rn_for_cohort
+  from final_filtered ff
+)
+select
+  cohort,
+  cast(week_start as date) as week_start,
+  QuestionId,
+  Title,
+  owner_name,
+  owner_rep,
+  owner_location,
+  first_tag,
+  tag_count,
+  Score,
+  ViewCount,
+  AnswerCount,
+  upvotes,
+  downvotes,
+  favorites,
+  comment_count,
+  bounty_total,
+  dup_link_count,
+  status_bucket,
+  engagement_score,
+  decile_engagement,
+  rn_week_engagement,
+  first_answer_secs,
+  accept_latency_secs,
+  accepted_user_name,
+  accepted_user_rep,
+  first_tag_pop_qs,
+  first_tag_pop_views,
+  first_tag_pop_score,
+  min_helpful_comment_len,
+  max_related_views,
+  title_slug
+from final_with_rownum
+where rn_for_cohort <= 50
+order by week_start desc, cohort, engagement_score desc, QuestionId;

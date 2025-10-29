@@ -1,0 +1,118 @@
+-- {"query": "3521.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2027} 
+WITH
+    -- Base statistics per user
+    user_stats AS (
+        SELECT
+            u.id                                   AS user_id,
+            u.displayname                          AS display_name,
+            u.reputation,
+            COUNT(p.id) FILTER (WHERE p.posttypeid = 1) AS question_cnt,
+            COUNT(p.id) FILTER (WHERE p.posttypeid = 2) AS answer_cnt,
+            SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS upvote_given,
+            SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) AS downvote_given,
+            MAX(p.creationdate)                   AS last_post_date
+        FROM users u
+        LEFT JOIN posts  p ON p.owneruserid = u.id
+        LEFT JOIN votes  v ON v.userid = u.id
+        GROUP BY u.id, u.displayname, u.reputation
+    ),
+
+    -- Badge aggregation and ranking per user
+    badge_rank AS (
+        SELECT
+            b.userid,
+            COUNT(*)                                     AS badge_cnt,
+            SUM(CASE b.class WHEN 1 THEN 3 WHEN 2 THEN 2 ELSE 1 END) AS badge_score,
+            ROW_NUMBER() OVER (PARTITION BY b.userid ORDER BY COUNT(*) DESC) AS rn
+        FROM badges b
+        GROUP BY b.userid
+    ),
+
+    -- Tag‑centric activity (only tags with a decent volume)
+    tag_activity AS (
+        SELECT
+            t.tagname,
+            COUNT(p.id)                                   AS post_cnt,
+            COUNT(DISTINCT p.owneruserid)                AS author_cnt,
+            STRING_AGG(DISTINCT COALESCE(p.ownerdisplayname, ''), ', ' ORDER BY p.ownerdisplayname) 
+                                                          FILTER (WHERE p.ownerdisplayname IS NOT NULL) AS sample_authors
+        FROM tags t
+        JOIN posts p ON p.tags LIKE CONCAT('%<', t.tagname, '>%')
+        WHERE p.posttypeid = 1                     -- only questions
+        GROUP BY t.tagname
+        HAVING COUNT(p.id) > 100
+    ),
+
+    -- Posts closed in the last 30 days (close reason extracted from comment field)
+    recent_closed AS (
+        SELECT
+            ph.postid,
+            ph.creationdate                              AS closed_date,
+            COALESCE(NULLIF(ph.comment, ''), 'unknown') AS close_reason,
+            p.title
+        FROM posthistory ph
+        JOIN posts p ON p.id = ph.postid
+        WHERE ph.posthistorytypeid = 10                 -- Post Closed
+          AND ph.creationdate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+    ),
+
+    -- Users that satisfy the core activity thresholds
+    active_users AS (
+        SELECT *
+        FROM user_stats
+        WHERE reputation > 5000
+          AND (question_cnt + answer_cnt) > 100
+    )
+
+-- Final result pulling everything together, using a lateral join to pick the “most relevant” tag per user,
+-- an outer join for optional badge info, and a left join for possible recent closed posts.
+SELECT
+    au.user_id,
+    au.display_name,
+    au.reputation,
+    au.question_cnt,
+    au.answer_cnt,
+    au.upvote_given,
+    au.downvote_given,
+    COALESCE(br.badge_cnt, 0)           AS badge_cnt,
+    COALESCE(br.badge_score, 0)        AS badge_score,
+    au.last_post_date,
+    tn.tagname,
+    tn.post_cnt,
+    tn.author_cnt,
+    tn.sample_authors,
+    rc.title           AS recent_closed_title,
+    rc.closed_date,
+    rc.close_reason
+FROM active_users au
+LEFT JOIN badge_rank br
+       ON br.userid = au.user_id AND br.rn = 1
+LEFT JOIN LATERAL (
+        SELECT *
+        FROM tag_activity ta
+        WHERE ta.tagname ILIKE ANY (ARRAY[
+                CASE WHEN au.reputation > 20000 THEN '%java%'   ELSE '%python%'   END,
+                CASE WHEN au.answer_cnt > 1000 THEN '%c#%'      ELSE '%javascript%' END
+            ])
+        ORDER BY ta.post_cnt DESC
+        LIMIT 1
+) tn ON TRUE
+LEFT JOIN recent_closed rc
+       ON rc.postid = au.user_id          -- (unlikely match, demonstrates outer join with NULL logic)
+WHERE au.last_post_date IS NOT NULL
+ORDER BY au.reputation DESC, br.badge_score DESC NULLS LAST
+LIMIT 50
+
+EXCEPT
+
+SELECT *
+FROM (
+    SELECT
+        u.id,
+        u.displayname,
+        u.reputation,
+        0,0,0,0,0,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+    FROM users u
+    LEFT JOIN posts p ON p.owneruserid = u.id
+    WHERE p.id IS NULL                     -- users with no posts at all
+) x;

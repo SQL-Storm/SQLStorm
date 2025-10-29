@@ -1,0 +1,336 @@
+-- {"query": "529.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3585} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as country_guess,
+           date_trunc('month', u.creationdate) as signup_month
+    from users u
+    where u.creationdate >= now() - interval '5 years'
+),
+active_posts as (
+    select p.id,
+           p.posttypeid,
+           p.owneruserid,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.answercount,
+           p.commentcount,
+           p.favoritecount,
+           p.closeddate,
+           p.title,
+           p.tags,
+           case when p.posttypeid = 1 then 1 when p.posttypeid = 2 then 0 else null end as is_question
+    from posts p
+    where p.creationdate >= now() - interval '5 years'
+),
+q_with_tag as (
+    select ap.id as post_id,
+           ap.owneruserid as user_id,
+           ap.creationdate,
+           ap.score,
+           ap.viewcount,
+           ap.answercount,
+           ap.commentcount,
+           ap.favoritecount,
+           ap.closeddate,
+           ap.title,
+           ap.tags,
+           array_length(string_to_array(coalesce(nullif(ap.tags, ''), '[]'), '><'), 1) as tag_count,
+           position('><' in coalesce(ap.tags, '')) as has_multi_tags_pos,
+           (ap.tags ilike '%<sql>%') as has_sql_tag,
+           (ap.tags ilike '%<performance>%') as has_performance_tag
+    from active_posts ap
+    where ap.posttypeid = 1
+),
+answers as (
+    select ap.id as answer_id,
+           ap.parentid as question_id,
+           ap.owneruserid as user_id,
+           ap.creationdate,
+           ap.score,
+           ap.commentcount
+    from posts ap
+    where ap.posttypeid = 2
+      and ap.creationdate >= now() - interval '5 years'
+),
+q_stats as (
+    select q.post_id,
+           q.user_id,
+           q.creationdate,
+           q.score,
+           q.viewcount,
+           q.answercount,
+           q.commentcount,
+           q.favoritecount,
+           q.closeddate,
+           q.title,
+           q.tags,
+           q.tag_count,
+           q.has_multi_tags_pos,
+           q.has_sql_tag,
+           q.has_performance_tag,
+           sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes,
+           sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites_legacy,
+           count(distinct c.id) as comment_rows,
+           count(distinct a.answer_id) as answers_found,
+           count(distinct case when a.score > 0 then a.answer_id end) as answers_positive,
+           max(a.creationdate) as last_answer_date,
+           min(a.creationdate) as first_answer_date
+    from q_with_tag q
+    left join votes v on v.postid = q.post_id and v.creationdate >= q.creationdate
+    left join comments c on c.postid = q.post_id
+    left join answers a on a.question_id = q.post_id
+    group by q.post_id, q.user_id, q.creationdate, q.score, q.viewcount, q.answercount, q.commentcount, q.favoritecount, q.closeddate, q.title, q.tags, q.tag_count, q.has_multi_tags_pos, q.has_sql_tag, q.has_performance_tag
+),
+user_agg as (
+    select ru.user_id,
+           ru.displayname,
+           ru.reputation,
+           ru.signup_month,
+           ru.country_guess,
+           count(distinct qs.post_id) as questions_count,
+           sum(coalesce(qs.viewcount,0)) as total_views,
+           sum(coalesce(qs.net_votes,0)) as total_net_votes,
+           sum(coalesce(qs.favorites_legacy,0)) as total_favorites_legacy,
+           sum(case when qs.has_sql_tag then 1 else 0 end) as sql_questions,
+           sum(case when qs.has_performance_tag then 1 else 0 end) as perf_questions,
+           avg(nullif(qs.tag_count,0)) as avg_tag_count,
+           sum(case when qs.closeddate is not null then 1 else 0 end) as closed_questions,
+           max(qs.last_answer_date) as last_answer_any,
+           min(qs.first_answer_date) as first_answer_any
+    from recent_users ru
+    left join q_stats qs on qs.user_id = ru.user_id
+    group by ru.user_id, ru.displayname, ru.reputation, ru.signup_month, ru.country_guess
+),
+badge_roll as (
+    select b.userid,
+           b.date,
+           b.name,
+           b.class,
+           sum(case when b.class = 1 then 1 else 0 end) over (partition by b.userid order by b.date rows between unbounded preceding and current row) as gold_cum,
+           sum(case when b.class = 2 then 1 else 0 end) over (partition by b.userid order by b.date rows between unbounded preceding and current row) as silver_cum,
+           sum(case when b.class = 3 then 1 else 0 end) over (partition by b.userid order by b.date rows between unbounded preceding and current row) as bronze_cum,
+           row_number() over (partition by b.userid order by b.date desc, b.id desc) as rn_desc
+    from badges b
+    where b.date >= now() - interval '5 years'
+),
+latest_badge as (
+    select br.userid,
+           br.name as latest_badge_name,
+           br.class as latest_badge_class,
+           br.gold_cum,
+           br.silver_cum,
+           br.bronze_cum
+    from badge_roll br
+    where br.rn_desc = 1
+),
+post_history_close as (
+    select ph.postid,
+           ph.creationdate as close_event_date,
+           ph.comment as close_reason_id,
+           crt.name as close_reason_name,
+           row_number() over (partition by ph.postid order by ph.creationdate desc, ph.id desc) as rn
+    from posthistory ph
+    join posthistorytypes pht on pht.id = ph.posthistorytypeid and pht.name ilike '%Post Closed%'
+    left join closerreasontypes crt on crt.id::varchar = nullif(ph.comment,'')
+),
+q_status as (
+    select qs.post_id,
+           coalesce(phc.close_reason_name, case when qs.closeddate is not null then 'Closed (unknown reason)' else 'Open' end) as status_text,
+           phc.close_event_date
+    from q_stats qs
+    left join post_history_close phc on phc.postid = qs.post_id and phc.rn = 1
+),
+dupe_graph as (
+    select pl.postid as dup_post_id,
+           pl.relatedpostid as canonical_post_id,
+           pl.creationdate as link_date
+    from postlinks pl
+    join linktypes lt on lt.id = pl.linktypeid and lower(lt.name) like '%duplicate%'
+),
+q_enriched as (
+    select qs.*,
+           qs.score - coalesce(qs.net_votes,0) as score_minus_votes,
+           case when qs.has_sql_tag and qs.has_performance_tag then 'sql+perf'
+                when qs.has_sql_tag then 'sql-only'
+                when qs.has_performance_tag then 'perf-only'
+                else 'other' end as topic_bucket,
+           qst.status_text,
+           qst.close_event_date,
+           case when dg.canonical_post_id is not null then 1 else 0 end as is_marked_duplicate
+    from q_stats qs
+    left join q_status qst on qst.post_id = qs.post_id
+    left join dupe_graph dg on dg.dup_post_id = qs.post_id
+),
+ranked_users as (
+    select ua.*,
+           lb.latest_badge_name,
+           lb.latest_badge_class,
+           lb.gold_cum,
+           lb.silver_cum,
+           lb.bronze_cum,
+           ntile(4) over (order by coalesce(ua.total_net_votes,0) desc nulls last) as netvote_quartile,
+           dense_rank() over (order by coalesce(ua.total_views,0) desc nulls last) as view_rank,
+           row_number() over (partition by ua.country_guess order by ua.reputation desc nulls last, ua.user_id) as country_rep_rank
+    from user_agg ua
+    left join latest_badge lb on lb.userid = ua.user_id
+),
+per_user_topic as (
+    select qe.user_id,
+           qe.topic_bucket,
+           count(*) as q_cnt,
+           sum(case when qe.is_marked_duplicate = 1 then 1 else 0 end) as dup_cnt,
+           avg(coalesce(qe.viewcount,0)) as avg_views,
+           avg(coalesce(qe.net_votes,0)) as avg_net_votes
+    from q_enriched qe
+    group by qe.user_id, qe.topic_bucket
+),
+wide_topic as (
+    select put.user_id,
+           max(case when put.topic_bucket = 'sql+perf' then put.q_cnt end) as q_sqlperf,
+           max(case when put.topic_bucket = 'sql-only' then put.q_cnt end) as q_sql,
+           max(case when put.topic_bucket = 'perf-only' then put.q_cnt end) as q_perf,
+           max(case when put.topic_bucket = 'other' then put.q_cnt end) as q_other,
+           max(case when put.topic_bucket = 'sql+perf' then put.dup_cnt end) as dup_sqlperf,
+           max(case when put.topic_bucket = 'sql-only' then put.dup_cnt end) as dup_sql,
+           max(case when put.topic_bucket = 'perf-only' then put.dup_cnt end) as dup_perf,
+           max(case when put.topic_bucket = 'other' then put.dup_cnt end) as dup_other
+    from per_user_topic put
+    group by put.user_id
+),
+user_comment_activity as (
+    select u.id as user_id,
+           count(*) as comments_made,
+           avg(coalesce(c.score,0)) as avg_comment_score,
+           max(c.creationdate) as last_comment_date
+    from users u
+    left join comments c on c.userid = u.id and c.creationdate >= now() - interval '5 years'
+    where u.creationdate >= now() - interval '5 years'
+    group by u.id
+),
+user_answer_activity as (
+    select u.id as user_id,
+           count(a.answer_id) as answers_written,
+           sum(case when a.score > 0 then 1 else 0 end) as pos_answers,
+           avg(coalesce(a.score,0)) as avg_answer_score,
+           max(a.creationdate) as last_answer_date
+    from users u
+    left join answers a on a.user_id = u.id
+    where u.creationdate >= now() - interval '5 years'
+    group by u.id
+),
+leaderboard as (
+    select ru.user_id,
+           ru.displayname,
+           ru.reputation,
+           ru.signup_month,
+           ru.country_guess,
+           coalesce(ru.questions_count,0) as questions_count,
+           coalesce(ru.total_views,0) as total_views,
+           coalesce(ru.total_net_votes,0) as total_net_votes,
+           coalesce(ru.total_favorites_legacy,0) as total_favorites_legacy,
+           coalesce(ru.sql_questions,0) as sql_questions,
+           coalesce(ru.perf_questions,0) as perf_questions,
+           coalesce(ru.avg_tag_count,0) as avg_tag_count,
+           coalesce(ru.closed_questions,0) as closed_questions,
+           ru.last_answer_any,
+           ru.first_answer_any,
+           ru.latest_badge_name,
+           ru.latest_badge_class,
+           ru.gold_cum,
+           ru.silver_cum,
+           ru.bronze_cum,
+           ru.netvote_quartile,
+           ru.view_rank,
+           ru.country_rep_rank,
+           coalesce(wt.q_sqlperf,0) as q_sqlperf,
+           coalesce(wt.q_sql,0) as q_sql,
+           coalesce(wt.q_perf,0) as q_perf,
+           coalesce(wt.q_other,0) as q_other,
+           coalesce(wt.dup_sqlperf,0) as dup_sqlperf,
+           coalesce(wt.dup_sql,0) as dup_sql,
+           coalesce(wt.dup_perf,0) as dup_perf,
+           coalesce(wt.dup_other,0) as dup_other,
+           coalesce(uca.comments_made,0) as comments_made,
+           coalesce(uca.avg_comment_score,0) as avg_comment_score,
+           uaa.answers_written,
+           uaa.pos_answers,
+           uaa.avg_answer_score,
+           greatest(coalesce(ru.last_answer_any, timestamp 'epoch'), coalesce(uca.last_comment_date, timestamp 'epoch'), coalesce(uaa.last_answer_date, timestamp 'epoch')) as last_activity_any
+    from ranked_users ru
+    left join wide_topic wt on wt.user_id = ru.user_id
+    left join user_comment_activity uca on uca.user_id = ru.user_id
+    left join user_answer_activity uaa on uaa.user_id = ru.user_id
+),
+outliers as (
+    select l.*,
+           case
+               when l.questions_count = 0 then null
+               else (l.total_views::numeric / nullif(l.questions_count,0)) end as views_per_question,
+           case
+               when l.questions_count = 0 then null
+               else (l.total_net_votes::numeric / nullif(l.questions_count,0)) end as netvotes_per_question,
+           percentile_cont(0.9) within group (order by coalesce(l.total_views,0)) over () as p90_views,
+           percentile_cont(0.9) within group (order by coalesce(l.total_net_votes,0)) over () as p90_netvotes
+    from leaderboard l
+),
+final_rank as (
+    select o.*,
+           coalesce(o.netvotes_per_question,0) * 0.6
+           + coalesce(o.views_per_question,0) * 0.3
+           + coalesce(o.avg_answer_score,0) * 0.1
+           + case when o.closed_questions > 0 then -0.5 else 0 end
+           + case when o.dup_sql + o.dup_perf + o.dup_sqlperf + o.dup_other > 0 then -0.25 else 0 end
+           as perf_score,
+           row_number() over (order by
+               coalesce(o.netvotes_per_question,0) * 0.6
+             + coalesce(o.views_per_question,0) * 0.3
+             + coalesce(o.avg_answer_score,0) * 0.1
+             + case when o.closed_questions > 0 then -0.5 else 0 end
+             + case when o.dup_sql + o.dup_perf + o.dup_sqlperf + o.dup_other > 0 then -0.25 else 0 end
+             desc nulls last, o.user_id) as perf_rank
+    from outliers o
+)
+select fr.perf_rank,
+       fr.user_id,
+       fr.displayname,
+       fr.reputation,
+       fr.country_guess,
+       fr.signup_month,
+       fr.questions_count,
+       fr.total_views,
+       fr.total_net_votes,
+       round(coalesce(fr.views_per_question,0)::numeric, 2) as views_per_question,
+       round(coalesce(fr.netvotes_per_question,0)::numeric, 2) as netvotes_per_question,
+       fr.sql_questions,
+       fr.perf_questions,
+       fr.q_sqlperf,
+       fr.q_sql,
+       fr.q_perf,
+       fr.q_other,
+       fr.dup_sqlperf,
+       fr.dup_sql,
+       fr.dup_perf,
+       fr.dup_other,
+       fr.comments_made,
+       round(coalesce(fr.avg_comment_score,0)::numeric, 2) as avg_comment_score,
+       fr.answers_written,
+       fr.pos_answers,
+       round(coalesce(fr.avg_answer_score,0)::numeric, 2) as avg_answer_score,
+       fr.latest_badge_name,
+       fr.latest_badge_class,
+       fr.gold_cum,
+       fr.silver_cum,
+       fr.bronze_cum,
+       fr.netvote_quartile,
+       fr.view_rank,
+       fr.country_rep_rank,
+       fr.last_activity_any,
+       round(fr.perf_score::numeric, 3) as perf_score
+from final_rank fr
+where (fr.total_views >= fr.p90_views or fr.total_net_votes >= fr.p90_netvotes)
+   or fr.perf_rank <= 50
+order by fr.perf_rank, fr.user_id;

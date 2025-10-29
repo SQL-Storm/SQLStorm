@@ -1,0 +1,138 @@
+-- {"query": "4592.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1318} 
+
+WITH PostScores AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        COUNT(c.Id) AS CommentCountTotal,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn_user_post
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.CreationDate > '2023-01-01'
+    GROUP BY
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(CASE WHEN b.Name LIKE '%Gold%' THEN 1 ELSE 0 END) AS HasGoldBadge,
+        AVG(COALESCE(ps.Score, 0)) AS AvgPostScore,
+        SUM(CASE WHEN ps.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedQuestionCount,
+        COUNT(ps.PostId) AS TotalQuestionsPosted,
+        SUM(CASE WHEN ps.rn_user_post = 1 THEN 1 ELSE 0 END) AS IsMostRecentPost
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostScores ps ON u.Id = ps.OwnerUserId
+    WHERE u.Id > 0
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes
+),
+HighReputationUsers AS (
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        UserCreationDate,
+        BadgeCount,
+        HasGoldBadge,
+        AvgPostScore,
+        ClosedQuestionCount,
+        TotalQuestionsPosted,
+        IsMostRecentPost
+    FROM UserActivity
+    WHERE Reputation > 10000
+),
+RecentQuestions AS (
+    SELECT
+        PostId,
+        OwnerUserId,
+        Title,
+        PostCreationDate,
+        Score,
+        ViewCount,
+        CommentCountTotal,
+        UpVoteCount,
+        DownVoteCount,
+        CASE WHEN ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS QuestionStatus,
+        'Question' AS PostType
+    FROM PostScores
+    WHERE rn_user_post <= 5
+),
+TagPerformance AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS TotalPostsWithTag,
+        AVG(p.Score) AS AvgScoreForTag,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS PostsWithAcceptedAnswer,
+        MAX(p.CreationDate) AS LatestPostWithTag
+    FROM Posts p
+    JOIN Tags t ON t.Id = ANY(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'))
+    WHERE p.PostTypeId = 1 AND p.CreationDate > '2023-01-01'
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 50
+)
+SELECT
+    hr.DisplayName AS HighRepUser,
+    hr.Reputation AS UserRep,
+    hr.BadgeCount AS UserBadges,
+    hr.HasGoldBadge,
+    hr.AvgPostScore AS UserAvgQuestionScore,
+    hr.ClosedQuestionCount AS UserClosedQuestions,
+    hr.TotalQuestionsPosted AS UserTotalQuestions,
+    rq.Title AS RecentQuestionTitle,
+    rq.PostCreationDate AS RecentQuestionDate,
+    rq.Score AS RecentQuestionScore,
+    rq.ViewCount AS RecentQuestionViews,
+    rq.CommentCountTotal AS RecentQuestionComments,
+    rq.UpVoteCount AS RecentQuestionUpvotes,
+    rq.DownVoteCount AS RecentQuestionDownvotes,
+    rq.QuestionStatus,
+    tp.TagName,
+    tp.TotalPostsWithTag,
+    tp.AvgScoreForTag,
+    tp.PostsWithAcceptedAnswer,
+    tp.LatestPostWithTag
+FROM HighReputationUsers hr
+LEFT JOIN RecentQuestions rq ON hr.UserId = rq.OwnerUserId
+LEFT JOIN TagPerformance tp ON tp.TagName = ANY(
+    (SELECT TagName FROM TagPerformance ORDER BY AvgScoreForTag DESC LIMIT 1)
+    UNION ALL
+    (SELECT TagName FROM TagPerformance ORDER BY TotalPostsWithTag DESC LIMIT 1)
+)
+WHERE hr.IsMostRecentPost = 1
+ORDER BY hr.Reputation DESC, tp.AvgScoreForTag DESC;

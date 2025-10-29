@@ -1,0 +1,345 @@
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl_norm
+  from users u
+  where u.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from users)
+),
+question_posts as (
+  select p.id as post_id,
+         p.owneruserid as user_id,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.title,
+         p.tags,
+         p.answercount,
+         p.closeddate,
+         p.contentlicense
+  from posts p
+  where p.posttypeid = 1
+),
+answer_posts as (
+  select p.id as answer_id,
+         p.parentid as question_id,
+         p.owneruserid as user_id,
+         p.creationdate,
+         p.score,
+         p.commentcount
+  from posts p
+  where p.posttypeid = 2
+),
+q_activity as (
+  select q.post_id,
+         q.user_id,
+         q.creationdate as q_created,
+         q.score as q_score,
+         q.viewcount as q_views,
+         q.title,
+         q.tags,
+         q.answercount,
+         q.closeddate,
+         lower(split_part(substring(q.tags from 2 for greatest(length(q.tags)-2,0)), '><', 1)) as primary_tag
+  from question_posts q
+),
+user_badges as (
+  select b.userid,
+         count(*) as total_badges,
+         sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+         sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+         sum(case when b.tagbased = true then 1 else 0 end) as tag_badges
+  from badges b
+  where b.date >= (select coalesce(min(creationdate), cast('1970-01-01' as timestamp)) from users)
+  group by b.userid
+),
+votes_aug as (
+  select v.postid,
+         v.userid,
+         v.votetypeid,
+         v.creationdate,
+         coalesce(v.bountyamount, 0) as bountyamount
+  from votes v
+),
+q_votes as (
+  select q.post_id,
+         sum(case when vt.name = 'UpMod' then 1 else 0 end) as upvotes,
+         sum(case when vt.name = 'DownMod' then 1 else 0 end) as downvotes,
+         sum(case when vt.name = 'Favorite' then 1 else 0 end) as favorites,
+         sum(case when vt.name in ('BountyStart','BountyClose') then va.bountyamount else 0 end) as bounty_total
+  from q_activity q
+  left join votes_aug va on va.postid = q.post_id
+  left join votetypes vt on vt.id = va.votetypeid
+  group by q.post_id
+),
+dup_links as (
+  select pl.postid as dup_post_id,
+         pl.relatedpostid as canonical_post_id,
+         pl.creationdate as dup_marked_at
+  from postlinks pl
+  where pl.linktypeid = 3
+),
+q_edits as (
+  select ph.postid,
+         count(*) filter (where pht.name in ('Edit Title','Edit Body','Edit Tags','Rollback Title','Rollback Body','Rollback Tags','Suggested Edit Applied')) as edit_count,
+         max(ph.creationdate) as last_edit_date,
+         sum(case when pht.name in ('Post Closed','Post Reopened','Post Locked','Post Unlocked','Question Protected','Question Unprotected') then 1 else 0 end) as mod_actions
+  from posthistory ph
+  left join posthistorytypes pht on pht.id = ph.posthistorytypeid
+  group by ph.postid
+),
+ans_stats as (
+  select a.question_id,
+         count(*) as answer_count_total,
+         sum(case when a.score > 0 then 1 else 0 end) as pos_answers,
+         avg(cast(a.score as numeric)) as avg_answer_score,
+         min(a.creationdate) as first_answer_time,
+         max(a.creationdate) as last_answer_time
+  from answer_posts a
+  group by a.question_id
+),
+user_activity as (
+  select ru.user_id,
+         count(distinct qa.post_id) as questions_posted,
+         count(distinct a.answer_id) as answers_posted,
+         sum(coalesce(qa.q_score, 0)) as total_q_score,
+         sum(coalesce(a.score, 0)) as total_a_score,
+         min(least(coalesce(qa.q_created, timestamp 'infinity'), coalesce(a.creationdate, timestamp 'infinity'))) as first_post_at,
+         max(greatest(coalesce(qa.q_created, timestamp '-infinity'), coalesce(a.creationdate, timestamp '-infinity'))) as last_post_at
+  from recent_users ru
+  left join q_activity qa on qa.user_id = ru.user_id
+  left join answer_posts a on a.user_id = ru.user_id
+  group by ru.user_id
+),
+tag_dim as (
+  select t.tagname,
+         t.count as tag_post_count,
+         coalesce(t.ismoderaToronly::int, 0) as is_mod_only,
+         coalesce(t.isrequired::int, 0) as is_required
+  from tags t
+),
+q_enriched as (
+  select qa.post_id,
+         qa.user_id,
+         qa.q_created,
+         qa.q_score,
+         qa.q_views,
+         qa.title,
+         qa.tags,
+         qa.answercount as answercount_snapshot,
+         qa.closeddate,
+         qa.primary_tag,
+         qv.upvotes,
+         qv.downvotes,
+         qv.favorites,
+         qv.bounty_total,
+         qe.edit_count,
+         qe.last_edit_date,
+         qe.mod_actions,
+         an.answer_count_total,
+         an.pos_answers,
+         an.avg_answer_score,
+         an.first_answer_time,
+         an.last_answer_time,
+         dl.canonical_post_id,
+         dl.dup_marked_at
+  from q_activity qa
+  left join q_votes qv on qv.post_id = qa.post_id
+  left join q_edits qe on qe.postid = qa.post_id
+  left join ans_stats an on an.question_id = qa.post_id
+  left join dup_links dl on dl.dup_post_id = qa.post_id
+),
+ranked_questions as (
+  select q.post_id,
+         q.user_id,
+         q.q_created,
+         q.q_score,
+         q.q_views,
+         q.title,
+         q.tags,
+         q.answercount_snapshot,
+         q.closeddate,
+         q.primary_tag,
+         q.upvotes,
+         q.downvotes,
+         q.favorites,
+         q.bounty_total,
+         q.edit_count,
+         q.last_edit_date,
+         q.mod_actions,
+         q.answer_count_total,
+         q.pos_answers,
+         q.avg_answer_score,
+         q.first_answer_time,
+         q.last_answer_time,
+         q.canonical_post_id,
+         q.dup_marked_at,
+         dense_rank() over (partition by q.primary_tag order by coalesce(q.q_score,0) desc, coalesce(q.q_views,0) desc, q.q_created asc) as rank_in_tag,
+         row_number() over (order by coalesce(q.q_views,0) desc) as global_view_rank,
+         percentile_disc(0.9) within group (order by coalesce(q.q_score,0)) over () as p90_score_global
+  from q_enriched q
+),
+user_quality as (
+  select ua.user_id,
+         ru.displayname,
+         ru.reputation,
+         coalesce(ub.total_badges,0) as total_badges,
+         coalesce(ub.gold_badges,0) as gold_badges,
+         coalesce(ub.silver_badges,0) as silver_badges,
+         coalesce(ub.bronze_badges,0) as bronze_badges,
+         ua.questions_posted,
+         ua.answers_posted,
+         ua.total_q_score,
+         ua.total_a_score,
+         case
+           when ua.answers_posted + ua.questions_posted = 0 then null
+           else cast(ua.total_q_score + ua.total_a_score as numeric) / nullif(ua.answers_posted + ua.questions_posted,0)
+         end as avg_post_score,
+         ru.location,
+         ru.websiteurl_norm
+  from user_activity ua
+  join recent_users ru on ru.user_id = ua.user_id
+  left join user_badges ub on ub.userid = ua.user_id
+),
+q_monthly as (
+  select u.user_id,
+         date_trunc('month', q.q_created) as month,
+         count(*) as q_count,
+         sum(coalesce(q.q_score,0)) as q_score_sum,
+         sum(coalesce(q.q_views,0)) as q_views_sum
+  from recent_users u
+  left join q_activity q on q.user_id = u.user_id
+  group by u.user_id, date_trunc('month', q.q_created)
+),
+q_monthly_window as (
+  select qm.user_id,
+         qm.month,
+         qm.q_count,
+         qm.q_score_sum,
+         qm.q_views_sum,
+         sum(q_count) over (partition by qm.user_id order by qm.month rows between 2 preceding and current row) as q_3mo_count,
+         sum(q_views_sum) over (partition by qm.user_id order by qm.month rows between 2 preceding and current row) as views_3mo_sum,
+         avg(cast(q_score_sum as numeric)) over (partition by qm.user_id order by qm.month rows between 11 preceding and current row) as avg_score_12mo
+  from q_monthly qm
+),
+q_flags as (
+  select rq.post_id,
+         case when rq.q_score >= rq.p90_score_global then 1 else 0 end as is_top_score,
+         case when rq.global_view_rank <= 100 then 1 else 0 end as is_top_viewed,
+         case when rq.downvotes > rq.upvotes then 1 else 0 end as is_controversial,
+         case when rq.edit_count >= 5 then 1 else 0 end as is_heavily_edited,
+         case when rq.closeddate is not null then 1 else 0 end as is_closed,
+         case when rq.canonical_post_id is not null then 1 else 0 end as is_marked_duplicate,
+         case
+           when rq.primary_tag is null or rq.primary_tag = '' then 'untagged'
+           when rq.primary_tag ~ '(^|[-])c\+\+$' then 'c++'
+           else rq.primary_tag
+         end as normalized_tag
+  from ranked_questions rq
+),
+final_agg as (
+  select
+    rq.post_id,
+    rq.user_id,
+    uq.displayname,
+    uq.reputation,
+    uq.total_badges,
+    uq.gold_badges,
+    uq.silver_badges,
+    uq.bronze_badges,
+    coalesce(uq.location, 'Unknown') as location,
+    coalesce(nullif(uq.websiteurl_norm, 'N/A'), 'Unknown') as website,
+    rq.q_created,
+    rq.title,
+    rq.tags,
+    qf.normalized_tag as primary_tag,
+    rq.q_score,
+    rq.q_views,
+    rq.upvotes,
+    rq.downvotes,
+    rq.favorites,
+    rq.bounty_total,
+    rq.edit_count,
+    rq.last_edit_date,
+    rq.mod_actions,
+    rq.answer_count_total,
+    rq.pos_answers,
+    rq.avg_answer_score,
+    rq.first_answer_time,
+    rq.last_answer_time,
+    rq.rank_in_tag,
+    rq.global_view_rank,
+    qf.is_top_score,
+    qf.is_top_viewed,
+    qf.is_controversial,
+    qf.is_heavily_edited,
+    qf.is_closed,
+    qf.is_marked_duplicate,
+    (
+      coalesce(rq.q_score,0) * 3
+      + coalesce(rq.upvotes,0) * 2
+      - coalesce(rq.downvotes,0) * 4
+      + ln(greatest(coalesce(rq.q_views,0)+1,1)) * 5
+      + coalesce(rq.favorites,0) * 4
+      + case when qf.is_marked_duplicate = 1 then -20 else 0 end
+      + case when qf.is_closed = 1 then -10 else 0 end
+      + case when qf.is_heavily_edited = 1 then 5 else 0 end
+      + case when uq.gold_badges >= 1 then 3 else 0 end
+    )::numeric as composite_score,
+    (
+      select c.text
+      from comments c
+      where c.postid = rq.post_id
+      order by c.creationdate desc
+      limit 1
+    ) as latest_comment_text,
+    (
+      select case
+               when lower(coalesce(c.text,'')) ~ '(thank|great|nice|helpful)' then 1
+               when lower(coalesce(c.text,'')) ~ '(wrong|bad|terrible|useless)' then -1
+               else 0
+             end
+      from comments c
+      where c.postid = rq.post_id
+      order by c.creationdate desc
+      limit 1
+    ) as latest_comment_sentiment,
+    extract(epoch from (rq.first_answer_time - rq.q_created))/60.0 as minutes_to_first_answer,
+    lower(
+      regexp_replace(
+        substring(coalesce(rq.title,'') from 1 for 80),
+        '[^a-zA-Z0-9]+','-','g'
+      )
+    ) as title_slug
+  from ranked_questions rq
+  join q_flags qf on qf.post_id = rq.post_id
+  left join user_quality uq on uq.user_id = rq.user_id
+)
+select *
+from (
+  select fa.*
+  from final_agg fa
+  where fa.is_top_viewed = 1
+  union all
+  select fa.*
+  from final_agg fa
+  where fa.is_controversial = 1
+) u
+where
+  coalesce(u.primary_tag, '') <> 'untagged'
+  and (u.title is not null and length(trim(u.title)) > 0)
+  and (u.website = 'Unknown' or lower(u.website) like 'http%')
+  and (u.latest_comment_text is null or u.latest_comment_sentiment >= -1)
+  and (
+    u.composite_score >= (
+      select avg(z.composite_score)
+      from final_agg z
+      where z.normalized_tag = u.primary_tag
+    )
+    or u.rank_in_tag <= 10
+  )
+order by u.primary_tag, u.rank_in_tag, u.global_view_rank
+limit 500;

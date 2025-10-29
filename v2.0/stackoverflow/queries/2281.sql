@@ -1,0 +1,150 @@
+with recursive RecursiveTagPaths as (
+    select 
+        t.Id,
+        t.TagName,
+        1 as depth,
+        cast(t.TagName as varchar(1000)) as path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select 
+        t2.Id,
+        t2.TagName,
+        r.depth + 1,
+        cast(r.path || '>' || t2.TagName as varchar(1000)) as path
+    from Tags t2
+    join RecursiveTagPaths r on t2.Id = r.Id + 1
+    where r.depth < 3
+), 
+UserActivityStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(pqs.QuestionCount,0) as QuestionCount,
+        coalesce(ans.AnswerCount,0) as AnswerCount,
+        coalesce(bdg.BadgeGold,0) as BadgeGold,
+        coalesce(bdg.BadgeSilver,0) as BadgeSilver,
+        coalesce(bdg.BadgeBronze,0) as BadgeBronze,
+        coalesce(vt.UpVoteCount,0) as UpVoteCount
+    from Users u
+    left join (
+        select OwnerUserId, count(*) as QuestionCount
+        from Posts
+        where PostTypeId = 1
+        group by OwnerUserId
+    ) pqs on pqs.OwnerUserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2
+        group by OwnerUserId
+    ) ans on ans.OwnerUserId = u.Id
+    left join (
+        select 
+            UserId,
+            sum(case when Class = 1 then 1 else 0 end) as BadgeGold,
+            sum(case when Class = 2 then 1 else 0 end) as BadgeSilver,
+            sum(case when Class = 3 then 1 else 0 end) as BadgeBronze
+        from Badges
+        group by UserId
+    ) bdg on bdg.UserId = u.Id
+    left join (
+        select v.UserId, count(*) as UpVoteCount
+        from Votes v
+        join VoteTypes vt on v.VoteTypeId = vt.Id
+        where vt.Name = 'UpMod'
+        group by v.UserId
+    ) vt on vt.UserId = u.Id
+    where u.Reputation > 1000
+), 
+LatestPostHistory as (
+    select ph1.PostId, ph1.PostHistoryTypeId, ph1.CreationDate, ph1.UserId, ph1.Comment,
+           row_number() over (partition by ph1.PostId order by ph1.CreationDate desc) as rn
+    from PostHistory ph1
+), 
+ClosedQuestions as (
+    select p.Id as PostId, p.Title, p.CreationDate, ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName
+    from Posts p
+    join LatestPostHistory ph on ph.PostId = p.Id and ph.rn = 1
+    left join CloseReasonTypes crt on cast(crt.Id as varchar) = ph.Comment
+    where p.PostTypeId = 1 and ph.PostHistoryTypeId = 10
+), 
+QuestionAnswerPairs as (
+    select q.Id as QuestionId, q.Title, a.Id as AnswerId, a.Score as AnswerScore, 
+        a.OwnerUserId as AnswererId, u.DisplayName as AnswererName,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+),
+TaggedQuestions as (
+    select p.Id as PostId, p.Title, lower(t.value) as TagValue
+    from Posts p,
+         unnest(string_to_array(substring(p.Tags, 2, char_length(p.Tags) - 2), '><')) t(value)
+    where p.PostTypeId = 1
+),
+HighImpactQuestions as (
+    select tq.PostId, tq.Title, tq.TagValue, p.Score, p.ViewCount, p.AnswerCount,
+        (p.FavoriteCount + coalesce(vtFav.FavoriteVotes,0)) as TotalFavorites
+    from TaggedQuestions tq
+    join Posts p on p.Id = tq.PostId
+    left join (
+        select PostId, count(*) as FavoriteVotes
+        from Votes v join VoteTypes vt on v.VoteTypeId = vt.Id
+        where vt.Name = 'Favorite'
+        group by PostId
+    ) vtFav on vtFav.PostId = p.Id
+    where p.Score > 10 and p.ViewCount > 1000
+),
+ExploratorySet as (
+    select ua.UserId, ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.BadgeGold,
+        ua.BadgeSilver,
+        ua.BadgeBronze,
+        ua.UpVoteCount,
+        count(distinct hp.PostId) as ClosedQuestionsCount,
+        coalesce(max(p.Score),0) as MaxQuestionScore
+    from UserActivityStats ua
+    left join Posts p on p.OwnerUserId = ua.UserId and p.PostTypeId = 1
+    left join ClosedQuestions hp on hp.PostId = p.Id
+    group by  ua.UserId, ua.DisplayName, ua.Reputation,
+        ua.QuestionCount, ua.AnswerCount,
+        ua.BadgeGold, ua.BadgeSilver, ua.BadgeBronze, ua.UpVoteCount
+)
+select distinct 
+    es.UserId,
+    es.DisplayName,
+    es.Reputation,
+    es.QuestionCount,
+    es.AnswerCount,
+    es.BadgeGold,
+    es.BadgeSilver,
+    es.BadgeBronze,
+    es.UpVoteCount,
+    es.ClosedQuestionsCount,
+    es.MaxQuestionScore,
+    hp.Title as ClosedQuestionTitle,
+    hp.CloseReasonName as ClosedReason,
+    qa.AnswerId,
+    qa.AnswerScore,
+    qa.AnswererName,
+    hiq.TagValue as PopularQuestionTag,
+    hiq.Score as PopularQuestionScore,
+    row_number() over (partition by es.UserId order by hiq.Score desc, hiq.ViewCount desc) as PopularQuestionRank
+from ExploratorySet es
+left join ClosedQuestions hp on hp.PostId = (
+    select p.Id from Posts p where p.OwnerUserId = es.UserId and p.PostTypeId = 1 and p.ClosedDate is not null order by p.Id limit 1
+)
+left join QuestionAnswerPairs qa on qa.QuestionId = hp.PostId and qa.AnswerRank = 1
+left join HighImpactQuestions hiq on hiq.PostId = qa.QuestionId
+where es.UpVoteCount > 50
+order by es.Reputation desc, es.BadgeGold desc, PopularQuestionRank
+limit 50;

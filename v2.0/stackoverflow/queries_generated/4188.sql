@@ -1,0 +1,165 @@
+-- {"query": "4188.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1478} 
+WITH
+  HighReputationUsers AS (
+    SELECT
+      Id,
+      DisplayName,
+      Reputation
+    FROM
+      Users
+    WHERE
+      Reputation > 10000
+  ),
+  RecentQuestions AS (
+    SELECT
+      Id,
+      Title,
+      OwnerUserId,
+      CreationDate,
+      Score,
+      AnswerCount,
+      Tags
+    FROM
+      Posts
+    WHERE
+      PostTypeId = 1 AND CreationDate >= DATE('now', '-30 day')
+  ),
+  QuestionDetails AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.Title AS QuestionTitle,
+      q.CreationDate AS QuestionCreationDate,
+      q.Score AS QuestionScore,
+      q.AnswerCount AS QuestionAnswerCount,
+      u.DisplayName AS OwnerDisplayName,
+      u.Reputation AS OwnerReputation,
+      CASE
+        WHEN q.AcceptedAnswerId IS NOT NULL THEN 1
+        ELSE 0
+      END AS HasAcceptedAnswer,
+      STRING_SPLIT(q.Tags, '><') AS QuestionTags
+    FROM
+      RecentQuestions q
+      LEFT OUTER JOIN Users u ON q.OwnerUserId = u.Id
+  ),
+  AnswerStats AS (
+    SELECT
+      ParentId AS QuestionId,
+      COUNT(Id) AS AnswerCount,
+      SUM(CASE WHEN Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreAnswerCount,
+      AVG(Score) AS AverageAnswerScore,
+      MAX(CASE WHEN Posts.Id = p.AcceptedAnswerId THEN 1 ELSE 0 END) AS IsAcceptedAnswerIndicator
+    FROM
+      Posts
+    LEFT OUTER JOIN QuestionDetails p ON Posts.ParentId = p.QuestionId
+    WHERE
+      PostTypeId = 2
+    GROUP BY
+      ParentId
+  ),
+  TagPopularity AS (
+    SELECT
+      TagName,
+      COUNT(*) AS TagCount,
+      ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) AS Rank
+    FROM
+      QuestionDetails
+      CROSS APPLY STRING_SPLIT(QuestionTags, '><')
+    GROUP BY
+      TagName
+  ),
+  UserActivity AS (
+    SELECT
+      UserId,
+      COUNT(DISTINCT PostId) AS PostsWithComments,
+      SUM(Score) AS TotalCommentScore,
+      MAX(CreationDate) AS LastCommentDate
+    FROM
+      Comments
+    WHERE
+      UserId IS NOT NULL
+    GROUP BY
+      UserId
+  ),
+  CombinedData AS (
+    SELECT
+      qd.QuestionId,
+      qd.QuestionTitle,
+      qd.QuestionCreationDate,
+      qd.QuestionScore,
+      qd.QuestionAnswerCount,
+      qd.OwnerDisplayName,
+      qd.OwnerReputation,
+      qd.HasAcceptedAnswer,
+      ta.TagName,
+      tp.Rank AS TagRank,
+      COALESCE(ans.AnswerCount, 0) AS TotalAnswersForQuestion,
+      COALESCE(ans.PositiveScoreAnswerCount, 0) AS PositiveAnswersForQuestion,
+      COALESCE(ans.AverageAnswerScore, 0) AS AvgAnswerScoreForQuestion,
+      ua.PostsWithComments AS UserCommentsCount,
+      ua.TotalCommentScore AS UserTotalCommentScore,
+      ua.LastCommentDate AS UserLastCommentDate,
+      CASE
+        WHEN qd.OwnerReputation > 50000 THEN 'High Rep'
+        WHEN qd.OwnerReputation > 10000 THEN 'Medium Rep'
+        ELSE 'Low Rep'
+      END AS ReputationBand,
+      CASE
+        WHEN qd.QuestionScore > 100 THEN 'High Score'
+        WHEN qd.QuestionScore > 10 THEN 'Medium Score'
+        ELSE 'Low Score'
+      END AS ScoreBand,
+      DATEDIFF(day, qd.QuestionCreationDate, GETDATE()) AS DaysSinceCreation,
+      (qd.QuestionScore * 1.0 / NULLIF(qd.QuestionAnswerCount, 0)) AS ScorePerAnswer,
+      IIF(qd.OwnerReputation < 1000, 'Newbie', 'Experienced') AS OwnerExperience
+    FROM
+      QuestionDetails qd
+      LEFT OUTER JOIN AnswerStats ans ON qd.QuestionId = ans.QuestionId
+      LEFT OUTER JOIN TagPopularity tp ON tp.TagName = qd.QuestionTags
+      LEFT OUTER JOIN Users u ON qd.OwnerUserId = u.Id
+      LEFT OUTER JOIN UserActivity ua ON qd.OwnerUserId = ua.UserId
+      CROSS APPLY STRING_SPLIT(qd.QuestionTags, '><') ta
+  )
+SELECT
+  cd.QuestionId,
+  cd.QuestionTitle,
+  cd.OwnerDisplayName,
+  cd.OwnerReputation,
+  cd.QuestionCreationDate,
+  cd.QuestionScore,
+  cd.TotalAnswersForQuestion,
+  cd.PositiveAnswersForQuestion,
+  cd.AvgAnswerScoreForQuestion,
+  cd.HasAcceptedAnswer,
+  cd.ReputationBand,
+  cd.ScoreBand,
+  cd.DaysSinceCreation,
+  cd.ScorePerAnswer,
+  cd.OwnerExperience,
+  tp.TagName,
+  tp.TagRank,
+  cd.UserCommentsCount,
+  cd.UserTotalCommentScore,
+  cd.UserLastCommentDate,
+  CASE
+    WHEN cd.UserLastCommentDate > DATE('now', '-7 day') THEN 'Active Commenter'
+    ELSE 'Inactive Commenter'
+  END AS CommenterStatus,
+  IIF(cd.QuestionScore < 0, 'Negative Score', 'Non-Negative Score') AS ScoreStatus,
+  IIF(cd.TotalAnswersForQuestion = 0, 'No Answers', 'Has Answers') AS AnswerStatus,
+  LEN(cd.QuestionTitle) AS TitleLength,
+  SUBSTRING(cd.QuestionTitle, 1, 10) AS TitlePrefix,
+  cd.QuestionScore + cd.TotalAnswersForQuestion AS TotalEngagementScore,
+  cd.OwnerReputation * cd.QuestionScore AS ReputationScoreProduct
+FROM
+  CombinedData cd
+  LEFT JOIN TagPopularity tp ON cd.QuestionTags = tp.TagName
+WHERE
+  cd.QuestionScore > 5
+  AND cd.TotalAnswersForQuestion BETWEEN 1 AND 10
+  AND tp.TagRank <= 10
+  AND COALESCE(cd.OwnerReputation, 0) > 1000
+  AND cd.QuestionCreationDate >= '2023-01-01'
+ORDER BY
+  cd.QuestionScore DESC,
+  cd.QuestionCreationDate ASC;

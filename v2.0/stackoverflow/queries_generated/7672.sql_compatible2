@@ -1,0 +1,188 @@
+WITH UserActivitySummary AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as RankByReputation,
+        CASE 
+            WHEN u.Reputation >= 100000 THEN 'Legendary'
+            WHEN u.Reputation >= 10000 THEN 'Master'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            WHEN u.Reputation >= 100 THEN 'Novice'
+            ELSE 'Beginner'
+        END as ReputationTier,
+        CONCAT('User:', u.Id, '|Reputation:', u.Reputation, '|Posts:', COUNT(DISTINCT p.Id)) as UserSummary
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate
+),
+UserPostStats AS (
+    SELECT 
+        u.Id as UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) as QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) as AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore,
+        MAX(p.Score) as MaxPostScore,
+        MIN(p.Score) as MinPostScore,
+        STRING_AGG(DISTINCT p.Tags, '|' ) as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id > 0
+    GROUP BY u.Id
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        p.PostTypeId,
+        AVG(p.Score) as AvgScore,
+        COUNT(p.Id) as PostCount,
+        STRING_AGG(DISTINCT u.DisplayName, ', ' ) as ActiveUsers,
+        RANK() OVER (ORDER BY t.Count DESC) as TagRank
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE t.Count > 10
+    GROUP BY t.TagName, t.Count, p.PostTypeId
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        u.DisplayName as OwnerName,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostTypeDescription,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS BIGINT) as DaysSinceCreation,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Rated'
+            WHEN p.Score > 50 THEN 'Well Rated'
+            WHEN p.Score > 10 THEN 'Moderately Rated'
+            ELSE 'Low Rated'
+        END as RatingCategory,
+        COALESCE(STRING_AGG(DISTINCT CAST(v.VoteTypeId AS VARCHAR), ',' ), 'No Votes') as VoteTypes,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as ScoreRankInUser
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.Id > 0
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId, p.PostTypeId, p.Tags, p.AnswerCount, p.CommentCount, u.DisplayName
+),
+FinalCombinedAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.Reputation,
+        uas.DisplayName,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.TotalQuestionScore,
+        ups.TotalAnswerScore,
+        ups.AvgQuestionScore,
+        ups.AvgAnswerScore,
+        ta.TagName,
+        ta.Count,
+        ta.AvgScore as TagAvgScore,
+        cpa.PostId,
+        cpa.Title,
+        cpa.Score as PostScore,
+        cpa.ViewCount,
+        cpa.DaysSinceCreation,
+        cpa.RatingCategory,
+        cpa.PostTypeDescription,
+        cpa.ScoreRankInUser,
+        CASE 
+            WHEN uas.PostCount > 100 AND uas.Reputation > 5000 THEN 'Highly Active'
+            WHEN uas.PostCount > 50 AND uas.Reputation > 1000 THEN 'Active'
+            WHEN uas.PostCount > 10 THEN 'Regular'
+            ELSE 'New'
+        END as ActivityLevel,
+        CONCAT(
+            'User: ', uas.DisplayName, 
+            ' | Posts: ', uas.PostCount, 
+            ' | Reputation: ', uas.Reputation,
+            ' | Questions: ', ups.QuestionCount,
+            ' | Answers: ', ups.AnswerCount,
+            ' | Tags: ', COALESCE(SUBSTRING(ups.AllTags FROM 1 FOR 200), 'None')
+        ) as ComprehensiveSummary
+    FROM UserActivitySummary uas
+    JOIN UserPostStats ups ON uas.UserId = ups.UserId
+    LEFT JOIN TagAnalysis ta ON ta.TagRank <= 5
+    LEFT JOIN ComplexPostAnalysis cpa ON cpa.OwnerUserId = uas.UserId
+    WHERE uas.UserId IN (
+        SELECT Id FROM Users WHERE Reputation > 500
+    )
+    AND uas.UserId NOT IN (
+        SELECT DISTINCT OwnerUserId FROM Posts WHERE PostTypeId = 1
+        EXCEPT 
+        SELECT DISTINCT Id FROM Users
+    )
+)
+SELECT 
+    UserId,
+    Reputation,
+    DisplayName,
+    PostCount,
+    CommentCount,
+    BadgeCount,
+    QuestionCount,
+    AnswerCount,
+    TotalQuestionScore,
+    TotalAnswerScore,
+    AvgQuestionScore,
+    AvgAnswerScore,
+    TagName,
+    Count as TagCount,
+    TagAvgScore,
+    PostId,
+    Title,
+    PostScore,
+    ViewCount,
+    DaysSinceCreation,
+    RatingCategory,
+    PostTypeDescription,
+    ScoreRankInUser,
+    ActivityLevel,
+    ComprehensiveSummary,
+    CASE 
+        WHEN AVG(PostScore) OVER (PARTITION BY UserId) > 50 THEN 'AboveAvg'
+        ELSE 'BelowAvg'
+    END as UserScorePerformance,
+    DENSE_RANK() OVER (ORDER BY Reputation DESC) as RankByReputation,
+    RANK() OVER (ORDER BY PostCount DESC) as RankByPostCount,
+    NTILE(10) OVER (ORDER BY PostScore) as ScoreQuartile,
+    LAG(DisplayName) OVER (ORDER BY Reputation DESC) as PreviousHighReputationUser
+FROM FinalCombinedAnalysis
+WHERE PostScore IS NOT NULL
+AND TagName IS NOT NULL
+AND Title IS NOT NULL
+AND DisplayName IS NOT NULL
+AND DaysSinceCreation > 0
+ORDER BY UserId, PostScore DESC, TagCount DESC
+LIMIT 1000 OFFSET 0;

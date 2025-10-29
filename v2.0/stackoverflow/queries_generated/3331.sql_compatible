@@ -1,0 +1,97 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)               AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)               AS AnswerCount,
+        SUM(p.Score)                                             AS TotalScore,
+        MAX(p.CreationDate)                                      AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC)           AS RepRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT *
+    FROM UserStats
+    WHERE RepRank <= 100
+),
+BadgeAgg AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                            AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)       AS GoldBadgeCount,
+        STRING_AGG(DISTINCT b.Name, ',')                   AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TagInfo AS (
+    SELECT 
+        t.TagName,
+        t.Count                                            AS TagUseCount,
+        COALESCE(p.Title, '')                              AS TagWikiTitle
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.WikiPostId
+    WHERE t.IsModeratorOnly = 0
+),
+PostActivity AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id)                               AS PostsWithComments,
+        COUNT(c.Id) FILTER (WHERE c.Score > 0)             AS PositiveComments
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+Combined AS (
+    SELECT 
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.TotalScore,
+        ba.BadgeCount,
+        ba.GoldBadgeCount,
+        ba.BadgeNames,
+        pa.PostsWithComments,
+        pa.PositiveComments,
+        COALESCE(ba.BadgeCount,0) + COALESCE(pa.PostsWithComments,0) AS ActivityScore
+    FROM TopUsers tu
+    LEFT JOIN BadgeAgg ba   ON ba.UserId   = tu.Id
+    LEFT JOIN PostActivity pa ON pa.OwnerUserId = tu.Id
+)
+SELECT 
+    c.Id,
+    c.DisplayName,
+    c.Reputation,
+    c.QuestionCount,
+    c.AnswerCount,
+    c.TotalScore,
+    c.BadgeCount,
+    c.GoldBadgeCount,
+    c.BadgeNames,
+    c.PostsWithComments,
+    c.PositiveComments,
+    c.ActivityScore,
+    CASE
+        WHEN c.Reputation > 20000 THEN 'Legendary'
+        WHEN c.Reputation > 10000 THEN 'Expert'
+        ELSE 'Contributor'
+    END                                            AS ReputationTier,
+    (SELECT COUNT(*) 
+     FROM Posts p 
+     WHERE p.OwnerUserId = c.Id AND p.Score > 0)    AS PositivePostCount,
+    (SELECT STRING_AGG(DISTINCT t.TagName, ';')
+     FROM Posts p
+     CROSS JOIN LATERAL (
+         SELECT TRIM(BOTH '<>' FROM tag) AS tag
+         FROM regexp_split_to_table(p.Tags, '><') AS s(tag)
+     ) split
+     JOIN Tags t ON t.TagName = split.tag
+     WHERE p.OwnerUserId = c.Id AND p.PostTypeId = 1) AS TagsUsed
+FROM Combined c
+ORDER BY c.ActivityScore DESC
+LIMIT 50;

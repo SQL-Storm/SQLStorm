@@ -1,0 +1,138 @@
+-- {"query": "2915.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1250} 
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = 1
+    UNION ALL
+    SELECT 
+        tg.Id,
+        tg.TagName,
+        tg.Count,
+        tg.IsModeratorOnly,
+        tg.IsRequired,
+        r.Level + 1,
+        r.Path || tg.TagName
+    FROM Tags tg
+    JOIN Posts p ON tg.ExcerptPostId = p.Id
+    JOIN PostLinks pl ON pl.PostId = p.Id
+    JOIN RecursiveTagHierarchy r ON pl.RelatedPostId = r.Id
+    WHERE tg.Id <> ALL(r.Path)
+), 
+TopUsersByReputation AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rn
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 500
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+), 
+UserActivityWindow AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        p.Tags,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank,
+        LEAD(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostDate,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId IN (1, 2)
+), 
+CloseReasonsSummary AS (
+    SELECT 
+        ph.PostId,
+        cr.Name AS CloseReason,
+        COUNT(*) AS CloseVotes,
+        MAX(ph.CreationDate) AS LastCloseVoteDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes cr ON CAST(ph.Comment AS INT) = cr.Id AND ph.PostHistoryTypeId = 10
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, cr.Name
+), 
+RecentActivity AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        COALESCE(p.Score, 0) AS Score,
+        COALESCE(p.ViewCount, 0) AS Views,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+), 
+AggregatedVotes AS (
+    SELECT 
+        p.Id AS PostId,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        SUM(v.BountyAmount) AS TotalBounty,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 1) AS AcceptedVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id
+)
+SELECT 
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    ua.PostId,
+    ua.PostTypeId,
+    ua.Score AS PostScore,
+    ua.CreationDate AS PostCreated,
+    ua.Tags,
+    CASE 
+        WHEN ua.NextPostDate IS NOT NULL THEN EXTRACT(EPOCH FROM (ua.NextPostDate - ua.CreationDate))/3600
+        ELSE NULL
+    END AS HoursToNextPost,
+    CASE 
+        WHEN ua.PrevPostScore IS NULL THEN 'No previous post'
+        WHEN ua.PrevPostScore > ua.Score THEN 'Decline'
+        WHEN ua.PrevPostScore < ua.Score THEN 'Improved'
+        ELSE 'Same score'
+    END AS ScoreTrend,
+    cr.CloseReason,
+    cr.CloseVotes,
+    ra.Title,
+    ra.Views,
+    ra.AnswerCount,
+    av.UpVotes,
+    av.DownVotes,
+    av.TotalBounty,
+    av.AcceptedVotes,
+    STRING_AGG(DISTINCT trg.TagName, ', ') FILTER (WHERE trg.Level = 1) OVER (PARTITION BY ua.PostId) AS TopLevelTagPath
+FROM TopUsersByReputation tu
+INNER JOIN UserActivityWindow ua ON ua.OwnerUserId = tu.Id AND ua.RecentPostRank <= 5
+LEFT JOIN CloseReasonsSummary cr ON cr.PostId = ua.PostId
+LEFT JOIN RecentActivity ra ON ra.Id = ua.PostId
+LEFT JOIN AggregatedVotes av ON av.PostId = ua.PostId
+LEFT JOIN RecursiveTagHierarchy trg ON trg.TagName = ANY(string_to_array(REPLACE(REPLACE(ua.Tags, '<', ''), '>', ''), ','))
+WHERE ( 
+    av.UpVotes IS NULL OR av.UpVotes > 10
+  ) 
+  AND (cr.CloseVotes IS NULL OR cr.CloseVotes < 3)
+ORDER BY tu.Reputation DESC, ua.CreationDate DESC
+LIMIT 100;

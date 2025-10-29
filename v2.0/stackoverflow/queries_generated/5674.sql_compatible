@@ -1,0 +1,171 @@
+WITH
+RecentUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.AboutMe,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.ProfileImageUrl,
+        u.EmailHash,
+        u.AccountId,
+        ROW_NUMBER() OVER (ORDER BY u.LastAccessDate DESC) AS rn
+    FROM Users u
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        COALESCE(p.Title, '') AS PostTitle,
+        COALESCE(p.OwnerDisplayName, '') AS OwnerDisplayName
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+),
+ActivityStream AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        p.OwnerDisplayName,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Body,
+        p.ParentId,
+        pv.VoteTypeId,
+        pv.UserId AS VoterUserId,
+        pv.CreationDate AS VoteDate,
+        v.Name AS VoteTypeName,
+        CASE
+            WHEN pv.VoteTypeId = 2 THEN 1
+            ELSE 0
+        END AS IsUpvote,
+        CASE
+            WHEN pv.VoteTypeId = 3 THEN 1
+            ELSE 0
+        END AS IsDownvote
+    FROM Posts p
+    LEFT JOIN Votes pv ON pv.PostId = p.Id
+    LEFT JOIN VoteTypes v ON pv.VoteTypeId = v.Id
+),
+CorrelatedBench AS (
+    SELECT
+        a.PostId,
+        a.PostTypeId,
+        a.Title,
+        a.CreationDate,
+        a.LastActivityDate,
+        a.OwnerUserId,
+        a.OwnerDisplayName,
+        a.Score,
+        a.ViewCount,
+        a.Tags,
+        a.AnswerCount,
+        a.CommentCount,
+        a.FavoriteCount,
+        a.Body,
+        a.ParentId,
+        a.VoteTypeName,
+        a.IsUpvote,
+        a.IsDownvote,
+        ROW_NUMBER() OVER (
+            PARTITION BY a.OwnerUserId
+            ORDER BY a.LastActivityDate DESC
+        ) AS rn_by_owner
+    FROM ActivityStream a
+    WHERE a.LastActivityDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+),
+ComplexQuery AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.LastAccessDate,
+        COALESCE(b.Name, '') AS BadgeName,
+        b.Class AS BadgeClass,
+        b.Date AS BadgeDate,
+        t.TagName,
+        t.Count AS TagCount,
+        p.Id AS PostId,
+        p.Title AS PostTitle,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViews,
+        p.Tags AS PostTags,
+        p.OwnerDisplayName AS PostOwner
+    FROM RecentUserActivity u
+    LEFT JOIN Badges b ON b.UserId = u.UserId
+    LEFT JOIN Posts p ON p.OwnerUserId = u.UserId
+    LEFT JOIN Tags t ON t.ExcerptPostId = p.Id
+    WHERE u.rn <= 100
+
+    UNION ALL
+
+    SELECT
+        u2.Id AS UserId,
+        u2.DisplayName AS UserName,
+        u2.Reputation,
+        u2.LastAccessDate,
+        '' AS BadgeName,
+        NULL AS BadgeClass,
+        NULL AS BadgeDate,
+        tt.TagName,
+        tt.Count,
+        ph.Id AS PostId,
+        ph.Title,
+        ph.CreationDate,
+        ph.Score,
+        ph.ViewCount,
+        ph.Tags,
+        ph.OwnerDisplayName
+    FROM TopTags tt
+    CROSS JOIN RecentUserActivity u2
+    LEFT JOIN Posts ph ON ph.Tags LIKE ('%' || tt.TagName || '%')
+    WHERE u2.rn <= 50
+),
+FinalAgg AS (
+    SELECT
+        UserId,
+        UserName,
+        Reputation,
+        LastAccessDate,
+        STRING_AGG(DISTINCT BadgeName, ', ') AS Badges,
+        STRING_AGG(DISTINCT TagName, ', ') AS TagsOfInterest,
+        COUNT(DISTINCT PostId) AS PostCount,
+        MAX(PostCreationDate) AS LastPostDate,
+        SUM(PostScore) AS TotalScore,
+        AVG(PostViews) AS AvgPostViews
+    FROM ComplexQuery
+    GROUP BY UserId, UserName, Reputation, LastAccessDate
+)
+SELECT
+    fa.UserId,
+    fa.UserName,
+    fa.Reputation,
+    fa.LastAccessDate,
+    fa.Badges,
+    fa.TagsOfInterest,
+    fa.PostCount,
+    fa.LastPostDate,
+    fa.TotalScore,
+    fa.AvgPostViews,
+    CASE
+        WHEN fa.TotalScore > 1000 THEN 'High'
+        WHEN fa.TotalScore > 100 THEN 'Medium'
+        ELSE 'Low'
+    END AS ActivityTier
+FROM FinalAgg fa
+ORDER BY fa.Reputation DESC, fa.TotalScore DESC
+LIMIT 200;

@@ -1,0 +1,437 @@
+-- {"query": "117.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 4298} 
+with
+-- recent active users with weighted activity
+active_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        date_trunc('month', u.creationdate) as cohort_month,
+        coalesce(u.location, 'Unknown') as location_norm,
+        coalesce(u.websiteurl, '') as websiteurl,
+        (u.upvotes - u.downvotes) as net_votes,
+        greatest(u.views, 0) as views_nonneg,
+        dense_rank() over (order by u.reputation desc, u.id) as rep_rank
+    from users u
+    where u.creationdate >= now() - interval '5 years'
+),
+-- posts enriched with tag array and type flags
+enriched_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.favoritecount,
+        p.commentcount,
+        p.answercount,
+        p.title,
+        p.tags,
+        string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><') as tag_arr,
+        (p.posttypeid = 1)::int as is_question,
+        (p.posttypeid = 2)::int as is_answer,
+        (case when p.closeddate is not null then 1 else 0 end) as is_closed
+    from posts p
+    where p.creationdate >= now() - interval '5 years'
+),
+-- engagement signals per post
+post_engagement as (
+    select
+        ep.id as post_id,
+        ep.owneruserid as user_id,
+        ep.posttypeid,
+        ep.creationdate,
+        coalesce(ep.score,0) as score,
+        coalesce(ep.viewcount,0) as views,
+        coalesce(ep.favoritecount,0) as favs,
+        coalesce(ep.commentcount,0) as comments,
+        coalesce(ep.answercount,0) as answers,
+        ep.is_question,
+        ep.is_answer,
+        ep.is_closed,
+        ep.tag_arr,
+        -- compute a decayed engagement score favoring recent activity
+        (coalesce(ep.score,0)*2
+         + coalesce(ep.favs,0)*1.5
+         + coalesce(ep.comments,0)*0.75
+         + coalesce(ep.answers,0)*1.25
+         + ln(1 + coalesce(ep.viewcount,0))*0.5
+        ) * exp(-extract(epoch from (now() - ep.creationdate)) / (60*60*24*180)) as decayed_engagement
+    from enriched_posts ep
+),
+-- votes summary per post
+vote_summary as (
+    select
+        v.postid as post_id,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 12 then 1 else 0 end) as spamflags,
+        sum(case when v.votetypeid = 10 then 1 else 0 end) as deletions,
+        sum(case when v.votetypeid = 11 then 1 else 0 end) as undeletions,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites_legacy,
+        count(*) as total_votes,
+        max(v.creationdate) as last_vote_at
+    from votes v
+    where v.creationdate >= now() - interval '5 years'
+    group by v.postid
+),
+-- comments summary per post
+comment_summary as (
+    select
+        c.postid as post_id,
+        count(*) as comments_count,
+        sum(greatest(coalesce(c.score,0),0)) as comment_karma,
+        max(c.creationdate) as last_comment_at
+    from comments c
+    where c.creationdate >= now() - interval '5 years'
+    group by c.postid
+),
+-- badges per user and month
+monthly_badges as (
+    select
+        b.userid as user_id,
+        date_trunc('month', b.date) as badge_month,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges,
+        count(*) as total_badges
+    from badges b
+    where b.date >= now() - interval '5 years'
+    group by b.userid, date_trunc('month', b.date)
+),
+-- closing reasons extracted from posthistory (including JSON text presence)
+close_events as (
+    select
+        ph.postid as post_id,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_closed_at,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_at,
+        -- parse numeric close reason if present in comment field
+        max(try_cast(nullif(trim(ph.comment), '') as int)) filter (where ph.posthistorytypeid = 10) as close_reason_id,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_votes
+    from posthistory ph
+    where ph.creationdate >= now() - interval '5 years'
+    group by ph.postid
+),
+-- duplicates mapping via postlinks
+duplicates as (
+    select
+        pl.postid as dup_post_id,
+        pl.relatedpostid as canonical_post_id,
+        max(pl.creationdate) as dup_linked_at
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+-- tag explosion for questions to allow tag-level analytics
+question_tags as (
+    select
+        pe.post_id,
+        lower(trim(t)) as tag
+    from post_engagement pe
+    cross join lateral (
+        select unnest(pe.tag_arr)
+    ) s(t)
+    where pe.is_question = 1 and pe.tag_arr is not null
+),
+-- rolling engagement per user over time
+user_post_activity as (
+    select
+        pe.user_id,
+        date_trunc('month', pe.creationdate) as month,
+        count(*) as posts_count,
+        sum(pe.decayed_engagement) as total_engagement,
+        sum(case when pe.is_question = 1 then 1 else 0 end) as questions_count,
+        sum(case when pe.is_answer = 1 then 1 else 0 end) as answers_count,
+        sum(case when pe.is_closed = 1 then 1 else 0 end) as closed_posts
+    from post_engagement pe
+    group by pe.user_id, date_trunc('month', pe.creationdate)
+),
+-- anomaly detection-ish z-scores of engagement per user
+user_engagement_stats as (
+    select
+        upa.user_id,
+        avg(upa.total_engagement) as avg_engagement,
+        stddev_pop(upa.total_engagement) as sd_engagement,
+        count(*) as months
+    from user_post_activity upa
+    group by upa.user_id
+),
+user_monthly_with_z as (
+    select
+        upa.*,
+        ues.avg_engagement,
+        ues.sd_engagement,
+        case
+            when ues.sd_engagement is null or ues.sd_engagement = 0 then null
+            else (upa.total_engagement - ues.avg_engagement) / ues.sd_engagement
+        end as z_engagement
+    from user_post_activity upa
+    join user_engagement_stats ues on ues.user_id = upa.user_id
+),
+-- compute per-tag difficulty proxy based on score/answers/close
+tag_difficulty as (
+    select
+        qt.tag,
+        count(distinct qt.post_id) as q_count,
+        avg(coalesce(pe.score,0)) as avg_score,
+        avg(coalesce(pe.answers,0)) as avg_answers,
+        avg(coalesce(pe.is_closed,0)) as close_rate,
+        -- more negative score and more closures -> harder
+        (1 - avg(coalesce(pe.score,0)) / nullif(avg(coalesce(pe.answers,0)) + 1,0))
+        + 2*avg(coalesce(pe.is_closed,0)) as difficulty_index
+    from question_tags qt
+    join post_engagement pe on pe.post_id = qt.post_id
+    group by qt.tag
+    having count(*) > 10
+),
+-- aggregate per user signals with outer joins
+user_aggregate as (
+    select
+        au.user_id,
+        au.displayname,
+        au.reputation,
+        au.cohort_month,
+        au.location_norm,
+        au.websiteurl,
+        au.net_votes,
+        au.views_nonneg,
+        au.rep_rank,
+        coalesce(sum(pe.decayed_engagement),0) as sum_decayed_engagement,
+        coalesce(avg(pe.decayed_engagement),0) as avg_decayed_engagement,
+        coalesce(count(pe.post_id),0) as total_posts,
+        sum(case when pe.is_question = 1 then 1 else 0 end) as questions,
+        sum(case when pe.is_answer = 1 then 1 else 0 end) as answers,
+        count(distinct date_trunc('month', pe.creationdate)) as active_months
+    from active_users au
+    left join post_engagement pe on pe.user_id = au.user_id
+    group by au.user_id, au.displayname, au.reputation, au.cohort_month, au.location_norm, au.websiteurl, au.net_votes, au.views_nonneg, au.rep_rank
+),
+-- rank users by multiple facets
+user_ranks as (
+    select
+        ua.*,
+        rank() over (order by ua.sum_decayed_engagement desc nulls last, ua.total_posts desc, ua.user_id) as r_engagement,
+        rank() over (order by ua.total_posts desc nulls last, ua.user_id) as r_activity,
+        rank() over (order by ua.reputation desc, ua.user_id) as r_reputation,
+        rank() over (order by (ua.questions::numeric / nullif(ua.total_posts,0)) desc nulls last) as r_question_ratio
+    from user_aggregate ua
+),
+-- tie in last activity from comments/votes at user level
+user_last_touch as (
+    select
+        u.id as user_id,
+        greatest(
+            max(p.lastactivitydate),
+            max(c.creationdate),
+            max(v.creationdate)
+        ) as last_touch
+    from users u
+    left join posts p on p.owneruserid = u.id
+    left join comments c on c.userid = u.id
+    left join votes v on v.userid = u.id
+    group by u.id
+),
+-- construct per-post quality score using multiple inputs
+post_quality as (
+    select
+        pe.post_id,
+        pe.user_id,
+        coalesce(vs.upvotes,0) as upvotes,
+        coalesce(vs.downvotes,0) as downvotes,
+        coalesce(vs.total_votes,0) as total_votes,
+        coalesce(cs.comments_count,0) as comments_count,
+        coalesce(cs.comment_karma,0) as comment_karma,
+        coalesce(ce.close_reason_id,0) as close_reason_id,
+        coalesce(ce.close_votes,0) as close_votes,
+        pe.decayed_engagement,
+        -- quality scoring with guardrails against division by zero
+        (
+            0.4 * ln(1 + greatest(coalesce(vs.upvotes,0) - coalesce(vs.downvotes,0), -0.99) + 1)
+          + 0.2 * ln(1 + coalesce(cs.comments_count,0))
+          + 0.15 * ln(1 + greatest(coalesce(cs.comment_karma,0),0))
+          + 0.15 * ln(1 + coalesce(vs.favorites_legacy,0))
+          + 0.1 * nullif(coalesce(pe.score,0),0)
+        ) - (case when coalesce(ce.close_votes,0) > 0 then 0.5 else 0 end) as quality_score
+    from post_engagement pe
+    left join vote_summary vs on vs.post_id = pe.post_id
+    left join comment_summary cs on cs.post_id = pe.post_id
+    left join close_events ce on ce.post_id = pe.post_id
+),
+-- choose "top" post per user using window functions and tie-breakers
+top_post_per_user as (
+    select
+        pq.*,
+        row_number() over (
+            partition by pq.user_id
+            order by pq.quality_score desc nulls last, pq.decayed_engagement desc nulls last, pq.post_id
+        ) as rn
+    from post_quality pq
+),
+-- build a set for users with anomalies in monthly engagement
+anomalous_months as (
+    select
+        umwz.user_id,
+        umwz.month,
+        umwz.total_engagement,
+        umwz.z_engagement
+    from user_monthly_with_z umwz
+    where umwz.z_engagement is not null and abs(umwz.z_engagement) >= 2
+),
+-- union of users by different top criteria to form a test cohort
+test_cohort as (
+    select user_id from user_ranks where r_engagement <= 500
+    union
+    select user_id from user_ranks where r_activity <= 500
+    union
+    select user_id from user_ranks where r_reputation <= 500
+),
+-- derive per-user tag affinity from their questions
+user_tag_affinity as (
+    select
+        pe.user_id,
+        qt.tag,
+        count(*) as q_count,
+        avg(pe.decayed_engagement) as avg_engagement_with_tag
+    from question_tags qt
+    join post_engagement pe on pe.post_id = qt.post_id
+    group by pe.user_id, qt.tag
+    having count(*) >= 3
+),
+-- correlate tag difficulty with user tag affinity
+user_tag_difficulty_corr as (
+    select
+        uta.user_id,
+        avg(td.difficulty_index) as avg_tag_difficulty,
+        count(*) as tags_considered
+    from user_tag_affinity uta
+    join tag_difficulty td on td.tag = uta.tag
+    group by uta.user_id
+),
+-- final assemble with outer joins and complex null logic
+final_assembled as (
+    select
+        tr.user_id,
+        ua.displayname,
+        ua.reputation,
+        ua.cohort_month,
+        ua.location_norm,
+        ua.total_posts,
+        ua.questions,
+        ua.answers,
+        ua.sum_decayed_engagement,
+        ua.avg_decayed_engagement,
+        tr.r_engagement,
+        tr.r_activity,
+        tr.r_reputation,
+        tr.r_question_ratio,
+        coalesce(mlb.total_badges,0) as badges_last_month,
+        coalesce(mlb.gold_badges,0) as gold_last_month,
+        coalesce(mlb.silver_badges,0) as silver_last_month,
+        coalesce(mlb.bronze_badges,0) as bronze_last_month,
+        ult.last_touch,
+        tppu.post_id as top_post_id,
+        tppu.quality_score as top_post_quality_score,
+        utdc.avg_tag_difficulty,
+        -- composite fitness for benchmarking order
+        (
+            0.35 * coalesce(ua.sum_decayed_engagement,0)
+          + 0.25 * greatest(0, 1000 - tr.r_engagement)
+          + 0.2  * ln(1 + coalesce(ua.total_posts,0))
+          + 0.1  * ln(1 + coalesce(mlb.total_badges,0))
+          + 0.1  * coalesce(utdc.avg_tag_difficulty,0)
+        ) as fitness_score
+    from test_cohort tc
+    join user_ranks tr on tr.user_id = tc.user_id
+    join user_aggregate ua on ua.user_id = tr.user_id
+    left join user_last_touch ult on ult.user_id = tr.user_id
+    left join (
+        select mb.user_id,
+               mb.badge_month,
+               sum(mb.total_badges) as total_badges,
+               sum(mb.gold_badges) as gold_badges,
+               sum(mb.silver_badges) as silver_badges,
+               sum(mb.bronze_badges) as bronze_badges
+        from monthly_badges mb
+        where mb.badge_month = date_trunc('month', now()) - interval '1 month'
+        group by mb.user_id, mb.badge_month
+    ) mlb on mlb.user_id = tr.user_id
+    left join (
+        select tppu.user_id, tppu.post_id, tppu.quality_score
+        from top_post_per_user tppu
+        where tppu.rn = 1
+    ) tppu on tppu.user_id = tr.user_id
+    left join user_tag_difficulty_corr utdc on utdc.user_id = tr.user_id
+),
+-- correlated subquery: compute user duplicate ratio considering only their questions
+user_duplicate_ratio as (
+    select
+        u.user_id,
+        (
+            select
+                coalesce(count(*) filter (where d.dup_post_id is not null),0)::numeric
+                / nullif(count(*),0)
+            from post_engagement pe2
+            left join duplicates d on d.dup_post_id = pe2.post_id
+            where pe2.user_id = u.user_id and pe2.is_question = 1
+        ) as duplicate_rate
+    from final_assembled u
+)
+select
+    fa.user_id,
+    fa.displayname,
+    fa.reputation,
+    fa.cohort_month,
+    fa.location_norm,
+    fa.total_posts,
+    fa.questions,
+    fa.answers,
+    fa.sum_decayed_engagement,
+    fa.avg_decayed_engagement,
+    fa.r_engagement,
+    fa.r_activity,
+    fa.r_reputation,
+    fa.r_question_ratio,
+    fa.badges_last_month,
+    fa.gold_last_month,
+    fa.silver_last_month,
+    fa.bronze_last_month,
+    fa.last_touch,
+    fa.top_post_id,
+    fa.top_post_quality_score,
+    fa.avg_tag_difficulty,
+    udr.duplicate_rate,
+    -- complicated predicate-based classification
+    case
+        when fa.sum_decayed_engagement is null then 'inactive'
+        when fa.sum_decayed_engagement > 100 and coalesce(udr.duplicate_rate,0) < 0.05 and coalesce(fa.badges_last_month,0) >= 1 then 'elite'
+        when fa.sum_decayed_engagement > 50 and coalesce(udr.duplicate_rate,0) < 0.1 then 'power'
+        when fa.total_posts >= 10 and coalesce(fa.avg_tag_difficulty,0) >= 1.0 then 'specialist'
+        when fa.questions::numeric / nullif(fa.total_posts,0) > 0.7 then 'inquisitive'
+        else 'regular'
+    end as user_bucket
+from final_assembled fa
+left join user_duplicate_ratio udr on udr.user_id = fa.user_id
+where
+    -- mixed complex predicate to stress optimizer
+    (
+        (fa.r_engagement <= 100 or fa.r_activity <= 100)
+        and (fa.top_post_quality_score is null or fa.top_post_quality_score > 0)
+        and (fa.last_touch is null or fa.last_touch >= now() - interval '365 days')
+        and (
+            fa.location_norm ilike '%united%' or
+            (fa.websiteurl is not null and length(fa.websiteurl) > 0) or
+            (fa.net_votes >= 0 and fa.views_nonneg >= 0)
+        )
+    )
+    and coalesce(fa.sum_decayed_engagement,0) >= 0
+order by
+    user_bucket,
+    fitness_score desc nulls last,
+    fa.r_engagement,
+    fa.r_activity,
+    fa.user_id
+limit 500;

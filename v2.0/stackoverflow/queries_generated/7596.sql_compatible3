@@ -1,0 +1,391 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount_coalesced,
+        COALESCE(p.CommentCount, 0) AS CommentCount_coalesced,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount_coalesced,
+        CAST(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400 AS INTEGER) AS DaysSinceCreation,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRank,
+        RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'Popular'
+            WHEN p.ViewCount > 500 THEN 'Moderate'
+            ELSE 'Low'
+        END AS Popularity
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.LastAccessDate,
+        COUNT(DISTINCT ps.PostId) AS TotalPosts,
+        SUM(ps.Score) AS TotalScore,
+        AVG(ps.Score) AS AvgScore,
+        SUM(ps.ViewCount) AS TotalViews,
+        MAX(ps.CreationDate) AS LastPostDate,
+        MIN(ps.CreationDate) AS FirstPostDate,
+        CAST(EXTRACT(EPOCH FROM (MAX(ps.CreationDate) - MIN(ps.CreationDate))) / 86400 AS INTEGER) AS ActiveDays,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Expert'
+            WHEN u.Reputation > 1000 THEN 'Advanced'
+            WHEN u.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS ReputationLevel
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.LastAccessDate
+),
+TopPosts AS (
+    SELECT 
+        ps.PostId,
+        ps.Title,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.DaysSinceCreation,
+        ps.PostRank,
+        ps.ScoreRank,
+        ps.ViewRank,
+        ps.ScoreCategory,
+        ps.Popularity,
+        ps.Tags,
+        ps.CreationDate,
+        ps.LastActivityDate,
+        ROW_NUMBER() OVER (ORDER BY ps.Score DESC, ps.ViewCount DESC) AS CombinedRank
+    FROM PostStats ps
+    WHERE ps.PostTypeId = 1 AND ps.Score > 0
+),
+PostWithComments AS (
+    SELECT 
+        tp.PostId,
+        tp.Title,
+        tp.OwnerUserId,
+        tp.Score,
+        tp.ViewCount,
+        tp.AnswerCount,
+        tp.CommentCount,
+        tp.FavoriteCount,
+        tp.DaysSinceCreation,
+        tp.CombinedRank,
+        tp.ScoreCategory,
+        tp.Popularity,
+        COALESCE(ct.CommentCount, 0) AS CommentCountWithCTE,
+        CASE 
+            WHEN tp.Score > 50 AND tp.ViewCount > 1000 THEN 'High Impact'
+            WHEN tp.Score > 20 OR tp.ViewCount > 500 THEN 'Moderate Impact'
+            ELSE 'Low Impact'
+        END AS ImpactLevel
+    FROM TopPosts tp
+    LEFT JOIN (
+        SELECT 
+            c.PostId,
+            COUNT(*) AS CommentCount
+        FROM Comments c
+        GROUP BY c.PostId
+    ) ct ON tp.PostId = ct.PostId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Trending'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS TrendLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+),
+ComplexMetrics AS (
+    SELECT 
+        pa.UserId,
+        pa.DisplayName,
+        pa.Reputation,
+        pa.Views,
+        pa.UpVotes,
+        pa.DownVotes,
+        pa.TotalPosts,
+        pa.TotalScore,
+        pa.AvgScore,
+        pa.TotalViews,
+        pa.ActiveDays,
+        pa.ReputationLevel,
+        COALESCE(pm.PostCount, 0) AS PostsWithMetrics,
+        COALESCE(pm.HighScorePosts, 0) AS HighScorePosts,
+        COALESCE(pm.ModerateScorePosts, 0) AS ModerateScorePosts,
+        COALESCE(pm.LowScorePosts, 0) AS LowScorePosts,
+        COALESCE(pm.PopularPosts, 0) AS PopularPosts,
+        COALESCE(pm.ModeratePosts, 0) AS ModeratePosts,
+        COALESCE(pm.NichePosts, 0) AS NichePosts,
+        pa.LastPostDate,
+        pa.FirstPostDate
+    FROM UserActivity pa
+    LEFT JOIN (
+        SELECT 
+            ps.OwnerUserId,
+            COUNT(*) AS PostCount,
+            COUNT(CASE WHEN ps.Score > 100 THEN 1 END) AS HighScorePosts,
+            COUNT(CASE WHEN ps.Score BETWEEN 20 AND 100 THEN 1 END) AS ModerateScorePosts,
+            COUNT(CASE WHEN ps.Score < 20 THEN 1 END) AS LowScorePosts,
+            COUNT(CASE WHEN ps.ViewCount > 1000 THEN 1 END) AS PopularPosts,
+            COUNT(CASE WHEN ps.ViewCount BETWEEN 500 AND 1000 THEN 1 END) AS ModeratePosts,
+            COUNT(CASE WHEN ps.ViewCount < 500 THEN 1 END) AS NichePosts
+        FROM PostStats ps
+        GROUP BY ps.OwnerUserId
+    ) pm ON pa.UserId = pm.OwnerUserId
+)
+SELECT 
+    cm.UserId,
+    cm.DisplayName,
+    cm.Reputation,
+    cm.Views,
+    cm.UpVotes,
+    cm.DownVotes,
+    cm.ReputationLevel,
+    cm.TotalPosts,
+    cm.TotalScore,
+    ROUND(cm.AvgScore, 2) AS AvgScore,
+    cm.TotalViews,
+    cm.ActiveDays,
+    CASE 
+        WHEN cm.TotalPosts > 0 THEN 
+            ROUND((cm.TotalScore * 100.0) / NULLIF(cm.TotalViews, 0), 2)
+        ELSE 0
+    END AS EfficiencyRatio,
+    CASE 
+        WHEN cm.ActiveDays > 0 THEN 
+            ROUND(cm.TotalPosts * 1.0 / NULLIF(cm.ActiveDays, 0), 2)
+        ELSE 0
+    END AS PostsPerDay,
+    COALESCE(
+        (SELECT STRING_AGG(ta.TagName, ', ')
+         FROM Tags ta
+         WHERE ta.Count > 100 AND ta.IsModeratorOnly = FALSE
+         ORDER BY ta.Count DESC
+         LIMIT 5), 
+        'No Popular Tags'
+    ) AS PopularTagList,
+    CASE 
+        WHEN cm.TotalScore > 1000 AND cm.TotalPosts > 10 THEN 'Elite Contributor'
+        WHEN cm.TotalScore > 500 AND cm.TotalPosts > 5 THEN 'Active Contributor'
+        WHEN cm.TotalScore > 100 THEN 'Regular Contributor'
+        ELSE 'New Contributor'
+    END AS ContributionTier,
+    CASE 
+        WHEN cm.Reputation > 10000 AND cm.TotalPosts > 50 THEN 'Expert Contributor'
+        WHEN cm.Reputation > 1000 AND cm.TotalPosts > 20 THEN 'Advanced Contributor'
+        WHEN cm.Reputation > 100 AND cm.TotalPosts > 10 THEN 'Intermediate Contributor'
+        ELSE 'Beginner Contributor'
+    END AS ContributorType,
+    COALESCE(pm.HighestScore, 'No Posts') AS TopPostScore,
+    COALESCE(pm.TopPostTitle, 'No Posts') AS TopPostTitle,
+    CASE 
+        WHEN cm.TotalPosts > 0 THEN 
+            ROUND((cm.AvgScore * 1.0) / NULLIF(cm.TotalPosts, 0), 2)
+        ELSE 0
+    END AS AvgScorePerPost,
+    COALESCE(
+        (SELECT STRING_AGG('Tag:' || t.TagName || ' Count:' || CAST(t.Count AS VARCHAR), '; ')
+         FROM Tags t
+         WHERE t.Count > 500
+         ORDER BY t.Count DESC
+         LIMIT 3), 
+        'No High Count Tags'
+    ) AS HighCountTags,
+    CASE 
+        WHEN cm.TotalScore > 1000 THEN 'Highly Valued'
+        WHEN cm.TotalScore > 500 THEN 'Valued'
+        WHEN cm.TotalScore > 100 THEN 'Contributing'
+        ELSE 'Active'
+    END AS CommunityValue,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = cm.UserId 
+        AND p.PostTypeId = 1
+    ) AS QuestionCount,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = cm.UserId 
+        AND p.PostTypeId = 2
+    ) AS AnswerCount,
+    CAST(EXTRACT(EPOCH FROM (cm.LastPostDate - cm.FirstPostDate)) / 86400 AS INTEGER) AS TimeSpanDays,
+    CASE 
+        WHEN cm.ActiveDays > 365 THEN 'Veteran'
+        WHEN cm.ActiveDays > 180 THEN 'Experienced'
+        WHEN cm.ActiveDays > 90 THEN 'Active'
+        ELSE 'Recent'
+    END AS ActivityDuration,
+    COALESCE(pm.AvgViews, 0) AS AvgPostViews,
+    COALESCE(pm.MaxViews, 0) AS MaxPostViews,
+    COALESCE(pm.MinViews, 0) AS MinPostViews,
+    CASE 
+        WHEN cm.Reputation / NULLIF(cm.TotalPosts, 0) > 100 THEN 'High Value'
+        WHEN cm.Reputation / NULLIF(cm.TotalPosts, 0) > 50 THEN 'Good Value'
+        WHEN cm.Reputation / NULLIF(cm.TotalPosts, 0) > 10 THEN 'Average Value'
+        ELSE 'Low Value'
+    END AS ReputationalValue,
+    COALESCE(cm.PostsWithMetrics, 0) AS PostsWithMetricsCount,
+    COALESCE(cm.HighScorePosts, 0) AS PostsWithHighScore,
+    COALESCE(cm.ModerateScorePosts, 0) AS PostsWithModerateScore,
+    COALESCE(cm.LowScorePosts, 0) AS PostsWithLowScore,
+    COALESCE(cm.PopularPosts, 0) AS PostsWithHighViews,
+    COALESCE(cm.ModeratePosts, 0) AS PostsWithModerateViews,
+    COALESCE(cm.NichePosts, 0) AS PostsWithLowViews,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.UserId = cm.UserId 
+        AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+    ) AS EditingActivityCount,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.UserId = cm.UserId
+    ) AS CommentActivityCount,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.UserId = cm.UserId 
+        AND v.VoteTypeId IN (2, 3, 4, 5, 8, 9)
+    ) AS VotingActivityCount,
+    CASE 
+        WHEN cm.Views > 10000 OR cm.TotalViews > 100000 THEN 'High Visibility'
+        WHEN cm.Views > 5000 OR cm.TotalViews > 50000 THEN 'Moderate Visibility'
+        WHEN cm.Views > 1000 OR cm.TotalViews > 10000 THEN 'Low Visibility'
+        ELSE 'Minimal Visibility'
+    END AS VisibilityLevel,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = cm.UserId
+    ) AS BadgeCount,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Badges b WHERE b.UserId = cm.UserId AND b.Class = 1) > 0 THEN 'Gold'
+        WHEN (SELECT COUNT(*) FROM Badges b WHERE b.UserId = cm.UserId AND b.Class = 2) > 0 THEN 'Silver'
+        WHEN (SELECT COUNT(*) FROM Badges b WHERE b.UserId = cm.UserId AND b.Class = 3) > 0 THEN 'Bronze'
+        ELSE 'None'
+    END AS MedalTier,
+    (
+        SELECT STRING_AGG(b.Name, ', ')
+        FROM Badges b
+        WHERE b.UserId = cm.UserId
+        AND (b.Class = 1 OR b.Class = 2 OR b.Class = 3)
+        ORDER BY b.Date DESC
+        LIMIT 10
+    ) AS RecentBadges,
+    COALESCE(
+        (SELECT STRING_AGG(pt.Title, ' | ') 
+         FROM Posts pt 
+         WHERE pt.OwnerUserId = cm.UserId 
+         AND pt.PostTypeId = 1 
+         AND pt.Score > 10 
+         ORDER BY pt.Score DESC 
+         LIMIT 5), 
+        'No High Scoring Questions'
+    ) AS TopQuestions,
+    COALESCE(
+        (SELECT STRING_AGG(pa.Title, ' | ') 
+         FROM Posts pa 
+         WHERE pa.OwnerUserId = cm.UserId 
+         AND pa.PostTypeId = 2 
+         AND pa.Score > 5 
+         ORDER BY pa.Score DESC 
+         LIMIT 5), 
+        'No High Scoring Answers'
+    ) AS TopAnswers,
+    CASE 
+        WHEN cm.TotalScore > 1000 AND cm.Views > 1000 THEN 'Top Performer'
+        WHEN cm.TotalScore > 500 AND cm.Views > 500 THEN 'Solid Performer'
+        WHEN cm.TotalScore > 100 THEN 'Regular Performer'
+        ELSE 'Emerging Performer'
+    END AS PerformanceLevel,
+    CASE 
+        WHEN cm.Reputation > 10000 AND cm.TotalPosts > 20 THEN 'Leader'
+        WHEN cm.Reputation > 5000 AND cm.TotalPosts > 10 THEN 'Influencer'
+        WHEN cm.Reputation > 1000 THEN 'Contributor'
+        ELSE 'Participant'
+    END AS CommunityRole,
+    ROUND(
+        (cm.Reputation * 1.0) / (NULLIF(cm.TotalPosts, 0) * NULLIF(cm.Views, 0) / 1000), 
+        2
+    ) AS ReputationEfficiency,
+    (
+        SELECT MIN(ph.CreationDate) 
+        FROM PostHistory ph 
+        WHERE ph.UserId = cm.UserId
+    ) AS FirstEditDate,
+    (
+        SELECT MAX(ph.CreationDate) 
+        FROM PostHistory ph 
+        WHERE ph.UserId = cm.UserId
+    ) AS LastEditDate,
+    COALESCE(
+        (SELECT STRING_AGG(DISTINCT t.TagName, ', ') 
+         FROM Posts p
+         CROSS JOIN LATERAL (SELECT UNNEST(STRING_TO_ARRAY(p.Tags, '>')) AS TagName) t
+         WHERE p.OwnerUserId = cm.UserId
+         AND p.Score > 10), 
+        'No Relevant Tags'
+    ) AS ActiveTagList,
+    CASE 
+        WHEN cm.AvgScore > 50 THEN 'High Quality'
+        WHEN cm.AvgScore > 25 THEN 'Good Quality'
+        WHEN cm.AvgScore > 10 THEN 'Moderate Quality'
+        ELSE 'Basic Quality'
+    END AS QualityLevel,
+    CASE 
+        WHEN cm.TotalViews > 10000 AND cm.TotalScore > 100 THEN 'Impactful Contributor'
+        WHEN cm.TotalViews > 5000 AND cm.TotalScore > 50 THEN 'Notable Contributor'
+        WHEN cm.TotalViews > 1000 AND cm.TotalScore > 20 THEN 'Regular Contributor'
+        ELSE 'Consistent Contributor'
+    END AS RecognitionLevel
+FROM ComplexMetrics cm
+LEFT JOIN (
+    SELECT 
+        ps.OwnerUserId,
+        MAX(ps.Score) AS HighestScore,
+        MAX(CASE WHEN ps.Score = (SELECT MAX(s.Score) FROM PostStats s WHERE s.OwnerUserId = ps.OwnerUserId) THEN ps.Title END) AS TopPostTitle,
+        AVG(ps.ViewCount) AS AvgViews,
+        MAX(ps.ViewCount) AS MaxViews,
+        MIN(ps.ViewCount) AS MinViews
+    FROM PostStats ps
+    GROUP BY ps.OwnerUserId
+) pm ON cm.UserId = pm.OwnerUserId
+WHERE cm.Reputation > 0
+  AND cm.TotalPosts > 0
+  AND cm.Views > 0
+ORDER BY cm.TotalScore DESC, cm.Reputation DESC, cm.ActiveDays DESC
+LIMIT 100;

@@ -1,0 +1,142 @@
+WITH 
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(SUM(p.Score), 0)                         AS TotalPostScore,
+        COUNT(p.Id)                                      AS PostCount,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END)     AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END)     AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v   ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+BadgeAgg AS (
+    SELECT 
+        b.UserId,
+        STRING_AGG(b.Name, ', ' ORDER BY b.Class)       AS Badges,
+        COUNT(*) FILTER (WHERE b.Class = 1)             AS GoldCount,
+        COUNT(*) FILTER (WHERE b.Class = 2)             AS SilverCount,
+        COUNT(*) FILTER (WHERE b.Class = 3)             AS BronzeCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count                                 AS TagUseCount,
+        COALESCE(p.Title, '')                   AS SampleQuestionTitle,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    WHERE t.IsModeratorOnly = 0
+),
+RecentClosedQuestions AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate                         AS ClosedDate,
+        TRY_CAST(ph.Comment AS INTEGER)         AS CloseReasonId,
+        p.Title,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    JOIN Posts p ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId = 10
+),
+UserActivityWindow AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC)               AS ReputationRank,
+        RANK()        OVER (ORDER BY u.CreationDate)                 AS JoinRank,
+        NTILE(4)      OVER (ORDER BY 
+                            COALESCE(us.TotalPostScore, 0) 
+                          + COALESCE(ba.GoldCount * 100, 0) 
+                          + COALESCE(ba.SilverCount * 10, 0) 
+                          + COALESCE(ba.BronzeCount, 0))               AS ActivityQuartile
+    FROM Users u
+    LEFT JOIN UserStats us ON us.Id = u.Id
+    LEFT JOIN BadgeAgg ba ON ba.UserId = u.Id
+),
+CombinedUsers AS (
+    SELECT 
+        ua.Id,
+        ua.DisplayName,
+        u.Reputation,
+        ua.ReputationRank,
+        ua.ActivityQuartile,
+        us.TotalPostScore,
+        us.PostCount,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.UpVotesGiven,
+        us.DownVotesGiven,
+        COALESCE(ba.Badges, '')  AS BadgeList,
+        ba.GoldCount,
+        ba.SilverCount,
+        ba.BronzeCount
+    FROM UserActivityWindow ua
+    JOIN Users u             ON u.Id = ua.Id
+    LEFT JOIN UserStats us   ON us.Id = ua.Id
+    LEFT JOIN BadgeAgg ba    ON ba.UserId = ua.Id
+    WHERE ua.ReputationRank <= 1000
+)
+
+SELECT
+    cu.Id,
+    cu.DisplayName,
+    cu.Reputation,
+    cu.ReputationRank,
+    cu.ActivityQuartile,
+    cu.TotalPostScore,
+    cu.PostCount,
+    cu.QuestionCount,
+    cu.AnswerCount,
+    cu.UpVotesGiven,
+    cu.DownVotesGiven,
+    cu.BadgeList,
+    cu.GoldCount,
+    cu.SilverCount,
+    cu.BronzeCount,
+    COALESCE(rcq.Title, 'No recent closed question')   AS RecentClosedQuestionTitle,
+    rcq.ClosedDate,
+    COALESCE(cr.Name, 'Unknown')                        AS CloseReasonName
+FROM CombinedUsers cu
+LEFT JOIN (
+    SELECT PostId, Title, ClosedDate, CloseReasonId
+    FROM RecentClosedQuestions
+    WHERE rn = 1
+) rcq ON rcq.PostId = cu.Id
+LEFT JOIN CloseReasonTypes cr ON cr.Id = rcq.CloseReasonId
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS INTEGER)               AS Id,
+    'Top Tags'                          AS DisplayName,
+    CAST(NULL AS INTEGER)               AS Reputation,
+    CAST(NULL AS INTEGER)               AS ReputationRank,
+    tt.TagRank                          AS ActivityQuartile,
+    CAST(NULL AS INTEGER)               AS TotalPostScore,
+    CAST(NULL AS INTEGER)               AS PostCount,
+    CAST(NULL AS INTEGER)               AS QuestionCount,
+    CAST(NULL AS INTEGER)               AS AnswerCount,
+    CAST(NULL AS INTEGER)               AS UpVotesGiven,
+    CAST(NULL AS INTEGER)               AS DownVotesGiven,
+    CAST(NULL AS VARCHAR)               AS BadgeList,
+    CAST(NULL AS INTEGER)               AS GoldCount,
+    CAST(NULL AS INTEGER)               AS SilverCount,
+    CAST(NULL AS INTEGER)               AS BronzeCount,
+    tt.TagName                          AS RecentClosedQuestionTitle,
+    tt.TagUseCount                      AS ClosedDate,
+    tt.SampleQuestionTitle              AS CloseReasonName
+FROM TopTags tt
+WHERE tt.TagRank <= 10
+
+ORDER BY 
+    ReputationRank NULLS LAST,
+    ActivityQuartile NULLS FIRST;

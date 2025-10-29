@@ -1,0 +1,207 @@
+-- {"query": "7702.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1842} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Advanced'
+            WHEN u.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationLevel,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        AvgPostScore,
+        LastPostDate,
+        ReputationLevel,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) as ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY PostCount DESC, Reputation DESC) as ProductivityRank
+    FROM UserStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Upvoted'
+            WHEN p.Score > 50 THEN 'Moderately Upvoted'
+            WHEN p.Score > 0 THEN 'Slightly Upvoted'
+            ELSE 'Downvoted or Neutral'
+        END as ScoreCategory,
+        CASE 
+            WHEN p.AnswerCount > 10 THEN 'Highly Active'
+            WHEN p.AnswerCount > 5 THEN 'Moderately Active'
+            WHEN p.AnswerCount > 0 THEN 'Low Activity'
+            ELSE 'No Answers'
+        END as ActivityLevel,
+        COALESCE(p.Tags, '') as TagsStripped,
+        ARRAY_LENGTH(SPLIT_PART(p.Tags, '><', 1), '><') as TagCount,
+        EXTRACT(YEAR FROM p.CreationDate) as PostYear,
+        EXTRACT(MONTH FROM p.CreationDate) as PostMonth,
+        DATEDIFF(DAY, p.CreationDate, cast('2024-10-01' as date)) as DaysSincePost
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2) AND p.CreationDate >= '2015-01-01'
+),
+UserPostStats AS (
+    SELECT 
+        p.OwnerUserId as UserId,
+        COUNT(p.Id) as TotalPosts,
+        SUM(p.Score) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        MAX(p.Score) as MaxScore,
+        MIN(p.Score) as MinScore,
+        STRING_AGG(p.Title, ' | ') as AllTitles,
+        STRING_AGG(p.Tags, ' | ') as AllTags
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+    GROUP BY p.OwnerUserId
+),
+CombinedAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.CommentCount,
+        tu.BadgeCount,
+        tu.AvgPostScore,
+        tu.ReputationLevel,
+        tu.ReputationRank,
+        tu.ProductivityRank,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.ScoreCategory,
+        pa.ActivityLevel,
+        pa.DaysSincePost,
+        pa.TagCount,
+        pa.PostYear,
+        pa.PostMonth,
+        ups.TotalPosts,
+        ups.TotalScore,
+        ups.AvgScore,
+        ups.MaxScore,
+        ups.MinScore,
+        ups.AllTitles,
+        ups.AllTags,
+        CASE 
+            WHEN tu.ReputationRank <= 10 THEN 'Top 10'
+            WHEN tu.ReputationRank <= 50 THEN 'Top 50'
+            ELSE 'Others'
+        END as ReputationTier,
+        COUNT(*) OVER (PARTITION BY tu.UserId) as UserPostCount,
+        ROW_NUMBER() OVER (PARTITION BY tu.UserId ORDER BY pa.Score DESC) as PostRankWithinUser
+    FROM TopUsers tu
+    INNER JOIN PostAnalysis pa ON tu.UserId = pa.OwnerUserId
+    LEFT JOIN UserPostStats ups ON tu.UserId = ups.UserId
+    WHERE pa.Score > 0
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.PostCount,
+    ca.CommentCount,
+    ca.BadgeCount,
+    ca.AvgPostScore,
+    ca.ReputationLevel,
+    ca.ReputationRank,
+    ca.ProductivityRank,
+    ca.PostId,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.AnswerCount,
+    ca.CommentCount,
+    ca.ScoreCategory,
+    ca.ActivityLevel,
+    ca.DaysSincePost,
+    ca.TagCount,
+    ca.PostYear,
+    ca.PostMonth,
+    ca.TotalPosts,
+    ca.TotalScore,
+    ca.AvgScore,
+    ca.MaxScore,
+    ca.MinScore,
+    ca.ReputationTier,
+    ca.UserPostCount,
+    ca.PostRankWithinUser,
+    CASE 
+        WHEN ca.UserPostCount > 100 THEN 'Extremely Active'
+        WHEN ca.UserPostCount > 50 THEN 'Very Active'
+        WHEN ca.UserPostCount > 25 THEN 'Active'
+        ELSE 'Regular'
+    END as PostingFrequency,
+    CASE 
+        WHEN ca.MaxScore > 1000 THEN 'Legend'
+        WHEN ca.MaxScore > 500 THEN 'Veteran'
+        WHEN ca.MaxScore > 100 THEN 'Experienced'
+        ELSE 'Novice'
+    END as PostingSkillLevel,
+    (ca.Reputation + ca.Score * 10 + ca.ViewCount) as CompositeScore,
+    CAST(100 * ca.PostRankWithinUser / ca.UserPostCount AS DECIMAL(5,2)) as PostRankPercentage,
+    COALESCE(ca.AllTitles, 'No titles') as UserFullTitles,
+    COALESCE(ca.AllTags, 'No tags') as UserFullTags,
+    CASE 
+        WHEN ca.PostYear = EXTRACT(YEAR FROM cast('2024-10-01' as date)) AND ca.PostMonth = EXTRACT(MONTH FROM cast('2024-10-01' as date)) 
+        THEN 'This Month'
+        WHEN ca.PostYear = EXTRACT(YEAR FROM cast('2024-10-01' as date)) AND ca.PostMonth = EXTRACT(MONTH FROM cast('2024-10-01' as date)) - 1
+        THEN 'Last Month'
+        ELSE 'Older'
+    END as RecencyCategory,
+    LAG(ca.Score, 1) OVER (PARTITION BY ca.UserId ORDER BY ca.CreationDate) as PrevScore,
+    LEAD(ca.Score, 1) OVER (PARTITION BY ca.UserId ORDER BY ca.CreationDate) as NextScore,
+    AVG(ca.Score) OVER (PARTITION BY ca.UserId) as UserAvgScore,
+    STDDEV(ca.Score) OVER (PARTITION BY ca.UserId) as UserScoreStdDev,
+    PERCENT_RANK() OVER (ORDER BY ca.Score) as ScorePercentile,
+    ROW_NUMBER() OVER (ORDER BY ca.Score DESC) as GlobalScoreRank,
+    COUNT(*) OVER () as TotalResults,
+    CASE 
+        WHEN ca.ReputationRank <= 10 AND ca.PostRankWithinUser <= 1 AND ca.DaysSincePost <= 30
+        THEN 'Elite Top Performer'
+        WHEN ca.ReputationRank <= 50 AND ca.PostRankWithinUser <= 5 AND ca.DaysSincePost <= 60
+        THEN 'High Performer'
+        ELSE 'Standard'
+    END as PerformanceCategory
+FROM CombinedAnalysis ca
+WHERE ca.Reputation > 1000 
+    AND ca.Score > 10
+    AND (ca.ScoreCategory = 'Highly Upvoted' OR ca.ScoreCategory = 'Moderately Upvoted')
+    AND (ca.ActivityLevel = 'Highly Active' OR ca.ActivityLevel = 'Moderately Active')
+ORDER BY ca.Score DESC, ca.Reputation DESC, ca.PostCount DESC
+LIMIT 1000;

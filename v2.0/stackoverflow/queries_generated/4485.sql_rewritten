@@ -1,0 +1,136 @@
+-- {"query": "4485.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1282} 
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate AS EditDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn,
+      pht.Name AS EditType
+    FROM PostHistory AS ph
+    JOIN PostHistoryTypes AS pht
+      ON ph.PostHistoryTypeId = pht.Id
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS QuestionsAsked,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+      SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswers,
+      COUNT(DISTINCT b.Id) AS BadgesEarned,
+      MAX(p.CreationDate) AS LastPostDate,
+      AVG(p.Score) AS AvgPostScore,
+      SUM(CASE WHEN c.UserId = u.Id THEN 1 ELSE 0 END) AS CommentsMade
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    LEFT JOIN Comments AS c
+      ON u.Id = c.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  CorrelatedEditCount AS (
+    SELECT
+      p.Id AS PostId,
+      (
+        SELECT
+          COUNT(*)
+        FROM PostHistory AS ph_corr
+        WHERE
+          ph_corr.PostId = p.Id AND ph_corr.PostHistoryTypeId IN (4, 5, 6)
+      ) AS TotalEditsOnPost,
+      p.OwnerUserId,
+      p.CreationDate AS PostCreationDate,
+      p.ViewCount,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.Score AS PostScore,
+      p.Title,
+      pt.Name AS PostTypeName,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed
+    FROM Posts AS p
+    JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+  )
+SELECT
+  ua.DisplayName,
+  cec.PostTypeName,
+  cec.Title,
+  cec.PostScore,
+  cec.ViewCount,
+  cec.AnswerCount,
+  cec.FavoriteCount,
+  ua.QuestionsAsked,
+  ua.AnswersGiven,
+  ua.AcceptedAnswers,
+  ua.BadgesEarned,
+  ua.CommentsMade,
+  cec.TotalEditsOnPost,
+  rpe.EditDate AS LastEditDateForUserOnPost,
+  rpe.EditType AS LastEditTypeForUserOnPost,
+  CASE
+    WHEN ua.LastPostDate > cec.PostCreationDate THEN 'User posted later'
+    WHEN ua.LastPostDate < cec.PostCreationDate THEN 'Post created later'
+    ELSE 'Concurrent'
+  END AS UserActivityVsPostTiming,
+  COALESCE(cec.ViewCount, 0) + COALESCE(cec.AnswerCount, 0) * 5 AS WeightedActivityMetric,
+  CASE
+    WHEN cec.IsClosed = 1 AND cec.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN cec.ViewCount > 10000 THEN 'High Views'
+    WHEN cec.AnswerCount > 50 THEN 'High Answers'
+    ELSE 'Standard'
+  END AS PostStatusCategory
+FROM UserActivity AS ua
+JOIN CorrelatedEditCount AS cec
+  ON ua.UserId = cec.OwnerUserId
+LEFT JOIN RankedPostEdits AS rpe
+  ON cec.PostId = rpe.PostId AND ua.UserId = rpe.UserId AND rpe.rn = 1
+WHERE
+  cec.PostTypeName = 'Question'
+  AND cec.PostScore > 0
+  AND ua.QuestionsAsked > 10
+  AND LENGTH(cec.Title) > 10
+  AND cec.ViewCount > 100
+  AND (
+    ua.DisplayName LIKE '%a%' OR ua.DisplayName LIKE '%e%'
+  )
+  AND cec.PostId % 2 = 0
+UNION
+SELECT
+  'Community User' AS DisplayName,
+  cec.PostTypeName,
+  cec.Title,
+  cec.PostScore,
+  cec.ViewCount,
+  cec.AnswerCount,
+  cec.FavoriteCount,
+  0 AS QuestionsAsked,
+  0 AS AnswersGiven,
+  0 AS AcceptedAnswers,
+  0 AS BadgesEarned,
+  0 AS CommentsMade,
+  cec.TotalEditsOnPost,
+  NULL AS LastEditDateForUserOnPost,
+  NULL AS LastEditTypeForUserOnPost,
+  'Community Owned' AS UserActivityVsPostTiming,
+  COALESCE(cec.ViewCount, 0) AS WeightedActivityMetric,
+  CASE
+    WHEN cec.IsClosed = 1 THEN 'Closed'
+    ELSE 'Community Standard'
+  END AS PostStatusCategory
+FROM CorrelatedEditCount AS cec
+WHERE
+  cec.OwnerUserId = -1
+  AND cec.PostTypeName = 'Question'
+  AND cec.PostScore >= 0
+  AND cec.ViewCount > 500
+ORDER BY
+  PostScore DESC,
+  ViewCount DESC
+LIMIT 100;

@@ -1,0 +1,93 @@
+WITH RecentTopPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.PostTypeId,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC, p.Score DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+),
+TopTagVoters AS (
+  SELECT
+    tt.TagName,
+    v.UserId,
+    v.CreationDate,
+    COUNT(*) OVER (PARTITION BY tt.TagName) AS tagVotes
+  FROM Votes v
+  JOIN Posts p ON p.Id = v.PostId
+  -- normalize splitting tags into individual tag tokens; different dialects use different functions
+  -- use standard regexp_split_to_table where available; fall back to UNNEST string_to_array if supported
+  JOIN LATERAL regexp_split_to_table(COALESCE(p.Tags, ''), E'[<>]+') AS t(tag) ON true
+  JOIN Tags tt ON tt.TagName = TRIM(BOTH ' <>' FROM p.Tags)
+  WHERE v.VoteTypeId = 2
+    AND v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+),
+Competition AS (
+  SELECT
+    rtp.PostId,
+    rtp.Title,
+    rtp.CreationDate,
+    rtp.Score,
+    rtp.ViewCount,
+    rtp.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    COUNT(DISTINCT vl.UserId) AS UniqueVoters,
+    AVG(v.BountyAmount) FILTER (WHERE v.BountyAmount IS NOT NULL) AS AvgBounty,
+    MAX(v.CreationDate) AS LastVoteDate
+  FROM RecentTopPosts rtp
+  LEFT JOIN Votes v ON v.PostId = rtp.PostId
+  LEFT JOIN Users u ON u.Id = rtp.OwnerUserId
+  LEFT JOIN Votes vl ON vl.PostId = rtp.PostId AND vl.VoteTypeId = 2
+  WHERE rtp.rn <= 5
+  GROUP BY
+    rtp.PostId, rtp.Title, rtp.CreationDate, rtp.Score, rtp.ViewCount,
+    rtp.OwnerUserId, u.DisplayName, u.Reputation
+)
+SELECT
+  c.PostId,
+  c.Title,
+  c.CreationDate,
+  c.Score,
+  c.ViewCount,
+  c.OwnerUserId,
+  c.OwnerDisplayName,
+  c.Reputation,
+  c.UniqueVoters,
+  c.AvgBounty,
+  c.LastVoteDate,
+  ht.Name AS HistoryTypeName,
+  cl.Name AS CloseReason
+FROM Competition c
+LEFT JOIN PostHistory ph ON ph.PostId = c.PostId
+LEFT JOIN PostHistoryTypes ht ON ht.Id = ph.PostHistoryTypeId
+LEFT JOIN PostLinks pl ON pl.PostId = c.PostId
+LEFT JOIN CloseReasonTypes cl ON cl.Id = (
+  -- extract numeric CloseReasonId from ph.Text in a dialect-agnostic way
+  NULLIF(
+    TRIM(BOTH '"' FROM
+      -- try JSON_VALUE style extraction; if not available, use regexp to capture number
+      COALESCE(
+        -- JSON_VALUE may not be present; try to extract with regexp_replace to leave digits
+        regexp_replace(ph.Text::text, '.*"CloseReasonId"\s*:\s*"*([^",}]+)".*', '\1'),
+        ''
+      )
+    ),
+    ''
+  )::smallint
+)
+WHERE
+  ph.Id IS NULL OR ph.CreationDate = (
+    SELECT MAX(ph2.CreationDate)
+    FROM PostHistory ph2
+    WHERE ph2.PostId = c.PostId
+  )
+ORDER BY c.LastVoteDate DESC
+LIMIT 100;

@@ -1,0 +1,232 @@
+-- {"query": "2000.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3501} 
+
+WITH UserEngagement AS (
+    -- CTE 1: Aggregate user-specific activity and reputation metrics
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate AS UserLastAccessDate,
+        COUNT(DISTINCT q.Id) AS TotalQuestionsPosted,
+        COUNT(DISTINCT a.Id) AS TotalAnswersPosted,
+        SUM(COALESCE(q.Score, 0)) AS TotalQuestionScore,
+        SUM(COALESCE(a.Score, 0)) AS TotalAnswerScore,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMadeByOwner,
+        SUM(CASE WHEN q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS TotalAcceptedAnswersOnQuestions,
+        MAX(u.Views) AS UserProfileViews
+    FROM Users u
+    LEFT JOIN Posts q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1 -- Questions
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2 -- Answers
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views
+    HAVING COUNT(DISTINCT q.Id) > 0 OR COUNT(DISTINCT a.Id) > 0 -- Focus on users with actual posts
+),
+PostHistoryAggregates AS (
+    -- CTE 2: Pre-aggregate post history details for each post to avoid repetitive subqueries
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS LatestClosedDate, -- Post Closed
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate ELSE NULL END) AS LatestReopenedDate, -- Post Reopened
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id ELSE NULL END) AS NumMinorEdits, -- Title/Body/Tags Edits
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.Id ELSE NULL END) AS NumBodyEdits, -- Body Edits only
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 4 THEN ph.Id ELSE NULL END) AS NumTitleEdits, -- Title Edits only
+        MAX(CASE WHEN ph.PostHistoryTypeId = 5 THEN LENGTH(ph.Text) - LENGTH(REPLACE(ph.Text, '<img src', '')) / (LENGTH('<img src') -1) ELSE 0 END) AS MaxImageCountInBodyEdit, -- Complex string parsing for images
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 5 AND ph.CreationDate > ph.CreationDate - INTERVAL '1 hour' THEN ph.Id ELSE NULL END) AS BodyEditsLastHour
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+QuestionDetailedMetrics AS (
+    -- CTE 3: Comprehensive metrics for each question, joining with history and calculating answer stats
+    SELECT
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.LastActivityDate AS QuestionLastActivityDate,
+        pha.LatestClosedDate,
+        pha.LatestReopenedDate,
+        pha.NumMinorEdits,
+        pha.NumBodyEdits,
+        pha.NumTitleEdits,
+        pha.MaxImageCountInBodyEdit,
+        pha.BodyEditsLastHour,
+        -- Correlated subquery for first answer date
+        (SELECT MIN(a.CreationDate) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2) AS FirstAnswerDate,
+        -- Aggregated scores of all answers to this question
+        (SELECT SUM(a.Score) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2) AS TotalAnswersScore,
+        (SELECT AVG(a.Score) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2) AS AvgAnswerScore,
+        -- Score of the accepted answer, or 0 if none
+        COALESCE((SELECT ans.Score FROM Posts ans WHERE ans.Id = p.AcceptedAnswerId AND ans.PostTypeId = 2), 0) AS AcceptedAnswerScore,
+        -- Number of unique users who commented on this question
+        (SELECT COUNT(DISTINCT c.UserId) FROM Comments c WHERE c.PostId = p.Id AND c.UserId IS NOT NULL) AS NumUniqueCommentersOnQuestion
+    FROM Posts p
+    LEFT JOIN PostHistoryAggregates pha ON p.Id = pha.PostId
+    WHERE p.PostTypeId = 1 -- Only questions
+),
+PostTagAnalysis AS (
+    -- CTE 4: Parse tags from questions and normalize them
+    SELECT
+        q.QuestionId,
+        q.OwnerUserId,
+        TRIM(LOWER(unnest(string_to_array(SUBSTRING(q.Tags, 2, LENGTH(q.Tags) - 2), '><')))) AS TagName
+    FROM QuestionDetailedMetrics q
+    WHERE q.Tags IS NOT NULL AND LENGTH(q.Tags) > 2 -- Ensure tags exist and are not empty
+),
+TagGlobalStats AS (
+    -- CTE 5: Calculate global statistics for each tag
+    SELECT
+        pta.TagName,
+        COUNT(DISTINCT pta.QuestionId) AS TotalQuestionsTaggedGlobally,
+        SUM(q.QuestionScore) AS TotalTagQuestionScoreGlobally,
+        AVG(q.QuestionScore) AS AvgTagQuestionScoreGlobally,
+        COUNT(DISTINCT pta.OwnerUserId) AS TotalUniqueQuestionersForTag
+    FROM PostTagAnalysis pta
+    JOIN QuestionDetailedMetrics q ON pta.QuestionId = q.QuestionId
+    GROUP BY pta.TagName
+),
+UserBadgeSummary AS (
+    -- CTE 6: Summarize badge counts for each user
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 ELSE NULL END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 ELSE NULL END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 ELSE NULL END) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+)
+-- Main Query: Combine all CTEs to find highly engaged users with influential, well-managed questions
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TotalQuestionsPosted,
+    ue.TotalAnswersPosted,
+    ue.TotalQuestionScore,
+    ue.TotalAnswerScore,
+    ue.TotalCommentsMadeByOwner,
+    ue.TotalAcceptedAnswersOnQuestions,
+    ue.UserProfileViews,
+    ue.UserCreationDate,
+    ue.UserLastAccessDate,
+    q.QuestionId,
+    q.QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    q.QuestionCreationDate,
+    q.QuestionLastActivityDate,
+    q.NumMinorEdits,
+    q.NumBodyEdits,
+    q.NumTitleEdits,
+    q.LatestClosedDate,
+    q.LatestReopenedDate,
+    q.FirstAnswerDate,
+    q.TotalAnswersScore,
+    q.AvgAnswerScore,
+    q.AcceptedAnswerScore,
+    q.NumUniqueCommentersOnQuestion,
+    q.MaxImageCountInBodyEdit,
+    q.BodyEditsLastHour,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.TagBadges,
+    -- Complex calculations involving dates and NULL logic
+    EXTRACT(EPOCH FROM (q.QuestionLastActivityDate - q.QuestionCreationDate)) / 3600.0 AS QuestionAgeHours,
+    NULLIF(EXTRACT(EPOCH FROM (q.FirstAnswerDate - q.QuestionCreationDate)) / 60.0, 0) AS TimeToFirstAnswerMinutes, -- NULLIF to avoid 0 if no answer
+    -- Conditional expressions (CASE statements)
+    CASE
+        WHEN q.LatestClosedDate IS NOT NULL AND (q.LatestReopenedDate IS NULL OR q.LatestReopenedDate < q.LatestClosedDate) THEN 'Closed_Permanently'
+        WHEN q.LatestClosedDate IS NOT NULL AND q.LatestReopenedDate IS NOT NULL AND q.LatestReopenedDate > q.LatestClosedDate THEN 'Closed_Then_Reopened'
+        ELSE 'Open_And_Active'
+    END AS QuestionLifecycleStatus,
+    COALESCE(q.FavoriteCount, 0) * 1.0 / NULLIF(q.ViewCount, 0) AS FavoriteToViewRatio,
+    -- Correlated subquery: Number of unique users who provided answers to this user's other questions
+    (SELECT COUNT(DISTINCT ans.OwnerUserId)
+     FROM Posts ans
+     WHERE ans.PostTypeId = 2
+       AND ans.OwnerUserId IS NOT NULL
+       AND ans.ParentId IN (SELECT p_other.Id FROM Posts p_other WHERE p_other.OwnerUserId = ue.UserId AND p_other.PostTypeId = 1 AND p_other.Id <> q.QuestionId)) AS UniqueAnswerersToOtherQuestions,
+    -- Window functions for ranking and aggregation over partitions
+    ROW_NUMBER() OVER (PARTITION BY ue.UserId ORDER BY q.QuestionScore DESC, q.ViewCount DESC) AS RankQuestionByUser,
+    DENSE_RANK() OVER (ORDER BY ue.Reputation DESC, ue.TotalQuestionsPosted DESC, ue.TotalAnswerScore DESC) AS GlobalUserEngagementRank,
+    AVG(q.QuestionScore) OVER (PARTITION BY ue.UserCreationDate::date) AS AvgQuestionScoreForUsersByCreationDay,
+    -- Lateral join for top 3 most popular tags associated with *this specific question*
+    STRING_AGG(tgs_lateral.TagName, ' ; ') AS TopAssociatedTags,
+    MAX(CASE WHEN tgs_lateral.TagName IN ('sql', 'database', 'performance', 'optimization') THEN 1 ELSE 0 END) AS IsTechnicalPerformanceQuestion,
+    -- Nested EXISTS clause with complex condition
+    EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        WHERE pl.PostId = q.QuestionId
+          AND pl.LinkTypeId = 3 -- Duplicate link
+          AND EXISTS (
+                SELECT 1
+                FROM QuestionDetailedMetrics q_orig
+                WHERE q_orig.QuestionId = pl.RelatedPostId
+                  AND q_orig.QuestionScore >= q.QuestionScore * 1.5 -- Original is significantly better
+                  AND q_orig.AnswerCount > q.AnswerCount
+             )
+    ) AS HasHigherScoringDuplicateLink,
+    -- NOT EXISTS clause to filter out questions with rapid, problematic edits
+    NOT EXISTS (
+        SELECT 1
+        FROM PostHistory ph_rapid_check
+        WHERE ph_rapid_check.PostId = q.QuestionId
+          AND ph_rapid_check.PostHistoryTypeId = 5 -- Body Edit
+        GROUP BY ph_rapid_check.PostId
+        HAVING COUNT(DISTINCT ph_rapid_check.Id) >= 2 -- At least 2 distinct body edits
+           AND MAX(ph_rapid_check.CreationDate) - MIN(ph_rapid_check.CreationDate) < INTERVAL '15 minutes' -- within 15 minutes
+    ) AS NotRapidlyEditedQuestion
+FROM UserEngagement ue
+JOIN QuestionDetailedMetrics q ON ue.UserId = q.OwnerUserId
+LEFT JOIN UserBadgeSummary ubs ON ue.UserId = ubs.UserId
+LEFT JOIN LATERAL ( -- LATERAL JOIN to get relevant tags for the question from global stats
+    SELECT
+        pta_inner.TagName
+    FROM PostTagAnalysis pta_inner
+    JOIN TagGlobalStats tgs_inner ON pta_inner.TagName = tgs_inner.TagName
+    WHERE pta_inner.QuestionId = q.QuestionId
+    ORDER BY tgs_inner.TotalQuestionsTaggedGlobally DESC, tgs_inner.AvgTagQuestionScoreGlobally DESC
+    LIMIT 3
+) tgs_lateral ON TRUE
+WHERE
+    ue.Reputation >= 10000 -- High reputation users
+    AND ue.TotalQuestionsPosted >= 10 -- Significant question contributors
+    AND ue.TotalAnswersPosted >= 20 -- Significant answer contributors
+    AND q.QuestionScore >= 20 -- Questions with good scores
+    AND q.ViewCount >= 2000 -- Highly viewed questions
+    AND q.NumBodyEdits >= 2 -- Questions that have been refined
+    AND (q.LatestClosedDate IS NULL OR (q.LatestReopenedDate IS NOT NULL AND q.LatestReopenedDate > q.LatestClosedDate)) -- Only currently open questions or those reopened after being closed
+    AND EXISTS ( -- Question must contain at least one of the highly relevant technical tags
+        SELECT 1
+        FROM PostTagAnalysis pta_filter
+        WHERE pta_filter.QuestionId = q.QuestionId
+          AND pta_filter.TagName IN ('sql', 'database', 'performance', 'optimization', 'query-performance', 'indexing', 'transactions', 'scalability')
+    )
+    AND NOT EXISTS ( -- Exclude questions where the accepted answer was self-provided AND very low scoring
+        SELECT 1
+        FROM Posts self_ans
+        WHERE self_ans.Id = q.AcceptedAnswerId
+          AND self_ans.OwnerUserId = q.OwnerUserId
+          AND self_ans.Score <= 2
+    )
+GROUP BY
+    ue.UserId, ue.DisplayName, ue.Reputation, ue.TotalQuestionsPosted, ue.TotalAnswersPosted, ue.TotalQuestionScore, ue.TotalAnswerScore, ue.TotalCommentsMadeByOwner,
+    ue.TotalAcceptedAnswersOnQuestions, ue.UserProfileViews, ue.UserCreationDate, ue.UserLastAccessDate,
+    q.QuestionId, q.QuestionScore, q.ViewCount, q.AnswerCount, q.FavoriteCount, q.QuestionCreationDate, q.QuestionLastActivityDate, q.NumMinorEdits,
+    q.NumBodyEdits, q.NumTitleEdits, q.LatestClosedDate, q.LatestReopenedDate, q.FirstAnswerDate, q.TotalAnswersScore, q.AvgAnswerScore,
+    q.AcceptedAnswerScore, q.NumUniqueCommentersOnQuestion, q.MaxImageCountInBodyEdit, q.BodyEditsLastHour,
+    ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.TagBadges
+HAVING
+    COUNT(DISTINCT tgs_lateral.TagName) > 0 -- Ensure the LATERAL join found at least one top tag
+    AND AVG(q.QuestionScore) OVER (PARTITION BY ue.UserId) > 15 -- User's average question score is above a threshold
+ORDER BY
+    ue.Reputation DESC, q.QuestionScore DESC, q.ViewCount DESC, q.NumBodyEdits DESC
+LIMIT 500;

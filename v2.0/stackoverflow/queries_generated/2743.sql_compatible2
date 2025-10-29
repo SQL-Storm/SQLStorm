@@ -1,0 +1,154 @@
+WITH RECURSIVE RecursiveTagPaths AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        ARRAY[t.TagName] AS Path,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        p.Path || t.TagName,
+        p.Depth + 1
+    FROM Tags t
+    JOIN RecursiveTagPaths p ON substring(t.TagName FROM 1 FOR 1) = substring(p.TagName FROM 1 FOR 1)
+    WHERE p.Depth < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        count(*) AS BadgesPerClass
+    FROM Badges b
+    WHERE b.Date >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+    GROUP BY b.UserId, b.Class
+),
+TopUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(bc_gold.BadgesPerClass, 0) AS GoldCount,
+        COALESCE(bc_silver.BadgesPerClass, 0) AS SilverCount,
+        COALESCE(bc_bronze.BadgesPerClass, 0) AS BronzeCount,
+        row_number() OVER (ORDER BY u.Reputation DESC, u.Id) AS rn
+    FROM Users u
+    LEFT JOIN UserBadgeCounts bc_gold ON u.Id = bc_gold.UserId AND bc_gold.Class = 1
+    LEFT JOIN UserBadgeCounts bc_silver ON u.Id = bc_silver.UserId AND bc_silver.Class = 2
+    LEFT JOIN UserBadgeCounts bc_bronze ON u.Id = bc_bronze.UserId AND bc_bronze.Class = 3
+    WHERE u.Reputation > 1000
+),
+PostAnswerStats AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        count(*) FILTER (WHERE po.Score >= 10) AS HighScoreAnswerCount,
+        avg(po.Score) AS AvgAnswerScore,
+        max(po.Score) AS MaxAnswerScore,
+        sum(CASE WHEN po.OwnerUserId IS NULL THEN 1 ELSE 0 END) AS AnonymousAnswers
+    FROM Posts p
+    JOIN Posts po ON p.ParentId = po.Id AND po.PostTypeId = 1
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+QuestionWithStats AS (
+    SELECT 
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        pas.HighScoreAnswerCount,
+        pas.AvgAnswerScore,
+        pas.MaxAnswerScore,
+        pas.AnonymousAnswers,
+        row_number() OVER (PARTITION BY q.OwnerUserId ORDER BY q.Score DESC) AS UserTopQuestionRank,
+        count(*) OVER (PARTITION BY q.OwnerUserId) AS UserTotalQuestions
+    FROM Posts q
+    LEFT JOIN PostAnswerStats pas ON q.Id = pas.QuestionId
+    WHERE q.PostTypeId = 1
+),
+LatestComments AS (
+    SELECT DISTINCT ON (c.PostId)
+        c.PostId,
+        c.Id AS CommentId,
+        c.Text AS CommentText,
+        c.CreationDate AS CommentDate,
+        COALESCE(u.DisplayName, c.UserDisplayName) AS CommentOwnerDisplayName
+    FROM Comments c
+    LEFT JOIN Users u ON c.UserId = u.Id
+    ORDER BY c.PostId, c.CreationDate DESC
+),
+LinkedDuplicateCounts AS (
+    SELECT 
+        pl.PostId,
+        count(DISTINCT pl.RelatedPostId) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount,
+        count(DISTINCT pl.RelatedPostId) FILTER (WHERE lt.Name = 'Linked') AS LinkedCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+)
+SELECT 
+    qu.Id AS QuestionId,
+    qu.Title,
+    qu.CreationDate,
+    COALESCE(u.DisplayName, 'Unknown') AS QuestionOwner,
+    qu.Score,
+    qu.ViewCount,
+    qu.AnswerCount,
+    qu.HighScoreAnswerCount,
+    round(CAST(qu.AvgAnswerScore AS numeric), 2) AS AvgAnswerScore,
+    qu.MaxAnswerScore,
+    qu.AnonymousAnswers,
+    qu.UserTopQuestionRank,
+    qu.UserTotalQuestions,
+    tc.CommentOwnerDisplayName AS LatestCommentOwner,
+    tc.CommentText AS LatestComment,
+    dup.DuplicateCount,
+    dup.LinkedCount,
+    CASE 
+        WHEN qu.ViewCount > 1000 THEN 'High Views'
+        WHEN qu.ViewCount BETWEEN 100 AND 1000 THEN 'Medium Views'
+        ELSE 'Low Views'
+    END AS ViewCategory,
+    substring(qu.Title FROM '([A-Za-z]+)') AS FirstWordInTitle,
+    COALESCE(u.Reputation, 0) AS OwnerReputation,
+    (SELECT count(*) FROM Votes v WHERE v.PostId = qu.Id AND v.VoteTypeId = 2) AS UpVotesCount,
+    (SELECT count(*) FROM Votes v WHERE v.PostId = qu.Id AND v.VoteTypeId = 3) AS DownVotesCount,
+    CASE
+        WHEN qu.Score < 0 THEN 'Negative Score'
+        WHEN qu.Score = 0 THEN 'Zero Score'
+        ELSE 'Positive Score'
+    END AS ScoreCategory,
+    lag(qu.Score) OVER (PARTITION BY qu.OwnerUserId ORDER BY qu.CreationDate) AS PreviousQuestionScore,
+    lead(qu.Score) OVER (PARTITION BY qu.OwnerUserId ORDER BY qu.CreationDate) AS NextQuestionScore,
+    tp.GoldCount,
+    tp.SilverCount,
+    tp.BronzeCount,
+    CASE 
+        WHEN qu.AnswerCount = 0 THEN NULL
+        ELSE CAST(qu.Score AS double precision) / qu.AnswerCount
+    END AS ScorePerAnswerRatio,
+    CASE 
+        WHEN qu.AnswerCount > 0 THEN (SELECT count(*) FROM Comments c WHERE c.PostId = qu.Id) * 1.0 / qu.AnswerCount
+        ELSE NULL
+    END AS CommentsPerAnswer,
+    CASE 
+        WHEN dup.DuplicateCount > 0 THEN 'Has Duplicates'
+        ELSE 'Original Question'
+    END AS DuplicateStatus
+FROM QuestionWithStats qu
+LEFT JOIN Users u ON qu.OwnerUserId = u.Id
+LEFT JOIN LatestComments tc ON qu.Id = tc.PostId
+LEFT JOIN LinkedDuplicateCounts dup ON qu.Id = dup.PostId
+LEFT JOIN TopUsers tp ON qu.OwnerUserId = tp.Id
+WHERE 
+    (COALESCE(qu.HighScoreAnswerCount, 0) > 0 OR qu.Score > 50 OR qu.ViewCount > 1000)
+    AND (COALESCE(qu.UserTopQuestionRank, 999999) <= 5 OR COALESCE(qu.UserTotalQuestions, 0) >= 10)
+ORDER BY qu.Score DESC NULLS LAST, qu.ViewCount DESC NULLS LAST, qu.CreationDate DESC
+LIMIT 50;

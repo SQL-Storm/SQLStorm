@@ -1,0 +1,33 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) AS TotalWikis,
+    COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) AS TotalPositiveScorePosts,
+    SUM(p.ViewCount) AS TotalViews,
+    MAX(p.LastActivityDate) AS LastActivity,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.CreationDate) AS LastPostDate,
+    SUM(v.BountyAmount) AS TotalBountyAmount,
+    AVG(p.Score) AS AvgScore,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS PopularTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId OR p.Id = t.WikiPostId
+WHERE 
+    p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5' YEAR)
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    u.Reputation DESC, 
+    TotalViews DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

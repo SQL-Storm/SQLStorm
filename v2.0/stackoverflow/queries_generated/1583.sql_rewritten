@@ -1,0 +1,197 @@
+-- {"query": "1583.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2722} 
+WITH UserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        AVG(p.Score) FILTER (WHERE p.Id IS NOT NULL) AS AvgPostScore,
+        MAX(b.Date) AS LastBadgeDate,
+        MAX(CASE WHEN b.Class = 1 THEN b.Date ELSE NULL END) AS LastGoldBadgeDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostHistoryAggregates AS (
+    SELECT
+        ph.PostId,
+        MIN(CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN ph.CreationDate END) AS InitialPostCreationDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 8, 9) AND ph.UserId IS NOT NULL THEN ph.CreationDate END) AS LastEditDateByAnyUser,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 8, 9) AND ph.UserId = p.OwnerUserId THEN ph.CreationDate END) AS LastEditDateByOwner,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN 1 END) AS EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.RevisionGUID END) AS CloseCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.RevisionGUID END) AS ReopenCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS LastCloseReasonTypeId_Str
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    GROUP BY ph.PostId
+),
+PostVotesReceived AS (
+    SELECT
+        PostId,
+        COUNT(CASE WHEN VoteTypeId = 2 THEN 1 END) AS UpvotesReceived,
+        COUNT(CASE WHEN VoteTypeId = 3 THEN 1 END) AS DownvotesReceived
+    FROM Votes
+    WHERE VoteTypeId IN (2, 3)
+    GROUP BY PostId
+),
+PostDetailMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.AcceptedAnswerId,
+        ph.InitialPostCreationDate,
+        ph.LastEditDateByAnyUser,
+        ph.LastEditDateByOwner,
+        ph.EditCount,
+        ph.CloseCount,
+        ph.ReopenCount,
+        ph.LastCloseReasonTypeId_Str,
+        COALESCE(pvr.UpvotesReceived, 0) AS UpvotesReceived,
+        COALESCE(pvr.DownvotesReceived, 0) AS DownvotesReceived,
+        (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate)) / (60 * 60 * 24))::NUMERIC(10, 2) AS PostAgeDays,
+        (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - p.LastActivityDate)) / (60 * 60 * 24))::NUMERIC(10, 2) AS DaysSinceLastActivity,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId, p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByUserPostTypeScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS RollingAvgScoreForUser,
+        LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostCreationDate
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN PostHistoryAggregates ph ON p.Id = ph.PostId
+    LEFT JOIN PostVotesReceived pvr ON p.Id = pvr.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+),
+PostTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')))) AS TagName
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+AggregatedTagMetrics AS (
+    SELECT
+        pta.PostId,
+        STRING_AGG(DISTINCT pta.TagName, ', ') AS TagsList,
+        COUNT(DISTINCT pta.TagName) AS UniqueTagCount,
+        AVG(tm.AvgTagPostScore) AS AvgScoreAcrossTagsForPost,
+        AVG(tm.AvgTagPostViewCount) AS AvgViewCountAcrossTagsForPost
+    FROM PostTagAnalysis pta
+    JOIN (
+        SELECT
+            LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(p_inner.Tags, 2, LENGTH(p_inner.Tags) - 2), '><')))) AS TagName,
+            AVG(p_inner.Score) AS AvgTagPostScore,
+            AVG(p_inner.ViewCount) AS AvgTagPostViewCount
+        FROM Posts p_inner
+        WHERE p_inner.PostTypeId = 1 AND p_inner.Tags IS NOT NULL AND LENGTH(p_inner.Tags) > 2
+        GROUP BY LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(p_inner.Tags, 2, LENGTH(p_inner.Tags) - 2), '><'))))
+    ) tm ON pta.TagName = tm.TagName
+    GROUP BY pta.PostId
+)
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.TotalPosts,
+    us.TotalQuestions,
+    us.TotalAnswers,
+    us.TotalComments,
+    us.TotalBadges,
+    us.AvgPostScore,
+    us.LastGoldBadgeDate,
+    pdm.PostId,
+    pdm.PostTypeName,
+    pdm.Title,
+    pdm.Score AS PostScore,
+    pdm.ViewCount AS PostViewCount,
+    pdm.AnswerCount,
+    pdm.CommentCount AS PostCommentCount,
+    pdm.FavoriteCount,
+    pdm.UpvotesReceived,
+    pdm.DownvotesReceived,
+    COALESCE(pdm.UpvotesReceived, 0) - COALESCE(pdm.DownvotesReceived, 0) AS NetVotesReceived,
+    (CASE WHEN COALESCE(pdm.UpvotesReceived, 0) + COALESCE(pdm.DownvotesReceived, 0) > 0
+          THEN (COALESCE(pdm.UpvotesReceived, 0)::NUMERIC / (COALESCE(pdm.UpvotesReceived, 0) + COALESCE(pdm.DownvotesReceived, 0)))
+          ELSE 0.0
+     END) AS UpvoteRatio,
+    pdm.PostAgeDays,
+    pdm.DaysSinceLastActivity,
+    pdm.EditCount,
+    pdm.CloseCount,
+    pdm.ReopenCount,
+    crt.Name AS LastCloseReasonTypeName,
+    pdm.RankByUserPostTypeScore,
+    pdm.RollingAvgScoreForUser,
+    EXTRACT(EPOCH FROM (pdm.PostCreationDate - pdm.PreviousPostCreationDate)) / (60 * 60 * 24) AS DaysSincePreviousPost,
+    COALESCE(ata.TagsList, 'No Tags') AS PostTags,
+    ata.UniqueTagCount,
+    ata.AvgScoreAcrossTagsForPost,
+    ata.AvgViewCountAcrossTagsForPost,
+    CASE
+        WHEN pdm.AcceptedAnswerId IS NOT NULL AND pdm.PostTypeId = 1
+            THEN CONCAT('Accepted (AnsId: ', pdm.AcceptedAnswerId, ')')
+        WHEN pdm.CloseCount > 0 AND crt.Name IS NOT NULL
+            THEN CONCAT('Closed (Reason: ', crt.Name, ')')
+        WHEN pdm.ViewCount > 1000 AND pdm.FavoriteCount > 50 AND pdm.PostAgeDays < 365
+            THEN 'Popular & Recent'
+        WHEN pdm.Score > 50 AND pdm.EditCount > 5
+            THEN 'High Score & Highly Edited'
+        ELSE 'Standard Post'
+    END AS PostStatusCategory,
+    EXISTS (
+        SELECT 1
+        FROM Badges b_corr
+        WHERE b_corr.UserId = us.UserId AND b_corr.Class = 1
+    ) AS HasAnyGoldBadge,
+    EXISTS (
+        SELECT 1
+        FROM Posts ans_corr
+        WHERE ans_corr.ParentId = pdm.PostId
+          AND ans_corr.PostTypeId = 2
+          AND ans_corr.Score > 5
+          AND ans_corr.OwnerUserId IS NOT NULL
+          AND ans_corr.OwnerUserId <> pdm.OwnerUserId
+    ) AS HasHighScoringExternalAnswer,
+    (
+        SELECT COUNT(pl_corr.RelatedPostId)
+        FROM PostLinks pl_corr
+        WHERE pl_corr.PostId = pdm.PostId
+          AND pl_corr.LinkTypeId = 3 -- Duplicate links
+          AND EXISTS (
+              SELECT 1
+              FROM Posts related_p_corr
+              WHERE related_p_corr.Id = pl_corr.RelatedPostId
+                AND related_p_corr.OwnerUserId = pdm.OwnerUserId
+          )
+    ) AS NumSelfDuplicateLinks
+FROM UserStats us
+LEFT JOIN PostDetailMetrics pdm ON us.UserId = pdm.OwnerUserId
+LEFT JOIN CloseReasonTypes crt ON pdm.LastCloseReasonTypeId_Str IS NOT NULL AND crt.Id = pdm.LastCloseReasonTypeId_Str::SMALLINT
+LEFT JOIN AggregatedTagMetrics ata ON pdm.PostId = ata.PostId
+WHERE
+    us.TotalPosts > 10
+    AND pdm.PostId IS NOT NULL
+    AND (pdm.Score > 0 OR pdm.ViewCount > 100)
+    AND us.Reputation > 500
+    AND (us.LastGoldBadgeDate IS NOT NULL OR pdm.EditCount > 10)
+ORDER BY us.Reputation DESC, pdm.PostCreationDate DESC
+LIMIT 1000;

@@ -1,0 +1,186 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 1) AS TotalQuestionsPosted,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 2) AS TotalAnswersPosted,
+        SUM(P.Score) AS TotalPostsScoreCombined,
+        AVG(P.Score) FILTER (WHERE P.PostTypeId IN (1, 2) AND P.Score IS NOT NULL) AS AvgPostScoreOverall,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        MIN(P.CreationDate) AS FirstPostCreationDate,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+    HAVING COUNT(P.Id) >= 5 AND U.Reputation >= 1000
+),
+PostEngagementMetrics AS (
+    SELECT
+        PQ.Id AS QuestionId,
+        PQ.OwnerUserId,
+        PQ.CreationDate AS QuestionCreationDate,
+        PQ.Title AS QuestionTitle,
+        PQ.ViewCount,
+        PQ.Score AS QuestionScore,
+        COALESCE(PQ.FavoriteCount, 0) AS QuestionFavoriteCount,
+        PQ.AnswerCount,
+        PQ.Tags,
+        (
+            SELECT CR.Name
+            FROM PostHistory PH_CLOSE
+            JOIN CloseReasonTypes CR ON CR.Id = CAST(PH_CLOSE.Comment AS SMALLINT)
+            WHERE PH_CLOSE.PostId = PQ.Id
+            AND PH_CLOSE.PostHistoryTypeId = 10
+            ORDER BY PH_CLOSE.CreationDate DESC
+            LIMIT 1
+        ) AS PrimaryCloseReason,
+        COUNT(CA.Id) AS TotalQuestionCommentCount,
+        (
+            SELECT SUM(CASE WHEN PV.VoteTypeId = 2 THEN 1 ELSE 0 END)
+            FROM Votes PV
+            WHERE PV.PostId = PQ.Id
+        ) AS TotalQuestionUpvotesReceived,
+        (
+            SELECT SUM(CASE WHEN PV.VoteTypeId = 3 THEN 1 ELSE 0 END)
+            FROM Votes PV
+            WHERE PV.PostId = PQ.Id
+        ) AS TotalQuestionDownvotesReceived,
+        (PQ.Score * 1.5 + PQ.ViewCount * 0.1 + COALESCE(PQ.FavoriteCount, 0) * 2 + COALESCE(PQ.AnswerCount, 0) * 3 + COUNT(CA.Id) * 0.5) AS QuestionActivityScore
+    FROM Posts PQ
+    LEFT JOIN Comments CA ON PQ.Id = CA.PostId
+    WHERE PQ.PostTypeId = 1 AND PQ.OwnerUserId IS NOT NULL
+    GROUP BY PQ.Id, PQ.OwnerUserId, PQ.CreationDate, PQ.Title, PQ.ViewCount, PQ.Score, PQ.FavoriteCount, PQ.AnswerCount, PQ.Tags
+    HAVING PQ.Score > 5 OR PQ.ViewCount > 100
+),
+UserHistoryActions AS (
+    SELECT
+        PH.UserId,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId = 5) AS BodyEditCount,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId = 6) AS TagsEditCount,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId = 10) AS PostClosedCount,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId = 11) AS PostReopenedCount,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId = 12) AS PostDeletedCount,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId = 24) AS SuggestedEditAppliedCount,
+        MAX(PH.CreationDate) AS LastHistoryActionDate,
+        MIN(PH.CreationDate) AS FirstHistoryActionDate
+    FROM PostHistory PH
+    WHERE PH.UserId IS NOT NULL
+    GROUP BY PH.UserId
+),
+HighImpactTags AS (
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><'))) AS TagName,
+        COUNT(DISTINCT P.Id) AS TagPostCount,
+        SUM(P.Score) AS TagTotalScore,
+        AVG(P.ViewCount) AS TagAvgViewCount,
+        COUNT(DISTINCT P.OwnerUserId) AS UniqueContributors
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL
+    GROUP BY TagName
+    HAVING COUNT(DISTINCT P.Id) > 50 AND SUM(P.Score) > 200
+    ORDER BY TagTotalScore DESC, TagAvgViewCount DESC
+    LIMIT 20
+)
+SELECT
+    UAS.UserId,
+    COALESCE(NULLIF(UAS.DisplayName, ''), 'Anonymous_User_' || UAS.UserId) AS FormattedDisplayName,
+    UAS.Reputation,
+    LPAD(CAST(UAS.Reputation AS VARCHAR), 8, '0') AS PaddedReputation,
+    UAS.TotalQuestionsPosted,
+    UAS.TotalAnswersPosted,
+    UAS.TotalPostsScoreCombined,
+    UAS.AvgPostScoreOverall,
+    UAS.TotalCommentsMade,
+    COALESCE(UHA.BodyEditCount, 0) AS BodyEditCount,
+    COALESCE(UHA.TagsEditCount, 0) AS TagsEditCount,
+    COALESCE(UHA.PostClosedCount, 0) AS PostClosedCount,
+    COALESCE(UHA.PostReopenedCount, 0) AS PostReopenedCount,
+    COALESCE(UHA.SuggestedEditAppliedCount, 0) AS SuggestedEditAppliedCount,
+    STRING_AGG(DISTINCT B.Name, ', ') FILTER (WHERE B.Class = 1) AS GoldBadges,
+    STRING_AGG(DISTINCT B.Name, ', ') FILTER (WHERE B.Class = 2) AS SilverBadges,
+    STRING_AGG(DISTINCT B.Name, ', ') FILTER (WHERE B.Class = 3) AS BronzeBadges,
+    ARRAY_AGG(PEM.QuestionTitle || ' (Score: ' || CAST(PEM.QuestionScore AS VARCHAR) || ', Activity: ' || CAST(PEM.QuestionActivityScore AS VARCHAR) || ')'
+        ) FILTER (WHERE PEM.QuestionId IS NOT NULL) AS TopHighImpactQuestions,
+    RANK() OVER (ORDER BY UAS.Reputation DESC, UAS.TotalPostsScoreCombined DESC) AS GlobalReputationRank,
+    DENSE_RANK() OVER (ORDER BY (COALESCE(UHA.PostClosedCount, 0) + COALESCE(UHA.PostReopenedCount, 0)) DESC, UAS.Reputation DESC) AS ModeratorLikeActivityRank,
+    AVG(PEM.QuestionScore) OVER (PARTITION BY UAS.UserId) AS AvgScoreOfTheirHighImpactQuestions,
+    NTILE(5) OVER (ORDER BY UAS.TotalPostsScoreCombined DESC) AS PostScoreTier,
+    (
+        SELECT COUNT(DISTINCT A.Id)
+        FROM Posts Q_Inner
+        JOIN Posts A ON Q_Inner.Id = A.ParentId
+        WHERE Q_Inner.OwnerUserId = UAS.UserId
+        AND A.OwnerUserId = UAS.UserId
+        AND A.PostTypeId = 2
+    ) AS AnswersToOwnQuestionsCount,
+    (
+        SELECT MAX(CASE WHEN PA.Id = Q.AcceptedAnswerId AND PA.OwnerUserId = UAS.UserId THEN 1 ELSE 0 END)
+        FROM Posts PA
+        JOIN Posts Q ON PA.ParentId = Q.Id
+        WHERE Q.OwnerUserId IS NOT NULL
+        AND PA.OwnerUserId = UAS.UserId
+        AND PA.PostTypeId = 2
+        AND Q.OwnerUserId <> UAS.UserId
+    ) AS HasAcceptedAnswerOnOthersQuestion,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - COALESCE(UHA.LastHistoryActionDate, UAS.LastPostActivityDate, UAS.UserCreationDate))) / (60 * 60 * 24) AS DaysSinceLastSignificantActivity,
+    (
+        SELECT COUNT(PL.Id)
+        FROM PostLinks PL
+        WHERE PL.PostId IN (SELECT P_Sub.Id FROM Posts P_Sub WHERE P_Sub.OwnerUserId = UAS.UserId AND P_Sub.PostTypeId = 1)
+        AND PL.LinkTypeId = 1
+    ) AS TotalLinkedQuestionsByThisUser,
+    CASE
+        WHEN UAS.Reputation > 50000 AND COALESCE(UHA.BodyEditCount, 0) + COALESCE(UHA.TagsEditCount, 0) > 100 AND UAS.TotalQuestionsPosted > 50 THEN 'High-Volume Expert Editor'
+        WHEN UAS.Reputation > 10000 AND (COALESCE(UHA.PostClosedCount, 0) > 5 OR COALESCE(UHA.PostReopenedCount, 0) > 2) AND UAS.AvgPostScoreOverall > 10 THEN 'Community Curator & Contributor'
+        WHEN UAS.TotalQuestionsPosted > 100 AND UAS.TotalAnswersPosted > 200 THEN 'Prolific Generalist'
+        ELSE 'Active Contributor'
+    END AS UserCategoryClassification,
+    MAX(CASE WHEN B.Name LIKE '%Analyst%' OR B.Name LIKE '%Reviewer%' THEN 1 ELSE 0 END) AS HasSpecificReviewBadges,
+    (
+        SELECT PH_Latest.CreationDate
+        FROM PostHistory PH_Latest
+        WHERE PH_Latest.UserId = UAS.UserId AND PH_Latest.PostHistoryTypeId IN (10, 12, 14)
+        ORDER BY PH_Latest.CreationDate DESC
+        LIMIT 1
+    ) AS LatestModerationActionDate,
+    UAS.DisplayName,
+    UHA.PostDeletedCount,
+    UHA.LastHistoryActionDate,
+    UAS.LastPostActivityDate,
+    UAS.UserCreationDate
+FROM UserActivitySummary UAS
+LEFT JOIN UserHistoryActions UHA ON UAS.UserId = UHA.UserId
+LEFT JOIN Badges B ON UAS.UserId = B.UserId
+LEFT JOIN LATERAL (
+    SELECT DISTINCT
+        PEM_inner.QuestionId,
+        PEM_inner.QuestionTitle,
+        PEM_inner.QuestionScore,
+        PEM_inner.QuestionActivityScore,
+        PEM_inner.Tags
+    FROM PostEngagementMetrics PEM_inner
+    CROSS JOIN LATERAL (
+        SELECT TRIM(UNNEST(string_to_array(SUBSTRING(PEM_inner.Tags, 2, LENGTH(PEM_inner.Tags)-2), '><'))) AS TagName
+    ) AS T
+    WHERE PEM_inner.OwnerUserId = UAS.UserId
+    AND T.TagName IN (SELECT TagName FROM HighImpactTags)
+) AS PEM ON TRUE
+WHERE UAS.TotalPostsScoreCombined > 0
+AND (COALESCE(UHA.BodyEditCount, 0) > 0 OR COALESCE(UHA.PostClosedCount, 0) > 0 OR UAS.TotalQuestionsPosted > 100)
+GROUP BY
+    UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.TotalQuestionsPosted, UAS.TotalAnswersPosted,
+    UAS.TotalPostsScoreCombined, UAS.AvgPostScoreOverall, UAS.TotalCommentsMade,
+    COALESCE(UHA.BodyEditCount, 0), COALESCE(UHA.TagsEditCount, 0),
+    COALESCE(UHA.PostClosedCount, 0), COALESCE(UHA.PostReopenedCount, 0),
+    COALESCE(UHA.PostDeletedCount, 0), COALESCE(UHA.SuggestedEditAppliedCount, 0),
+    UHA.LastHistoryActionDate, UAS.LastPostActivityDate, UAS.UserCreationDate,
+    UAS.DisplayName, UHA.PostDeletedCount, UHA.LastHistoryActionDate, UAS.LastPostActivityDate, UAS.UserCreationDate
+HAVING SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) >= 1 OR SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) >= 2
+ORDER BY GlobalReputationRank ASC, ModeratorLikeActivityRank ASC
+LIMIT 200;

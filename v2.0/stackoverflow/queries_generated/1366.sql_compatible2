@@ -1,0 +1,204 @@
+WITH UserStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+        COUNT(DISTINCT C.Id) AS CommentsWritten,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(B.Date) AS LastBadgeDate,
+        SUM(P.ViewCount) FILTER (WHERE P.PostTypeId = 1) AS TotalQuestionViewsOwned,
+        SUM(P.Score) AS TotalPostScoreOwned,
+        COUNT(DISTINCT PH.Id) FILTER (WHERE PH.UserId = U.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS TotalEditsMadeBySelf,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId = 2) AS UpvotesGiven,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId = 3) AS DownvotesGiven
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN PostHistory PH ON U.Id = PH.UserId
+    WHERE U.Reputation > 5000 AND U.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostActivity AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.ParentId,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        P.LastEditorUserId,
+        P.LastEditDate,
+        P.ClosedDate,
+        COALESCE(P.CommunityOwnedDate, CAST('1900-01-01' AS timestamp)) AS CommunityOwnedDateOrEpoch,
+        COUNT(DISTINCT C.Id) AS CommentCountOnPost,
+        DENSE_RANK() OVER (PARTITION BY P.PostTypeId, DATE_TRUNC('month', P.CreationDate) ORDER BY P.Score DESC, COALESCE(P.ViewCount, 0) DESC) AS MonthlyRank,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - P.LastActivityDate)) AS DaysSinceLastActivity,
+        ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'), 1) AS TagCount,
+        (SELECT COUNT(DISTINCT PL.RelatedPostId) FROM PostLinks PL WHERE PL.PostId = P.Id AND PL.LinkTypeId = 3) AS DuplicateLinkCountToOtherPosts,
+        (SELECT COUNT(DISTINCT PL.PostId) FROM PostLinks PL WHERE PL.RelatedPostId = P.Id AND PL.LinkTypeId = 3) AS DuplicateLinkCountFromOtherPosts
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY P.Id, P.PostTypeId, PT.Name, P.OwnerUserId, P.ParentId, P.CreationDate, P.LastActivityDate, P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount, P.Title, P.Tags, P.LastEditorUserId, P.LastEditDate, P.ClosedDate, P.CommunityOwnedDate
+),
+PostEditAndStatusAnalysis AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS TotalContentEdits,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS LastContentEditDate,
+        STRING_AGG(DISTINCT CRT.Name, '; ') FILTER (WHERE PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL) AS ClosureReasonsConcatenated,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId = 10) AS PostClosedDateFromHistory,
+        COALESCE(
+            MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 'Closed'
+                     WHEN PH.PostHistoryTypeId = 11 THEN 'Reopened'
+                     WHEN PH.PostHistoryTypeId = 12 THEN 'Deleted'
+                     WHEN PH.PostHistoryTypeId = 13 THEN 'Undeleted'
+                     WHEN PH.PostHistoryTypeId = 19 THEN 'Protected'
+                     WHEN PH.PostHistoryTypeId = 20 THEN 'Unprotected'
+                     ELSE NULL END),
+            'No Major Status Change'
+        ) AS LastMajorStatusDescription,
+        AVG(EXTRACT(EPOCH FROM (PH_Next.CreationDate - PH.CreationDate))) FILTER (WHERE PH_Next.UserId = PH.UserId AND PH.PostHistoryTypeId = 5 AND PH_Next.PostHistoryTypeId = 5) AS AvgBodyEditIntervalSeconds,
+        (
+            SELECT jsonb_agg(x.val)
+            FROM LATERAL (
+                SELECT jsonb_array_elements_text(CAST(ph_close.Text AS JSONB)) AS val
+            ) x
+            JOIN PostHistory ph_close ON TRUE
+            WHERE ph_close.PostId = PH.PostId
+              AND ph_close.PostHistoryTypeId = 10
+              AND ph_close.Text LIKE '%OriginalQuestionIds%'
+        ) AS DuplicateOriginalQuestionIdsJson
+    FROM PostHistory PH
+    LEFT JOIN PostHistory PH_Next ON PH.PostId = PH_Next.PostId
+        AND PH_Next.CreationDate = (
+            SELECT MIN(PH_Inner.CreationDate)
+            FROM PostHistory PH_Inner
+            WHERE PH_Inner.PostId = PH.PostId
+              AND PH_Inner.CreationDate > PH.CreationDate
+              AND PH_Inner.PostHistoryTypeId = 5
+              AND PH_Inner.UserId = PH.UserId
+        )
+    LEFT JOIN CloseReasonTypes CRT ON PH.PostHistoryTypeId = 10 AND CAST(PH.Comment AS SMALLINT) = CRT.Id
+    GROUP BY PH.PostId
+),
+VoteBehaviorPerPost AS (
+    SELECT
+        V.PostId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswerVotes,
+        SUM(CASE WHEN V.VoteTypeId IN (4, 12) THEN 1 ELSE 0 END) AS OffensiveOrSpamVotes,
+        NTILE(5) OVER (ORDER BY SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) DESC) AS NetVoteQuintile,
+        AVG(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - V.CreationDate)) / 86400) AS AvgVoteAgeDays
+    FROM Votes V
+    GROUP BY V.PostId
+)
+SELECT
+    US.UserId,
+    US.DisplayName,
+    US.Reputation,
+    PA.PostId AS ContentId,
+    PA.PostTypeName AS ContentType,
+    PA.Title AS ContentTitle,
+    PA.Score AS ContentScore,
+    PA.ViewCount AS ContentViewCount,
+    PA.AnswerCount,
+    PA.CommentCountOnPost,
+    COALESCE(PA.FavoriteCount, 0) AS FavoriteCount,
+    PA.PostCreationDate,
+    PA.LastActivityDate,
+    PA.LastEditorUserId,
+    U_Editor.DisplayName AS LastEditorDisplayName,
+    PA.LastEditDate,
+    PA.MonthlyRank,
+    PA.DaysSinceLastActivity,
+    PA.TagCount,
+    PA.DuplicateLinkCountToOtherPosts,
+    PA.DuplicateLinkCountFromOtherPosts,
+    PEA.TotalContentEdits,
+    PEA.LastContentEditDate,
+    PEA.LastMajorStatusDescription AS ContentStatus,
+    PEA.ClosureReasonsConcatenated,
+    PEA.AvgBodyEditIntervalSeconds,
+    PEA.DuplicateOriginalQuestionIdsJson,
+    VBP.UpvotesReceived,
+    VBP.DownvotesReceived,
+    VBP.AcceptedAnswerVotes,
+    VBP.OffensiveOrSpamVotes,
+    VBP.NetVoteQuintile,
+    VBP.AvgVoteAgeDays,
+    (CAST(US.Reputation AS DECIMAL) / 1000 * 0.5) +
+    COALESCE((CAST(PA.Score AS DECIMAL) / NULLIF(PA.ViewCount, 0) * 100), 0) * 0.3 +
+    (COALESCE(PA.FavoriteCount, 0) + COALESCE(PA.AnswerCount, 0)) * 0.2
+    AS CalculatedContentInfluenceScore,
+    ARRAY_TO_STRING(
+        ARRAY(
+            SELECT REPLACE(REPLACE(TRIM(t.tag), '&lt;', '<'), '&gt;', '>')
+            FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(PA.Tags FROM 2 FOR LENGTH(PA.Tags) - 2), '><')) AS t(tag)
+            WHERE LENGTH(t.tag) > 3 AND NOT (LOWER(t.tag) LIKE 'c-%' OR LOWER(t.tag) LIKE '%-language')
+        ), '; '
+    ) AS CleanedAndFilteredTags,
+    EXISTS (
+        SELECT 1
+        FROM Badges B_inner
+        WHERE B_inner.UserId = US.UserId
+          AND B_inner.Class = 1
+          AND B_inner.TagBased = TRUE
+          AND PA.Tags LIKE '%' || '<' || B_inner.Name || '>' || '%'
+    ) AS OwnerHasRelevantGoldTagBadge,
+    (
+        SELECT SUM(C_owner.Score)
+        FROM Comments C_owner
+        WHERE C_owner.PostId = PA.PostId AND C_owner.UserId = US.UserId
+    ) AS OwnerCommentsScoreOnPost,
+    NULLIF(
+        (SELECT SUM(V_bounty.BountyAmount) FROM Votes V_bounty WHERE V_bounty.PostId = PA.PostId AND V_bounty.VoteTypeId = 8),
+        0
+    ) AS TotalBountyPostedForQuestion,
+    COALESCE(
+        CASE
+            WHEN US.WebsiteUrl IS NOT NULL AND POSITION('github.com' IN LOWER(US.WebsiteUrl)) > 0 THEN 'GitHub Profile Present'
+            WHEN US.WebsiteUrl IS NOT NULL THEN 'Other Website Present'
+            ELSE NULL
+        END, 'No Website Info'
+    ) AS UserWebsiteDetail,
+    EXTRACT(DAY FROM (PA.PostCreationDate - LAG(PA.PostCreationDate, 1, US.CreationDate) OVER (PARTITION BY US.UserId ORDER BY PA.PostCreationDate))) AS DaysSincePreviousPostByOwner,
+    CASE
+        WHEN PA.PostTypeId = 1 AND PA.Score > 200 AND PA.AnswerCount > 10 AND PA.FavoriteCount > 50 THEN 'Highly Valued Question'
+        WHEN PA.PostTypeId = 1 AND PA.ClosedDate IS NOT NULL AND PEA.DuplicateOriginalQuestionIdsJson IS NOT NULL THEN 'Closed Duplicate Question'
+        WHEN PA.PostTypeId = 2 AND VBP.AcceptedAnswerVotes > 0 AND PA.Score > 50 THEN 'Accepted High-Score Answer'
+        WHEN PA.LastEditDate IS NOT NULL AND PA.LastEditDate > PA.CreationDate + INTERVAL '1 year' AND PEA.TotalContentEdits > 5 THEN 'Long-Lived & Actively Maintained Content'
+        ELSE 'General Active Content'
+    END AS ContentEngagementCategory
+FROM UserStats US
+INNER JOIN PostActivity PA ON US.UserId = PA.OwnerUserId
+LEFT JOIN Users U_Editor ON PA.LastEditorUserId = U_Editor.Id
+LEFT JOIN PostEditAndStatusAnalysis PEA ON PA.PostId = PEA.PostId
+LEFT JOIN VoteBehaviorPerPost VBP ON PA.PostId = VBP.PostId
+WHERE
+    PA.MonthlyRank <= 10
+    AND PA.DaysSinceLastActivity < 365
+    AND US.TotalPostsOwned > 50
+    AND US.CommentsWritten > 100
+    AND (
+        (PA.PostTypeId = 1 AND PA.ViewCount > 10000 AND PA.Score > 50)
+        OR
+        (PA.PostTypeId = 2 AND PA.Score > 30 AND VBP.AcceptedAnswerVotes > 0)
+    )
+ORDER BY CalculatedContentInfluenceScore DESC, US.Reputation DESC, PA.PostCreationDate DESC
+LIMIT 200;

@@ -1,0 +1,155 @@
+WITH UserEngagementMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.DisplayName,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScoreReceived,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScoreReceived,
+        MAX(p.LastActivityDate) AS LatestPostActivityDate,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        (u.Reputation * 0.15 + u.UpVotes - u.DownVotes + COUNT(DISTINCT p.Id) * 3 + COUNT(DISTINCT c.Id) * 1.5) AS DerivedUserActivityScore,
+        CASE WHEN u.DownVotes = 0 THEN NULL ELSE (u.UpVotes * 1.0 / u.DownVotes) END AS UpvoteDownvoteRatio
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+PostDetailStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.Body AS PostBodyExcerpt,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        p.LastEditDate,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerPostId,
+        (SELECT COUNT(pl_linked.Id) FROM PostLinks pl_linked WHERE pl_linked.PostId = p.Id AND pl_linked.LinkTypeId = 1) AS CountLinkedPosts,
+        (SELECT COUNT(pl_dup.Id) FROM PostLinks pl_dup WHERE pl_dup.PostId = p.Id AND pl_dup.LinkTypeId = 3) AS CountDuplicateLinks,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL AND EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10 AND ph.Comment = '101') THEN 'Closed_Duplicate'
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed_OtherReason'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question_AcceptedAnswer'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Question_Answered'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'Question_Unanswered'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'OtherPostType'
+        END AS PostLifecycleStatus,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostScoreRankByPostType,
+        LOWER(SPLIT_PART(REPLACE(REPLACE(COALESCE(p.Tags, ''), '><', '|'), '<', ''), '|', 1)) AS PrimaryTag,
+        CASE WHEN p.Tags IS NOT NULL AND (p.Tags LIKE '%<sql>%' OR p.Tags LIKE '%<SQL>%') THEN TRUE ELSE FALSE END AS ContainsSqlTag
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId IN (1, 2)
+        AND (p.DeletionDate IS NULL OR p.DeletionDate IS NOT DISTINCT FROM NULL)
+),
+BadgeAchievementInfo AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date AS BadgeAwardDate,
+        b.Class AS BadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn,
+        COUNT(b.Id) OVER (PARTITION BY b.UserId) AS TotalBadgesForUser
+    FROM
+        Badges b
+    WHERE
+        b.Class IN (1, 2)
+        AND b.Date >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+),
+FrequentCommenters AS (
+    SELECT ue.UserId, ue.DisplayName, 'FrequentCommenter' AS UserTypeFlag
+    FROM UserEngagementMetrics ue
+    WHERE ue.TotalCommentsMade > (SELECT AVG(ue2.TotalCommentsMade) * 2 FROM UserEngagementMetrics ue2) 
+      AND ue.Reputation > 500
+
+    UNION ALL
+
+    SELECT u.Id AS UserId, u.DisplayName, 'HighReputationUser' AS UserTypeFlag
+    FROM Users u
+    WHERE u.Reputation > 10000
+)
+SELECT
+    uem.UserId,
+    uem.DisplayName,
+    uem.Reputation,
+    uem.UserCreationDate,
+    pds.PostId,
+    pds.Title,
+    pds.PostScore,
+    pds.ViewCount,
+    pds.PostLifecycleStatus,
+    pds.PostCreationDate,
+    uem.TotalPostsOwned,
+    uem.TotalCommentsMade,
+    pds.PrimaryTag,
+    pds.ContainsSqlTag,
+    bai.BadgeName AS RecentSignificantBadge,
+    bai.BadgeAwardDate,
+    bai.TotalBadgesForUser,
+    fc.UserTypeFlag AS UserCategorization,
+    (
+        SELECT pa.CreationDate
+        FROM Posts pa
+        WHERE pa.Id = pds.AcceptedAnswerPostId AND pds.AcceptedAnswerPostId != -1
+        LIMIT 1
+    ) AS AcceptedAnswerCreationDate,
+    AVG(CASE WHEN pds.PostTypeId = 1 THEN pds.PostScore END) OVER (PARTITION BY pds.PrimaryTag) AS AvgQuestionScoreForPrimaryTag,
+    COALESCE(
+        (CASE WHEN pds.FavoriteCount IS NULL THEN NULL ELSE NULLIF(pds.FavoriteCount, 0) END) * 0.5 +
+        (CASE WHEN pds.AnswerCount IS NULL THEN NULL ELSE NULLIF(pds.AnswerCount, 0) END) * 2.0 +
+        (CASE WHEN pds.ViewCount IS NULL OR pds.ViewCount = 0 THEN NULL ELSE (pds.PostScore * 1.0 / pds.ViewCount) * 100 END),
+        0.0
+    ) AS ContentQualityMetric,
+    DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - COALESCE(pds.LastEditDate, pds.PostCreationDate)) AS DaysSinceLastEditOrCreation,
+    CASE WHEN pds.LastEditDate IS NULL AND pds.OwnerUserId IS NOT NULL THEN 'NeverEditedByOwner' ELSE 'EditedByOwnerOrOther' END AS EditStatusByOwner,
+    LENGTH(pds.Title) AS TitleLength
+FROM
+    UserEngagementMetrics uem
+INNER JOIN
+    PostDetailStats pds ON uem.UserId = pds.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT bai_inner.BadgeName, bai_inner.BadgeAwardDate, bai_inner.TotalBadgesForUser
+    FROM BadgeAchievementInfo bai_inner
+    WHERE bai_inner.UserId = uem.UserId AND bai_inner.rn = 1
+    LIMIT 1
+) bai ON TRUE
+LEFT JOIN
+    FrequentCommenters fc ON uem.UserId = fc.UserId
+WHERE
+    uem.Reputation >= 500
+    AND pds.PostScore > 0
+    AND pds.ViewCount > 100
+    AND pds.PostScoreRankByPostType <= 50
+    AND EXISTS (
+        SELECT 1
+        FROM Comments c_high_rep
+        INNER JOIN Users u_high_rep ON c_high_rep.UserId = u_high_rep.Id
+        WHERE c_high_rep.PostId = pds.PostId AND u_high_rep.Reputation > 5000 AND c_high_rep.Score >= 1
+    )
+ORDER BY
+    uem.DerivedUserActivityScore DESC,
+    pds.PostCreationDate DESC,
+    ContentQualityMetric DESC
+LIMIT 1000;

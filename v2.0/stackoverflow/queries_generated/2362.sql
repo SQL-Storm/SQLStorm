@@ -1,0 +1,163 @@
+-- {"query": "2362.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1485} 
+with RecursiveBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class,
+        count(*) as BadgeCount
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, b.Class
+
+    union all
+
+    select
+        rbc.UserId,
+        rbc.DisplayName,
+        coalesce(rbc.Class, 0) + 1,
+        rbc.BadgeCount
+    from RecursiveBadgeCounts rbc
+    where rbc.Class < 3
+), 
+RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        row_number() over (
+            partition by p.OwnerUserId, p.PostTypeId 
+            order by p.Score desc, p.ViewCount desc, p.CreationDate asc
+        ) as PostRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+), 
+UserAnswerStats as (
+    select
+        a.OwnerUserId,
+        count(*) as TotalAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.Score > 5 then 1 else 0 end) as HighScoreAnswers,
+        max(a.CreationDate) as LastAnswerDate
+    from Posts a
+    where a.PostTypeId = 2 and a.OwnerUserId is not null
+    group by a.OwnerUserId
+), 
+UserQuestionStats as (
+    select
+        q.OwnerUserId,
+        count(*) as TotalQuestions,
+        avg(q.Score) as AvgQuestionScore,
+        sum(case when q.ViewCount > 1000 then 1 else 0 end) as PopularQuestions,
+        max(q.CreationDate) as LastQuestionDate
+    from Posts q
+    where q.PostTypeId = 1 and q.OwnerUserId is not null
+    group by q.OwnerUserId
+),
+TopTagsPerUser as (
+    select
+        u.Id as UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as TagName
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.Tags is not null
+),
+UserTopTagsCount as (
+    select
+        UserId,
+        TagName,
+        count(*) as UsageCount,
+        row_number() over (partition by UserId order by count(*) desc) as TagRank
+    from TopTagsPerUser
+    group by UserId, TagName
+),
+DuplicatesLinkedAnswers as (
+    select
+        pl.PostId as DuplicatePostId,
+        pl.RelatedPostId as OriginalPostId,
+        p1.OwnerUserId as DuplicateOwner,
+        p2.OwnerUserId as OriginalOwner,
+        pl.CreationDate as LinkDate
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 2
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 2
+    where pl.LinkTypeId = 3
+),
+UserCommentStats as (
+    select
+        c.UserId,
+        count(*) as TotalComments,
+        avg(c.Score) as AvgCommentScore,
+        count(distinct c.PostId) as PostsCommentedOn
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+UserActivityWindows as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.CreationDate,
+        u.LastAccessDate,
+        lag(u.LastAccessDate) over (partition by u.Id order by u.LastAccessDate) as PrevAccessDate,
+        extract(epoch from (u.LastAccessDate - lag(u.LastAccessDate) over (partition by u.Id order by u.LastAccessDate))) as AccessDeltaSeconds
+    from Users u
+    where u.LastAccessDate is not null
+),
+UserActiveGaps as (
+    select
+        UserId,
+        max(coalesce(AccessDeltaSeconds, 0)) as MaxIdleSeconds
+    from UserActivityWindows
+    group by UserId
+)
+
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    coalesce(ua.TotalAnswers, 0) as TotalAnswers,
+    round(coalesce(ua.AvgAnswerScore, 0)::numeric, 2) as AvgAnswerScore,
+    coalesce(ua.HighScoreAnswers, 0) as HighScoreAnswers,
+    coalesce(uq.TotalQuestions, 0) as TotalQuestions,
+    round(coalesce(uq.AvgQuestionScore, 0)::numeric, 2) as AvgQuestionScore,
+    coalesce(uq.PopularQuestions, 0) as PopularQuestions,
+    coalesce(uc.TotalComments, 0) as TotalComments,
+    round(coalesce(uc.AvgCommentScore, 0)::numeric, 2) as AvgCommentScore,
+    coalesce(utc.TagName, 'N/A') as TopTag,
+    coalesce(utc.UsageCount, 0) as TopTagUsage,
+    coalesce(dla.DuplicateOwner, -1) as HasDuplicatesInAnswers,
+    coalesce(uag.MaxIdleSeconds, 0) as LongestIdleSecondsBetweenAccesses,
+    -- String expression concatenating badges with class info
+    (select string_agg(b.Name || ' (' || 
+        case b.Class 
+            when 1 then 'Gold' 
+            when 2 then 'Silver' 
+            when 3 then 'Bronze' 
+            else 'Unknown' end || ')', ', ') 
+        from Badges b where b.UserId = u.Id) as BadgeSummary
+from Users u
+left join UserAnswerStats ua on ua.OwnerUserId = u.Id
+left join UserQuestionStats uq on uq.OwnerUserId = u.Id
+left join UserCommentStats uc on uc.UserId = u.Id
+left join UserTopTagsCount utc on utc.UserId = u.Id and utc.TagRank = 1
+left join duplicateslinkedAnswers dla on dla.DuplicateOwner = u.Id
+left join UserActiveGaps uag on uag.UserId = u.Id
+where u.Reputation > 1000
+  and (ua.TotalAnswers > 10 or uq.TotalQuestions > 10)
+  and (
+      exists (
+          select 1 
+          from Posts p 
+          where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.Score > 10 and p.Tags is not null
+            and lower(p.Title) like '%sql%'
+            and p.CreationDate > current_date - interval '1 year'
+      )
+      or
+      coalesce(uc.TotalComments, 0) > 5
+  )
+order by u.Reputation desc, TotalAnswers desc, TotalQuestions desc
+limit 100;

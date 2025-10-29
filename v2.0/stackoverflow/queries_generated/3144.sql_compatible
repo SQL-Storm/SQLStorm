@@ -1,0 +1,147 @@
+WITH UserAgg AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(u.LastAccessDate) AS LastSeen,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.LastAccessDate, u.Location
+),
+
+PostAgg AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScoreSum,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScoreSum,
+        MAX(p.CreationDate) AS MostRecentPost,
+        -- standard SQL: emulate STRING_AGG of distinct tags by aggregation after splitting is DB-specific.
+        -- Use LISTAGG as a generic function; if not supported, replace with appropriate function for the target DB.
+        LISTAGG(DISTINCT TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM tag)), ', ') WITHIN GROUP (ORDER BY tag) AS TagList
+    FROM (
+        SELECT p.*, TRIM(BOTH ' ' FROM tag) AS tag
+        FROM Posts p
+        CROSS JOIN LATERAL (
+            -- split tags like '<tag1><tag2>' into rows; generic dialects differ. Use regexp or string functions per DB.
+            -- Here we emulate by splitting on '><' and removing leading '<' and trailing '>'.
+            -- Replace this block with the target DB's string-split function if needed.
+            SELECT REGEXP_SUBSTR(p.Tags, '[^><]+', 1, seq) AS tag
+            FROM (
+                SELECT LEVEL AS seq FROM (SELECT 1 FROM dual) -- placeholder for generating sequence; may need adapting per dialect
+                CONNECT BY LEVEL <= 100
+            )
+            WHERE REGEXP_SUBSTR(p.Tags, '[^><]+', 1, seq) IS NOT NULL
+        ) s
+    ) p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+TagStats AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagUseCount,
+        COALESCE(e.ExcerptLength, 0) + COALESCE(w.WikiLength, 0) AS ContentSize,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN LATERAL (
+        SELECT LENGTH(p.Body) AS ExcerptLength
+        FROM Posts p
+        WHERE p.Id = t.ExcerptPostId
+        FETCH FIRST 1 ROWS ONLY
+    ) e ON true
+    LEFT JOIN LATERAL (
+        SELECT LENGTH(p.Body) AS WikiLength
+        FROM Posts p
+        WHERE p.Id = t.WikiPostId
+        FETCH FIRST 1 ROWS ONLY
+    ) w ON true
+    WHERE t.IsModeratorOnly = 0
+),
+
+RecentVotes AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        v.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS VoteRank
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3)
+),
+
+UsersWithPosts AS (
+    SELECT
+        ua.Id AS UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.NetVotes,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        COALESCE(pa.QuestionCount, 0) AS Questions,
+        COALESCE(pa.AnswerCount, 0) AS Answers,
+        COALESCE(pa.QuestionScoreSum, 0) AS QScore,
+        COALESCE(pa.AnswerScoreSum, 0) AS AScore,
+        pa.MostRecentPost,
+        pa.TagList,
+        CASE
+            WHEN ua.LocRank = 1 THEN 'TopInLocation'
+            WHEN ua.Reputation > 50000 THEN 'HighRep'
+            ELSE 'Regular'
+        END AS UserSegment,
+        EXISTS (
+            SELECT 1
+            FROM Posts p
+            WHERE p.OwnerUserId = ua.Id
+              AND p.CreationDate > ua.LastSeen - INTERVAL '30' DAY
+        ) AS RecentActivityFlag
+    FROM UserAgg ua
+    LEFT JOIN PostAgg pa ON pa.UserId = ua.Id
+    WHERE ua.Reputation IS NOT NULL
+),
+
+UsersNoPosts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        0 AS NetVotes,
+        0 AS GoldBadges,
+        0 AS SilverBadges,
+        0 AS BronzeBadges,
+        0 AS Questions,
+        0 AS Answers,
+        0 AS QScore,
+        0 AS AScore,
+        CAST(NULL AS TIMESTAMP) AS MostRecentPost,
+        CAST(NULL AS VARCHAR(1000)) AS TagList,
+        'NoPosts' AS UserSegment,
+        FALSE AS RecentActivityFlag
+    FROM Users u
+    WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+      AND u.Reputation IS NOT NULL
+)
+
+SELECT *
+FROM (
+    SELECT *
+    FROM UsersWithPosts
+    ORDER BY Reputation DESC
+    FETCH FIRST 100 ROWS ONLY
+) a
+UNION ALL
+SELECT *
+FROM (
+    SELECT *
+    FROM UsersNoPosts
+    ORDER BY Reputation DESC
+    FETCH FIRST 50 ROWS ONLY
+) b
+ORDER BY Reputation DESC;

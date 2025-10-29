@@ -1,0 +1,193 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.Id] AS Ancestors,
+        t.ExcerptPostId
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Ancestors || t2.Id,
+        t2.ExcerptPostId
+    FROM Tags t2
+    JOIN PostLinks pl ON pl.PostId = t2.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON pl.RelatedPostId = r.ExcerptPostId
+    WHERE NOT (t2.Id = ANY (r.Ancestors)) AND r.Level < 3
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p2.PostTypeId = 2 THEN p2.Id END) AS AnswersGiven,
+        COALESCE(SUM(vtUp.CountVotes), 0) AS TotalUpVotes,
+        COALESCE(SUM(vtDown.CountVotes), 0) AS TotalDownVotes,
+        COUNT(DISTINCT b.Id) AS BadgesCount,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS MaxQuestionScore,
+        MAX(CASE WHEN p2.PostTypeId = 2 THEN p2.Score END) AS MaxAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p2.PostTypeId = 2 THEN p2.Score END) AS AvgAnswerScore,
+        FIRST_VALUE(p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ASC) AS FirstPostDate,
+        LAST_VALUE(p.LastActivityDate) OVER (PARTITION BY u.Id ORDER BY p.LastActivityDate ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS LastPostActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CountVotes
+        FROM Votes v
+        WHERE v.VoteTypeId = 2
+        GROUP BY PostId
+    ) vtUp ON vtUp.PostId = p.Id OR vtUp.PostId = p2.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CountVotes
+        FROM Votes v
+        WHERE v.VoteTypeId = 3
+        GROUP BY PostId
+    ) vtDown ON vtDown.PostId = p.Id OR vtDown.PostId = p2.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostsEnriched AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.CreationDate END) AS LastEditDate,
+        COALESCE(pl.LinkedCount, 0) AS LinkedPostsCount,
+        COALESCE(pl.DuplicateCount, 0) AS DuplicatePostsCount,
+        CASE WHEN EXISTS (SELECT 1 FROM PostHistory ph2 WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId = 10) THEN 1 ELSE 0 END AS IsClosed
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(CASE WHEN LinkTypeId = 1 THEN 1 END) AS LinkedCount,
+            COUNT(CASE WHEN LinkTypeId = 3 THEN 1 END) AS DuplicateCount
+        FROM PostLinks
+        GROUP BY PostId
+    ) pl ON pl.PostId = p.Id
+    GROUP BY p.Id, p.PostTypeId, p.Title, p.CreationDate, p.OwnerUserId, p.Score, p.ViewCount, p.Tags, pl.LinkedCount, pl.DuplicateCount
+),
+TopUsersCTE AS (
+    SELECT
+        ups.UserId,
+        ups.DisplayName,
+        ups.QuestionsAsked,
+        ups.AnswersGiven,
+        ups.TotalUpVotes,
+        ups.TotalDownVotes,
+        ups.BadgesCount,
+        ups.MaxQuestionScore,
+        ups.MaxAnswerScore,
+        ups.AvgQuestionScore,
+        ups.AvgAnswerScore,
+        ups.FirstPostDate,
+        ups.LastPostActivity,
+        RANK() OVER (ORDER BY ups.TotalUpVotes DESC) AS RankByUpVotes,
+        RANK() OVER (ORDER BY ups.BadgesCount DESC, ups.TotalUpVotes DESC) AS RankByBadges
+    FROM UserPostStats ups
+    WHERE ups.QuestionsAsked > 10 AND ups.AnswersGiven > 20
+),
+UserPostTags AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        unnest(string_to_array(coalesce(p.Tags, ''), '><')) AS TagRaw
+    FROM PostsEnriched p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+UserTagAggregates AS (
+    SELECT
+        upt.UserId,
+        LOWER(TRIM(BOTH '<>' FROM upt.TagRaw)) AS TagName,
+        COUNT(*) AS TagUsageCount
+    FROM UserPostTags upt
+    GROUP BY upt.UserId, LOWER(TRIM(BOTH '<>' FROM upt.TagRaw))
+),
+UserFavoriteTag AS (
+    SELECT DISTINCT ON (uta.UserId)
+        uta.UserId,
+        uta.TagName,
+        uta.TagUsageCount
+    FROM UserTagAggregates uta
+    ORDER BY uta.UserId, uta.TagUsageCount DESC, uta.TagName
+),
+ComplexStats AS (
+    SELECT
+        tu.UserId,
+        tu.DisplayName,
+        tu.QuestionsAsked,
+        tu.AnswersGiven,
+        tu.TotalUpVotes,
+        tu.TotalDownVotes,
+        tu.BadgesCount,
+        tu.MaxQuestionScore,
+        tu.MaxAnswerScore,
+        tu.AvgQuestionScore,
+        tu.AvgAnswerScore,
+        tu.FirstPostDate,
+        tu.LastPostActivity,
+        uft.TagName AS FavoriteTag,
+        ROW_NUMBER() OVER (PARTITION BY uft.TagName ORDER BY tu.TotalUpVotes DESC) AS TagUserRank,
+        ('User ' || tu.DisplayName ||
+            ' asked ' || tu.QuestionsAsked || ' questions with avg score ' ||
+            COALESCE(CAST(ROUND(tu.AvgQuestionScore, 2) AS TEXT), 'N/A') ||
+            ' and answered ' || tu.AnswersGiven ||
+            ' posts with avg score ' || COALESCE(CAST(ROUND(tu.AvgAnswerScore, 2) AS TEXT), 'N/A') ||
+            '. Favorite tag: ' || COALESCE(uft.TagName, 'none') || '.'
+        ) AS SummaryString
+    FROM TopUsersCTE tu
+    LEFT JOIN UserFavoriteTag uft ON uft.UserId = tu.UserId
+)
+SELECT
+    cs.UserId,
+    cs.DisplayName,
+    cs.QuestionsAsked,
+    cs.AnswersGiven,
+    cs.TotalUpVotes,
+    cs.TotalDownVotes,
+    cs.BadgesCount,
+    cs.MaxQuestionScore,
+    cs.MaxAnswerScore,
+    cs.AvgQuestionScore,
+    cs.AvgAnswerScore,
+    cs.FirstPostDate,
+    cs.LastPostActivity,
+    cs.FavoriteTag,
+    cs.TagUserRank,
+    cs.SummaryString,
+    phs.Name AS MostFrequentPostHistoryType,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cs.UserId AND p.Score > 10) AS HighScorePostsCount,
+    (SELECT STRING_AGG(DISTINCT lt.Name, ', ') FROM PostLinks pl JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId WHERE pl.PostId IN (SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = cs.UserId) AND pl.CreationDate > cs.FirstPostDate) AS UserLinkTypes,
+    COALESCE((SELECT MAX(p3.Score) FROM Posts p3 WHERE p3.OwnerUserId = cs.UserId AND p3.CreationDate > cs.FirstPostDate + INTERVAL '365 days'), 0) AS MaxScoreAfterOneYear
+FROM ComplexStats cs
+LEFT JOIN (
+    SELECT
+        ph.PostHistoryTypeId,
+        p.OwnerUserId,
+        COUNT(*) AS CountHistory,
+        pht.Name
+    FROM PostHistory ph
+    JOIN Posts p ON p.Id = ph.PostId
+    JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    GROUP BY ph.PostHistoryTypeId, p.OwnerUserId, pht.Name
+) phs ON phs.OwnerUserId = cs.UserId
+WHERE cs.TagUserRank <= 5
+ORDER BY cs.TotalUpVotes DESC, cs.BadgesCount DESC, cs.UserId
+LIMIT 50;

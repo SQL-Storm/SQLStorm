@@ -1,0 +1,79 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.EmailHash,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.LastActivityDate) AS LastActiveDate,
+    MAX(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) AS MaxAnswersPerQuestion,
+    AVG(p.ViewCount) AS AvgViewsPerPost,
+    AVG(ph.Score) AS AvgCommentScore,
+    (
+        SELECT STRING_AGG(tg.TagName, ', ')
+        FROM Tags tg
+        WHERE tg.Id IN (
+            SELECT CAST(tag AS INTEGER)
+            FROM (
+                SELECT UNNEST(
+                    regexp_split_to_table(
+                        REGEXP_REPLACE(p2.Tags, '[<>]', ' ', 'g'),
+                        '\s+'
+                    )
+                ) AS tag
+                FROM Posts p2
+                WHERE p2.Tags IS NOT NULL
+                  AND p2.Id IN (
+                      SELECT pl.RelatedPostId
+                      FROM PostLinks pl
+                      WHERE pl.PostId = p2.Id
+                        AND pl.LinkTypeId = 3
+                  )
+            ) s
+        )
+    ) AS MostCommonDuplicateTags,
+    b.Name AS MostEarnedBadge,
+    b.Class AS BadgeClass,
+    b.Date AS BadgeEarnedDate
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (
+        SELECT ph.UserId, ph.Score
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10
+    ) ph ON u.Id = ph.UserId
+LEFT JOIN 
+    (
+        SELECT p.OwnerUserId, COUNT(v.PostId) AS VoteCount, MAX(v.PostId) AS PostId
+        FROM Posts p
+        LEFT JOIN Votes v ON p.Id = v.PostId
+        WHERE v.VoteTypeId IN (2, 3)
+        GROUP BY p.OwnerUserId
+    ) v ON u.Id = v.OwnerUserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.EmailHash,
+    b.Name,
+    b.Class,
+    b.Date,
+    ph.UserId,
+    ph.Score
+HAVING 
+    COUNT(DISTINCT v.PostId) > 100
+ORDER BY 
+    TotalPosts DESC, 
+    TotalVotes DESC;

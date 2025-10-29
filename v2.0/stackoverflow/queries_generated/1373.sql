@@ -1,0 +1,185 @@
+-- {"query": "1373.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2642} 
+
+WITH UserEngagementSummary AS (
+    -- CTE 1: Aggregates user activities, reputation tiers, and badge counts
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersProvided,
+        COALESCE(SUM(p.Score), 0) AS TotalPostsScoreReceived,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentsScoreReceived,
+        -- Calculate the reputation tier based on reputation score
+        CASE
+            WHEN u.Reputation >= 100000 THEN 'Legendary'
+            WHEN u.Reputation >= 25000 THEN 'Expert'
+            WHEN u.Reputation >= 5000 THEN 'Advanced'
+            WHEN u.Reputation >= 1000 THEN 'Intermediate'
+            ELSE 'Novice'
+        END AS ReputationTier,
+        -- Count gold badges using a correlated subquery
+        (SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1 AND b.Date >= u.CreationDate) AS GoldBadgesEarned,
+        -- Calculate average daily reputation gain since creation
+        NULLIF(u.Reputation * 1.0 / EXTRACT(EPOCH FROM (NOW() - u.CreationDate)) / (24*3600.0), 0) AS AvgDailyReputationGain
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostHistoricalMetrics AS (
+    -- CTE 2: Gathers latest relevant historical data for posts, including close/reopen dates
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate, -- Post Closed
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LastReopenedDate, -- Post Reopened
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (5, 6) THEN ph.CreationDate END) AS LastEditDate, -- Edit Body or Edit Tags
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (5, 6) THEN ph.UserId END) AS LastEditorUserId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (5, 6) THEN 1 END) AS TotalEditCount
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+QuestionAnswerDetails AS (
+    -- CTE 3: Provides specific details for questions and their associated answers
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.Body AS QuestionBody,
+        q.CreationDate AS QuestionCreationDate,
+        q.LastActivityDate AS QuestionLastActivityDate,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        q.AnswerCount AS QuestionAnswerCount,
+        q.FavoriteCount AS QuestionFavoriteCount,
+        q.ClosedDate AS QuestionClosedDate,
+        q.AcceptedAnswerId,
+        -- Parse tags into an array, handling potential NULL or empty tags
+        CASE
+            WHEN q.Tags IS NULL OR LENGTH(q.Tags) <= 2 THEN NULL
+            ELSE string_to_array(SUBSTRING(q.Tags FROM 2 FOR LENGTH(q.Tags) - 2), '><')
+        END AS ParsedTags,
+        (SELECT COUNT(DISTINCT c.Id) FROM Comments c WHERE c.PostId = q.Id AND c.Score >= 1) AS QuestionHighScoreCommentCount,
+        -- Average score of answers to this question
+        COALESCE((SELECT AVG(a.Score) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2), 0) AS AvgAnswerScore,
+        -- Count of unique users who provided an answer to this question
+        (SELECT COUNT(DISTINCT a.OwnerUserId) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL) AS UniqueAnswerersCount,
+        -- Latest answer creation date
+        (SELECT MAX(a.CreationDate) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS LatestAnswerDate,
+        -- Sum of bounty amounts (if any) for this question
+        COALESCE((SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 8), 0) AS TotalBountyAmount
+    FROM Posts q
+    WHERE q.PostTypeId = 1 -- Only questions
+)
+-- Main Query: Combines all CTEs to identify high-impact, actively managed questions and influential users
+SELECT
+    ues.UserId,
+    ues.DisplayName,
+    ues.Reputation,
+    ues.ReputationTier,
+    ues.GoldBadgesEarned,
+    qad.QuestionId,
+    qad.QuestionTitle,
+    qad.QuestionCreationDate,
+    qad.QuestionLastActivityDate,
+    qad.QuestionScore,
+    qad.QuestionViewCount,
+    qad.QuestionAnswerCount,
+    qad.QuestionHighScoreCommentCount,
+    qad.AvgAnswerScore,
+    qad.AcceptedAnswerId,
+    qad.TotalBountyAmount,
+    phm.LastClosedDate,
+    phm.LastReopenedDate,
+    phm.LastEditDate,
+    phm.LastEditorUserId,
+    phm.TotalEditCount,
+    COALESCE(ARRAY_LENGTH(qad.ParsedTags, 1), 0) AS NumberOfTags,
+    -- String expression: Concatenate display name and last access info, handling NULLs
+    COALESCE(ues.DisplayName, 'Unknown User') || ' (Last access: ' || TO_CHAR(ues.LastAccessDate, 'YYYY-MM-DD HH24:MI') || ')' AS UserAccessInfo,
+    -- Complex calculation: "Engagement Index" for the question
+    (
+        qad.QuestionScore * 3.0 +
+        COALESCE(qad.AvgAnswerScore, 0) * 2.0 +
+        qad.QuestionViewCount * 0.005 +
+        qad.QuestionAnswerCount * 1.5 +
+        qad.QuestionFavoriteCount * 4.0 +
+        qad.QuestionHighScoreCommentCount * 0.8 +
+        (qad.TotalBountyAmount / 10.0) + -- Convert bounty to a smaller score contribution
+        (phm.TotalEditCount * 0.5) + -- Edited questions get a small boost
+        CASE
+            WHEN qad.AcceptedAnswerId IS NOT NULL THEN 50 -- Major boost for accepted answer
+            ELSE 0
+        END +
+        -- Penalty for recently closed questions, bonus for reopened ones
+        CASE
+            WHEN phm.LastClosedDate IS NOT NULL AND phm.LastClosedDate > NOW() - INTERVAL '3 months' THEN -20
+            WHEN phm.LastReopenedDate IS NOT NULL AND phm.LastReopenedDate > NOW() - INTERVAL '6 months' THEN 30
+            ELSE 0
+        END
+    ) AS QuestionEngagementIndex,
+    -- Window function: Rank questions by their engagement index within the same 'ReputationTier'
+    RANK() OVER (
+        PARTITION BY ues.ReputationTier
+        ORDER BY (
+            qad.QuestionScore * 3.0 +
+            COALESCE(qad.AvgAnswerScore, 0) * 2.0 +
+            qad.QuestionViewCount * 0.005 +
+            qad.QuestionAnswerCount * 1.5 +
+            qad.QuestionFavoriteCount * 4.0 +
+            qad.QuestionHighScoreCommentCount * 0.8 +
+            (qad.TotalBountyAmount / 10.0) +
+            (phm.TotalEditCount * 0.5) +
+            CASE WHEN qad.AcceptedAnswerId IS NOT NULL THEN 50 ELSE 0 END +
+            CASE
+                WHEN phm.LastClosedDate IS NOT NULL AND phm.LastClosedDate > NOW() - INTERVAL '3 months' THEN -20
+                WHEN phm.LastReopenedDate IS NOT NULL AND phm.LastReopenedDate > NOW() - INTERVAL '6 months' THEN 30
+                ELSE 0
+            END
+        ) DESC, qad.QuestionCreationDate DESC
+    ) AS ReputationTierQuestionRank,
+    -- Correlated subquery: Determine if any answer to this question was provided by an 'Expert' user
+    EXISTS (
+        SELECT 1
+        FROM Posts a
+        JOIN UserEngagementSummary ans_ues ON a.OwnerUserId = ans_ues.UserId
+        WHERE a.ParentId = qad.QuestionId
+          AND a.PostTypeId = 2
+          AND ans_ues.ReputationTier = 'Expert'
+    ) AS HasExpertAnswerer,
+    -- String expression: Extract the first two tags (if available) and format them
+    COALESCE(
+        ARRAY_TO_STRING(
+            (SELECT ARRAY_AGG(tag) FROM UNNEST(qad.ParsedTags) AS tag LIMIT 2),
+            ' & '
+        ), 'No Primary Tags'
+    ) AS PrimaryTagsSummary
+FROM UserEngagementSummary ues
+JOIN QuestionAnswerDetails qad ON ues.UserId = qad.QuestionOwnerId
+LEFT JOIN PostHistoricalMetrics phm ON qad.QuestionId = phm.PostId
+LEFT JOIN Users last_editor ON phm.LastEditorUserId = last_editor.Id -- Join to get last editor's display name if needed
+WHERE
+    ues.Reputation >= 1000 -- Focus on more established users
+    AND ues.TotalQuestionsAsked >= 3 -- Users who have asked a few questions
+    AND qad.QuestionViewCount > 5000 -- Questions with significant visibility
+    AND qad.QuestionScore > 15 -- Highly upvoted questions
+    AND qad.QuestionAnswerCount >= 2 -- Questions with multiple answers
+    AND qad.LatestAnswerDate IS NOT NULL AND qad.LatestAnswerDate > NOW() - INTERVAL '2 years' -- Recently active questions
+    -- Complex string predicate: Search for keywords in title or body, or specific tags
+    AND (
+        qad.QuestionTitle ILIKE '%database%' OR qad.QuestionTitle ILIKE '%sql%' OR
+        qad.QuestionBody ILIKE '%performance%' OR qad.QuestionBody ILIKE '%optimization%' OR
+        EXISTS (SELECT 1 FROM UNNEST(qad.ParsedTags) AS tag WHERE tag ILIKE 'performance' OR tag ILIKE 'sql-server')
+    )
+ORDER BY
+    QuestionEngagementIndex DESC,
+    ues.Reputation DESC,
+    qad.QuestionCreationDate DESC
+LIMIT 200;

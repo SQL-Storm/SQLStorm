@@ -1,0 +1,122 @@
+-- {"query": "3303.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2207} 
+WITH
+    q AS (
+        SELECT
+            p.Id                         AS QuestionId,
+            p.Title,
+            p.OwnerUserId,
+            p.CreationDate,
+            p.Score                      AS QuestionScore,
+            p.Tags,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+    top_questions AS (
+        SELECT *
+        FROM q
+        WHERE rn <= 5
+    ),
+    answer_stats AS (
+        SELECT
+            a.ParentId                                   AS QuestionId,
+            COUNT(*) FILTER (WHERE a.Score > 0)          AS PositiveAnswers,
+            COUNT(*) FILTER (WHERE a.Score <= 0)         AS NonPositiveAnswers,
+            MAX(a.Score)                                 AS MaxAnswerScore,
+            AVG(a.Score)::numeric(10,2)                  AS AvgAnswerScore
+        FROM Posts a
+        WHERE a.PostTypeId = 2
+        GROUP BY a.ParentId
+    ),
+    user_badges AS (
+        SELECT
+            b.UserId,
+            COUNT(*) FILTER (WHERE b.Class = 1)          AS GoldBadges,
+            COUNT(*) FILTER (WHERE b.Class = 2)          AS SilverBadges,
+            COUNT(*) FILTER (WHERE b.Class = 3)          AS BronzeBadges,
+            STRING_AGG(DISTINCT b.Name, ', ')            AS BadgeList
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    recent_votes AS (
+        SELECT
+            v.PostId,
+            SUM(CASE
+                    WHEN v.VoteTypeId = 2 THEN 1
+                    WHEN v.VoteTypeId = 3 THEN -1
+                    ELSE 0
+                END)                                      AS NetScore,
+            MAX(v.CreationDate)                          AS LastVoteDate
+        FROM Votes v
+        WHERE v.VoteTypeId IN (2,3)
+        GROUP BY v.PostId
+    )
+SELECT
+    tq.QuestionId,
+    tq.Title,
+    COALESCE(u.DisplayName, 'Anonymous')                AS OwnerDisplayName,
+    tq.QuestionScore,
+    tq.Tags,
+    COALESCE(ab.PositiveAnswers,0)                      AS PositiveAnswers,
+    COALESCE(ab.NonPositiveAnswers,0)                   AS NonPositiveAnswers,
+    ab.MaxAnswerScore,
+    ab.AvgAnswerScore,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.BadgeList,
+    rv.NetScore                                         AS QuestionNetVoteScore,
+    rv.LastVoteDate,
+    (SELECT COUNT(*)
+        FROM PostLinks pl
+        WHERE pl.LinkTypeId = 3
+          AND pl.RelatedPostId = tq.QuestionId)          AS DuplicateLinkCount,
+    RANK() OVER (ORDER BY
+                 (tq.QuestionScore
+                  + COALESCE(rv.NetScore,0)
+                  + COALESCE(ab.AvgAnswerScore,0)) DESC) AS ActivityRank,
+    COALESCE(
+        (SELECT split_part(trim(both '<>' FROM tq.Tags), '><', 1)),
+        'no-tag')                                        AS PrimaryTag,
+    CASE
+        WHEN tq.ClosedDate IS NOT NULL          THEN 'Closed'
+        WHEN tq.CommunityOwnedDate IS NOT NULL  THEN 'Community Owned'
+        ELSE 'Open'
+    END                                                AS Status
+FROM top_questions tq
+LEFT JOIN Users u         ON u.Id = tq.OwnerUserId
+LEFT JOIN answer_stats ab ON ab.QuestionId = tq.QuestionId
+LEFT JOIN user_badges ub  ON ub.UserId = tq.OwnerUserId
+LEFT JOIN recent_votes rv ON rv.PostId = tq.QuestionId
+
+UNION ALL
+
+SELECT
+    p.Id,
+    p.Title,
+    COALESCE(u.DisplayName, 'Anonymous')                AS OwnerDisplayName,
+    p.Score,
+    p.Tags,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    CASE
+        WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN p.PostTypeId = 5 THEN 'TagWiki'
+        ELSE 'Other'
+    END                                                AS Status
+FROM Posts p
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+WHERE p.PostTypeId IN (4,5)
+  AND p.CreationDate > (cast('2024-10-01' as date) - INTERVAL '30 days')
+
+ORDER BY ActivityRank ASC NULLS LAST, QuestionId;

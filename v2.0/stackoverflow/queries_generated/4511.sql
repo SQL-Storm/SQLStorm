@@ -1,0 +1,204 @@
+-- {"query": "4511.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2116} 
+
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS AnswerId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.Score,
+      p.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 2
+  ),
+  TopAnswersPerQuestion AS (
+    SELECT
+      AnswerId,
+      QuestionId,
+      OwnerUserId,
+      Score,
+      CreationDate
+    FROM RankedAnswers
+    WHERE
+      rn = 1
+  ),
+  UserQuestionStats AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT q.Id) AS TotalQuestions,
+      SUM(CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+      AVG(CAST(q.AnswerCount AS DECIMAL(10, 2))) AS AvgAnswersPerQuestion,
+      MAX(q.FavoriteCount) AS MaxFavoritesOnQuestion
+    FROM Users AS u
+    LEFT OUTER JOIN Posts AS q
+      ON u.Id = q.OwnerUserId AND q.PostTypeId = 1
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  UserAnswerStats AS (
+    SELECT
+      u.Id AS UserId,
+      COUNT(DISTINCT a.Id) AS TotalAnswers,
+      SUM(a.Score) AS TotalAnswerScore,
+      AVG(CAST(a.Score AS DECIMAL(10, 2))) AS AvgAnswerScore
+    FROM Users AS u
+    LEFT OUTER JOIN Posts AS a
+      ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    GROUP BY
+      u.Id
+  ),
+  UserVoteStats AS (
+    SELECT
+      u.Id AS UserId,
+      COUNT(CASE WHEN v.VoteTypeId = 2 THEN v.Id ELSE NULL END) AS UpVotesGiven,
+      COUNT(CASE WHEN v.VoteTypeId = 3 THEN v.Id ELSE NULL END) AS DownVotesGiven
+    FROM Users AS u
+    LEFT OUTER JOIN Votes AS v
+      ON u.Id = v.UserId
+    GROUP BY
+      u.Id
+  ),
+  UserBadgeCounts AS (
+    SELECT
+      b.UserId,
+      COUNT(CASE WHEN b.Class = 1 THEN b.Id ELSE NULL END) AS GoldBadges,
+      COUNT(CASE WHEN b.Class = 2 THEN b.Id ELSE NULL END) AS SilverBadges,
+      COUNT(CASE WHEN b.Class = 3 THEN b.Id ELSE NULL END) AS BronzeBadges
+    FROM Badges AS b
+    GROUP BY
+      b.UserId
+  ),
+  PostTagCounts AS (
+    SELECT
+      p.Id AS PostId,
+      p.Tags,
+      LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', '')) + 1 AS NumberOfTags
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 1 AND p.Tags IS NOT NULL
+  ),
+  QuestionsWithHighReputationOwner AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.OwnerUserId,
+      u.Reputation
+    FROM Posts AS q
+    JOIN Users AS u
+      ON q.OwnerUserId = u.Id
+    WHERE
+      q.PostTypeId = 1 AND u.Reputation > 100000
+  )
+SELECT
+  uqs.DisplayName,
+  uqs.TotalQuestions,
+  uas.TotalAnswers,
+  CASE
+    WHEN uqs.AcceptedAnswersCount IS NULL THEN 0
+    ELSE uqs.AcceptedAnswersCount
+  END AS AcceptedAnswers,
+  COALESCE(uas.TotalAnswerScore, 0) AS TotalAnswerScore,
+  COALESCE(uas.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+  COALESCE(uvs.UpVotesGiven, 0) AS UpVotesGiven,
+  COALESCE(uvs.DownVotesGiven, 0) AS DownVotesGiven,
+  COALESCE(ubc.GoldBadges, 0) AS GoldBadges,
+  COALESCE(ubc.SilverBadges, 0) AS SilverBadges,
+  COALESCE(ubc.BronzeBadges, 0) AS BronzeBadges,
+  uqs.MaxFavoritesOnQuestion,
+  COALESCE(ptc.NumberOfTags, 0) AS NumberOfTagsOnQuestion,
+  COUNT(DISTINCT pth.Id) AS PostHistoryEntries,
+  SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15) THEN 1 ELSE 0 END) AS ModerationHistoryEntries,
+  qwhr.Reputation AS OwnerReputationForHighRepQuestions,
+  ta.Score AS TopAnswerScore,
+  ta.CreationDate AS TopAnswerDate,
+  CASE
+    WHEN LOWER(uqs.DisplayName) LIKE '%john%' THEN 'Contains John'
+    WHEN LOWER(uqs.DisplayName) LIKE '%doe%' THEN 'Contains Doe'
+    ELSE 'Neither John nor Doe'
+  END AS NameCategory,
+  CASE
+    WHEN u.CreationDate < '2010-01-01' AND u.Views > 1000000 THEN 'Early Power User'
+    WHEN u.CreationDate >= '2020-01-01' AND u.Reputation > 50000 THEN 'Recent High Rep'
+    ELSE 'Standard User'
+  END AS UserTier
+FROM Users AS u
+LEFT OUTER JOIN UserQuestionStats AS uqs
+  ON u.Id = uqs.UserId
+LEFT OUTER JOIN UserAnswerStats AS uas
+  ON u.Id = uas.UserId
+LEFT OUTER JOIN UserVoteStats AS uvs
+  ON u.Id = uvs.UserId
+LEFT OUTER JOIN UserBadgeCounts AS ubc
+  ON u.Id = ubc.UserId
+LEFT OUTER JOIN PostTagCounts AS ptc
+  ON u.Id = (
+    SELECT
+      OwnerUserId
+    FROM Posts AS p
+    WHERE
+      p.Id = ptc.PostId AND p.PostTypeId = 1
+  )
+LEFT OUTER JOIN QuestionsWithHighReputationOwner AS qwhr
+  ON u.Id = qwhr.OwnerUserId
+LEFT OUTER JOIN TopAnswersPerQuestion AS ta
+  ON u.Id = ta.OwnerUserId
+LEFT OUTER JOIN PostHistory AS ph
+  ON u.Id = ph.UserId
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  uqs.TotalQuestions,
+  uas.TotalAnswers,
+  uqs.AcceptedAnswersCount,
+  uas.TotalAnswerScore,
+  uas.AvgAnswerScore,
+  uvs.UpVotesGiven,
+  uvs.DownVotesGiven,
+  ubc.GoldBadges,
+  ubc.SilverBadges,
+  ubc.BronzeBadges,
+  uqs.MaxFavoritesOnQuestion,
+  ptc.NumberOfTags,
+  qwhr.Reputation,
+  ta.Score,
+  ta.CreationDate,
+  u.CreationDate,
+  u.Reputation,
+  u.Views
+HAVING
+  COUNT(DISTINCT ph.Id) > 5 OR COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15) THEN ph.Id ELSE NULL END) > 2
+UNION ALL
+SELECT
+  'Community User' AS DisplayName,
+  COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+  COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+  0 AS AcceptedAnswers,
+  SUM(p.Score) AS TotalAnswerScore,
+  AVG(CAST(p.Score AS DECIMAL(10, 2))) AS AvgAnswerScore,
+  0 AS UpVotesGiven,
+  0 AS DownVotesGiven,
+  0 AS GoldBadges,
+  0 AS SilverBadges,
+  0 AS BronzeBadges,
+  MAX(p.FavoriteCount) AS MaxFavoritesOnQuestion,
+  COALESCE(COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Tags ELSE NULL END), 0) AS NumberOfTagsOnQuestion,
+  COUNT(DISTINCT ph.Id) AS PostHistoryEntries,
+  SUM(CASE WHEN ph.PostHistoryTypeId IN (16, 50) THEN 1 ELSE 0 END) AS ModerationHistoryEntries,
+  NULL AS OwnerReputationForHighRepQuestions,
+  NULL AS TopAnswerScore,
+  NULL AS TopAnswerDate,
+  'Community Tier' AS NameCategory,
+  'Community Tier' AS UserTier
+FROM Posts AS p
+LEFT OUTER JOIN PostHistory AS ph
+  ON p.Id = ph.PostId AND ph.UserId IS NULL AND ph.UserDisplayName = 'Community'
+WHERE
+  p.OwnerUserId = -1 OR p.OwnerDisplayName = 'Community'
+GROUP BY
+  p.OwnerUserId,
+  p.OwnerDisplayName
+HAVING
+  COUNT(DISTINCT ph.Id) > 10;

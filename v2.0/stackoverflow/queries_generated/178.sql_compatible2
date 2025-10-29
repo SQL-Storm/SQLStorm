@@ -1,0 +1,314 @@
+with
+q as (
+    select p.Id as QuestionId,
+           p.Title,
+           p.OwnerUserId,
+           p.CreationDate,
+           p.Score,
+           p.ViewCount,
+           p.Tags,
+           coalesce(p.AnswerCount, 0) as AnswerCount
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= (select date_trunc('month', max(CreationDate)) - interval '24 months' from Posts where PostTypeId = 1)
+),
+a as (
+    select a.ParentId as QuestionId,
+           a.Id as AnswerId,
+           a.OwnerUserId as AnswerOwnerId,
+           a.Score as AnswerScore,
+           a.CreationDate as AnswerCreationDate
+    from Posts a
+    where a.PostTypeId = 2
+),
+user_activity as (
+    select u.Id as UserId,
+           u.Reputation,
+           u.CreationDate as UserCreated,
+           u.DisplayName,
+           u.Location,
+           u.UpVotes,
+           u.DownVotes,
+           u.Views as ProfileViews,
+           coalesce((
+             select count(*) from Badges b where b.UserId = u.Id and b.Class = 1
+           ),0) as GoldBadges,
+           coalesce((
+             select count(*) from Badges b where b.UserId = u.Id and b.Class = 2
+           ),0) as SilverBadges,
+           coalesce((
+             select count(*) from Badges b where b.UserId = u.Id and b.Class = 3
+           ),0) as BronzeBadges
+    from Users u
+),
+question_votes as (
+    select v.PostId as QuestionId,
+           sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end) as NetVotes,
+           sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+           sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountySum
+    from Votes v
+    group by v.PostId
+),
+comment_stats as (
+    select c.PostId,
+           count(*) as CommentCount,
+           max(c.Score) as MaxCommentScore,
+           avg(c.Score) as AvgCommentScore
+    from Comments c
+    group by c.PostId
+),
+accepted as (
+    select p.Id as AnswerId, p.ParentId as QuestionId
+    from Posts p
+    where p.PostTypeId = 2
+      and exists (
+        select 1
+        from Posts q2
+        where q2.Id = p.ParentId
+          and q2.AcceptedAnswerId = p.Id
+      )
+),
+tag_norm as (
+    select q.QuestionId,
+           unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) as tag
+    from q
+    where q.Tags is not null and length(q.Tags) > 2
+),
+top_tags as (
+    select tag,
+           count(*) as tag_q_count,
+           row_number() over (order by count(*) desc, tag) as tag_rank
+    from tag_norm
+    group by tag
+),
+question_edit_events as (
+    select ph.PostId as QuestionId,
+           sum(case when ph.PostHistoryTypeId in (4,5,6) then 1 else 0 end) as EditEvents,
+           max(ph.CreationDate) as LastEditEventAt,
+           sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVotesEvents
+    from PostHistory ph
+    group by ph.PostId
+),
+duplicates as (
+    select pl.PostId as DuplicateId,
+           pl.RelatedPostId as OriginalId,
+           min(pl.CreationDate) as FirstDupLinkAt
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId, pl.RelatedPostId
+),
+linked as (
+    select pl.PostId,
+           count(*) filter (where pl.LinkTypeId = 1) as LinkedCount,
+           count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinkCount
+    from PostLinks pl
+    group by pl.PostId
+),
+answerer_rank as (
+    select
+      a.QuestionId,
+      a.AnswerId,
+      a.AnswerOwnerId,
+      a.AnswerScore,
+      row_number() over (partition by a.QuestionId order by a.AnswerScore desc nulls last, a.AnswerId) as AnswerScoreRank,
+      dense_rank() over (partition by a.QuestionId order by a.AnswerScore desc nulls last) as DenseAnswerRank,
+      count(*) over (partition by a.QuestionId) as TotalAnswers
+    from a
+),
+question_summary as (
+    select
+      q.QuestionId,
+      q.Title,
+      q.OwnerUserId,
+      q.CreationDate,
+      q.Score,
+      q.ViewCount,
+      q.AnswerCount,
+      q.Tags,
+      coalesce(qv.NetVotes, 0) as NetVotes,
+      coalesce(qv.Favorites, 0) as Favorites,
+      coalesce(qv.BountySum, 0) as BountySum,
+      coalesce(cs.CommentCount, 0) as CommentCount,
+      coalesce(cs.MaxCommentScore, 0) as MaxCommentScore,
+      coalesce(cs.AvgCommentScore, 0.0) as AvgCommentScore,
+      coalesce(qe.EditEvents, 0) as EditEvents,
+      qe.LastEditEventAt,
+      coalesce(qe.CloseVotesEvents, 0) as CloseVotesEvents,
+      coalesce(lk.LinkedCount, 0) as LinkedCount,
+      coalesce(lk.DuplicateLinkCount, 0) as DuplicateLinkCount,
+      case when d.OriginalId is not null then 1 else 0 end as IsMarkedDuplicate
+    from q
+    left join question_votes qv on qv.QuestionId = q.QuestionId
+    left join comment_stats cs on cs.PostId = q.QuestionId
+    left join question_edit_events qe on qe.QuestionId = q.QuestionId
+    left join duplicates d on d.DuplicateId = q.QuestionId
+    left join linked lk on lk.PostId = q.QuestionId
+),
+owner_metrics as (
+    select
+      qs.QuestionId,
+      ua.UserId,
+      ua.Reputation,
+      ua.UpVotes,
+      ua.DownVotes,
+      ua.ProfileViews,
+      ua.GoldBadges,
+      ua.SilverBadges,
+      ua.BronzeBadges,
+      (ua.UpVotes - ua.DownVotes) as NetUserVotes,
+      case when ua.Reputation >= 20000 then 'legend'
+           when ua.Reputation >= 10000 then 'guru'
+           when ua.Reputation >= 3000 then 'pro'
+           when ua.Reputation >= 1000 then 'intermediate'
+           when ua.Reputation is null then 'unknown'
+           else 'novice' end as RepTier
+    from question_summary qs
+    left join user_activity ua on ua.UserId = qs.OwnerUserId
+),
+pct_calcs as (
+    select
+      qs.QuestionId,
+      case when qs.ViewCount > 0 then round( (cast(qs.Score as numeric) / qs.ViewCount) * 100000, 2) else null end as ScorePer100kViews,
+      case when qs.ViewCount > 0 then round( (cast(qs.Favorites as numeric) / qs.ViewCount) * 100000, 2) else null end as FavoritesPer100kViews,
+      case when qs.AnswerCount > 0 then round( (coalesce(qs.BountySum,0) / qs.AnswerCount)::numeric, 2) else null end as AvgBountyPerAnswer,
+      case when qs.CommentCount > 0 then round( (cast(qs.MaxCommentScore as numeric) / qs.CommentCount), 3) else null end as MaxCommentPctOfComments
+    from question_summary qs
+),
+rankings as (
+    select
+      qs.QuestionId,
+      row_number() over (order by qs.Score desc nulls last, qs.ViewCount desc) as RankByScore,
+      row_number() over (order by coalesce(qs.ViewCount,0) desc nulls last, qs.Score desc) as RankByViews,
+      percent_rank() over (order by coalesce(qs.ViewCount,0)) as ViewPercentile,
+      ntile(10) over (order by coalesce(qs.Score, -2147483648)) as ScoreDecile
+    from question_summary qs
+),
+tag_focus as (
+    select
+      tn.tag,
+      qs.QuestionId,
+      count(*) over (partition by tn.tag) as QuestionsWithTag,
+      dense_rank() over (partition by tn.tag order by qs.Score desc nulls last, qs.ViewCount desc) as RankInTagByScore
+    from tag_norm tn
+    join question_summary qs on qs.QuestionId = tn.QuestionId
+    where tn.tag in (select tag from top_tags where tag_rank <= 50)
+),
+best_answerers as (
+    select
+      ar.QuestionId,
+      ar.AnswerId,
+      ar.AnswerOwnerId,
+      ar.AnswerScore,
+      ar.AnswerScoreRank,
+      ar.TotalAnswers,
+      case when ac.AnswerId is not null then 1 else 0 end as IsAccepted
+    from answerer_rank ar
+    left join accepted ac on ac.AnswerId = ar.AnswerId
+    where ar.AnswerScoreRank <= 3
+),
+string_features as (
+    select
+      qs.QuestionId,
+      length(coalesce(qs.Title,'')) as TitleLen,
+      case when position('?' in coalesce(qs.Title,'')) > 0 then 1 else 0 end as HasQuestionMark,
+      case when position('how' in lower(coalesce(qs.Title,''))) > 0 then 1 else 0 end as MentionsHow,
+      case when (select count(*) from regexp_matches(coalesce(qs.Title,''), '[A-Z]{2,}')) > 0 then 1 else 0 end as HasAcronym
+    from question_summary qs
+),
+null_logic as (
+    select
+      qs.QuestionId,
+      coalesce(nullif(trim(qs.Tags), ''), '[untagged]') as NormalizedTags,
+      case when qs.LastEditEventAt is null and qs.EditEvents > 0 then 'inconsistent'
+           when qs.LastEditEventAt is null then 'no-edits'
+           else 'edited' end as EditState
+    from question_summary qs
+),
+final_scores as (
+    select
+      qs.QuestionId,
+      round(
+           0.40 * coalesce(qs.Score,0)
+         + 0.25 * ln(greatest(coalesce(qs.ViewCount,0)+1, 1))
+         + 0.15 * coalesce(qs.Favorites,0)
+         + 0.05 * coalesce(qs.LinkedCount,0)
+         + 0.05 * coalesce(qs.CommentCount,0)
+         + 0.05 * case when qs.IsMarkedDuplicate = 1 then -10 else 0 end
+         + 0.05 * case when qs.BountySum > 0 then 5 else 0 end
+      , 3) as CompositeScore
+    from question_summary qs
+)
+select
+  qs.QuestionId,
+  qs.Title,
+  qs.Score,
+  qs.ViewCount,
+  qs.AnswerCount,
+  qs.Tags,
+  om.RepTier,
+  om.Reputation,
+  om.NetUserVotes,
+  om.GoldBadges,
+  om.SilverBadges,
+  om.BronzeBadges,
+  qs.NetVotes,
+  qs.Favorites,
+  qs.BountySum,
+  qs.CommentCount,
+  qs.MaxCommentScore,
+  round(cast(qs.AvgCommentScore as numeric), 2) as AvgCommentScore,
+  qs.EditEvents,
+  qs.CloseVotesEvents,
+  qs.LinkedCount,
+  qs.DuplicateLinkCount,
+  qs.IsMarkedDuplicate,
+  pc.ScorePer100kViews,
+  pc.FavoritesPer100kViews,
+  pc.AvgBountyPerAnswer,
+  pc.MaxCommentPctOfComments,
+  r.RankByScore,
+  r.RankByViews,
+  round(cast(r.ViewPercentile as numeric), 4) as ViewPercentile,
+  r.ScoreDecile,
+  fs.CompositeScore,
+  string_agg(distinct concat(tg.tag, ':', tg.RankInTagByScore), ', ' order by tg.RankInTagByScore) as TopTagRanks,
+  max(case when ba.AnswerScoreRank = 1 then ba.AnswerScore end) as TopAnswerScore,
+  count(distinct ba.AnswerId) as Top3AnswerCount,
+  sum(ba.IsAccepted) as AcceptedAmongTop3,
+  sf.TitleLen,
+  sf.HasQuestionMark,
+  sf.MentionsHow as MentionsHow,
+  sf.HasAcronym as HasAcronym,
+  nl.NormalizedTags,
+  nl.EditState,
+  case
+    when qs.Score >= 5 and qs.ViewCount >= 1000 and qs.AnswerCount >= 1 and qs.IsMarkedDuplicate = 0 then 'good'
+    when qs.IsMarkedDuplicate = 1 then 'duplicate'
+    when qs.Score < 0 then 'controversial'
+    else 'average'
+  end as QualityBucket
+from question_summary qs
+left join owner_metrics om on om.QuestionId = qs.QuestionId
+left join pct_calcs pc on pc.QuestionId = qs.QuestionId
+left join rankings r on r.QuestionId = qs.QuestionId
+left join final_scores fs on fs.QuestionId = qs.QuestionId
+left join tag_focus tg on tg.QuestionId = qs.QuestionId
+left join best_answerers ba on ba.QuestionId = qs.QuestionId
+left join string_features sf on sf.QuestionId = qs.QuestionId
+left join null_logic nl on nl.QuestionId = qs.QuestionId
+group by
+  qs.QuestionId, qs.Title, qs.Score, qs.ViewCount, qs.AnswerCount, qs.Tags,
+  om.RepTier, om.Reputation, om.NetUserVotes, om.GoldBadges, om.SilverBadges, om.BronzeBadges,
+  qs.NetVotes, qs.Favorites, qs.BountySum, qs.CommentCount, qs.MaxCommentScore, qs.AvgCommentScore,
+  qs.EditEvents, qs.CloseVotesEvents, qs.LinkedCount, qs.DuplicateLinkCount, qs.IsMarkedDuplicate,
+  pc.ScorePer100kViews, pc.FavoritesPer100kViews, pc.AvgBountyPerAnswer, pc.MaxCommentPctOfComments,
+  r.RankByScore, r.RankByViews, r.ViewPercentile, r.ScoreDecile,
+  fs.CompositeScore, sf.TitleLen, sf.HasQuestionMark, sf.MentionsHow, sf.HasAcronym,
+  nl.NormalizedTags, nl.EditState
+having
+  (qs.Score > 0 or qs.ViewCount > 1000 or qs.Favorites > 0 or qs.BountySum > 0 or qs.EditEvents > 0)
+order by
+  fs.CompositeScore desc nulls last,
+  qs.Score desc nulls last,
+  qs.ViewCount desc nulls last
+limit 250;

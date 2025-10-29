@@ -1,0 +1,120 @@
+-- {"query": "3039.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2573} 
+
+WITH user_posts AS (
+    SELECT
+        u.Id                                    AS user_id,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)      AS question_cnt,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)      AS answer_cnt,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 1)    AS question_score,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 2)    AS answer_score,
+        MAX(p.CreationDate)                             AS last_post_dt
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+user_comments AS (
+    SELECT
+        u.Id                                    AS user_id,
+        COUNT(c.Id)                           AS comment_cnt,
+        MAX(c.CreationDate)                   AS last_comment_dt
+    FROM Users u
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id
+),
+user_votes AS (
+    SELECT
+        u.Id                                           AS user_id,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes_given,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes_given,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites_given,
+        MAX(v.CreationDate)                              AS last_vote_dt
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+user_badges AS (
+    SELECT
+        u.Id                                 AS user_id,
+        COUNT(b.Id)                        AS badge_cnt,
+        SUM(CASE WHEN b.Class = 1 THEN 3
+                 WHEN b.Class = 2 THEN 2
+                 ELSE 1 END)               AS badge_weight,
+        MAX(b.Date)                        AS last_badge_dt
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+tag_activity AS (
+    SELECT
+        up.user_id,
+        TRIM(BOTH '<>' FROM UNNEST(string_to_array(p.Tags, '><'))::text) AS tag,
+        COUNT(*)                                                 AS tag_post_cnt,
+        AVG(p.Score)                                            AS avg_tag_score
+    FROM user_posts up
+    JOIN Posts p ON p.OwnerUserId = up.user_id
+                AND p.Tags IS NOT NULL
+    GROUP BY up.user_id, tag
+),
+ranked_tags AS (
+    SELECT
+        user_id,
+        STRING_AGG(tag || ':' || tag_post_cnt, ', '
+                ORDER BY tag_post_cnt DESC) AS top_tags
+    FROM (
+        SELECT
+            *,
+            ROW_NUMBER() OVER (PARTITION BY user_id
+                               ORDER BY tag_post_cnt DESC) AS rn
+        FROM tag_activity
+    ) t
+    WHERE rn <= 5
+    GROUP BY user_id
+)
+SELECT
+    u.Id,
+    COALESCE(u.DisplayName, 'Anonymous')                            AS display_name,
+    COALESCE(up.question_cnt, 0)                                     AS questions,
+    COALESCE(up.answer_cnt, 0)                                       AS answers,
+    COALESCE(up.question_score, 0) + COALESCE(up.answer_score, 0)    AS total_post_score,
+    COALESCE(uc.comment_cnt, 0)                                      AS comments,
+    COALESCE(uv.upvotes_given, 0) - COALESCE(uv.downvotes_given,0)   AS vote_balance,
+    COALESCE(ub.badge_weight, 0)                                     AS badge_score,
+    GREATEST(
+        COALESCE(up.last_post_dt,      TIMESTAMP '1970-01-01'),
+        COALESCE(uc.last_comment_dt,  TIMESTAMP '1970-01-01'),
+        COALESCE(uv.last_vote_dt,     TIMESTAMP '1970-01-01'),
+        COALESCE(ub.last_badge_dt,    TIMESTAMP '1970-01-01')
+    )                                                               AS most_recent_activity,
+    COALESCE(rt.top_tags, '')                                       AS top_tags,
+    ROUND(
+        (COALESCE(up.question_cnt,0) * 1.5 +
+         COALESCE(up.answer_cnt,0)   * 2.0 +
+         COALESCE(uc.comment_cnt,0)  * 1.0 +
+         COALESCE(uv.upvotes_given,0) * 0.5 -
+         COALESCE(uv.downvotes_given,0) * 0.3 +
+         COALESCE(ub.badge_weight,0) * 3.0) *
+        (1 + EXTRACT(EPOCH FROM (
+            NOW() -
+            GREATEST(
+                COALESCE(up.last_post_dt,      TIMESTAMP '1970-01-01'),
+                COALESCE(uc.last_comment_dt,  TIMESTAMP '1970-01-01'),
+                COALESCE(uv.last_vote_dt,     TIMESTAMP '1970-01-01'),
+                COALESCE(ub.last_badge_dt,    TIMESTAMP '1970-01-01')
+            )
+        )) / 31536000)                                             , 2) AS weighted_score
+FROM Users u
+LEFT JOIN user_posts     up ON up.user_id = u.Id
+LEFT JOIN user_comments  uc ON uc.user_id = u.Id
+LEFT JOIN user_votes     uv ON uv.user_id = u.Id
+LEFT JOIN user_badges    ub ON ub.user_id = u.Id
+LEFT JOIN ranked_tags    rt ON rt.user_id = u.Id
+WHERE u.Reputation > 1000
+ORDER BY weighted_score DESC
+LIMIT 10
+UNION ALL
+SELECT
+    NULL,
+    '---',
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+LIMIT 1;

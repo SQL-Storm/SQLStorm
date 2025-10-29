@@ -1,0 +1,299 @@
+-- {"query": "7829.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2546} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId IN (1, 2) THEN p.Id END) as QuestionAnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore,
+        STRING_AGG(DISTINCT p.Tags, ', ') as AllTags,
+        COUNT(DISTINCT ph.Id) as HistoryCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        LastCommentDate,
+        QuestionCount,
+        AnswerCount,
+        QuestionAnswerCount,
+        TotalQuestionScore,
+        TotalAnswerScore,
+        AvgQuestionScore,
+        AvgAnswerScore,
+        AllTags,
+        HistoryCount,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) as RankByReputation,
+        ROW_NUMBER() OVER (ORDER BY PostCount DESC, Reputation DESC) as RankByPostCount,
+        RANK() OVER (ORDER BY TotalQuestionScore DESC) as RankByQuestionScore,
+        DENSE_RANK() OVER (ORDER BY BadgeCount DESC) as RankByBadgeCount
+    FROM UserActivityStats
+),
+PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 10 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) as PreviousScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) as NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgScorePerUser,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as TotalPostsPerUser,
+        MAX(p.Score) OVER (PARTITION BY p.OwnerUserId) as MaxScorePerUser,
+        MIN(p.Score) OVER (PARTITION BY p.OwnerUserId) as MinScorePerUser
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+CombinedStats AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.CommentCount,
+        tu.BadgeCount,
+        tu.LastPostDate,
+        tu.LastCommentDate,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.QuestionAnswerCount,
+        tu.TotalQuestionScore,
+        tu.TotalAnswerScore,
+        tu.AvgQuestionScore,
+        tu.AvgAnswerScore,
+        tu.AllTags,
+        tu.HistoryCount,
+        tu.RankByReputation,
+        tu.RankByPostCount,
+        tu.RankByQuestionScore,
+        tu.RankByBadgeCount,
+        ps.PostId,
+        ps.Title,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount as PostAnswerCount,
+        ps.CommentCount as PostCommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate as PostCreationDate,
+        ps.PostTypeId,
+        ps.Tags as PostTags,
+        ps.ParentId,
+        ps.PostType,
+        ps.ScoreCategory,
+        ps.UserPostRank,
+        ps.ScoreRank,
+        ps.ScorePercentile,
+        ps.PreviousScore,
+        ps.NextScore,
+        ps.AvgScorePerUser,
+        ps.TotalPostsPerUser,
+        ps.MaxScorePerUser,
+        ps.MinScorePerUser,
+        CASE 
+            WHEN ps.Score > 50 
+                 AND ps.AnswerCount > 0 
+                 AND ps.CommentCount > 2 
+                 AND ps.UserPostRank <= 3 
+                 AND ps.PostType = 'Question'
+            THEN 'HighlyEngaged'
+            ELSE 'Normal'
+        END as EngagementLevel
+    FROM TopUsers tu
+    LEFT JOIN PostStats ps ON tu.UserId = ps.OwnerUserId
+    WHERE ps.Score IS NOT NULL OR ps.PostId IS NULL
+)
+SELECT 
+    c.UserId,
+    c.DisplayName,
+    c.Reputation,
+    c.PostCount,
+    c.CommentCount,
+    c.BadgeCount,
+    c.LastPostDate,
+    c.LastCommentDate,
+    c.QuestionCount,
+    c.AnswerCount,
+    c.QuestionAnswerCount,
+    c.TotalQuestionScore,
+    c.TotalAnswerScore,
+    c.AvgQuestionScore,
+    c.AvgAnswerScore,
+    c.AllTags,
+    c.HistoryCount,
+    c.RankByReputation,
+    c.RankByPostCount,
+    c.RankByQuestionScore,
+    c.RankByBadgeCount,
+    c.PostId,
+    c.Title,
+    c.Score,
+    c.ViewCount,
+    c.PostAnswerCount,
+    c.PostCommentCount,
+    c.FavoriteCount,
+    c.PostCreationDate,
+    c.PostTypeId,
+    c.PostTags,
+    c.ParentId,
+    c.PostType,
+    c.ScoreCategory,
+    c.UserPostRank,
+    c.ScoreRank,
+    c.ScorePercentile,
+    c.PreviousScore,
+    c.NextScore,
+    c.AvgScorePerUser,
+    c.TotalPostsPerUser,
+    c.MaxScorePerUser,
+    c.MinScorePerUser,
+    c.EngagementLevel,
+    CASE 
+        WHEN c.RankByReputation <= 100 THEN 'Top100'
+        WHEN c.RankByReputation <= 1000 THEN 'Top1000'
+        ELSE 'BelowTop1000'
+    END as ReputationTier,
+    CASE 
+        WHEN c.QuestionAnswerCount >= 5 AND c.QuestionCount > 0 THEN 'ActiveContributor'
+        WHEN c.QuestionAnswerCount >= 2 AND c.QuestionCount > 0 THEN 'RegularContributor'
+        WHEN c.QuestionAnswerCount >= 1 AND c.QuestionCount > 0 THEN 'OccasionalContributor'
+        ELSE 'Inactive'
+    END as ContributionStatus,
+    COALESCE(c.BadgeCount, 0) + COALESCE(c.HistoryCount, 0) as TotalActivity,
+    CAST((c.PostCount * 1.0 / NULLIF(c.Reputation, 0)) * 1000 AS DECIMAL(10,2)) as EfficiencyRatio,
+    COUNT(*) OVER () as TotalRecords,
+    NTILE(4) OVER (ORDER BY c.Reputation) as Quartile,
+    CASE 
+        WHEN c.AllTags IS NOT NULL AND LENGTH(c.AllTags) > 0 THEN 1
+        ELSE 0
+    END as HasTags,
+    DATEDIFF(DAY, c.PostCreationDate, CURRENT_TIMESTAMP) as DaysSinceLastPost,
+    NULLIF(c.AvgAnswerScore, 0) as SafeAvgAnswerScore,
+    NULLIF(c.AvgQuestionScore, 0) as SafeAvgQuestionScore
+FROM CombinedStats c
+WHERE (c.UserId IN (SELECT UserId FROM TopUsers WHERE RankByReputation <= 5000) 
+       OR c.PostId IS NULL)
+  AND (c.PostType IS NULL OR c.PostType IN ('Question', 'Answer'))
+  AND (c.Score IS NULL OR (c.Score BETWEEN -100 AND 1000))
+  AND (c.Reputation BETWEEN 0 AND 1000000)
+  AND (c.PostCount BETWEEN 0 AND 10000)
+  AND c.DisplayName IS NOT NULL
+  AND c.DisplayName != ''
+ORDER BY 
+    CASE 
+        WHEN c.UserId IS NOT NULL THEN c.Reputation 
+        ELSE 0 
+    END DESC,
+    CASE 
+        WHEN c.PostId IS NOT NULL THEN c.Score 
+        ELSE 0 
+    END DESC,
+    c.PostCreationDate DESC
+OFFSET 0 ROWS
+FETCH NEXT 1000 ROWS ONLY
+UNION ALL
+SELECT 
+    -1 as UserId,
+    'Aggregate Summary' as DisplayName,
+    SUM(c.Reputation) as Reputation,
+    SUM(c.PostCount) as PostCount,
+    SUM(c.CommentCount) as CommentCount,
+    SUM(c.BadgeCount) as BadgeCount,
+    MAX(c.LastPostDate) as LastPostDate,
+    MAX(c.LastCommentDate) as LastCommentDate,
+    SUM(c.QuestionCount) as QuestionCount,
+    SUM(c.AnswerCount) as AnswerCount,
+    SUM(c.QuestionAnswerCount) as QuestionAnswerCount,
+    SUM(c.TotalQuestionScore) as TotalQuestionScore,
+    SUM(c.TotalAnswerScore) as TotalAnswerScore,
+    AVG(c.AvgQuestionScore) as AvgQuestionScore,
+    AVG(c.AvgAnswerScore) as AvgAnswerScore,
+    STRING_AGG(DISTINCT c.AllTags, ', ') as AllTags,
+    SUM(c.HistoryCount) as HistoryCount,
+    NULL as RankByReputation,
+    NULL as RankByPostCount,
+    NULL as RankByQuestionScore,
+    NULL as RankByBadgeCount,
+    NULL as PostId,
+    NULL as Title,
+    NULL as Score,
+    NULL as ViewCount,
+    NULL as PostAnswerCount,
+    NULL as PostCommentCount,
+    NULL as FavoriteCount,
+    NULL as PostCreationDate,
+    NULL as PostTypeId,
+    NULL as PostTags,
+    NULL as ParentId,
+    NULL as PostType,
+    NULL as ScoreCategory,
+    NULL as UserPostRank,
+    NULL as ScoreRank,
+    NULL as ScorePercentile,
+    NULL as PreviousScore,
+    NULL as NextScore,
+    NULL as AvgScorePerUser,
+    NULL as TotalPostsPerUser,
+    NULL as MaxScorePerUser,
+    NULL as MinScorePerUser,
+    NULL as EngagementLevel,
+    NULL as ReputationTier,
+    NULL as ContributionStatus,
+    NULL as TotalActivity,
+    NULL as EfficiencyRatio,
+    COUNT(*) OVER () as TotalRecords,
+    NULL as Quartile,
+    NULL as HasTags,
+    NULL as DaysSinceLastPost,
+    NULL as SafeAvgAnswerScore,
+    NULL as SafeAvgQuestionScore
+FROM CombinedStats c
+WHERE c.UserId IS NOT NULL
+HAVING COUNT(*) > 0
+ORDER BY 1, 2;

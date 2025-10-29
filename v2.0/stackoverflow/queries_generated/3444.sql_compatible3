@@ -1,0 +1,124 @@
+WITH
+    UserStats AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(p.Id)                                    AS TotalPosts,
+            SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+            SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+            AVG(p.Score)                                   AS AvgScore,
+            MAX(p.CreationDate)                            AS LastPostDate
+        FROM Users u
+        LEFT JOIN Posts p
+               ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+    BadgeAgg AS (
+        SELECT
+            b.UserId,
+            STRING_AGG(DISTINCT b.Name, ', ')               AS BadgeList,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)    AS GoldBadges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)    AS SilverBadges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)    AS BronzeBadges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    RecentVotes AS (
+        SELECT
+            v.UserId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END)   AS UpVotesLast30d,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotesLast30d,
+            MAX(v.CreationDate)                                  AS LastVoteDate
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        WHERE v.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)
+        GROUP BY v.UserId
+    ),
+    TagStats AS (
+        SELECT
+            p.OwnerUserId                                    AS UserId,
+            STRING_AGG(DISTINCT t.TagName, ',')             AS TagsUsed,
+            COUNT(DISTINCT t.Id)                            AS DistinctTagCount
+        FROM Posts p
+        CROSS JOIN LATERAL (
+            SELECT unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS tag
+        ) AS t_raw
+        LEFT JOIN Tags t ON t.TagName = t_raw.tag
+        WHERE p.Tags IS NOT NULL
+        GROUP BY p.OwnerUserId
+    )
+
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    RANK() OVER (ORDER BY us.Reputation DESC)                AS ReputationRank,
+    us.TotalPosts,
+    us.Questions,
+    us.Answers,
+    COALESCE(us.AvgScore, 0)                                 AS AvgScore,
+    us.LastPostDate,
+    COALESCE(ba.BadgeList, '')                               AS BadgeList,
+    COALESCE(ba.GoldBadges, 0)                               AS GoldBadges,
+    COALESCE(ba.SilverBadges, 0)                             AS SilverBadges,
+    COALESCE(ba.BronzeBadges, 0)                             AS BronzeBadges,
+    COALESCE(rv.UpVotesLast30d, 0)                           AS UpVotesLast30d,
+    COALESCE(rv.DownVotesLast30d, 0)                         AS DownVotesLast30d,
+    rv.LastVoteDate,
+    COALESCE(ts.TagsUsed, '')                                AS TagsUsed,
+    COALESCE(ts.DistinctTagCount, 0)                         AS DistinctTagCount,
+    CASE
+        WHEN us.Reputation > 20000 THEN 'Elite'
+        WHEN us.Reputation > 10000 THEN 'Pro'
+        WHEN us.Reputation > 5000  THEN 'Experienced'
+        ELSE 'Novice'
+    END                                                      AS ReputationTier,
+    EXISTS (
+        SELECT 1
+        FROM Posts p2
+        WHERE p2.OwnerUserId = us.Id
+          AND p2.CreationDate > us.LastPostDate - INTERVAL '7' DAY
+        LIMIT 1
+    )                                                        AS RecentActivityFlag
+FROM UserStats us
+LEFT JOIN BadgeAgg     ba ON ba.UserId = us.Id
+LEFT JOIN RecentVotes  rv ON rv.UserId = us.Id
+LEFT JOIN TagStats     ts ON ts.UserId = us.Id
+WHERE us.TotalPosts > 0
+ORDER BY us.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS INTEGER)      AS Id,
+    CAST(NULL AS VARCHAR)      AS DisplayName,
+    CAST(NULL AS INTEGER)      AS Reputation,
+    CAST(NULL AS INTEGER)      AS ReputationRank,
+    CAST(NULL AS INTEGER)      AS TotalPosts,
+    CAST(NULL AS INTEGER)      AS Questions,
+    CAST(NULL AS INTEGER)      AS Answers,
+    CAST(NULL AS NUMERIC)      AS AvgScore,
+    CAST(NULL AS TIMESTAMP)    AS LastPostDate,
+    CAST(NULL AS VARCHAR)      AS BadgeList,
+    CAST(NULL AS INTEGER)      AS GoldBadges,
+    CAST(NULL AS INTEGER)      AS SilverBadges,
+    CAST(NULL AS INTEGER)      AS BronzeBadges,
+    CAST(NULL AS INTEGER)      AS UpVotesLast30d,
+    CAST(NULL AS INTEGER)      AS DownVotesLast30d,
+    CAST(NULL AS TIMESTAMP)    AS LastVoteDate,
+    CAST(NULL AS VARCHAR)      AS TagsUsed,
+    CAST(NULL AS INTEGER)      AS DistinctTagCount,
+    CAST(NULL AS VARCHAR)      AS ReputationTier,
+    CAST(NULL AS BOOLEAN)      AS RecentActivityFlag
+
+EXCEPT
+
+SELECT
+    Id, DisplayName, Reputation, ReputationRank, TotalPosts,
+    Questions, Answers, AvgScore, LastPostDate, BadgeList,
+    GoldBadges, SilverBadges, BronzeBadges,
+    UpVotesLast30d, DownVotesLast30d, LastVoteDate,
+    TagsUsed, DistinctTagCount, ReputationTier, RecentActivityFlag
+FROM (SELECT 1 AS dummy) t;

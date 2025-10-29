@@ -1,0 +1,108 @@
+-- {"query": "4970.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1365} 
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.Comment,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5) AND ph.UserId IS NOT NULL AND ph.Comment IS NOT NULL
+),
+UserEditCounts AS (
+    SELECT
+        rpe.UserId,
+        COUNT(DISTINCT rpe.PostId) AS DistinctPostsEdited,
+        SUM(CASE WHEN rpe.rn = 1 THEN 1 ELSE 0 END) AS FirstEditsOnPost,
+        AVG(JULIANDAY(rpe.CreationDate) - JULIANDAY(u.CreationDate)) AS AvgDaysFromUserCreationToEdit
+    FROM RankedPostEdits rpe
+    JOIN Users u ON rpe.UserId = u.Id
+    GROUP BY rpe.UserId
+),
+PostQuality AS (
+    SELECT
+        p.Id AS PostId,
+        CASE WHEN p.Score > 50 THEN 'High' WHEN p.Score > 10 THEN 'Medium' ELSE 'Low' END AS ScoreCategory,
+        p.AnswerCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS Status,
+        COALESCE(pc.EditCount, 0) AS TotalEditsOnPost,
+        CASE WHEN p.FavoriteCount > 10 THEN 'Popular' ELSE 'Normal' END AS Popularity
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS EditCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId IN (2, 5) -- Body edits
+        GROUP BY PostId
+    ) pc ON p.Id = pc.PostId
+    WHERE p.PostTypeId = 1 -- Questions only
+),
+UserBadgeImpact AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(CASE WHEN b.Name LIKE '%Great Answer%' THEN 1 ELSE 0 END) AS HasGreatAnswerBadge
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+)
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    uec.DistinctPostsEdited,
+    uec.FirstEditsOnPost,
+    uec.AvgDaysFromUserCreationToEdit,
+    ubi.GoldBadges,
+    ubi.SilverBadges,
+    ubi.BronzeBadges,
+    ubi.HasGreatAnswerBadge,
+    pq.ScoreCategory,
+    pq.AnswerCount,
+    pq.Status,
+    pq.TotalEditsOnPost,
+    pq.Popularity,
+    CASE
+        WHEN u.WebsiteUrl IS NOT NULL AND INSTR(u.WebsiteUrl, 'stackoverflow.com') > 0 THEN 'SO_User'
+        WHEN u.WebsiteUrl IS NOT NULL THEN 'Other_Web'
+        ELSE 'No_Web'
+    END AS UserWebsiteType,
+    LENGTH(u.AboutMe) AS AboutMeLength,
+    CASE WHEN u.Location IS NULL OR u.Location = '' THEN 'Unknown' ELSE u.Location END AS UserLocation,
+    ph_closed.CloseCount,
+    ph_reopen.ReopenCount,
+    pt.Name AS PostTypeForEdits,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND c.Score > 5) AS HighScoreComments,
+    CASE WHEN EXISTS (SELECT 1 FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Name = 'Stellar Question') THEN 'Yes' ELSE 'No' END AS StellarQuestionBadge,
+    p.Title AS SampleQuestionTitle,
+    p.CreationDate AS SampleQuestionDate,
+    CASE WHEN SUBSTRING(p.Tags, 1, 1) = '<' THEN SUBSTRING(p.Tags, 2, INSTR(p.Tags, '>') - 2) ELSE 'N/A' END AS FirstTag
+FROM Users u
+JOIN UserEditCounts uec ON u.Id = uec.UserId
+JOIN UserBadgeImpact ubi ON u.Id = ubi.UserId
+JOIN PostQuality pq ON u.Id = pq.UserId -- This is a potential join issue as PostQuality uses PostId, but we need to join on UserId to link to User data. Assuming a missing join condition for demonstration.
+LEFT JOIN (
+    SELECT UserId, COUNT(*) AS CloseCount
+    FROM PostHistory
+    WHERE PostHistoryTypeId = 10
+    GROUP BY UserId
+) ph_closed ON u.Id = ph_closed.UserId
+LEFT JOIN (
+    SELECT UserId, COUNT(*) AS ReopenCount
+    FROM PostHistory
+    WHERE PostHistoryTypeId = 11
+    GROUP BY UserId
+) ph_reopen ON u.Id = ph_reopen.UserId
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1 AND p.Id = pq.PostId -- Re-aligning pq to use PostId correctly
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+WHERE u.Reputation > 1000
+  AND u.Views > 500
+  AND uec.DistinctPostsEdited > 5
+  AND uec.AvgDaysFromUserCreationToEdit < 365
+  AND ubi.GoldBadges >= 1
+  AND pq.ScoreCategory = 'High'
+  AND pq.Status = 'Open'
+  AND pq.Popularity = 'Popular'
+  AND INSTR(u.AboutMe, 'SQL') > 0
+ORDER BY u.Reputation DESC, u.DownVotes ASC
+LIMIT 100;

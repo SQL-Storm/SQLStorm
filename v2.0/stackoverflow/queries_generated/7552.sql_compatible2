@@ -1,0 +1,261 @@
+WITH QuestionStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.LastActivityDate,
+        p.Tags,
+        COUNT(DISTINCT c.Id) AS CommentCountActual,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') FILTER (WHERE p.Tags IS NOT NULL) AS TagList,
+        MAX(ph.CreationDate) AS LastEditDate,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Open'
+        END AS PostStatus,
+        RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserQuestionRank,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate) AS ChronologicalRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (2, 5, 6)
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, 
+             p.CreationDate, p.OwnerUserId, u.DisplayName, p.LastActivityDate, p.Tags, p.ClosedDate, p.CommunityOwnedDate
+),
+AnswerStats AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        COUNT(p.Id) AS AnswerCount,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveAnswers,
+        SUM(CASE WHEN p.Score < 0 THEN 1 ELSE 0 END) AS NegativeAnswers,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.CreationDate) AS LatestAnswerDate,
+        COUNT(DISTINCT p.OwnerUserId) AS AnsweringUsers
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount AS UserViews,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS QuestionsAsked,
+        COUNT(DISTINCT a.Id) AS AnswersGiven,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        AVG(p.Score) AS AvgQuestionScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') FILTER (WHERE p.Tags IS NOT NULL) AS UserTagFocus,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS ProductivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes
+),
+TopAnswerers AS (
+    SELECT 
+        a.OwnerUserId AS UserId,
+        COUNT(DISTINCT a.ParentId) AS QuestionsAnswered,
+        SUM(a.Score) AS TotalAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        RANK() OVER (ORDER BY COUNT(DISTINCT a.ParentId) DESC) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.OwnerUserId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        COUNT(DISTINCT p.Id) AS QuestionsWithTag,
+        AVG(p.Score) AS AvgQuestionScore,
+        AVG(p.ViewCount) AS AvgViewCount,
+        MIN(p.CreationDate) AS FirstQuestionDate,
+        MAX(p.CreationDate) AS LastQuestionDate,
+        CASE 
+            WHEN t.Count > (SELECT AVG("Count") FROM Tags) THEN 'Popular'
+            WHEN t.Count < (SELECT AVG("Count") FROM Tags) * 0.5 THEN 'Rare'
+            ELSE 'Moderate'
+        END AS TagPopularityLevel
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired
+)
+SELECT 
+    qs.QuestionId,
+    qs.Title,
+    qs.Score,
+    qs.ViewCount,
+    qs.AnswerCount AS AnswerCountReported,
+    qs.CommentCountActual AS CommentCount,
+    qs.FavoriteCount,
+    qs.OwnerDisplayName,
+    qs.PostStatus,
+    qs.ScoreRank,
+    qs.UserQuestionRank,
+    qs.ChronologicalRank,
+    CASE 
+        WHEN qs.Score >= 100 THEN 'High Score'
+        WHEN qs.Score >= 50 THEN 'Medium Score'
+        ELSE 'Low Score'
+    END AS ScoreCategory,
+    COALESCE(ans.AnswerCount, 0) AS ActualAnswerCount,
+    COALESCE(ans.PositiveAnswers, 0) AS PositiveAnswers,
+    COALESCE(ans.NegativeAnswers, 0) AS NegativeAnswers,
+    COALESCE(ans.AvgAnswerScore, 0) AS AvgAnswerScore,
+    STRING_AGG(DISTINCT SUBSTRING(qs.Tags FROM 2 FOR (CHAR_LENGTH(qs.Tags)-2)), ', ') FILTER (WHERE qs.Tags IS NOT NULL) AS AllTags,
+    ('Tag Count: ' || (
+        SELECT COUNT(*) 
+        FROM UNNEST(STRING_TO_ARRAY(REPLACE(REPLACE(qs.Tags, '<', ''), '>', ''), ',')) AS tag
+    ) || '; Popular Tags: ' || COALESCE((
+        SELECT STRING_AGG(tagname, ', ') FROM (
+            SELECT tagname FROM UNNEST(STRING_TO_ARRAY(REPLACE(REPLACE(qs.Tags, '<', ''), '>', ''), ',')) AS tagname 
+            INNER JOIN Tags ON Tags.TagName = tagname WHERE Tags.Count > 200
+        ) t
+    ), 'None')) AS TagInfo,
+    COALESCE(US.QuestionsAsked, 0) AS UserQuestions,
+    COALESCE(US.AnswersGiven, 0) AS UserAnswers,
+    COALESCE(US.BadgesEarned, 0) AS UserBadges,
+    COALESCE(US.AvgQuestionScore, 0) AS UserAvgQuestionScore,
+    COALESCE(US.AvgAnswerScore, 0) AS UserAvgAnswerScore,
+    COALESCE(TA.QuestionsWithTag, 0) AS TagQuestions,
+    COALESCE(TA.AvgQuestionScore, 0) AS TagAvgScore,
+    COALESCE(TA.AvgViewCount, 0) AS TagAvgViews,
+    CASE 
+        WHEN qs.Score > 100 AND qs.ViewCount > 500 THEN 'Trending'
+        WHEN qs.Score < 0 THEN 'Controversial'
+        WHEN qs.ViewCount < 10 THEN 'Niche'
+        ELSE 'Standard'
+    END AS QuestionClassification,
+    RANK() OVER (ORDER BY qs.ViewCount DESC, qs.Score DESC) AS ViewScoreRank,
+    CASE 
+        WHEN COALESCE(ans.AnswerCount, 0) > 0 THEN (COALESCE(ans.PositiveAnswers, 0) * 100.0 / NULLIF(COALESCE(ans.AnswerCount, 0), 0))
+        ELSE 0
+    END AS PositiveAnswerPercentage,
+    (qs.OwnerDisplayName || ' (Reputation: ' || COALESCE(US.Reputation, 0) || ')') AS AuthorWithReputation,
+    qs.CreationDate,
+    qs.LastActivityDate,
+    CASE 
+        WHEN qs.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY THEN 'Recent'
+        WHEN qs.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90' DAY THEN 'Active'
+        ELSE 'Inactive'
+    END AS ActivityStatus,
+    COALESCE(TA.TagPopularityLevel, 'Unknown') AS TagPopularity,
+    LAG(qs.Score) OVER (ORDER BY qs.CreationDate) AS PreviousScore,
+    LAG(qs.ViewCount) OVER (ORDER BY qs.CreationDate) AS PreviousViews,
+    qs.Score - LAG(qs.Score) OVER (ORDER BY qs.CreationDate) AS ScoreChange,
+    qs.ViewCount - LAG(qs.ViewCount) OVER (ORDER BY qs.CreationDate) AS ViewChange,
+    (qs.Score - LAG(qs.Score) OVER (ORDER BY qs.CreationDate)) * 100.0 / NULLIF(LAG(qs.Score) OVER (ORDER BY qs.CreationDate), 0) AS ScoreChangePercentage,
+    CASE 
+        WHEN qs.Score > 50 AND qs.ViewCount > 100 AND COALESCE(ans.AnswerCount, 0) > 0 THEN 'High Engagement'
+        WHEN qs.Score > 20 AND qs.ViewCount > 50 THEN 'Moderate Engagement'
+        WHEN qs.Score BETWEEN -10 AND 20 AND qs.ViewCount > 20 THEN 'Low Engagement'
+        ELSE 'Minimal Engagement'
+    END AS EngagementLevel,
+    COALESCE(TA.TagCount, 0) AS TotalTagUses,
+    COALESCE(US.ReputationRank, 0) AS UserReputationRank,
+    COALESCE(US.ProductivityRank, 0) AS UserProductivityRank,
+    COALESCE(TA.QuestionsWithTag, 0) * 100.0 / NULLIF((SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1), 0) AS TagPercentageOfAllQuestions
+FROM QuestionStats qs
+LEFT JOIN AnswerStats ans ON qs.QuestionId = ans.QuestionId
+LEFT JOIN UserStats US ON qs.OwnerUserId = US.UserId
+LEFT JOIN TagAnalysis TA ON qs.Tags IS NOT NULL 
+    AND EXISTS (
+        SELECT 1 FROM UNNEST(STRING_TO_ARRAY(REPLACE(REPLACE(qs.Tags, '<', ''), '>', ''), ',')) AS t 
+        INNER JOIN Tags ON Tags.TagName = t 
+        WHERE Tags.TagName = TA.TagName
+    )
+WHERE qs.Score > 0 
+    AND qs.ViewCount > 10
+    AND (qs.CommentCountActual > 0 OR COALESCE(ans.AnswerCount, 0) > 0)
+    AND qs.PostStatus IN ('Open', 'Closed')
+    AND qs.ScoreRank <= 1000
+    AND qs.UserQuestionRank <= 100
+
+UNION ALL
+
+SELECT 
+    999999999 AS QuestionId,
+    'Aggregate Metrics Summary' AS Title,
+    SUM(qs.Score) AS Score,
+    SUM(qs.ViewCount) AS ViewCount,
+    SUM(qs.AnswerCount) AS AnswerCountReported,
+    SUM(qs.CommentCountActual) AS CommentCount,
+    SUM(qs.FavoriteCount) AS FavoriteCount,
+    CAST(NULL AS VARCHAR) AS OwnerDisplayName,
+    'Summary' AS PostStatus,
+    0 AS ScoreRank,
+    0 AS UserQuestionRank,
+    0 AS ChronologicalRank,
+    'Summary' AS ScoreCategory,
+    COUNT(*) AS ActualAnswerCount,
+    SUM(CASE WHEN COALESCE(ans.PositiveAnswers, 0) > 0 THEN 1 ELSE 0 END) AS PositiveAnswers,
+    SUM(CASE WHEN COALESCE(ans.NegativeAnswers, 0) > 0 THEN 1 ELSE 0 END) AS NegativeAnswers,
+    AVG(ans.AvgAnswerScore) AS AvgAnswerScore,
+    'Summary Tags' AS AllTags,
+    'Summary' AS TagInfo,
+    SUM(COALESCE(US.QuestionsAsked, 0)) AS UserQuestions,
+    SUM(COALESCE(US.AnswersGiven, 0)) AS UserAnswers,
+    SUM(COALESCE(US.BadgesEarned, 0)) AS UserBadges,
+    AVG(US.AvgQuestionScore) AS UserAvgQuestionScore,
+    AVG(US.AvgAnswerScore) AS UserAvgAnswerScore,
+    SUM(COALESCE(TA.QuestionsWithTag, 0)) AS TagQuestions,
+    AVG(TA.AvgQuestionScore) AS TagAvgScore,
+    AVG(TA.AvgViewCount) AS TagAvgViews,
+    'Summary' AS QuestionClassification,
+    SUM(1) AS ViewScoreRank,
+    AVG(CASE WHEN COALESCE(ans.AnswerCount, 0) > 0 THEN (COALESCE(ans.PositiveAnswers, 0) * 100.0 / NULLIF(ans.AnswerCount, 0)) ELSE 0 END) AS PositiveAnswerPercentage,
+    'Summary Authors' AS AuthorWithReputation,
+    MIN(qs.CreationDate) AS CreationDate,
+    MAX(qs.LastActivityDate) AS LastActivityDate,
+    'Summary' AS ActivityStatus,
+    'Summary' AS TagPopularity,
+    NULL AS PreviousScore,
+    NULL AS PreviousViews,
+    NULL AS ScoreChange,
+    NULL AS ViewChange,
+    NULL AS ScoreChangePercentage,
+    'Summary' AS EngagementLevel,
+    SUM(COALESCE(TA.TagCount, 0)) AS TotalTagUses,
+    AVG(COALESCE(US.ReputationRank, 0)) AS UserReputationRank,
+    AVG(COALESCE(US.ProductivityRank, 0)) AS UserProductivityRank,
+    AVG(COALESCE(TA.QuestionsWithTag, 0)) * 100.0 / NULLIF((SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1), 0) AS TagPercentageOfAllQuestions
+FROM QuestionStats qs
+LEFT JOIN AnswerStats ans ON qs.QuestionId = ans.QuestionId
+LEFT JOIN UserStats US ON qs.OwnerUserId = US.UserId
+LEFT JOIN TagAnalysis TA ON qs.Tags IS NOT NULL 
+    AND EXISTS (
+        SELECT 1 FROM UNNEST(STRING_TO_ARRAY(REPLACE(REPLACE(qs.Tags, '<', ''), '>', ''), ',')) AS t 
+        INNER JOIN Tags ON Tags.TagName = t 
+        WHERE Tags.TagName = TA.TagName
+    )
+WHERE qs.Score > 0 
+    AND qs.ViewCount > 10
+    AND (qs.CommentCountActual > 0 OR COALESCE(ans.AnswerCount, 0) > 0)
+    AND qs.PostStatus IN ('Open', 'Closed')
+ORDER BY Score DESC, ViewCount DESC;

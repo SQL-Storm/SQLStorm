@@ -1,0 +1,255 @@
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.CreationDate,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(vb.BountyAmount), 0) as TotalBountyReceived,
+        row_number() over (order by u.Reputation desc) as ReputationRank
+    from 
+        Users u
+    left join 
+        Posts p on p.OwnerUserId = u.Id
+    left join 
+        Comments c on c.UserId = u.Id
+    left join 
+        Votes vb on vb.UserId = u.Id and vb.VoteTypeId = 8
+    group by 
+        u.Id, u.DisplayName, u.CreationDate, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+QuestionDetails as (
+    select
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Body,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        pt.Name as PostType,
+        u.DisplayName as OwnerDisplayName,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as UserTopQuestionRank,
+        dense_rank() over (order by p.Score desc) as GlobalScoreRank,
+        string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') as TagArray
+    from 
+        Posts p
+    join
+        PostTypes pt on pt.Id = p.PostTypeId
+    left join
+        Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+),
+PopularTagStats as (
+    select
+        t.TagName,
+        t.Count,
+        coalesce(avg(q.Score), 0) as AvgQuestionScore,
+        coalesce(sum(q.AnswerCount), 0) as TotalAnswers,
+        coalesce(count(distinct q.QuestionId),0) as QuestionCount,
+        coalesce(sum(case when q.AcceptedAnswerId is not null then 1 else 0 end),0) as AcceptedAnswerCount
+    from 
+        Tags t
+    left join lateral
+        (
+            select *
+            from QuestionDetails q
+            where exists (
+                select 1
+                from unnest(q.TagArray) as tagname
+                where tagname = t.TagName
+            )
+        ) q on true
+    group by t.TagName, t.Count
+    having count(distinct q.QuestionId) > 50
+),
+TopUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        row_number() over (order by count(b.Id) filter (where b.Class = 1) desc, count(b.Id) filter (where b.Class = 2) desc) as BadgeRank
+    from
+        Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+    having count(b.Id) filter (where b.Class = 1) >= 5
+),
+UserRecentActivity as (
+    select
+        ph.UserId,
+        max(ph.CreationDate) as LastEditDate,
+        count(distinct ph.PostId) as EditedPostCount,
+        string_agg(distinct pht.Name, ', ') as RecentEditTypes
+    from 
+        PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    where ph.UserId is not null
+    group by ph.UserId
+),
+AnswerStats as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        u.DisplayName,
+        a.CreationDate,
+        a.Score,
+        case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAccepted,
+        rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerScoreRank
+    from 
+        Posts a
+    join 
+        Posts q on q.Id = a.ParentId
+    left join 
+        Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+AnswerVoteStats as (
+    select
+        a.AnswerId,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        count(v.Id) filter (where v.VoteTypeId = 5) as FavoriteVotes
+    from 
+        AnswerStats a
+    left join 
+        Votes v on v.PostId = a.AnswerId
+    group by a.AnswerId
+),
+UserAggregatedAnswerStats as (
+    select
+        a.OwnerUserId,
+        count(distinct a.AnswerId) as TotalAnswers,
+        sum(a.Score) as TotalAnswerScore,
+        sum(a.IsAccepted) as AcceptedAnswersCount,
+        avg(a.Score) as AvgAnswerScore,
+        sum(av.UpVotes) as TotalUpVotes,
+        sum(av.DownVotes) as TotalDownVotes
+    from 
+        AnswerStats a
+    left join 
+        AnswerVoteStats av on av.AnswerId = a.AnswerId
+    group by a.OwnerUserId
+)
+select 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.Views,
+    ua.UpVotes,
+    ua.DownVotes,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.TotalBountyReceived,
+    tas.TotalAnswers,
+    tas.TotalAnswerScore,
+    tas.AcceptedAnswersCount,
+    tas.AvgAnswerScore,
+    tas.TotalUpVotes,
+    tas.TotalDownVotes,
+    bub.GoldBadges,
+    bub.SilverBadges,
+    bub.BronzeBadges,
+    ua.ReputationRank,
+    ur.LastEditDate,
+    ur.EditedPostCount,
+    ur.RecentEditTypes,
+    array_agg(distinct pts.TagName) filter (where pts.AvgQuestionScore > 5) as HighScoreTags,
+    array_agg(distinct pts.TagName) filter (where pts.AvgQuestionScore <= 5) as OtherTags,
+    qd.GlobalScoreRank as HighestRankedQuestion,
+    case 
+        when qd.ClosedDate is not null then 'Closed' 
+        else 'Open' 
+    end as QuestionStatus,
+    coalesce(pl.LinkTypeId, 0) as LinkTypeId,
+    lt.Name as LinkTypeName,
+    textpos.length_diff,
+    case when ua.Views = 0 then null else round((ua.UpVotes::numeric)/nullif(ua.Views,0), 4) end as UpVotesPerView,
+    case when ua.Views = 0 then null else round((ua.DownVotes::numeric)/nullif(ua.Views,0),4) end as DownVotesPerView,
+    (
+        substring(ua.DisplayName from 1 for 3) || '_' ||
+        to_char(ua.CreationDate, 'YYYYMMDD') || '_' ||
+        'G' || coalesce(bub.GoldBadges::text, '0') ||
+        'S' || coalesce(bub.SilverBadges::text, '0') ||
+        'B' || coalesce(bub.BronzeBadges::text, '0')
+    ) as UserTag
+from 
+    RecursiveUserActivity ua
+left join 
+    UserAggregatedAnswerStats tas on tas.OwnerUserId = ua.UserId
+left join
+    TopUserBadges bub on bub.UserId = ua.UserId
+left join
+    UserRecentActivity ur on ur.UserId = ua.UserId
+left join lateral (
+    select 
+        qd2.*
+    from 
+        QuestionDetails qd2
+    where 
+        qd2.OwnerUserId = ua.UserId
+    order by qd2.Score desc, qd2.ViewCount desc
+    limit 1
+) qd on true
+left join 
+    PostLinks pl on pl.PostId = qd.QuestionId
+left join 
+    LinkTypes lt on lt.Id = pl.LinkTypeId
+left join lateral (
+    select length(qd.Body) - length(regexp_replace(qd.Body, '[^a-zA-Z0-9]', '', 'g')) as length_diff
+) textpos on true
+left join lateral (
+    select t.TagName, t.Count, p.AvgQuestionScore
+    from PopularTagStats p
+    join Tags t on t.TagName = p.TagName
+    where t.TagName = any (
+        select unnest(qd.TagArray)
+    )
+) pts on true
+group by
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.Views,
+    ua.UpVotes,
+    ua.DownVotes,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.TotalBountyReceived,
+    tas.TotalAnswers,
+    tas.TotalAnswerScore,
+    tas.AcceptedAnswersCount,
+    tas.AvgAnswerScore,
+    tas.TotalUpVotes,
+    tas.TotalDownVotes,
+    bub.GoldBadges,
+    bub.SilverBadges,
+    bub.BronzeBadges,
+    ua.ReputationRank,
+    ur.LastEditDate,
+    ur.EditedPostCount,
+    ur.RecentEditTypes,
+    qd.GlobalScoreRank,
+    qd.ClosedDate,
+    pl.LinkTypeId,
+    lt.Name,
+    textpos.length_diff,
+    ua.CreationDate,
+    qd.Body
+order by ua.ReputationRank
+limit 100;

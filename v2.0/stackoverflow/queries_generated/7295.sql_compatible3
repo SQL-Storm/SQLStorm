@@ -1,0 +1,253 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        STRING_AGG(DISTINCT p.Title, ' | ') AS PostTitles,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS TagsUsed,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) AS PositiveScorePosts,
+        COUNT(DISTINCT CASE WHEN p.Score < 0 THEN p.Id END) AS NegativeScorePosts,
+        COUNT(DISTINCT CASE WHEN p.Score = 0 THEN p.Id END) AS ZeroScorePosts,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN (COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) * 100.0) / COUNT(DISTINCT p.Id)
+            ELSE 0 
+        END AS PositiveScorePercentage,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS QuestionsWithAcceptedAnswers,
+        AVG(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN (p.Score - COALESCE(p2_avg.AvgScore, 0)) END) AS AvgScoreDiffWithAcceptedAnswer
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN (
+        SELECT ParentId, AVG(Score) AS AvgScore
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) p2_avg ON p.Id = p2_avg.ParentId
+    LEFT JOIN (
+        SELECT DISTINCT p_inner.Id AS PostId, t_inner.TagName
+        FROM Posts p_inner
+        CROSS JOIN LATERAL (
+            SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p_inner.Tags FROM 2 FOR (CHAR_LENGTH(p_inner.Tags)-2)), '><')) AS TagName
+        ) t_inner
+        WHERE p_inner.PostTypeId = 1
+          AND p_inner.Tags IS NOT NULL
+    ) AS t ON p.Id = t.PostId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01 00:00:00'
+      AND u.Id IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE CreationDate >= TIMESTAMP '2010-01-01 00:00:00')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        ua.*,
+        ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC, ua.PostCount DESC) AS ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY ua.PostCount DESC, ua.Reputation DESC) AS ActivityRank,
+        NTILE(5) OVER (ORDER BY ua.Reputation DESC) AS ReputationQuintile
+    FROM UserActivity ua
+    WHERE ua.PostCount >= 50
+),
+PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        COALESCE(p.Tags, 'No Tags') AS TagsOrDefault,
+        CASE 
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            ELSE 'Other'
+        END AS PostTypeDescription,
+        COALESCE(ans.avg_score, 0) AS AvgAnswerScore,
+        COALESCE(ans.pos_count, 0) AS PositiveAnswers,
+        COALESCE(ans.neg_count, 0) AS NegativeAnswers,
+        COALESCE(ans.zero_count, 0) AS ZeroScoreAnswers,
+        COALESCE(v.total_votes, 0) AS TotalVotes,
+        COALESCE(v.up_votes, 0) AS UpVotes,
+        COALESCE(v.down_votes, 0) AS DownVotes,
+        CASE WHEN EXISTS(SELECT 1 FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2 AND Score > 5) THEN 1 ELSE 0 END AS HasHighScoringAnswer,
+        CASE WHEN EXISTS(SELECT 1 FROM Comments WHERE PostId = p.Id AND Score > 5) THEN 1 ELSE 0 END AS HasHighScoringComment,
+        (p.CreationDate - LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)) AS TimeSinceLastPost,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS ScoreRankWithinUser,
+        PERCENT_RANK() OVER (ORDER BY p.Score) AS ScorePercentile,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = p.OwnerUserId AND p2.Score > p.Score) AS MorePopularPosts,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND OwnerUserId = p.OwnerUserId) THEN 'AboveAvg'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND OwnerUserId = p.OwnerUserId) THEN 'BelowAvg'
+            ELSE 'Avg'
+        END AS ScoreComparisonToUserAvg
+    FROM Posts p
+    LEFT JOIN (
+        SELECT ParentId,
+               AVG(Score) AS avg_score,
+               SUM(CASE WHEN Score > 0 THEN 1 ELSE 0 END) AS pos_count,
+               SUM(CASE WHEN Score < 0 THEN 1 ELSE 0 END) AS neg_count,
+               SUM(CASE WHEN Score = 0 THEN 1 ELSE 0 END) AS zero_count
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) ans ON p.Id = ans.ParentId
+    LEFT JOIN (
+        SELECT PostId,
+               COUNT(*) AS total_votes,
+               SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+               SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes
+        FROM Votes
+        GROUP BY PostId
+    ) v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1,2) 
+      AND p.CreationDate >= TIMESTAMP '2020-01-01 00:00:00'
+      AND COALESCE(p.ParentId, 0) > 0
+),
+UserPostComparison AS (
+    SELECT 
+        ut.UserId,
+        ut.DisplayName,
+        ut.Reputation,
+        ut.PostCount,
+        ut.QuestionCount,
+        ut.AnswerCount,
+        ut.PositiveScorePercentage,
+        COUNT(DISTINCT ps.PostId) AS UserPostCount,
+        AVG(ps.Score) AS AvgPostScore,
+        AVG(ps.ViewCount) AS AvgViewCount,
+        MAX(ps.CreationDate) AS LatestPost,
+        STRING_AGG(DISTINCT ps.PostTypeDescription, ', ') AS PostTypes,
+        SUM(CASE WHEN ps.PostTypeDescription = 'Question' THEN 1 ELSE 0 END) AS NumQuestions,
+        SUM(CASE WHEN ps.PostTypeDescription = 'Answer' THEN 1 ELSE 0 END) AS NumAnswers,
+        COUNT(DISTINCT ps.ParentId) AS UniqueQuestionsAnswered,
+        SUM(CASE WHEN ps.Score > 0 THEN 1 ELSE 0 END) AS NumPositivePosts,
+        SUM(CASE WHEN ps.Score < 0 THEN 1 ELSE 0 END) AS NumNegativePosts
+    FROM TopUsers ut
+    LEFT JOIN PostStats ps ON ut.UserId = ps.OwnerUserId
+    WHERE ps.PostTypeId IN (1,2)
+      AND ps.CreationDate >= DATE '2020-01-01'
+    GROUP BY ut.UserId, ut.DisplayName, ut.Reputation, ut.PostCount, ut.QuestionCount, ut.AnswerCount, ut.PositiveScorePercentage
+)
+SELECT 
+    upc.*,
+    CASE 
+        WHEN upc.Reputation > 10000 THEN 'Elite'
+        WHEN upc.Reputation > 5000 THEN 'Expert'
+        WHEN upc.Reputation > 1000 THEN 'Advanced'
+        ELSE 'Beginner'
+    END AS ReputationTier,
+    CASE 
+        WHEN upc.UserPostCount > 100 THEN 'Highly Active'
+        WHEN upc.UserPostCount > 50 THEN 'Active'
+        WHEN upc.UserPostCount > 10 THEN 'Regular'
+        ELSE 'Occasional'
+    END AS ActivityLevel,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = upc.UserId AND PostTypeId = 1) AS QuestionPostsCount,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = upc.UserId AND PostTypeId = 2) AS AnswerPostsCount,
+    (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = upc.UserId AND PostTypeId = 1) AS AvgQuestionScore,
+    (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = upc.UserId AND PostTypeId = 2) AS AvgAnswerScore,
+    ROUND((upc.NumPositivePosts * 100.0 / NULLIF(upc.UserPostCount, 0)), 2) AS PositivePostRate,
+    ROUND((upc.NumNegativePosts * 100.0 / NULLIF(upc.UserPostCount, 0)), 2) AS NegativePostRate,
+    COALESCE(upc.NumQuestions, 0) + COALESCE(upc.NumAnswers, 0) AS TotalPosts,
+    CASE 
+        WHEN upc.UniqueQuestionsAnswered > 0 THEN 
+            ROUND((upc.UserPostCount * 100.0 / NULLIF(upc.UniqueQuestionsAnswered, 0)), 2)
+        ELSE NULL 
+    END AS AnswerRate,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = upc.UserId AND PostTypeId = 2) > 0 THEN 
+            ROUND((upc.NumPositivePosts * 100.0 / NULLIF((SELECT COUNT(*) FROM Posts WHERE OwnerUserId = upc.UserId AND PostTypeId = 2), 0)), 2)
+        ELSE NULL 
+    END AS AnswerPositiveRate,
+    (
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = upc.UserId AND PostTypeId = 1 AND Score > 5)
+        - 
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = upc.UserId AND PostTypeId = 1 AND Score <= 5)
+    ) AS PositiveMinusNegativeQuestions,
+    (
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = upc.UserId AND PostTypeId = 2 AND Score > 5)
+        - 
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = upc.UserId AND PostTypeId = 2 AND Score <= 5)
+    ) AS PositiveMinusNegativeAnswers,
+    CASE 
+        WHEN COALESCE(filtered_users.ReputationLevel, 0) > 8000 AND 
+             upc.UserPostCount > 30 AND 
+             ROUND((upc.NumPositivePosts * 100.0 / NULLIF(upc.UserPostCount, 0)), 2) > 70 AND 
+             (CASE WHEN upc.UniqueQuestionsAnswered > 0 THEN ROUND((upc.UserPostCount * 100.0 / NULLIF(upc.UniqueQuestionsAnswered, 0)), 2) ELSE NULL END) > 50 
+        THEN 'Top Performer'
+        WHEN COALESCE(filtered_users.ReputationLevel, 0) BETWEEN 2000 AND 8000 AND 
+             upc.UserPostCount > 15 AND 
+             ROUND((upc.NumPositivePosts * 100.0 / NULLIF(upc.UserPostCount, 0)), 2) > 40 AND 
+             (CASE WHEN upc.UniqueQuestionsAnswered > 0 THEN ROUND((upc.UserPostCount * 100.0 / NULLIF(upc.UniqueQuestionsAnswered, 0)), 2) ELSE NULL END) > 30 
+        THEN 'Active Contributor'
+        WHEN COALESCE(filtered_users.ReputationLevel, 0) BETWEEN 500 AND 2000 AND 
+             upc.UserPostCount > 5 AND 
+             ROUND((upc.NumPositivePosts * 100.0 / NULLIF(upc.UserPostCount, 0)), 2) > 30 
+        THEN 'Regular Participant'
+        ELSE 'New Participant'
+    END AS PerformanceCategory,
+    ROW_NUMBER() OVER (ORDER BY upc.UserPostCount DESC) AS UserRank,
+    RANK() OVER (ORDER BY upc.AvgPostScore DESC) AS AvgScoreRank,
+    DENSE_RANK() OVER (ORDER BY upc.Reputation DESC) AS ReputationRank,
+    (SELECT 'Post Type Distribution' UNION ALL SELECT 'Question Distribution' UNION ALL SELECT 'Answer Distribution') AS ReportMetadata,
+    ('User ' || upc.DisplayName || ' (ID:' || upc.UserId || ') ' || 
+        'with ' || upc.UserPostCount || ' posts, ' || 
+        'avg score of ' || ROUND(upc.AvgPostScore, 2) || ', ' || 
+        'reputation ' || upc.Reputation || ' (' || 
+        CASE 
+            WHEN upc.Reputation > 10000 THEN 'Elite'
+            WHEN upc.Reputation > 5000 THEN 'Expert'
+            WHEN upc.Reputation > 1000 THEN 'Advanced'
+            ELSE 'Beginner'
+        END || ')'
+    ) AS UserProfileSummary
+FROM UserPostComparison upc
+INNER JOIN (
+    SELECT 
+        ut.UserId, 
+        ut.DisplayName,
+        ut.Reputation AS ReputationLevel,
+        ut.PostCount AS TotalUserPosts,
+        MAX(ut.ReputationRank) AS MaxReputationRank,
+        MAX(ut.ActivityRank) AS MaxActivityRank
+    FROM TopUsers ut
+    WHERE ut.PostCount >= 30
+    GROUP BY ut.UserId, ut.DisplayName, ut.Reputation, ut.PostCount
+    HAVING COUNT(*) >= 1
+) AS filtered_users 
+ON upc.UserId = filtered_users.UserId
+WHERE upc.UserPostCount > 0
+  AND (
+        (CASE 
+            WHEN upc.Reputation > 10000 THEN 'Elite'
+            WHEN upc.Reputation > 5000 THEN 'Expert'
+            WHEN upc.Reputation > 1000 THEN 'Advanced'
+            ELSE 'Beginner'
+        END) IN ('Elite', 'Expert')
+        OR EXISTS (
+            SELECT 1
+            FROM (
+                SELECT UserId, ROW_NUMBER() OVER (ORDER BY UserPostCount DESC) AS rn
+                FROM UserPostComparison
+            ) t_rn
+            WHERE t_rn.UserId = upc.UserId
+              AND t_rn.rn <= 30
+        )
+      )
+ORDER BY upc.UserPostCount DESC, upc.Reputation DESC
+FETCH FIRST 50 ROWS ONLY;

@@ -1,0 +1,119 @@
+WITH ranked_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.ParentId,
+    p.PostTypeId,
+    p.CommentCount,
+    p.AcceptedAnswerId,
+    p.FavoriteCount,
+    p.ContentLicense,
+    COALESCE(u.Reputation, 0) AS OwnerReputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.Location,
+    u.AccountId,
+    EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / 86400 AS AgeDays
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+),
+pdown AS (
+  SELECT
+    rp.*,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.PostId) AS PostCommentCount,
+    (SELECT COALESCE(SUM(p2.Score),0)
+     FROM Posts p2
+     WHERE p2.OwnerUserId = rp.OwnerUserId
+       AND p2.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days') AS OwnerLast30DayScore
+  FROM ranked_posts rp
+),
+joined AS (
+  SELECT
+    pdown.*,
+    pl.RelatedPostId AS LinkedPostId,
+    pl.LinkTypeId,
+    t.TagName
+  FROM pdown
+  LEFT JOIN PostLinks pl ON pl.PostId = pdown.PostId
+  LEFT JOIN Tags t ON t.ExcerptPostId = pdown.PostId
+),
+aggregates AS (
+  SELECT
+    j.PostId,
+    j.Title,
+    j.OwnerDisplayName,
+    j.OwnerReputation,
+    j.CreationDate,
+    j.LastActivityDate,
+    j.ViewCount,
+    j.Score,
+    j.CommentCount,
+    j.FavoriteCount,
+    j.PostTypeId,
+    j.LinkedPostId,
+    j.LinkTypeId,
+    j.TagName,
+    -- derive TagCount by stripping angle brackets then splitting on '>' and counting non-empty elements
+    (
+      SELECT COUNT(*)
+      FROM (
+        SELECT TRIM(t) AS tag
+        FROM UNNEST(string_to_array(
+          REPLACE(REPLACE(COALESCE(j.Tags, ''), '<', ''), '>', '>'),
+        '>')) AS t
+      ) AS sub
+      WHERE sub.tag <> ''
+    ) AS TagCount,
+    (COALESCE(j.ViewCount, 0) + COALESCE(j.Score, 0) + COALESCE(j.PostCommentCount, 0)) AS EngagementScore,
+    ROW_NUMBER() OVER (
+      PARTITION BY j.PostTypeId
+      ORDER BY
+        j.Score DESC NULLS LAST,
+        j.ViewCount DESC NULLS LAST,
+        j.CreationDate DESC
+    ) AS RankInType
+  FROM joined j
+),
+filtered AS (
+  SELECT
+    a.*,
+    (
+      (a.PostTypeId = 1 AND a.EngagementScore > 100)
+      OR
+      (a.PostTypeId = 2 AND a.EngagementScore > 50)
+      OR
+      (a.PostTypeId = 5)
+    ) AS IncludeFlag
+  FROM aggregates a
+)
+SELECT
+  f.IncludeFlag,
+  f.PostId,
+  f.Title,
+  f.OwnerDisplayName,
+  f.OwnerReputation,
+  f.CreationDate,
+  f.LastActivityDate,
+  f.ViewCount,
+  f.Score,
+  f.CommentCount,
+  f.FavoriteCount,
+  f.PostTypeId,
+  f.LinkedPostId,
+  f.LinkTypeId,
+  f.TagName,
+  f.TagCount,
+  f.EngagementScore,
+  f.RankInType
+FROM filtered f
+WHERE f.IncludeFlag
+  AND (f.LinkedPostId IS NULL OR f.LinkedPostId IN (SELECT p2.Id FROM Posts p2))
+  AND (f.TagName IS NULL OR f.TagName <> '')
+ORDER BY f.RankInType, f.CreationDate DESC
+LIMIT 100;

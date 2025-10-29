@@ -1,0 +1,146 @@
+with UserRankings as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(badge_counts.GoldBadges,0) as GoldBadges,
+        coalesce(badge_counts.SilverBadges,0) as SilverBadges,
+        coalesce(badge_counts.BronzeBadges,0) as BronzeBadges,
+        row_number() over (partition by u.Location order by u.Reputation desc, coalesce(badge_counts.GoldBadges,0) desc) as RankInLocation
+    from Users u
+    left join (
+        select 
+            UserId,
+            sum(case when Class=1 then 1 else 0 end) as GoldBadges,
+            sum(case when Class=2 then 1 else 0 end) as SilverBadges,
+            sum(case when Class=3 then 1 else 0 end) as BronzeBadges
+        from Badges
+        group by UserId
+    ) badge_counts on u.Id = badge_counts.UserId
+    where u.Location is not null
+), PostScoreStats as (
+    select
+        p.OwnerUserId as UserId,
+        count(*) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as Questions,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as Answers,
+        avg(p.Score) as AvgScore,
+        max(p.Score) as MaxScore
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+), TopTags as (
+    select 
+        pt.OwnerUserId as UserId,
+        unnest(string_to_array(substring(pt.Tags from 2 for char_length(pt.Tags) - 2), '><')) as Tag
+    from Posts pt
+    where pt.PostTypeId = 1 and pt.Tags is not null
+), UserTopTags as (
+    select 
+        UserId,
+        Tag,
+        count(*) as TagCount,
+        row_number() over (partition by UserId order by count(*) desc, Tag) as TagRank
+    from TopTags
+    group by UserId, Tag
+    having count(*) > 1
+), CloseVotesCount as (
+    select
+        ph.UserId,
+        count(*) as CloseVotesCast
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10 and ph.UserId is not null
+    group by ph.UserId
+), LatestComments as (
+    select distinct on (c.PostId)
+        c.PostId,
+        c.Id as CommentId,
+        c.UserId as CommenterUserId,
+        c.CreationDate as CommentDate,
+        c.Text as CommentText
+    from Comments c
+    order by c.PostId, c.CreationDate desc
+), UserActivityWindow as (
+    select
+        u.Id as UserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate rows between 6 preceding and current row) as ActivityInLast7Posts
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where p.CreationDate is not null
+)
+select
+    ur.UserId,
+    ur.DisplayName,
+    ur.Location,
+    ur.Reputation,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    pss.TotalPosts,
+    pss.Questions,
+    pss.Answers,
+    round(pss.AvgScore::double precision,2) as AvgPostScore,
+    pss.MaxScore,
+    coalesce(cv.CloseVotesCast, 0) as CloseVotesCast,
+    max(case when utt.TagRank = 1 then utt.Tag else null end) as TopTag,
+    -- emulate ordered distinct aggregation by collecting tag and tagcount pairs then taking top 3 via string_agg workaround
+    (select string_agg(t.Tag, ',') from (
+         select ut.Tag
+         from UserTopTags ut
+         where ut.UserId = ur.UserId and ut.TagRank <= 3
+         order by ut.TagCount desc, ut.Tag
+     ) t) as Top3Tags,
+    lc.CommentId,
+    lc.CommentDate,
+    substring(lc.CommentText from 1 for 50) || case when length(lc.CommentText) > 50 then '...' else '' end as LatestCommentSnippet,
+    ua.ActivityInLast7Posts,
+    case 
+        when ur.Reputation > 100000 and ur.GoldBadges > 10 then 'Elite'
+        when ur.Reputation > 20000 then 'Experienced'
+        else 'Regular'
+    end as UserLevel
+from UserRankings ur
+left join PostScoreStats pss on ur.UserId = pss.UserId
+left join CloseVotesCount cv on ur.UserId = cv.UserId
+left join UserTopTags utt on ur.UserId = utt.UserId and utt.TagRank = 1
+left join LatestComments lc on lc.CommenterUserId = ur.UserId
+left join UserActivityWindow ua on ur.UserId = ua.UserId
+where ur.RankInLocation <= 5
+group by ur.UserId, ur.DisplayName, ur.Location, ur.Reputation, ur.GoldBadges, ur.SilverBadges, ur.BronzeBadges, pss.TotalPosts, pss.Questions, pss.Answers, pss.AvgScore, pss.MaxScore, cv.CloseVotesCast, lc.CommentId, lc.CommentDate, lc.CommentText, ua.ActivityInLast7Posts
+having count(*) filter (where ua.ActivityInLast7Posts > 3) > 0
+
+union
+
+select
+    null as UserId,
+    'Summary' as DisplayName,
+    null as Location,
+    sum(u.Reputation) as Reputation,
+    sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+    sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+    sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+    count(p.Id) as TotalPosts,
+    sum(case when p.PostTypeId = 1 then 1 else 0 end) as Questions,
+    sum(case when p.PostTypeId = 2 then 1 else 0 end) as Answers,
+    avg(p.Score) as AvgPostScore,
+    max(p.Score) as MaxScore,
+    count(ph.Id) filter (where ph.PostHistoryTypeId = 10) as CloseVotesCast,
+    null as TopTag,
+    null as Top3Tags,
+    null as CommentId,
+    null as CommentDate,
+    null as LatestCommentSnippet,
+    null as ActivityInLast7Posts,
+    'Aggregate' as UserLevel
+from Users u
+left join Badges b on u.Id = b.UserId
+left join Posts p on u.Id = p.OwnerUserId
+left join PostHistory ph on ph.UserId = u.Id
+where u.Location is not null
+;

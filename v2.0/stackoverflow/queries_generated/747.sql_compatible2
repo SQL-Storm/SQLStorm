@@ -1,0 +1,394 @@
+with
+q as (
+  select p.Id as QuestionId,
+         p.Title,
+         p.CreationDate as QuestionCreation,
+         coalesce(p.OwnerUserId, -1) as OwnerUserId,
+         p.Score as QuestionScore,
+         p.ViewCount,
+         p.Tags,
+         p.AcceptedAnswerId
+  from Posts p
+  where p.PostTypeId = 1
+),
+a as (
+  select a.Id as AnswerId,
+         a.ParentId as QuestionId,
+         a.OwnerUserId as AnswerOwnerId,
+         a.Score as AnswerScore,
+         a.CreationDate as AnswerCreation,
+         row_number() over (partition by a.ParentId order by a.Score desc NULLS LAST, a.CreationDate asc) as rn_top_by_score,
+         row_number() over (partition by a.ParentId order by a.CreationDate asc) as rn_first_answer,
+         count(*) over (partition by a.ParentId) as AnswerCount
+  from Posts a
+  where a.PostTypeId = 2
+),
+accepted as (
+  select a.QuestionId,
+         a.AnswerId as AcceptedAnswerId,
+         a.AnswerOwnerId as AcceptedOwnerId,
+         a.AnswerScore as AcceptedAnswerScore,
+         a.AnswerCreation as AcceptedAnswerCreation
+  from a
+  join q on q.AcceptedAnswerId = a.AnswerId
+),
+first_ans as (
+  select QuestionId,
+         AnswerId as FirstAnswerId,
+         AnswerOwnerId as FirstAnswerOwnerId,
+         AnswerScore as FirstAnswerScore,
+         AnswerCreation as FirstAnswerCreation
+  from a
+  where rn_first_answer = 1
+),
+top_ans as (
+  select QuestionId,
+         AnswerId as TopAnswerId,
+         AnswerOwnerId as TopAnswerOwnerId,
+         AnswerScore as TopAnswerScore,
+         AnswerCreation as TopAnswerCreation
+  from a
+  where rn_top_by_score = 1
+),
+user_stats as (
+  select u.Id as UserId,
+         u.Reputation,
+         u.CreationDate as UserCreation,
+         u.LastAccessDate,
+         u.UpVotes,
+         u.DownVotes,
+         u.Views as ProfileViews,
+         sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+         sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+         sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+         count(b.Id) as TotalBadges
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes, u.Views
+),
+comments_agg as (
+  select c.PostId,
+         count(*) as CommentCount,
+         sum(coalesce(c.Score,0)) as CommentScoreSum,
+         max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+),
+votes_agg as (
+  select v.PostId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as FavoriteVotes,
+         sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal,
+         min(v.CreationDate) as FirstVoteAt,
+         max(v.CreationDate) as LastVoteAt
+  from Votes v
+  group by v.PostId
+),
+link_dupes as (
+  select pl.PostId,
+         sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateLinks,
+         sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as RelatedLinks
+  from PostLinks pl
+  group by pl.PostId
+),
+close_events as (
+  select ph.PostId,
+         count(*) filter (where ph.PostHistoryTypeId = 10) as CloseEvents,
+         count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenEvents,
+         max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as LastClosedAt,
+         max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenedAt,
+         array_agg(distinct ph.Comment) filter (where ph.PostHistoryTypeId = 10 and ph.Comment ~ '^[0-9]+$') as CloseReasonIds
+  from PostHistory ph
+  group by ph.PostId
+),
+tag_expansion as (
+  select q.QuestionId,
+         unnest(string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><')) as tag
+  from q
+  where q.Tags is not null and q.Tags like '<%>'
+),
+tag_rank as (
+  select te.QuestionId,
+         te.tag,
+         dense_rank() over (partition by te.QuestionId order by lower(te.tag)) as tag_pos
+  from tag_expansion te
+),
+question_enriched as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.QuestionCreation,
+    q.OwnerUserId,
+    q.QuestionScore,
+    q.ViewCount,
+    q.Tags,
+    coalesce(a.AnswerCount, 0) as AnswerCount,
+    va.UpVotes as QUpVotes,
+    va.DownVotes as QDownVotes,
+    va.FavoriteVotes as QFavorites,
+    va.BountyTotal as QBountyTotal,
+    ca.CommentCount as QCommentCount,
+    ca.CommentScoreSum as QCommentScoreSum,
+    le.DuplicateLinks,
+    le.RelatedLinks,
+    ce.CloseEvents,
+    ce.ReopenEvents,
+    ce.LastClosedAt,
+    ce.LastReopenedAt,
+    ce.CloseReasonIds,
+    fa.FirstAnswerId,
+    fa.FirstAnswerOwnerId,
+    fa.FirstAnswerScore,
+    fa.FirstAnswerCreation,
+    ta.TopAnswerId,
+    ta.TopAnswerOwnerId,
+    ta.TopAnswerScore,
+    ta.TopAnswerCreation,
+    ac.AcceptedAnswerId,
+    ac.AcceptedOwnerId,
+    ac.AcceptedAnswerScore,
+    ac.AcceptedAnswerCreation,
+    greatest(
+      coalesce(ac.AcceptedAnswerScore, -2147483648),
+      coalesce(ta.TopAnswerScore, -2147483648),
+      coalesce(fa.FirstAnswerScore, -2147483648)
+    ) as BestObservedAnswerScore,
+    case
+      when ac.AcceptedAnswerId is not null and ta.TopAnswerId is not null and ac.AcceptedAnswerId <> ta.TopAnswerId then 1
+      else 0
+    end as AcceptedNotTopFlag,
+    case
+      when q.Tags ilike '%<sql>%' or q.Tags ilike '%<postgresql>%' then 1 else 0
+    end as IsSQLish
+  from q
+  left join (select QuestionId, max(AnswerCount) as AnswerCount from a group by QuestionId) a on a.QuestionId = q.QuestionId
+  left join votes_agg va on va.PostId = q.QuestionId
+  left join comments_agg ca on ca.PostId = q.QuestionId
+  left join link_dupes le on le.PostId = q.QuestionId
+  left join close_events ce on ce.PostId = q.QuestionId
+  left join first_ans fa on fa.QuestionId = q.QuestionId
+  left join top_ans ta on ta.QuestionId = q.QuestionId
+  left join accepted ac on ac.QuestionId = q.QuestionId
+),
+owner_enriched as (
+  select
+    qe.*,
+    us.Reputation as OwnerReputation,
+    us.UpVotes as OwnerUpVotes,
+    us.DownVotes as OwnerDownVotes,
+    us.TotalBadges as OwnerTotalBadges,
+    us.GoldBadges as OwnerGoldBadges,
+    us.SilverBadges as OwnerSilverBadges,
+    us.BronzeBadges as OwnerBronzeBadges,
+    us.UserCreation as OwnerCreation
+  from question_enriched qe
+  left join user_stats us on us.UserId = nullif(qe.OwnerUserId, -1)
+),
+answerer_mix as (
+  select
+    qe.QuestionId,
+    count(distinct aa.AnswerOwnerId) as DistinctAnswerers,
+    sum(case when us.Reputation >= 10000 then 1 else 0 end) as HighRepAnswerers,
+    avg(cast(us.Reputation as numeric)) as AvgAnswererReputation
+  from a aa
+  join question_enriched qe on qe.QuestionId = aa.QuestionId
+  left join user_stats us on us.UserId = aa.AnswerOwnerId
+  group by qe.QuestionId
+),
+time_metrics as (
+  select
+    qe.QuestionId,
+    cast(extract(epoch from (fa.FirstAnswerCreation - qe.QuestionCreation)) as bigint) as SecsToFirstAnswer,
+    cast(extract(epoch from (ac.AcceptedAnswerCreation - qe.QuestionCreation)) as bigint) as SecsToAccept,
+    cast(extract(epoch from (ta.TopAnswerCreation - qe.QuestionCreation)) as bigint) as SecsToTopAnswer
+  from question_enriched qe
+  left join first_ans fa on fa.QuestionId = qe.QuestionId
+  left join accepted ac on ac.QuestionId = qe.QuestionId
+  left join top_ans ta on ta.QuestionId = qe.QuestionId
+),
+title_quality as (
+  select
+    qe.QuestionId,
+    length(coalesce(qe.Title,'')) as TitleLen,
+    regexp_count(coalesce(qe.Title,''), '\w+') as TitleWordCount,
+    length(regexp_replace(coalesce(qe.Title,''), '[A-Za-z0-9]', '', 'g')) as TitlePunctCount,
+    case when qe.Title ~* '\bhow|why|what|when|where|can|does|is|are\b' then 1 else 0 end as HasInterrogative
+  from question_enriched qe
+),
+tag_pivot as (
+  select
+    tr.QuestionId,
+    max(case when tr.tag_pos = 1 then tr.tag end) as Tag1,
+    max(case when tr.tag_pos = 2 then tr.tag end) as Tag2,
+    max(case when tr.tag_pos = 3 then tr.tag end) as Tag3
+  from tag_rank tr
+  group by tr.QuestionId
+),
+normalized as (
+  select
+    oe.*,
+    am.DistinctAnswerers,
+    am.HighRepAnswerers,
+    am.AvgAnswererReputation,
+    tm.SecsToFirstAnswer,
+    tm.SecsToAccept,
+    tm.SecsToTopAnswer,
+    tq.TitleLen,
+    tq.TitleWordCount,
+    tq.TitlePunctCount,
+    tq.HasInterrogative,
+    tp.Tag1, tp.Tag2, tp.Tag3
+  from owner_enriched oe
+  left join answerer_mix am on am.QuestionId = oe.QuestionId
+  left join time_metrics tm on tm.QuestionId = oe.QuestionId
+  left join title_quality tq on tq.QuestionId = oe.QuestionId
+  left join tag_pivot tp on tp.QuestionId = oe.QuestionId
+),
+scored as (
+  select
+    n.*,
+    (
+      coalesce(n.QuestionScore,0)*2
+      + coalesce(n.QUpVotes,0)*1
+      - coalesce(n.QDownVotes,0)*2
+      + coalesce(n.QFavorites,0)*3
+      + coalesce(n.QCommentScoreSum,0)*0.5
+      + cast(coalesce(n.ViewCount,0) as numeric)/1000
+      + coalesce(n.DistinctAnswerers,0)*1.5
+      + case when n.AcceptedNotTopFlag = 1 then -2 else 0 end
+      + case when coalesce(n.CloseEvents,0) > 0 then -5 else 0 end
+      + case when n.IsSQLish = 1 then 1 else 0 end
+      + cast(coalesce(n.OwnerReputation,0) as numeric)/5000
+      + coalesce(n.OwnerGoldBadges,0)*0.5
+      + coalesce(n.OwnerSilverBadges,0)*0.2
+      + coalesce(n.OwnerBronzeBadges,0)*0.1
+      - cast(coalesce(n.SecsToFirstAnswer,0) as numeric)/86400
+    ) as EngagementScore
+  from normalized n
+),
+ranked as (
+  select
+    s.*,
+    NULL as MedianEngagement,
+    avg(s.EngagementScore) over () as AvgEngagement,
+    stddev_pop(s.EngagementScore) over () as StdEngagement,
+    row_number() over (order by s.EngagementScore desc NULLS LAST, s.QuestionCreation desc) as rn_global,
+    row_number() over (partition by coalesce(s.Tag1, '<<none>>') order by s.EngagementScore desc NULLS LAST) as rn_by_tag1
+  from scored s
+),
+median_calc as (
+  select percentile_disc(0.5) within group (order by EngagementScore) as MedianEngagement from scored
+),
+ranked_with_median as (
+  select
+    r.QuestionId,
+    r.Title,
+    r.Tags,
+    r.Tag1,
+    r.QuestionScore,
+    r.ViewCount,
+    r.AnswerCount,
+    r.QUpVotes,
+    r.QDownVotes,
+    r.QFavorites,
+    r.QBountyTotal,
+    r.QCommentCount,
+    r.DistinctAnswerers,
+    r.HighRepAnswerers,
+    r.OwnerUserId,
+    r.OwnerReputation,
+    r.OwnerTotalBadges,
+    r.FirstAnswerId,
+    r.TopAnswerId,
+    r.AcceptedAnswerId,
+    r.AcceptedNotTopFlag,
+    r.CloseEvents,
+    r.ReopenEvents,
+    r.LastClosedAt,
+    r.EngagementScore,
+    m.MedianEngagement,
+    r.AvgEngagement,
+    r.StdEngagement,
+    r.SecsToFirstAnswer,
+    r.SecsToAccept,
+    r.SecsToTopAnswer,
+    r.HasInterrogative,
+    r.rn_global,
+    r.rn_by_tag1
+  from ranked r
+  cross join median_calc m
+),
+final as (
+  select
+    rw.QuestionId,
+    rw.Title,
+    rw.Tags,
+    coalesce(rw.Tag1,'') as PrimaryTag,
+    rw.QuestionScore,
+    rw.ViewCount,
+    rw.AnswerCount,
+    rw.QUpVotes,
+    rw.QDownVotes,
+    rw.QFavorites,
+    rw.QBountyTotal,
+    rw.QCommentCount,
+    rw.DistinctAnswerers,
+    rw.HighRepAnswerers,
+    rw.OwnerUserId,
+    rw.OwnerReputation,
+    rw.OwnerTotalBadges,
+    rw.FirstAnswerId,
+    rw.TopAnswerId,
+    rw.AcceptedAnswerId,
+    rw.AcceptedNotTopFlag,
+    rw.CloseEvents,
+    rw.ReopenEvents,
+    rw.LastClosedAt,
+    rw.EngagementScore,
+    rw.MedianEngagement,
+    rw.AvgEngagement,
+    rw.StdEngagement,
+    rw.SecsToFirstAnswer,
+    rw.SecsToAccept,
+    rw.SecsToTopAnswer,
+    rw.HasInterrogative,
+    case when rw.EngagementScore >= rw.MedianEngagement then 'above_median' else 'below_median' end as EngagementBucket,
+    to_char((select QuestionCreation from q where q.QuestionId = rw.QuestionId), 'YYYY-MM') as YearMonth
+  from ranked_with_median rw
+  where
+    coalesce(rw.ViewCount,0) > 0
+    and (coalesce(rw.CloseEvents,0) = 0 or coalesce(rw.ReopenEvents,0) >= coalesce(rw.CloseEvents,0))
+    and (
+      rw.Tag1 is null
+      or not exists (
+        select 1
+        from Tags t
+        where lower(t.TagName) = lower(rw.Tag1)
+          and t.IsModeratorOnly = true
+      )
+    )
+)
+select
+  f.YearMonth,
+  f.PrimaryTag,
+  count(*) as Questions,
+  avg(f.EngagementScore) as AvgEngagementScore,
+  min(f.EngagementScore) as MinEngagementScore,
+  max(f.EngagementScore) as MaxEngagementScore,
+  sum(case when f.EngagementBucket = 'above_median' then 1 else 0 end) as AboveMedianCount,
+  sum(f.AnswerCount) as TotalAnswers,
+  avg(f.SecsToFirstAnswer) as AvgSecsToFirstAnswer,
+  sum(case when f.AcceptedAnswerId is not null then 1 else 0 end) as AcceptedCount,
+  sum(coalesce(f.QBountyTotal,0)) as TotalBountyAwarded,
+  sum(coalesce(f.QFavorites,0)) as TotalFavorites,
+  sum(coalesce(f.QUpVotes,0)) as TotalUpvotes,
+  sum(coalesce(f.QDownVotes,0)) as TotalDownvotes
+from final f
+group by rollup (f.YearMonth, f.PrimaryTag)
+having
+  count(*) > 10
+order by
+  f.YearMonth NULLS FIRST,
+  f.PrimaryTag NULLS FIRST,
+  AvgEngagementScore desc NULLS LAST;

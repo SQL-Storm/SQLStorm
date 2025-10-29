@@ -1,0 +1,335 @@
+-- {"query": "84.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3560} 
+with
+-- Param-like seeds
+params as (
+  select
+    cast(365 as int) as days_back,
+    cast(0.15 as numeric(5,4)) as outlier_top_fraction,
+    cast(50 as int) as min_answers_threshold
+),
+-- Focus window of recent activity
+recent_posts as (
+  select p.*
+  from Posts p
+  join params on true
+  where p.CreationDate >= now() - (params.days_back || ' days')::interval
+    and p.PostTypeId in (1,2)
+),
+-- Normalize owner identity including anonymous/soft-deleted
+post_authors as (
+  select
+    rp.Id,
+    coalesce(rp.OwnerUserId, -1) as OwnerUserId,
+    coalesce(u.DisplayName, rp.OwnerDisplayName, 'anonymous') as OwnerName,
+    u.Reputation,
+    u.CreationDate as UserCreationDate,
+    u.Location
+  from recent_posts rp
+  left join Users u on u.Id = rp.OwnerUserId
+),
+-- Vote aggregates for the focus window
+vote_agg as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+    sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as BountyStartAmt,
+    sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as BountyCloseAmt,
+    min(v.CreationDate) as FirstVoteAt,
+    max(v.CreationDate) as LastVoteAt,
+    count(*) as VoteEvents
+  from Votes v
+  join recent_posts rp on rp.Id = v.PostId
+  group by v.PostId
+),
+-- Comment aggregates
+comment_agg as (
+  select
+    c.PostId,
+    count(*) as CommentCount,
+    sum(c.Score) as CommentScore,
+    max(c.CreationDate) as LastCommentAt,
+    sum(case when c.UserId is null then 1 else 0 end) as AnonCommentCount
+  from Comments c
+  join recent_posts rp on rp.Id = c.PostId
+  group by c.PostId
+),
+-- Post history signals like closes, locks, migrations
+history_flags as (
+  select
+    ph.PostId,
+    bool_or(ph.PostHistoryTypeId in (10,35)) as WasClosedOrMigrated,
+    bool_or(ph.PostHistoryTypeId in (11)) as WasReopened,
+    bool_or(ph.PostHistoryTypeId in (14,19)) as WasLockedOrProtected,
+    sum(case when ph.PostHistoryTypeId in (24) then 1 else 0 end) as SuggestedEditsApplied,
+    count(*) filter (where ph.PostHistoryTypeId in (10,11,12,13,14,15,19,20,35)) as ModerationEvents
+  from PostHistory ph
+  join recent_posts rp on rp.Id = ph.PostId
+  group by ph.PostId
+),
+-- Duplicate/linked relationships
+link_agg as (
+  select
+    pl.PostId,
+    sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateLinks,
+    sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as RelatedLinks,
+    count(distinct pl.RelatedPostId) as DistinctLinkedTargets
+  from PostLinks pl
+  join recent_posts rp on rp.Id = pl.PostId
+  group by pl.PostId
+),
+-- Question-level answer stats
+answer_stats as (
+  select
+    q.Id as QuestionId,
+    count(a.Id) as Answers,
+    max(a.Score) as MaxAnswerScore,
+    avg(a.Score::numeric) as AvgAnswerScore,
+    sum(case when a.OwnerUserId is null then 1 else 0 end) as AnonymousAnswers
+  from recent_posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  where q.PostTypeId = 1
+  group by q.Id
+),
+-- Tag parsing into rows
+question_tags as (
+  select
+    q.Id as QuestionId,
+    trim(t) as Tag
+  from recent_posts q
+  cross join lateral (
+    select unnest(
+      case
+        when q.Tags is null then array[]::varchar[]
+        else string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')
+      end
+    )
+  ) s(t)
+  where q.PostTypeId = 1
+),
+-- Tag-level aggregates for the question cohort
+tag_agg as (
+  select
+    qt.QuestionId,
+    count(*) as TagCount,
+    string_agg(qt.Tag, ',' order by qt.Tag) as TagList,
+    sum(case when lower(qt.Tag) like any (array['%sql%','%performance%','%index%']) then 1 else 0 end) as PerfHintTags
+  from question_tags qt
+  group by qt.QuestionId
+),
+-- Compute per-post activity density with window functions
+post_activity as (
+  select
+    rp.Id,
+    rp.PostTypeId,
+    rp.OwnerUserId,
+    rp.Score,
+    rp.ViewCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    extract(epoch from (coalesce(rp.LastActivityDate, now()) - rp.CreationDate)) / 3600.0 as AgeHours,
+    va.UpVotes,
+    va.DownVotes,
+    va.Favorites,
+    va.BountyStartAmt,
+    va.BountyCloseAmt,
+    coalesce(va.VoteEvents,0) as VoteEvents,
+    coalesce(ca.CommentCount,0) as CommentEvents,
+    coalesce(ca.CommentScore,0) as CommentScore,
+    coalesce(ha.ModerationEvents,0) as ModerationEvents,
+    coalesce(la.DuplicateLinks,0) as DuplicateLinks,
+    coalesce(la.RelatedLinks,0) as RelatedLinks,
+    coalesce(la.DistinctLinkedTargets,0) as DistinctLinkedTargets,
+    case when rp.PostTypeId = 1 then coalesce(ans.Answers,0) else null end as Answers,
+    case when rp.PostTypeId = 1 then coalesce(ans.MaxAnswerScore,0) else null end as MaxAnswerScore,
+    case when rp.PostTypeId = 1 then coalesce(ans.AvgAnswerScore,0) else null end as AvgAnswerScore,
+    case when rp.PostTypeId = 1 then coalesce(tag.TagCount,0) else null end as TagCount,
+    case when rp.PostTypeId = 1 then tag.TagList else null end as TagList,
+    case when rp.PostTypeId = 1 then coalesce(tag.PerfHintTags,0) else null end as PerfHintTags,
+    ha.WasClosedOrMigrated,
+    ha.WasReopened,
+    ha.WasLockedOrProtected,
+    ca.LastCommentAt,
+    va.FirstVoteAt,
+    va.LastVoteAt
+  from recent_posts rp
+  left join vote_agg va on va.PostId = rp.Id
+  left join comment_agg ca on ca.PostId = rp.Id
+  left join history_flags ha on ha.PostId = rp.Id
+  left join link_agg la on la.PostId = rp.Id
+  left join answer_stats ans on ans.QuestionId = rp.Id
+  left join tag_agg tag on tag.QuestionId = rp.Id
+),
+-- Rank posts within type by multiple metrics
+ranked as (
+  select
+    pa.*,
+    row_number() over (partition by pa.PostTypeId order by coalesce(pa.Score,0) desc, coalesce(pa.UpVotes,0) desc, coalesce(pa.ViewCount,0) desc) as rn_score,
+    row_number() over (partition by pa.PostTypeId order by (coalesce(pa.UpVotes,0) - coalesce(pa.DownVotes,0)) desc, coalesce(pa.Favorites,0) desc) as rn_netvotes,
+    row_number() over (partition by pa.PostTypeId order by coalesce(pa.AgeHours,0)) as rn_fresh,
+    ntile(100) over (partition by pa.PostTypeId order by nullif(pa.ViewCount,0)::numeric / nullif(pa.AgeHours,0.01) desc nulls last) as pct_view_rate,
+    percent_rank() over (partition by pa.PostTypeId order by coalesce(pa.ModerationEvents,0) desc) as pr_moderation
+  from post_activity pa
+),
+-- Identify outliers by view rate within each post type
+outliers as (
+  select
+    r.*,
+    r.pct_view_rate >= (100 - ceil((select outlier_top_fraction from params)*100)) as IsTopViewRate,
+    case
+      when r.PostTypeId = 1 then
+        case when coalesce(r.Answers,0) >= (select min_answers_threshold from params) then true else false end
+      else null
+    end as HasManyAnswers
+  from ranked r
+),
+-- User cohort stats to correlate with post performance
+user_cohort as (
+  select
+    u.Id as UserId,
+    date_part('year', now()) - date_part('year', u.CreationDate) - case when to_char(now(), 'MMDD') < to_char(u.CreationDate, 'MMDD') then 1 else 0 end as AccountAgeYears,
+    width_bucket(u.Reputation, 0, 100000, 10) as RepBucket,
+    count(b.Id) filter (where b.Class = 1) as GoldBadges,
+    count(b.Id) filter (where b.Class = 2) as SilverBadges,
+    count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+    sum(case when b.TagBased then 1 else 0 end) as TagBadges
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.CreationDate, u.Reputation
+),
+-- Synthesize final scoring with complex predicates and null logic
+scored as (
+  select
+    o.Id,
+    o.PostTypeId,
+    o.Score,
+    o.UpVotes,
+    o.DownVotes,
+    o.ViewCount,
+    o.AgeHours,
+    o.Favorites,
+    o.VoteEvents,
+    o.CommentEvents,
+    o.ModerationEvents,
+    o.DuplicateLinks,
+    o.RelatedLinks,
+    o.Answers,
+    o.MaxAnswerScore,
+    o.AvgAnswerScore,
+    o.TagCount,
+    o.TagList,
+    o.PerfHintTags,
+    o.WasClosedOrMigrated,
+    o.WasReopened,
+    o.WasLockedOrProtected,
+    o.pct_view_rate,
+    o.pr_moderation,
+    o.IsTopViewRate,
+    o.HasManyAnswers,
+    uc.RepBucket,
+    coalesce(uc.GoldBadges,0) as GoldBadges,
+    coalesce(uc.SilverBadges,0) as SilverBadges,
+    coalesce(uc.BronzeBadges,0) as BronzeBadges,
+    -- Composite engagement score mixing normalized components
+    (
+      coalesce(o.Score,0)*1.0
+      + (coalesce(o.UpVotes,0) - 0.75*coalesce(o.DownVotes,0))
+      + least(5, greatest(0, coalesce(o.Favorites,0))) * 0.5
+      + coalesce(o.ViewCount,0) / nullif(o.AgeHours, 1.0)
+      + coalesce(o.CommentEvents,0) * 0.25
+      + coalesce(o.ModerationEvents,0) * -0.5
+      + coalesce(o.DuplicateLinks,0) * -1
+      + case when o.WasClosedOrMigrated then -5 else 0 end
+      + case when o.WasReopened then 3 else 0 end
+      + case when o.PostTypeId = 1 then coalesce(o.Answers,0) * 0.4 else 0 end
+      + case when o.PostTypeId = 1 then coalesce(o.AvgAnswerScore,0) * 0.6 else 0 end
+      + case when o.PerfHintTags is not null and o.PerfHintTags > 0 then 2 else 0 end
+      + coalesce(uc.GoldBadges,0)*0.2 + coalesce(uc.SilverBadges,0)*0.1 + coalesce(uc.BronzeBadges,0)*0.05
+    ) as EngagementScore,
+    -- Text-based signal on title/body heuristics via PostHistory
+    (
+      select
+        count(*) filter (where lower(ph.Comment) like any(array['%duplicate%','%opinion%','%off-topic%']))
+      from PostHistory ph
+      where ph.PostId = o.Id
+    ) as ModReasonHints,
+    -- Time since last activity blending votes and comments
+    least(
+      coalesce(extract(epoch from (now() - o.LastVoteAt)) / 3600.0, 1e6),
+      coalesce(extract(epoch from (now() - o.LastCommentAt)) / 3600.0, 1e6),
+      coalesce(extract(epoch from (now() - o.LastActivityDate)) / 3600.0, 1e6)
+    ) as HoursSinceActivity
+  from outliers o
+  left join user_cohort uc on uc.UserId = o.OwnerUserId
+),
+-- Derive per-type distribution stats for z-scoring
+type_stats as (
+  select
+    PostTypeId,
+    avg(EngagementScore) as mean_score,
+    stddev_pop(EngagementScore) as std_score
+  from scored
+  group by PostTypeId
+),
+final_rank as (
+  select
+    s.*,
+    ts.mean_score,
+    ts.std_score,
+    case when coalesce(ts.std_score,0) = 0 then 0 else (s.EngagementScore - ts.mean_score) / ts.std_score end as z_score,
+    dense_rank() over (partition by s.PostTypeId order by s.EngagementScore desc) as rank_within_type
+  from scored s
+  left join type_stats ts using (PostTypeId)
+)
+select
+  fr.PostTypeId,
+  pt.Name as PostType,
+  fr.Id as PostId,
+  u.DisplayName as Owner,
+  fr.Score,
+  fr.UpVotes,
+  fr.DownVotes,
+  fr.ViewCount,
+  fr.AgeHours,
+  fr.Favorites,
+  fr.CommentEvents,
+  fr.ModerationEvents,
+  fr.Answers,
+  fr.MaxAnswerScore,
+  fr.TagCount,
+  fr.TagList,
+  fr.PerfHintTags,
+  fr.IsTopViewRate,
+  fr.HasManyAnswers,
+  fr.RepBucket,
+  fr.GoldBadges,
+  fr.SilverBadges,
+  fr.BronzeBadges,
+  round(fr.EngagementScore::numeric, 2) as EngagementScore,
+  round(fr.z_score::numeric, 3) as EngagementZ,
+  fr.rank_within_type as RankWithinType,
+  fr.HoursSinceActivity,
+  fr.ModReasonHints
+from final_rank fr
+left join PostTypes pt on pt.Id = fr.PostTypeId
+left join Posts p on p.Id = fr.Id
+left join Users u on u.Id = p.OwnerUserId
+where
+  -- Complicated predicates mixing nulls and booleans
+  (
+    (fr.PostTypeId = 1 and (fr.TagCount is null or fr.TagCount between 1 and 5))
+    or
+    (fr.PostTypeId = 2 and coalesce(fr.DuplicateLinks,0) = 0)
+  )
+  and coalesce(fr.ViewCount,0) >= 0
+  and not (fr.WasLockedOrProtected is true and fr.ModerationEvents > 10)
+  and (
+    fr.IsTopViewRate
+    or (fr.EngagementScore > fr.mean_score + coalesce(fr.std_score,0))
+    or (fr.PostTypeId = 1 and coalesce(fr.Answers,0) >= (select min_answers_threshold from params))
+  )
+order by fr.PostTypeId, fr.rank_within_type
+limit 200;

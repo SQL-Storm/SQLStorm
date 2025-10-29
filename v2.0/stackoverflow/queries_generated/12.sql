@@ -1,0 +1,275 @@
+-- {"query": "12.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2652} 
+with
+-- recent active users with tiering
+recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    u.websiteurl,
+    u.upvotes,
+    u.downvotes,
+    u.views,
+    width_bucket(u.reputation, 0, 100000, 10) as rep_bucket,
+    row_number() over (order by u.reputation desc, u.id) as rn_global
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '5 years' from users)
+),
+-- questions in the last N years with tag parsing and null-safe metrics
+recent_questions as (
+  select
+    p.id as question_id,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    coalesce(p.commentcount, 0) as commentcount,
+    p.closeddate,
+    p.title,
+    p.tags,
+    string_to_array(substring(p.tags, 2, length(p.tags)-2), '><') as tag_arr
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select max(creationdate) - interval '5 years' from posts)
+),
+-- answers referencing recent questions (semi-join) with window ranks
+answers_to_recent as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.creationdate,
+    a.score,
+    row_number() over (partition by a.parentid order by a.score desc nulls last, a.creationdate asc, a.id) as rn_by_q,
+    rank()       over (partition by a.owneruserid order by a.score desc nulls last, a.creationdate desc) as rk_by_user
+  from posts a
+  where a.posttypeid = 2
+    and exists (select 1 from recent_questions rq where rq.question_id = a.parentid)
+),
+-- aggregate votes by type for recent questions
+question_vote_agg as (
+  select
+    v.postid as question_id,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid in (10,12) then 1 else 0 end) as mod_actions
+  from votes v
+  where exists (select 1 from recent_questions rq where rq.question_id = v.postid)
+  group by v.postid
+),
+-- comment sentiment proxy via simple string pattern
+comment_sentiment as (
+  select
+    c.postid,
+    count(*) filter (where position('thanks' in lower(c.text)) > 0 or position('great' in lower(c.text)) > 0) as pos_count,
+    count(*) filter (where position('bad' in lower(c.text)) > 0 or position('wrong' in lower(c.text)) > 0) as neg_count,
+    count(*) as total_comments
+  from comments c
+  where exists (select 1 from recent_questions rq where rq.question_id = c.postid)
+  group by c.postid
+),
+-- tag stats for recent questions
+tag_stats as (
+  select
+    lower(trim(t)) as tag,
+    count(*) as q_count,
+    sum(coalesce(rq.viewcount,0)) as total_views,
+    avg(nullif(rq.score,0)) as avg_nonzero_score
+  from recent_questions rq
+  cross join lateral unnest(rq.tag_arr) as t
+  group by lower(trim(t))
+),
+-- identify duplicates via PostLinks and capture canonical target
+duplicates as (
+  select
+    pl.postid as dup_question_id,
+    pl.relatedpostid as canonical_question_id,
+    min(pl.creationdate) as first_link_date
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid, pl.relatedpostid
+),
+-- closure reasons from PostHistory with JSON parsing for duplicates
+closure_info as (
+  select
+    ph.postid as question_id,
+    min(ph.creationdate) as first_closed_at,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_at,
+    max(case when ph.posthistorytypeid = 10 then try_cast(ph.comment as int) end) as last_close_reason_id,
+    -- count duplicate original ids if present in JSON Text
+    coalesce((
+      select count(*)
+      from json_array_elements_text(ph.text::json -> 'OriginalQuestionIds')
+    ), 0) as duplicate_ref_count
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+    and exists (select 1 from recent_questions rq where rq.question_id = ph.postid)
+  group by ph.postid, ph.text
+),
+-- enrich recent questions with owner info (outer join to include anon)
+question_enriched as (
+  select
+    rq.*,
+    ru.displayname as owner_name,
+    ru.reputation as owner_rep,
+    ru.location as owner_location,
+    ru.websiteurl as owner_site,
+    ru.rep_bucket,
+    case when rq.closeddate is not null then 1 else 0 end as is_closed
+  from recent_questions rq
+  left join recent_users ru on ru.user_id = rq.owneruserid
+),
+-- derive per-question metrics, combining votes, comments, duplicates, closures
+question_metrics as (
+  select
+    qe.question_id,
+    qe.title,
+    qe.creationdate,
+    qe.score,
+    qe.viewcount,
+    qe.answercount,
+    qe.favoritecount,
+    qe.commentcount,
+    qe.owneruserid,
+    qe.owner_name,
+    qe.owner_rep,
+    qe.rep_bucket,
+    qa.upvotes,
+    qa.downvotes,
+    qa.favorites as vote_favorites,
+    qa.mod_actions,
+    cs.pos_count,
+    cs.neg_count,
+    cs.total_comments,
+    d.canonical_question_id,
+    c.first_closed_at,
+    c.last_reopened_at,
+    c.last_close_reason_id,
+    c.duplicate_ref_count,
+    case
+      when qe.closeddate is not null then 'Closed'
+      when d.canonical_question_id is not null then 'Duplicate'
+      when coalesce(qa.upvotes,0) - coalesce(qa.downvotes,0) < 0 then 'Controversial'
+      else 'Open'
+    end as status_bucket
+  from question_enriched qe
+  left join question_vote_agg qa on qa.question_id = qe.question_id
+  left join comment_sentiment cs on cs.postid = qe.question_id
+  left join duplicates d on d.dup_question_id = qe.question_id
+  left join (
+    select question_id,
+           min(first_closed_at) as first_closed_at,
+           max(last_reopened_at) as last_reopened_at,
+           max(last_close_reason_id) as last_close_reason_id,
+           sum(duplicate_ref_count) as duplicate_ref_count
+    from closure_info
+    group by question_id
+  ) c on c.question_id = qe.question_id
+),
+-- compute answer quality signals per question
+answer_quality as (
+  select
+    a.question_id,
+    count(*) as answer_cnt,
+    sum(case when a.score > 0 then 1 else 0 end) as pos_answers,
+    max(a.score) as top_answer_score,
+    count(*) filter (where a.rn_by_q = 1 and a.score >= 1) as has_good_top_answer,
+    count(*) filter (where a.rn_by_q = 1 and a.score is null) as has_null_top_answer
+  from answers_to_recent a
+  group by a.question_id
+),
+-- top answerers slice
+top_answerers as (
+  select
+    a.answerer_id,
+    count(*) as answers_count,
+    sum(greatest(a.score,0)) as nonneg_score_sum,
+    min(a.creationdate) as first_answer_at,
+    max(a.creationdate) as last_answer_at
+  from answers_to_recent a
+  where a.rk_by_user <= 100
+  group by a.answerer_id
+),
+-- combine everything and compute heavy expressions
+final_agg as (
+  select
+    qm.question_id,
+    qm.title,
+    qm.creationdate,
+    qm.owneruserid,
+    coalesce(qm.owner_name, '[anonymous]') as owner_name,
+    coalesce(qm.owner_rep, 0) as owner_rep,
+    qm.rep_bucket,
+    qm.status_bucket,
+    coalesce(qm.upvotes,0) as q_up,
+    coalesce(qm.downvotes,0) as q_down,
+    coalesce(qm.vote_favorites,0) + coalesce(qm.favoritecount,0) as favorites_total,
+    coalesce(qm.viewcount,0) as views,
+    coalesce(aq.answer_cnt,0) as answers,
+    coalesce(aq.pos_answers,0) as pos_answers,
+    coalesce(aq.top_answer_score,0) as top_answer_score,
+    coalesce(cs_ratio.pos_ratio,0.0) as pos_comment_ratio,
+    case when coalesce(qm.viewcount,0) > 0
+         then (coalesce(qm.upvotes,0)::decimal - coalesce(qm.downvotes,0)::decimal) / nullif(qm.viewcount,0)
+         else null end as vote_view_ratio,
+    case when coalesce(qm.answercount,0) > 0
+         then coalesce(qm.viewcount,0)::decimal / nullif(qm.answercount,0)
+         else null end as views_per_answer,
+    case when qm.last_close_reason_id in (101) or qm.duplicate_ref_count > 0 or qm.canonical_question_id is not null
+         then 1 else 0 end as is_duplicate_like,
+    coalesce(qm.first_closed_at, qm.last_reopened_at) as closure_signal,
+    substring(coalesce(qm.title,''), 1, 120) as short_title,
+    array(
+      select lower(trim(t))
+      from unnest(string_to_array(substring(qm.tags, 2, length(qm.tags)-2), '><')) as t
+      where t is not null and length(trim(t)) > 0
+    ) as tag_list
+  from question_metrics qm
+  left join answer_quality aq on aq.question_id = qm.question_id
+  left join lateral (
+    select case when coalesce(qm.total_comments,0) > 0
+                then coalesce(qm.pos_count,0)::decimal / nullif(qm.total_comments,0)
+                else null end as pos_ratio
+  ) cs_ratio on true
+)
+-- produce multi-faceted result set with window rankings and set operator flavor
+select *
+from (
+  select
+    f.*,
+    dense_rank() over (order by (coalesce(q_up,0) - coalesce(q_down,0)) desc, favorites_total desc, views desc) as dr_popularity,
+    ntile(10) over (order by coalesce(views_per_answer, 0) desc nulls last) as ntile_vpa,
+    row_number() over (partition by status_bucket order by coalesce(q_up,0) desc, creationdate desc) as rn_by_status
+  from final_agg f
+  where coalesce(owner_rep,0) >= 0
+) ranked
+where
+  (
+    -- complex predicate mixing null logic, regex-like, and numeric thresholds
+    (status_bucket in ('Open','Closed') and coalesce(pos_comment_ratio,0) >= 0.2 and (q_up - q_down) >= 0)
+    or
+    (status_bucket = 'Duplicate' and is_duplicate_like = 1)
+  )
+  and (
+    -- include questions with certain tags or extreme popularity
+    exists (
+      select 1
+      from unnest(tag_list) t(tag)
+      where tag similar to '(?i)(java|python|javascript|c\+\+|c#|sql)'
+    )
+    or dr_popularity <= 500
+  )
+  and (
+    -- exclude likely low-quality noise
+    not (coalesce(top_answer_score,0) <= -5 and coalesce(views,0) < 50)
+  )
+order by
+  dr_popularity,
+  rn_by_status,
+  creationdate desc
+limit 1000;

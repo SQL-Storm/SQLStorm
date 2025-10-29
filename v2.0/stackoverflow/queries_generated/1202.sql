@@ -1,0 +1,253 @@
+-- {"query": "1202.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2932} 
+
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(P.Score) AS TotalPostScore,
+        AVG(CASE WHEN P.PostTypeId IN (1, 2) THEN P.Score END) AS AvgPostScore,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        MAX(C.CreationDate) AS LastCommentActivity,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        RANK() OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS ReputationRank
+    FROM
+        Users AS U
+    LEFT JOIN
+        Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments AS C ON U.Id = C.UserId
+    LEFT JOIN
+        Badges AS B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+QuestionDetails AS (
+    SELECT
+        Q.Id AS PostId,
+        Q.Title AS PostTitle,
+        Q.OwnerUserId,
+        Q.CreationDate AS PostCreationDate,
+        Q.Score AS PostScore,
+        Q.ViewCount,
+        Q.AnswerCount AS RelatedPostCount, -- For questions, this is AnswerCount
+        Q.CommentCount,
+        Q.FavoriteCount,
+        Q.LastActivityDate,
+        Q.AcceptedAnswerId,
+        (SELECT U2.Reputation FROM Users AS U2 WHERE U2.Id = (SELECT A.OwnerUserId FROM Posts AS A WHERE A.Id = Q.AcceptedAnswerId)) AS RelatedOwnerReputation, -- Accepted answer owner rep
+        'Question' AS PostType,
+        NULL AS ParentPostId,
+        NULL AS IsAcceptedAnswer,
+        DENSE_RANK() OVER (ORDER BY Q.Score DESC, Q.ViewCount DESC, Q.CreationDate DESC) AS PostEngagementRank
+    FROM
+        Posts AS Q
+    WHERE
+        Q.PostTypeId = 1
+),
+AnswerDetails AS (
+    SELECT
+        A.Id AS PostId,
+        SUBSTRING(A.Body, 1, 150) || '...' AS PostTitle, -- Use part of body as title for answers
+        A.OwnerUserId,
+        A.CreationDate AS PostCreationDate,
+        A.Score AS PostScore,
+        NULL AS ViewCount, -- Answers don't have direct view counts
+        NULL AS RelatedPostCount, -- Answers don't have AnswerCount
+        A.CommentCount,
+        NULL AS FavoriteCount, -- Answers usually don't have FavoriteCount (it's on parent Q)
+        A.LastActivityDate,
+        NULL AS AcceptedAnswerId,
+        (SELECT P.OwnerUserId FROM Posts AS P WHERE P.Id = A.ParentId) AS ParentQuestionOwnerUserId, -- Used for calculation later
+        (SELECT U2.Reputation FROM Users AS U2 WHERE U2.Id = (SELECT P.OwnerUserId FROM Posts AS P WHERE P.Id = A.ParentId)) AS RelatedOwnerReputation, -- Parent question owner rep
+        'Answer' AS PostType,
+        A.ParentId AS ParentPostId,
+        CASE WHEN A.Id = (SELECT P.AcceptedAnswerId FROM Posts AS P WHERE P.Id = A.ParentId) THEN TRUE ELSE FALSE END AS IsAcceptedAnswer,
+        ROW_NUMBER() OVER (PARTITION BY A.ParentId ORDER BY A.Score DESC, A.CreationDate ASC) AS PostEngagementRank -- Rank answer within its question
+    FROM
+        Posts AS A
+    WHERE
+        A.PostTypeId = 2
+),
+TagPerformance AS (
+    SELECT
+        QP.Id AS PostId,
+        LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(QP.Tags, 2, LENGTH(QP.Tags) - 2), '><')))) AS TagName,
+        QP.Score AS QuestionScore,
+        QP.ViewCount,
+        QP.CreationDate AS QuestionCreationDate
+    FROM
+        Posts AS QP
+    WHERE
+        QP.PostTypeId = 1 AND QP.Tags IS NOT NULL AND LENGTH(QP.Tags) > 2
+),
+AggregatedTagMetrics AS (
+    SELECT
+        TagName,
+        COUNT(DISTINCT PostId) AS TaggedQuestionCount,
+        SUM(QuestionScore) AS TotalTagScore,
+        AVG(QuestionScore) AS AvgTagQuestionScore,
+        SUM(ViewCount) AS TotalTagViewCount,
+        NTILE(10) OVER (ORDER BY COUNT(DISTINCT PostId) DESC, SUM(ViewCount) DESC) AS TagPopularityDecile
+    FROM
+        TagPerformance
+    GROUP BY
+        TagName
+    HAVING
+        COUNT(DISTINCT PostId) >= 5 -- Only consider tags with at least 5 questions
+),
+HighImpactQuestions AS (
+    SELECT
+        QD.PostId,
+        QD.PostTitle,
+        QD.PostType,
+        QD.OwnerUserId,
+        UE.DisplayName AS OwnerDisplayName,
+        UE.Reputation AS OwnerReputation,
+        QD.PostScore,
+        QD.ViewCount,
+        QD.RelatedPostCount AS AnswerCount,
+        QD.CommentCount,
+        QD.FavoriteCount,
+        QD.PostEngagementRank,
+        QD.AcceptedAnswerId,
+        QD.RelatedOwnerReputation AS AcceptedAnswerOwnerReputation,
+        TP.TagName,
+        ATM.TaggedQuestionCount,
+        ATM.AvgTagQuestionScore,
+        ATM.TagPopularityDecile,
+        (CAST(QD.PostScore AS NUMERIC) / NULLIF(QD.ViewCount, 0)) AS ScorePerViewRatio,
+        COALESCE(QD.FavoriteCount, 0) +
+        (SELECT COUNT(V.Id) FROM Votes AS V WHERE V.PostId = QD.PostId AND V.VoteTypeId = 2) AS TotalUpvotesPlusFavorites
+    FROM
+        QuestionDetails AS QD
+    INNER JOIN
+        UserEngagement AS UE ON QD.OwnerUserId = UE.UserId
+    LEFT JOIN
+        TagPerformance AS TP ON QD.PostId = TP.PostId
+    LEFT JOIN
+        AggregatedTagMetrics AS ATM ON TP.TagName = ATM.TagName
+    WHERE
+        QD.PostScore >= 5
+        AND QD.ViewCount >= 100
+        AND QD.PostEngagementRank <= 1000 -- Filter for top 1000 questions by engagement
+        AND QD.PostCreationDate >= (NOW() - INTERVAL '3 year')
+),
+HighImpactAnswers AS (
+    SELECT
+        AD.PostId,
+        AD.PostTitle,
+        AD.PostType,
+        AD.OwnerUserId,
+        UE.DisplayName AS OwnerDisplayName,
+        UE.Reputation AS OwnerReputation,
+        AD.PostScore,
+        NULL AS ViewCount, -- Answers don't have direct view counts
+        NULL AS AnswerCount, -- Not applicable for answers
+        AD.CommentCount,
+        NULL AS FavoriteCount, -- Not applicable for answers
+        AD.PostEngagementRank,
+        NULL AS AcceptedAnswerId,
+        AD.RelatedOwnerReputation AS ParentQuestionOwnerReputation,
+        AD.IsAcceptedAnswer,
+        NULL AS TagName, -- Tags are on questions, not answers directly in this context
+        NULL AS TaggedQuestionCount,
+        NULL AS AvgTagQuestionScore,
+        NULL AS TagPopularityDecile,
+        (CAST(AD.PostScore AS NUMERIC) / NULLIF(AD.CommentCount + 1, 0) * 100) AS ScorePerCommentRatio, -- Example metric for answers, +1 to avoid div by zero if no comments
+        (SELECT COUNT(V.Id) FROM Votes AS V WHERE V.PostId = AD.PostId AND V.VoteTypeId = 2) AS TotalUpvotesPlusFavorites -- Upvotes on the answer
+    FROM
+        AnswerDetails AS AD
+    INNER JOIN
+        UserEngagement AS UE ON AD.OwnerUserId = UE.UserId
+    WHERE
+        AD.PostScore >= 5
+        AND AD.PostEngagementRank <= 500 -- Filter for top 500 answers within their questions
+        AND AD.IsAcceptedAnswer IS TRUE -- Only accepted answers
+        AND AD.PostCreationDate >= (NOW() - INTERVAL '3 year')
+)
+SELECT
+    'Question' AS EntryType,
+    HIQ.PostId,
+    HIQ.PostTitle,
+    HIQ.OwnerDisplayName,
+    HIQ.OwnerReputation,
+    HIQ.PostScore,
+    HIQ.ViewCount,
+    HIQ.AnswerCount,
+    HIQ.CommentCount,
+    HIQ.FavoriteCount,
+    HIQ.PostEngagementRank,
+    HIQ.TagName,
+    HIQ.TaggedQuestionCount,
+    HIQ.AvgTagQuestionScore,
+    HIQ.TagPopularityDecile,
+    HIQ.ScorePerViewRatio AS PrimaryEngagementMetric,
+    HIQ.TotalUpvotesPlusFavorites,
+    NULL::BOOLEAN AS AnswerAcceptedFlag, -- NULL for questions
+    (HIQ.AcceptedAnswerOwnerReputation - HIQ.OwnerReputation) AS AcceptedAnswerReputationDiff, -- NULL logic, can be NULL
+    'https://stackoverflow.com/questions/' || HIQ.PostId AS PostURL, -- String concatenation
+    COALESCE(HIQ.TagName, 'untagged') AS DisplayTag, -- NULL logic for tags
+    CASE
+        WHEN HIQ.PostScore > 50 AND HIQ.ViewCount > 5000 AND HIQ.AnswerCount > 5 THEN 'Viral Question'
+        WHEN HIQ.ScorePerViewRatio > 0.05 THEN 'Efficient Question'
+        ELSE 'Standard High-Impact Question'
+    END AS PostImpactClassification
+FROM
+    HighImpactQuestions AS HIQ
+WHERE
+    HIQ.OwnerReputation > 1000 -- Filter for users with significant reputation
+    AND HIQ.CommentCount >= 3 -- At least 3 comments
+    AND HIQ.TotalUpvotesPlusFavorites > 10 -- At least 10 upvotes + favorites
+    AND (
+        HIQ.AcceptedAnswerId IS NOT NULL -- Must have an accepted answer
+        OR (HIQ.TagName IS NOT NULL AND HIQ.TagPopularityDecile <= 2) -- Or be in a very popular tag
+    )
+    AND HIQ.PostScore > HIQ.CommentCount -- Complicated predicate
+
+UNION ALL
+
+SELECT
+    'Answer' AS EntryType,
+    HIA.PostId,
+    HIA.PostTitle,
+    HIA.OwnerDisplayName,
+    HIA.OwnerReputation,
+    HIA.PostScore,
+    HIA.ViewCount, -- This will be NULL for answers
+    HIA.AnswerCount, -- This will be NULL for answers
+    HIA.CommentCount,
+    HIA.FavoriteCount, -- This will be NULL for answers
+    HIA.PostEngagementRank,
+    HIA.TagName, -- This will be NULL for answers
+    HIA.TaggedQuestionCount, -- This will be NULL for answers
+    HIA.AvgTagQuestionScore, -- This will be NULL for answers
+    HIA.TagPopularityDecile, -- This will be NULL for answers
+    HIA.ScorePerCommentRatio AS PrimaryEngagementMetric,
+    HIA.TotalUpvotesPlusFavorites,
+    HIA.IsAcceptedAnswer AS AnswerAcceptedFlag,
+    (HIA.OwnerReputation - HIA.ParentQuestionOwnerReputation) AS AnswererReputationVsQuestioner, -- Example of calculation
+    'https://stackoverflow.com/a/' || HIA.PostId AS PostURL,
+    'answer' AS DisplayTag, -- Placeholder for answers as they don't have tags directly
+    CASE
+        WHEN HIA.IsAcceptedAnswer IS TRUE AND HIA.PostScore > 20 THEN 'Highly Accepted & Voted Answer'
+        WHEN HIA.PostScore > 10 THEN 'Well-Received Answer'
+        ELSE 'Standard High-Impact Answer'
+    END AS PostImpactClassification
+FROM
+    HighImpactAnswers AS HIA
+WHERE
+    HIA.OwnerReputation > 500 -- Filter for answerers with decent reputation
+    AND HIA.CommentCount >= 1 -- At least one comment
+    AND HIA.TotalUpvotesPlusFavorites > 5 -- At least 5 upvotes
+    AND HIA.PostScore >= (HIA.CommentCount * 2) -- Complicated predicate
+ORDER BY
+    PrimaryEngagementMetric DESC,
+    OwnerReputation DESC
+LIMIT 2000;

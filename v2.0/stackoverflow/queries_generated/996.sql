@@ -1,0 +1,302 @@
+-- {"query": "996.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2814} 
+with recent_questions as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        case when p.ClosedDate is null then 0 else 1 end as IsClosed
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+),
+user_activity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate as UserCreation,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views as ProfileViews,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct case when b.TagBased = 1 then b.Name end) as TagBadgeVariety
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes, u.Views
+),
+answers as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as AnswerCnt,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.Score > 0 then 1 else 0 end) as PosAnswerCnt
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+comment_stats as (
+    select
+        c.PostId,
+        count(*) as CommentCnt,
+        avg(c.Score) as AvgCommentScore,
+        sum(case when c.Score > 0 then 1 else 0 end) as PosCommentCnt,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.PostId
+),
+vote_agg as (
+    select
+        v.PostId,
+        count(*) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(*) filter (where v.VoteTypeId = 3) as DownVotes,
+        count(*) filter (where v.VoteTypeId = 5) as Favorites,
+        count(*) filter (where v.VoteTypeId in (8,9)) as BountyEvents,
+        sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyAmount
+    from Votes v
+    group by v.PostId
+),
+dup_links as (
+    select
+        pl.PostId as DuplicateOf,
+        count(*) as DupCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId
+),
+linked_network as (
+    select
+        l.PostId,
+        count(*) filter (where l.LinkTypeId = 1) as LinkedCnt,
+        count(*) filter (where l.LinkTypeId = 3) as DuplicateCnt,
+        count(distinct l.RelatedPostId) as UniqueRelated
+    from PostLinks l
+    group by l.PostId
+),
+close_reasons as (
+    select
+        ph.PostId,
+        min(ph.CreationDate) as FirstCloseDate,
+        max(ph.CreationDate) as LastCloseDate,
+        max(cast(nullif(ph.Comment, '') as int)) filter (where ph.PostHistoryTypeId = 10) as LastCloseReasonId
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11,12,13,14,15,19,20,35)
+    group by ph.PostId
+),
+question_tags as (
+    select
+        rq.QuestionId,
+        unnest(string_to_array(substring(rq.Tags, 2, length(rq.Tags)-2), '><')) as TagName
+    from recent_questions rq
+    where rq.Tags is not null
+),
+tag_popularity as (
+    select
+        qt.TagName,
+        count(*) as QuestionTagCount
+    from question_tags qt
+    group by qt.TagName
+),
+ranked_questions as (
+    select
+        rq.QuestionId,
+        rq.Title,
+        rq.CreationDate,
+        rq.OwnerUserId,
+        rq.Score,
+        rq.ViewCount,
+        rq.AnswerCount,
+        rq.IsClosed,
+        coalesce(a.AnswerCnt, 0) as AnswerCnt,
+        coalesce(a.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(a.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(cs.CommentCnt, 0) as CommentCnt,
+        coalesce(cs.AvgCommentScore, 0) as AvgCommentScore,
+        coalesce(va.UpVotes, 0) as UpVotes,
+        coalesce(va.DownVotes, 0) as DownVotes,
+        coalesce(va.Favorites, 0) as Favorites,
+        coalesce(va.BountyEvents, 0) as BountyEvents,
+        coalesce(va.BountyAmount, 0) as BountyAmount,
+        coalesce(ln.LinkedCnt, 0) as LinkedCnt,
+        coalesce(ln.DuplicateCnt, 0) as DuplicateCnt,
+        coalesce(ln.UniqueRelated, 0) as UniqueRelated,
+        cr.FirstCloseDate,
+        cr.LastCloseDate,
+        cr.LastCloseReasonId,
+        dense_rank() over (order by coalesce(va.UpVotes,0) desc, coalesce(va.Favorites,0) desc, rq.ViewCount desc, coalesce(a.AnswerCnt,0) desc) as PopularityRank,
+        row_number() over (partition by rq.OwnerUserId order by rq.CreationDate desc) as UserRecencyRank
+    from recent_questions rq
+    left join answers a on a.QuestionId = rq.QuestionId
+    left join comment_stats cs on cs.PostId = rq.QuestionId
+    left join vote_agg va on va.PostId = rq.QuestionId
+    left join linked_network ln on ln.PostId = rq.QuestionId
+    left join close_reasons cr on cr.PostId = rq.QuestionId
+),
+user_enriched as (
+    select
+        ua.*,
+        case
+            when ua.Reputation >= 20000 then 'Legend'
+            when ua.Reputation >= 10000 then 'Expert'
+            when ua.Reputation >= 3000 then 'Advanced'
+            when ua.Reputation >= 1000 then 'Intermediate'
+            when ua.Reputation is null then 'Unknown'
+            else 'Beginner'
+        end as ReputationTier,
+        (ua.UpVotes - ua.DownVotes) as NetVotes,
+        nullif(trim(coalesce(ua.Location,'')), '') as CleanLocation
+    from user_activity ua
+),
+tag_weight as (
+    select
+        qt.QuestionId,
+        sum(ln(qt.TagName)) as TagNameEntropyProxy,
+        sum(tp.QuestionTagCount) as TotalTagPopularity
+    from question_tags qt
+    left join tag_popularity tp on tp.TagName = qt.TagName
+    group by qt.QuestionId
+),
+closed_dup_reason as (
+    select
+        rq.QuestionId,
+        case
+            when rq.IsClosed = 1 and rq.DuplicateCnt > 0 then 'Closed as Duplicate'
+            when rq.IsClosed = 1 then 'Closed (Other)'
+            else 'Open'
+        end as CloseBucket
+    from ranked_questions rq
+),
+scored as (
+    select
+        rq.QuestionId,
+        rq.Title,
+        rq.CreationDate,
+        rq.OwnerUserId,
+        ue.DisplayName as OwnerName,
+        ue.Reputation,
+        ue.ReputationTier,
+        ue.GoldBadges,
+        ue.SilverBadges,
+        ue.BronzeBadges,
+        coalesce(ue.TagBadgeVariety,0) as TagBadgeVariety,
+        rq.Score,
+        rq.ViewCount,
+        rq.AnswerCnt,
+        rq.MaxAnswerScore,
+        rq.AvgAnswerScore,
+        rq.CommentCnt,
+        rq.AvgCommentScore,
+        rq.UpVotes,
+        rq.DownVotes,
+        rq.Favorites,
+        rq.BountyEvents,
+        rq.BountyAmount,
+        rq.LinkedCnt,
+        rq.DuplicateCnt,
+        rq.UniqueRelated,
+        rq.PopularityRank,
+        rq.UserRecencyRank,
+        tw.TagNameEntropyProxy,
+        tw.TotalTagPopularity,
+        cdr.CloseBucket,
+        cr.Name as LastCloseReasonName,
+        -- Composite performance-heavy score with mixed types, null logic, and scaling
+        (
+            coalesce(rq.UpVotes,0)*1.5
+            - coalesce(rq.DownVotes,0)*0.75
+            + coalesce(rq.Favorites,0)*2.0
+            + least(coalesce(rq.ViewCount,0)/100.0, 500)
+            + coalesce(rq.AnswerCnt,0)*1.25
+            + greatest(coalesce(rq.MaxAnswerScore,0),0)*0.9
+            + coalesce(rq.BountyAmount,0)/50.0
+            + coalesce(tw.TotalTagPopularity,0)/1000.0
+            - case when rq.IsClosed = 1 then 10 else 0 end
+            + case when lower(coalesce(ue.CleanLocation,'')) like any (array['%usa%','%united states%','%europe%','%india%']) then 1 else 0 end
+        ) as CompositeScore
+    from ranked_questions rq
+    left join user_enriched ue on ue.UserId = rq.OwnerUserId
+    left join tag_weight tw on tw.QuestionId = rq.QuestionId
+    left join closed_dup_reason c on c.QuestionId = rq.QuestionId
+    left join CloseReasonTypes cr on cr.Id = rq.LastCloseReasonId
+    left join closed_dup_reason cdr on cdr.QuestionId = rq.QuestionId
+),
+top_and_bottom as (
+    select * from (
+        select s.*, 'TOP' as Segment,
+               row_number() over (order by s.CompositeScore desc, s.PopularityRank asc, s.CreationDate desc) as rn
+        from scored s
+    ) t where t.rn <= 50
+    union all
+    select * from (
+        select s.*, 'BOTTOM' as Segment,
+               row_number() over (order by s.CompositeScore asc, s.PopularityRank desc, s.CreationDate asc) as rn
+        from scored s
+    ) b where b.rn <= 50
+),
+with_tag_text as (
+    select
+        tab.*,
+        -- string expressions and null-safe formatting
+        coalesce('[' || regexp_replace(coalesce((select string_agg(qt.TagName, '][') from question_tags qt where qt.QuestionId = tab.QuestionId), ''), '\s+', ' ', 'g') || ']', '[no-tags]') as TagList
+    from top_and_bottom tab
+)
+select
+    wt.Segment,
+    wt.rn as SegmentRank,
+    wt.QuestionId,
+    wt.Title,
+    wt.TagList,
+    wt.OwnerName,
+    wt.Reputation,
+    wt.ReputationTier,
+    wt.GoldBadges,
+    wt.SilverBadges,
+    wt.BronzeBadges,
+    wt.TagBadgeVariety,
+    wt.CreationDate,
+    wt.Score as PostScore,
+    wt.ViewCount,
+    wt.UpVotes,
+    wt.DownVotes,
+    wt.Favorites,
+    wt.AnswerCnt,
+    round(wt.AvgAnswerScore::numeric, 2) as AvgAnswerScore,
+    wt.MaxAnswerScore,
+    wt.CommentCnt,
+    round(wt.AvgCommentScore::numeric, 2) as AvgCommentScore,
+    wt.BountyEvents,
+    wt.BountyAmount,
+    wt.LinkedCnt,
+    wt.DuplicateCnt,
+    wt.UniqueRelated,
+    wt.PopularityRank,
+    wt.UserRecencyRank,
+    wt.TotalTagPopularity,
+    wt.CloseBucket,
+    coalesce(wt.LastCloseReasonName, 'N/A') as LastCloseReasonName,
+    round(wt.CompositeScore::numeric, 2) as CompositeScore,
+    -- correlated subquery: time to accepted answer if any
+    (
+        select min(a.CreationDate) - q.CreationDate
+        from Posts q
+        join Posts a on a.Id = q.AcceptedAnswerId
+        where q.Id = wt.QuestionId
+    ) as TimeToAcceptedAnswer,
+    -- predicate-heavy flag for "exceptional"
+    case
+        when wt.CompositeScore >= (
+            select percentile_disc(0.95) within group (order by s.CompositeScore) from scored s
+        ) and wt.AnswerCnt >= 3 and wt.ViewCount >= 10000 and wt.DuplicateCnt = 0 then 1
+        else 0
+    end as IsExceptional
+from with_tag_text wt
+order by wt.Segment, wt.rn;

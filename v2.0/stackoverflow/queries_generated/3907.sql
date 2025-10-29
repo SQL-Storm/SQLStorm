@@ -1,0 +1,131 @@
+-- {"query": "3907.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1891} 
+
+WITH 
+-- Aggregate basic user activity
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id)                                AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        COALESCE(SUM(v.UpVotes), 0)                AS VoteScore,
+        MAX(p.CreationDate)                       AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS UpVotes
+        FROM Votes
+        WHERE VoteTypeId = 2                     -- UpMod
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+-- Summarise badges per user
+BadgeAgg AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE b.Class WHEN 1 THEN 1000 WHEN 2 THEN 500 WHEN 3 THEN 100 ELSE 0 END) AS BadgePoints,
+        STRING_AGG(DISTINCT b.Name, ',')                                   AS BadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- Normalise tag strings and count per user/tag
+TagUsage AS (
+    SELECT 
+        pu.OwnerUserId                               AS UserId,
+        UNNEST(string_to_array(TRIM(BOTH '<>' FROM pu.Tags), '><')) AS Tag,
+        COUNT(*)                                     AS TagCount
+    FROM Posts pu
+    WHERE pu.Tags IS NOT NULL
+    GROUP BY pu.OwnerUserId, Tag
+),
+
+-- Pick the most used tag per user
+TopTagPerUser AS (
+    SELECT 
+        tu.UserId,
+        tu.Tag,
+        tu.TagCount,
+        RANK() OVER (PARTITION BY tu.UserId ORDER BY tu.TagCount DESC) AS rnk
+    FROM TagUsage tu
+),
+
+-- Recent comment activity
+RecentComments AS (
+    SELECT 
+        c.UserId,
+        COUNT(*)               AS CommentCount,
+        MAX(c.CreationDate)    AS LastCommentDate
+    FROM Comments c
+    GROUP BY c.UserId
+),
+
+-- Combine everything, add window ranking and complex predicates
+Combined AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.TotalPosts,
+        us.Questions,
+        us.Answers,
+        us.VoteScore,
+        us.LastPostDate,
+        COALESCE(ba.BadgePoints, 0)   AS BadgePoints,
+        ba.BadgeList,
+        rc.CommentCount,
+        rc.LastCommentDate,
+        tp.Tag                         AS TopTag,
+        tp.TagCount                    AS TopTagCount,
+        ROW_NUMBER() OVER (ORDER BY (us.Reputation + COALESCE(ba.BadgePoints,0) + us.VoteScore) DESC) AS GlobalRank
+    FROM UserStats us
+    LEFT JOIN BadgeAgg ba      ON ba.UserId = us.Id
+    LEFT JOIN RecentComments rc ON rc.UserId = us.Id
+    LEFT JOIN (
+        SELECT UserId, Tag, TagCount
+        FROM TopTagPerUser
+        WHERE rnk = 1
+    ) tp ON tp.UserId = us.Id
+    WHERE us.Reputation > 1000
+      AND (us.LastPostDate IS NULL OR us.LastPostDate < CURRENT_TIMESTAMP - INTERVAL '1 year')
+      AND COALESCE(ba.BadgePoints,0) > 0
+),
+
+-- Users with *no* posts but many high‑value badges (to stress outer joins and NULL handling)
+BadgeOnlyUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        0                               AS TotalPosts,
+        0                               AS Questions,
+        0                               AS Answers,
+        0                               AS VoteScore,
+        NULL                            AS LastPostDate,
+        ba.BadgePoints,
+        ba.BadgeList,
+        0                               AS CommentCount,
+        NULL                            AS LastCommentDate,
+        NULL                            AS TopTag,
+        0                               AS TopTagCount,
+        ROW_NUMBER() OVER (ORDER BY ba.BadgePoints DESC) AS GlobalRank
+    FROM Users u
+    LEFT JOIN BadgeAgg ba ON ba.UserId = u.Id
+    LEFT JOIN Posts p    ON p.OwnerUserId = u.Id
+    WHERE p.Id IS NULL                -- no posts at all
+      AND ba.BadgePoints > 2000
+)
+
+-- Final result set, union both groups and keep only the top 150 ranks overall
+SELECT *
+FROM (
+    SELECT * FROM Combined
+    UNION ALL
+    SELECT * FROM BadgeOnlyUsers
+) AS unified
+WHERE GlobalRank <= 150
+ORDER BY GlobalRank;

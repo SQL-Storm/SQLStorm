@@ -1,0 +1,151 @@
+WITH
+  TopUsers AS (
+    SELECT
+      "UserId",
+      "DisplayName",
+      "Reputation",
+      ROW_NUMBER() OVER (ORDER BY "Reputation" DESC) AS rn
+    FROM "Users"
+    WHERE
+      "Views" > 1000
+      AND "CreationDate" < DATE '2023-01-01'
+  ),
+  PostActivity AS (
+    SELECT
+      p."Id" AS PostId,
+      p."Title",
+      p."CreationDate" AS PostCreationDate,
+      p."OwnerUserId",
+      p."PostTypeId",
+      CASE
+        WHEN p."PostTypeId" = 1 THEN 'Question'
+        WHEN p."PostTypeId" = 2 THEN 'Answer'
+        ELSE 'Other'
+      END AS PostType,
+      COALESCE(p."AnswerCount", 0) AS AnswerCount,
+      COALESCE(p."CommentCount", 0) AS CommentCount,
+      COALESCE(p."FavoriteCount", 0) AS FavoriteCount,
+      p."Score",
+      p."ViewCount",
+      CAST((CAST(p."LastActivityDate" AS DATE) - CAST(p."CreationDate" AS DATE)) AS INTEGER) AS DaysSinceLastActivity,
+      CASE
+        WHEN p."ClosedDate" IS NOT NULL THEN 1
+        ELSE 0
+      END AS IsClosed,
+      (
+        SELECT
+          COUNT(*)
+        FROM "Comments" c
+        WHERE
+          c."PostId" = p."Id" AND c."CreationDate" > p."CreationDate"
+      ) AS CommentCountAfterCreation,
+      (
+        SELECT
+          SUM(CASE WHEN v."VoteTypeId" IN (2, 3) THEN 1 ELSE 0 END)
+        FROM "Votes" v
+        WHERE
+          v."PostId" = p."Id"
+      ) AS TotalVotesOnPost
+    FROM "Posts" p
+    WHERE
+      p."OwnerUserId" IN (
+        SELECT
+          "UserId"
+        FROM TopUsers
+        WHERE
+          rn <= 100
+      )
+      AND p."CreationDate" > DATE '2020-01-01'
+  ),
+  UserContributionSummary AS (
+    SELECT
+      tu."UserId",
+      tu."DisplayName",
+      tu."Reputation",
+      COUNT(pa.PostId) AS TotalPosts,
+      SUM(CASE WHEN pa.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAnswered,
+      SUM(CASE WHEN pa.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersPosted,
+      AVG(pa.Score) AS AvgPostScore,
+      SUM(pa.FavoriteCount) AS TotalFavorites,
+      COUNT(DISTINCT CASE WHEN pa.IsClosed = 1 THEN pa.PostId ELSE NULL END) AS ClosedPosts,
+      tu.rn
+    FROM TopUsers tu
+    LEFT JOIN PostActivity pa
+      ON tu."UserId" = pa."OwnerUserId"
+    WHERE
+      tu.rn <= 50
+    GROUP BY
+      tu."UserId",
+      tu."DisplayName",
+      tu."Reputation",
+      tu.rn
+  ),
+  PostQualityMetrics AS (
+    SELECT
+      pa.PostId,
+      pa.Title,
+      pa.PostType,
+      pa.Score,
+      pa.ViewCount,
+      pa.AnswerCount,
+      pa.CommentCount,
+      pa.FavoriteCount,
+      pa.IsClosed,
+      pa.DaysSinceLastActivity,
+      pa.CommentCountAfterCreation,
+      pa.TotalVotesOnPost,
+      CASE
+        WHEN pa.Score > 10 AND pa.AnswerCount > 5 THEN 'High Quality'
+        WHEN pa.Score < 0 AND pa.CommentCountAfterCreation > 2 THEN 'Needs Attention'
+        ELSE 'Standard'
+      END AS QualityIndicator,
+      CASE
+        WHEN pa.DaysSinceLastActivity > 365 THEN 'Stale'
+        ELSE 'Active'
+      END AS ActivityStatus,
+      pa.OwnerUserId
+    FROM PostActivity pa
+  )
+SELECT
+  ucs."DisplayName",
+  ucs."Reputation",
+  ucs."TotalPosts",
+  ucs."QuestionsAnswered",
+  ucs."AnswersPosted",
+  ucs."AvgPostScore",
+  ucs."TotalFavorites",
+  ucs."ClosedPosts",
+  COUNT(DISTINCT pqm.PostId) AS TotalPostsTracked,
+  SUM(pqm.Score) AS TotalScoreOfTrackedPosts,
+  AVG(pqm.ViewCount) AS AvgViewCountOfTrackedPosts,
+  SUM(pqm.FavoriteCount) AS TotalFavoritesOfTrackedPosts,
+  COUNT(DISTINCT CASE WHEN pqm.IsClosed = 1 THEN pqm.PostId ELSE NULL END) AS ClosedTrackedPosts,
+  SUM(CASE WHEN pqm.ActivityStatus = 'Stale' THEN 1 ELSE 0 END) AS StaleTrackedPosts,
+  SUM(CASE WHEN pqm.QualityIndicator = 'High Quality' THEN 1 ELSE 0 END) AS HighQualityTrackedPosts,
+  COUNT(DISTINCT p."Id") AS LinkedPostsCount,
+  COALESCE(lt."Name", 'Unknown') AS LinkTypeName,
+  ucs."UserId"
+FROM UserContributionSummary ucs
+LEFT JOIN PostQualityMetrics pqm
+  ON ucs."UserId" = pqm.OwnerUserId
+LEFT JOIN "Posts" p
+  ON pqm.PostId = p."Id"
+LEFT JOIN "PostLinks" pl
+  ON p."Id" = pl."PostId"
+LEFT JOIN "LinkTypes" lt
+  ON pl."LinkTypeId" = lt."Id"
+GROUP BY
+  ucs."UserId",
+  ucs."DisplayName",
+  ucs."Reputation",
+  ucs."TotalPosts",
+  ucs."QuestionsAnswered",
+  ucs."AnswersPosted",
+  ucs."AvgPostScore",
+  ucs."TotalFavorites",
+  ucs."ClosedPosts",
+  lt."Name"
+ORDER BY
+  ucs."Reputation" DESC,
+  ucs."TotalPosts" DESC
+FETCH FIRST 100 ROWS ONLY;

@@ -1,0 +1,283 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as QuestionWithAcceptedAnswer,
+        STRING_AGG(DISTINCT COALESCE(p.Tags, ''), ', ') as AllTags,
+        AVG(CAST(p.Score AS DOUBLE PRECISION)) as AvgPostScore,
+        COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) as PositiveScoredPosts,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        COALESCE(SUM(p.FavoriteCount), 0) as TotalFavorites,
+        CAST((CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate) AS INTEGER) * 1 as AccountAgeDays,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 1000 THEN 'Veteran'
+            WHEN u.Reputation > 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END as ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+RankedUsers AS (
+    SELECT UserId, DisplayName, Reputation, Views, UpVotes, DownVotes, PostCount, CommentCount, BadgeCount, LastPostDate, LastCommentDate,
+        QuestionCount, AnswerCount, QuestionWithAcceptedAnswer, AllTags, AvgPostScore, PositiveScoredPosts, TotalViews, TotalFavorites, AccountAgeDays, ReputationTier,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC, Views DESC) as RankByReputation,
+        RANK() OVER (ORDER BY TotalViews DESC) as RankByViews,
+        DENSE_RANK() OVER (ORDER BY QuestionCount DESC) as RankByQuestions
+    FROM UserStats
+),
+TopPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostTypeDesc,
+        CAST((CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate) AS INTEGER) * 1 as AgeInDays,
+        CAST((COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate) AS INTEGER) * 1 as ActivityDurationDays,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementCount,
+        CASE 
+            WHEN p.Score <= -5 THEN 'Downvoted'
+            WHEN p.Score <= 0 THEN 'Neutral'
+            WHEN p.Score <= 10 THEN 'Positive'
+            WHEN p.Score <= 50 THEN 'Highly Positive'
+            ELSE 'Exceptional'
+        END as ScoreCategory
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months')
+),
+AggregatedData AS (
+    SELECT 
+        'AllUsers' as DataSource,
+        COUNT(*) as TotalUsers,
+        COUNT(CASE WHEN Reputation > 1000 THEN 1 END) as HighReputationUsers,
+        AVG(Reputation) as AvgReputation,
+        AVG(PostCount) as AvgPostsPerUser,
+        AVG(Views) as AvgViewsPerUser,
+        AVG(UpVotes) as AvgUpVotesPerUser
+    FROM UserStats
+    UNION ALL
+    SELECT 
+        'ActiveUsers' as DataSource,
+        COUNT(*) as TotalUsers,
+        COUNT(CASE WHEN Reputation > 1000 THEN 1 END) as HighReputationUsers,
+        AVG(Reputation) as AvgReputation,
+        AVG(PostCount) as AvgPostsPerUser,
+        AVG(Views) as AvgViewsPerUser,
+        AVG(UpVotes) as AvgUpVotesPerUser
+    FROM UserStats 
+    WHERE LastPostDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 weeks')
+    UNION ALL
+    SELECT 
+        'QuestionPosts' as DataSource,
+        COUNT(*) as TotalUsers,
+        0 as HighReputationUsers,
+        AVG(Score) as AvgReputation,
+        AVG(ViewCount) as AvgPostsPerUser,
+        AVG(FavoriteCount) as AvgViewsPerUser,
+        AVG(AnswerCount) as AvgUpVotesPerUser
+    FROM TopPosts 
+    WHERE PostTypeId = 1
+    UNION ALL
+    SELECT 
+        'AnswerPosts' as DataSource,
+        COUNT(*) as TotalUsers,
+        0 as HighReputationUsers,
+        AVG(Score) as AvgReputation,
+        AVG(ViewCount) as AvgPostsPerUser,
+        AVG(FavoriteCount) as AvgViewsPerUser,
+        AVG(CommentCount) as AvgUpVotesPerUser
+    FROM TopPosts 
+    WHERE PostTypeId = 2
+),
+ComplexJoinResult AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.PostCount,
+        ru.QuestionCount,
+        ru.AnswerCount,
+        ru.AvgPostScore,
+        ru.TotalViews,
+        ru.TotalFavorites,
+        ru.ReputationTier,
+        ru.RankByReputation,
+        ru.RankByViews,
+        ru.RankByQuestions,
+        COALESCE(tp.Title, 'No Title') as RecentPostTitle,
+        COALESCE(tp.Score, 0) as RecentPostScore,
+        COALESCE(tp.ViewCount, 0) as RecentPostViews,
+        tp.PostTypeDesc,
+        tp.AgeInDays,
+        tp.ScoreCategory,
+        CASE 
+            WHEN ABS(tp.Score) > 100 AND tp.AgeInDays < 30 THEN 'High Impact Recent'
+            WHEN tp.Score > 10 AND tp.ActivityDurationDays > 7 THEN 'Active Contributor'
+            WHEN tp.Score > 5 AND tp.AgeInDays < 90 THEN 'Recent Activity'
+            ELSE 'Regular'
+        END as ActivityLevel,
+        CASE 
+            WHEN tp.PostTypeId = 1 AND tp.AnswerCount > 0 AND tp.Score > 10 THEN 'Question with Quality Answers'
+            WHEN tp.PostTypeId = 2 AND tp.Score > 20 THEN 'High Score Answer'
+            WHEN tp.PostTypeId = 1 AND tp.Score > 50 THEN 'Popular Question'
+            ELSE 'Standard Post'
+        END as PostClassification,
+        TRIM(BOTH ' ' FROM CASE WHEN tp.Tags IS NULL THEN '' ELSE tp.Tags END) as CleanTags,
+        CASE 
+            WHEN tp.PostTypeId = 1 THEN 
+                (SELECT COUNT(*) 
+                 FROM Comments c 
+                 WHERE c.PostId = tp.PostId)
+            ELSE 0 
+        END as CommentCountOnPost,
+        ru.LastPostDate,
+        ru.LastCommentDate,
+        ru.AccountAgeDays
+    FROM RankedUsers ru
+    LEFT JOIN TopPosts tp ON ru.UserId = tp.OwnerUserId 
+    WHERE ru.Reputation > 1000 
+       OR (ru.QuestionCount > 5 AND ru.AnswerCount > 10)
+       OR ru.PostCount > 100
+),
+FinalResult AS (
+    SELECT 
+        cj.*,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC, PostCount DESC) as OverallRank,
+        CASE 
+            WHEN ReputationTier = 'Elite' THEN 
+                (SELECT COUNT(*) FROM UserStats WHERE ReputationTier = 'Elite') 
+            WHEN ReputationTier = 'Veteran' THEN 
+                (SELECT COUNT(*) FROM UserStats WHERE ReputationTier = 'Veteran') 
+            WHEN ReputationTier = 'Regular' THEN 
+                (SELECT COUNT(*) FROM UserStats WHERE ReputationTier = 'Regular') 
+            ELSE 
+                (SELECT COUNT(*) FROM UserStats WHERE ReputationTier = 'Newbie') 
+        END as TierPopulation,
+        COALESCE(RecentPostScore, 0) + COALESCE(RecentPostViews, 0) as EngagementMetric,
+        CASE 
+            WHEN DENSE_RANK() OVER (ORDER BY Reputation DESC, PostCount DESC) <= 5 THEN 'Top 5'
+            WHEN DENSE_RANK() OVER (ORDER BY Reputation DESC, PostCount DESC) <= 25 THEN 'Top 25'
+            WHEN DENSE_RANK() OVER (ORDER BY Reputation DESC, PostCount DESC) <= 100 THEN 'Top 100'
+            ELSE 'Others'
+        END as RankGroup,
+        CASE WHEN RecentPostViews > RecentPostScore THEN 'Views Dominant' ELSE 'Score Dominant' END as PerformanceMetric,
+        CASE 
+            WHEN RecentPostScore > 100 THEN 'Extremely High'
+            WHEN RecentPostScore > 50 THEN 'High'
+            WHEN RecentPostScore > 10 THEN 'Moderate'
+            WHEN RecentPostScore > 0 THEN 'Low'
+            ELSE 'Negative'
+        END as ScoreLevel,
+        COALESCE(RecentPostTitle, 'No Recent Activity') as CurrentActivity,
+        COALESCE(CleanTags, 'No Tags') as TagInfo,
+        COALESCE(CAST(CommentCountOnPost AS TEXT), '0') as DirectCommentCount
+    FROM ComplexJoinResult cj
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    PostCount,
+    QuestionCount,
+    AnswerCount,
+    AvgPostScore,
+    TotalViews,
+    TotalFavorites,
+    ReputationTier,
+    RankByReputation,
+    RankByViews,
+    RankByQuestions,
+    RecentPostTitle,
+    RecentPostScore,
+    RecentPostViews,
+    PostTypeDesc,
+    AgeInDays,
+    ScoreCategory,
+    ActivityLevel,
+    PostClassification,
+    CleanTags,
+    CommentCountOnPost,
+    OverallRank,
+    TierPopulation,
+    EngagementMetric,
+    RankGroup,
+    PerformanceMetric,
+    ScoreLevel,
+    CurrentActivity,
+    TagInfo,
+    DirectCommentCount,
+    CASE 
+        WHEN AgeInDays > 365 THEN 'Long Term Contributor'
+        WHEN AgeInDays > 90 THEN 'Active Contributor'
+        WHEN AgeInDays > 30 THEN 'Recent Active'
+        ELSE 'New Contributor'
+    END as ContributionDuration,
+    CASE 
+        WHEN CommentCountOnPost > 10 THEN 'Highly Engaged'
+        WHEN CommentCountOnPost > 5 THEN 'Moderately Engaged'
+        WHEN CommentCountOnPost > 0 THEN 'Slightly Engaged'
+        ELSE 'Not Engaged'
+    END as EngagementStatus,
+    NULLIF(
+        CASE 
+            WHEN TotalFavorites > 0 THEN CAST(TotalFavorites AS DOUBLE PRECISION) / NULLIF(CAST(TotalViews AS DOUBLE PRECISION),0) * 100
+            ELSE 0
+        END, 0
+    ) as FavoriteRatePercent,
+    NULLIF(
+        CASE 
+            WHEN PostCount > 0 THEN CAST(AnswerCount AS DOUBLE PRECISION) / NULLIF(CAST(PostCount AS DOUBLE PRECISION),0) * 100
+            ELSE 0
+        END, 0
+    ) as AnswerRatePercent,
+    CAST(Reputation AS NUMERIC(18,2)) / NULLIF(CAST(AccountAgeDays AS NUMERIC(18,2)), 0) as ReputationPerDay,
+    COALESCE(
+        (SELECT COUNT(DISTINCT Id) 
+         FROM Badges b 
+         WHERE b.UserId = FinalResult.UserId 
+           AND b.Date >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months')), 
+        0
+    ) as RecentBadgeCount,
+    CASE 
+        WHEN PostCount > 50 AND AvgPostScore > 5 THEN 'Productive'
+        WHEN PostCount > 25 AND AvgPostScore > 2 THEN 'Moderately Productive'
+        ELSE 'Standard'
+    END as ProductivityLevel,
+    CAST((CAST('2024-10-01 12:34:56' AS timestamp) - LastPostDate) AS INTEGER) * 1 as DaysSinceLastPost,
+    CAST((CAST('2024-10-01 12:34:56' AS timestamp) - LastCommentDate) AS INTEGER) * 1 as DaysSinceLastComment,
+    repeat('*', CAST(Reputation / 1000 AS INTEGER)) as ReputationStarRating
+FROM FinalResult
+WHERE OverallRank <= 200
+ORDER BY OverallRank, Reputation DESC, PostCount DESC;

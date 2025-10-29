@@ -1,0 +1,214 @@
+-- {"query": "7807.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1745} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS UNBOUNDED PRECEDING) as cumulative_score,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'High'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Low'
+            ELSE 'Average'
+        END as score_category,
+        COALESCE(p.Title, 'No Title') as safe_title,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                ARRAY_LENGTH(string_to_array(trim(p.Tags, '<>'), '><'), 1)
+            ELSE 0
+        END as tag_count
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.ViewCount,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answer_count,
+        AVG(CAST(p.Score AS FLOAT)) as avg_post_score,
+        MAX(CAST(p.CreationDate AS DATE)) as last_post_date,
+        STRING_AGG(DISTINCT p.Tags, '; ') as all_tags,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, ' || ') as question_titles
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.ViewCount
+),
+AnswerStats AS (
+    SELECT 
+        pa.ParentId,
+        COUNT(pa.Id) as answer_count,
+        AVG(pa.Score) as avg_answer_score,
+        MAX(pa.CreationDate) as latest_answer_date,
+        STRING_AGG(pa.OwnerUserId::VARCHAR, ', ') as answer_owners
+    FROM Posts pa
+    WHERE pa.PostTypeId = 2
+    GROUP BY pa.ParentId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > (SELECT AVG(Count) FROM Tags) THEN 'Popular'
+            WHEN t.Count < (SELECT AVG(Count) FROM Tags) THEN 'Rare'
+            ELSE 'Moderate'
+        END as tag_popularity,
+        COALESCE((SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%'), 0) as usage_count
+    FROM Tags t
+),
+ComplexQuestions AS (
+    SELECT 
+        r.Id,
+        r.Score,
+        r.ViewCount,
+        r.Title,
+        r.safe_title,
+        r.tag_count,
+        r.score_category,
+        r.cumulative_score,
+        CASE 
+            WHEN r.prev_score IS NULL THEN 'First Post'
+            WHEN r.prev_score > r.Score THEN 'Decreased Score'
+            WHEN r.prev_score < r.Score THEN 'Increased Score'
+            ELSE 'Unchanged Score'
+        END as score_trend,
+        CASE 
+            WHEN r.AnswerCount > 5 THEN 'Many Answers'
+            WHEN r.AnswerCount > 0 THEN 'Some Answers'
+            ELSE 'No Answers'
+        END as answer_status,
+        CASE 
+            WHEN r.CommentCount > 10 THEN 'Highly Commented'
+            WHEN r.CommentCount > 2 THEN 'Moderately Commented'
+            ELSE 'Few Comments'
+        END as comment_status,
+        CASE 
+            WHEN r.FavoriteCount > 2 THEN 'Highly Favorited'
+            WHEN r.FavoriteCount > 0 THEN 'Moderately Favorited'
+            ELSE 'Not Favorited'
+        END as favorite_status,
+        CASE 
+            WHEN r.LastActivityDate >= CURRENT_TIMESTAMP - INTERVAL '7 days' THEN 'Recently Active'
+            WHEN r.LastActivityDate >= CURRENT_TIMESTAMP - INTERVAL '30 days' THEN 'Active Recently'
+            ELSE 'Inactive'
+        END as activity_status
+    FROM RankedPosts r
+    WHERE r.rn = 1
+),
+CombinedAnalysis AS (
+    SELECT 
+        cq.Id,
+        cq.Score,
+        cq.ViewCount,
+        cq.Title,
+        cq.safe_title,
+        cq.tag_count,
+        cq.score_category,
+        cq.cumulative_score,
+        cq.score_trend,
+        cq.answer_status,
+        cq.comment_status,
+        cq.favorite_status,
+        cq.activity_status,
+        us.total_posts,
+        us.question_count,
+        us.answer_count,
+        us.avg_post_score,
+        us.last_post_date,
+        us.all_tags,
+        CASE 
+            WHEN us.total_posts > 50 THEN 'High Contributor'
+            WHEN us.total_posts > 10 THEN 'Moderate Contributor'
+            ELSE 'New Contributor'
+        END as contributor_level,
+        ta.TagName,
+        ta.Count as tag_count_stats,
+        ta.tag_popularity,
+        ast.answer_count,
+        ast.avg_answer_score,
+        ast.latest_answer_date,
+        CASE 
+            WHEN ast.answer_count > 0 THEN 'Has Answers'
+            ELSE 'No Answers'
+        END as has_answers
+    FROM ComplexQuestions cq
+    LEFT JOIN UserStats us ON cq.OwnerUserId = us.UserId
+    LEFT JOIN AnswerStats ast ON cq.Id = ast.ParentId
+    LEFT JOIN Tags ta ON ta.TagName IN (
+        SELECT UNNEST(string_to_array(cq.Tags, '><')) 
+        WHERE cq.Tags IS NOT NULL AND cq.Tags != ''
+    )
+)
+SELECT 
+    ca.Id,
+    ca.Score,
+    ca.ViewCount,
+    ca.Title,
+    ca.safe_title,
+    ca.tag_count,
+    ca.score_category,
+    ca.cumulative_score,
+    ca.score_trend,
+    ca.answer_status,
+    ca.comment_status,
+    ca.favorite_status,
+    ca.activity_status,
+    ca.total_posts,
+    ca.question_count,
+    ca.answer_count,
+    ca.avg_post_score,
+    ca.last_post_date,
+    ca.all_tags,
+    ca.contributor_level,
+    ca.TagName,
+    ca.tag_count_stats,
+    ca.tag_popularity,
+    ca.answer_count as answers,
+    ca.avg_answer_score,
+    ca.latest_answer_date,
+    ca.has_answers,
+    CASE 
+        WHEN ca.avg_answer_score > 50 THEN 'Excellent Answers'
+        WHEN ca.avg_answer_score > 20 THEN 'Good Answers'
+        ELSE 'Average Answers'
+    END as answer_quality,
+    DENSE_RANK() OVER (ORDER BY ca.Score DESC) as rank_by_score,
+    PERCENT_RANK() OVER (ORDER BY ca.ViewCount) as percentile_views,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Score > ca.Score) as posts_above_score,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Score < ca.Score) as posts_below_score,
+    CASE 
+        WHEN ca.score_category = 'High' AND ca.answer_status = 'Many Answers' THEN 'Top Performer'
+        WHEN ca.score_category = 'Low' AND ca.answer_status = 'No Answers' THEN 'Low Performer'
+        ELSE 'Normal Performer'
+    END as performance_category
+FROM CombinedAnalysis ca
+WHERE 
+    ca.Title IS NOT NULL
+    AND (ca.Score IS NOT NULL OR ca.ViewCount IS NOT NULL)
+    AND (ca.answer_count > 0 OR ca.TagName IS NOT NULL)
+    AND ca.contributor_level IN ('High Contributor', 'Moderate Contributor')
+    AND ca.tag_popularity IN ('Popular', 'Moderate')
+ORDER BY 
+    ca.Score DESC,
+    ca.ViewCount DESC,
+    ca.total_posts DESC
+LIMIT 1000;

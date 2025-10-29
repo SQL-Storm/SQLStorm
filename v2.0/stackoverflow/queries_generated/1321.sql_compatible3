@@ -1,0 +1,195 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViewCount,
+        MAX(P.LastActivityDate) AS LastPostActivity
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostTagAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount AS PostFavoriteCount,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.Title,
+        P.Tags,
+        COALESCE(P.Body, '') AS PostBody,
+        (CASE WHEN P.Tags LIKE '%<sql>%' OR P.Tags LIKE '%<database>%' THEN 1 ELSE 0 END) AS IsSqlOrDatabaseRelated
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2)
+),
+PostHistoryMetrics AS (
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS EditCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate END) AS LastEditHistoryDate,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Id END) AS CloseVoteCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS LastClosureDate,
+        MIN(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS FirstClosureDate
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 10)
+    GROUP BY PH.PostId
+),
+AcceptedAnswerSpeed AS (
+    SELECT
+        Q.Id AS QuestionId,
+        A.Id AS AnswerId,
+        A.OwnerUserId AS AnswerOwnerUserId,
+        Q.CreationDate AS QuestionCreationDate,
+        A.CreationDate AS AnswerCreationDate,
+        (EXTRACT(EPOCH FROM (A.CreationDate - Q.CreationDate)) / 3600.0) AS TimeToAnswerHours
+    FROM Posts Q
+    JOIN Posts A ON Q.AcceptedAnswerId = A.Id
+    WHERE Q.PostTypeId = 1 AND A.PostTypeId = 2
+),
+UsersWithKeyBadges AS (
+    SELECT
+        B.UserId,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        MAX(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS HasSilverBadge,
+        COUNT(B.Id) AS TotalBadges
+    FROM Badges B
+    GROUP BY B.UserId
+),
+UserPostHistorySummary AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        SUM(COALESCE(PHM.EditCount, 0)) AS UserTotalEditHistoryCount,
+        SUM(COALESCE(PHM.CloseVoteCount, 0)) AS UserTotalCloseHistoryCount,
+        MAX(CASE WHEN COALESCE(PHM.EditCount, 0) > 2 OR COALESCE(PHM.CloseVoteCount, 0) > 0 THEN 1 ELSE 0 END) AS HasSignifcantPostHistory
+    FROM Posts P
+    JOIN PostHistoryMetrics PHM ON P.Id = PHM.PostId
+    WHERE P.OwnerUserId IS NOT NULL
+    GROUP BY P.OwnerUserId
+),
+SqlDatabaseEngagedUsers AS (
+    SELECT
+        UAS.UserId,
+        U.DisplayName,
+        UAS.Reputation,
+        UAS.TotalQuestions,
+        UAS.TotalAnswers,
+        UAS.TotalPostScore,
+        COALESCE(UWK.HasGoldBadge, 0) AS HasGoldBadge,
+        COALESCE(UWK.HasSilverBadge, 0) AS HasSilverBadge,
+        COALESCE(UWK.TotalBadges, 0) AS UserTotalBadges,
+        Q_Metrics.TotalQuestionsInTopic,
+        COALESCE(Q_Metrics.AvgQuestionScore, 0.0) AS AvgQuestionScore,
+        COALESCE(Q_Metrics.AvgTimeToAcceptedAnswerHours, 0.0) AS AvgTimeToAcceptedAnswerHours,
+        COALESCE(UPHS.UserTotalEditHistoryCount, 0) AS UserTotalEditCount,
+        COALESCE(UPHS.UserTotalCloseHistoryCount, 0) AS UserTotalCloseVoteCount,
+        RANK() OVER (ORDER BY UAS.Reputation DESC, UAS.TotalPostScore DESC) AS OverallUserRank,
+        (UAS.Reputation * 0.4 + UAS.TotalPostScore * 0.3 + UAS.TotalCommentsMade * 0.1 + COALESCE(Q_Metrics.AvgQuestionScore, 0) * 0.2) AS EngagementScore,
+        COALESCE(U.Location, 'Unknown') AS UserLocation,
+        NULLIF(TRIM(U.AboutMe), '') AS AboutMeSummary,
+        (
+            SELECT COUNT(DISTINCT B_inner.Id)
+            FROM Badges B_inner
+            WHERE B_inner.UserId = UAS.UserId
+              AND B_inner.Class IN (1, 2)
+              AND B_inner.Date >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+              AND EXISTS (
+                  SELECT 1
+                  FROM Posts P_inner
+                  WHERE P_inner.OwnerUserId = B_inner.UserId
+                    AND P_inner.PostTypeId = 1
+                    AND P_inner.Tags IS NOT NULL AND P_inner.Tags LIKE '%' || LOWER(B_inner.Name) || '%'
+                    AND P_inner.CreationDate >= B_inner.Date - INTERVAL '3 month'
+              )
+        ) AS RecentTopicRelatedBadges,
+        'SQL_DB_Engaged' AS UserCategory,
+        UAS.LastPostActivity
+    FROM UserActivitySummary UAS
+    JOIN Users U ON UAS.UserId = U.Id
+    LEFT JOIN UsersWithKeyBadges UWK ON UAS.UserId = UWK.UserId
+    LEFT JOIN (
+        SELECT
+            PTA.OwnerUserId AS QuestionOwnerId,
+            COUNT(PTA.PostId) AS TotalQuestionsInTopic,
+            AVG(PTA.PostScore) AS AvgQuestionScore,
+            AVG(AAS.TimeToAnswerHours) AS AvgTimeToAcceptedAnswerHours
+        FROM PostTagAnalysis PTA
+        LEFT JOIN AcceptedAnswerSpeed AAS ON PTA.PostId = AAS.QuestionId
+        WHERE PTA.PostTypeId = 1 AND PTA.IsSqlOrDatabaseRelated = 1
+        GROUP BY PTA.OwnerUserId
+    ) Q_Metrics ON UAS.UserId = Q_Metrics.QuestionOwnerId
+    LEFT JOIN UserPostHistorySummary UPHS ON UAS.UserId = UPHS.UserId
+    WHERE UAS.Reputation > 5000
+      AND UAS.TotalQuestions >= 5
+      AND Q_Metrics.TotalQuestionsInTopic IS NOT NULL
+      AND (COALESCE(UWK.HasGoldBadge, 0) = 1 OR COALESCE(UWK.HasSilverBadge, 0) = 1)
+      AND UAS.LastPostActivity >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 year')
+      AND COALESCE(UPHS.HasSignifcantPostHistory, 0) = 1
+      AND (COALESCE(Q_Metrics.AvgTimeToAcceptedAnswerHours, 999999.0) < (SELECT AVG(TimeToAnswerHours) FROM AcceptedAnswerSpeed WHERE TimeToAnswerHours IS NOT NULL))
+      AND (U.AboutMe IS NULL OR LOWER(U.AboutMe) LIKE '%engineer%' OR LOWER(U.AboutMe) LIKE '%architect%')
+    GROUP BY
+        UAS.UserId, U.DisplayName, UAS.Reputation, UAS.TotalQuestions, UAS.TotalAnswers,
+        UAS.TotalPostScore, UAS.TotalCommentsMade, UWK.HasGoldBadge, UWK.HasSilverBadge,
+        UWK.TotalBadges, Q_Metrics.TotalQuestionsInTopic, Q_Metrics.AvgQuestionScore,
+        Q_Metrics.AvgTimeToAcceptedAnswerHours, UPHS.UserTotalEditHistoryCount,
+        UPHS.UserTotalCloseHistoryCount, U.Location, U.AboutMe, UAS.LastPostActivity
+),
+HighUpvoteAnswerOnlyUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        UAS.TotalQuestions,
+        UAS.TotalAnswers,
+        UAS.TotalPostScore,
+        COALESCE(UWK.HasGoldBadge, 0) AS HasGoldBadge,
+        COALESCE(UWK.HasSilverBadge, 0) AS HasSilverBadge,
+        COALESCE(UWK.TotalBadges, 0) AS UserTotalBadges,
+        0 AS TotalQuestionsInTopic,
+        0.0 AS AvgQuestionScore,
+        0.0 AS AvgTimeToAcceptedAnswerHours,
+        COALESCE(UPHS.UserTotalEditHistoryCount, 0) AS UserTotalEditCount,
+        COALESCE(UPHS.UserTotalCloseHistoryCount, 0) AS UserTotalCloseVoteCount,
+        RANK() OVER (ORDER BY UAS.Reputation DESC, UAS.TotalPostScore DESC) AS OverallUserRank,
+        (UAS.Reputation * 0.5 + UAS.TotalPostScore * 0.5) AS EngagementScore,
+        COALESCE(U.Location, 'Unknown') AS UserLocation,
+        NULLIF(TRIM(U.AboutMe), '') AS AboutMeSummary,
+        0 AS RecentTopicRelatedBadges,
+        'High_Upvote_Answers' AS UserCategory,
+        UAS.LastPostActivity
+    FROM Users U
+    JOIN UserActivitySummary UAS ON U.Id = UAS.UserId
+    LEFT JOIN UsersWithKeyBadges UWK ON U.Id = UWK.UserId
+    LEFT JOIN UserPostHistorySummary UPHS ON U.Id = UPHS.UserId
+    WHERE UAS.TotalQuestions = 0
+      AND UAS.TotalAnswers >= 10
+      AND UAS.TotalPostScore >= 100
+      AND UAS.Reputation > 2000
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, UAS.TotalQuestions, UAS.TotalAnswers, UAS.TotalPostScore,
+        UWK.HasGoldBadge, UWK.HasSilverBadge, UWK.TotalBadges,
+        UPHS.UserTotalEditHistoryCount, UPHS.UserTotalCloseHistoryCount, U.Location, U.AboutMe, UAS.LastPostActivity
+)
+SELECT *
+FROM (
+    SELECT * FROM SqlDatabaseEngagedUsers
+    UNION ALL
+    SELECT * FROM HighUpvoteAnswerOnlyUsers
+) AS CombinedUsers
+ORDER BY Reputation DESC, TotalPostScore DESC;

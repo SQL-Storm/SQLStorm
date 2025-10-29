@@ -1,0 +1,155 @@
+WITH
+  RankedUserPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.ViewCount AS PostViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostNumber
+    FROM Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+      AND p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= DATE '2023-01-01'
+  ),
+  UserAggregates AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.Views AS UserViews,
+      u.UpVotes AS UserUpVotes,
+      u.DownVotes AS UserDownVotes,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+      AVG(CASE WHEN rp.PostTypeId = 1 THEN rp.PostScore END) AS AvgQuestionScore,
+      AVG(CASE WHEN rp.PostTypeId = 2 THEN rp.PostScore END) AS AvgAnswerScore,
+      MAX(CASE WHEN rp.PostTypeId = 1 THEN rp.PostViewCount END) AS MaxQuestionViewCount,
+      SUM(CASE WHEN pht.Name IN ('Edit Body', 'Edit Title', 'Edit Tags') THEN 1 ELSE 0 END) AS EditCount
+    FROM Users AS u
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    LEFT JOIN RankedUserPosts AS rp
+      ON u.Id = rp.OwnerUserId
+    LEFT JOIN PostHistory AS ph
+      ON u.Id = ph.UserId
+    LEFT JOIN PostHistoryTypes AS pht
+      ON ph.PostHistoryTypeId = pht.Id
+    WHERE
+      u.Id < 1000000
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes
+  ),
+  HighReputationUsers AS (
+    SELECT
+      UserId
+    FROM UserAggregates
+    WHERE
+      Reputation > 10000
+  ),
+  TopQuestions AS (
+    SELECT
+      Id,
+      OwnerUserId,
+      Title,
+      Score,
+      ViewCount,
+      FavoriteCount,
+      AnswerCount,
+      CreationDate,
+      ROW_NUMBER() OVER (ORDER BY Score DESC, ViewCount DESC) AS Rank
+    FROM Posts
+    WHERE
+      PostTypeId = 1
+      AND CreationDate >= DATE '2023-01-01'
+      AND OwnerUserId IN (SELECT UserId FROM HighReputationUsers)
+  ),
+  RecentAnswers AS (
+    SELECT
+      p.Id AS AnswerId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.Score AS AnswerScore,
+      p.CreationDate AS AnswerCreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC) AS AnswerRank
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 2
+      AND p.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '90 days')
+      AND p.ParentId IN (SELECT Id FROM TopQuestions)
+  )
+SELECT
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.UserCreationDate,
+  ua.UserViews,
+  ua.UserUpVotes,
+  ua.UserDownVotes,
+  ua.BadgeCount,
+  ua.TotalUpVotesGiven,
+  ua.TotalDownVotesGiven,
+  ua.AvgQuestionScore,
+  ua.AvgAnswerScore,
+  ua.MaxQuestionViewCount,
+  ua.EditCount,
+  COALESCE(tq.Title, 'No Top Question') AS TopQuestionTitle,
+  COALESCE(tq.Score, 0) AS TopQuestionScore,
+  COALESCE(tq.ViewCount, 0) AS TopQuestionViewCount,
+  COALESCE(tq.FavoriteCount, 0) AS TopQuestionFavoriteCount,
+  COALESCE(tq.AnswerCount, 0) AS TopQuestionAnswerCount,
+  ra.AnswerScore AS BestAnswerScoreForTopQuestion,
+  ra.AnswerCreationDate AS BestAnswerDateForTopQuestion,
+  CASE
+    WHEN ua.Reputation > 50000 THEN 'Expert'
+    WHEN ua.Reputation > 10000 THEN 'Advanced'
+    WHEN ua.Reputation > 1000 THEN 'Intermediate'
+    ELSE 'Beginner'
+  END AS ReputationLevel,
+  UPPER(SUBSTRING(ua.DisplayName FROM 1 FOR 1)) || LOWER(SUBSTRING(ua.DisplayName FROM 2)) AS FormattedDisplayName,
+  CASE
+    WHEN ua.UserCreationDate < (cast('2024-10-01' as date) - INTERVAL '5 years') THEN 'Long-time User'
+    ELSE 'Recent User'
+  END AS UserTenure,
+  (ua.UserUpVotes + ua.UserDownVotes) AS TotalVotesCast,
+  COALESCE(ua.AvgQuestionScore, 0) + COALESCE(ua.AvgAnswerScore, 0) AS TotalAvgScore,
+  CASE
+    WHEN ua.BadgeCount > 10 THEN 'Highly Awarded'
+    ELSE 'Standard Awarded'
+  END AS BadgeStatus,
+  (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ua.UserId AND p.ClosedDate IS NOT NULL) AS ClosedPostCount,
+  (SELECT COUNT(*) FROM Comments c WHERE c.UserId = ua.UserId AND c.Score > 5) AS HighScoreCommentCount,
+  CASE
+    WHEN ua.UserCreationDate IS NULL THEN 'Unknown'
+    ELSE TO_CHAR(ua.UserCreationDate, 'YYYY-MM')
+  END AS UserSignupMonthYear
+FROM UserAggregates AS ua
+LEFT JOIN TopQuestions AS tq
+  ON ua.UserId = tq.OwnerUserId AND tq.Rank = 1
+LEFT JOIN RecentAnswers AS ra
+  ON tq.Id = ra.QuestionId AND ra.AnswerRank = 1
+WHERE
+  ua.UserId IS NOT NULL
+  AND (ua.UserUpVotes > 100 OR ua.BadgeCount > 5)
+  AND ua.DisplayName IS NOT NULL
+  AND ua.DisplayName <> ''
+  AND ua.DisplayName NOT LIKE '%[^a-zA-Z0-9 ]%'
+  AND ua.UserCreationDate BETWEEN DATE '2022-01-01' AND DATE '2023-12-31'
+ORDER BY
+  ua.Reputation DESC
+LIMIT 100;

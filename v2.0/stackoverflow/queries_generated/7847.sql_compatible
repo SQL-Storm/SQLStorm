@@ -1,0 +1,162 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            WHEN u.Reputation >= 100 THEN 'Novice'
+            ELSE 'Newbie'
+        END as ReputationTier,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopQuestions AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        u.DisplayName as OwnerName,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) as RankByScore,
+        RANK() OVER (ORDER BY p.ViewCount DESC) as RankByViews,
+        DENSE_RANK() OVER (ORDER BY p.AnswerCount DESC) as RankByAnswers
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.Score > 0
+),
+QuestionTags AS (
+    SELECT 
+        q.QuestionId,
+        q.Title,
+        q.Score,
+        STRING_AGG(t.TagName, ', ') as TagList,
+        COUNT(t.TagName) as TagCount
+    FROM TopQuestions q
+    CROSS JOIN unnest(string_to_array(replace(replace(q.Title, '<', ''), '>', ''), ' ')) as t(TagName)
+    WHERE t.TagName IS NOT NULL AND LENGTH(t.TagName) > 2
+    GROUP BY q.QuestionId, q.Title, q.Score
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        ph.Text,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15) THEN 'StatusChange'
+            WHEN ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) THEN 'ContentEdit'
+            WHEN ph.PostHistoryTypeId IN (24, 35, 36, 37, 38) THEN 'Migration'
+            ELSE 'Other'
+        END as ChangeCategory,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) as PreviousChangeDate,
+        EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) / 60.0 as MinutesBetweenChanges
+    FROM PostHistory ph
+    WHERE ph.PostId IS NOT NULL
+),
+UserPostStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId IN (3, 4, 5) THEN p.Id END) as OtherPostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.ReputationTier,
+    uas.PostCount,
+    uas.CommentCount,
+    uas.BadgeCount,
+    uas.TotalScore,
+    uas.TotalViews,
+    COALESCE(ups.QuestionCount, 0) as QuestionCount,
+    COALESCE(ups.AnswerCount, 0) as AnswerCount,
+    COALESCE(ups.TotalQuestionScore, 0) as TotalQuestionScore,
+    COALESCE(ups.TotalAnswerScore, 0) as TotalAnswerScore,
+    COALESCE(ups.AvgQuestionScore, 0) as AvgQuestionScore,
+    COALESCE(ups.AvgAnswerScore, 0) as AvgAnswerScore,
+    COALESCE(MAX(qt.QuestionId), 0) as TopQuestionId,
+    MAX(qt.Title) as TopQuestionTitle,
+    MAX(qt.Score) as TopQuestionScore,
+    MAX(qt.TagList) as TopQuestionTags,
+    MAX(qt.TagCount) as TopQuestionTagCount,
+    COUNT(DISTINCT CASE WHEN pha.ChangeCategory = 'ContentEdit' THEN pha.PostId END) as ContentEditCount,
+    COUNT(DISTINCT CASE WHEN pha.ChangeCategory = 'StatusChange' THEN pha.PostId END) as StatusChangeCount,
+    MAX(pha.MinutesBetweenChanges) as MaxMinutesBetweenChanges,
+    AVG(pha.MinutesBetweenChanges) as AvgMinutesBetweenChanges,
+    CAST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - uas.LastPostDate)) / 86400.0 AS numeric) as DaysSinceLastPost,
+    CASE 
+        WHEN CAST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - uas.LastPostDate)) / 86400.0 AS numeric) > 30 THEN 'Inactive'
+        WHEN CAST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - uas.LastPostDate)) / 86400.0 AS numeric) > 7 THEN 'Moderate'
+        ELSE 'Active'
+    END as ActivityLevel,
+    CASE 
+        WHEN uas.Reputation > 5000 AND uas.PostCount > 50 THEN 'HighlyActive'
+        WHEN uas.Reputation > 2000 AND uas.PostCount > 20 THEN 'Active'
+        WHEN uas.Reputation > 500 AND uas.PostCount > 5 THEN 'Regular'
+        ELSE 'Casual'
+    END as EngagementLevel
+FROM UserActivityStats uas
+LEFT JOIN UserPostStats ups ON uas.UserId = ups.UserId
+LEFT JOIN TopQuestions tq ON uas.UserId = tq.OwnerUserId
+LEFT JOIN QuestionTags qt ON tq.QuestionId = qt.QuestionId
+LEFT JOIN PostHistoryAnalysis pha ON uas.UserId = pha.UserId
+WHERE uas.UserId IS NOT NULL
+GROUP BY 
+    uas.UserId, 
+    uas.DisplayName, 
+    uas.Reputation, 
+    uas.ReputationTier, 
+    uas.PostCount, 
+    uas.CommentCount, 
+    uas.BadgeCount, 
+    uas.TotalScore, 
+    uas.TotalViews, 
+    ups.QuestionCount, 
+    ups.AnswerCount, 
+    ups.TotalQuestionScore, 
+    ups.TotalAnswerScore, 
+    ups.AvgQuestionScore, 
+    ups.AvgAnswerScore, 
+    uas.LastPostDate
+HAVING 
+    COUNT(*) > 0 
+    AND (uas.PostCount > 0 OR uas.CommentCount > 0 OR uas.BadgeCount > 0)
+ORDER BY 
+    uas.TotalScore DESC, 
+    uas.Reputation DESC, 
+    uas.PostCount DESC
+LIMIT 100;

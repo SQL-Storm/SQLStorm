@@ -1,0 +1,112 @@
+-- {"query": "3006.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1937} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(p.PostCnt,0)            AS PostCnt,
+        COALESCE(a.AnsCnt,0)             AS AnsCnt,
+        COALESCE(q.AvgQScore,0)          AS AvgQScore,
+        COALESCE(b.GoldCnt,0)            AS GoldCnt,
+        COALESCE(b.SilverCnt,0)          AS SilverCnt,
+        COALESCE(b.BronzeCnt,0)          AS BronzeCnt,
+        COALESCE(t.TopTags, '')          AS TopTags
+    FROM Users u
+    LEFT JOIN (
+        SELECT OwnerUserId, COUNT(*) AS PostCnt
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) p  ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT OwnerUserId, SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnsCnt
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) a  ON a.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT OwnerUserId, AVG(CAST(Score AS DECIMAL(10,2))) AS AvgQScore
+        FROM Posts
+        WHERE PostTypeId = 1
+        GROUP BY OwnerUserId
+    ) q  ON q.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCnt,
+               SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCnt,
+               SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCnt
+        FROM Badges
+        GROUP BY UserId
+    ) b  ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT ub.UserId,
+               STRING_AGG(t.TagName, ', ') WITHIN GROUP (ORDER BY cnt DESC) AS TopTags
+        FROM (
+            SELECT 
+                p.OwnerUserId AS UserId,
+                regexp_split_to_table(p.Tags, '[><]') AS Tag,
+                COUNT(*) OVER (PARTITION BY p.OwnerUserId, regexp_split_to_table(p.Tags, '[><]')) AS cnt
+            FROM Posts p
+            WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+        ) ub
+        JOIN Tags t ON t.TagName = ub.Tag
+        GROUP BY ub.UserId
+    ) t  ON t.UserId = u.Id
+),
+
+RecentPosts AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+        COALESCE(p.Score,0) - COALESCE(p.ViewCount/1000,0) AS ScoreAdj
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+
+UserActivity AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCnt,
+        us.AnsCnt,
+        us.AvgQScore,
+        us.GoldCnt,
+        us.SilverCnt,
+        us.BronzeCnt,
+        us.TopTags,
+        COALESCE(rp.Title, 'No recent posts')      AS RecentTitle,
+        rp.CreationDate                            AS RecentDate,
+        COALESCE(rp.ScoreAdj,0)                    AS RecentScoreAdj
+    FROM UserStats us
+    LEFT JOIN RecentPosts rp 
+           ON rp.OwnerUserId = us.Id AND rp.rn = 1
+)
+
+SELECT *
+FROM UserActivity
+WHERE (Reputation > 10000 OR GoldCnt > 5)
+  AND (PostCnt + AnsCnt) > 50
+  AND (RecentScoreAdj IS NOT NULL AND RecentScoreAdj > 0)
+ORDER BY Reputation DESC, GoldCnt DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    NULL AS Id,
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    NULL AS PostCnt,
+    NULL AS AnsCnt,
+    NULL AS AvgQScore,
+    NULL AS GoldCnt,
+    NULL AS SilverCnt,
+    NULL AS BronzeCnt,
+    NULL AS TopTags,
+    NULL AS RecentTitle,
+    NULL AS RecentDate,
+    NULL AS RecentScoreAdj
+WHERE NOT EXISTS (SELECT 1 FROM Users WHERE Reputation > 0);

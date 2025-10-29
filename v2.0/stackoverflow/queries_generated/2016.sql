@@ -1,0 +1,171 @@
+-- {"query": "2016.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1913} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        t.Count, 
+        1 AS Level,
+        ARRAY[t.TagName] AS AncestorChain
+    FROM Tags t
+    WHERE NOT EXISTS (
+        SELECT 1 FROM PostLinks pl
+        JOIN Posts p ON pl.PostId = p.Id
+        WHERE pl.RelatedPostId = t.ExcerptPostId AND p.PostTypeId = 1
+    )
+    UNION ALL
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        t.Count, 
+        r.Level + 1,
+        r.AncestorChain || t.TagName
+    FROM Tags t
+    JOIN PostLinks pl ON pl.RelatedPostId = t.ExcerptPostId
+    JOIN Posts p ON pl.PostId = p.Id AND p.PostTypeId = 1
+    JOIN RecursiveTagHierarchy r ON r.TagName = p.Title
+    WHERE NOT t.TagName = ANY(r.AncestorChain)
+), UserActivityInsights AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(vt.UpVotes), 0) AS TotalUpVotes,
+        COALESCE(SUM(vt.DownVotes), 0) AS TotalDownVotes,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        MAX(COALESCE(ph.CreationDate, p.CreationDate)) AS LastEditOrPostDate,
+        STRING_AGG(DISTINCT 
+            CASE WHEN pt.Name = 'Question' THEN 'Q:' || p.Title ELSE 'A to Q#' || COALESCE(p.ParentId::text, 'NULL') END, 
+            '; ' ORDER BY p.CreationDate DESC
+        ) AS RecentPostsSummary
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v_up ON v_up.PostId = p.Id AND v_up.VoteTypeId = 2 -- UpMod
+    LEFT JOIN Votes v_down ON v_down.PostId = p.Id AND v_down.VoteTypeId = 3 -- DownMod
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.UserId = u.Id
+    LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN LATERAL (
+      SELECT 
+          COUNT(v_up.Id) AS UpVotes,
+          COUNT(v_down.Id) AS DownVotes
+      FROM Votes v_up 
+      JOIN Votes v_down ON v_down.PostId = v_up.PostId
+      WHERE v_up.PostId = p.Id
+    ) vt ON true
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+), TagPopularityFiltered AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        COUNT(p.Id) AS PostsWithTag,
+        AVG(p.Score) AS AvgScore,
+        BOOL_OR(p.ClosedDate IS NOT NULL) AS HasClosedPosts,
+        STRING_AGG(DISTINCT u.DisplayName, ', ' ORDER BY u.Reputation DESC) AS TopContributors
+    FROM Tags t
+    LEFT JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE t.Count > 5000
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(p.Id) > 1000 AND AVG(p.Score) > 5
+), QuestionAnswerQuality AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        COALESCE(q.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        COUNT(a.Id) AS AnswersCountComputed,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(COALESCE(v_up_count,0)) AS TotalUpVotesOnAnswers,
+        SUM(COALESCE(v_down_count,0)) AS TotalDownVotesOnAnswers,
+        MAX(a.OwnerUserId) AS TopAnswererUserId,
+        CASE 
+          WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+          WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+          ELSE 'Open'
+        END AS QuestionStatus
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) FILTER (WHERE VoteTypeId = 2) AS v_up_count,
+               COUNT(*) FILTER (WHERE VoteTypeId = 3) AS v_down_count
+        FROM Votes v WHERE v.PostId = a.Id
+    ) v_counts ON true
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.AcceptedAnswerId, q.ClosedDate
+), DuplicateLinkAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateLinksCount,
+        BOOL_OR(pl.LinkTypeId = 3) AS HasDuplicates,
+        MAX(u.Reputation) AS HighestReputationOfLinkedUsers
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    LEFT JOIN Posts linked_p ON linked_p.Id = pl.RelatedPostId
+    LEFT JOIN Users u ON u.Id = linked_p.OwnerUserId
+    GROUP BY p.Id, p.Title
+), UserCommentSentiment AS (
+    SELECT 
+        c.UserId,
+        u.DisplayName,
+        COUNT(c.Id) AS CommentCount,
+        AVG(LENGTH(c.Text) - LENGTH(REPLACE(c.Text, '!', ''))) AS AvgExclamationMarks,
+        AVG(CASE WHEN c.Text LIKE '%hate%' OR c.Text LIKE '%bad%' OR c.Text LIKE '%useless%' THEN 1 ELSE 0 END) AS NegativeSentimentRatio,
+        AVG(CASE WHEN c.Text LIKE '%thank%' OR c.Text LIKE '%good%' OR c.Text LIKE '%helpful%' THEN 1 ELSE 0 END) AS PositiveSentimentRatio,
+        COUNT(DISTINCT c.PostId) AS DistinctPostsCommentedOn
+    FROM Comments c
+    INNER JOIN Users u ON u.Id = c.UserId
+    GROUP BY c.UserId, u.DisplayName
+)
+SELECT
+    uai.UserId,
+    uai.DisplayName,
+    uai.Reputation,
+    uai.QuestionCount,
+    uai.AnswerCount,
+    uai.GoldBadges,
+    uai.SilverBadges,
+    uai.BronzeBadges,
+    uai.AvgPostScore,
+    qaq.QuestionStatus,
+    qaq.QuestionId,
+    qaq.Title AS QuestionTitle,
+    qaq.AnswerCount,
+    dq.DuplicateLinksCount,
+    dq.HasDuplicates,
+    dq.HighestReputationOfLinkedUsers,
+    tpf.TagName,
+    tpf.PostsWithTag,
+    tpf.AvgScore AS TagAvgScore,
+    ucs.CommentCount,
+    ucs.AvgExclamationMarks,
+    ucs.NegativeSentimentRatio,
+    ucs.PositiveSentimentRatio,
+    uh.Level AS TagHierarchyLevel,
+    uh.AncestorChain
+FROM UserActivityInsights uai
+LEFT JOIN QuestionAnswerQuality qaq ON qaq.TopAnswererUserId = uai.UserId AND qaq.AnswerCount > 5 AND qaq.QuestionStatus = 'Accepted'
+LEFT JOIN DuplicateLinkAnalysis dq ON dq.PostId = qaq.QuestionId
+LEFT JOIN TagPopularityFiltered tpf ON tpf.TagName = ANY(
+    SELECT UNNEST(string_to_array(
+      substring(p.Tags, 2, length(p.Tags)-2), '><'
+    )) FROM Posts p WHERE p.OwnerUserId = uai.UserId LIMIT 1
+)
+LEFT JOIN UserCommentSentiment ucs ON ucs.UserId = uai.UserId
+LEFT JOIN RecursiveTagHierarchy uh ON uh.TagName = tpf.TagName
+WHERE uai.Reputation > 15000
+ORDER BY uai.Reputation DESC, qaq.QuestionCreation DESC
+LIMIT 100;

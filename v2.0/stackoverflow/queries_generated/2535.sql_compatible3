@@ -1,0 +1,199 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        array[t.TagName] as TagPath,
+        1 as Level
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.TagPath || t.TagName,
+        r.Level + 1
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id < r.Id
+    where t.IsModeratorOnly = false
+      and t.IsRequired = false
+      and not t.TagName = any(r.TagPath)
+      and r.Level < 2
+),
+PostScoresByUser as (
+    select
+        p.OwnerUserId,
+        sum(coalesce(p.Score, 0)) as TotalScore,
+        count(*) as PostCount,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswerCount,
+        avg(p.ViewCount) as AvgViewCount
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+    group by p.OwnerUserId
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        bool_or(case when b.TagBased = 1 then true else false end) as HasTagBasedBadge
+    from Badges b
+    group by b.UserId
+),
+PostWithComments as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.PostTypeId,
+        coalesce(count(c.Id), 0) as CommentCount,
+        string_agg(distinct u.DisplayName, ', ') as Commenters,
+        row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) as PostRankDescScore,
+        rank() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC NULLS LAST) as PostRankDescViews
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Users u on u.Id = c.UserId
+    group by p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.PostTypeId
+),
+AcceptedAnswerDetails as (
+    select
+        q.Id as QuestionId,
+        a.Id as AcceptedAnswerId,
+        a.OwnerUserId as AcceptedAnswerOwner,
+        a.Score as AcceptedAnswerScore,
+        a.CreationDate as AcceptedAnswerCreationDate,
+        (CAST(a.Score AS double precision) / nullif(extract(epoch from (a.CreationDate - q.CreationDate)),0)) as ScorePerSecond
+    from Posts q
+    join Posts a on q.AcceptedAnswerId = a.Id
+    where q.PostTypeId = 1 and a.PostTypeId = 2
+),
+ComplexUserStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(ps.TotalScore, 0) as TotalPostScore,
+        coalesce(ps.PostCount, 0) as TotalPosts,
+        coalesce(badges.GoldBadges, 0) as GoldBadgeCount,
+        coalesce(badges.SilverBadges, 0) as SilverBadgeCount,
+        coalesce(badges.BronzeBadges, 0) as BronzeBadgeCount,
+        badges.HasTagBasedBadge,
+        u.CreationDate,
+        u.LastAccessDate,
+        case
+            when coalesce(ps.PostCount,0) > 0 then CAST(coalesce(ps.TotalScore,0) AS double precision) / ps.PostCount
+            else 0
+        end as AvgScorePerPost,
+        case
+            when u.Views is null then 0
+            else u.Views
+        end as Views,
+        (
+            select count(distinct pl.RelatedPostId)
+            from PostLinks pl
+            where pl.PostId in (select p.Id from Posts p where p.OwnerUserId = u.Id limit 10)
+        ) as DistinctLinkedPosts,
+        (
+            select count(*)
+            from Votes v
+            where v.UserId = u.Id and v.VoteTypeId = 2
+        ) as UpVotesGiven,
+        (
+            select count(*)
+            from Votes v
+            where v.UserId = u.Id and v.VoteTypeId = 3
+        ) as DownVotesGiven
+    from Users u
+    left join PostScoresByUser ps on ps.OwnerUserId = u.Id
+    left join UserBadgeSummary badges on badges.UserId = u.Id
+),
+DuplicatedQuestions as (
+    select distinct p.Id as DuplicateQuestionId, pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    join Posts p on p.Id = pl.PostId and p.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+CloseVoteCounts as (
+    select
+        p.Id,
+        count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseVotes,
+        count(case when ph.PostHistoryTypeId = 11 then 1 end) as ReopenVotes
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (10,11)
+    group by p.Id
+)
+
+select
+    cu.Id as UserId,
+    cu.DisplayName,
+    cu.Reputation,
+    cu.TotalPostScore,
+    cu.TotalPosts,
+    cu.GoldBadgeCount,
+    cu.SilverBadgeCount,
+    cu.BronzeBadgeCount,
+    cu.HasTagBasedBadge,
+    cu.Views,
+    cu.UpVotesGiven,
+    cu.DownVotesGiven,
+    coalesce(dq.DuplicateQuestionId, 0) as HasDuplicateQuestion,
+    ac.AcceptedAnswerId,
+    ac.AcceptedAnswerScore,
+    ac.ScorePerSecond,
+    pwc.Title as TopScoredPostTitle,
+    pwc.Score as TopScoredPostScore,
+    pwc.CommentCount as TopScoredPostCommentCount,
+    pwc.Commenters as TopScoredPostCommenters,
+    rh.TagName as SampleNonModTag,
+    count(case when ph.PostHistoryTypeId = 14 then ph.Id end) as SuggestedEditAppliedCount,
+    coalesce(cv.CloseVotes,0) as CloseVotes,
+    coalesce(cv.ReopenVotes,0) as ReopenVotes
+from ComplexUserStats cu
+left join DuplicatedQuestions dq on dq.DuplicateQuestionId in (
+    select p.Id from Posts p where p.OwnerUserId = cu.Id and p.PostTypeId = 1 limit 1
+)
+left join AcceptedAnswerDetails ac on ac.AcceptedAnswerOwner = cu.Id
+left join PostWithComments pwc on pwc.OwnerUserId = cu.Id and pwc.PostRankDescScore = 1
+left join RecursiveTagHierarchy rh on rh.Level = 1
+left join PostHistory ph on ph.UserId = cu.Id
+left join CloseVoteCounts cv on cv.Id in (
+    select p.Id from Posts p where p.OwnerUserId = cu.Id and p.PostTypeId = 1 limit 1
+)
+where cu.TotalPosts > 20 and cu.Reputation > 1000
+and cu.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - interval '1 year'
+group by
+    cu.Id,
+    cu.DisplayName,
+    cu.Reputation,
+    cu.TotalPostScore,
+    cu.TotalPosts,
+    cu.GoldBadgeCount,
+    cu.SilverBadgeCount,
+    cu.BronzeBadgeCount,
+    cu.HasTagBasedBadge,
+    cu.Views,
+    cu.UpVotesGiven,
+    cu.DownVotesGiven,
+    dq.DuplicateQuestionId,
+    ac.AcceptedAnswerId,
+    ac.AcceptedAnswerScore,
+    ac.ScorePerSecond,
+    pwc.Title,
+    pwc.Score,
+    pwc.CommentCount,
+    pwc.Commenters,
+    rh.TagName,
+    cv.CloseVotes,
+    cv.ReopenVotes,
+    cu.LastAccessDate
+order by cu.TotalPostScore desc
+limit 100;

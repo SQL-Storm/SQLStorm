@@ -1,0 +1,149 @@
+-- {"query": "3513.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2107} 
+
+WITH
+-- 1️⃣ Compute per‑user activity aggregates
+UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2)            AS AnswerCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1)            AS QuestionCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)  AS UpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)  AS DownVotesGiven,
+        MAX(p.CreationDate)                                AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts   p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes   v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+-- 2️⃣ Top scoring answer per user (correlated sub‑query via window function)
+TopAnswers AS (
+    SELECT
+        a.OwnerUserId        AS UserId,
+        q.Id                 AS QuestionId,
+        a.Id                 AS AnswerId,
+        a.Score,
+        ROW_NUMBER() OVER (
+            PARTITION BY a.OwnerUserId
+            ORDER BY a.Score DESC, a.CreationDate DESC
+        )                    AS rn
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId
+    WHERE a.PostTypeId = 2                -- only answers
+      AND a.Score >= 10
+),
+
+-- 3️⃣ Tag‑level statistics (string search on the Tags column)
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id)                                          AS QuestionCnt,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1)                  AS AvgQuestionScore,
+        AVG(a.Score) FILTER (WHERE a.PostTypeId = 2)                  AS AvgAnswerScore
+    FROM Tags t
+    JOIN Posts p ON p.PostTypeId = 1
+                AND p.Tags LIKE '%' || t.TagName || '%'               -- naïve tag match
+    LEFT JOIN Posts a ON a.ParentId = p.Id
+                     AND a.PostTypeId = 2
+    GROUP BY t.TagName
+),
+
+-- 4️⃣ Most recent badge per user in the last 180 days
+RecentBadges AS (
+    SELECT
+        b.UserId,
+        b.Name,
+        b.Date,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS badge_rn
+    FROM Badges b
+    WHERE b.Date >= CURRENT_DATE - INTERVAL '180 days'
+),
+
+-- 5️⃣ Combine user aggregates with the latest badge (outer join + NULL handling)
+Aggregated AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.AnswerCount,
+        us.QuestionCount,
+        us.UpVotesGiven,
+        us.DownVotesGiven,
+        us.LastPostDate,
+        COALESCE(rb.Name, 'NoRecentBadge') AS RecentBadge,
+        rb.Date                               AS BadgeDate
+    FROM UserStats us
+    LEFT JOIN RecentBadges rb
+           ON rb.UserId = us.Id
+          AND rb.badge_rn = 1
+)
+
+-- 6️⃣ Final result set with multiple advanced constructs
+SELECT
+    a.Id,
+    a.DisplayName,
+    a.Reputation,
+    a.AnswerCount,
+    a.QuestionCount,
+    a.UpVotesGiven,
+    a.DownVotesGiven,
+    a.LastPostDate,
+    a.RecentBadge,
+    a.BadgeDate,
+    ta.QuestionId,
+    ta.AnswerId,
+    ta.Score               AS TopAnswerScore,
+    ts.TagName,
+    ts.QuestionCnt,
+    ROUND(ts.AvgQuestionScore::numeric, 2) AS AvgQuestionScore,
+    ROUND(ts.AvgAnswerScore::numeric, 2)   AS AvgAnswerScore
+FROM Aggregated a
+LEFT JOIN TopAnswers ta
+       ON ta.UserId = a.Id
+      AND ta.rn = 1                                         -- pick the best answer only
+LEFT JOIN LATERAL (                                         -- correlated sub‑query per row
+    SELECT
+        t.TagName,
+        t.QuestionCnt,
+        t.AvgQuestionScore,
+        t.AvgAnswerScore
+    FROM TagStats t
+    WHERE t.TagName ILIKE ANY (ARRAY[
+        CASE
+            WHEN a.Reputation > 20000 THEN '%java%'
+            WHEN a.Reputation > 10000 THEN '%c#%'
+            ELSE '%sql%'
+        END])
+    ORDER BY t.QuestionCnt DESC
+    LIMIT 1
+) ts ON TRUE
+WHERE a.Reputation IS NOT NULL
+
+UNION ALL
+
+-- 7️⃣ Include users with *no* activity (set operator, outer join logic)
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    'NoRecentBadge',
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Aggregated agg WHERE agg.Id = u.Id)
+
+ORDER BY Reputation DESC
+LIMIT 100;

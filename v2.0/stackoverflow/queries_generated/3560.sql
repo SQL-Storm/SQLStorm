@@ -1,0 +1,125 @@
+-- {"query": "3560.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2891} 
+
+WITH
+    user_post_counts AS (
+        SELECT
+            u.Id AS UserId,
+            COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+            COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+            AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgScore,
+            MAX(p.CreationDate) AS LastPostDate
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        GROUP BY u.Id
+    ),
+    badge_counts AS (
+        SELECT
+            b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+            COUNT(*) AS TotalBadges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    tag_usage AS (
+        SELECT
+            p.OwnerUserId AS UserId,
+            COUNT(DISTINCT t) AS DistinctTagCount,
+            STRING_AGG(DISTINCT t, ',') FILTER (WHERE t <> '') AS TagList
+        FROM Posts p
+        CROSS JOIN LATERAL (
+            SELECT UNNEST(regexp_split_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS t
+        ) tags
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+    recent_votes AS (
+        SELECT
+            v.PostId,
+            MAX(v.CreationDate) AS LastVoteDate,
+            COUNT(*) FILTER (WHERE vt.Id = 2) AS UpVotes,
+            COUNT(*) FILTER (WHERE vt.Id = 3) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.PostId
+    ),
+    user_activity AS (
+        SELECT
+            u.Id AS UserId,
+            COALESCE(up.LastPostDate, '1970-01-01'::timestamp) AS LastPostDate,
+            COALESCE(rv.LastVoteDate, '1970-01-01'::timestamp) AS LastVoteDate,
+            GREATEST(
+                COALESCE(up.LastPostDate, '1970-01-01'::timestamp),
+                COALESCE(rv.LastVoteDate, '1970-01-01'::timestamp)
+            ) AS MostRecentActivity
+        FROM Users u
+        LEFT JOIN user_post_counts up ON up.UserId = u.Id
+        LEFT JOIN (
+            SELECT
+                p.OwnerUserId,
+                MAX(rv.LastVoteDate) AS LastVoteDate
+            FROM Posts p
+            LEFT JOIN recent_votes rv ON rv.PostId = p.Id
+            GROUP BY p.OwnerUserId
+        ) rv ON rv.OwnerUserId = u.Id
+    ),
+    ranked_users AS (
+        SELECT
+            ua.*,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS ReputationRank,
+            DENSE_RANK() OVER (ORDER BY ua.MostRecentActivity DESC) AS RecentActivityRank
+        FROM user_activity ua
+        JOIN Users u ON u.Id = ua.UserId
+    )
+SELECT
+    ru.UserId,
+    u.DisplayName,
+    u.Reputation,
+    ru.ReputationRank,
+    ru.RecentActivityRank,
+    COALESCE(upc.QuestionCount,0) AS QuestionsPosted,
+    COALESCE(upc.AnswerCount,0) AS AnswersPosted,
+    ROUND(COALESCE(upc.AvgScore,0)::numeric,2) AS AvgPostScore,
+    COALESCE(bc.GoldBadges,0) AS GoldBadges,
+    COALESCE(bc.SilverBadges,0) AS SilverBadges,
+    COALESCE(bc.BronzeBadges,0) AS BronzeBadges,
+    COALESCE(tu.DistinctTagCount,0) AS DistinctTagsUsed,
+    CASE
+        WHEN COALESCE(tu.DistinctTagCount,0) = 0 THEN NULL
+        ELSE tu.TagList
+    END AS SampleTagList,
+    ru.MostRecentActivity,
+    CASE
+        WHEN ru.MostRecentActivity > CURRENT_TIMESTAMP - INTERVAL '30 days' THEN 'Active'
+        WHEN ru.MostRecentActivity > CURRENT_TIMESTAMP - INTERVAL '90 days' THEN 'Semi-Active'
+        ELSE 'Dormant'
+    END AS ActivityStatus
+FROM ranked_users ru
+LEFT JOIN user_post_counts upc ON upc.UserId = ru.UserId
+LEFT JOIN badge_counts bc ON bc.UserId = ru.UserId
+LEFT JOIN tag_usage tu ON tu.UserId = ru.UserId
+JOIN Users u ON u.Id = ru.UserId
+WHERE ru.ReputationRank <= 1000
+ORDER BY ru.ReputationRank
+UNION ALL
+SELECT
+    NULL AS UserId,
+    'Summary' AS DisplayName,
+    NULL AS Reputation,
+    NULL,
+    NULL,
+    SUM(COALESCE(upc.QuestionCount,0)) AS QuestionsPosted,
+    SUM(COALESCE(upc.AnswerCount,0)) AS AnswersPosted,
+    NULL,
+    SUM(COALESCE(bc.GoldBadges,0)) AS GoldBadges,
+    SUM(COALESCE(bc.SilverBadges,0)) AS SilverBadges,
+    SUM(COALESCE(bc.BronzeBadges,0)) AS BronzeBadges,
+    SUM(COALESCE(tu.DistinctTagCount,0)) AS DistinctTagsUsed,
+    NULL,
+    NULL,
+    NULL
+FROM user_post_counts upc
+LEFT JOIN badge_counts bc ON bc.UserId = upc.UserId
+LEFT JOIN tag_usage tu ON tu.UserId = upc.UserId;

@@ -1,0 +1,315 @@
+-- {"query": "108.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2915} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'unknown') as websiteurl_norm,
+        dense_rank() over (order by u.creationdate desc) as signup_rank
+    from users u
+),
+ranked_questions as (
+    select
+        p.id as post_id,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.answercount,
+        p.closeddate,
+        row_number() over (partition by p.owneruserid order by p.score desc nulls last, p.viewcount desc nulls last, p.creationdate desc) as rn_best_by_owner,
+        sum(coalesce(v.score_case,0)) over (partition by p.id) as vote_score_window
+    from posts p
+    left join lateral (
+        select
+            case when vt.votetypeid = 2 then 1 when vt.votetypeid = 3 then -1 else 0 end as score_case,
+            vt.postid
+        from votes vt
+        where vt.postid = p.id
+    ) v on true
+    where p.posttypeid = 1
+),
+answer_stats as (
+    select
+        q.id as question_id,
+        count(a.id) filter (where a.posttypeid = 2) as answers_total,
+        avg(a.score) filter (where a.posttypeid = 2 and a.score is not null) as avg_answer_score,
+        min(a.creationdate) filter (where a.posttypeid = 2) as first_answer_time,
+        max(a.creationdate) filter (where a.posttypeid = 2) as last_answer_time,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events
+    from posts q
+    left join posts a on a.parentid = q.id and a.posttypeid = 2
+    left join posthistory ph on ph.postid = q.id and ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)
+    where q.posttypeid = 1
+    group by q.id
+),
+user_badge_tiers as (
+    select
+        b.userid,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+tag_explode as (
+    select
+        q.id as question_id,
+        unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tagname
+    from posts q
+    where q.posttypeid = 1 and q.tags is not null and q.tags like '<%>'
+),
+tag_popularity as (
+    select
+        te.tagname,
+        count(*) as tag_usage,
+        sum(case when q.score >= 5 then 1 else 0 end) as tag_high_score_q,
+        avg(q.score::numeric) as tag_avg_score
+    from tag_explode te
+    join posts q on q.id = te.question_id
+    group by te.tagname
+),
+comment_activity as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        sum(case when c.score > 0 then 1 else 0 end) as pos_comments,
+        sum(case when c.score < 0 then 1 else 0 end) as neg_comments,
+        max(c.creationdate) as last_comment_at
+    from comments c
+    group by c.postid
+),
+hot_network_events as (
+    select
+        ph.postid,
+        min(ph.creationdate) as first_hot_at,
+        count(*) as hot_events
+    from posthistory ph
+    where ph.posthistorytypeid in (52,53)
+    group by ph.postid
+),
+dup_links as (
+    select
+        pl.postid as dup_post_id,
+        pl.relatedpostid as original_post_id,
+        min(pl.creationdate) as first_seen
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+user_quality as (
+    select
+        u.id as user_id,
+        percentile_cont(0.5) within group (order by p.score) as median_q_score,
+        avg(p.score) as avg_q_score,
+        stddev_pop(p.score) as std_q_score,
+        sum(case when p.acceptedanswerid is not null then 1 else 0 end) as accepted_qs,
+        count(*) filter (where p.posttypeid = 1) as q_count
+    from users u
+    left join posts p on p.owneruserid = u.id and p.posttypeid = 1
+    group by u.id
+),
+activity_bins as (
+    select
+        p.owneruserid as user_id,
+        date_trunc('month', p.creationdate) as month_bucket,
+        count(*) filter (where p.posttypeid = 1) as q_monthly,
+        count(*) filter (where p.posttypeid = 2) as a_monthly,
+        sum(greatest(p.score,0)) as nonneg_score_sum
+    from posts p
+    group by p.owneruserid, date_trunc('month', p.creationdate)
+),
+user_recent_streak as (
+    select
+        ab.user_id,
+        count(*) as active_months,
+        sum(ab.q_monthly + ab.a_monthly) as total_posts_recent,
+        max(ab.month_bucket) as last_active_month
+    from activity_bins ab
+    where ab.month_bucket >= date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '24 months'
+    group by ab.user_id
+),
+complex_agg as (
+    select
+        q.id as question_id,
+        q.owneruserid,
+        q.score,
+        q.viewcount,
+        q.title,
+        q.tags,
+        coalesce(ans.answers_total, 0) as answers_total,
+        coalesce(ans.avg_answer_score, 0) as avg_answer_score,
+        ca.comment_count,
+        ca.pos_comments,
+        ca.neg_comments,
+        hn.hot_events,
+        case
+            when q.closeddate is not null then 'closed'
+            when hn.postid is not null then 'hot'
+            when q.score >= 10 and q.viewcount >= 10000 then 'legendary'
+            when q.score >= 5 then 'good'
+            when q.score <= 0 then 'cold'
+            else 'normal'
+        end as quality_band,
+        (q.vote_score_window + coalesce(q.score,0)) as combined_vote_signal,
+        (coalesce(q.viewcount,0) / nullif(1 + extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.creationdate))/86400, 0))::numeric as views_per_day
+    from ranked_questions q
+    left join answer_stats ans on ans.question_id = q.post_id
+    left join comment_activity ca on ca.postid = q.post_id
+    left join hot_network_events hn on hn.postid = q.post_id
+),
+owner_enrichment as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.creationdate as user_created,
+        ru.location,
+        ut.gold_count,
+        ut.silver_count,
+        ut.bronze_count,
+        uq.median_q_score,
+        uq.avg_q_score,
+        uq.std_q_score,
+        ur.total_posts_recent,
+        ur.active_months,
+        ru.signup_rank,
+        case
+            when coalesce(ut.gold_count,0) >= 5 or coalesce(uq.avg_q_score,0) >= 5 then 'elite'
+            when coalesce(ut.silver_count,0) >= 5 then 'experienced'
+            when coalesce(ut.bronze_count,0) >= 10 then 'seasoned'
+            else 'novice'
+        end as user_tier
+    from recent_users ru
+    left join user_badge_tiers ut on ut.userid = ru.user_id
+    left join user_quality uq on uq.user_id = ru.user_id
+    left join user_recent_streak ur on ur.user_id = ru.user_id
+),
+question_flags as (
+    select
+        c.question_id,
+        bool_or(dl.dup_post_id is not null) as is_duplicate,
+        count(dl.original_post_id) as dup_count,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_votes_count
+    from complex_agg c
+    left join dup_links dl on dl.dup_post_id = c.question_id
+    left join posthistory ph on ph.postid = c.question_id and ph.posthistorytypeid = 10
+    group by c.question_id
+),
+cross_user_similarity as (
+    select
+        q1.owneruserid as user_a,
+        q2.owneruserid as user_b,
+        count(*) as shared_tag_qs,
+        avg(abs(q1.score - q2.score)) as avg_abs_score_diff
+    from tag_explode t1
+    join tag_explode t2 on t1.tagname = t2.tagname and t1.question_id <> t2.question_id
+    join posts q1 on q1.id = t1.question_id and q1.posttypeid = 1
+    join posts q2 on q2.id = t2.question_id and q2.posttypeid = 1
+    where q1.owneruserid is not null and q2.owneruserid is not null and q1.owneruserid <> q2.owneruserid
+    group by q1.owneruserid, q2.owneruserid
+),
+best_question_per_user as (
+    select
+        c.*
+    from complex_agg c
+    join ranked_questions rq on rq.post_id = c.question_id and rq.rn_best_by_owner = 1
+),
+scored_output as (
+    select
+        bq.question_id,
+        bq.owneruserid as user_id,
+        bq.title,
+        bq.tags,
+        bq.score as q_score,
+        bq.viewcount,
+        bq.answers_total,
+        bq.avg_answer_score,
+        bq.comment_count,
+        bq.hot_events,
+        bq.quality_band,
+        oe.displayname,
+        oe.reputation,
+        oe.user_tier,
+        oe.gold_count,
+        oe.silver_count,
+        oe.bronze_count,
+        oe.median_q_score,
+        oe.avg_q_score,
+        oe.std_q_score,
+        oe.total_posts_recent,
+        oe.active_months,
+        qf.is_duplicate,
+        qf.dup_count,
+        tp.tag_usage as primary_tag_usage,
+        tp.tag_avg_score as primary_tag_avg_score,
+        (
+            coalesce(bq.combined_vote_signal,0)
+            + coalesce(bq.answers_total,0) * 0.5
+            + coalesce(bq.avg_answer_score,0) * 0.3
+            + case when qf.is_duplicate then -5 else 0 end
+            + case bq.quality_band when 'legendary' then 8 when 'hot' then 4 when 'good' then 2 when 'cold' then -2 else 0 end
+            + least(coalesce(oe.reputation,0)/500.0, 10)
+            + greatest(0, least(coalesce(tp.tag_avg_score,0), 5))
+        )::numeric(18,6) as perf_score
+    from best_question_per_user bq
+    left join owner_enrichment oe on oe.user_id = bq.owneruserid
+    left join question_flags qf on qf.question_id = bq.question_id
+    left join lateral (
+        select tp.*
+        from tag_explode te
+        join tag_popularity tp on tp.tagname = te.tagname
+        where te.question_id = bq.question_id
+        order by tp.tag_usage desc, tp.tag_avg_score desc
+        limit 1
+    ) tp on true
+),
+top_similar_pairs as (
+    select
+        cs.user_a,
+        cs.user_b,
+        cs.shared_tag_qs,
+        cs.avg_abs_score_diff,
+        row_number() over (partition by cs.user_a order by cs.shared_tag_qs desc, cs.avg_abs_score_diff asc nulls last) as rn_sim
+    from cross_user_similarity cs
+)
+select
+    so.user_id,
+    so.displayname,
+    so.user_tier,
+    so.reputation,
+    so.gold_count,
+    so.silver_count,
+    so.bronze_count,
+    so.question_id,
+    so.title,
+    so.tags,
+    so.q_score,
+    so.viewcount,
+    so.answers_total,
+    so.avg_answer_score,
+    so.comment_count,
+    so.hot_events,
+    so.quality_band,
+    so.primary_tag_usage,
+    so.primary_tag_avg_score,
+    so.perf_score,
+    ts.user_b as most_similar_user,
+    ts.shared_tag_qs as shared_tag_questions,
+    ts.avg_abs_score_diff as score_diff_estimate
+from scored_output so
+left join top_similar_pairs ts on ts.user_a = so.user_id and ts.rn_sim = 1
+where
+    coalesce(so.perf_score, 0) > (
+        select coalesce(avg(perf_score),0) + coalesce(stddev_pop(perf_score),0)
+        from scored_output
+        where perf_score is not null
+    )
+and (so.q_score is distinct from null or so.viewcount is distinct from null)
+order by so.perf_score desc, so.viewcount desc nulls last, so.q_score desc nulls last
+limit 250;

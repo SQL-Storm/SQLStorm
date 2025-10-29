@@ -1,0 +1,43 @@
+SELECT 
+    u.displayname,
+    u.reputation,
+    COUNT(DISTINCT p.id) AS totalposts,
+    SUM(CASE WHEN p.posttypeid = 1 THEN 1 ELSE 0 END) AS totalquestions,
+    SUM(CASE WHEN p.posttypeid = 2 THEN 1 ELSE 0 END) AS totalanswers,
+    MAX(u.creationdate) AS lastaccountactivity,
+    MAX(ph.creationdate) AS lastpostedit,
+    COUNT(DISTINCT CASE WHEN v.votetypeid = 2 THEN v.userid ELSE NULL END) AS totalupvotes,
+    COUNT(DISTINCT CASE WHEN v.votetypeid = 3 THEN v.userid ELSE NULL END) AS totaldownvotes,
+    (
+        SELECT STRING_AGG(t.tagname, ', ')
+        FROM tags t
+        WHERE t.id IN (
+            SELECT pt.tagid
+            FROM posttags pt
+            WHERE pt.postid = p.id
+        )
+    ) AS taggedtopics,
+    (
+        SELECT COUNT(*)
+        FROM votes v2
+        WHERE v2.postid = p.id AND v2.votetypeid = 14
+    ) AS moderaternominationvotes
+FROM 
+    users u
+LEFT JOIN 
+    posts p ON u.id = p.owneruserid
+LEFT JOIN 
+    votes v ON p.id = v.postid
+LEFT JOIN 
+    posthistory ph ON p.id = ph.postid
+WHERE 
+    u.reputation > 100
+    AND p.lastactivitydate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '12 months')
+    AND p.viewcount > 100
+GROUP BY 
+    u.id, u.displayname, u.reputation, u.creationdate, ph.creationdate, p.id
+HAVING 
+    COUNT(DISTINCT p.id) > 50
+ORDER BY 
+    u.reputation DESC, 
+    totalposts DESC;

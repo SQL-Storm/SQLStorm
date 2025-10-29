@@ -1,0 +1,164 @@
+-- {"query": "4216.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1678} 
+
+WITH
+  QuestionScores AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.OwnerUserId,
+      p.Title,
+      p.AnswerCount,
+      p.ViewCount,
+      p.FavoriteCount,
+      p.Score AS QuestionScore,
+      COUNT(c.Id) AS CommentCount,
+      AVG(CAST(c.Score AS NUMERIC)) AS AvgCommentScore,
+      MAX(c.CreationDate) AS LastCommentDate,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        ELSE 'Open'
+      END AS QuestionStatus,
+      ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC, p.FavoriteCount DESC) AS RankByPopularity,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRankForPostType
+    FROM
+      Posts AS p
+      LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+      LEFT JOIN Votes AS v
+      ON p.Id = v.PostId
+    WHERE
+      p.PostTypeId = 1 -- Questions only
+      AND p.OwnerUserId IS NOT NULL
+      AND p.OwnerUserId > 0
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.Title,
+      p.AnswerCount,
+      p.ViewCount,
+      p.FavoriteCount,
+      p.Score,
+      p.ClosedDate,
+      p.PostTypeId
+  ),
+  AnswerMetrics AS (
+    SELECT
+      a.ParentId AS QuestionId,
+      COUNT(a.Id) AS TotalAnswers,
+      SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswerExists,
+      AVG(CAST(a.Score AS NUMERIC)) AS AvgAnswerScore,
+      MAX(a.CreationDate) AS LastAnswerDate,
+      ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS AnswerRankForQuestion
+    FROM
+      Posts AS a
+      LEFT JOIN Posts AS q
+      ON a.ParentId = q.Id
+    WHERE
+      a.PostTypeId = 2 -- Answers only
+      AND a.ParentId IS NOT NULL
+    GROUP BY
+      a.ParentId
+  ),
+  UserReputation AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views AS UserViews,
+      u.UpVotes AS UserUpVotes,
+      u.DownVotes AS UserDownVotes,
+      COUNT(b.Id) AS BadgeCount,
+      SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+      SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+      SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount,
+      CASE
+        WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website'
+        ELSE 'Has Website'
+      END AS WebsiteStatus
+    FROM
+      Users AS u
+      LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes,
+      u.WebsiteUrl
+  ),
+  PostEditHistory AS (
+    SELECT
+      ph.PostId,
+      COUNT(DISTINCT ph.RevisionGUID) AS DistinctEdits,
+      MAX(ph.CreationDate) AS LastEditDate,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS ContentEditCount,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN 1 END) AS InitialPostCount
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId NOT IN (10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 24, 25, 31, 33, 34, 35, 36, 37, 38, 50, 52, 53, 66)
+    GROUP BY
+      ph.PostId
+  )
+SELECT
+  qs.Title AS QuestionTitle,
+  qs.QuestionScore,
+  qs.ViewCount,
+  qs.FavoriteCount,
+  qs.CommentCount,
+  qs.AvgCommentScore,
+  qs.LastCommentDate,
+  qs.QuestionStatus,
+  qs.UpVoteCount,
+  qs.DownVoteCount,
+  am.TotalAnswers,
+  am.AcceptedAnswerExists,
+  am.AvgAnswerScore,
+  am.LastAnswerDate,
+  ur.DisplayName AS OwnerDisplayName,
+  ur.Reputation AS OwnerReputation,
+  ur.BadgeCount,
+  ur.GoldBadgeCount,
+  ur.SilverBadgeCount,
+  ur.BronzeBadgeCount,
+  ur.WebsiteStatus,
+  peh.DistinctEdits AS TotalDistinctEdits,
+  peh.ContentEditCount,
+  peh.InitialPostCount,
+  COALESCE(qs.RankByPopularity, 1000000) AS OverallPopularityRank,
+  COALESCE(am.AnswerRankForQuestion, 1000000) AS AnswerRankForThisQuestion,
+  COALESCE(qs.ScoreRankForPostType, 1000000) AS QuestionScoreRankForType,
+  CASE
+    WHEN qs.LastCommentDate > DATE('now', '-7 day') THEN 'Recent Activity'
+    WHEN qs.LastCommentDate IS NULL THEN 'No Comments'
+    ELSE 'Older Activity'
+  END AS CommentActivityGroup,
+  UPPER(SUBSTRING(ur.DisplayName FROM 1 FOR 1)) AS FirstLetterOfDisplayName,
+  CASE
+    WHEN qs.QuestionScore > 1000 AND am.TotalAnswers > 10 THEN 'High Engagement'
+    WHEN qs.ViewCount > 10000 THEN 'High Visibility'
+    WHEN ur.Reputation > 50000 THEN 'Expert User'
+    ELSE 'Standard Engagement'
+  END AS EngagementCategory
+FROM
+  QuestionScores AS qs
+  FULL OUTER JOIN AnswerMetrics AS am
+  ON qs.QuestionId = am.QuestionId
+  LEFT JOIN UserReputation AS ur
+  ON qs.OwnerUserId = ur.UserId
+  LEFT JOIN PostEditHistory AS peh
+  ON qs.QuestionId = peh.PostId
+WHERE
+  qs.QuestionScore > 0
+  AND am.TotalAnswers IS NOT NULL
+  AND ur.Reputation > 100
+ORDER BY
+  qs.QuestionScore DESC,
+  am.TotalAnswers DESC,
+  qs.ViewCount DESC
+LIMIT 100;

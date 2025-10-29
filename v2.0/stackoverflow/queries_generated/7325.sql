@@ -1,0 +1,255 @@
+-- {"query": "7325.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2199} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 5000 THEN 'Veteran'
+            WHEN u.Reputation >= 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END as ReputationTier,
+        CASE 
+            WHEN u.AccountId IS NOT NULL THEN 'MultipleAccounts'
+            ELSE 'SingleAccount'
+        END as AccountStatus
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.Tags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN
+                LEFT(TRANSLATE(p.Tags, '<>', ''), LENGTH(TRANSLATE(p.Tags, '<>', '')) - 1)
+            ELSE ''
+        END as CleanedTags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as PostRank,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextScore,
+        NTILE(4) OVER (ORDER BY p.Score) as ScoreQuartile,
+        DATEDIFF('DAY', p.CreationDate, CURRENT_TIMESTAMP) as AgeInDays
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= '2020-01-01'
+),
+QualifiedQuestions AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.OwnerName,
+        pa.CleanedTags,
+        pa.AgeInDays,
+        pa.PostRank,
+        pa.ScoreQuartile,
+        CASE 
+            WHEN pa.Score > 100 THEN 'Hot Question'
+            WHEN pa.Score > 50 THEN 'Popular Question'
+            WHEN pa.Score > 10 THEN 'Moderate Question'
+            ELSE 'Low Question'
+        END as PopularityLevel,
+        CASE 
+            WHEN pa.AnswerCount = 0 THEN 'Unanswered'
+            WHEN pa.AnswerCount BETWEEN 1 AND 3 THEN 'Few Answers'
+            WHEN pa.AnswerCount BETWEEN 4 AND 10 THEN 'Many Answers'
+            ELSE 'Extremely Answered'
+        END as AnswerCategory,
+        CASE 
+            WHEN pa.ViewCount > 1000 THEN 'High Visibility'
+            WHEN pa.ViewCount > 500 THEN 'Medium Visibility'
+            WHEN pa.ViewCount > 100 THEN 'Low Visibility'
+            ELSE 'Minimal Visibility'
+        END as VisibilityLevel
+    FROM PostAnalysis pa
+    WHERE pa.PostTypeId = 1
+),
+TopUsers AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.ReputationTier,
+        us.AccountStatus,
+        DENSE_RANK() OVER (ORDER BY us.Reputation DESC, us.PostCount DESC) as UserRank,
+        PERCENT_RANK() OVER (ORDER BY us.Reputation) as ReputationPercentile
+    FROM UserStats us
+    WHERE us.PostCount > 0
+),
+ComplexAnalysis AS (
+    SELECT 
+        tq.PostId,
+        tq.Title,
+        tq.Score,
+        tq.ViewCount,
+        tq.AnswerCount,
+        tq.CommentCount,
+        tq.OwnerName,
+        tq.CleanedTags,
+        tq.AgeInDays,
+        tq.PostRank,
+        tq.ScoreQuartile,
+        tq.PopularityLevel,
+        tq.AnswerCategory,
+        tq.VisibilityLevel,
+        tu.UserId,
+        tu.DisplayName as TopUser,
+        tu.Reputation as TopUserReputation,
+        tu.UserRank,
+        tu.ReputationPercentile,
+        CASE 
+            WHEN tq.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+                 AND tq.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1)
+            THEN 'High Impact'
+            ELSE 'Normal Impact'
+        END as ImpactLevel,
+        STRING_AGG(tq.CleanedTags, ', ') OVER (ORDER BY tq.Score DESC ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as RecentTagTrend,
+        COUNT(*) OVER () as TotalQuestions,
+        SUM(tq.Score) OVER (ORDER BY tq.Score DESC) as CumulativeScore,
+        LAG(tq.Score) OVER (ORDER BY tq.Score DESC) - tq.Score as ScoreDifferenceFromPrevious,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p2 
+             WHERE p2.OwnerUserId = tu.UserId 
+               AND p2.CreationDate > DATEADD('MONTH', -1, CURRENT_TIMESTAMP)), 0
+        ) as RecentPosts
+    FROM QualifiedQuestions tq
+    INNER JOIN TopUsers tu ON tq.OwnerName = tu.DisplayName
+    WHERE tu.UserRank <= 100
+)
+SELECT 
+    ca.PostId,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.AnswerCount,
+    ca.CommentCount,
+    ca.OwnerName,
+    ca.CleanedTags,
+    ca.AgeInDays,
+    ca.PostRank,
+    ca.ScoreQuartile,
+    ca.PopularityLevel,
+    ca.AnswerCategory,
+    ca.VisibilityLevel,
+    ca.UserId,
+    ca.TopUser,
+    ca.TopUserReputation,
+    ca.UserRank,
+    ca.ReputationPercentile,
+    ca.ImpactLevel,
+    ca.RecentTagTrend,
+    ca.TotalQuestions,
+    ca.CumulativeScore,
+    ca.ScoreDifferenceFromPrevious,
+    ca.RecentPosts,
+    CASE 
+        WHEN ca.TopUserReputation > 100000 
+             AND ca.Score > 100 
+             AND ca.ViewCount > 500 
+             AND ca.AnswerCount > 5 
+        THEN 'Elite Contributor'
+        WHEN ca.TopUserReputation > 50000 
+             AND ca.Score > 50 
+             AND ca.ViewCount > 200 
+             AND ca.AnswerCount > 2 
+        THEN 'Experienced Contributor'
+        WHEN ca.TopUserReputation > 10000 
+             AND ca.Score > 25 
+             AND ca.ViewCount > 100 
+        THEN 'Active Contributor'
+        ELSE 'Regular Contributor'
+    END as ContributionTier,
+    CASE 
+        WHEN ca.AgeInDays < 30 THEN 'Fresh'
+        WHEN ca.AgeInDays BETWEEN 30 AND 180 THEN 'Seasoned'
+        WHEN ca.AgeInDays BETWEEN 180 AND 365 THEN 'Veteran'
+        ELSE 'Legendary'
+    END as QuestionAgeCategory,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.PostId = ca.PostId 
+           AND v.VoteTypeId IN (2, 3)
+        ), 0
+    ) as TotalVotes,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Posts p 
+         WHERE p.ParentId = ca.PostId
+        ), 0
+    ) as AnswerCountWithNullCheck,
+    CASE 
+        WHEN ca.Score > 0 THEN 
+            CAST((ca.Score * 100.0 / (SELECT MAX(Score) FROM Posts WHERE PostTypeId = 1)) AS DECIMAL(5,2))
+        ELSE 0.00
+    END as ScorePercentage,
+    CASE 
+        WHEN ca.AgeInDays > 0 THEN 
+            CAST((ca.Score * 1.0 / ca.AgeInDays) AS DECIMAL(10,4))
+        ELSE 0.0000
+    END as ScorePerDay,
+    CASE 
+        WHEN ca.ViewCount > 0 THEN 
+            CAST((ca.Score * 100.0 / ca.ViewCount) AS DECIMAL(5,2))
+        ELSE 0.00
+    END as ScoreToViewRatio,
+    CAST((SELECT 
+            COUNT(*) 
+          FROM Badges b 
+          WHERE b.UserId = ca.UserId 
+            AND b.Date >= DATEADD('YEAR', -1, CURRENT_TIMESTAMP)
+         ) AS DECIMAL(5,2)) as RecentBadges,
+    CASE 
+        WHEN ca.TopUserReputation > 100000 THEN 'Very High'
+        WHEN ca.TopUserReputation > 50000 THEN 'High'
+        WHEN ca.TopUserReputation > 10000 THEN 'Medium'
+        WHEN ca.TopUserReputation > 1000 THEN 'Low'
+        ELSE 'Very Low'
+    END as ReputationCategory,
+    CASE 
+        WHEN ca.ScoreQuartile = 1 THEN 'Top Quartile'
+        WHEN ca.ScoreQuartile = 2 THEN 'High Quartile'
+        WHEN ca.ScoreQuartile = 3 THEN 'Low Quartile'
+        ELSE 'Bottom Quartile'
+    END as ScoreQuartileDescription
+FROM ComplexAnalysis ca
+WHERE ca.AgeInDays > 0
+  AND ca.ViewCount >= 0
+  AND ca.Score IS NOT NULL
+ORDER BY 
+    ca.Score DESC,
+    ca.ViewCount DESC,
+    ca.UserRank ASC,
+    ca.CumulativeScore DESC
+LIMIT 500;

@@ -1,0 +1,132 @@
+-- {"query": "4214.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1488} 
+WITH RECURSIVE UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS RankByReputation,
+        COUNT(p.Id) AS PostCount,
+        SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AveragePostScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE u.DisplayName IS NOT NULL AND u.DisplayName NOT LIKE '%[bot]%'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        pt.Name AS PostType,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVoteCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        LEAD(p.CreationDate, 1, NULL) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostDate,
+        LAG(p.CreationDate, 1, NULL) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostDate,
+        DATEDIFF(minute, LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate), p.CreationDate) AS TimeSincePreviousPost
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0 AND p.Title IS NOT NULL
+),
+UserPostPerformance AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.RankByReputation,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.AveragePostScore,
+        pe.PostId,
+        pe.Title,
+        pe.PostType,
+        pe.Score,
+        pe.ViewCount,
+        pe.AnswerCount AS PostAnswerCount,
+        pe.CommentCount,
+        pe.UpVoteCount,
+        pe.DownVoteCount,
+        pe.IsClosed,
+        pe.TimeSincePreviousPost,
+        CASE
+            WHEN pe.Score > 100 AND pe.UpVoteCount > pe.DownVoteCount * 5 THEN 'Highly Valued'
+            WHEN pe.Score < 0 AND pe.DownVoteCount > pe.UpVoteCount * 3 THEN 'Controversial'
+            WHEN pe.ViewCount > 10000 AND pe.AnswerCount > 5 THEN 'Widely Discussed'
+            WHEN pe.IsClosed = 1 THEN 'Closed'
+            ELSE 'Standard'
+        END AS PostPerformanceCategory,
+        ROW_NUMBER() OVER (PARTITION BY ua.UserId ORDER BY pe.Score DESC, pe.ViewCount DESC) AS PostRankForUser
+    FROM UserActivity ua
+    LEFT JOIN PostEngagement pe ON ua.UserId = pe.OwnerUserId
+    WHERE ua.RankByReputation <= 1000
+)
+SELECT
+    upp.UserId,
+    upp.DisplayName,
+    upp.Reputation,
+    upp.RankByReputation,
+    upp.QuestionCount,
+    upp.AnswerCount,
+    upp.AveragePostScore,
+    upp.PostId,
+    upp.Title,
+    upp.PostType,
+    upp.Score,
+    upp.ViewCount,
+    upp.PostAnswerCount,
+    upp.CommentCount,
+    upp.UpVoteCount,
+    upp.DownVoteCount,
+    upp.IsClosed,
+    upp.TimeSincePreviousPost,
+    upp.PostPerformanceCategory,
+    pht.Name AS LastHistoryAction,
+    MAX(ph.CreationDate) AS LastHistoryDate,
+    COALESCE(u2.DisplayName, 'Community') AS LastEditorDisplayName,
+    CASE
+        WHEN upp.PostRankForUser <= 5 THEN 'Top 5 Post for User'
+        ELSE 'Other Post'
+    END AS UserPostImportance
+FROM UserPostPerformance upp
+LEFT JOIN PostHistory ph ON upp.PostId = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13, 14, 15, 16, 19, 20, 35, 36, 50)
+LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+LEFT JOIN Users u2 ON ph.UserId = u2.Id
+WHERE upp.PostRankForUser <= 10 -- Limit to top 10 posts per user for performance
+GROUP BY
+    upp.UserId,
+    upp.DisplayName,
+    upp.Reputation,
+    upp.RankByReputation,
+    upp.QuestionCount,
+    upp.AnswerCount,
+    upp.AveragePostScore,
+    upp.PostId,
+    upp.Title,
+    upp.PostType,
+    upp.Score,
+    upp.ViewCount,
+    upp.PostAnswerCount,
+    upp.CommentCount,
+    upp.UpVoteCount,
+    upp.DownVoteCount,
+    upp.IsClosed,
+    upp.TimeSincePreviousPost,
+    upp.PostPerformanceCategory,
+    upp.PostRankForUser,
+    pht.Name,
+    u2.DisplayName
+HAVING COUNT(ph.Id) > 0 OR upp.PostRankForUser <= 5 -- Include users with no history but are top posts
+ORDER BY
+    upp.RankByReputation,
+    upp.UserId,
+    upp.PostRankForUser;

@@ -1,0 +1,417 @@
+with recent_activity as (
+    select
+        p.id as post_id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.answercount,
+        p.favoritecount,
+        p.closeddate,
+        p.lastactivitydate,
+        coalesce(p.lasteditdate, p.creationdate) as last_edit_or_create,
+        extract(epoch from (timestamp '2024-10-01 12:34:56' - coalesce(p.lastactivitydate, p.creationdate))) / 3600.0 as hrs_since_activity
+    from posts p
+    where p.creationdate >= timestamp '2024-10-01 12:34:56' - interval '3 years'
+),
+user_dims as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate as user_created,
+        u.upvotes,
+        u.downvotes,
+        u.views as profile_views,
+        nullif(trim(coalesce(u.location,'')), '') as location_norm,
+        case when u.websiteurl ~* 'https?://' then u.websiteurl else null end as website_norm
+    from users u
+),
+badge_rollup as (
+    select
+        b.userid,
+        count(*) as badge_count,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+        max(b.date) as last_badge_date
+    from badges b
+    where b.date >= timestamp '2024-10-01 12:34:56' - interval '5 years'
+    group by b.userid
+),
+question_core as (
+    select
+        ra.*,
+        pl.relatedpostid as dup_of_id,
+        case when pl.linktypeid = 3 then 1 else 0 end as is_marked_duplicate
+    from recent_activity ra
+    left join postlinks pl
+      on pl.postid = ra.post_id
+     and pl.linktypeid in (1,3)
+    where ra.posttypeid = 1
+),
+votes_rollup as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+        count(*) filter (where v.votetypeid in (10,11,12)) as mod_actions
+    from votes v
+    where v.creationdate >= timestamp '2024-10-01 12:34:56' - interval '3 years'
+    group by v.postid
+),
+first_last_comment as (
+    select
+        c.postid,
+        min(c.creationdate) as first_comment_at,
+        max(c.creationdate) as last_comment_at,
+        count(*) as comment_count,
+        max(c.score) as max_comment_score,
+        count(*) filter (where c.score > 0) as pos_comment_cnt
+    from comments c
+    where c.creationdate >= timestamp '2024-10-01 12:34:56' - interval '3 years'
+    group by c.postid
+),
+tag_explode as (
+    select
+        qc.post_id,
+        unnest(string_to_array(substring(coalesce(qc.tags,''), 2, greatest(length(coalesce(qc.tags,'')) - 2,0)), '><')) as tagname
+    from question_core qc
+),
+tag_rank as (
+    select
+        te.post_id,
+        te.tagname,
+        t.count as tag_global_count,
+        row_number() over (partition by te.post_id order by coalesce(t.count,0) desc, te.tagname) as tag_rank_by_pop
+    from tag_explode te
+    left join tags t on lower(t.tagname) = lower(te.tagname)
+),
+best_tag as (
+    select post_id,
+           tagname as primary_tag,
+           tag_global_count
+    from tag_rank
+    where tag_rank_by_pop = 1
+),
+edits_cte as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_events,
+        count(*) filter (where ph.posthistorytypeid in (10)) as close_votes,
+        count(*) filter (where ph.posthistorytypeid in (11)) as reopen_votes,
+        max(ph.creationdate) as last_history_at,
+        max(case when ph.posthistorytypeid in (10) then ph.comment end) as last_close_reason_id_raw
+    from posthistory ph
+    where ph.creationdate >= timestamp '2024-10-01 12:34:56' - interval '3 years'
+    group by ph.postid
+),
+close_reason as (
+    select
+        e.postid,
+        crt.name as last_close_reason_name
+    from edits_cte e
+    left join closereasontypes crt
+      on cast(crt.id as text) = nullif(e.last_close_reason_id_raw,'')
+),
+owner_activity as (
+    select
+        qc.post_id,
+        u.user_id,
+        u.displayname,
+        u.reputation,
+        u.user_created,
+        u.upvotes,
+        u.downvotes,
+        u.profile_views,
+        u.location_norm,
+        u.website_norm,
+        br.badge_count,
+        br.gold_count,
+        br.silver_count,
+        br.bronze_count,
+        br.last_badge_date
+    from question_core qc
+    left join user_dims u on u.user_id = qc.owneruserid
+    left join badge_rollup br on br.userid = qc.owneruserid
+),
+dup_target as (
+    select
+        d.post_id,
+        d.dup_of_id,
+        p.score as dup_target_score,
+        p.viewcount as dup_target_views,
+        p.creationdate as dup_target_created
+    from (
+        select distinct post_id, dup_of_id
+        from question_core
+        where is_marked_duplicate = 1 and dup_of_id is not null
+    ) d
+    left join posts p on p.id = d.dup_of_id
+),
+answer_stats as (
+    select
+        a.parentid as question_id,
+        count(*) as answers,
+        sum(case when a.score > 0 then 1 else 0 end) as pos_answers,
+        max(a.score) as max_answer_score,
+        avg(a.score) as avg_answer_score,
+        min(a.creationdate) as first_answer_at
+    from posts a
+    where a.posttypeid = 2
+      and a.creationdate >= timestamp '2024-10-01 12:34:56' - interval '3 years'
+    group by a.parentid
+),
+question_quality as (
+    select
+        qc.post_id,
+        qc.title,
+        length(coalesce(qc.title,'')) as title_len,
+        qc.score,
+        qc.viewcount,
+        qc.answercount,
+        qc.favoritecount,
+        vr.upvotes,
+        vr.downvotes,
+        coalesce(vr.upvotes,0) - coalesce(vr.downvotes,0) as net_votes,
+        fc.comment_count,
+        fc.max_comment_score,
+        es.edit_events,
+        es.close_votes,
+        es.reopen_votes,
+        es.last_history_at,
+        cr.last_close_reason_name,
+        coalesce(as2.answers,0) as answers,
+        coalesce(as2.pos_answers,0) as pos_answers,
+        coalesce(as2.max_answer_score,0) as max_answer_score,
+        coalesce(as2.avg_answer_score,0) as avg_answer_score,
+        qc.hrs_since_activity,
+        bt.primary_tag,
+        bt.tag_global_count,
+        dt.dup_of_id,
+        dt.dup_target_score,
+        dt.dup_target_views,
+        dt.dup_target_created
+    from question_core qc
+    left join votes_rollup vr on vr.postid = qc.post_id
+    left join first_last_comment fc on fc.postid = qc.post_id
+    left join edits_cte es on es.postid = qc.post_id
+    left join close_reason cr on cr.postid = qc.post_id
+    left join answer_stats as2 on as2.question_id = qc.post_id
+    left join best_tag bt on bt.post_id = qc.post_id
+    left join dup_target dt on dt.post_id = qc.post_id
+),
+ranked as (
+    select
+        qq.post_id,
+        qq.title,
+        qq.title_len,
+        qq.score,
+        qq.viewcount,
+        qq.answercount,
+        qq.favoritecount,
+        qq.upvotes,
+        qq.downvotes,
+        qq.net_votes,
+        qq.comment_count,
+        qq.max_comment_score,
+        qq.edit_events,
+        qq.close_votes,
+        qq.reopen_votes,
+        qq.last_history_at,
+        qq.last_close_reason_name,
+        qq.answers,
+        qq.pos_answers,
+        qq.max_answer_score,
+        qq.avg_answer_score,
+        qq.hrs_since_activity,
+        qq.primary_tag,
+        qq.tag_global_count,
+        qq.dup_of_id,
+        qq.dup_target_score,
+        qq.dup_target_views,
+        qq.dup_target_created,
+        oa.user_id,
+        oa.displayname as owner_name,
+        oa.reputation as owner_rep,
+        oa.location_norm as owner_location,
+        oa.badge_count,
+        oa.gold_count,
+        oa.silver_count,
+        oa.bronze_count,
+        row_number() over (order by
+            coalesce(qq.score,0) desc,
+            coalesce(qq.viewcount,0) desc,
+            coalesce(qq.net_votes,0) desc,
+            coalesce(qq.answers,0) desc,
+            coalesce(qq.title_len,0) desc) as global_rn,
+        dense_rank() over (partition by coalesce(qq.primary_tag,'[none]') order by coalesce(qq.score,0) desc) as tag_dense_rank,
+        NULL as p90_views_all,
+        sum(coalesce(qq.viewcount,0)) over (partition by coalesce(qq.primary_tag,'[none]')) as tag_view_sum,
+        avg(coalesce(qq.score,0)) over (partition by coalesce(qq.primary_tag,'[none]')) as tag_avg_score
+    from question_quality qq
+    left join owner_activity oa on oa.post_id = qq.post_id
+),
+anomalies as (
+    select
+        r.post_id,
+        r.viewcount,
+        r.score,
+        r.answercount,
+        r.comment_count,
+        r.net_votes,
+        r.close_votes,
+        r.reopen_votes,
+        r.dup_of_id,
+        r.dup_target_views,
+        case
+            when r.viewcount > 0 and r.score <= 0 and r.answercount = 0 and r.comment_count > 5 then 'high_comments_low_engagement'
+            when r.viewcount > (select viewcount from (
+                    select viewcount, row_number() over (order by viewcount) as rn, count(*) over () as total_rows
+                    from ranked
+                ) t where rn = ceil(0.9 * total_rows) limit 1) and r.answercount = 0 then 'high_views_no_answers'
+            when r.net_votes < -5 then 'heavily_downvoted'
+            when r.close_votes > 0 and r.reopen_votes = 0 then 'closed_and_not_reopened'
+            when r.dup_of_id is not null and coalesce(r.dup_target_views,0) < coalesce(r.viewcount,0) then 'dup_target_less_viewed'
+            else null
+        end as anomaly_flag
+    from ranked r
+),
+final_score as (
+    select
+        r.post_id,
+        r.title,
+        r.title_len,
+        r.score,
+        r.viewcount,
+        r.answercount,
+        r.favoritecount,
+        r.upvotes,
+        r.downvotes,
+        r.net_votes,
+        r.comment_count,
+        r.max_comment_score,
+        r.edit_events,
+        r.close_votes,
+        r.reopen_votes,
+        r.last_history_at,
+        r.last_close_reason_name,
+        r.answers,
+        r.pos_answers,
+        r.max_answer_score,
+        r.avg_answer_score,
+        r.hrs_since_activity,
+        r.primary_tag,
+        r.tag_global_count,
+        r.dup_of_id,
+        r.dup_target_score,
+        r.dup_target_views,
+        r.dup_target_created,
+        r.user_id as owner_user_id,
+        r.owner_name,
+        r.owner_rep,
+        r.owner_location,
+        r.badge_count,
+        r.gold_count,
+        r.silver_count,
+        r.bronze_count,
+        case
+            when r.last_close_reason_name ilike '%duplicate%' then 0.5
+            when r.last_close_reason_name is not null then 0.3
+            else 1.0
+        end as close_reason_factor,
+        case when r.hrs_since_activity <= 24 then 1.1 else 1.0 end as freshness_boost,
+        case when r.tag_global_count is null or r.tag_global_count = 0 then 0.9 else 1.0 end as rare_tag_adjust,
+        coalesce(a.anomaly_flag,'') as anomaly_flag,
+        (
+            0.35 * greatest(coalesce(r.score,0), 0)
+          + 0.20 * ln(1 + greatest(coalesce(r.viewcount,0),0))
+          + 0.15 * greatest(coalesce(r.answers,0),0)
+          + 0.10 * greatest(coalesce(r.net_votes,0),0)
+          + 0.05 * greatest(coalesce(r.max_answer_score,0),0)
+          + 0.05 * greatest(coalesce(r.comment_count,0),0)
+          + 0.10 * greatest(coalesce(r.badge_count,0) / nullif(r.owner_rep,0), 0)
+        ) * case
+                when r.last_close_reason_name ilike '%duplicate%' then 0.5
+                when r.last_close_reason_name is not null then 0.3
+                else 1.0
+            end
+          * case when r.hrs_since_activity <= 24 then 1.1 else 1.0 end
+          * case when r.tag_global_count is null or r.tag_global_count = 0 then 0.9 else 1.0 end
+        as perf_score,
+        r.global_rn,
+        r.tag_dense_rank,
+        r.owner_name as owner_name_out,
+        r.owner_location as owner_location_out,
+        r.owner_rep as owner_rep_out,
+        -- ensure creationdate is available: join back to recent_activity via post_id
+        ra.creationdate
+    from ranked r
+    left join anomalies a on a.post_id = r.post_id
+    left join recent_activity ra on ra.post_id = r.post_id
+),
+perf_percentiles as (
+    select
+        (select perf_score from (
+            select perf_score, row_number() over (order by perf_score) as rn, count(*) over () as total_rows
+            from final_score
+        ) t where rn = ceil(0.95 * total_rows) limit 1) as p95_perf,
+        (select viewcount from (
+            select viewcount, row_number() over (order by viewcount) as rn, count(*) over () as total_rows
+            from final_score
+        ) t where rn = ceil(0.9 * total_rows) limit 1) as p90_views_all,
+        (select reputation from (
+            select reputation, row_number() over (order by reputation) as rn, count(*) over () as total_rows
+            from users
+        ) t where rn = ceil(0.25 * total_rows) limit 1) as p25_reputation
+)
+select
+    fs.post_id,
+    fs.title,
+    coalesce(fs.primary_tag,'[none]') as primary_tag,
+    fs.tag_dense_rank,
+    fs.owner_name_out as owner_name,
+    fs.owner_rep_out as owner_rep,
+    coalesce(fs.owner_location_out,'[unknown]') as owner_location,
+    fs.score,
+    fs.viewcount,
+    fs.answercount,
+    fs.net_votes,
+    fs.comment_count,
+    fs.edit_events,
+    fs.close_votes,
+    fs.reopen_votes,
+    coalesce(fs.last_close_reason_name,'') as last_close_reason,
+    fs.dup_of_id,
+    fs.dup_target_score,
+    fs.dup_target_views,
+    to_char(fs.creationdate, 'YYYY-MM-DD') as created_on,
+    round(cast(fs.hrs_since_activity as numeric), 1) as hrs_since_activity,
+    fs.anomaly_flag,
+    round(cast(fs.perf_score as numeric), 3) as perf_score,
+    rank() over (order by fs.perf_score desc, fs.global_rn) as perf_rank,
+    case when fs.perf_score >= (select p95_perf from perf_percentiles) then 'P95+' else 'P95-' end as perf_bucket
+from final_score fs
+where (
+        fs.primary_tag is null
+        or lower(fs.primary_tag) not in (
+            select lower(tagname) from tags where ismoderatoronly = 1 or isrequired = 1
+        )
+      )
+  and (
+        fs.owner_rep is null
+        or fs.owner_rep >= (select p25_reputation from perf_percentiles)
+      )
+  and (
+        fs.viewcount is null
+        or fs.viewcount > (
+            select avg(viewcount) from posts where posttypeid = 1 and creationdate >= timestamp '2024-10-01 12:34:56' - interval '3 years'
+        )
+      )
+order by fs.perf_score desc, fs.post_id
+limit 250;

@@ -1,0 +1,244 @@
+-- {"query": "7348.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2274} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        MAX(p.CreationDate) as LatestPostDate,
+        AVG(p.Score) as AvgPostScore,
+        STRING_AGG(DISTINCT t.TagName, ', ') as TagsUsed,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) as PopularQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 10 THEN p.Id END) as HighScoreAnswers
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p2 ON p2.ParentId = p.Id
+    LEFT JOIN (
+        SELECT DISTINCT unnest(string_to_array(p2.Tags, '><')) as TagName, p2.Id
+        FROM Posts p2 
+        WHERE p2.Tags IS NOT NULL AND p2.Tags != ''
+    ) t ON p.Id = t.Id
+    WHERE u.AccountId IS NOT NULL AND u.CreationDate > '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) as RankByReputation,
+        DENSE_RANK() OVER (ORDER BY AvgPostScore DESC) as RankByAvgScore,
+        NTILE(10) OVER (ORDER BY Views DESC) as ViewsQuartile
+    FROM UserStats
+),
+TopPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostTypeDesc,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate > '2020-01-01' AND (p.PostTypeId IN (1, 2) OR p.Tags LIKE '%<%')
+),
+ActiveUsers AS (
+    SELECT 
+        Id,
+        DisplayName,
+        Reputation,
+        CreationDate,
+        LastAccessDate,
+        Views,
+        UpVotes,
+        DownVotes,
+        CASE 
+            WHEN DATEDIFF(day, LastAccessDate, CURRENT_TIMESTAMP) <= 30 THEN 'Active'
+            WHEN DATEDIFF(day, LastAccessDate, CURRENT_TIMESTAMP) <= 90 THEN 'Inactive'
+            ELSE 'Very Inactive'
+        END as ActivityStatus
+    FROM Users
+    WHERE CreationDate > '2015-01-01'
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Rare'
+            ELSE 'Very Rare'
+        END as PopularityLevel,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as PopularityRank
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) as EditCount,
+        COUNT(DISTINCT ph.UserId) as UniqueEditors,
+        MAX(ph.CreationDate) as LastEditDate,
+        MIN(ph.CreationDate) as FirstEditDate,
+        STRING_AGG(DISTINCT ph.PostHistoryTypeId::TEXT, ', ') as EditTypes,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (10,11,12,13) THEN 1 END) as CloseReopenEdits
+    FROM PostHistory ph
+    WHERE ph.CreationDate > '2019-01-01'
+    GROUP BY ph.PostId
+),
+ComplexQuestionAnalysis AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.CreationDate,
+        q.OwnerUserId,
+        u.DisplayName as OwnerName,
+        CASE 
+            WHEN q.AnswerCount = 0 THEN 'No Answers'
+            WHEN q.AnswerCount = 1 THEN 'One Answer'
+            WHEN q.AnswerCount > 1 AND q.AnswerCount <= 5 THEN 'Few Answers'
+            ELSE 'Many Answers'
+        END as AnswerDepth,
+        CASE 
+            WHEN q.Score > 100 THEN 'Highly Upvoted'
+            WHEN q.Score > 50 THEN 'Upvoted'
+            WHEN q.Score > 10 THEN 'Moderate'
+            ELSE 'Low Score'
+        END as ScoreTier,
+        CASE 
+            WHEN q.ViewCount > 5000 THEN 'Viral'
+            WHEN q.ViewCount > 1000 THEN 'Popular'
+            WHEN q.ViewCount > 100 THEN 'Moderate'
+            ELSE 'Low View'
+        END as ViewTier,
+        (q.Score * 1.0 / (q.AnswerCount + 1)) as ScorePerAnswer,
+        NULLIF(q.CommentCount * 1.0 / NULLIF(q.AnswerCount, 0), 0) as CommentsPerAnswer
+    FROM Posts q
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    WHERE q.PostTypeId = 1 AND q.CreationDate > '2018-01-01'
+),
+CombinedAnalysis AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.PostCount,
+        ru.CommentCount,
+        ru.BadgeCount,
+        ru.QuestionCount,
+        ru.AnswerCount,
+        ru.LatestPostDate,
+        ru.AvgPostScore,
+        ru.TagsUsed,
+        ru.PopularQuestions,
+        ru.HighScoreAnswers,
+        ru.RankByReputation,
+        ru.RankByAvgScore,
+        ru.ViewsQuartile,
+        au.ActivityStatus,
+        CASE 
+            WHEN ru.Reputation > 100000 THEN 'Elite'
+            WHEN ru.Reputation > 50000 THEN 'Veteran'
+            WHEN ru.Reputation > 10000 THEN 'Experienced'
+            WHEN ru.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as RepTier,
+        NULLIF(ru.PostCount * 1.0 / NULLIF(ru.CommentCount, 0), 0) as PostsPerComment
+    FROM RankedUsers ru
+    LEFT JOIN ActiveUsers au ON ru.UserId = au.Id
+    WHERE ru.Reputation > 1000 OR ru.PostCount > 5
+),
+FinalAnalysis AS (
+    SELECT 
+        ca.UserId,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.PostCount,
+        ca.CommentCount,
+        ca.BadgeCount,
+        ca.QuestionCount,
+        ca.AnswerCount,
+        ca.LatestPostDate,
+        ca.AvgPostScore,
+        ca.TagsUsed,
+        ca.PopularQuestions,
+        ca.HighScoreAnswers,
+        ca.RankByReputation,
+        ca.RankByAvgScore,
+        ca.ViewsQuartile,
+        ca.ActivityStatus,
+        ca.RepTier,
+        ca.PostsPerComment,
+        CASE 
+            WHEN ca.RepTier IN ('Elite', 'Veteran') AND ca.PostCount > 100 THEN 'High Value Contributor'
+            WHEN ca.RepTier IN ('Experienced', 'Intermediate') AND ca.QuestionCount > 10 THEN 'Active Contributor'
+            WHEN ca.PostCount > 50 AND ca.AvgPostScore > 5 THEN 'Productive Member'
+            ELSE 'Regular Member'
+        END as ContributionStatus
+    FROM CombinedAnalysis ca
+    WHERE ca.UserId IS NOT NULL
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.PostCount,
+    fa.CommentCount,
+    fa.BadgeCount,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.LatestPostDate,
+    ROUND(fa.AvgPostScore, 2) as AvgPostScore,
+    CASE 
+        WHEN LENGTH(fa.TagsUsed) > 0 THEN LEFT(fa.TagsUsed, 50) || '...'
+        ELSE 'No Tags'
+    END as TagPreview,
+    fa.PopularQuestions,
+    fa.HighScoreAnswers,
+    fa.RankByReputation,
+    fa.RankByAvgScore,
+    fa.ViewsQuartile,
+    fa.ActivityStatus,
+    fa.RepTier,
+    ROUND(fa.PostsPerComment, 2) as PostsPerComment,
+    fa.ContributionStatus,
+    COUNT(DISTINCT tp.Id) as TopScorePosts,
+    STRING_AGG(DISTINCT tp.Title, '; ') FILTER (WHERE tp.ScoreRank <= 5) as TopTitles
+FROM FinalAnalysis fa
+LEFT JOIN TopPosts tp ON fa.UserId = tp.OwnerUserId AND tp.ScoreRank <= 5
+WHERE fa.Reputation IS NOT NULL
+GROUP BY 
+    fa.UserId, fa.DisplayName, fa.Reputation, fa.PostCount, fa.CommentCount, 
+    fa.BadgeCount, fa.QuestionCount, fa.AnswerCount, fa.LatestPostDate, 
+    fa.AvgPostScore, fa.TagsUsed, fa.PopularQuestions, fa.HighScoreAnswers, 
+    fa.RankByReputation, fa.RankByAvgScore, fa.ViewsQuartile, fa.ActivityStatus, 
+    fa.RepTier, fa.PostsPerComment, fa.ContributionStatus
+HAVING COUNT(ta.Id) > 0 OR COUNT(tp.Id) > 0
+ORDER BY fa.Reputation DESC, fa.PostCount DESC
+LIMIT 100;

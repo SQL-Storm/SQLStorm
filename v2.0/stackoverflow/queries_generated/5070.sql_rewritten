@@ -1,0 +1,122 @@
+-- {"query": "5070.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 969} 
+WITH
+RecentActivePosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ContentLicense,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.LastActivityDate DESC) AS rn
+    FROM Posts p
+    WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+),
+TopQuestionTags AS (
+    SELECT
+        t.TagName,
+        SUM(p.Score) AS ScoreSum,
+        AVG(p.ViewCount) AS AvgViews,
+        COUNT(*) AS QCount
+    FROM Posts p
+    JOIN UNNEST(string_to_array(p.Tags, '') ) AS t(TagName) WITH ORDINALITY ON TRUE
+    WHERE p.PostTypeId = 1
+      AND p.LastActivityDate IS NOT NULL
+    GROUP BY t.TagName
+),
+CorrelatedSubquery AS (
+    SELECT
+        a.PostId,
+        a.Title,
+        a.OwnerUserId,
+        a.LastActivityDate,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.PostId) AS CommentCountOnPost,
+        (SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.PostId = a.PostId) AS TotalBounties
+    FROM Posts a
+    WHERE a.PostTypeId = 1
+      AND EXISTS (
+          SELECT 1
+          FROM Votes v
+          WHERE v.PostId = a.PostId
+            AND v.VoteTypeId = 2
+            AND v.CreationDate > a.CreationDate
+      )
+),
+WindowedResults AS (
+    SELECT
+        r.PostId,
+        r.PostTypeId,
+        r.Title,
+        r.OwnerUserId,
+        r.LastActivityDate,
+        r.Score,
+        r.ViewCount,
+        r.AnswerCount,
+        r.CommentCount,
+        r.FavoriteCount,
+        ROW_NUMBER() OVER (ORDER BY r.LastActivityDate DESC, r.Score DESC) AS wn
+    FROM RecentActivePosts r
+    WHERE r.rn <= 5
+),
+ComplexPredicate AS (
+    SELECT
+        w.PostId,
+        w.Title,
+        w.LastActivityDate,
+        w.Score,
+        w.ViewCount,
+        w.AnswerCount,
+        w.CommentCount,
+        w.FavoriteCount,
+        CASE
+            WHEN w.Score > 0 AND w.ViewCount > 1000 THEN 'Highly Engaged'
+            WHEN w.Score <= 0 AND w.ViewCount > 500 THEN 'Moderately Engaged'
+            ELSE 'Low Engagement'
+        END AS EngagementBucket,
+        CONCAT_WS(' | ', COALESCE(w.Title, ''), COALESCE((SELECT TOP 1 DoNotExist FROM (SELECT 1) AS t), '')) AS MetaInfo
+    FROM WindowedResults w
+    JOIN Users u ON w.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE w.wn <= 10
+      AND (u.Reputation IS NULL OR u.Reputation BETWEEN 1 AND 1000000)
+)
+SELECT
+    c.PostId AS PostId,
+    c.Title AS Title,
+    c.LastActivityDate AS LastActivityDate,
+    c.Score AS Score,
+    c.ViewCount AS ViewCount,
+    c.AnswerCount AS AnswerCount,
+    c.CommentCount AS CommentCount,
+    c.FavoriteCount AS FavoriteCount,
+    c.EngagementBucket AS EngagementBucket,
+    c.MetaInfo AS MetaInfo,
+    t.TagName AS TopTag,
+    t.ScoreSum AS TagScoreSum,
+    t.AvgViews AS TagAvgViews,
+    t.QCount AS TagQuestionCount,
+    cr.Name AS CloseReason
+FROM ComplexPredicate c
+LEFT JOIN (
+    SELECT
+        pt.TagName,
+        SUM(pr.Score) AS ScoreSum,
+        AVG(pr.ViewCount) AS AvgViews,
+        COUNT(*) AS QCount
+    FROM Posts pr
+    JOIN UNNEST(string_to_array(pr.Tags, '') ) AS pt(TagName) ON TRUE
+    WHERE pr.PostTypeId = 1
+    GROUP BY pt.TagName
+) t ON TRUE
+LEFT JOIN PostHistory ph ON ph.PostId = c.PostId
+LEFT JOIN CloseReasonTypes cr ON CAST(JSON_VALUE(ph.Text, '$.CloseReasonId') AS SMALLINT) = cr.Id
+WHERE c.wn <= 20
+ORDER BY c.LastActivityDate DESC, c.Score DESC
+LIMIT 100;

@@ -1,0 +1,366 @@
+-- {"query": "225.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3274} 
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'unknown') as websiteurl_norm,
+    case when u.location is null or u.location = '' then 1 else 0 end as is_loc_null
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_activity as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.posttypeid = 1) as q_count,
+    count(*) filter (where p.posttypeid = 2) as a_count,
+    sum(coalesce(p.score,0)) as post_score_sum,
+    sum(coalesce(p.viewcount,0)) as view_sum,
+    count(distinct p.id) as post_count,
+    min(p.creationdate) as first_post_at,
+    max(p.lastactivitydate) as last_activity_at
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+comment_stats as (
+  select
+    c.userid as user_id,
+    count(*) as comment_count,
+    sum(coalesce(c.score,0)) as comment_score_sum,
+    max(c.creationdate) as last_comment_at
+  from comments c
+  where c.userid is not null
+  group by c.userid
+),
+badge_rollup as (
+  select
+    b.userid as user_id,
+    count(*) as badge_count,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+    min(b.date) as first_badge_at,
+    max(b.date) as last_badge_at
+  from badges b
+  group by b.userid
+),
+question_core as (
+  select
+    p.id as post_id,
+    p.owneruserid as owner_user_id,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.title,
+    p.tags,
+    p.acceptedanswerid,
+    p.closeddate,
+    p.answercount
+  from posts p
+  where p.posttypeid = 1
+),
+answer_core as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as owner_user_id,
+    a.creationdate,
+    a.score,
+    a.lastactivitydate
+  from posts a
+  where a.posttypeid = 2
+),
+dup_links as (
+  select
+    pl.postid as dup_post_id,
+    pl.relatedpostid as canonical_post_id,
+    pl.creationdate as dup_linked_at
+  from postlinks pl
+  where pl.linktypeid = 3
+),
+hot_history as (
+  select
+    ph.postid,
+    ph.creationdate as hot_at,
+    ph.posthistorytypeid,
+    row_number() over (partition by ph.postid order by ph.creationdate) as rn
+  from posthistory ph
+  where ph.posthistorytypeid in (52,53)
+),
+votes_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+    count(*) as vote_events
+  from votes v
+  group by v.postid
+),
+tag_unrolled as (
+  select
+    qc.post_id,
+    unnest(string_to_array(substring(qc.tags, 2, length(qc.tags)-2), '><')) as tagname
+  from question_core qc
+  where qc.tags is not null and length(qc.tags) > 2
+),
+tag_density as (
+  select
+    t.post_id,
+    count(*) as tag_count,
+    string_agg(t.tagname, ',' order by t.tagname) as tag_list
+  from tag_unrolled t
+  group by t.post_id
+),
+accepted_answer_info as (
+  select
+    qc.post_id,
+    aa.answer_id,
+    aa.owner_user_id as accepted_owner_id,
+    aa.score as accepted_score,
+    aa.creationdate as accepted_created_at
+  from question_core qc
+  left join answer_core aa
+    on aa.answer_id = qc.acceptedanswerid
+),
+answer_stats as (
+  select
+    ac.question_id,
+    count(*) as answers_total,
+    avg(ac.score::numeric) as avg_answer_score,
+    max(ac.score) as max_answer_score,
+    min(ac.creationdate) as first_answer_at,
+    max(ac.creationdate) as last_answer_at
+  from answer_core ac
+  group by ac.question_id
+),
+question_quality as (
+  select
+    qc.post_id,
+    qc.owner_user_id,
+    qc.creationdate,
+    qc.score,
+    qc.viewcount,
+    qc.title,
+    td.tag_count,
+    td.tag_list,
+    va.upvotes,
+    va.downvotes,
+    va.vote_events,
+    coalesce(va.upvotes,0) - coalesce(va.downvotes,0) as net_votes,
+    asx.answers_total,
+    asx.avg_answer_score,
+    asx.max_answer_score,
+    aa.accepted_owner_id,
+    aa.accepted_score,
+    case when qc.closeddate is not null then 1 else 0 end as is_closed,
+    dl.canonical_post_id,
+    dl.dup_linked_at
+  from question_core qc
+  left join tag_density td on td.post_id = qc.post_id
+  left join votes_agg va on va.postid = qc.post_id
+  left join answer_stats asx on asx.question_id = qc.post_id
+  left join accepted_answer_info aa on aa.post_id = qc.post_id
+  left join dup_links dl on dl.dup_post_id = qc.post_id
+),
+user_rollup as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.creationdate,
+    ru.location,
+    ru.websiteurl_norm,
+    ru.is_loc_null,
+    coalesce(ua.q_count,0) as q_count,
+    coalesce(ua.a_count,0) as a_count,
+    coalesce(ua.post_score_sum,0) as post_score_sum,
+    coalesce(ua.view_sum,0) as view_sum,
+    ua.first_post_at,
+    ua.last_activity_at,
+    coalesce(cs.comment_count,0) as comment_count,
+    coalesce(cs.comment_score_sum,0) as comment_score_sum,
+    cs.last_comment_at,
+    coalesce(br.badge_count,0) as badge_count,
+    coalesce(br.gold_count,0) as gold_count,
+    coalesce(br.silver_count,0) as silver_count,
+    coalesce(br.bronze_count,0) as bronze_count,
+    br.first_badge_at,
+    br.last_badge_at
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.user_id
+  left join comment_stats cs on cs.user_id = ru.user_id
+  left join badge_rollup br on br.user_id = ru.user_id
+),
+question_ranked as (
+  select
+    qq.*,
+    row_number() over (partition by qq.owner_user_id order by qq.score desc nulls last, qq.viewcount desc nulls last, qq.post_id) as rn_by_user_score,
+    rank() over (order by coalesce(qq.score, -2147483648) desc, coalesce(qq.viewcount, -2147483648) desc, qq.post_id) as global_rank_by_popularity,
+    dense_rank() over (order by coalesce(qq.net_votes, -2147483648) desc, coalesce(qq.answers_total, -2147483648) desc) as dense_rank_by_engagement
+  from question_quality qq
+),
+question_anomalies as (
+  select
+    qr.post_id,
+    case when qr.tag_count is null or qr.tag_count = 0 then 'NO_TAGS'
+         when qr.tag_count > 5 then 'MANY_TAGS'
+         else null end as tag_issue,
+    case when qr.viewcount is not null and qr.score is not null and qr.viewcount > 0 and qr.score::numeric / nullif(qr.viewcount,0)::numeric < -0.01 then 'NEG_SCORE_HIGH_VIEWS' else null end as neg_ratio_issue,
+    case when qr.is_closed = 1 and qr.answers_total is not null and qr.answers_total > 5 then 'CLOSED_WITH_MANY_ANSWERS' else null end as closed_answers_issue
+  from question_ranked qr
+),
+final_user_question as (
+  select
+    ur.user_id,
+    ur.displayname,
+    ur.reputation,
+    ur.creationdate as user_created_at,
+    ur.location,
+    ur.websiteurl_norm,
+    ur.q_count,
+    ur.a_count,
+    ur.post_score_sum,
+    ur.view_sum,
+    ur.comment_count,
+    ur.comment_score_sum,
+    ur.badge_count,
+    ur.gold_count,
+    ur.silver_count,
+    ur.bronze_count,
+    qr.post_id,
+    coalesce(qr.title, '[no title]') as title,
+    qr.score as q_score,
+    qr.viewcount as q_views,
+    qr.tag_list,
+    qr.net_votes,
+    qr.answers_total,
+    qr.avg_answer_score,
+    qr.accepted_score,
+    qr.is_closed,
+    qr.canonical_post_id,
+    qr.dup_linked_at,
+    qr.rn_by_user_score,
+    qr.global_rank_by_popularity,
+    qr.dense_rank_by_engagement,
+    array_remove(array[qax.tag_issue, qax.neg_ratio_issue, qax.closed_answers_issue], null) as anomaly_flags
+  from user_rollup ur
+  left join lateral (
+    select * from question_ranked q
+    where q.owner_user_id = ur.user_id
+      and q.rn_by_user_score <= 3
+    order by q.rn_by_user_score
+  ) qr on true
+  left join question_anomalies qax on qax.post_id = qr.post_id
+),
+top_tags as (
+  select
+    tq.user_id,
+    lower(t.tagname) as tagname,
+    count(*) as tag_use_count,
+    row_number() over (partition by tq.user_id order by count(*) desc, lower(t.tagname)) as rn
+  from final_user_question tq
+  join tag_unrolled t on t.post_id = tq.post_id
+  group by tq.user_id, lower(t.tagname)
+),
+top_tag_pivot as (
+  select
+    tt.user_id,
+    max(case when tt.rn = 1 then tt.tagname end) as top_tag_1,
+    max(case when tt.rn = 2 then tt.tagname end) as top_tag_2,
+    max(case when tt.rn = 3 then tt.tagname end) as top_tag_3
+  from top_tags tt
+  where tt.rn <= 3
+  group by tt.user_id
+),
+close_reasons as (
+  select
+    ph.postid,
+    max(case when ph.posthistorytypeid = 10 then ph.comment end) as last_close_reason_id,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_closed_at
+  from posthistory ph
+  where ph.posthistorytypeid = 10
+  group by ph.postid
+),
+close_reason_name as (
+  select
+    cr.postid,
+    crt.name as close_reason_name,
+    cr.last_closed_at
+  from close_reasons cr
+  left join closerreasontypes crt on cast(cr.last_close_reason_id as smallint) = crt.id
+),
+hot_status as (
+  select
+    hh.postid,
+    max(case when hh.posthistorytypeid = 52 then hh.hot_at end) as first_hot_at,
+    max(case when hh.posthistorytypeid = 53 then hh.hot_at end) as removed_hot_at,
+    min(hh.rn) as first_hot_event_order
+  from hot_history hh
+  group by hh.postid
+)
+select
+  fuq.user_id,
+  fuq.displayname,
+  fuq.reputation,
+  fuq.user_created_at,
+  fuq.location,
+  fuq.websiteurl_norm,
+  fuq.q_count,
+  fuq.a_count,
+  fuq.post_score_sum,
+  fuq.view_sum,
+  fuq.comment_count,
+  fuq.comment_score_sum,
+  fuq.badge_count,
+  fuq.gold_count,
+  fuq.silver_count,
+  fuq.bronze_count,
+  coalesce(ttp.top_tag_1, 'n/a') as top_tag_1,
+  coalesce(ttp.top_tag_2, 'n/a') as top_tag_2,
+  coalesce(ttp.top_tag_3, 'n/a') as top_tag_3,
+  fuq.post_id as question_id,
+  fuq.title,
+  fuq.q_score,
+  fuq.q_views,
+  fuq.tag_list,
+  fuq.net_votes,
+  fuq.answers_total,
+  round(coalesce(fuq.avg_answer_score,0)::numeric, 2) as avg_answer_score,
+  fuq.accepted_score,
+  fuq.is_closed,
+  coalesce(crn.close_reason_name, 'n/a') as close_reason_name,
+  crn.last_closed_at,
+  fuq.canonical_post_id as duplicate_of,
+  fuq.dup_linked_at,
+  hs.first_hot_at,
+  hs.removed_hot_at,
+  fuq.rn_by_user_score as top_q_rank_for_user,
+  fuq.global_rank_by_popularity,
+  fuq.dense_rank_by_engagement,
+  case
+    when fuq.anomaly_flags is null or cardinality(fuq.anomaly_flags) = 0 then 'OK'
+    else array_to_string(fuq.anomaly_flags, '|')
+  end as anomaly_summary,
+  coalesce(vq.upvotes,0) as upvotes,
+  coalesce(vq.downvotes,0) as downvotes,
+  coalesce(vq.vote_events,0) as vote_events,
+  (coalesce(vq.upvotes,0)::numeric / nullif(coalesce(vq.vote_events,0),0)) as upvote_ratio
+from final_user_question fuq
+left join votes_agg vq on vq.postid = fuq.question_id
+left join top_tag_pivot ttp on ttp.user_id = fuq.user_id
+left join close_reason_name crn on crn.postid = fuq.question_id
+left join hot_status hs on hs.postid = fuq.question_id
+where
+  (fuq.q_score is null or fuq.q_score >= 0 or fuq.is_closed = 1)
+  and (fuq.title is null or length(fuq.title) > 5)
+  and (fuq.tag_list is null or position('sql' in lower(fuq.tag_list)) = 0)
+  and (fuq.question_id is not null or fuq.user_id is not null)
+order by
+  fuq.global_rank_by_popularity nulls last,
+  fuq.user_id,
+  fuq.rn_by_user_score;

@@ -1,0 +1,168 @@
+-- {"query": "4225.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1407} 
+
+WITH
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS QuestionsCount,
+      COUNT(DISTINCT a.Id) AS AnswersCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+      MAX(p.CreationDate) AS LastQuestionDate,
+      MAX(a.CreationDate) AS LastAnswerDate,
+      DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Badges b
+        WHERE
+          b.UserId = u.Id AND b.Class = 1
+      ) AS GoldBadges,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Badges b
+        WHERE
+          b.UserId = u.Id AND b.Class = 2
+      ) AS SilverBadges,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Badges b
+        WHERE
+          b.UserId = u.Id AND b.Class = 3
+      ) AS BronzeBadges
+    FROM
+      Users u
+    LEFT JOIN
+      Posts p
+      ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN
+      Posts a
+      ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN
+      Votes v
+      ON u.Id = v.UserId
+    WHERE
+      u.Id > 0 AND u.DisplayName IS NOT NULL AND u.AboutMe IS NOT NULL
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.OwnerUserId,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      SUM(CASE WHEN pv.VoteTypeId IN (2, 16) THEN 1 ELSE 0 END) AS PositiveVoteCount,
+      SUM(CASE WHEN pv.VoteTypeId = 3 THEN 1 ELSE 0 END) AS NegativeVoteCount,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostSequenceNumber,
+      AVG(CAST(p.Score AS FLOAT)) OVER (PARTITION BY p.OwnerUserId) AS AverageScorePerUser
+    FROM
+      Posts p
+    LEFT JOIN
+      Comments c
+      ON p.Id = c.PostId
+    LEFT JOIN
+      Votes pv
+      ON p.Id = pv.PostId
+    WHERE
+      p.PostTypeId IN (1, 2)
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate
+  ),
+  RankedPostEngagement AS (
+    SELECT
+      pe.*,
+      CASE
+        WHEN pe.PostSequenceNumber <= 5 THEN 'Top 5 Recent'
+        WHEN pe.PostSequenceNumber <= 10 THEN 'Next 5 Recent'
+        ELSE 'Older'
+      END AS PostRecencyBucket
+    FROM
+      PostEngagement pe
+  )
+SELECT
+  ua.DisplayName,
+  ua.Reputation,
+  ua.ReputationRank,
+  ua.QuestionsCount,
+  ua.AnswersCount,
+  ua.UpVotesReceived,
+  ua.DownVotesReceived,
+  ua.GoldBadges,
+  ua.SilverBadges,
+  ua.BronzeBadges,
+  ua.LastQuestionDate,
+  ua.LastAnswerDate,
+  COALESCE(rpe.Title, 'No Recent Activity') AS LatestPostTitle,
+  COALESCE(rpe.PostRecencyBucket, 'N/A') AS LatestPostBucket,
+  CASE
+    WHEN rpe.AverageScorePerUser > 50 THEN 'High Performing'
+    WHEN rpe.AverageScorePerUser BETWEEN 10 AND 50 THEN 'Moderate Performing'
+    ELSE 'Low Performing'
+  END AS UserPostPerformance,
+  CASE
+    WHEN ua.DisplayName LIKE '%[^a-zA-Z0-9 ]%' THEN 'Contains Special Chars'
+    WHEN ua.DisplayName LIKE '%[^a-zA-Z]%' THEN 'Contains Non-Alphabet'
+    ELSE 'Alphanumeric Only'
+  END AS DisplayNameCharType,
+  CASE
+    WHEN ua.LastAccessDate < ua.CreationDate + INTERVAL '1 year' THEN 'Early Adopter'
+    ELSE 'Later Adopter'
+  END AS UserAdoptionSegment,
+  (
+    SELECT
+      COUNT(DISTINCT ph.Id)
+    FROM
+      PostHistory ph
+    WHERE
+      ph.UserId = ua.UserId AND ph.PostHistoryTypeId IN (1, 2, 3)
+  ) AS InitialEdits,
+  (
+    SELECT
+      COUNT(DISTINCT ph.Id)
+    FROM
+      PostHistory ph
+    WHERE
+      ph.UserId = ua.UserId AND ph.PostHistoryTypeId IN (4, 5, 6)
+  ) AS SubsequentEdits,
+  COALESCE(
+    (
+      SELECT
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END)
+      FROM
+        PostLinks pl
+      WHERE
+        pl.PostId IN (
+          SELECT
+            p2.Id
+          FROM
+            Posts p2
+          WHERE
+            p2.OwnerUserId = ua.UserId
+        )
+    ),
+    0
+  ) AS DuplicateLinksCreated
+FROM
+  UserActivity ua
+LEFT JOIN
+  RankedPostEngagement rpe
+  ON ua.UserId = rpe.OwnerUserId AND rpe.PostSequenceNumber = 1
+WHERE
+  ua.Reputation > 10000 AND ua.QuestionsCount > 10 AND ua.AnswersCount > 50
+  AND (ua.GoldBadges + ua.SilverBadges + ua.BronzeBadges) > 5
+ORDER BY
+  ua.ReputationRank,
+  ua.DisplayName;

@@ -1,0 +1,160 @@
+WITH RECURSIVE TagHierarchy AS (
+    SELECT t.Id,
+           t.TagName,
+           CAST(NULL AS INTEGER)        AS ParentTagId,
+           1                            AS Level
+    FROM   Tags t
+    WHERE  t.IsModeratorOnly = 0
+    UNION ALL
+    SELECT t.Id,
+           t.TagName,
+           th.Id,
+           th.Level + 1
+    FROM   Tags t
+    JOIN   TagHierarchy th
+           ON t.TagName LIKE th.TagName || '-%'
+    WHERE  th.Level < 5
+),
+UserPostStats AS (
+    SELECT u.Id                                      AS UserId,
+           u.DisplayName,
+           COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+           COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+           COALESCE(SUM(p.Score),0)                      AS TotalScore,
+           AVG(p.Score)                                  AS AvgScore,
+           MAX(p.CreationDate)                           AS LastPostDate
+    FROM   Users u
+    LEFT   JOIN Posts p
+           ON p.OwnerUserId = u.Id
+    GROUP  BY u.Id, u.DisplayName
+),
+TopPosts AS (
+    SELECT p.Id,
+           p.Title,
+           p.Score,
+           p.CreationDate,
+           p.OwnerUserId,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                              ORDER BY p.Score DESC NULLS LAST, p.CreationDate DESC) AS RN
+    FROM   Posts p
+    WHERE  p.PostTypeId = 1
+      AND  p.Score IS NOT NULL
+),
+RecentVotes AS (
+    SELECT v.PostId,
+           MAX(v.CreationDate)                                      AS LatestVoteDate,
+           SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END)               AS UpVotes,
+           SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END)               AS DownVotes
+    FROM   Votes v
+    JOIN   VoteTypes vt
+           ON vt.Id = v.VoteTypeId
+    WHERE  vt.Id IN (2,3)
+    GROUP  BY v.PostId
+),
+BadgeAgg AS (
+    SELECT b.UserId,
+           STRING_AGG(b.Name, '; ')                                 AS BadgeList,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END)                   AS GoldCount,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END)                   AS SilverCount,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END)                   AS BronzeCount
+    FROM   Badges b
+    GROUP  BY b.UserId
+),
+CommentLatest AS (
+    SELECT c.PostId,
+           c.Text                     AS LatestComment,
+           c.CreationDate
+    FROM   Comments c
+    WHERE  c.Id = (SELECT MAX(c2.Id)
+                   FROM   Comments c2
+                   WHERE  c2.PostId = c.PostId)
+),
+ActiveUsers AS (
+SELECT ups.UserId,
+       ups.DisplayName,
+       ups.QuestionCount,
+       ups.AnswerCount,
+       ups.TotalScore,
+       ROUND(CAST(ups.AvgScore AS NUMERIC),2)             AS AvgScore,
+       ups.LastPostDate,
+       COALESCE(bag.BadgeList,'None')            AS Badges,
+       bag.GoldCount,
+       bag.SilverCount,
+       bag.BronzeCount,
+       tp.Id                                      AS TopQuestionId,
+       tp.Title                                   AS TopQuestionTitle,
+       tp.Score                                   AS TopQuestionScore,
+       rv.UpVotes,
+       rv.DownVotes,
+       rv.LatestVoteDate,
+       cl.LatestComment,
+       cl.CreationDate                           AS CommentDate,
+       CASE
+           WHEN ups.TotalScore > 1000            THEN 'PowerUser'
+           WHEN ups.QuestionCount >= 10
+                AND ups.AnswerCount   >= 20     THEN 'Contributor'
+           ELSE                                   'Casual'
+       END                                        AS UserCategory,
+       COALESCE(NULLIF(tp.Title,''),'Untitled')  AS NormalizedTitle,
+       LENGTH(COALESCE(tp.Title,''))             AS TitleLength,
+       (SELECT COUNT(*)
+          FROM Posts p2
+         WHERE p2.OwnerUserId = ups.UserId
+           AND p2.Tags ILIKE '%<sql>%')           AS SqlTagCount
+FROM   UserPostStats ups
+LEFT   JOIN BadgeAgg bag
+       ON bag.UserId = ups.UserId
+LEFT   JOIN TopPosts tp
+       ON tp.OwnerUserId = ups.UserId
+      AND tp.RN = 1
+LEFT   JOIN RecentVotes rv
+       ON rv.PostId = tp.Id
+LEFT   JOIN CommentLatest cl
+       ON cl.PostId = tp.Id
+WHERE  ups.UserId IS NOT NULL
+  AND (ups.QuestionCount > 0 OR ups.AnswerCount > 0)
+),
+InactiveUsers AS (
+SELECT u.Id                                      AS UserId,
+       u.DisplayName,
+       0                                           AS QuestionCount,
+       0                                           AS AnswerCount,
+       0                                           AS TotalScore,
+       CAST(NULL AS NUMERIC)                       AS AvgScore,
+       CAST(NULL AS TIMESTAMP)                     AS LastPostDate,
+       COALESCE(bag.BadgeList,'None')              AS Badges,
+       bag.GoldCount,
+       bag.SilverCount,
+       bag.BronzeCount,
+       CAST(NULL AS INTEGER)                       AS TopQuestionId,
+       CAST(NULL AS TEXT)                          AS TopQuestionTitle,
+       CAST(NULL AS INTEGER)                       AS TopQuestionScore,
+       CAST(NULL AS INTEGER)                       AS UpVotes,
+       CAST(NULL AS INTEGER)                       AS DownVotes,
+       CAST(NULL AS TIMESTAMP)                     AS LatestVoteDate,
+       CAST(NULL AS TEXT)                          AS LatestComment,
+       CAST(NULL AS TIMESTAMP)                     AS CommentDate,
+       'Inactive'                                  AS UserCategory,
+       CAST(NULL AS TEXT)                          AS NormalizedTitle,
+       CAST(NULL AS INTEGER)                       AS TitleLength,
+       0                                           AS SqlTagCount
+FROM   Users u
+LEFT   JOIN BadgeAgg bag
+       ON bag.UserId = u.Id
+WHERE  NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+  AND  EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id)
+)
+SELECT *
+FROM (
+  SELECT *
+  FROM ActiveUsers
+  ORDER BY TotalScore DESC, LastPostDate DESC
+  LIMIT 100
+
+  UNION ALL
+
+  SELECT *
+  FROM InactiveUsers
+  ORDER BY GoldCount DESC, SilverCount DESC, BronzeCount DESC
+  LIMIT 20
+) sub;

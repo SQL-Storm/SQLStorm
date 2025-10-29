@@ -1,0 +1,146 @@
+-- {"query": "5741.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 930} 
+WITH ranked_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    COALESCE(p.OwnerDisplayName, '') AS OwnerDisplayName,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY
+        p.Score DESC NULLS LAST,
+        p.ViewCount DESC NULLS LAST,
+        p.CreationDate DESC
+    ) AS rn
+  FROM Posts p
+  WHERE p.ClosedDate IS NULL
+),
+correlated_stats AS (
+  SELECT
+    rp.PostId,
+    rp.PostTypeId,
+    rp.Title,
+    rp.OwnerUserId,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.Tags,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    u.Reputation,
+    u.DisplayName,
+    bv.Name AS BadgeName,
+    COUNT(c.Id) OVER (PARTITION BY rp.PostId) AS CommentCountLive
+  FROM ranked_posts rp
+  LEFT JOIN Users u ON u.Id = rp.OwnerUserId
+  LEFT JOIN Badges bv ON bv.UserId = rp.OwnerUserId
+  LEFT JOIN Comments c ON c.PostId = rp.PostId
+  WHERE rp.rn = 1
+),
+dynamic_sources AS (
+  SELECT
+    cs.PostId,
+    cs.PostTypeId,
+    cs.Title,
+    cs.OwnerUserId,
+    cs.Reputation,
+    cs.DisplayName,
+    cs.CreatedAt,
+    cs.LastActivityDate,
+    cs.Score,
+    cs.ViewCount,
+    cs.Tags,
+    cs.AnswerCount,
+    cs.CommentCount,
+    cs.FavoriteCount,
+    cs.BadgeName,
+    CASE
+      WHEN cs.Reputation IS NULL THEN 0
+      ELSE cs.Reputation / 10
+    END AS ReputationBand
+  FROM correlated_stats cs
+),
+windowed AS (
+  SELECT
+    ds.PostId,
+    ds.Title,
+    ds.OwnerUserId,
+    ds.Reputation,
+    ds.DisplayName,
+    ds.LastActivityDate,
+    ds.Score,
+    ds.ViewCount,
+    ds.Tags,
+    ds.AnswerCount,
+    ds.CommentCount,
+    ds.FavoriteCount,
+    ds.BadgeName,
+    ds.ReputationBand,
+    SUM(ds.Score) OVER (PARTITION BY ds.PostTypeId
+                        ORDER BY ds.Score DESC, ds.ViewCount DESC
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningScore
+  FROM dynamic_sources ds
+),
+final AS (
+  SELECT
+    w.PostId,
+    w.PostTypeId,
+    w.Title,
+    w.OwnerUserId,
+    w.DisplayName,
+    w.LastActivityDate,
+    w.Score,
+    w.ViewCount,
+    w.Tags,
+    w.AnswerCount,
+    w.CommentCount,
+    w.FavoriteCount,
+    w.BadgeName,
+    w.ReputationBand,
+    w.RunningScore,
+    CASE
+      WHEN w.PostTypeId = 1 THEN 'Question'
+      WHEN w.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END AS PostKind,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = w.OwnerUserId AND p2.CreationDate > w.CreationDate) AS LaterPostsFromAuthor
+  FROM windowed w
+)
+SELECT
+  f.PostId,
+  f.PostTypeId,
+  f.PostKind,
+  f.Title,
+  f.OwnerUserId,
+  f.DisplayName,
+  f.LastActivityDate,
+  f.Score,
+  f.ViewCount,
+  f.Tags,
+  f.AnswerCount,
+  f.CommentCount,
+  f.FavoriteCount,
+  f.BadgeName,
+  f.ReputationBand,
+  f.RunningScore,
+  f.LaterPostsFromAuthor,
+  vul.Name AS LastEditorName
+FROM final f
+LEFT JOIN Votes v ON v.PostId = f.PostId
+LEFT JOIN Users vul ON vul.Id = f.OwnerUserId
+WHERE f.RunningScore > 100
+  AND f.ViewCount > 1000
+ORDER BY f.RunningScore DESC NULLS LAST, f.ViewCount DESC NULLS LAST
+LIMIT 200
+;

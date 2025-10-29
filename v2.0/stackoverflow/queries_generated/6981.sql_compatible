@@ -1,0 +1,47 @@
+SELECT 
+    u.Id,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.Reputation) AS MaxReputation,
+    MIN(u.CreationDate) AS EarliestUserCreationDate,
+    STRING_AGG(DISTINCT b.Name, ', ') AS BadgesEarned,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.LastActivityDate) DESC) AS LastActivePostRank,
+    (SELECT STRING_AGG(tt.TagName, ', ' ORDER BY tt.Count DESC)
+     FROM (
+         SELECT DISTINCT t2.TagName, t2.Count
+         FROM (
+             SELECT 
+                 pt.TagName, 
+                 COUNT(*) AS Count, 
+                 pt.Id
+             FROM 
+                 PostTags pt
+             JOIN 
+                 Tags tg ON tg.Id = pt.TagId
+             GROUP BY 
+                 pt.Id, pt.TagName
+         ) t2
+         JOIN (
+             SELECT p3.Id, p3.OwnerUserId
+             FROM Posts p3
+             WHERE p3.OwnerUserId = u.Id
+         ) uposts ON uposts.Id = uposts.Id
+     ) tt
+    ) AS TopTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+WHERE 
+    u.Id IS NOT NULL
+GROUP BY 
+    u.Id, u.DisplayName
+HAVING 
+    COUNT(DISTINCT p.Id) > 100
+ORDER BY 
+    MaxReputation DESC, 
+    TotalPosts DESC;

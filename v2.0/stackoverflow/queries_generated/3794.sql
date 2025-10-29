@@ -1,0 +1,185 @@
+-- {"query": "3794.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 4027} 
+
+WITH
+/* recent questions from the last year */
+recent_q AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_owner_q
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= date_trunc('year', CURRENT_DATE) - INTERVAL '1 year'
+),
+/* aggregate user statistics */
+user_stats AS (
+    SELECT
+        u.Id                     AS UserId,
+        u.Reputation,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END),0) AS GoldBadgeCnt,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END),0) AS SilverBadgeCnt,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END),0) AS BronzeBadgeCnt,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS UpVoteCnt,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS DownVoteCnt,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS reputation_rank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v  ON v.UserId = u.Id
+    GROUP BY u.Id, u.Reputation
+),
+/* tag popularity per month */
+tag_monthly AS (
+    SELECT
+        lower(trim(both '><' FROM unnest(string_to_array(q.Tags, '><')))) AS tag,
+        date_trunc('month', q.CreationDate)                             AS month,
+        COUNT(*)                                                       AS qcnt
+    FROM recent_q q
+    WHERE q.Tags IS NOT NULL
+    GROUP BY 1,2
+),
+/* top 5 tags per month */
+top_tags AS (
+    SELECT
+        t.tag,
+        t.month,
+        t.qcnt,
+        ROW_NUMBER() OVER (PARTITION BY t.month ORDER BY t.qcnt DESC) AS rn_month
+    FROM tag_monthly t
+)
+SELECT
+    rq.Id                                 AS QuestionId,
+    rq.Title,
+    LOWER(REPLACE(rq.Title,' ','_'))       AS Title_Slug,
+    COALESCE(u.Reputation,0)               AS OwnerReputation,
+    us.reputation_rank,
+    rq.Score,
+    rq.ViewCount,
+    rq.FavoriteCount,
+    rq.AnswerCount,
+    /* avg score of answers (correlated subquery) */
+    (SELECT AVG(a.Score)::numeric(10,2)
+     FROM Posts a
+     WHERE a.PostTypeId = 2 AND a.ParentId = rq.Id)          AS AvgAnswerScore,
+    /* id of highest‑scored answer */
+    (SELECT a.Id
+     FROM Posts a
+     WHERE a.PostTypeId = 2 AND a.ParentId = rq.Id
+     ORDER BY a.Score DESC NULLS LAST
+     LIMIT 1)                                                AS TopAnswerId,
+    COALESCE(us.GoldBadgeCnt,0)                               AS OwnerGoldBadges,
+    /* duplicate link, if any */
+    pl.RelatedPostId                                          AS DuplicateOf,
+    pl.CreationDate                                           AS DuplicateLinkDate,
+    tt.rn_month                                               AS TagMonthRank,
+    /* questions this owner posted in the last 30 days */
+    COUNT(rq.Id) OVER (PARTITION BY rq.OwnerUserId
+                       ORDER BY rq.CreationDate
+                       RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW)
+                                                               AS OwnerRecentQCount
+FROM recent_q rq
+LEFT JOIN Users u          ON u.Id = rq.OwnerUserId
+LEFT JOIN user_stats us   ON us.UserId = u.Id
+LEFT JOIN PostLinks pl    ON pl.PostId = rq.Id AND pl.LinkTypeId = 3           -- duplicate link
+LEFT JOIN LATERAL (
+    SELECT tt.rn_month
+    FROM top_tags tt
+    WHERE tt.tag = lower(trim(both '><' FROM unnest(string_to_array(rq.Tags,'><'))))
+      AND tt.rn_month <= 5
+    LIMIT 1
+) tt ON TRUE
+WHERE (rq.Score > 10 OR (rq.ViewCount > 1000 AND rq.FavoriteCount IS NOT NULL))
+  AND (rq.ClosedDate IS NULL OR rq.ClosedDate > CURRENT_DATE - INTERVAL '30 days')
+  AND rq.rn_owner_q <= 20                     -- keep only the newest 20 per owner
+UNION ALL
+/* stale unanswered questions (older than 180 days, no answers) */
+SELECT
+    p.Id,
+    p.Title,
+    LOWER(REPLACE(p.Title,' ','_')),
+    COALESCE(u.Reputation,0),
+    us.reputation_rank,
+    p.Score,
+    p.ViewCount,
+    p.FavoriteCount,
+    p.AnswerCount,
+    NULL::numeric(10,2)          AS AvgAnswerScore,
+    NULL::int                    AS TopAnswerId,
+    COALESCE(us.GoldBadgeCnt,0),
+    NULL,
+    NULL,
+    NULL,
+    0
+FROM Posts p
+LEFT JOIN Users u        ON u.Id = p.OwnerUserId
+LEFT JOIN user_stats us ON us.UserId = u.Id
+WHERE p.PostTypeId = 1
+  AND p.CreationDate < CURRENT_DATE - INTERVAL '180 days'
+  AND p.AnswerCount = 0
+  AND p.Score >= 0
+INTERSECT
+/* users with >20k reputation who also hold a gold badge */
+SELECT
+    q.Id,
+    q.Title,
+    q.Title_Slug,
+    q.OwnerReputation,
+    q.reputation_rank,
+    q.Score,
+    q.ViewCount,
+    q.FavoriteCount,
+    q.AnswerCount,
+    q.AvgAnswerScore,
+    q.TopAnswerId,
+    q.OwnerGoldBadges,
+    q.DuplicateOf,
+    q.DuplicateLinkDate,
+    q.TagMonthRank,
+    q.OwnerRecentQCount
+FROM (
+    SELECT
+        rq.Id,
+        rq.Title,
+        LOWER(REPLACE(rq.Title,' ','_'))                        AS Title_Slug,
+        COALESCE(u.Reputation,0)                               AS OwnerReputation,
+        us.reputation_rank,
+        rq.Score,
+        rq.ViewCount,
+        rq.FavoriteCount,
+        rq.AnswerCount,
+        (SELECT AVG(a.Score)::numeric(10,2)
+         FROM Posts a
+         WHERE a.PostTypeId = 2 AND a.ParentId = rq.Id)      AS AvgAnswerScore,
+        (SELECT a.Id
+         FROM Posts a
+         WHERE a.PostTypeId = 2 AND a.ParentId = rq.Id
+         ORDER BY a.Score DESC NULLS LAST
+         LIMIT 1)                                            AS TopAnswerId,
+        COALESCE(us.GoldBadgeCnt,0)                           AS OwnerGoldBadges,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        tt.rn_month                                           AS TagMonthRank,
+        COUNT(rq.Id) OVER (PARTITION BY rq.OwnerUserId
+                           ORDER BY rq.CreationDate
+                           RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW)
+                                                            AS OwnerRecentQCount
+    FROM recent_q rq
+    LEFT JOIN Users u        ON u.Id = rq.OwnerUserId
+    LEFT JOIN user_stats us ON us.UserId = u.Id
+    LEFT JOIN PostLinks pl  ON pl.PostId = rq.Id AND pl.LinkTypeId = 3
+    LEFT JOIN LATERAL (
+        SELECT tt.rn_month
+        FROM top_tags tt
+        WHERE tt.tag = lower(trim(both '><' FROM unnest(string_to_array(rq.Tags,'><'))))
+          AND tt.rn_month <= 5
+        LIMIT 1
+    ) tt ON TRUE
+    WHERE us.Reputation > 20000 AND us.GoldBadgeCnt > 0
+) q;

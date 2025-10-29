@@ -1,0 +1,152 @@
+-- {"query": "7143.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1715} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 1000 THEN 'Elite'
+            WHEN COUNT(DISTINCT p.Id) > 500 THEN 'Veteran'
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Experienced'
+            ELSE 'Beginner'
+        END as UserLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostComplexity AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END as HasAcceptedAnswer,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END as IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END as IsCommunityOwned,
+        DATEDIFF(DAY, p.CreationDate, COALESCE(p.ClosedDate, p.LastActivityDate, GETDATE())) as AgeInDays,
+        COALESCE(p.ViewCount, 0) + COALESCE(p.Score, 0) + COALESCE(p.AnswerCount, 0) as ActivityScore,
+        REPLACE(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ' ', '') as CleanedTags
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers only
+),
+TagAnalysis AS (
+    SELECT 
+        ta.TagName,
+        ta.Count as TagCount,
+        ta.ExcerptPostId,
+        ta.WikiPostId,
+        CASE 
+            WHEN ta.Count > 1000 THEN 'Popular'
+            WHEN ta.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as TagPopularity,
+        AVG(CASE WHEN p.Score > 0 THEN p.Score ELSE 0 END) as AvgScore,
+        COUNT(p.Id) as RelatedPosts,
+        STRING_AGG(CONCAT(p.Title, ' (', p.Score, ')'), '; ') as SamplePosts
+    FROM Tags ta
+    LEFT JOIN Posts p ON p.Tags LIKE CONCAT('%<', ta.TagName, '>%')
+    WHERE ta.TagName IS NOT NULL AND ta.TagName != ''
+    GROUP BY ta.TagName, ta.Count, ta.ExcerptPostId, ta.WikiPostId
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.PostCount,
+    uas.CommentCount,
+    uas.BadgeCount,
+    uas.UserLevel,
+    uas.ReputationRank,
+    pa.PostId,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.HasAcceptedAnswer,
+    pa.IsClosed,
+    pa.IsCommunityOwned,
+    pa.AgeInDays,
+    pa.ActivityScore,
+    COALESCE(ta.TagPopularity, 'Unknown') as TagPopularity,
+    COALESCE(ta.AvgScore, 0) as AvgTagScore,
+    CASE 
+        WHEN uas.Reputation > 100000 AND uas.PostCount > 500 AND uas.BadgeCount > 20 THEN 'Elite Contributor'
+        WHEN uas.Reputation > 50000 AND uas.PostCount > 200 THEN 'Active Contributor'
+        WHEN uas.Reputation > 10000 AND uas.PostCount > 50 THEN 'Regular Contributor'
+        ELSE 'Contributor'
+    END as ContributorType,
+    NULLIF(pa.Title, '') as TitleNotNull,
+    CASE 
+        WHEN pa.Score > 100 THEN 'Highly Upvoted'
+        WHEN pa.Score > 50 THEN 'Upvoted'
+        WHEN pa.Score > 0 THEN 'Neutral'
+        WHEN pa.Score < 0 THEN 'Downvoted'
+        ELSE 'No Votes'
+    END as VoteStatus,
+    CONCAT('Q', CAST(pa.PostId AS VARCHAR(10))) as PostReference,
+    COALESCE(SUBSTRING(pa.Title, 1, 50), 'No Title') as ShortTitle,
+    COALESCE(pa.CreationDate, GETDATE()) as PostDate,
+    COALESCE(CAST(pa.Score AS VARCHAR(10)), '0') + ' pts' as ScoreDisplay,
+    COALESCE(CAST(pa.ViewCount AS VARCHAR(10)), '0') + ' views' as ViewDisplay,
+    ROW_NUMBER() OVER (PARTITION BY uas.UserId ORDER BY pa.Score DESC) as ScoreRank,
+    DENSE_RANK() OVER (ORDER BY pa.Score DESC) as ScoreDenseRank,
+    NTILE(4) OVER (ORDER BY pa.Score DESC) as ScoreQuartile,
+    LAG(pa.Score, 1) OVER (ORDER BY pa.Score DESC) as PrevScore,
+    LEAD(pa.Score, 1, 0) OVER (ORDER BY pa.Score DESC) as NextScore,
+    AVG(pa.Score) OVER (PARTITION BY uas.UserId) as AvgUserScore,
+    COUNT(*) OVER (PARTITION BY uas.UserId) as UserPostCount,
+    PERCENT_RANK() OVER (ORDER BY pa.Score) as ScorePercentile,
+    CUME_DIST() OVER (ORDER BY pa.Score) as ScoreCumulativeDist,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pa.Score) OVER () as MedianScore,
+    CASE 
+        WHEN pa.IsClosed = 1 AND pa.Score < 0 THEN 'Problematic Closed'
+        WHEN pa.IsClosed = 0 AND pa.Score < 0 THEN 'Problematic Opened'
+        WHEN pa.Score > 100 AND pa.AnswerCount > 10 THEN 'Highly Active'
+        WHEN pa.ViewCount > 1000 AND pa.AnswerCount > 5 THEN 'Highly Viewed'
+        WHEN pa.CommentCount > 10 THEN 'Highly Commented'
+        ELSE 'Standard'
+    END as PostClassification,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM PostHistory ph 
+        WHERE ph.PostId = pa.PostId 
+        AND ph.PostHistoryTypeId = 1 
+        AND ph.CreationDate > pa.CreationDate
+    ) THEN 'Modified' ELSE 'Original' END as PostStatus,
+    ABS(pa.Score - (SELECT AVG(Score) FROM Posts)) as ScoreDeviation,
+    uas.LastPostDate,
+    uas.LastCommentDate
+FROM UserActivityStats uas
+INNER JOIN PostComplexity pa ON uas.UserId = pa.OwnerUserId
+LEFT JOIN TagAnalysis ta ON EXISTS (
+    SELECT 1 FROM STRING_SPLIT(pa.CleanedTags, ',') s 
+    WHERE s.value = ta.TagName
+)
+WHERE uas.Reputation > 1000
+  AND pa.Score > 5
+  AND pa.ViewCount > 10
+  AND (pa.IsClosed = 0 OR pa.IsClosed IS NULL)
+ORDER BY 
+    uas.Reputation DESC, 
+    pa.Score DESC,
+    pa.CreationDate DESC
+OFFSET 100 ROWS 
+FETCH NEXT 100 ROWS ONLY;

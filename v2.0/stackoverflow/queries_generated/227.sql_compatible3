@@ -1,0 +1,355 @@
+with
+q as (
+  select p.Id as QuestionId,
+         p.Title,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.OwnerUserId,
+         p.AcceptedAnswerId,
+         p.Tags,
+         date_trunc('month', p.CreationDate) as q_month
+  from Posts p
+  where p.PostTypeId = 1
+),
+a as (
+  select pa.Id as AnswerId,
+         pa.ParentId as QuestionId,
+         pa.OwnerUserId as AnswerOwnerId,
+         pa.Score as AnswerScore,
+         pa.CreationDate as AnswerCreationDate
+  from Posts pa
+  where pa.PostTypeId = 2
+),
+q_tags as (
+  select q.QuestionId,
+         lower(trim(tag)) as tag,
+         q.q_month
+  from q
+  cross join lateral unnest(string_to_array(substring(coalesce(q.Tags, '') from 2 for greatest(length(coalesce(q.Tags,'')) - 2, 0)), '><')) as t(tag)
+),
+q_metrics as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.Score as QScore,
+    q.ViewCount,
+    q.OwnerUserId,
+    q.AcceptedAnswerId,
+    count(a.AnswerId) filter (where a.AnswerId is not null) as AnswerCount,
+    sum(a.AnswerScore) filter (where a.AnswerId is not null) as SumAnswerScore,
+    max(a.AnswerScore) filter (where a.AnswerId is not null) as MaxAnswerScore,
+    min(a.AnswerScore) filter (where a.AnswerId is not null) as MinAnswerScore,
+    avg(a.AnswerScore) filter (where a.AnswerId is not null) as AvgAnswerScore,
+    count(distinct a.AnswerOwnerId) as DistinctAnswerers,
+    min(a.AnswerCreationDate) as FirstAnswerDate,
+    bool_or(a.AnswerId = q.AcceptedAnswerId) as HasAccepted,
+    row_number() over (partition by date_trunc('month', q.CreationDate) order by q.Score desc nulls last, q.ViewCount desc nulls last, q.QuestionId) as RankInMonthByScore,
+    dense_rank() over (order by date_trunc('month', q.CreationDate), q.Score desc nulls last) as DenseRankGlobalScore
+  from q
+  left join a on a.QuestionId = q.QuestionId
+  group by q.QuestionId, q.Title, q.CreationDate, q.Score, q.ViewCount, q.OwnerUserId, q.AcceptedAnswerId
+),
+-- compute global median QScore in a separate CTE without using ordered-set aggregate OVER()
+global_median as (
+  select
+    percentile_cont(0.5) within group (order by QScore) as GlobalMedianQScore
+  from q_metrics
+),
+u_metrics as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate as UserCreationDate,
+    u.Location,
+    coalesce(u.WebsiteUrl, '') as WebsiteUrl,
+    count(distinct q.QuestionId) as QuestionsAsked,
+    count(distinct a.AnswerId) as AnswersAuthored,
+    sum(qm.QScore) filter (where qm.QuestionId is not null) as SumQScores,
+    sum(a.AnswerScore) as SumAScores,
+    avg(nullif(qm.ViewCount,0)) as AvgQViewsNonZero
+  from Users u
+  left join q on q.OwnerUserId = u.Id
+  left join q_metrics qm on qm.QuestionId = q.QuestionId
+  left join a on a.AnswerOwnerId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.WebsiteUrl
+),
+v_stats as (
+  select
+    p.Id as PostId,
+    sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end) as NetVotes,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    count(*) as TotalVotes,
+    min(v.CreationDate) as FirstVoteAt,
+    max(v.CreationDate) as LastVoteAt
+  from Posts p
+  left join Votes v on v.PostId = p.Id
+  where p.PostTypeId in (1,2)
+  group by p.Id
+),
+c_stats as (
+  select
+    p.Id as PostId,
+    count(c.Id) as CommentCount,
+    avg(c.Score) as AvgCommentScore,
+    max(length(c.Text)) as MaxCommentLen,
+    min(c.CreationDate) as FirstCommentAt
+  from Posts p
+  left join Comments c on c.PostId = p.Id
+  where p.PostTypeId = 1
+  group by p.Id
+),
+closure as (
+  select
+    ph.PostId,
+    max(case when ph.PostHistoryTypeId in (10,35) then 1 else 0 end) = 1 as WasClosedOrMigrated,
+    max(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) = 1 as WasReopened,
+    max(case when ph.PostHistoryTypeId = 50 then 1 else 0 end) = 1 as CommunityBumped,
+    min(case when ph.PostHistoryTypeId in (10,35) then ph.CreationDate end) as FirstCloseOrMigAt,
+    max(case when ph.PostHistoryTypeId = 10 and ph.Comment ~ '^[0-9]+$' then nullif(ph.Comment, '0') end) as LastCloseReasonId_raw
+  from PostHistory ph
+  group by ph.PostId
+),
+closure_casted as (
+  select
+    PostId,
+    WasClosedOrMigrated,
+    WasReopened,
+    CommunityBumped,
+    FirstCloseOrMigAt,
+    case when LastCloseReasonId_raw is not null then cast(LastCloseReasonId_raw as integer) else null end as LastCloseReasonId
+  from closure
+),
+dups as (
+  select
+    pl.PostId as DuplicateId,
+    pl.RelatedPostId as CanonicalId,
+    min(pl.CreationDate) as FirstDupLinkAt,
+    count(*) as DupLinkCount
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+  group by pl.PostId, pl.RelatedPostId
+),
+tag_month_pop as (
+  select qt.tag,
+         qt.q_month,
+         count(distinct qt.QuestionId) as QuestionsWithTagMonth
+  from q_tags qt
+  group by qt.tag, qt.q_month
+),
+q_tag_enriched as (
+  select
+    qm.*,
+    qt.tag,
+    tmp.QuestionsWithTagMonth,
+    case when tmp.QuestionsWithTagMonth = 0 then null
+         else (cast(qm.AnswerCount as numeric) / cast(tmp.QuestionsWithTagMonth as numeric))
+    end as AnsPerTagQuestionMonthRatio
+  from q_metrics qm
+  left join q on q.QuestionId = qm.QuestionId
+  left join q_tags qt on qt.QuestionId = qm.QuestionId
+  left join tag_month_pop tmp on tmp.tag = qt.tag and tmp.q_month = date_trunc('month', qm.CreationDate)
+),
+badges_near_q as (
+  select
+    q.QuestionId,
+    count(b.Id) filter (where b.Date <= q.CreationDate) as BadgesBeforeQ,
+    count(b.Id) filter (where b.Date > q.CreationDate and b.Date <= q.CreationDate + interval '7 days') as BadgesNext7d,
+    sum(case when b.Class = 1 then 1 else 0 end) as GoldTotalByQTime,
+    sum(case when b.Class = 2 then 1 else 0 end) as SilverTotalByQTime,
+    sum(case when b.Class = 3 then 1 else 0 end) as BronzeTotalByQTime
+  from q
+  left join Users u on u.Id = q.OwnerUserId
+  left join Badges b on b.UserId = u.Id
+  group by q.QuestionId
+),
+dup_pairs as (
+  select
+    d.DuplicateId,
+    d.CanonicalId,
+    d.FirstDupLinkAt,
+    d.DupLinkCount,
+    qd.Title as DupTitle,
+    qc.Title as CanonTitle,
+    qd.QScore as DupQScore,
+    qc.QScore as CanonQScore,
+    (qc.QScore - qd.QScore) as ScoreDelta,
+    coalesce(vd.NetVotes,0) as DupNetVotes,
+    coalesce(vc.NetVotes,0) as CanonNetVotes,
+    coalesce(vc.NetVotes,0) - coalesce(vd.NetVotes,0) as NetVoteDelta
+  from dups d
+  left join q_metrics qd on qd.QuestionId = d.DuplicateId
+  left join q_metrics qc on qc.QuestionId = d.CanonicalId
+  left join v_stats vd on vd.PostId = d.DuplicateId
+  left join v_stats vc on vc.PostId = d.CanonicalId
+),
+response_time as (
+  select
+    q.QuestionId,
+    extract(epoch from (min(a.AnswerCreationDate) - q.CreationDate)) / 60.0 as MinutesToFirstAnswer,
+    extract(epoch from (max(a.AnswerCreationDate) - q.CreationDate)) / 60.0 as MinutesToLastAnswer,
+    extract(epoch from (case when q.AcceptedAnswerId is not null then min(a.AcceptedAnswerTime) end)) / 60.0 as MinutesToAccepted
+  from q
+  left join (
+    select a.QuestionId,
+           a.AnswerCreationDate,
+           case when a.AnswerId = q2.AcceptedAnswerId then a.AnswerCreationDate end as AcceptedAnswerTime
+    from a
+    join q q2 on q2.QuestionId = a.QuestionId
+  ) a on a.QuestionId = q.QuestionId
+  group by q.QuestionId, q.CreationDate, q.AcceptedAnswerId
+),
+heavy_window as (
+  select
+    qte.QuestionId,
+    qte.Title,
+    qte.OwnerUserId,
+    qte.QScore,
+    qte.ViewCount,
+    qte.AnswerCount,
+    qte.HasAccepted,
+    qte.tag,
+    qte.AnsPerTagQuestionMonthRatio,
+    coalesce(vs.UpVotes,0) as UpVotes,
+    coalesce(vs.DownVotes,0) as DownVotes,
+    coalesce(cs.CommentCount,0) as CommentCount,
+    coalesce(cs.AvgCommentScore,0) as AvgCommentScore,
+    coalesce(rt.MinutesToFirstAnswer, null) as MinutesToFirstAnswer,
+    coalesce(rt.MinutesToAccepted, null) as MinutesToAccepted,
+    coalesce(bq.BadgesBeforeQ,0) as BadgesBeforeQ,
+    sum(qte.QScore) over (partition by qte.tag) as SumQScoreByTag,
+    avg(qte.QScore) over (partition by qte.tag) as AvgQScoreByTag,
+    row_number() over (partition by qte.tag order by qte.QScore desc nulls last, qte.ViewCount desc nulls last) as RankInTagByQScore,
+    ntile(10) over (order by qte.ViewCount nulls last) as ViewDecile,
+    sum(coalesce(vs.TotalVotes,0)) over (rows between unbounded preceding and current row) as RunningVotesAll,
+    lag(qte.QScore) over (order by qte.CreationDate) as PrevQScoreByTime,
+    lead(qte.QScore) over (order by qte.CreationDate) as NextQScoreByTime
+  from q_tag_enriched qte
+  left join v_stats vs on vs.PostId = qte.QuestionId
+  left join c_stats cs on cs.PostId = qte.QuestionId
+  left join response_time rt on rt.QuestionId = qte.QuestionId
+  left join badges_near_q bq on bq.QuestionId = qte.QuestionId
+),
+outliers as (
+  select
+    hw.*,
+    avg(hw.QScore) over () as mean_q,
+    stddev_pop(hw.QScore) over () as std_q,
+    case
+      when stddev_pop(hw.QScore) over () > 0 then (hw.QScore - avg(hw.QScore) over ()) / nullif(stddev_pop(hw.QScore) over (),0)
+      else null
+    end as z_q,
+    avg(hw.ViewCount) over () as mean_v,
+    stddev_pop(hw.ViewCount) over () as std_v,
+    case
+      when stddev_pop(hw.ViewCount) over () > 0 then (hw.ViewCount - avg(hw.ViewCount) over ()) / nullif(stddev_pop(hw.ViewCount) over (),0)
+      else null
+    end as z_v
+  from heavy_window hw
+),
+top_comment as (
+  select c.PostId,
+         (select left(c2.Text, 120)
+          from Comments c2
+          where c2.PostId = c.PostId
+          order by c2.Score desc nulls last, length(c2.Text) desc, c2.Id
+          limit 1) as TopCommentSnippet
+  from Comments c
+  group by c.PostId
+),
+user_host as (
+  select
+    u.UserId,
+    nullif(regexp_replace(split_part(u.WebsiteUrl, '://', 2), '/.*$', ''), '') as WebsiteHost,
+    nullif(split_part(coalesce(u.Location,''), ',', 1), '') as LocationRegion
+  from u_metrics u
+),
+final as (
+  select
+    qm.QuestionId,
+    coalesce(qm.Title, ('[untitled #' || qm.QuestionId || ']')) as Title,
+    qm.QScore,
+    qm.ViewCount,
+    qm.AnswerCount,
+    qm.HasAccepted,
+    coalesce(cl.WasClosedOrMigrated, false) as WasClosedOrMigrated,
+    coalesce(cl.WasReopened, false) as WasReopened,
+    cl.FirstCloseOrMigAt,
+    cl.LastCloseReasonId,
+    coalesce(vs.NetVotes,0) as NetVotes,
+    coalesce(vs.UpVotes,0) as UpVotes,
+    coalesce(vs.DownVotes,0) as DownVotes,
+    coalesce(cs.CommentCount,0) as CommentCount,
+    coalesce(cs.AvgCommentScore,0) as AvgCommentScore,
+    coalesce(tc.TopCommentSnippet, '') as TopCommentSnippet,
+    coalesce(rt.MinutesToFirstAnswer, null) as MinutesToFirstAnswer,
+    coalesce(rt.MinutesToAccepted, null) as MinutesToAccepted,
+    string_agg(distinct qte.tag, ',') filter (where qte.tag is not null) as TagsFlat,
+    max(qte.AnsPerTagQuestionMonthRatio) as MaxAnsPerTagMonthRatio,
+    hw.RankInTagByQScore,
+    hw.ViewDecile,
+    round(coalesce(ol.z_q,0), 3) as Z_QScore,
+    round(coalesce(ol.z_v,0), 3) as Z_Views,
+    up.DisplayName as OwnerDisplayName,
+    up.Reputation as OwnerReputation,
+    uh.WebsiteHost,
+    uh.LocationRegion,
+    dp.CanonicalId as DuplicateOf,
+    dp.ScoreDelta as CanonMinusDupScoreDelta,
+    dp.NetVoteDelta as CanonMinusDupNetVoteDelta,
+    case
+      when qm.AnswerCount >= 5 and coalesce(vs.NetVotes,0) >= 10 and coalesce(cs.CommentCount,0) >= 5 then 'high'
+      when qm.AnswerCount >= 2 and coalesce(vs.NetVotes,0) >= 3 then 'medium'
+      when qm.AnswerCount is null and coalesce(vs.TotalVotes,0) = 0 and coalesce(cs.CommentCount,0) = 0 then 'zero'
+      else 'low'
+    end as EngagementBucket,
+    regexp_replace(coalesce(qm.Title,''), '\s+', ' ', 'g') as NormalizedTitle,
+    length(coalesce(qm.Title,'')) as TitleLen,
+    coalesce(nullif(position('?' in coalesce(qm.Title,'')),0), -1) as QMarkPos
+  from q_metrics qm
+  left join q_tag_enriched qte on qte.QuestionId = qm.QuestionId
+  left join v_stats vs on vs.PostId = qm.QuestionId
+  left join c_stats cs on cs.PostId = qm.QuestionId
+  left join closure_casted cl on cl.PostId = qm.QuestionId
+  left join response_time rt on rt.QuestionId = qm.QuestionId
+  left join heavy_window hw on hw.QuestionId = qm.QuestionId
+  left join outliers ol on ol.QuestionId = qm.QuestionId
+  left join top_comment tc on tc.PostId = qm.QuestionId
+  left join Users up on up.Id = qm.OwnerUserId
+  left join user_host uh on uh.UserId = up.Id
+  left join dup_pairs dp on dp.DuplicateId = qm.QuestionId
+  group by
+    qm.QuestionId, qm.Title, qm.QScore, qm.ViewCount, qm.AnswerCount, qm.HasAccepted,
+    cl.WasClosedOrMigrated, cl.WasReopened, cl.FirstCloseOrMigAt, cl.LastCloseReasonId,
+    vs.NetVotes, vs.UpVotes, vs.DownVotes, vs.TotalVotes, cs.CommentCount, cs.AvgCommentScore, tc.TopCommentSnippet,
+    rt.MinutesToFirstAnswer, rt.MinutesToAccepted, hw.RankInTagByQScore, hw.ViewDecile,
+    ol.z_q, ol.z_v, up.DisplayName, up.Reputation, uh.WebsiteHost, uh.LocationRegion,
+    dp.CanonicalId, dp.ScoreDelta, dp.NetVoteDelta
+)
+select *
+from final
+where
+  (QScore is not null and ViewCount >= 0 and (HasAccepted or AnswerCount >= 1))
+  and (
+    (WasClosedOrMigrated and coalesce(MinutesToFirstAnswer, 1e9) > 10)
+    or (EngagementBucket in ('high','medium') and coalesce(Z_Views,0) >= -1.0)
+    or (DuplicateOf is not null and coalesce(NetVotes,0) >= 0)
+  )
+  and (
+    length(NormalizedTitle) between 15 and 200
+    and (position('how' in lower(NormalizedTitle)) > 0 or position('why' in lower(NormalizedTitle)) > 0 or position('what' in lower(NormalizedTitle)) > 0)
+  )
+  and (
+    WebsiteHost is null
+    or WebsiteHost not ilike any (array['%spam%','%malware%'])
+  )
+order by
+  EngagementBucket desc,
+  coalesce(Z_QScore, 0) desc nulls last,
+  coalesce(NetVotes, 0) desc nulls last,
+  ViewCount desc nulls last,
+  QuestionId
+limit 500;

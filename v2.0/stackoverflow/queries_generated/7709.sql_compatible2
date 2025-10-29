@@ -1,0 +1,188 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        CAST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / 86400 AS bigint) as AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'High'
+            WHEN u.Reputation >= 1000 THEN 'Medium'
+            ELSE 'Low'
+        END as ReputationTier,
+        RANK() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) as ScoreRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostComplexityAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN 
+                STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')
+            ELSE ARRAY[]::text[]  -- keep for dialects that support array literal; if not supported replace with NULL
+        END as TagArray,
+        COALESCE(p.AnswerCount, 0) as CoalescedAnswerCount,
+        COALESCE(p.CommentCount, 0) as CoalescedCommentCount,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly_Voted'
+            WHEN p.Score > 50 THEN 'Well_Voted'
+            WHEN p.Score > 0 THEN 'Moderately_Voted'
+            ELSE 'Low_Voted'
+        END as VotingCategory,
+        CAST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / 86400 AS bigint) as DaysSinceCreation,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) as CommentCountWithSubquery
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPostHistoryAnalysis AS (
+    SELECT 
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.Comment,
+        COALESCE(ph.UserDisplayName, 'Unknown') as EditorName,
+        CASE 
+            WHEN ph.PostHistoryTypeId = 1 THEN 'Initial Title'
+            WHEN ph.PostHistoryTypeId = 2 THEN 'Initial Body'
+            WHEN ph.PostHistoryTypeId = 3 THEN 'Initial Tags'
+            WHEN ph.PostHistoryTypeId = 4 THEN 'Edit Title'
+            WHEN ph.PostHistoryTypeId = 5 THEN 'Edit Body'
+            WHEN ph.PostHistoryTypeId = 6 THEN 'Edit Tags'
+            ELSE 'Other'
+        END as EditType,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) as EditSequence,
+        CAST(EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) / 86400 AS double precision) as DaysBetweenEdits
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+),
+TagPopularityAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Very_Popular'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Less_Popular'
+        END as PopularityLevel
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+),
+ComprehensivePostAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.CreationDate,
+        pa.VotingCategory,
+        pa.DaysSinceCreation,
+        pa.CommentCountWithSubquery,
+        COALESCE(ua.DisplayName, 'Anonymous') as OwnerDisplayName,
+        COALESCE(ua.Reputation, 0) as OwnerReputation,
+        CASE 
+            WHEN pa.Score > 0 AND pa.ViewCount > 100 THEN 'Engaged_Popular'
+            WHEN pa.Score > 0 THEN 'Engaged'
+            WHEN pa.ViewCount > 100 THEN 'Viewed_Popular'
+            ELSE 'Low_Activity'
+        END as PostQualityCategory,
+        COALESCE(
+            (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = pa.PostId AND pl.LinkTypeId = 3),
+            0
+        ) as DuplicateLinkCount,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = pa.PostId AND ph.PostHistoryTypeId IN (10, 11, 12, 13)) as StatusChangeCount,
+        pa.TagArray
+    FROM PostComplexityAnalysis pa
+    LEFT JOIN UserActivityStats ua ON pa.OwnerUserId = ua.UserId
+)
+SELECT 
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT CASE WHEN cpa.PostQualityCategory = 'Engaged_Popular' THEN cpa.PostId END) as EngagedPopularPosts,
+    COUNT(DISTINCT CASE WHEN cpa.PostQualityCategory = 'Engaged' THEN cpa.PostId END) as EngagedPosts,
+    COUNT(DISTINCT CASE WHEN cpa.PostQualityCategory = 'Viewed_Popular' THEN cpa.PostId END) as ViewedPopularPosts,
+    COUNT(DISTINCT CASE WHEN cpa.PostQualityCategory = 'Low_Activity' THEN cpa.PostId END) as LowActivityPosts,
+    AVG(CASE WHEN cpa.Score > 0 THEN cpa.Score END) as AvgScoreForVotedPosts,
+    AVG(CASE WHEN cpa.ViewCount > 0 THEN cpa.ViewCount END) as AvgViewsForViewedPosts,
+    AVG(cpa.AnswerCount) as AvgAnswerCount,
+    AVG(cpa.CommentCount) as AvgCommentCount,
+    AVG(cpa.DaysSinceCreation) as AvgDaysSinceCreation,
+    STRING_AGG(
+        CASE 
+            WHEN cpa.Score > 100 AND cpa.ViewCount > 1000 THEN 
+                CONCAT('HighQualityPost:', cpa.PostId, ':', cpa.Title)
+            ELSE NULL
+        END, 
+        ';'
+    ) as HighQualityPostsList,
+    COUNT(DISTINCT CASE WHEN cpa.DuplicateLinkCount > 0 THEN cpa.PostId END) as DuplicateLinkedPosts,
+    COUNT(DISTINCT CASE WHEN cpa.StatusChangeCount > 0 THEN cpa.PostId END) as StatusChangedPosts,
+    STRING_AGG(
+        CASE 
+            WHEN cpa.TagArray IS NOT NULL AND array_length(cpa.TagArray, 1) > 0 THEN 
+                CONCAT('TagAnalysis:', cpa.PostId, ':', array_to_string(cpa.TagArray, ','))
+            ELSE NULL
+        END, 
+        '|'
+    ) as TagAnalysisData,
+    AVG(CASE WHEN uas.TotalPosts > 0 THEN uas.TotalPosts END) as AvgUserPosts,
+    AVG(CASE WHEN uas.QuestionCount > 0 THEN uas.QuestionCount END) as AvgUserQuestions,
+    AVG(CASE WHEN uas.AnswerCount > 0 THEN uas.AnswerCount END) as AvgUserAnswers,
+    COUNT(DISTINCT CASE WHEN uas.ReputationTier = 'High' THEN uas.UserId END) as HighReputationUsers,
+    COUNT(DISTINCT CASE WHEN uas.ReputationTier = 'Medium' THEN uas.UserId END) as MediumReputationUsers,
+    COUNT(DISTINCT CASE WHEN uas.ReputationTier = 'Low' THEN uas.UserId END) as LowReputationUsers,
+    SUM(CASE WHEN uas.BadgeCount > 0 THEN uas.BadgeCount ELSE 0 END) as TotalBadges,
+    AVG(CASE WHEN uas.AccountAgeDays > 0 THEN uas.AccountAgeDays ELSE 0 END) as AvgAccountAgeDays,
+    MAX(CASE WHEN uas.ScoreRank <= 10 THEN uas.DisplayName ELSE NULL END) as TopScoringUser,
+    COUNT(DISTINCT CASE 
+        WHEN cpa.VotingCategory IN ('Highly_Voted', 'Well_Voted') 
+        AND cpa.DaysSinceCreation < 30 
+        AND cpa.AnswerCount > 0 
+        THEN cpa.PostId 
+    END) as RecentHighVotedAnsweredPosts,
+    COUNT(DISTINCT CASE 
+        WHEN cpa.VotingCategory IN ('Highly_Voted', 'Well_Voted') 
+        AND cpa.DaysSinceCreation < 30 
+        AND cpa.AnswerCount = 0 
+        THEN cpa.PostId 
+    END) as RecentHighVotedUnansweredPosts
+FROM ComprehensivePostAnalysis cpa
+LEFT JOIN UserActivityStats uas ON cpa.OwnerUserId = uas.UserId
+LEFT JOIN (
+    SELECT 
+        ph.PostId,
+        COUNT(*) as TotalEdits,
+        COUNT(DISTINCT ph.UserId) as UniqueEditors
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+) edit_stats ON cpa.PostId = edit_stats.PostId
+WHERE cpa.PostId IS NOT NULL
+GROUP BY 
+    cpa.VotingCategory,
+    cpa.PostQualityCategory
+HAVING 
+    COUNT(cpa.PostId) > 0
+ORDER BY 
+    AVG(cpa.Score) DESC
+LIMIT 1000;

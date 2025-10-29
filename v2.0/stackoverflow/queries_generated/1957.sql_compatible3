@@ -1,0 +1,235 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.DisplayName AS UserDisplayName,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersProvided,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        (SELECT SUM(V.BountyAmount) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId = 8) AS TotalBountySpent,
+        (SELECT SUM(V.BountyAmount) FROM Votes V WHERE V.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = U.Id) AND V.VoteTypeId = 9) AS TotalBountyEarned
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.Reputation, U.CreationDate, U.DisplayName, U.Views, U.UpVotes, U.DownVotes
+),
+PostHistoricalContext AS (
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditors,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (12, 13) THEN 1 ELSE 0 END) AS DeleteUndeleteCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS LastEditHistoryDate,
+        (
+            SELECT CR.Name
+            FROM PostHistory PH_INNER
+            LEFT JOIN CloseReasonTypes CR ON
+                -- replace TRY_CAST with a safe standard cast using NULLIF to avoid errors; cast only when numeric
+                CASE
+                    WHEN PH_INNER.Comment ~ '^[0-9]+$' THEN CAST(PH_INNER.Comment AS INTEGER)
+                    ELSE NULL
+                END = CR.Id
+            WHERE PH_INNER.PostId = PH.PostId AND PH_INNER.PostHistoryTypeId = 10 AND PH_INNER.Comment IS NOT NULL
+            ORDER BY PH_INNER.CreationDate DESC
+            LIMIT 1
+        ) AS LastCloseReason
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+QuestionAnswerPerformance AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        Q.AnswerCount AS QuestionAnswerCount,
+        Q.CommentCount AS QuestionCommentCount,
+        Q.FavoriteCount AS QuestionFavoriteCount,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.LastActivityDate AS QuestionLastActivityDate,
+        Q.OwnerUserId AS QuestionOwnerUserId,
+        Q.AcceptedAnswerId,
+        Q.ClosedDate,
+        COALESCE(AA.Score, 0) AS AcceptedAnswerScore,
+        AA.OwnerUserId AS AcceptedAnswerOwnerUserId,
+        AA.CreationDate AS AcceptedAnswerCreationDate,
+        CARDINALITY(string_to_array(SUBSTRING(Q.Tags, 2, LENGTH(Q.Tags) - 2), '><')) AS NumberOfTags,
+        (
+            SELECT AVG(A_INNER.Score)
+            FROM Posts A_INNER
+            WHERE A_INNER.ParentId = Q.Id AND A_INNER.PostTypeId = 2
+        ) AS AverageAnswerScore,
+        (
+            SELECT COUNT(DISTINCT V.UserId)
+            FROM Votes V
+            WHERE V.PostId = Q.Id AND V.VoteTypeId = 5
+        ) AS DistinctFavoriters
+    FROM Posts Q
+    LEFT JOIN Posts AA ON Q.AcceptedAnswerId = AA.Id AND AA.PostTypeId = 2
+    WHERE Q.PostTypeId = 1
+),
+UserQuestionAggregates AS (
+    SELECT
+        UE.UserId,
+        UE.UserDisplayName,
+        UE.Reputation,
+        UE.TotalQuestionsAsked,
+        QAP.QuestionId,
+        QAP.QuestionScore,
+        QAP.QuestionViewCount,
+        QAP.QuestionAnswerCount,
+        QAP.QuestionFavoriteCount,
+        QAP.QuestionCreationDate,
+        QAP.QuestionLastActivityDate AS LastActivityDate,
+        QAP.ClosedDate,
+        PHC.EditCount,
+        PHC.CloseCount,
+        PHC.ReopenCount,
+        PHC.DistinctEditors,
+        PHC.LastCloseReason,
+        QAP.AcceptedAnswerScore,
+        QAP.AverageAnswerScore,
+        QAP.NumberOfTags,
+        QAP.DistinctFavoriters,
+        CASE
+            WHEN QAP.QuestionAnswerCount > 0 THEN QAP.AcceptedAnswerScore * 1.0 / NULLIF(QAP.QuestionScore, 0)
+            ELSE 0.0
+        END AS AcceptanceToQuestionScoreRatio,
+        CASE
+            WHEN QAP.QuestionViewCount > 0 THEN QAP.QuestionScore * 1.0 / QAP.QuestionViewCount
+            ELSE 0.0
+        END AS ScorePerViewRatio,
+        COALESCE(PHC.EditCount, 0) + COALESCE(PHC.CloseCount, 0) + COALESCE(PHC.ReopenCount, 0) AS TotalHistoryEvents,
+        (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - QAP.QuestionCreationDate)) / (60 * 60 * 24 * 365.25)) AS QuestionAgeYears,
+        QAP.AcceptedAnswerOwnerUserId
+    FROM UserEngagement UE
+    INNER JOIN QuestionAnswerPerformance QAP ON UE.UserId = QAP.QuestionOwnerUserId
+    LEFT JOIN PostHistoricalContext PHC ON QAP.QuestionId = PHC.PostId
+    GROUP BY
+        UE.UserId,
+        UE.UserDisplayName,
+        UE.Reputation,
+        UE.TotalQuestionsAsked,
+        QAP.QuestionId,
+        QAP.QuestionScore,
+        QAP.QuestionViewCount,
+        QAP.QuestionAnswerCount,
+        QAP.QuestionFavoriteCount,
+        QAP.QuestionCreationDate,
+        QAP.QuestionLastActivityDate,
+        QAP.ClosedDate,
+        PHC.EditCount,
+        PHC.CloseCount,
+        PHC.ReopenCount,
+        PHC.DistinctEditors,
+        PHC.LastCloseReason,
+        QAP.AcceptedAnswerScore,
+        QAP.AverageAnswerScore,
+        QAP.NumberOfTags,
+        QAP.DistinctFavoriters,
+        QAP.AcceptedAnswerOwnerUserId
+)
+SELECT
+    UQA.UserId,
+    UQA.UserDisplayName,
+    UQA.Reputation,
+    UQA.QuestionId,
+    UQA.QuestionCreationDate,
+    UQA.QuestionScore,
+    UQA.QuestionViewCount,
+    UQA.QuestionAnswerCount,
+    UQA.QuestionFavoriteCount,
+    UQA.ClosedDate,
+    UQA.LastCloseReason,
+    UQA.AcceptedAnswerScore,
+    UQA.AverageAnswerScore,
+    UQA.NumberOfTags,
+    UQA.DistinctFavoriters,
+    UQA.AcceptanceToQuestionScoreRatio,
+    UQA.ScorePerViewRatio,
+    UQA.EditCount,
+    UQA.CloseCount,
+    UQA.ReopenCount,
+    UQA.DistinctEditors,
+    UQA.TotalHistoryEvents,
+    UQA.QuestionAgeYears,
+    CAST(ROUND(
+        (UQA.QuestionScore * 0.5) +
+        (UQA.QuestionFavoriteCount * 1.5) +
+        (UQA.AcceptedAnswerScore * 2.0) +
+        (COALESCE(UQA.AverageAnswerScore, 0) * 0.8) +
+        (UQA.DistinctFavoriters * 1.2) +
+        (UQA.DistinctEditors * -0.5) +
+        (UQA.CloseCount * -10.0) +
+        (UQA.ReopenCount * 5.0) +
+        (UQA.TotalHistoryEvents * 0.1) +
+        (COALESCE(UQA.NumberOfTags, 0) * 0.2)
+    , 0) AS NUMERIC) AS QuestionImpactScore,
+    RANK() OVER (PARTITION BY UQA.UserId ORDER BY UQA.QuestionScore DESC, UQA.QuestionViewCount DESC) AS RankByUserScore,
+    NTILE(10) OVER (ORDER BY UQA.Reputation DESC, UQA.TotalQuestionsAsked DESC, UQA.QuestionFavoriteCount DESC) AS UserReputationTier,
+    AVG(UQA.QuestionScore) OVER (PARTITION BY UQA.UserId) AS AverageQuestionScoreForUser,
+    LAG(UQA.QuestionScore, 1, 0) OVER (PARTITION BY UQA.UserId ORDER BY UQA.QuestionCreationDate) AS PreviousQuestionScore,
+    COALESCE(U.Location, 'Unknown Location') AS OwnerLocation,
+    SUBSTRING(U.WebsiteUrl FROM POSITION('//' IN U.WebsiteUrl) + 2 FOR POSITION('/' IN SUBSTRING(U.WebsiteUrl FROM POSITION('//' IN U.WebsiteUrl) + 2)) - 1) AS OwnerWebsiteDomain,
+    (
+        SELECT COUNT(DISTINCT L.RelatedPostId)
+        FROM PostLinks L
+        WHERE L.PostId = UQA.QuestionId AND L.LinkTypeId = 1
+    ) AS LinkedPostsCount,
+    (
+        SELECT COUNT(DISTINCT L.RelatedPostId)
+        FROM PostLinks L
+        WHERE L.PostId = UQA.QuestionId AND L.LinkTypeId = 3
+    ) AS DuplicateCount,
+    CASE
+        WHEN UQA.ClosedDate IS NOT NULL AND UQA.ReopenCount > 0 THEN 'Closed and Reopened'
+        WHEN UQA.ClosedDate IS NOT NULL THEN 'Permanently Closed'
+        WHEN UQA.QuestionAgeYears > 3 AND UQA.QuestionScore = 0 THEN 'Stale Unanswered'
+        WHEN UQA.QuestionAnswerCount = 0 AND UQA.LastActivityDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months' THEN 'Dormant Unanswered'
+        ELSE 'Active'
+    END AS QuestionStatusCategory,
+    (LOWER(UQA.UserDisplayName) LIKE '%admin%' OR LOWER(UQA.UserDisplayName) LIKE '%moderator%') AS IsPrivilegedUserDisplayName,
+    NULLIF(UQA.QuestionViewCount, 0) * UQA.ScorePerViewRatio AS EffectiveViewsValue
+FROM UserQuestionAggregates UQA
+JOIN Users U ON UQA.UserId = U.Id
+WHERE
+    UQA.Reputation > 5000 AND UQA.TotalQuestionsAsked > 5
+    AND UQA.QuestionCreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years'
+    AND (
+        UQA.QuestionScore > 10
+        OR UQA.EditCount > 2
+        OR UQA.CloseCount > 0
+    )
+    AND (
+        UQA.AcceptedAnswerOwnerUserId IS NOT NULL
+        OR UQA.AverageAnswerScore > 5
+    )
+    AND ( -- ensure existence of computed QuestionImpactScore by recomputing the expression; avoid referencing alias in WHERE
+        CAST(ROUND(
+            (UQA.QuestionScore * 0.5) +
+            (UQA.QuestionFavoriteCount * 1.5) +
+            (UQA.AcceptedAnswerScore * 2.0) +
+            (COALESCE(UQA.AverageAnswerScore, 0) * 0.8) +
+            (UQA.DistinctFavoriters * 1.2) +
+            (UQA.DistinctEditors * -0.5) +
+            (UQA.CloseCount * -10.0) +
+            (UQA.ReopenCount * 5.0) +
+            (UQA.TotalHistoryEvents * 0.1) +
+            (COALESCE(UQA.NumberOfTags, 0) * 0.2)
+        , 0) AS NUMERIC) IS NOT NULL
+    )
+ORDER BY
+    UQA.Reputation DESC,
+    QuestionImpactScore DESC,
+    UQA.QuestionCreationDate DESC;

@@ -1,0 +1,329 @@
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    date_trunc('month', u.creationdate) as cohort_month,
+    ntile(5) over (order by u.reputation desc nulls last) as rep_quintile
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+posts_enriched as (
+  select
+    p.id,
+    p.posttypeid,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.favoritecount,
+    p.answercount,
+    p.commentcount,
+    p.acceptedanswerid,
+    p.parentid,
+    coalesce(nullif(trim(p.title), ''), '[no-title]') as title_norm,
+    case
+      when p.tags is null then array[]::text[]
+      else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><')
+    end as tag_array
+  from posts p
+  where p.creationdate is not null
+),
+user_activity as (
+  select
+    ru.user_id,
+    count(*) filter (where pe.posttypeid = 1) as q_count,
+    count(*) filter (where pe.posttypeid = 2) as a_count,
+    sum(greatest(pe.score, 0)) as pos_score,
+    sum(least(pe.score, 0)) as neg_score,
+    sum(pe.viewcount) as total_views,
+    sum(coalesce(pe.favoritecount,0)) as total_favs,
+    max(pe.creationdate) as last_post_date
+  from recent_users ru
+  left join posts_enriched pe on pe.owneruserid = ru.user_id
+  group by ru.user_id
+),
+answers_with_meta as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.score as answer_score,
+    a.creationdate as answer_created,
+    q.owneruserid as asker_id,
+    q.acceptedanswerid as accepted_id,
+    q.viewcount as question_views,
+    q.score as question_score,
+    q.creationdate as question_created
+  from posts_enriched a
+  join posts_enriched q on q.id = a.parentid and q.posttypeid = 1
+  where a.posttypeid = 2
+),
+answer_quality as (
+  select
+    awm.answer_id,
+    awm.answerer_id,
+    awm.question_id,
+    awm.answer_score,
+    awm.question_score,
+    case when awm.answer_id = awm.accepted_id then 1 else 0 end as is_accepted,
+    extract(epoch from (awm.answer_created - awm.question_created)) / 3600.0 as hours_to_answer,
+    case when awm.question_views > 0 then (awm.answer_score * 1.0) / awm.question_views else null end as score_per_view
+  from answers_with_meta awm
+),
+tag_exploded as (
+  select
+    pe.id as post_id,
+    lower(trim(t::text)) as tag
+  from posts_enriched pe,
+  lateral unnest(pe.tag_array) as t
+  where pe.posttypeid = 1
+),
+tag_stats as (
+  select
+    te.tag,
+    count(*) as q_cnt,
+    avg(p.score) as avg_q_score,
+    percentile_cont(0.5) within group (order by p.viewcount) as p50_views,
+    sum(case when p.closeddate is not null then 1 else 0 end) as closed_cnt
+  from tag_exploded te
+  join posts p on p.id = te.post_id
+  group by te.tag
+),
+user_badge_activity as (
+  select
+    u.id as user_id,
+    count(*) as badge_cnt,
+    count(*) filter (where b.class = 1) as gold_cnt,
+    count(*) filter (where b.class = 2) as silver_cnt,
+    count(*) filter (where b.class = 3) as bronze_cnt,
+    min(b.date) as first_badge_date,
+    max(b.date) as last_badge_date
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id
+),
+comment_engagement as (
+  select
+    u.id as user_id,
+    count(c.id) as comment_cnt,
+    avg(c.score) as avg_comment_score,
+    max(c.creationdate) as last_comment_date
+  from users u
+  left join comments c on c.userid = u.id
+  group by u.id
+),
+vote_agg as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where v.votetypeid = 2) as upvotes_received,
+    count(*) filter (where v.votetypeid = 3) as downvotes_received,
+    count(*) filter (where v.votetypeid = 8) as bounties_started,
+    sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_amount_total
+  from votes v
+  join posts p on p.id = v.postid
+  group by p.owneruserid
+),
+user_linkage as (
+  select
+    u.id as user_id,
+    count(distinct pl.relatedpostid) filter (where pl.linktypeid = 1) as linked_out,
+    count(distinct pl.postid) filter (where pl.linktypeid = 3) as dup_marked
+  from users u
+  left join posts po on po.owneruserid = u.id
+  left join postlinks pl on pl.postid = po.id
+  group by u.id
+),
+recent_closures as (
+  select
+    ph.postid,
+    max(ph.creationdate) as last_closed_date,
+    max(case when ph.comment ~ '^[0-9]+$' then cast(ph.comment as integer) end) as last_close_reason_id
+  from posthistory ph
+  where ph.posthistorytypeid = 10
+  group by ph.postid
+),
+close_reasons_map as (
+  select
+    rct.id as reason_id,
+    rct.name as reason_name
+  from closereasontypes rct
+),
+user_close_impact as (
+  select
+    p.owneruserid as user_id,
+    count(rc.postid) as closed_posts_cnt,
+    count(rc.postid) filter (where rc.last_closed_date >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as recent_closed_cnt,
+    count(rc.postid) filter (where crm.reason_name ilike '%duplicate%') as dup_closed_cnt
+  from posts p
+  left join recent_closures rc on rc.postid = p.id
+  left join close_reasons_map crm on crm.reason_id = rc.last_close_reason_id
+  group by p.owneruserid
+),
+cohort_quality as (
+  select
+    ru.cohort_month,
+    avg(ua.pos_score + ua.neg_score) as avg_net_score,
+    avg(ua.q_count + ua.a_count) as avg_posts,
+    percentile_cont(0.9) within group (order by ua.total_views) as p90_views
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.user_id
+  group by ru.cohort_month
+),
+accepted_rate as (
+  select
+    aq.answerer_id as user_id,
+    avg(cast(aq.is_accepted as double precision)) as acceptance_rate,
+    avg(aq.hours_to_answer) as avg_hours_to_answer,
+    avg(aq.score_per_view) as avg_score_per_view
+  from answer_quality aq
+  group by aq.answerer_id
+),
+string_features as (
+  select
+    u.id as user_id,
+    length(coalesce(u.displayname, '')) as disp_len,
+    length(coalesce(u.location, '')) as loc_len,
+    cast((position(',' in coalesce(u.location,'')) > 0) as integer) as location_has_comma,
+    cast((coalesce(u.websiteurl,'') ~* '(github|gitlab|bitbucket)') as integer) as has_code_site
+  from users u
+),
+ranked_users as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.cohort_month,
+    ru.rep_quintile,
+    ua.q_count,
+    ua.a_count,
+    ua.pos_score + ua.neg_score as net_score,
+    ua.total_views,
+    coalesce(va.upvotes_received,0) as up_rcv,
+    coalesce(va.downvotes_received,0) as down_rcv,
+    coalesce(aba.badge_cnt,0) as badge_cnt,
+    coalesce(aba.gold_cnt,0) as gold_cnt,
+    coalesce(ce.comment_cnt,0) as comment_cnt,
+    coalesce(ul.linked_out,0) as linked_out,
+    coalesce(ul.dup_marked,0) as dup_marked,
+    coalesce(uci.closed_posts_cnt,0) as closed_posts_cnt,
+    coalesce(ar.acceptance_rate,0.0) as acceptance_rate,
+    coalesce(ar.avg_hours_to_answer, null) as avg_hours_to_answer,
+    coalesce(sf.has_code_site,0) as has_code_site,
+    dense_rank() over (
+      order by
+        coalesce(ua.pos_score + ua.neg_score,0) desc,
+        coalesce(va.upvotes_received - va.downvotes_received,0) desc,
+        coalesce(aba.badge_cnt,0) desc,
+        coalesce(ar.acceptance_rate,0) desc,
+        coalesce(ua.q_count + ua.a_count,0) desc
+    ) as perf_rank
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.user_id
+  left join vote_agg va on va.user_id = ru.user_id
+  left join user_badge_activity aba on aba.user_id = ru.user_id
+  left join comment_engagement ce on ce.user_id = ru.user_id
+  left join user_linkage ul on ul.user_id = ru.user_id
+  left join user_close_impact uci on uci.user_id = ru.user_id
+  left join accepted_rate ar on ar.user_id = ru.user_id
+  left join string_features sf on sf.user_id = ru.user_id
+),
+top_users as (
+  select *
+  from ranked_users
+  where perf_rank <= 200
+),
+tag_affinity as (
+  select
+    pe.owneruserid as user_id,
+    te.tag,
+    count(*) as tag_posts,
+    row_number() over (partition by pe.owneruserid order by count(*) desc, min(pe.creationdate)) as rn
+  from posts_enriched pe
+  join tag_exploded te on te.post_id = pe.id
+  group by pe.owneruserid, te.tag
+),
+best_tag as (
+  select user_id, tag as top_tag, tag_posts
+  from tag_affinity
+  where rn = 1
+),
+dupe_network as (
+  select
+    q.id as post_id,
+    array_agg(distinct pl.relatedpostid) filter (where pl.linktypeid = 3) as dup_of_ids,
+    cardinality(array_agg(distinct pl.relatedpostid) filter (where pl.linktypeid = 3)) as dup_of_cnt
+  from posts q
+  left join postlinks pl on pl.postid = q.id
+  group by q.id
+),
+question_outliers as (
+  select
+    q.id as question_id,
+    q.owneruserid as user_id,
+    q.score,
+    q.viewcount,
+    dn.dup_of_cnt,
+    cast((q.viewcount > (select ts.p50_views from tag_stats ts where ts.tag = (select te.tag from tag_exploded te where te.post_id = q.id limit 1))) as integer) as high_view_for_tag
+  from posts q
+  left join dupe_network dn on dn.post_id = q.id
+  where q.posttypeid = 1
+),
+final as (
+  select
+    tu.user_id,
+    tu.displayname,
+    tu.reputation,
+    tu.rep_quintile,
+    tu.cohort_month,
+    tu.q_count,
+    tu.a_count,
+    tu.net_score,
+    tu.up_rcv,
+    tu.down_rcv,
+    tu.badge_cnt,
+    tu.gold_cnt,
+    tu.comment_cnt,
+    tu.linked_out,
+    tu.dup_marked,
+    tu.closed_posts_cnt,
+    tu.acceptance_rate,
+    tu.avg_hours_to_answer,
+    coalesce(bt.top_tag, '[none]') as top_tag,
+    coalesce(bt.tag_posts, 0) as top_tag_posts,
+    sum(case when qo.high_view_for_tag = 1 then 1 else 0 end) as hv_tag_qs,
+    sum(coalesce(qo.dup_of_cnt,0)) as total_dupe_refs,
+    avg(ts.avg_q_score) filter (where bt.top_tag is not null and ts.tag = bt.top_tag) as top_tag_avg_q_score,
+    count(*) over () as total_returned,
+    row_number() over (order by tu.perf_rank, tu.user_id) as rownum,
+    tu.perf_rank
+  from top_users tu
+  left join best_tag bt on bt.user_id = tu.user_id
+  left join tag_stats ts on ts.tag = bt.top_tag
+  left join question_outliers qo on qo.user_id = tu.user_id
+  group by
+    tu.user_id, tu.displayname, tu.reputation, tu.rep_quintile, tu.cohort_month, tu.q_count, tu.a_count,
+    tu.net_score, tu.up_rcv, tu.down_rcv, tu.badge_cnt, tu.gold_cnt, tu.comment_cnt, tu.linked_out,
+    tu.dup_marked, tu.closed_posts_cnt, tu.acceptance_rate, tu.avg_hours_to_answer, bt.top_tag, bt.tag_posts, tu.perf_rank
+)
+select
+  f.*,
+  case
+    when f.acceptance_rate >= 0.5 and f.gold_cnt >= 1 then 'A'
+    when f.acceptance_rate >= 0.3 and f.badge_cnt >= 5 then 'B'
+    when f.acceptance_rate >= 0.1 then 'C'
+    else 'D'
+  end as grade_bucket
+from final f
+where
+  (f.rep_quintile in (1,2,3,4,5))
+  and ((f.net_score is not null and f.net_score <> 0) or f.badge_cnt > 0)
+  and coalesce(f.top_tag, '') not like '%meta%'
+order by
+  f.perf_rank,
+  f.gold_cnt desc,
+  f.net_score desc,
+  f.user_id
+limit 100;

@@ -1,0 +1,237 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS TotalAcceptedAnswersForQuestions,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        AVG(CAST(p.Score AS NUMERIC)) AS AvgPostScore,
+        MAX(p.CreationDate) AS LatestPostCreationDate,
+        COUNT(DISTINCT vp_up.PostId) AS TotalPostsReceivedUpvotes,
+        COUNT(DISTINCT vp_down.PostId) AS TotalPostsReceivedDownvotes,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / (60 * 60 * 24) AS ActiveDays
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes vp_up ON p.Id = vp_up.PostId AND vp_up.VoteTypeId = 2
+    LEFT JOIN Votes vp_down ON p.Id = vp_down.PostId AND vp_down.VoteTypeId = 3
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostEngagementMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.Title,
+        p.Body,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        (CAST(p.Score AS NUMERIC) * 0.5 + p.CommentCount * 0.8 + COALESCE(p.FavoriteCount, 0) * 1.5) / NULLIF(p.ViewCount, 0.001) AS EngagementRatio,
+        CASE
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN CAST(p.AnswerCount AS NUMERIC) / NULLIF(p.ViewCount, 0.001)
+            ELSE 0
+        END AS QuestionAnswerViewRatio,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS UserTopPostRank,
+        (SELECT MAX(ph.CreationDate)
+         FROM PostHistory ph
+         WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6, 11, 13, 15, 16)) AS LatestSignificantEditOrActivity,
+        (SELECT MAX(c.CreationDate)
+         FROM Comments c
+         WHERE c.PostId = p.Id) AS LatestCommentDate,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Wiki'
+            ELSE 'Active'
+        END AS PostStatusCategory,
+        NULLIF(TRIM(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2)), '') AS CleanTagsString
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.OwnerUserId IS NOT NULL
+      AND p.CreationDate >= DATE '2022-01-01'
+),
+TagUsageAnalysis AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS TaggedPostCount,
+        SUM(p.Score) AS TagTotalScore,
+        MAX(p.CreationDate) AS LatestTagPostDate,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC, SUM(p.Score) DESC) AS TagPopularityRank,
+        AVG(CAST(p.Score AS NUMERIC)) AS AvgTagPostScore
+    FROM Posts p
+    JOIN LATERAL (
+        SELECT unnest_str AS tag_name
+        FROM (SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS unnest_str) s
+    ) AS tarr ON TRUE
+    JOIN Tags t ON LOWER(t.TagName) = LOWER(tarr.tag_name)
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= DATE '2022-01-01'
+    GROUP BY t.TagName
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.TotalPosts,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    uas.TotalComments,
+    uas.AvgPostScore,
+    pem.PostId,
+    pem.PostTypeName,
+    pem.Title,
+    pem.Score AS PostScore,
+    pem.ViewCount AS PostViewCount,
+    pem.AnswerCount,
+    pem.CommentCount AS PostCommentCount,
+    pem.FavoriteCount AS PostFavoriteCount,
+    pem.EngagementRatio,
+    pem.QuestionAnswerViewRatio,
+    pem.PostStatusCategory,
+    pem.UserTopPostRank,
+    tu.TagName AS TopAssociatedTag,
+    tu.TaggedPostCount,
+    tu.TagTotalScore,
+    pl.RelatedPostId AS LinkedToPost,
+    lt.Name AS LinkTypeName,
+    COALESCE(cr.Name, 'N/A') AS CloseReason,
+    (SELECT cmt.Text
+     FROM Comments cmt
+     WHERE cmt.PostId = pem.PostId
+     ORDER BY cmt.CreationDate DESC
+     LIMIT 1) AS MostRecentCommentText,
+    (SELECT COUNT(DISTINCT v2.UserId)
+     FROM Votes v2
+     WHERE v2.PostId = pem.PostId AND v2.VoteTypeId = 5) AS TotalFavoritesOnPost,
+    CASE
+        WHEN uas.Reputation > 10000 AND pem.EngagementRatio > 0.5 AND pem.UserTopPostRank = 1 THEN 'Elite Contributor - Top Post'
+        WHEN uas.TotalQuestions > 50 AND pem.PostTypeId = 1 AND pem.ViewCount > 1000 AND pem.AnswerCount > 0 THEN 'High Impact Question'
+        WHEN uas.TotalBadges >= 10 AND pem.PostTypeId = 2 AND pem.Score > 5 THEN 'Valued Answerer'
+        ELSE 'General Activity'
+    END AS UserPostContributionCategory,
+    pem.PostCreationDate,
+    pem.LastActivityDate,
+    uas.LastAccessDate,
+    uas.LatestPostCreationDate,
+    pem.CleanTagsString,
+    pem.LatestSignificantEditOrActivity,
+    pem.LatestCommentDate,
+    (uas.Reputation * 0.1
+     + uas.TotalPosts * 0.5
+     + uas.TotalBadges * 2
+     + pem.Score * 1.5
+     + pem.EngagementRatio * 100
+     + pem.AnswerCount * 3
+     + pem.CommentCount * 1.5
+     + (CASE WHEN pem.AcceptedAnswerId IS NOT NULL THEN 50 ELSE 0 END)
+     + tu.TagTotalScore * 0.01
+     + (SELECT COUNT(DISTINCT v3.UserId) FROM Votes v3 WHERE v3.PostId = pem.PostId AND v3.VoteTypeId = 2) * 2
+    ) AS FinalCompositeScore
+FROM UserActivitySummary uas
+JOIN PostEngagementMetrics pem ON uas.UserId = pem.OwnerUserId
+LEFT JOIN PostLinks pl ON pem.PostId = pl.PostId
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+LEFT JOIN PostHistory ph_close ON pem.PostId = ph_close.PostId AND ph_close.PostHistoryTypeId = 10
+LEFT JOIN CloseReasonTypes cr ON ph_close.Comment IS NOT NULL AND cr.Id = CAST(ph_close.Comment AS SMALLINT)
+LEFT JOIN TagUsageAnalysis tu ON LOWER(SPLIT_PART(SUBSTRING(pem.CleanTagsString FROM 1 FOR COALESCE(NULLIF(POSITION('><' IN pem.CleanTagsString), 0), LENGTH(pem.CleanTagsString) + 1) - 1), '><', 1)) = LOWER(tu.TagName)
+WHERE uas.Reputation > 1000
+  AND uas.TotalPosts > 5
+  AND pem.EngagementRatio IS NOT NULL
+  AND pem.Score > 0
+  AND (pem.Title LIKE '%SQL%' OR pem.Title LIKE '%database%' OR pem.Tags LIKE '%<sql>%' OR pem.Tags LIKE '%<postgresql>%')
+  AND uas.ActiveDays > 30
+  AND pem.UserTopPostRank <= 3
+
+UNION ALL
+
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.TotalPosts,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    uas.TotalComments,
+    uas.AvgPostScore,
+    pem.PostId,
+    pem.PostTypeName,
+    pem.Title,
+    pem.Score AS PostScore,
+    pem.ViewCount AS PostViewCount,
+    pem.AnswerCount,
+    pem.CommentCount AS PostCommentCount,
+    pem.FavoriteCount AS PostFavoriteCount,
+    pem.EngagementRatio,
+    pem.QuestionAnswerViewRatio,
+    pem.PostStatusCategory,
+    pem.UserTopPostRank,
+    tu.TagName AS TopAssociatedTag,
+    tu.TaggedPostCount,
+    tu.TagTotalScore,
+    pl.RelatedPostId AS LinkedToPost,
+    lt.Name AS LinkTypeName,
+    COALESCE(cr.Name, 'N/A') AS CloseReason,
+    (SELECT cmt.Text
+     FROM Comments cmt
+     WHERE cmt.PostId = pem.PostId
+     ORDER BY cmt.CreationDate DESC
+     LIMIT 1) AS MostRecentCommentText,
+    (SELECT COUNT(DISTINCT v2.UserId)
+     FROM Votes v2
+     WHERE v2.PostId = pem.PostId AND v2.VoteTypeId = 5) AS TotalFavoritesOnPost,
+    CASE
+        WHEN uas.Reputation > 10000 AND pem.EngagementRatio > 0.5 AND pem.UserTopPostRank = 1 THEN 'Elite Contributor - Top Post'
+        WHEN uas.TotalQuestions > 50 AND pem.PostTypeId = 1 AND pem.ViewCount > 1000 AND pem.AnswerCount > 0 THEN 'High Impact Question'
+        WHEN uas.TotalBadges >= 10 AND pem.PostTypeId = 2 AND pem.Score > 5 THEN 'Valued Answerer'
+        ELSE 'General Activity'
+    END AS UserPostContributionCategory,
+    pem.PostCreationDate,
+    pem.LastActivityDate,
+    uas.LastAccessDate,
+    uas.LatestPostCreationDate,
+    pem.CleanTagsString,
+    pem.LatestSignificantEditOrActivity,
+    pem.LatestCommentDate,
+    (uas.Reputation * 0.1
+     + uas.TotalPosts * 0.5
+     + uas.TotalBadges * 2
+     + pem.Score * 1.5
+     + pem.EngagementRatio * 100
+     + pem.AnswerCount * 3
+     + pem.CommentCount * 1.5
+     + (CASE WHEN pem.AcceptedAnswerId IS NOT NULL THEN 50 ELSE 0 END)
+     + tu.TagTotalScore * 0.01
+     + (SELECT COUNT(DISTINCT v3.UserId) FROM Votes v3 WHERE v3.PostId = pem.PostId AND v3.VoteTypeId = 2) * 2
+    ) AS FinalCompositeScore
+FROM UserActivitySummary uas
+JOIN PostEngagementMetrics pem ON uas.UserId = pem.OwnerUserId
+LEFT JOIN PostLinks pl ON pem.PostId = pl.PostId
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+LEFT JOIN PostHistory ph_close ON pem.PostId = ph_close.PostId AND ph_close.PostHistoryTypeId = 10
+LEFT JOIN CloseReasonTypes cr ON ph_close.Comment IS NOT NULL AND cr.Id = CAST(ph_close.Comment AS SMALLINT)
+LEFT JOIN TagUsageAnalysis tu ON LOWER(SPLIT_PART(SUBSTRING(pem.CleanTagsString FROM 1 FOR COALESCE(NULLIF(POSITION('><' IN pem.CleanTagsString), 0), LENGTH(pem.CleanTagsString) + 1) - 1), '><', 1)) = LOWER(tu.TagName)
+WHERE uas.Reputation <= 1000
+  AND uas.TotalBadges = 0
+  AND pem.PostTypeId = 2
+  AND pem.Score > 10
+  AND pem.PostCreationDate > DATE '2023-01-01'
+ORDER BY FinalCompositeScore DESC, PostCreationDate DESC
+LIMIT 1000;

@@ -1,0 +1,151 @@
+-- {"query": "3555.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2365} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(*) FILTER (WHERE b.Class = 1)                     AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)                     AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)                     AS BronzeBadges,
+        COALESCE(SUM(p.Score),0)                               AS TotalPostScore,
+        COALESCE(SUM(vup.VoteCnt),0)                           AS UpVotesGiven,
+        COALESCE(SUM(vdown.VoteCnt),0)                         AS DownVotesGiven
+    FROM Users u
+    LEFT JOIN Badges b          ON b.UserId = u.Id
+    LEFT JOIN Posts p           ON p.OwnerUserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS VoteCnt
+        FROM Votes v
+        WHERE v.UserId = u.Id AND v.VoteTypeId = 2
+    ) vup ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS VoteCnt
+        FROM Votes v
+        WHERE v.UserId = u.Id AND v.VoteTypeId = 3
+    ) vdown ON TRUE
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+TagUsage AS (
+    SELECT 
+        t.TagName,
+        COUNT(*)                                    AS QuestionCount,
+        SUM(p.Score)                                AS TotalScore,
+        AVG(p.ViewCount)                            AS AvgViews,
+        COUNT(DISTINCT p.OwnerUserId)               AS DistinctAuthors
+    FROM Posts p
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS tag
+    ) AS ttag ON TRUE
+    JOIN Tags t ON t.TagName = ttag.tag
+    WHERE p.PostTypeId = 1                         -- questions
+      AND p.CreationDate >= '2023-01-01'::date
+    GROUP BY t.TagName
+),
+
+TopTags AS (
+    SELECT TagName
+    FROM TagUsage
+    ORDER BY QuestionCount DESC
+    LIMIT 10
+),
+
+RecentClosed AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.ClosedDate,
+        ph.Comment                     AS CloseReason,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE p.ClosedDate IS NOT NULL
+      AND ph.PostHistoryTypeId = 10                -- close
+),
+
+UserLatestQuestion AS (
+    SELECT 
+        p.OwnerUserId,
+        MAX(p.CreationDate) AS LatestQDate,
+        MAX(p.Id) FILTER (WHERE p.CreationDate = MAX(p.CreationDate)) AS LatestQId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+)
+
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.TotalPostScore,
+    us.UpVotesGiven,
+    us.DownVotesGiven,
+    COALESCE(rc.CloseReason, 'Open')            AS CurrentCloseReason,
+    rc.ClosedDate,
+    CASE
+        WHEN us.Reputation > 100000 AND us.GoldBadges >= 5 THEN 'Legendary'
+        WHEN us.Reputation > 20000                           THEN 'Power User'
+        ELSE                                                  'Contributor'
+    END                                          AS UserTier,
+    STRING_AGG(DISTINCT tt.TagName, ', ') 
+        FILTER (WHERE tt.TagName IS NOT NULL)    AS TopTagList
+FROM UserStats us
+LEFT JOIN UserLatestQuestion ulq ON ulq.OwnerUserId = us.Id
+LEFT JOIN LATERAL (
+    SELECT rc.CloseReason, rc.ClosedDate
+    FROM RecentClosed rc
+    WHERE rc.Id = ulq.LatestQId AND rc.rn = 1
+) rc ON TRUE
+LEFT JOIN (
+    SELECT 
+        p.OwnerUserId,
+        t.TagName
+    FROM Posts p
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS tag
+    ) ATAG ON TRUE
+    JOIN Tags t ON t.TagName = ATAG.tag
+    WHERE p.PostTypeId = 1
+) tt ON tt.OwnerUserId = us.Id
+WHERE us.Reputation IS NOT NULL
+GROUP BY 
+    us.Id, us.DisplayName, us.Reputation,
+    us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+    us.TotalPostScore, us.UpVotesGiven, us.DownVotesGiven,
+    rc.CloseReason, rc.ClosedDate
+HAVING COUNT(*) > 0
+ORDER BY us.Reputation DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+
+UNION ALL
+
+SELECT 
+    NULL,
+    '---',
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+WHERE EXISTS (
+    SELECT 1
+    FROM Tags tg
+    WHERE tg.IsModeratorOnly = 1
+      AND NOT EXISTS (
+          SELECT 1
+          FROM Posts p
+          JOIN Users u ON u.Id = p.OwnerUserId
+          WHERE p.Id = tg.ExcerptPostId
+            AND u.Reputation > 50000
+      )
+);

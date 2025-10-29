@@ -1,0 +1,290 @@
+WITH UserActivityMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views AS TotalProfileViews,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScoreOwned,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalPostViewCountOwned,
+        COALESCE(SUM(p.FavoriteCount), 0) AS TotalFavoriteCountOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScoreMade,
+        COUNT(DISTINCT v.PostId) FILTER (WHERE v.VoteTypeId = 2) AS TotalUpVotesReceived,
+        COUNT(DISTINCT v.PostId) FILTER (WHERE v.VoteTypeId = 3) AS TotalDownVotesReceived,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN ph.Id END) AS TotalEditsToOwnedPosts,
+        MAX(p.LastActivityDate) AS LastPostActivityDate,
+        MAX(ph.CreationDate) AS LastPostHistoryDate,
+        COALESCE(
+            CAST(
+                EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate)) / (3600 * 24)
+            AS numeric(10,2)),
+            99999.00
+        ) AS DaysSinceLastAccess,
+        (u.UpVotes - u.DownVotes) AS NetVotesGiven,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COALESCE(
+            (SELECT AVG(ap.Score)
+             FROM Posts ap
+             WHERE ap.PostTypeId = 2
+               AND ap.ParentId IN (SELECT qp.Id FROM Posts qp WHERE qp.OwnerUserId = u.Id AND qp.PostTypeId = 1)
+            ),
+            0
+        ) AS AvgAnswerScoreForOwnedQuestions,
+        SUM(COALESCE(SUM(p.Score), 0)) OVER (ORDER BY u.LastAccessDate ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS Rolling7DayPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.PostId = p.Id
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Body,
+        p.Tags,
+        p.CreationDate,
+        CASE
+            WHEN p.Tags IS NOT NULL AND (
+                p.Tags LIKE '%<performance>%' OR
+                p.Tags LIKE '%<optimization>%' OR
+                p.Tags LIKE '%<benchmarking>%' OR
+                p.Tags LIKE '%<speed>%' OR
+                p.Tags LIKE '%<efficiency>%'
+            ) THEN 1
+            ELSE 0
+        END AS HasPerformanceTag,
+        CASE
+            WHEN p.Body IS NOT NULL AND (
+                POSITION('performance' IN LOWER(p.Body)) > 0 OR
+                POSITION('optimize' IN LOWER(p.Body)) > 0 OR
+                POSITION('benchmark' IN LOWER(p.Body)) > 0 OR
+                POSITION('slow' IN LOWER(p.Body)) > 0 OR
+                POSITION('fast' IN LOWER(p.Body)) > 0
+            ) THEN 1
+            ELSE 0
+        END AS BodyMentionsPerformance,
+        COALESCE(NULLIF(LENGTH(TRIM(BOTH '<>' FROM p.Tags)) - LENGTH(REPLACE(TRIM(BOTH '<>' FROM p.Tags), '><', '')) + 1, 0), 0) AS NumTags
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+    AND p.OwnerUserId IS NOT NULL
+),
+AggregatedPerformancePosts AS (
+    SELECT
+        pta.OwnerUserId AS UserId,
+        COUNT(pta.PostId) FILTER (WHERE pta.HasPerformanceTag = 1) AS PerformanceTaggedPosts,
+        COUNT(pta.PostId) FILTER (WHERE pta.BodyMentionsPerformance = 1) AS BodyMentionsPerformancePosts,
+        COALESCE(AVG(pta.Score) FILTER (WHERE pta.HasPerformanceTag = 1), 0) AS AvgScorePerformancePosts,
+        COALESCE(AVG(pta.ViewCount) FILTER (WHERE pta.HasPerformanceTag = 1), 0) AS AvgViewCountPerformancePosts,
+        COALESCE(SUM(pta.NumTags), 0) AS TotalTagsUsedAcrossPosts
+    FROM PostTagAnalysis pta
+    GROUP BY pta.OwnerUserId
+),
+UserEngagementRanks AS (
+    SELECT
+        uam.UserId,
+        uam.DisplayName,
+        uam.Reputation,
+        uam.CreationDate,
+        uam.LastAccessDate,
+        uam.TotalPostsOwned,
+        uam.TotalPostScoreOwned,
+        uam.TotalPostViewCountOwned,
+        uam.TotalCommentsMade,
+        uam.TotalEditsToOwnedPosts,
+        uam.GoldBadges,
+        uam.AvgAnswerScoreForOwnedQuestions,
+        uam.DaysSinceLastAccess,
+        uam.Rolling7DayPostScore,
+        apr.PerformanceTaggedPosts,
+        apr.BodyMentionsPerformancePosts,
+        apr.AvgScorePerformancePosts,
+        apr.AvgViewCountPerformancePosts,
+        apr.TotalTagsUsedAcrossPosts,
+        RANK() OVER (ORDER BY uam.Reputation DESC, uam.LastAccessDate DESC) AS ReputationRank,
+        NTILE(10) OVER (ORDER BY uam.TotalPostsOwned DESC) AS PostVolumeDecile,
+        AVG(uam.TotalPostScoreOwned) OVER (PARTITION BY EXTRACT(YEAR FROM uam.CreationDate)) AS AvgUserPostScoreForCreationYear,
+        EXISTS (
+            SELECT 1
+            FROM Posts q_posts
+            JOIN Posts a_posts ON q_posts.AcceptedAnswerId = a_posts.Id
+            JOIN Comments ans_comment ON a_posts.Id = ans_comment.PostId
+            WHERE q_posts.OwnerUserId = uam.UserId
+              AND a_posts.OwnerUserId = uam.UserId
+              AND ans_comment.UserId = uam.UserId
+        ) AS HasSelfCommentedAcceptedAnswer
+    FROM UserActivityMetrics uam
+    LEFT JOIN AggregatedPerformancePosts apr ON uam.UserId = apr.UserId
+    WHERE uam.Reputation > 500
+      AND uam.TotalPostsOwned > 2
+      AND uam.DaysSinceLastAccess < 180
+),
+UserInfluenceScore AS (
+    SELECT
+        uer.UserId,
+        uer.DisplayName,
+        uer.Reputation,
+        uer.CreationDate,
+        uer.LastAccessDate,
+        uer.TotalPostsOwned,
+        uer.TotalPostScoreOwned,
+        uer.TotalPostViewCountOwned,
+        uer.TotalCommentsMade,
+        uer.TotalEditsToOwnedPosts,
+        uer.GoldBadges,
+        uer.PerformanceTaggedPosts,
+        uer.AvgAnswerScoreForOwnedQuestions,
+        uer.HasSelfCommentedAcceptedAnswer,
+        uer.ReputationRank,
+        uer.PostVolumeDecile,
+        uer.Rolling7DayPostScore,
+        CAST((
+            (uer.Reputation * 0.15) +
+            (COALESCE(uer.TotalPostScoreOwned, 0) * 0.05) +
+            (COALESCE(uer.TotalPostViewCountOwned, 0) * 0.001) +
+            (COALESCE(uer.TotalCommentsMade, 0) * 0.02) +
+            (COALESCE(uer.TotalEditsToOwnedPosts, 0) * 0.03) +
+            (COALESCE(uer.GoldBadges, 0) * 10) +
+            (COALESCE(uer.PerformanceTaggedPosts, 0) * 5) +
+            (COALESCE(uer.AvgAnswerScoreForOwnedQuestions, 0) * 0.05) +
+            (CASE WHEN uer.HasSelfCommentedAcceptedAnswer THEN 25 ELSE 0 END) +
+            (CASE WHEN uer.DaysSinceLastAccess <= 30 THEN 50 ELSE 0 END) +
+            (COALESCE(uer.Rolling7DayPostScore, 0) * 0.005)
+        ) AS numeric(15,2)) AS InfluenceScore
+    FROM UserEngagementRanks uer
+    WHERE uer.ReputationRank <= 500
+),
+TopInfluentialUsers AS (
+    SELECT
+        uis.UserId,
+        uis.DisplayName,
+        uis.Reputation,
+        uis.CreationDate,
+        uis.LastAccessDate,
+        uis.TotalPostsOwned,
+        uis.TotalCommentsMade,
+        uis.GoldBadges,
+        uis.InfluenceScore,
+        RANK() OVER (ORDER BY uis.InfluenceScore DESC, uis.LastAccessDate DESC) AS GlobalInfluenceRank
+    FROM UserInfluenceScore uis
+    WHERE uis.InfluenceScore > 100
+),
+RecentHighImpactPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.OwnerUserId,
+        p.PostTypeId,
+        COUNT(DISTINCT pl.RelatedPostId) AS NumLinkedPosts,
+        COALESCE(
+            (SELECT COUNT(DISTINCT cmt.Id)
+             FROM Comments cmt
+             WHERE cmt.PostId = p.Id AND cmt.Score > 5),
+            0
+        ) AS HighScoreCommentsCount,
+        NULLIF(
+            TRIM(BOTH '<>' FROM SUBSTRING(
+                p.Tags,
+                POSITION('><' IN p.Tags) + 2,
+                POSITION('>' IN SUBSTRING(p.Tags, POSITION('><' IN p.Tags) + 2)) - 1
+            )),
+            ''
+        ) AS SecondTag
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 1
+    WHERE p.Score > 75
+      AND p.LastActivityDate > CAST('2024-10-01' AS date) - INTERVAL '1 year'
+      AND p.OwnerUserId IS NOT NULL
+      AND p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.CreationDate, p.LastActivityDate, p.Score, p.OwnerUserId, p.PostTypeId, p.Tags
+),
+UserPostLinkageSummary AS (
+    SELECT
+        tui.UserId,
+        COUNT(rhip.PostId) AS NumHighImpactPostsAssociated,
+        AVG(rhip.Score) AS AvgHighImpactPostScore
+    FROM TopInfluentialUsers tui
+    JOIN RecentHighImpactPosts rhip ON tui.UserId = rhip.OwnerUserId
+    GROUP BY tui.UserId
+),
+TopTagsByInfluencers AS (
+    SELECT
+        LOWER(TRIM(BOTH '<>' FROM unnested_tags.tag_name)) AS TagName,
+        COUNT(DISTINCT p.Id) AS TaggedPostsByInfluencers,
+        SUM(p.Score) AS TotalScoreForTag
+    FROM TopInfluentialUsers tiu
+    JOIN Posts p ON tiu.UserId = p.OwnerUserId
+    CROSS JOIN LATERAL UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS unnested_tags(tag_name)
+    WHERE p.Tags IS NOT NULL
+      AND LENGTH(TRIM(BOTH '<>' FROM unnested_tags.tag_name)) > 0
+    GROUP BY LOWER(TRIM(BOTH '<>' FROM unnested_tags.tag_name))
+    HAVING COUNT(DISTINCT p.Id) > 5
+)
+SELECT
+    tiu.UserId,
+    tiu.DisplayName,
+    tiu.Reputation,
+    tiu.GlobalInfluenceRank,
+    tiu.TotalPostsOwned,
+    tiu.TotalCommentsMade,
+    tiu.GoldBadges,
+    tiu.InfluenceScore,
+    upls.NumHighImpactPostsAssociated,
+    upls.AvgHighImpactPostScore,
+    COALESCE(
+        CASE
+            WHEN tiu.GoldBadges > 10 AND upls.NumHighImpactPostsAssociated > 5 AND tiu.Reputation > 150000 THEN 'Legendary Architect' || ' (Top ' || LPAD(CAST(tiu.GlobalInfluenceRank AS text), 3, '0') || ')'
+            WHEN tiu.GoldBadges > 3 AND upls.NumHighImpactPostsAssociated > 1 AND tiu.Reputation > 75000 THEN 'Veteran Trailblazer'
+            WHEN tiu.TotalPostsOwned > 200 AND tiu.TotalCommentsMade > 500 AND upls.AvgHighImpactPostScore > 100 THEN 'Prodigious Contributor'
+            ELSE 'Engaged Member'
+        END,
+        'Undetermined Role'
+    ) AS UserTierClassification,
+    UPPER(LEFT(COALESCE(tiu.DisplayName, 'Anon'), 4)) || '_' || LPAD(CAST(tiu.UserId AS text), 6, '0') || '_' || UPPER(RIGHT(REPLACE(COALESCE(tiu.DisplayName, 'User'), ' ', ''), 3)) AS UserIdentifierHash,
+    (SELECT t.TagName FROM TopTagsByInfluencers t ORDER BY t.TaggedPostsByInfluencers DESC LIMIT 1) AS OverallMostPopularTagByInfluencers,
+    (SELECT AVG(Reputation) FROM TopInfluentialUsers WHERE GlobalInfluenceRank <= 10) AS AvgReputationOfTop10Influencers
+FROM TopInfluentialUsers tiu
+LEFT JOIN UserPostLinkageSummary upls ON tiu.UserId = upls.UserId
+WHERE tiu.GlobalInfluenceRank <= 100
+
+UNION ALL
+
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    NULL AS GlobalInfluenceRank,
+    COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+    COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    0 AS InfluenceScore,
+    0 AS NumHighImpactPostsAssociated,
+    0 AS AvgHighImpactPostScore,
+    'Tag Specialist: ' || tt.TagName AS UserTierClassification,
+    UPPER(LEFT(COALESCE(u.DisplayName, 'Anon'), 4)) || '_' || LPAD(CAST(u.Id AS text), 6, '0') || '_' || UPPER(RIGHT(REPLACE(COALESCE(u.DisplayName, 'User'), ' ', ''), 3)) AS UserIdentifierHash,
+    (SELECT t.TagName FROM TopTagsByInfluencers t ORDER BY t.TaggedPostsByInfluencers DESC LIMIT 1) AS OverallMostPopularTagByInfluencers,
+    (SELECT AVG(Reputation) FROM TopInfluentialUsers WHERE GlobalInfluenceRank <= 10) AS AvgReputationOfTop10Influencers
+FROM Users u
+JOIN Posts p ON u.Id = p.OwnerUserId
+CROSS JOIN LATERAL UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS unnested_tags(tag_name)
+JOIN Comments c ON u.Id = c.UserId
+JOIN Badges b ON u.Id = b.UserId
+JOIN (SELECT TagName FROM TopTagsByInfluencers ORDER BY TaggedPostsByInfluencers DESC LIMIT 5) tt ON LOWER(TRIM(BOTH '<>' FROM unnested_tags.tag_name)) = tt.TagName
+WHERE u.Reputation > 2000
+GROUP BY u.Id, u.DisplayName, u.Reputation, tt.TagName
+HAVING COUNT(DISTINCT p.Id) FILTER (WHERE LOWER(TRIM(BOTH '<>' FROM unnested_tags.tag_name)) = tt.TagName) > 10
+ORDER BY Reputation DESC, GlobalInfluenceRank ASC NULLS LAST;

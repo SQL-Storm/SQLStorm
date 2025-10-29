@@ -1,0 +1,122 @@
+-- {"query": "4355.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1202} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.Title AS PostTitle,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) as rn
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.Score > 10 AND p.CreationDate > '2023-01-01'
+),
+UserPostCounts AS (
+    SELECT
+        OwnerUserId,
+        COUNT(Id) AS NumberOfPosts,
+        AVG(Score) AS AveragePostScore,
+        MAX(CreationDate) AS LatestPostDate
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+),
+CommentAggregates AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        SUM(c.Score) AS TotalCommentScore,
+        MAX(c.CreationDate) AS LatestCommentDate
+    FROM Comments c
+    GROUP BY c.PostId
+),
+HighReputationUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COALESCE(upc.NumberOfPosts, 0) AS TotalUserPosts,
+        COALESCE(upc.AveragePostScore, 0) AS AvgUserScore
+    FROM Users u
+    LEFT JOIN UserPostCounts upc ON u.Id = upc.OwnerUserId
+    WHERE u.Reputation > 50000
+),
+PostDetails AS (
+    SELECT
+        rp.PostId,
+        rp.PostTypeId,
+        rp.PostTypeName,
+        rp.PostTitle,
+        rp.PostCreationDate,
+        rp.PostScore,
+        hru.UserName AS PostOwnerName,
+        hru.Reputation AS OwnerReputation,
+        COALESCE(ca.CommentCount, 0) AS PostCommentCount,
+        COALESCE(ca.TotalCommentScore, 0) AS PostTotalCommentScore,
+        COALESCE(ca.LatestCommentDate, rp.PostCreationDate) AS LastActivityOnPost,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Active'
+        END AS PostStatus
+    FROM RankedPosts rp
+    JOIN HighReputationUsers hru ON rp.OwnerUserId = hru.UserId
+    LEFT JOIN CommentAggregates ca ON rp.PostId = ca.PostId
+    JOIN Posts p ON rp.PostId = p.Id
+    WHERE rp.rn <= 10
+)
+SELECT
+    pd.PostId,
+    pd.PostTypeName,
+    pd.PostTitle,
+    pd.PostCreationDate,
+    pd.PostScore,
+    pd.PostOwnerName,
+    pd.OwnerReputation,
+    pd.PostCommentCount,
+    pd.PostTotalCommentScore,
+    pd.LastActivityOnPost,
+    pd.PostStatus,
+    UPPER(SUBSTRING(pd.PostTitle FROM 1 FOR 3)) AS TitlePrefix,
+    DATE_PART('year', pd.PostCreationDate) AS PostYear,
+    CASE
+        WHEN DATEDIFF('day', pd.PostCreationDate, GETDATE()) < 7 THEN 'Recent'
+        WHEN DATEDIFF('day', pd.PostCreationDate, GETDATE()) BETWEEN 7 AND 30 THEN 'Monthly'
+        ELSE 'Older'
+    END AS PostAgeCategory,
+    (pd.PostScore + pd.PostCommentCount * 5) * (pd.OwnerReputation / 10000.0) AS WeightedScore
+FROM PostDetails pd
+WHERE pd.OwnerReputation > 100000
+UNION ALL
+SELECT
+    p.Id,
+    pt.Name,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    u.DisplayName,
+    u.Reputation,
+    p.CommentCount,
+    (SELECT SUM(Score) FROM Comments WHERE PostId = p.Id) AS TotalCommentScore,
+    p.LastActivityDate,
+    CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        ELSE 'Active'
+    END AS PostStatus,
+    LOWER(SUBSTRING(p.Title FROM 4 FOR 3)) AS TitlePrefix,
+    DATE_PART('month', p.CreationDate) AS PostYear,
+    CASE
+        WHEN p.Score < 0 THEN 'NegativeScore'
+        WHEN p.AnswerCount > 10 THEN 'ManyAnswers'
+        ELSE 'Standard'
+    END AS PostAgeCategory,
+    p.FavoriteCount * (u.Reputation / 5000.0) AS WeightedScore
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+JOIN PostTypes pt ON p.PostTypeId = pt.Id
+WHERE p.Score < 0 AND u.DownVotes > 100
+ORDER BY WeightedScore DESC
+LIMIT 20;

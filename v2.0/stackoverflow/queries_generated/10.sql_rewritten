@@ -1,0 +1,284 @@
+-- {"query": "10.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2934} 
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         coalesce(nullif(trim(split_part(coalesce(u.websiteurl,''),'//',2)),''), 'unknown') as website_host
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+question_posts as (
+  select p.id as post_id,
+         p.owneruserid as user_id,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.title,
+         p.tags,
+         p.answercount,
+         p.closeddate,
+         p.communityowneddate
+  from posts p
+  where p.posttypeid = 1
+),
+user_q_activity as (
+  select ru.user_id,
+         count(*) filter (where qp.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days') as questions_180d,
+         avg(qp.score) filter (where qp.score is not null) as avg_q_score,
+         sum(qp.viewcount) as total_q_views,
+         max(qp.creationdate) as last_q_date
+  from recent_users ru
+  left join question_posts qp
+    on qp.user_id = ru.user_id
+  group by ru.user_id
+),
+answers as (
+  select a.id as post_id,
+         a.parentid as question_id,
+         a.owneruserid as user_id,
+         a.creationdate,
+         a.score
+  from posts a
+  where a.posttypeid = 2
+),
+user_a_activity as (
+  select ru.user_id,
+         count(*) filter (where a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days') as answers_180d,
+         avg(a.score) filter (where a.score is not null) as avg_a_score,
+         max(a.creationdate) as last_a_date
+  from recent_users ru
+  left join answers a
+    on a.user_id = ru.user_id
+  group by ru.user_id
+),
+votes_agg as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+         sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+  from votes v
+  where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by v.postid
+),
+comments_agg as (
+  select c.postid,
+         count(*) as comment_count,
+         max(c.creationdate) as last_comment_date,
+         sum(case when c.score >= 5 then 1 else 0 end) as high_scored_comments
+  from comments c
+  where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by c.postid
+),
+postlinks_agg as (
+  select pl.postid,
+         sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_count,
+         sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_count
+  from postlinks pl
+  where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by pl.postid
+),
+posthistory_closure as (
+  select ph.postid,
+         min(ph.creationdate) filter (where ph.posthistorytypeid in (10,35)) as first_close_or_migrate,
+         max(ph.creationdate) filter (where ph.posthistorytypeid in (11)) as last_reopen,
+         count(*) filter (where ph.posthistorytypeid in (10,35)) as close_events
+  from posthistory ph
+  where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by ph.postid
+),
+tag_explode as (
+  select p.id as post_id,
+         unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tag
+  from posts p
+  where p.posttypeid = 1
+    and p.tags is not null
+),
+tag_activity as (
+  select te.tag,
+         count(*) as tag_q_count,
+         avg(p.score) as tag_avg_q_score,
+         sum(p.viewcount) as tag_total_views,
+         percentile_cont(0.9) within group (order by p.score) as tag_p90_score
+  from tag_explode te
+  join posts p on p.id = te.post_id
+  group by te.tag
+),
+user_badges as (
+  select b.userid as user_id,
+         sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+         sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+         count(*) filter (where b.tagbased = 1) as tag_badges
+  from badges b
+  where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by b.userid
+),
+user_recent_posts as (
+  select p.owneruserid as user_id,
+         p.id as post_id,
+         p.posttypeid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         coalesce(v.upvotes,0) - coalesce(v.downvotes,0) as net_votes,
+         coalesce(v.favorites,0) as favorites,
+         coalesce(v.bounty_total,0) as bounty_total,
+         coalesce(ca.comment_count,0) as comment_count,
+         coalesce(pl.linked_count,0) as linked_count,
+         coalesce(pl.duplicate_count,0) as duplicate_count,
+         ph.first_close_or_migrate,
+         ph.last_reopen,
+         ph.close_events
+  from posts p
+  left join votes_agg v on v.postid = p.id
+  left join comments_agg ca on ca.postid = p.id
+  left join postlinks_agg pl on pl.postid = p.id
+  left join posthistory_closure ph on ph.postid = p.id
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+user_post_windows as (
+  select urp.*,
+         row_number() over (partition by urp.user_id order by urp.net_votes desc nulls last, urp.viewcount desc nulls last, urp.creationdate desc) as rn_best,
+         row_number() over (partition by urp.user_id order by urp.creationdate desc) as rn_latest,
+         sum(urp.net_votes) over (partition by urp.user_id) as user_net_votes_year,
+         avg(urp.score) over (partition by urp.user_id) as user_avg_post_score_year
+  from user_recent_posts urp
+),
+best_and_latest as (
+  select upw.user_id,
+         max(case when upw.rn_best = 1 then upw.post_id end) as best_post_id,
+         max(case when upw.rn_best = 1 then upw.net_votes end) as best_post_net_votes,
+         max(case when upw.rn_best = 1 then upw.viewcount end) as best_post_views,
+         max(case when upw.rn_latest = 1 then upw.post_id end) as latest_post_id,
+         max(case when upw.rn_latest = 1 then upw.creationdate end) as latest_post_date,
+         max(upw.user_net_votes_year) as user_net_votes_year,
+         max(upw.user_avg_post_score_year) as user_avg_post_score_year
+  from user_post_windows upw
+  group by upw.user_id
+),
+user_tag_profile as (
+  select te_user.user_id,
+         te_user.tag,
+         count(*) as user_tag_q_count,
+         avg(p.score) as user_tag_avg_score,
+         dense_rank() over (partition by te_user.user_id order by count(*) desc, avg(p.score) desc) as tag_rank
+  from tag_explode te_user
+  join posts p on p.id = te_user.post_id
+  group by te_user.user_id, te_user.tag
+),
+top3_tags as (
+  select utp.user_id,
+         string_agg(utp.tag, ', ' order by utp.tag_rank) as top_tags
+  from user_tag_profile utp
+  where utp.tag_rank <= 3
+  group by utp.user_id
+),
+activity_union as (
+  select ua.user_id,
+         ru.displayname,
+         'Q' as kind,
+         ua.questions_180d as act_180d,
+         ua.avg_q_score as avg_score,
+         ru.website_host
+  from user_q_activity ua
+  join recent_users ru on ru.user_id = ua.user_id
+  union all
+  select aa.user_id,
+         ru.displayname,
+         'A' as kind,
+         aa.answers_180d as act_180d,
+         aa.avg_a_score as avg_score,
+         ru.website_host
+  from user_a_activity aa
+  join recent_users ru on ru.user_id = aa.user_id
+),
+activity_pivot as (
+  select user_id,
+         max(displayname) as displayname,
+         max(website_host) as website_host,
+         max(case when kind='Q' then act_180d end) as q_180d,
+         max(case when kind='A' then act_180d end) as a_180d,
+         max(case when kind='Q' then avg_score end) as avg_q_score,
+         max(case when kind='A' then avg_score end) as avg_a_score
+  from activity_union
+  group by user_id
+),
+engagement_score as (
+  select ap.user_id,
+         coalesce(ap.q_180d,0)*2
+         + coalesce(ap.a_180d,0)*1.5
+         + coalesce(ba.best_post_net_votes,0)*0.25
+         + coalesce(ba.user_net_votes_year,0)*0.1
+         + least(coalesce(ba.best_post_views,0), 5000)/5000.0
+         + coalesce(ub.gold_badges,0)*3
+         + coalesce(ub.silver_badges,0)*1.5
+         + coalesce(ub.bronze_badges,0)*0.5
+         + coalesce(ub.tag_badges,0)*0.75
+         as engagement
+  from activity_pivot ap
+  left join best_and_latest ba on ba.user_id = ap.user_id
+  left join user_badges ub on ub.user_id = ap.user_id
+),
+qualified_users as (
+  select ru.user_id
+  from recent_users ru
+  where (ru.reputation >= 1000 or ru.creationdate <= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days')
+),
+final_users as (
+  select qu.user_id,
+         ru.displayname,
+         ru.location,
+         ap.website_host,
+         ap.q_180d,
+         ap.a_180d,
+         ap.avg_q_score,
+         ap.avg_a_score,
+         coalesce(ba.best_post_id, ba.latest_post_id) as spotlight_post_id,
+         ba.latest_post_date,
+         ba.user_net_votes_year,
+         ba.user_avg_post_score_year,
+         ub.gold_badges,
+         ub.silver_badges,
+         ub.bronze_badges,
+         ub.tag_badges,
+         tg.top_tags,
+         es.engagement
+  from qualified_users qu
+  join recent_users ru on ru.user_id = qu.user_id
+  left join activity_pivot ap on ap.user_id = qu.user_id
+  left join best_and_latest ba on ba.user_id = qu.user_id
+  left join user_badges ub on ub.user_id = qu.user_id
+  left join top3_tags tg on tg.user_id = qu.user_id
+  left join engagement_score es on es.user_id = qu.user_id
+)
+select fu.user_id,
+       fu.displayname,
+       coalesce(nullif(fu.location,''), 'N/A') as location,
+       fu.website_host,
+       fu.q_180d,
+       fu.a_180d,
+       round(coalesce(fu.avg_q_score,0)::numeric,2) as avg_q_score,
+       round(coalesce(fu.avg_a_score,0)::numeric,2) as avg_a_score,
+       fu.spotlight_post_id,
+       fu.latest_post_date,
+       round(coalesce(fu.user_avg_post_score_year,0)::numeric,2) as avg_post_score_year,
+       fu.user_net_votes_year,
+       coalesce(fu.gold_badges,0) as gold_badges,
+       coalesce(fu.silver_badges,0) as silver_badges,
+       coalesce(fu.bronze_badges,0) as bronze_badges,
+       coalesce(fu.tag_badges,0) as tag_badges,
+       coalesce(fu.top_tags, '(none)') as top_tags,
+       round(coalesce(fu.engagement,0)::numeric,2) as engagement,
+       case
+         when fu.engagement is null then 'no-activity'
+         when fu.engagement >= 50 then 'elite'
+         when fu.engagement >= 20 then 'active'
+         when fu.engagement >= 5 then 'casual'
+         else 'lurker'
+       end as engagement_band
+from final_users fu
+where coalesce(fu.q_180d,0) + coalesce(fu.a_180d,0) + coalesce(fu.user_net_votes_year,0) > 0
+qualify row_number() over (order by fu.engagement desc nulls last, fu.user_net_votes_year desc, fu.latest_post_date desc nulls last) <= 200;

@@ -1,0 +1,155 @@
+-- {"query": "7377.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1577} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        AVG(COALESCE(p.ViewCount, 0)) as AvgViews,
+        STRING_AGG(DISTINCT p.Tags, ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.AcceptedAnswerId, 0) as AcceptedAnswerId,
+        COALESCE(p.ClosedDate, p.CommunityOwnedDate) as ImportantEventDate,
+        CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END as PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyUpvoted'
+            WHEN p.Score > 50 THEN 'Upvoted'
+            WHEN p.Score > 0 THEN 'Neutral'
+            ELSE 'Downvoted'
+        END as ScoreCategory,
+        COALESCE(p.Tags, '') as CleanTags,
+        LENGTH(p.Title) as TitleLength,
+        DATEDIFF(CURRENT_TIMESTAMP, p.CreationDate) as DaysOld
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Expert'
+            WHEN u.Reputation >= 1000 THEN 'Advanced'
+            WHEN u.Reputation >= 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as RepLevel,
+        CASE 
+            WHEN u.Views > 10000 THEN 'Viral'
+            WHEN u.Views > 5000 THEN 'Popular'
+            WHEN u.Views > 1000 THEN 'Known'
+            ELSE 'Unknown'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (PARTITION BY u.Reputation ORDER BY u.Views DESC) as ViewRankWithinLevel,
+        RANK() OVER (ORDER BY u.Reputation DESC) as RepRank,
+        ROUND(CAST(u.UpVotes AS FLOAT) / NULLIF(u.UpVotes + u.DownVotes, 0) * 100, 2) as UpvoteRatio
+    FROM Users u
+    WHERE u.Reputation IS NOT NULL
+    AND u.Views >= 0
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Trending'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as PopularityStatus,
+        RANK() OVER (ORDER BY t.Count DESC) as TagRank
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) as RevisionCount,
+        MIN(ph.CreationDate) as FirstRevision,
+        MAX(ph.CreationDate) as LastRevision,
+        COUNT(DISTINCT ph.UserId) as Editors,
+        STRING_AGG(DISTINCT ph.PostHistoryTypeId::VARCHAR, ', ') as RevisionTypes,
+        STRING_AGG(DISTINCT CASE WHEN ph.Comment IS NOT NULL THEN ph.Comment ELSE 'No Comment' END, ' | ') as Comments
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+    HAVING COUNT(*) > 1
+)
+SELECT 
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT ua.UserId) as DistinctUsers,
+    COUNT(DISTINCT pa.Id) as DistinctPosts,
+    COUNT(DISTINCT ta.TagName) as DistinctTags,
+    COUNT(DISTINCT CASE WHEN pa.PostTypeId = 1 THEN pa.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN pa.PostTypeId = 2 THEN pa.Id END) as Answers,
+    AVG(pa.Score) as AvgPostScore,
+    AVG(pa.ViewCount) as AvgViewCount,
+    AVG(ua.TotalScore) as AvgUserScore,
+    MAX(pa.CreationDate) as LatestPostDate,
+    MIN(pa.CreationDate) as EarliestPostDate,
+    SUM(pa.AnswerCount) as TotalAnswers,
+    SUM(pa.CommentCount) as TotalComments,
+    AVG(ca.ViewRankWithinLevel) as AvgViewRankWithinLevel,
+    SUM(CASE WHEN ca.RepLevel = 'Expert' THEN 1 ELSE 0 END) as ExpertUsers,
+    SUM(CASE WHEN ca.PopularityLevel = 'Viral' THEN 1 ELSE 0 END) as ViralUsers,
+    AVG(CASE WHEN pa.Score > 0 THEN 1 ELSE 0 END) as PositiveScoreRatio,
+    COUNT(DISTINCT CASE 
+        WHEN pa.Score > 100 AND pa.ViewCount > 1000 
+        THEN pa.Id 
+        ELSE NULL 
+    END) as HighValuePosts,
+    STRING_AGG(DISTINCT CASE 
+        WHEN ta.PopularityStatus = 'Trending' THEN ta.TagName 
+        ELSE NULL 
+    END, ', ') as TrendingTags,
+    COUNT(DISTINCT phs.PostId) as PostsWithRevisions,
+    AVG(phs.RevisionCount) as AvgRevisionsPerPost,
+    COUNT(DISTINCT CASE 
+        WHEN phs.Editors > 1 THEN phs.PostId 
+        ELSE NULL 
+    END) as MultiEditorPosts,
+    ROUND(
+        CAST(SUM(CASE WHEN pa.PostTypeId = 1 AND pa.Score > 0 THEN 1 ELSE 0 END) AS FLOAT) / 
+        NULLIF(COUNT(CASE WHEN pa.PostTypeId = 1 THEN 1 END), 0) * 100, 2
+    ) as QuestionQualityPercentage
+FROM UserActivityStats ua
+FULL OUTER JOIN PostAnalysis pa ON ua.UserId = pa.OwnerUserId
+FULL OUTER JOIN ComplexUserAnalysis ca ON ua.UserId = ca.UserId
+LEFT JOIN TagPopularity ta ON 1=1
+LEFT JOIN PostHistorySummary phs ON pa.Id = phs.PostId
+WHERE (ua.TotalPosts IS NOT NULL OR pa.Id IS NOT NULL)
+AND (
+    ua.TotalPosts IS NULL OR 
+    (ua.TotalPosts > 0 AND pa.Score IS NOT NULL)
+)

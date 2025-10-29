@@ -1,0 +1,166 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id as QuestionId,
+        p.Score as QuestionScore,
+        p.ViewCount as QuestionViews,
+        u.Id as OwnerUserId,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        row_number() over (partition by t.Id order by p.Score desc, p.ViewCount desc) as rn
+    from Tags t
+    join Posts p on p.PostTypeId = 1 and position(concat('<', t.TagName, '>') in coalesce(p.Tags, '')) > 0
+    join Users u on u.Id = p.OwnerUserId
+    where coalesce(t.IsModeratorOnly, cast(0 as boolean)) = cast(0 as boolean) and coalesce(t.IsRequired, cast(0 as boolean)) = cast(0 as boolean)
+),
+TopQuestionsPerTag as (
+    select * from RecursiveTagCounts where rn <= 5
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserAggregateBadges as (
+    select
+        ubc.UserId,
+        sum(case when ubc.Class = 1 then ubc.BadgeCount else 0 end) as GoldBadges,
+        sum(case when ubc.Class = 2 then ubc.BadgeCount else 0 end) as SilverBadges,
+        sum(case when ubc.Class = 3 then ubc.BadgeCount else 0 end) as BronzeBadges
+    from UserBadgeCounts ubc
+    group by ubc.UserId
+),
+QuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerUserId,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        bool_or(a.OwnerUserId = q.OwnerUserId) as OwnerAlsoAnswered
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join UserAggregateBadges ua on ua.UserId = q.OwnerUserId
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags, q.OwnerUserId, ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+),
+QuestionCloseInfo as (
+    select PostId, CloseReason from QuestionCloseReasons where rn = 1
+),
+AnswerVotesSummary as (
+    select
+        a.Id as AnswerId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 14 then 1 else 0 end) as NominateModeratorVotes
+    from Posts a
+    left join Votes v on v.PostId = a.Id
+    where a.PostTypeId = 2
+    group by a.Id
+),
+PostLinkDuplicates as (
+    select
+        pl.PostId,
+        sum(case when lt.Name = 'Duplicate' then 1 else 0 end) as DuplicateCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+UserActivityRanks as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) as PostsCount,
+        count(distinct c.Id) as CommentsCount,
+        rank() over (order by count(distinct p.Id) desc) as PostsRank,
+        dense_rank() over (order by count(distinct c.Id) desc) as CommentsRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+FinalAggregated AS (
+    select
+        tq.TagName,
+        tq.QuestionId,
+        tq.QuestionScore,
+        tq.QuestionViews,
+        tq.OwnerUserId,
+        coalesce(ua.GoldBadges,0) as GoldBadges,
+        coalesce(ua.SilverBadges,0) as SilverBadges,
+        coalesce(ua.BronzeBadges,0) as BronzeBadges,
+        qwa.AnswerCount,
+        qwa.MaxAnswerScore,
+        qwa.AvgAnswerScore,
+        coalesce(qci.CloseReason, 'Open') as CloseReason,
+        coalesce(dup.DuplicateCount, 0) as DuplicateCount,
+        uar.PostsCount,
+        uar.CommentsCount,
+        uar.PostsRank,
+        uar.CommentsRank,
+        case when qwa.OwnerAlsoAnswered then 'Yes' else 'No' end as OwnerAlsoAnsweredFlag,
+        substr(tq.TagName, 1, 5) || '...' as TagNameShort,
+        lower(tq.TagName) as TagNameLower
+    from TopQuestionsPerTag tq
+    left join UserAggregateBadges ua on ua.UserId = tq.OwnerUserId
+    left join QuestionsWithAnswers qwa on qwa.QuestionId = tq.QuestionId
+    left join QuestionCloseInfo qci on qci.PostId = tq.QuestionId
+    left join PostLinkDuplicates dup on dup.PostId = tq.QuestionId
+    left join UserActivityRanks uar on uar.Id = tq.OwnerUserId
+)
+select
+    TagName,
+    QuestionId,
+    QuestionScore,
+    QuestionViews,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    AnswerCount,
+    coalesce(MaxAnswerScore,0) as MaxAnswerScore,
+    round(coalesce(AvgAnswerScore,0),2) as AvgAnswerScore,
+    CloseReason,
+    DuplicateCount,
+    PostsCount,
+    CommentsCount,
+    PostsRank,
+    CommentsRank,
+    OwnerAlsoAnsweredFlag,
+    TagNameShort,
+    TagNameLower,
+    case
+        when CloseReason is null then 'UNKNOWN'
+        when CloseReason = 'Open' then 'ACTIVE'
+        else 'CLOSED'
+    end as PostStatus
+from FinalAggregated
+where QuestionScore > (
+    select percentile_cont(0.75) within group (order by Score)
+    from Posts
+    where PostTypeId = 1 and Score is not null
+)
+and AnswerCount > 0
+order by TagNameLower, QuestionScore desc
+limit 100;

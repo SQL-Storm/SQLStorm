@@ -1,0 +1,151 @@
+-- {"query": "1144.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2471} 
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views AS UserProfileViews,
+        COUNT(DISTINCT p.Id) AS TotalQuestionsPosted,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        NTILE(5) OVER (ORDER BY u.Reputation DESC) AS ReputationTier,
+        -- Correlated subquery to find the most recent edit activity by the user
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)) AS LastEditActivityDate,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+        u.UpVotes, u.DownVotes, u.Views
+),
+QuestionEventMetrics AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS EditCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseVoteCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate,
+        -- Aggregate unique close reasons using STRING_AGG
+        STRING_AGG(DISTINCT crt.Name, ', ') FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL AND crt.Id = CAST(ph.Comment AS smallint)) AS CloseReasons
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL AND crt.Id = CAST(ph.Comment AS smallint)
+    GROUP BY ph.PostId
+),
+PostTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'), 1) AS TagCount,
+        -- Check if any of the tags are relevant to 'sql' or 'database' or 'performance'
+        EXISTS (SELECT 1 FROM UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS tag WHERE tag IN ('sql', 'database', 'performance', 'query-optimization')) AS HasRelevantTag,
+        STRING_AGG(DISTINCT t.TagName, ', ') FILTER (WHERE t.TagName IN ('sql', 'database', 'performance', 'query-optimization')) AS RelevantTags
+    FROM Posts p
+    LEFT JOIN UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS tag_unnest ON TRUE
+    LEFT JOIN Tags t ON t.TagName = tag_unnest
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    GROUP BY p.Id, p.Tags
+),
+CommentSentiment AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        SUM(CASE WHEN c.Text ILIKE '%great%' OR c.Text ILIKE '%thanks%' THEN 1 ELSE 0 END) AS PositiveCommentCount,
+        SUM(CASE WHEN c.Text ILIKE '%bug%' OR c.Text ILIKE '%error%' OR c.Text ILIKE '%issue%' THEN 1 ELSE 0 END) AS NegativeCommentCount,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    GROUP BY c.PostId
+)
+SELECT
+    ue.UserName,
+    ue.Reputation,
+    ue.ReputationTier,
+    p.Id AS QuestionId,
+    p.Title,
+    p.CreationDate AS QuestionCreationDate,
+    p.LastActivityDate,
+    p.Score AS QuestionScore,
+    p.ViewCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    -- Determine who was the last editor, handling NULLs gracefully
+    COALESCE(p.LastEditorDisplayName, (SELECT u_edit.DisplayName FROM Users u_edit WHERE u_edit.Id = p.LastEditorUserId), 'Community Editor') AS EffectiveLastEditor,
+    pta.TagCount,
+    pta.RelevantTags,
+    pta.HasRelevantTag,
+    COALESCE(cs.CommentCount, 0) AS TotalCommentsOnQuestion,
+    COALESCE(cs.AvgCommentScore, 0.0) AS AverageCommentScore,
+    COALESCE(cs.PositiveCommentCount, 0) AS PositiveFeedbackComments,
+    COALESCE(cs.NegativeCommentCount, 0) AS NegativeFeedbackComments,
+    -- Use COALESCE for effective last activity date, preferring comment date if available
+    COALESCE(cs.LastCommentDate, p.LastActivityDate, p.CreationDate) AS EffectiveLastActivity,
+    qem.EditCount,
+    qem.CloseVoteCount,
+    qem.LastClosedDate,
+    qem.CloseReasons,
+    pl_linked.RelatedPostId AS LinkedQuestionId,
+    pl_dup.RelatedPostId AS DuplicateOfQuestionId,
+    CASE
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+        WHEN p.AnswerCount > 0 THEN 'Answered'
+        ELSE 'Unanswered'
+    END AS QuestionStatus,
+    -- Window function to calculate time since the user's previous question
+    p.CreationDate - LAG(p.CreationDate, 1, '1900-01-01'::timestamp) OVER (PARTITION BY ue.UserId ORDER BY p.CreationDate) AS TimeSincePreviousQuestion,
+    -- Complex calculation: Custom Engagement Score incorporating multiple factors
+    (p.Score * 0.6 + p.ViewCount * 0.01 + COALESCE(p.FavoriteCount, 0) * 0.3 + COALESCE(cs.CommentCount, 0) * 0.1) *
+    (CASE WHEN pta.HasRelevantTag THEN 1.2 ELSE 0.8 END) AS EngagementScore,
+    -- Rank questions within each reputation tier based on view count and score
+    RANK() OVER (PARTITION BY ue.ReputationTier ORDER BY p.ViewCount DESC, p.Score DESC) AS RankWithinReputationTier,
+    -- Daily average score of questions using a window function
+    AVG(p.Score) OVER (PARTITION BY p.CreationDate::date) AS DailyAverageQuestionScore,
+    -- Correlated subquery to check if the question's owner has ever edited this specific post
+    EXISTS (
+        SELECT 1
+        FROM PostHistory ph_owner_edit
+        WHERE ph_owner_edit.PostId = p.Id
+          AND ph_owner_edit.UserId = ue.UserId
+          AND ph_owner_edit.PostHistoryTypeId IN (4, 5, 6)
+          AND ph_owner_edit.CreationDate BETWEEN p.CreationDate AND COALESCE(p.LastEditDate, p.CreationDate)
+    ) AS OwnerHasEditedQuestion,
+    -- Subquery in SELECT to get the maximum score of any answer to this question
+    (SELECT MAX(a.Score) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2) AS BestAnswerScore,
+    -- Boolean flag for highly viewed but closed and negative-scored questions
+    (p.ClosedDate IS NOT NULL AND p.ViewCount > 5000 AND p.Score < 0 AND COALESCE(qem.CloseVoteCount, 0) > 1) AS HighlyViewedButClosedNegative
+FROM Posts p
+INNER JOIN UserEngagement ue ON p.OwnerUserId = ue.UserId
+INNER JOIN PostTagAnalysis pta ON p.Id = pta.PostId
+LEFT JOIN QuestionEventMetrics qem ON p.Id = qem.PostId
+LEFT JOIN CommentSentiment cs ON p.Id = cs.PostId
+LEFT JOIN PostLinks pl_linked ON p.Id = pl_linked.PostId AND pl_linked.LinkTypeId = 1 -- Linked posts
+LEFT JOIN PostLinks pl_dup ON p.Id = pl_dup.PostId AND pl_dup.LinkTypeId = 3 -- Duplicate posts
+WHERE
+    p.PostTypeId = 1 -- Only questions
+    AND p.CreationDate BETWEEN '2022-01-01' AND '2023-12-31' -- Specific time window
+    AND p.ViewCount > 1000
+    AND p.Score >= 0 -- Focus on non-negative scored questions for primary analysis
+    AND ue.Reputation > 1000
+    AND pta.HasRelevantTag IS TRUE
+    -- Exclude questions that are explicitly marked as duplicates (source of the duplication)
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostLinks pl_is_dup
+        WHERE pl_is_dup.PostId = p.Id AND pl_is_dup.LinkTypeId = 3
+    )
+    -- Complex NULL logic and conditional filtering for engagement
+    AND (
+        (COALESCE(p.FavoriteCount, 0) > 5 AND p.LastActivityDate > p.CreationDate + INTERVAL '3 months') OR
+        (p.AnswerCount IS NOT NULL AND p.AnswerCount > 2 AND p.AcceptedAnswerId IS NOT NULL AND p.Body ILIKE '%solution%') OR
+        (COALESCE(cs.CommentCount, 0) > 10 AND cs.AvgCommentScore >= 1 AND cs.NegativeCommentCount = 0)
+    )
+ORDER BY
+    EngagementScore DESC, p.CreationDate DESC, p.ViewCount DESC
+LIMIT 1000;

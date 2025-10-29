@@ -1,0 +1,124 @@
+-- {"query": "3027.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2357} 
+
+WITH
+    -- aggregate per‑user statistics
+    u_stats AS (
+        SELECT
+            u.Id                                   AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(SUM(vu.VoteCount),0)           AS total_answer_upvotes,
+            COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS gold_badge_cnt,
+            MAX(p.CreationDate)                    AS last_activity,
+            MIN(p.CreationDate)                    AS first_post_date
+        FROM Users u
+        LEFT JOIN Posts p
+               ON p.OwnerUserId = u.Id
+        LEFT JOIN (
+            SELECT pv.PostId, COUNT(*) AS VoteCount
+            FROM Votes pv
+            WHERE pv.VoteTypeId = 2                 -- UpMod
+            GROUP BY pv.PostId
+        ) vu
+               ON vu.PostId = p.Id
+              AND p.PostTypeId = 2                  -- only answers
+        LEFT JOIN Badges b
+               ON b.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    -- latest question per user (uses a window function)
+    user_latest_question AS (
+        SELECT
+            p.OwnerUserId                          AS user_id,
+            p.Id                                    AS question_id,
+            p.Title,
+            p.CreationDate,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+            COALESCE(array_length(string_to_array(p.Tags, '><'),1),0) AS tag_count,
+            CASE
+                WHEN POSITION('<' IN p.Tags) > 0
+                THEN SUBSTRING(p.Tags FROM '<([^>]+)>' FOR '#')
+                ELSE NULL
+            END                                    AS first_tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1                     -- question
+          AND p.OwnerUserId IS NOT NULL
+    ),
+
+    -- a tag that the user “owns” via a gold badge (correlated sub‑query)
+    user_expert_tags AS (
+        SELECT DISTINCT
+            ub.UserId                               AS user_id,
+            t.TagName
+        FROM Badges ub
+        JOIN Users u          ON u.Id = ub.UserId
+        JOIN Tags  t          ON t.Id = (
+            SELECT pt.Id
+            FROM Tags pt
+            WHERE pt.TagName = ANY (
+                SELECT unnest(string_to_array(p.Tags, '><'))
+                FROM Posts p
+                WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1
+            )
+            LIMIT 1
+        )
+        WHERE ub.Class = 1                         -- gold badge
+    )
+
+SELECT
+    us.user_id,
+    us.DisplayName,
+    us.Reputation,
+    us.total_answer_upvotes,
+    us.gold_badge_cnt,
+    us.last_activity,
+    q.question_id,
+    q.Title,
+    q.CreationDate          AS question_date,
+    q.tag_count,
+    COALESCE(et.TagName,'<none>')   AS expert_tag,
+    CASE
+        WHEN us.first_post_date IS NULL               THEN 'NeverPosted'
+        WHEN us.first_post_date < '2010-01-01'::timestamp THEN 'Veteran'
+        ELSE 'Newcomer'
+    END                         AS user_cohort,
+    CASE
+        WHEN q.Title IS NULL                           THEN 0
+        WHEN POSITION('java' IN LOWER(q.Title)) > 0    THEN 1
+        ELSE 0
+    END                         AS contains_java
+FROM u_stats us
+LEFT JOIN user_latest_question q
+       ON q.user_id = us.user_id AND q.rn = 1
+LEFT JOIN user_expert_tags et
+       ON et.user_id = us.user_id
+WHERE us.Reputation > 1000
+   OR us.gold_badge_cnt > 0
+ORDER BY us.total_answer_upvotes DESC
+LIMIT 20
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0                                 AS total_answer_upvotes,
+    0                                 AS gold_badge_cnt,
+    NULL                              AS last_activity,
+    NULL                              AS question_id,
+    NULL                              AS Title,
+    NULL                              AS question_date,
+    NULL                              AS tag_count,
+    '<none>'                          AS expert_tag,
+    CASE
+        WHEN u.CreationDate < '2009-01-01'::timestamp THEN 'Veteran'
+        ELSE 'Newcomer'
+    END                             AS user_cohort,
+    0                                 AS contains_java
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+  AND u.Reputation > 500
+ORDER BY Reputation DESC
+LIMIT 5;

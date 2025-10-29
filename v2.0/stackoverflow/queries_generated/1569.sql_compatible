@@ -1,0 +1,232 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(c.CreationDate) AS LastCommentActivity,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.OwnerUserId = u.Id), 0) AS AvgPostScore,
+        CASE
+            WHEN u.Reputation >= 20000 AND u.AccountId IS NOT NULL THEN 'Elite User'
+            WHEN u.Reputation >= 5000 AND u.Views > 5000 THEN 'Experienced Contributor'
+            WHEN u.Reputation >= 1000 AND u.DisplayName IS NOT NULL THEN 'Active Member'
+            WHEN u.Reputation > 0 THEN 'Novice'
+            ELSE 'Dormant'
+        END AS ReputationTier,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC, u.Id) AS RankInCreationYear
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+    HAVING COUNT(DISTINCT p.Id) + COUNT(DISTINCT c.Id) > 0
+),
+QuestionMetrics AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.OwnerUserId,
+        q.Tags,
+        CAST(q.AnswerCount AS NUMERIC) / NULLIF(q.ViewCount, 0) AS AnswerViewRatio,
+        TRIM(SUBSTRING(q.Tags, POSITION('<' IN q.Tags) + 1, POSITION('>' IN q.Tags) - POSITION('<' IN q.Tags) - 1)) AS PrimaryTag,
+        (
+            SELECT COUNT(DISTINCT ph.Comment)
+            FROM PostHistory ph
+            WHERE ph.PostId = q.Id
+              AND ph.PostHistoryTypeId = 10
+              AND ph.Comment IS NOT NULL
+        ) AS DistinctCloseReasons,
+        CASE
+            WHEN q.Tags LIKE '%<sql>%' OR q.Tags LIKE '%<database>%' OR q.Tags LIKE '%<performance>%' THEN TRUE
+            ELSE FALSE
+        END AS HasHotTag,
+        EXTRACT(EPOCH FROM (q.LastActivityDate - q.CreationDate)) / 3600 AS HoursSinceCreationToLastActivity,
+        RANK() OVER (PARTITION BY TRIM(SUBSTRING(q.Tags, POSITION('<' IN q.Tags) + 1, POSITION('>' IN q.Tags) - POSITION('<' IN q.Tags) - 1)) ORDER BY q.Score DESC) AS TagScoreRank
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 year')
+      AND q.ViewCount > 100
+),
+AnswerAggregates AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(a.Id) AS TotalAnswers,
+        SUM(a.Score) AS TotalAnswerScore,
+        MAX(a.CreationDate) AS LatestAnswerDate,
+        MAX(CASE WHEN q.AcceptedAnswerId = a.Id THEN a.Score ELSE NULL END) AS AcceptedAnswerScore,
+        MAX(a.Score) OVER (PARTITION BY a.ParentId) AS MaxAnswerScoreForQuestion
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId, q.AcceptedAnswerId
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(CASE WHEN pl.LinkTypeId = 1 THEN pl.RelatedPostId ELSE NULL END) AS LinkedPostsCount,
+        COUNT(CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId ELSE NULL END) AS DuplicatePostsCount,
+        EXISTS (
+            SELECT 1 FROM Posts rp
+            WHERE rp.Id IN (
+                SELECT pl_inner.RelatedPostId
+                FROM PostLinks pl_inner
+                WHERE pl_inner.PostId = pl.PostId AND pl_inner.LinkTypeId = 1
+            ) AND rp.ClosedDate IS NOT NULL
+        ) AS HasClosedLinkedPost
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+RecentModeratorActions AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS ActionDate,
+        ph.PostHistoryTypeId,
+        ph.UserId AS ModeratorId,
+        LAG(ph.PostHistoryTypeId, 1, 0) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousActionTypeId,
+        LAG(ph.UserId, 1, -1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousActionUserId,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)
+      AND ph.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+),
+TopActiveTags AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT q.Id) AS QuestionCount,
+        SUM(q.Score) AS TotalScore,
+        SUM(COUNT(DISTINCT q.Id)) OVER (ORDER BY SUM(q.Score) DESC) AS CumulativeQuestionCount
+    FROM Tags t
+    JOIN Posts q ON q.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 year')
+    GROUP BY t.TagName
+    ORDER BY TotalScore DESC
+    LIMIT 100
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.ReputationTier,
+    ue.AvgPostScore,
+    qm.QuestionTitle,
+    qm.QuestionCreationDate,
+    qm.QuestionScore,
+    qm.ViewCount,
+    qm.PrimaryTag,
+    qm.HasHotTag,
+    qm.TagScoreRank,
+    aa.TotalAnswers,
+    aa.TotalAnswerScore,
+    aa.AcceptedAnswerScore,
+    pla.LinkedPostsCount,
+    pla.DuplicatePostsCount,
+    pla.HasClosedLinkedPost,
+    rma.ActionDate AS LastModActionDate,
+    rma.PostHistoryTypeId AS LastModActionType,
+    rma.PreviousActionTypeId AS PrevModActionType,
+    t.TagName AS TopTag,
+    t.QuestionCount AS TopTagQuestionCount,
+    t.TotalScore AS TopTagTotalScore,
+    (qm.QuestionScore * 0.5) + (LOG(GREATEST(qm.ViewCount, 1)) * 0.2) + (COALESCE(qm.AnswerCount, 0) * 0.1) +
+    (
+        CASE
+            WHEN qm.HoursSinceCreationToLastActivity IS NOT NULL
+            THEN 100.0 / (qm.HoursSinceCreationToLastActivity + 1)
+            ELSE 0
+        END
+    ) AS WeightedQuestionScore,
+    COALESCE(UPPER(SUBSTRING(ue.DisplayName, 1, 3)) || LPAD(CAST(ue.UserId AS TEXT), 7, '0'), 'UNKNOWN_USER') AS UserIdentifierCode,
+    (
+        SELECT c_inner.Text
+        FROM Comments c_inner
+        WHERE c_inner.PostId = qm.QuestionId
+          AND c_inner.UserId = qm.OwnerUserId
+        ORDER BY c_inner.CreationDate DESC
+        LIMIT 1
+    ) AS LatestOwnerComment,
+    EXISTS (
+        SELECT 1 FROM Badges b_inner
+        WHERE b_inner.UserId = ue.UserId AND b_inner.Class = 1
+    ) AS HasGoldBadge
+FROM QuestionMetrics qm
+JOIN UserEngagement ue ON qm.OwnerUserId = ue.UserId
+LEFT JOIN AnswerAggregates aa ON qm.QuestionId = aa.QuestionId
+LEFT JOIN PostLinkAnalysis pla ON qm.QuestionId = pla.PostId
+LEFT JOIN RecentModeratorActions rma ON qm.QuestionId = rma.PostId AND rma.rn = 1
+LEFT JOIN TopActiveTags t ON qm.PrimaryTag = t.TagName
+WHERE qm.QuestionScore >= 5
+  AND (qm.AnswerCount > 0 OR qm.FavoriteCount IS NOT NULL)
+  AND ue.TotalPosts >= 5
+  AND NOT EXISTS (
+      SELECT 1 FROM PostHistory ph_exclude
+      WHERE ph_exclude.PostId = qm.QuestionId
+        AND ph_exclude.PostHistoryTypeId IN (12, 14)
+  )
+
+UNION ALL
+
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.ReputationTier,
+    ue.AvgPostScore,
+    SUBSTRING(p_ans.Body, 1, 200) AS QuestionTitle,
+    p_ans.CreationDate AS QuestionCreationDate,
+    p_ans.Score AS QuestionScore,
+    NULL AS ViewCount,
+    NULL AS PrimaryTag,
+    FALSE AS HasHotTag,
+    NULL AS TagScoreRank,
+    NULL AS TotalAnswers,
+    p_ans.Score AS TotalAnswerScore,
+    NULL AS AcceptedAnswerScore,
+    NULL AS LinkedPostsCount,
+    NULL AS DuplicatePostsCount,
+    FALSE AS HasClosedLinkedPost,
+    rma.ActionDate AS LastModActionDate,
+    rma.PostHistoryTypeId AS LastModActionType,
+    rma.PreviousActionTypeId AS PrevModActionType,
+    NULL AS TopTag,
+    NULL AS TopTagQuestionCount,
+    NULL AS TopTagTotalScore,
+    (p_ans.Score * 0.7) + (
+        CASE
+            WHEN EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p_ans.CreationDate)) / 3600 IS NOT NULL
+            THEN 50.0 / (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p_ans.CreationDate)) / 3600 + 1)
+            ELSE 0
+        END
+    ) AS WeightedQuestionScore,
+    COALESCE(UPPER(SUBSTRING(ue.DisplayName, 1, 3)) || LPAD(CAST(ue.UserId AS TEXT), 7, '0'), 'UNKNOWN_USER') AS UserIdentifierCode,
+    (
+        SELECT c_inner.Text
+        FROM Comments c_inner
+        WHERE c_inner.PostId = p_ans.Id
+          AND c_inner.UserId = p_ans.OwnerUserId
+        ORDER BY c_inner.CreationDate DESC
+        LIMIT 1
+    ) AS LatestOwnerComment,
+    EXISTS (
+        SELECT 1 FROM Badges b_inner
+        WHERE b_inner.UserId = ue.UserId AND b_inner.Class = 1
+    ) AS HasGoldBadge
+FROM Posts p_ans
+JOIN UserEngagement ue ON p_ans.OwnerUserId = ue.UserId
+LEFT JOIN RecentModeratorActions rma ON p_ans.Id = rma.PostId AND rma.rn = 1
+WHERE p_ans.PostTypeId = 2
+  AND p_ans.Score >= 10
+  AND p_ans.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 year')
+  AND ue.ReputationTier IN ('Elite User', 'Experienced Contributor')
+ORDER BY WeightedQuestionScore DESC, QuestionCreationDate DESC
+LIMIT 1000;

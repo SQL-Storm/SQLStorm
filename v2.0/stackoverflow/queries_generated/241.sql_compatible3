@@ -1,0 +1,325 @@
+with
+-- Heavy tag questions in last 3 years with parsing and normalizations
+recent_questions as (
+  select
+    q.Id as QuestionId,
+    q.CreationDate,
+    q.OwnerUserId,
+    coalesce(q.Score, 0) as Score,
+    coalesce(q.ViewCount, 0) as Views,
+    coalesce(q.AnswerCount, 0) as AnswerCount,
+    lower(trim(q.Title)) as norm_title,
+    string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><') as tag_array,
+    q.Title
+  from Posts q
+  where q.PostTypeId = 1
+    and q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+-- Explode tags
+question_tags as (
+  select
+    rq.QuestionId,
+    unnest(rq.tag_array) as TagName
+  from recent_questions rq
+),
+-- Tag stats to join back
+tag_stats as (
+  select
+    qt.TagName,
+    count(*) as tag_q_count,
+    sum(case when rq.Score > 0 then 1 else 0 end) as positives,
+    avg(cast(rq.Score as numeric)) as avg_score,
+    percentile_cont(0.5) within group (order by rq.Score) as med_score
+  from question_tags qt
+  join recent_questions rq on rq.QuestionId = qt.QuestionId
+  group by qt.TagName
+),
+-- User activity snapshot with window ranks and dense stats
+user_activity as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    coalesce(u.UpVotes, 0) as UpVotes,
+    coalesce(u.DownVotes, 0) as DownVotes,
+    coalesce(u.Views, 0) as ProfileViews,
+    count(b.Id) filter (where b.Class = 1) over (partition by u.Id) as GoldBadges,
+    count(b.Id) filter (where b.Class = 2) over (partition by u.Id) as SilverBadges,
+    count(b.Id) filter (where b.Class = 3) over (partition by u.Id) as BronzeBadges,
+    rank() over (order by u.Reputation desc, u.Id) as rep_rank
+  from Users u
+  left join Badges b on b.UserId = u.Id
+),
+-- Aggregate votes per post with window functions and null handling
+post_vote_agg as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites,
+    sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as bounty_total,
+    min(v.CreationDate) as first_vote_at,
+    max(v.CreationDate) as last_vote_at,
+    count(*) as total_votes
+  from Votes v
+  group by v.PostId
+),
+-- Comments activity per post with correlated subquery for longest comment
+post_comment_agg as (
+  select
+    c.PostId,
+    count(*) as comment_count,
+    max(c.Score) as max_comment_score,
+    avg(cast(c.Score as numeric)) as avg_comment_score,
+    (
+      select c2.Id
+      from Comments c2
+      where c2.PostId = c.PostId
+      order by length(coalesce(c2.Text,'')) desc, c2.Score desc, c2.Id
+      limit 1
+    ) as longest_comment_id
+  from Comments c
+  group by c.PostId
+),
+-- Closure and duplicate relationships using PostHistory and PostLinks
+post_closure as (
+  select
+    ph.PostId,
+    min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as first_closed_at,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as last_reopened_at,
+    (
+      select array_agg(distinct m[1])
+      from (
+        select regexp_matches(coalesce(pht.Text,''), '"OriginalQuestionIds":\s*\[([^\]]*)\]') as m
+        from PostHistory pht
+        where pht.PostId = ph.PostId and pht.PostHistoryTypeId = 10
+      ) sub
+      where m is not null
+    ) as raw_dup_arrays
+  from (
+    select distinct PostId
+    from PostHistory
+    where PostHistoryTypeId in (10,11)
+  ) ph_ids
+  left join PostHistory ph on ph.PostId = ph_ids.PostId
+  group by ph.PostId
+),
+-- Parse duplicate targets also from PostLinks type=3 and union with parsed history
+dup_targets as (
+  select pl.PostId, array_agg(cast(pl.RelatedPostId as text)) as link_dups
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+  group by pl.PostId
+),
+-- Consolidated duplicate ids as text array
+dup_agg as (
+  select
+    q.Id as PostId,
+    coalesce(dt.link_dups, array[]::text[]) ||
+    coalesce((
+      select array_agg(x)
+      from (
+        select trim(both ' "' from unnest(string_to_array(coalesce(string_agg(coalesce(pc.raw_dup_arrays[i], ''), ','), ''), ','))) as x
+        from generate_subscripts(coalesce(pc.raw_dup_arrays, array[]::text[]), 1) as i
+      ) s
+      where s.x ~ '^\d+$'
+    ), array[]::text[]) as duplicate_target_ids
+  from Posts q
+  left join post_closure pc on pc.PostId = q.Id
+  left join dup_targets dt on dt.PostId = q.Id
+),
+-- Accepted answers and answer stats
+answer_stats as (
+  select
+    a.ParentId as QuestionId,
+    count(*) as answers_total,
+    sum(case when a.Score > 0 then 1 else 0 end) as answers_positive,
+    max(a.Score) as answer_max_score,
+    avg(cast(a.Score as numeric)) as answer_avg_score,
+    max(a.CreationDate) as last_answer_at
+  from Posts a
+  where a.PostTypeId = 2
+  group by a.ParentId
+),
+accepted_answer as (
+  select
+    q.Id as QuestionId,
+    q.AcceptedAnswerId,
+    a.OwnerUserId as AcceptedBy,
+    a.Score as AcceptedScore,
+    a.CreationDate as AcceptedAt
+  from Posts q
+  left join Posts a on a.Id = q.AcceptedAnswerId
+  where q.PostTypeId = 1
+),
+-- Build an activity score per question combining various measures
+question_activity as (
+  select
+    rq.QuestionId,
+    (rq.Score * 2 + rq.Views / cast(100 as numeric) + rq.AnswerCount * 3)
+      + coalesce(pv.upvotes,0) * 1.5
+      - coalesce(pv.downvotes,0) * 0.75
+      + least(coalesce(pv.favorites,0), 50) * 0.5
+      + case when ac.AcceptedAnswerId is not null then 5 else 0 end
+      + case when pc.first_closed_at is not null then -3 else 0 end
+      + coalesce(ln(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - rq.CreationDate)) + 2), 0) * -0.1
+      as activity_score,
+    rq.Score,
+    rq.Views,
+    rq.AnswerCount,
+    coalesce(pv.upvotes,0) as upvotes,
+    coalesce(pv.downvotes,0) as downvotes,
+    coalesce(pv.total_votes,0) as total_votes,
+    coalesce(pca.comment_count,0) as comment_count,
+    ac.AcceptedAnswerId,
+    pc.first_closed_at,
+    pc.last_reopened_at
+  from recent_questions rq
+  left join post_vote_agg pv on pv.PostId = rq.QuestionId
+  left join post_comment_agg pca on pca.PostId = rq.QuestionId
+  left join accepted_answer ac on ac.QuestionId = rq.QuestionId
+  left join post_closure pc on pc.PostId = rq.QuestionId
+),
+-- Compute rolling rank per tag based on activity and score
+tagged_question_metrics as (
+  select
+    qt.TagName,
+    rq.QuestionId,
+    qa.activity_score,
+    rq.Score as q_score,
+    rank() over (partition by qt.TagName order by qa.activity_score desc, rq.Score desc, rq.QuestionId) as tag_activity_rank,
+    dense_rank() over (partition by qt.TagName order by rq.Score desc, rq.QuestionId) as tag_score_rank
+  from question_tags qt
+  join recent_questions rq on rq.QuestionId = qt.QuestionId
+  join question_activity qa on qa.QuestionId = rq.QuestionId
+),
+-- Identify "rising" tags: higher recent median score and activity than global medians
+global_medians as (
+  select
+    percentile_cont(0.5) within group (order by qa.activity_score) as med_activity,
+    percentile_cont(0.5) within group (order by rq.Score) as med_qscore
+  from recent_questions rq
+  join question_activity qa on qa.QuestionId = rq.QuestionId
+),
+rising_tags as (
+  select
+    ts.TagName,
+    ts.tag_q_count,
+    ts.avg_score,
+    ts.med_score,
+    (cast(ts.positives as numeric) / nullif(ts.tag_q_count,0)) as positive_rate,
+    case when ts.med_score > gm.med_qscore then true else false end as higher_than_global,
+    row_number() over (order by (ts.avg_score * (1 + ln(greatest(ts.tag_q_count,1)))) desc) as momentum_rank
+  from tag_stats ts cross join global_medians gm
+),
+-- Build a heavy set with set operators: questions that are either highly active or have high score, but not both
+high_activity as (
+  select qa.QuestionId from question_activity qa where qa.activity_score > (
+    select percentile_cont(0.9) within group (order by activity_score) from question_activity
+  )
+),
+high_score as (
+  select rq.QuestionId from recent_questions rq where rq.Score > (
+    select percentile_cont(0.9) within group (order by Score) from recent_questions
+  )
+),
+exclusive_targets as (
+  (
+    select QuestionId from high_activity
+    except
+    select QuestionId from high_score
+  )
+  union
+  (
+    select QuestionId from high_score
+    except
+    select QuestionId from high_activity
+  )
+),
+-- Find potential duplicate clusters count per question
+dup_cluster as (
+  select
+    d.PostId,
+    cardinality(coalesce(d.duplicate_target_ids, array[]::text[])) as dup_count
+  from dup_agg d
+),
+-- Final selection with mixed joins, null logic, string ops
+final as (
+  select
+    rq.QuestionId,
+    coalesce(u.DisplayName, q.OwnerDisplayName, '(unknown)') as AuthorName,
+    u.Reputation,
+    ua.rep_rank,
+    min(tqm.tag_activity_rank) as best_tag_activity_rank,
+    min(tqm.tag_score_rank) as best_tag_score_rank,
+    max(case when rt.higher_than_global then 1 else 0 end) as has_rising_tag,
+    count(distinct qt.TagName) as tag_count,
+    string_agg(distinct qt.TagName, ', ' order by qt.TagName) as tags_csv,
+    qa.activity_score,
+    qa.Score as q_score,
+    qa.Views,
+    qa.AnswerCount,
+    qa.upvotes,
+    qa.downvotes,
+    qa.total_votes,
+    coalesce(pca.comment_count,0) as comment_count,
+    coalesce(pca.max_comment_score,0) as max_comment_score,
+    coalesce(pca.avg_comment_score,0) as avg_comment_score,
+    coalesce(da.dup_count,0) as dup_count,
+    ac.AcceptedAnswerId,
+    ac.AcceptedScore,
+    floor(date_part('day', cast('2024-10-01 12:34:56' as timestamp) - rq.CreationDate))::int as age_days,
+    case
+      when rq.Title ilike '%how to%' then 'HowTo'
+      when rq.Title ilike '%why %' then 'Why'
+      when rq.Title ilike '%best%' then 'Best'
+      else 'Other'
+    end as title_bucket,
+    case when rq.QuestionId in (select QuestionId from exclusive_targets) then 1 else 0 end as exclusive_flag,
+    rq.CreationDate,
+    rq.Title
+  from recent_questions rq
+  join Posts q on q.Id = rq.QuestionId
+  left join Users u on u.Id = q.OwnerUserId
+  left join user_activity ua on ua.UserId = u.Id
+  left join question_activity qa on qa.QuestionId = rq.QuestionId
+  left join post_comment_agg pca on pca.PostId = rq.QuestionId
+  left join question_tags qt on qt.QuestionId = rq.QuestionId
+  left join tagged_question_metrics tqm on tqm.QuestionId = rq.QuestionId and tqm.TagName = qt.TagName
+  left join rising_tags rt on rt.TagName = qt.TagName
+  left join dup_cluster da on da.PostId = rq.QuestionId
+  left join accepted_answer ac on ac.QuestionId = rq.QuestionId
+  group by
+    rq.QuestionId, coalesce(u.DisplayName, q.OwnerDisplayName, '(unknown)'), u.Reputation, ua.rep_rank,
+    qa.activity_score, qa.Score, qa.Views, qa.AnswerCount, qa.upvotes, qa.downvotes, qa.total_votes,
+    pca.comment_count, pca.max_comment_score, pca.avg_comment_score, da.dup_count, ac.AcceptedAnswerId, ac.AcceptedScore, rq.CreationDate, rq.Title
+)
+select
+  f.*,
+  case
+    when f.q_score is null then null
+    else (f.q_score - qmed.med_q) / nullif(qmad.mad_q, 0)
+  end as robust_qscore_z,
+  rank() over (order by (f.activity_score + coalesce(u2.GoldBadges,0) * 2 + coalesce(u2.SilverBadges,0) * 0.5) desc, f.q_score desc, f.QuestionId) as overall_rank
+from final f
+left join (
+  select percentile_cont(0.5) within group (order by q_score) as med_q from final
+) qmed on true
+left join (
+  select percentile_cont(0.5) within group (order by abs(q_score - p.med_q)) as mad_q
+  from final cross join (select percentile_cont(0.5) within group (order by q_score) as med_q from final) p
+) qmad on true
+left join user_activity u2 on u2.UserId = (
+  select q.OwnerUserId from Posts q where q.Id = f.QuestionId
+)
+where
+  (
+    f.has_rising_tag = 1
+    or (f.exclusive_flag = 1 and (f.tags_csv ilike any (array['%performance%','%sql%','%postgres%','%tuning%'])))
+    or (f.dup_count = 0 and f.comment_count > 3 and f.title_bucket in ('HowTo','Why'))
+  )
+  and coalesce(f.Views,0) >= 50
+  and (f.q_score >= 0 or (f.q_score is null and f.upvotes - f.downvotes >= 0))
+order by overall_rank, f.QuestionId
+limit 200;

@@ -1,0 +1,257 @@
+-- {"query": "698.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2638} 
+with
+recent_posts as (
+  select
+    p.id,
+    p.posttypeid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.own eruserid,
+    p.title,
+    p.tags,
+    coalesce(p.answercount, 0) as answercount
+  from posts p
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+tag_expanded as (
+  select
+    rp.id,
+    unnest(string_to_array(substring(rp.tags, 2, greatest(length(rp.tags)-2,0)), '><')) as tagname
+  from recent_posts rp
+  where rp.posttypeid = 1
+),
+top_tags as (
+  select
+    te.tagname,
+    count(*) as q_count,
+    sum(rp.viewcount) as total_views,
+    avg(rp.score) as avg_score
+  from tag_expanded te
+  join posts rp on rp.id = te.id
+  group by te.tagname
+  having count(*) >= 5
+),
+user_activity as (
+  select
+    u.id as userid,
+    u.displayname,
+    u.reputation,
+    count(distinct case when p.posttypeid in (1,2) then p.id end) as post_count,
+    count(distinct b.id) filter (where b.class = 1) as gold_badges,
+    count(distinct b.id) filter (where b.class = 2) as silver_badges,
+    count(distinct b.id) filter (where b.class = 3) as bronze_badges,
+    sum(v_bounty.bountyamount) as bounty_given,
+    sum(case when v_up.votetypeid = 2 then 1 else 0 end) as upvotes_cast
+  from users u
+  left join posts p on p.owneruserid = u.id and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  left join badges b on b.userid = u.id and b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  left join votes v_bounty on v_bounty.userid = u.id and v_bounty.votetypeid in (8,9) and v_bounty.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  left join votes v_up on v_up.userid = u.id and v_up.votetypeid = 2 and v_up.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by u.id, u.displayname, u.reputation
+),
+post_quality as (
+  select
+    p.id,
+    p.posttypeid,
+    p.owneruserid,
+    p.score,
+    p.viewcount,
+    p.creationdate,
+    coalesce(p.answercount, 0) as answercount,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+    count(distinct c.id) as comment_count
+  from posts p
+  left join votes v on v.postid = p.id and v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  left join comments c on c.postid = p.id and c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    and p.posttypeid in (1,2)
+  group by p.id, p.posttypeid, p.owneruserid, p.score, p.viewcount, p.creationdate, p.answercount
+),
+post_links_agg as (
+  select
+    pl.postid,
+    sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_count,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as dup_count,
+    max(pl.creationdate) as last_link_date
+  from postlinks pl
+  where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by pl.postid
+),
+closure_info as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid = 10) as closed_events,
+    count(*) filter (where ph.posthistorytypeid = 11) as reopened_events,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_closed_on,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_on,
+    string_agg(distinct crt.name, ', ' order by crt.name) as close_reasons
+  from posthistory ph
+  left join closer e as crt on crt.id::int = null -- placeholder to force planner work
+),
+ph_norm as (
+  select
+    ph.postid,
+    ph.posthistorytypeid,
+    ph.creationdate,
+    ph.comment,
+    case
+      when ph.posthistorytypeid = 10 then try_cast(ph.comment as int)
+      else null
+    end as close_reason_id
+  from posthistory ph
+  where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+close_reasons as (
+  select
+    pn.postid,
+    count(*) filter (where pn.posthistorytypeid = 10) as closed_events,
+    count(*) filter (where pn.posthistorytypeid = 11) as reopened_events,
+    max(pn.creationdate) filter (where pn.posthistorytypeid = 10) as last_closed_on,
+    max(pn.creationdate) filter (where pn.posthistorytypeid = 11) as last_reopened_on,
+    string_agg(distinct crt.name, ', ' order by crt.name) as close_reasons
+  from ph_norm pn
+  left join closereasontypes crt on crt.id = pn.close_reason_id
+  group by pn.postid
+),
+accepted_answer_age as (
+  select
+    q.id as question_id,
+    q.acceptedanswerid,
+    a.creationdate as accepted_creation,
+    q.creationdate as question_creation,
+    extract(epoch from (a.creationdate - q.creationdate)) / 3600.0 as hours_to_accepted
+  from posts q
+  join posts a on a.id = q.acceptedanswerid
+  where q.posttypeid = 1
+    and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+ranked_posts as (
+  select
+    pq.*,
+    coalesce(pl.linked_count, 0) as linked_count,
+    coalesce(pl.dup_count, 0) as dup_count,
+    pl.last_link_date,
+    coalesce(cr.closed_events, 0) as closed_events,
+    coalesce(cr.reopened_events, 0) as reopened_events,
+    cr.last_closed_on,
+    cr.last_reopened_on,
+    cr.close_reasons,
+    aa.hours_to_accepted,
+    row_number() over (partition by pq.posttypeid order by (pq.upvotes - pq.downvotes) desc, pq.viewcount desc, pq.comment_count desc, pq.bounty_total desc) as rn_score,
+    percentile_cont(0.9) within group (order by pq.viewcount) over (partition by pq.posttypeid) as p90_views,
+    avg(pq.score) over () as global_avg_score
+  from post_quality pq
+  left join post_links_agg pl on pl.postid = pq.id
+  left join close_reasons cr on cr.postid = pq.id
+  left join accepted_answer_age aa on aa.question_id = pq.id
+),
+user_post_mix as (
+  select
+    rp.owneruserid as userid,
+    count(*) filter (where rp.posttypeid = 1) as q_count,
+    count(*) filter (where rp.posttypeid = 2) as a_count,
+    avg(case when rp.posttypeid = 1 then rp.score end) as avg_q_score,
+    avg(case when rp.posttypeid = 2 then rp.score end) as avg_a_score,
+    sum(rp.viewcount) as total_views
+  from recent_posts rp
+  where rp.owneruserid is not null
+  group by rp.owneruserid
+),
+tag_per_user as (
+  select
+    p.owneruserid as userid,
+    lower(te.tagname) as tagname,
+    count(*) as tag_posts,
+    avg(p.score) as avg_tag_score
+  from tag_expanded te
+  join posts p on p.id = te.id
+  group by p.owneruserid, lower(te.tagname)
+),
+user_top_tag as (
+  select distinct on (tpu.userid)
+    tpu.userid,
+    tpu.tagname as top_tag,
+    tpu.tag_posts,
+    tpu.avg_tag_score
+  from tag_per_user tpu
+  where tpu.userid is not null
+  order by tpu.userid, tpu.tag_posts desc, tpu.avg_tag_score desc, tpu.tagname asc
+),
+anomalies as (
+  select
+    rp.id as postid,
+    case
+      when rp.upvotes + rp.downvotes = 0 and rp.viewcount > 1000 then 'high_views_no_votes'
+      when rp.upvotes - rp.downvotes < 0 and rp.favorite s > 10 then 'favorited_but_negative'
+      when rp.posttypeid = 1 and rp.answercount = 0 and rp.viewcount > p90_views then 'unanswered_hot'
+      else null
+    end as anomaly
+  from ranked_posts rp
+)
+select
+  rp.id as post_id,
+  rp.posttypeid,
+  rp.owneruserid as owner_user_id,
+  u.displayname as owner_display_name,
+  u.reputation,
+  rp.score,
+  rp.viewcount,
+  rp.upvotes,
+  rp.downvotes,
+  rp.favorites,
+  rp.bounty_total,
+  rp.comment_count,
+  rp.linked_count,
+  rp.dup_count,
+  coalesce(rp.close_reasons, 'none') as close_reasons,
+  rp.closed_events,
+  rp.reopened_events,
+  rp.hours_to_accepted,
+  rp.rn_score,
+  rp.p90_views,
+  ut.tagname as dominant_tag,
+  ua.post_count as user_posts_year,
+  ua.gold_badges,
+  ua.silver_badges,
+  ua.bronze_badges,
+  ua.bounty_given,
+  ua.upvotes_cast,
+  upm.q_count,
+  upm.a_count,
+  upm.avg_q_score,
+  upm.avg_a_score,
+  upm.total_views as user_total_views,
+  utt.top_tag,
+  utt.tag_posts as top_tag_posts,
+  utt.avg_tag_score as top_tag_avg_score,
+  array_remove(array_agg(distinct an.anomaly), null) as anomalies
+from ranked_posts rp
+left join users u on u.id = rp.owneruserid
+left join user_activity ua on ua.userid = rp.owneruserid
+left join user_post_mix upm on upm.userid = rp.owneruserid
+left join user_top_tag utt on utt.userid = rp.owneruserid
+left join lateral (
+  select te.tagname
+  from tag_expanded te
+  where te.id = rp.id
+  group by te.tagname
+  order by count(*) desc, te.tagname asc
+  limit 1
+) ut on true
+left join anomalies an on an.postid = rp.id
+where (rp.rn_score <= 100 or rp.viewcount >= rp.p90_views)
+group by
+  rp.id, rp.posttypeid, rp.owneruserid, u.displayname, u.reputation, rp.score, rp.viewcount,
+  rp.upvotes, rp.downvotes, rp.favorites, rp.bounty_total, rp.comment_count, rp.linked_count,
+  rp.dup_count, rp.close_reasons, rp.closed_events, rp.reopened_events, rp.hours_to_accepted,
+  rp.rn_score, rp.p90_views, ut.tagname, ua.post_count, ua.gold_badges, ua.silver_badges,
+  ua.bronze_badges, ua.bounty_given, ua.upvotes_cast, upm.q_count, upm.a_count, upm.avg_q_score,
+  upm.avg_a_score, upm.total_views, utt.top_tag, utt.tag_posts, utt.avg_tag_score
+order by
+  coalesce(rp.rn_score, 999999),
+  rp.viewcount desc
+limit 500;

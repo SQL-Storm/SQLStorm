@@ -1,0 +1,215 @@
+WITH UserPostStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViews,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        EXISTS (
+            SELECT 1
+            FROM PostHistory PH
+            WHERE PH.PostId IN (SELECT PI.Id FROM Posts PI WHERE PI.OwnerUserId = U.Id)
+              AND PH.PostHistoryTypeId = 10
+              AND COALESCE(PH.Comment, '') IN ('101', '1', '2')
+        ) AS HasProblematicClosedPost
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+UserBadgeAwards AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeAwardDate
+    FROM Badges B
+    GROUP BY B.UserId
+),
+PostTagEngagement AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.FavoriteCount AS PostFavoriteCount,
+        P.CommentCount AS PostCommentCount,
+        P.Title,
+        P.Tags,
+        (P.Tags LIKE '%<sql>%' OR P.Tags LIKE '%<database>%' OR P.Tags LIKE '%<performance>%' OR P.Tags LIKE '%<optimization>%') AS IsRelevantTagPost,
+        (SELECT SUM(COALESCE(C.Score, 0)) FROM Comments C WHERE C.PostId = P.Id) AS TotalCommentScore
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2)
+      AND P.CreationDate >= DATE_TRUNC('year', CAST('2024-10-01' AS date) - INTERVAL '2 year')
+),
+RecentPostEdits AS (
+    SELECT
+        PH.PostId,
+        PH.UserId AS EditorUserId,
+        PH.CreationDate AS EditDate,
+        PH.PostHistoryTypeId,
+        EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate))) / 3600 AS HoursSincePreviousEdit
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6)
+      AND PH.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+),
+AggregatedPostEngagement AS (
+    SELECT
+        PTE.PostId,
+        PTE.OwnerUserId,
+        PTE.PostTypeId,
+        PTE.PostCreationDate,
+        PTE.PostScore,
+        PTE.PostViewCount,
+        PTE.PostFavoriteCount,
+        PTE.PostCommentCount,
+        PTE.Title,
+        PTE.Tags,
+        PTE.IsRelevantTagPost,
+        PTE.TotalCommentScore,
+        COUNT(RPE.PostId) AS NumberOfRecentEdits,
+        MAX(RPE.EditDate) AS LastEditByAnyUser,
+        AVG(RPE.HoursSincePreviousEdit) AS AvgHoursBetweenEdits
+    FROM PostTagEngagement PTE
+    LEFT JOIN RecentPostEdits RPE ON PTE.PostId = RPE.PostId
+    GROUP BY
+        PTE.PostId, PTE.OwnerUserId, PTE.PostTypeId, PTE.PostCreationDate, PTE.PostScore,
+        PTE.PostViewCount, PTE.PostFavoriteCount, PTE.PostCommentCount, PTE.Title, PTE.Tags,
+        PTE.IsRelevantTagPost, PTE.TotalCommentScore
+),
+UserEngagementSummary AS (
+    SELECT
+        UPS.UserId,
+        UPS.DisplayName,
+        UPS.Reputation,
+        UPS.UserCreationDate,
+        UPS.TotalPosts,
+        UPS.TotalQuestions,
+        UPS.TotalAnswers,
+        UPS.TotalPostScore,
+        UPS.TotalPostViews,
+        UBA.TotalBadges,
+        UBA.GoldBadges,
+        UBA.SilverBadges,
+        UBA.BronzeBadges,
+        UBA.LastBadgeAwardDate,
+        SUM(APE.PostScore) FILTER (WHERE APE.IsRelevantTagPost) AS RelevantTagPostScore,
+        SUM(APE.PostViewCount) FILTER (WHERE APE.IsRelevantTagPost) AS RelevantTagPostViews,
+        COUNT(DISTINCT APE.PostId) FILTER (WHERE APE.IsRelevantTagPost AND APE.PostTypeId = 1) AS RelevantTagQuestions,
+        COUNT(DISTINCT APE.PostId) FILTER (WHERE APE.IsRelevantTagPost AND APE.PostTypeId = 2) AS RelevantTagAnswers,
+        SUM(COALESCE(APE.PostCommentCount, 0) + COALESCE(APE.TotalCommentScore, 0)) AS TotalEngagementFromComments,
+        AVG(APE.NumberOfRecentEdits) AS AvgEditsPerPost,
+        (COALESCE(UPS.Reputation / 100.0, 0) * 0.45 +
+         COALESCE(UBA.GoldBadges * 12 + UBA.SilverBadges * 6 + UBA.BronzeBadges * 2, 0) * 0.25 +
+         COALESCE(SUM(APE.PostScore + APE.PostFavoriteCount) FILTER (WHERE APE.PostCreationDate >= DATE_TRUNC('year', CAST('2024-10-01' AS date))), 0) * 0.2 +
+         COALESCE(SUM(APE.PostViewCount) FILTER (WHERE APE.PostTypeId = 1 AND APE.PostCreationDate >= CAST('2024-10-01' AS date) - INTERVAL '6 months'), 0) / 750.0 * 0.1) AS UserInfluenceScore,
+        COALESCE(UPS.LastPostActivity, UBA.LastBadgeAwardDate, UPS.UserCreationDate) AS EffectiveLastActivityDate,
+        UPS.HasProblematicClosedPost
+    FROM UserPostStats UPS
+    LEFT JOIN UserBadgeAwards UBA ON UPS.UserId = UBA.UserId
+    LEFT JOIN AggregatedPostEngagement APE ON UPS.UserId = APE.OwnerUserId
+    GROUP BY
+        UPS.UserId, UPS.DisplayName, UPS.Reputation, UPS.UserCreationDate, UPS.TotalPosts,
+        UPS.TotalQuestions, UPS.TotalAnswers, UPS.TotalPostScore, UPS.TotalPostViews,
+        UBA.TotalBadges, UBA.GoldBadges, UBA.SilverBadges, UBA.BronzeBadges,
+        UBA.LastBadgeAwardDate, UPS.LastPostActivity, UPS.HasProblematicClosedPost
+),
+RankedInfluentialUsers AS (
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        TotalQuestions,
+        TotalAnswers,
+        RelevantTagPostScore,
+        RelevantTagPostViews,
+        TotalBadges,
+        UserInfluenceScore,
+        EffectiveLastActivityDate,
+        HasProblematicClosedPost,
+        GoldBadges,
+        SilverBadges,
+        RANK() OVER (ORDER BY UserInfluenceScore DESC, Reputation DESC, TotalQuestions DESC) AS InfluenceRank,
+        NTILE(10) OVER (PARTITION BY (CASE WHEN GoldBadges > 0 THEN 1 WHEN SilverBadges > 0 THEN 2 ELSE 3 END) ORDER BY RelevantTagPostScore DESC NULLS LAST) AS RelevantTagScoreDecile
+    FROM UserEngagementSummary
+    WHERE Reputation > 1000
+      AND TotalPosts > 20
+      AND TotalQuestions + TotalAnswers > 5
+      AND RelevantTagPostScore > 0
+),
+RecentActiveCommenters AS (
+    SELECT DISTINCT
+        C.UserId AS CommenterUserId,
+        MAX(C.CreationDate) AS LastCommentDate
+    FROM Comments C
+    INNER JOIN Posts P ON C.PostId = P.Id
+    WHERE C.UserId IS NOT NULL
+      AND C.UserId != P.OwnerUserId
+      AND C.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90 days'
+    GROUP BY C.UserId
+    HAVING COUNT(C.Id) > 5
+)
+SELECT
+    RIU.UserId,
+    RIU.DisplayName,
+    RIU.Reputation,
+    RIU.TotalPosts,
+    RIU.TotalQuestions,
+    RIU.TotalAnswers,
+    RIU.RelevantTagPostScore,
+    RIU.RelevantTagPostViews,
+    RIU.TotalBadges,
+    RIU.UserInfluenceScore,
+    RIU.InfluenceRank,
+    RIU.RelevantTagScoreDecile,
+    RIU.EffectiveLastActivityDate,
+    RIU.HasProblematicClosedPost,
+    TRUE AS IsHighlyInfluential,
+    NULL AS LastCommenterActivity
+FROM RankedInfluentialUsers RIU
+WHERE RIU.InfluenceRank <= 500
+  AND NOT RIU.HasProblematicClosedPost
+  AND RIU.RelevantTagScoreDecile <= 3
+  AND RIU.EffectiveLastActivityDate >= CAST('2024-10-01' AS date) - INTERVAL '6 months'
+  AND (COALESCE(RIU.GoldBadges, 0) > 0 OR COALESCE(RIU.SilverBadges, 0) > 0)
+
+UNION ALL
+
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    UES.TotalPosts,
+    UES.TotalQuestions,
+    UES.TotalAnswers,
+    UES.RelevantTagPostScore,
+    UES.RelevantTagPostViews,
+    UES.TotalBadges,
+    UES.UserInfluenceScore,
+    NULL AS InfluenceRank,
+    NULL AS RelevantTagScoreDecile,
+    UES.EffectiveLastActivityDate,
+    UES.HasProblematicClosedPost,
+    FALSE AS IsHighlyInfluential,
+    RAC.LastCommentDate AS LastCommenterActivity
+FROM Users U
+INNER JOIN RecentActiveCommenters RAC ON U.Id = RAC.CommenterUserId
+LEFT JOIN UserEngagementSummary UES ON U.Id = UES.UserId
+WHERE U.Reputation > 500
+  AND U.LastAccessDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+  AND U.Id NOT IN (SELECT UserId FROM RankedInfluentialUsers WHERE InfluenceRank <= 500)
+  AND COALESCE(UES.HasProblematicClosedPost, FALSE) IS FALSE
+ORDER BY
+    IsHighlyInfluential DESC,
+    UserInfluenceScore DESC NULLS LAST,
+    LastCommenterActivity DESC NULLS LAST,
+    Reputation DESC;

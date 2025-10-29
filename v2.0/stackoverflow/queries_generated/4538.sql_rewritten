@@ -1,0 +1,108 @@
+-- {"query": "4538.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 894} 
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  UserPostContributions AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS QuestionCount,
+      SUM(p.AnswerCount) AS TotalAnswers,
+      SUM(p.FavoriteCount) AS TotalFavorites
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  AvgScoreByTag AS (
+    SELECT
+      t.TagName,
+      AVG(CAST(p.Score AS DECIMAL(10, 2))) AS AverageScore
+    FROM Tags AS t
+    JOIN Posts AS p
+      ON CHARINDEX('<' + t.TagName + '>', p.Tags) > 0
+    WHERE
+      p.PostTypeId = 1 AND p.Score IS NOT NULL
+    GROUP BY
+      t.TagName
+  ),
+  HighReputationUsers AS (
+    SELECT
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+    FROM Users AS u
+    WHERE
+      u.Reputation > 50000
+  )
+SELECT
+  hru.DisplayName AS UserName,
+  hru.Reputation,
+  hru.CreationDate AS UserCreationDate,
+  COALESCE(upc.QuestionCount, 0) AS QuestionsAsked,
+  COALESCE(upc.TotalAnswers, 0) AS AnswersGiven,
+  COALESCE(upc.TotalFavorites, 0) AS TotalQuestionFavorites,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = hru.Id AND b.Class = 1
+  ) AS GoldBadges,
+  (
+    SELECT
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)
+    FROM Votes AS v
+    WHERE
+      v.UserId = hru.Id AND v.CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))
+  ) AS UpvotesLastYear,
+  CASE
+    WHEN rpe.UserId IS NOT NULL THEN 'Has Recent Edits'
+    ELSE 'No Recent Edits'
+  END AS EditStatus,
+  COALESCE(ast.AverageScore, 0.0) AS AvgQuestionScoreForTopTags
+FROM HighReputationUsers AS hru
+LEFT JOIN UserPostContributions AS upc
+  ON hru.Id = upc.OwnerUserId
+LEFT JOIN RankedPostEdits AS rpe
+  ON hru.Id = rpe.UserId AND rpe.rn = 1
+LEFT JOIN AvgScoreByTag AS ast
+  ON EXISTS (
+    SELECT
+      1
+    FROM Tags AS t2
+    WHERE
+      t2.TagName IN ('sql', 'performance', 'benchmark') AND t2.Id IN (
+        SELECT
+          t3.Id
+        FROM Posts AS p3
+        JOIN Tags AS t3
+          ON CHARINDEX('<' + t3.TagName + '>', p3.Tags) > 0
+        WHERE
+          p3.Id = (
+            SELECT
+              p4.Id
+            FROM Posts AS p4
+            WHERE
+              p4.OwnerUserId = hru.Id
+            ORDER BY
+              p4.CreationDate ASC
+            LIMIT 1
+          )
+      ) AND ast.TagName = t2.TagName
+  )
+WHERE
+  hru.DisplayName LIKE '%[a-z]%'
+ORDER BY
+  hru.Reputation DESC,
+  hru.CreationDate ASC
+LIMIT 100;

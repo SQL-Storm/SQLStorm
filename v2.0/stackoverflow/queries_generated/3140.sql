@@ -1,0 +1,117 @@
+-- {"query": "3140.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1922} 
+
+/*  Benchmark query: top contributors per tag with rich calculations */
+WITH
+    /* All non‑moderator tags */
+    TagList AS (
+        SELECT t.Id   AS TagId,
+               t.TagName
+        FROM   Tags t
+        WHERE  t.IsModeratorOnly = 0
+    ),
+
+    /* All questions (PostTypeId = 1) */
+    QuestionPosts AS (
+        SELECT p.Id,
+               p.Tags,
+               p.OwnerUserId,
+               p.Score,
+               p.CreationDate
+        FROM   Posts p
+        WHERE  p.PostTypeId = 1
+    ),
+
+    /* All answers with a reference to their parent question and its tag list */
+    AnswerPosts AS (
+        SELECT a.Id,
+               a.ParentId,
+               a.OwnerUserId,
+               a.Score,
+               a.CreationDate,
+               q.Tags
+        FROM   Posts a
+        JOIN   QuestionPosts q ON a.ParentId = q.Id
+        WHERE  a.PostTypeId = 2            -- answers
+    ),
+
+    /* Aggregate vote counts per answer (only up‑votes) */
+    AnswerVoteCounts AS (
+        SELECT v.PostId,
+               COUNT(*) AS UpVoteCnt
+        FROM   Votes v
+        WHERE  v.VoteTypeId = 2            -- UpMod
+        GROUP BY v.PostId
+    ),
+
+    /* Highest badge class per user (1=Gold, 2=Silver, 3=Bronze) */
+    UserBadgeClass AS (
+        SELECT b.UserId,
+               MAX(b.Class) AS HighestClass
+        FROM   Badges b
+        GROUP BY b.UserId
+    ),
+
+    /* Per‑tag user statistics */
+    UserStatsPerTag AS (
+        SELECT
+            t.TagName,
+            u.Id                         AS UserId,
+            COALESCE(u.DisplayName, 'Deleted') AS DisplayName,
+            u.Reputation,
+            COUNT(*)                     AS AnswerCnt,
+            COUNT(*) FILTER (WHERE a.Score > 0)  AS PositiveAnswers,
+            COUNT(*) FILTER (WHERE a.Score <= 0) AS NonPositiveAnswers,
+            ROUND(AVG(a.Score)::numeric, 2)      AS AvgScore,
+            SUM(COALESCE(v.UpVoteCnt,0))          AS TotalUpVotes,
+            COALESCE(b.HighestClass, 3)           AS HighestBadgeClass   -- default Bronze
+        FROM   TagList t
+        JOIN   AnswerPosts a
+               ON a.Tags LIKE concat('%<', t.TagName, '>%')      -- tag appears in <tag> list
+        JOIN   Users u ON u.Id = a.OwnerUserId
+        LEFT JOIN AnswerVoteCounts v ON v.PostId = a.Id
+        LEFT JOIN UserBadgeClass b   ON b.UserId = u.Id
+        GROUP BY t.TagName, u.Id, u.DisplayName, u.Reputation, b.HighestClass
+    ),
+
+    /* Rank users inside each tag */
+    RankedUserStats AS (
+        SELECT *,
+               ROW_NUMBER() OVER (PARTITION BY TagName
+                                  ORDER BY Reputation DESC, AvgScore DESC) AS rn
+        FROM   UserStatsPerTag
+    )
+
+/* Final result: top‑5 users per tag plus an overall summary row */
+SELECT
+    TagName,
+    UserId,
+    DisplayName,
+    Reputation,
+    AnswerCnt,
+    PositiveAnswers,
+    NonPositiveAnswers,
+    AvgScore,
+    TotalUpVotes,
+    HighestBadgeClass
+FROM   RankedUserStats
+WHERE  rn <= 5
+
+UNION ALL
+
+SELECT
+    'Overall'                                    AS TagName,
+    u.Id,
+    COALESCE(u.DisplayName, 'Deleted')           AS DisplayName,
+    u.Reputation,
+    COUNT(a.Id)                                  AS AnswerCnt,
+    COUNT(a.Id) FILTER (WHERE a.Score > 0)       AS PositiveAnswers,
+    COUNT(a.Id) FILTER (WHERE a.Score <= 0)      AS NonPositiveAnswers,
+    ROUND(AVG(a.Score)::numeric, 2)              AS AvgScore,
+    SUM(COALESCE(v.UpVoteCnt,0))                 AS TotalUpVotes,
+    COALESCE(b.HighestClass, 3)                  AS HighestBadgeClass
+FROM   Users u
+LEFT JOIN AnswerPosts a      ON a.OwnerUserId = u.Id
+LEFT JOIN AnswerVoteCounts v ON v.PostId = a.Id
+LEFT JOIN UserBadgeClass b    ON b.UserId = u.Id
+GROUP BY u.Id, u.DisplayName, u.Reputation, b.HighestClass
+ORDER BY TagName, Reputation DESC, AvgScore DESC;

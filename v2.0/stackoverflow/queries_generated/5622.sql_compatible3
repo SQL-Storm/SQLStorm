@@ -1,0 +1,80 @@
+WITH recent_questions AS (
+  SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+),
+tag_popularity AS (
+  SELECT
+    t.tag,
+    COUNT(*) AS tag_count
+  FROM Posts p
+  JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+  ) t ON TRUE
+  JOIN recent_questions rq ON rq.PostId = p.Id
+  WHERE p.PostTypeId = 1
+  GROUP BY t.tag
+),
+top_tags AS (
+  SELECT tag
+  FROM tag_popularity
+  ORDER BY tag_count DESC
+  LIMIT 5
+),
+tag_join AS (
+  SELECT rq.PostId, rq.Title, rq.OwnerUserId, rq.LastActivityDate,
+         COALESCE(t.TagName, 'untagged') AS primary_tag
+  FROM recent_questions rq
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(rq.Tags, 2, length(rq.Tags)-2), '><')) AS tag
+  ) tag_vals ON TRUE
+  LEFT JOIN Tags t ON t.TagName = tag_vals.tag
+  WHERE rq.PostId IN (SELECT PostId FROM recent_questions)
+)
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.OwnerDisplayName,
+  rp.Reputation,
+  rp.CreationDate,
+  rp.ViewCount,
+  rp.Score,
+  rp.AnswerCount,
+  rp.CommentCount,
+  rp.FavoriteCount,
+  rp.LastActivityDate,
+  tj.primary_tag,
+  RANK() OVER (PARTITION BY tj.primary_tag ORDER BY rp.ViewCount DESC, rp.CreationDate DESC) AS view_rank_within_tag,
+  (SELECT MAX(ph.CreationDate)
+     FROM PostHistory ph
+     WHERE ph.PostId = rp.PostId
+       AND ph.PostHistoryTypeId IN (16, 36, 50)
+  ) AS last_community_update
+FROM (
+  SELECT rp2.PostId, rp2.Title, rp2.OwnerUserId, u.DisplayName AS OwnerDisplayName, u.Reputation,
+         rp2.CreationDate, rp2.ViewCount, rp2.Score, rp2.AnswerCount, rp2.CommentCount,
+         rp2.FavoriteCount, rp2.LastActivityDate
+  FROM Posts rp2
+  JOIN Users u ON rp2.OwnerUserId = u.Id
+  WHERE rp2.PostTypeId = 1
+) rp
+LEFT JOIN tag_join tj ON tj.PostId = rp.PostId
+ORDER BY view_rank_within_tag ASC, rp.LastActivityDate DESC
+LIMIT 100;

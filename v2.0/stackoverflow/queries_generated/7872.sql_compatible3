@@ -1,0 +1,239 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        ROW_NUMBER() OVER (PARTITION BY CASE WHEN u.Reputation >= 10000 THEN 'High' ELSE 'Low' END ORDER BY u.CreationDate) AS CreatedOrder
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= CAST('2010-01-01' AS DATE)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostRankings AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        PERCENT_RANK() OVER (ORDER BY p.ViewCount) AS ViewPercentile,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScorePerType,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.ViewCount, 1) OVER (ORDER BY p.CreationDate) AS NextViews,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'High'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Low'
+            ELSE 'Medium'
+        END AS ScoreCategory,
+        COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id), 0) AS CommentCount,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2), 0) AS Upvotes,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3), 0) AS Downvotes
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2019-01-01' AS DATE)
+      AND p.PostTypeId IN (1, 2)
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.LastPostDate,
+        uas.RepRank,
+        uas.CreatedOrder,
+        CASE 
+            WHEN uas.Questions > 100 AND uas.Answers > 500 THEN 'Power User'
+            WHEN uas.Questions > 50 AND uas.Answers > 100 THEN 'Active Contributor'
+            WHEN uas.Badges >= 50 THEN 'Badge Hunter'
+            ELSE 'Regular User'
+        END AS UserCategory,
+        CASE 
+            WHEN uas.Reputation >= 100000 THEN 'Elite'
+            WHEN uas.Reputation >= 50000 THEN 'Veteran'
+            WHEN uas.Reputation >= 10000 THEN 'Experienced'
+            ELSE 'Beginner'
+        END AS RepTier,
+        ROW_NUMBER() OVER (PARTITION BY 
+            CASE 
+                WHEN uas.Reputation >= 100000 THEN 'Elite'
+                WHEN uas.Reputation >= 50000 THEN 'Veteran'
+                WHEN uas.Reputation >= 10000 THEN 'Experienced'
+                ELSE 'Beginner'
+            END
+            ORDER BY uas.Reputation DESC
+        ) AS TierRank,
+        NTH_VALUE(uas.DisplayName, 1) OVER (
+            PARTITION BY 
+                CASE 
+                    WHEN uas.Reputation >= 100000 THEN 'Elite'
+                    WHEN uas.Reputation >= 50000 THEN 'Veteran'
+                    WHEN uas.Reputation >= 10000 THEN 'Experienced'
+                    ELSE 'Beginner'
+                END
+            ORDER BY uas.Reputation DESC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) AS TopRepUserInTier
+    FROM UserActivityStats uas
+),
+DetailedPostAnalysis AS (
+    SELECT 
+        pra.PostId,
+        pra.Title,
+        pra.Score,
+        pra.ViewCount,
+        pra.CreationDate,
+        pra.OwnerUserId,
+        pra.PostTypeId,
+        pra.ScoreRank,
+        pra.ViewPercentile,
+        pra.AvgScorePerType,
+        pra.PrevScore,
+        pra.NextViews,
+        pra.ScoreCategory,
+        pra.CommentCount,
+        pra.Upvotes,
+        pra.Downvotes,
+        CASE 
+            WHEN pra.Score > pra.AvgScorePerType THEN 'Above Average'
+            WHEN pra.Score < pra.AvgScorePerType THEN 'Below Average'
+            ELSE 'Average'
+        END AS PerformanceCategory,
+        CASE 
+            WHEN pra.ViewCount > 1000 THEN 'High Views'
+            WHEN pra.ViewCount > 100 THEN 'Medium Views'
+            WHEN pra.ViewCount > 10 THEN 'Low Views'
+            ELSE 'Very Low Views'
+        END AS ViewCategory,
+        CASE 
+            WHEN pra.Upvotes - pra.Downvotes > 50 THEN 'Popular'
+            WHEN pra.Upvotes - pra.Downvotes > 10 THEN 'Moderately Popular'
+            WHEN pra.Upvotes - pra.Downvotes < -10 THEN 'Controversial'
+            ELSE 'Neutral'
+        END AS PopularityRating,
+        ROW_NUMBER() OVER (ORDER BY pra.ViewCount DESC) AS ViewRank
+    FROM PostRankings pra
+),
+CombinedAnalysis AS (
+    SELECT 
+        dua.UserId,
+        dua.DisplayName,
+        dua.Reputation,
+        dua.TotalPosts,
+        dua.Questions,
+        dua.Answers,
+        dua.Comments,
+        dua.Badges,
+        dua.LastPostDate,
+        dua.RepRank,
+        dua.CreatedOrder,
+        dua.UserCategory,
+        dua.RepTier,
+        dua.TierRank,
+        dua.TopRepUserInTier,
+        dpa.PostId,
+        dpa.Title,
+        dpa.Score,
+        dpa.ViewCount,
+        dpa.CreationDate AS PostCreationDate,
+        dpa.PostTypeId,
+        dpa.ScoreRank,
+        dpa.ViewPercentile,
+        dpa.AvgScorePerType,
+        dpa.PrevScore,
+        dpa.NextViews,
+        dpa.ScoreCategory,
+        dpa.CommentCount,
+        dpa.Upvotes,
+        dpa.Downvotes,
+        dpa.PerformanceCategory,
+        dpa.ViewCategory,
+        dpa.PopularityRating,
+        dpa.ViewRank,
+        CAST(
+            EXTRACT(EPOCH FROM (CAST(dpa.CreationDate AS TIMESTAMP) - CAST(dua.LastPostDate AS TIMESTAMP))) / 86400
+            AS INTEGER
+        ) AS DaysSinceLastPost,
+        CASE 
+            WHEN dua.Reputation >= 10000 AND dpa.Score >= 100 THEN 'High Impact Post'
+            WHEN dua.Reputation >= 1000 AND dpa.Score >= 50 THEN 'Moderate Impact Post'
+            ELSE 'Standard Post'
+        END AS ImpactLevel
+    FROM ComplexUserAnalysis dua
+    FULL OUTER JOIN DetailedPostAnalysis dpa ON dua.UserId = dpa.OwnerUserId
+    WHERE dua.UserId IS NOT NULL OR dpa.PostId IS NOT NULL
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.TotalPosts,
+    ca.Questions,
+    ca.Answers,
+    ca.Comments,
+    ca.Badges,
+    ca.LastPostDate,
+    ca.RepRank,
+    ca.CreatedOrder,
+    ca.UserCategory,
+    ca.RepTier,
+    ca.TierRank,
+    ca.TopRepUserInTier,
+    ca.PostId,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.PostCreationDate,
+    ca.PostTypeId,
+    ca.ScoreRank,
+    ca.ViewPercentile,
+    ca.AvgScorePerType,
+    ca.PrevScore,
+    ca.NextViews,
+    ca.ScoreCategory,
+    ca.CommentCount,
+    ca.Upvotes,
+    ca.Downvotes,
+    ca.PerformanceCategory,
+    ca.ViewCategory,
+    ca.PopularityRating,
+    ca.ViewRank,
+    ca.DaysSinceLastPost,
+    ca.ImpactLevel,
+    CASE 
+        WHEN ca.UserCategory = 'Power User' AND ca.ViewCategory = 'High Views' THEN 'Elite Content Creator'
+        WHEN ca.UserCategory = 'Active Contributor' AND ca.PerformanceCategory = 'Above Average' THEN 'Quality Contributor'
+        WHEN ca.UserCategory = 'Badge Hunter' AND ca.ScoreCategory = 'High' THEN 'Achievement Focused'
+        ELSE 'General Contributor'
+    END AS UserRole,
+    CASE 
+        WHEN ca.ViewCount > (SELECT AVG(ViewCount) FROM Posts) * 2 THEN 'Viral'
+        WHEN ca.ViewCount > (SELECT AVG(ViewCount) FROM Posts) * 1.5 THEN 'Popular'
+        WHEN ca.ViewCount > (SELECT AVG(ViewCount) FROM Posts) THEN 'Standard'
+        ELSE 'Underperforming'
+    END AS ViewPerformance,
+    LEAD(ca.Reputation, 1) OVER (ORDER BY ca.Reputation DESC) AS NextHigherReputation,
+    LAG(ca.Reputation, 1) OVER (ORDER BY ca.Reputation ASC) AS NextLowerReputation
+FROM CombinedAnalysis ca
+WHERE (ca.RepRank <= 20 OR ca.ViewRank <= 50)
+  AND (ca.PostId IS NOT NULL OR ca.UserId IS NOT NULL)
+  AND (ca.Title IS NOT NULL OR ca.DisplayName IS NOT NULL)
+ORDER BY 
+    CASE WHEN ca.RepRank <= 20 THEN ca.RepRank ELSE 1000 END,
+    CASE WHEN ca.ViewRank <= 50 THEN ca.ViewRank ELSE 1000 END,
+    ca.PostCreationDate DESC;

@@ -1,0 +1,269 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'unknown') as website_host,
+           date_trunc('month', u.creationdate) as cohort_month
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+post_basics as (
+    select p.id,
+           p.posttypeid,
+           p.owneruserid,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.title,
+           p.tags,
+           p.parentid,
+           p.acceptedanswerid,
+           case when p.posttypeid = 1 then 1 else 0 end as is_question,
+           case when p.posttypeid = 2 then 1 else 0 end as is_answer
+    from posts p
+),
+recent_posts as (
+    select pb.*
+    from post_basics pb
+    where pb.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+user_post_activity as (
+    select ru.user_id,
+           count(case when rp.is_question = 1 then 1 end) as questions_posted,
+           count(case when rp.is_answer = 1 then 1 end) as answers_posted,
+           sum(coalesce(rp.score,0)) as total_post_score,
+           avg(nullif(rp.score,0)) as avg_nonzero_post_score,
+           max(case when rp.is_question = 1 then rp.viewcount end) as max_question_views,
+           count(distinct date_trunc('day', rp.creationdate)) as active_posting_days
+    from recent_users ru
+    left join recent_posts rp
+      on rp.owneruserid = ru.user_id
+    group by ru.user_id
+),
+comment_activity as (
+    select ru.user_id,
+           count(c.id) as comments_count,
+           sum(c.score) as comment_score,
+           avg(c.score) filter (where c.score is not null) as avg_comment_score,
+           max(c.creationdate) as last_comment_at
+    from recent_users ru
+    left join comments c
+      on c.userid = ru.user_id
+     and c.creationdate >= (select max(creationdate) - interval '365 days' from comments)
+    group by ru.user_id
+),
+vote_activity as (
+    select ru.user_id,
+           count(case when v.votetypeid = 2 then 1 end) as upvotes_cast,
+           count(case when v.votetypeid = 3 then 1 end) as downvotes_cast,
+           count(case when v.votetypeid = 5 then 1 end) as favorites_cast,
+           count(case when v.votetypeid in (8,9) then 1 end) as bounties_tx,
+           sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_amount_total,
+           min(v.creationdate) as first_vote_at,
+           max(v.creationdate) as last_vote_at
+    from recent_users ru
+    left join votes v
+      on v.userid = ru.user_id
+     and v.creationdate >= (select max(creationdate) - interval '365 days' from votes)
+    group by ru.user_id
+),
+badge_activity as (
+    select ru.user_id,
+           count(*) as badges_earned,
+           count(case when b.class = 1 then 1 end) as gold_badges,
+           count(case when b.class = 2 then 1 end) as silver_badges,
+           count(case when b.class = 3 then 1 end) as bronze_badges,
+           count(case when b.tagbased = true then 1 end) as tag_badges,
+           max(b.date) as last_badge_at
+    from recent_users ru
+    left join badges b
+      on b.userid = ru.user_id
+     and b.date >= (select max(date) - interval '365 days' from badges)
+    group by ru.user_id
+),
+question_metrics as (
+    select q.owneruserid as user_id,
+           count(*) as questions_total,
+           sum(case when q.acceptedanswerid is not null then 1 else 0 end) as questions_with_accepted,
+           avg(q.viewcount) as avg_question_views,
+           percentile_cont(0.9) within group (order by coalesce(q.viewcount,0)) as p90_question_views,
+           avg(q.score) as avg_question_score
+    from recent_posts q
+    where q.is_question = 1
+    group by q.owneruserid
+),
+answer_metrics as (
+    select a.owneruserid as user_id,
+           count(*) as answers_total,
+           sum(case when pa.acceptedanswerid = a.id then 1 else 0 end) as answers_accepted,
+           avg(a.score) as avg_answer_score,
+           percentile_cont(0.9) within group (order by coalesce(a.score,0)) as p90_answer_score
+    from recent_posts a
+    left join posts pa on pa.id = a.parentid and a.is_answer = 1
+    where a.is_answer = 1
+    group by a.owneruserid
+),
+linkage as (
+    select ru.user_id,
+           count(case when pl.linktypeid = 1 then 1 end) as links_count,
+           count(case when pl.linktypeid = 3 and pl.postid = p.id and p.posttypeid = 1 then 1 end) as duplicates_flagged,
+           count(case when pl.linktypeid = 3 and pl.relatedpostid = p.id and p.posttypeid = 1 then 1 end) as duplicates_as_target
+    from recent_users ru
+    left join posts p on p.owneruserid = ru.user_id
+    left join postlinks pl on pl.postid = p.id or pl.relatedpostid = p.id
+    group by ru.user_id
+),
+edits as (
+    select ru.user_id,
+           count(case when ph.posthistorytypeid in (4,5,6,7,8,9,24) then 1 end) as edits_made,
+           count(case when ph.posthistorytypeid = 10 then 1 end) as closes,
+           count(case when ph.posthistorytypeid = 11 then 1 end) as reopens,
+           count(case when ph.posthistorytypeid in (12,13) then 1 end) as delete_undelete,
+           max(ph.creationdate) as last_edit_at,
+           json_agg(distinct ph.posthistorytypeid) filter (where ph.posthistorytypeid is not null) as edit_types_sample
+    from recent_users ru
+    left join posthistory ph
+      on ph.userid = ru.user_id
+     and ph.creationdate >= (select max(creationdate) - interval '365 days' from posthistory)
+    group by ru.user_id
+),
+tag_extraction as (
+    select rp.owneruserid as user_id,
+           unnest(string_to_array(coalesce(nullif(substring(rp.tags from 2 for length(rp.tags)-2), ''), ''), '><')) as tagname
+    from recent_posts rp
+    where rp.is_question = 1
+),
+top_tags as (
+    select te.user_id,
+           tt.tagname,
+           count(*) as tag_uses,
+           dense_rank() over (partition by te.user_id order by count(*) desc, tt.tagname) as tag_rank
+    from tag_extraction te
+    join tags tt on lower(tt.tagname) = lower(te.tagname)
+    group by te.user_id, tt.tagname
+),
+top3_tags as (
+    select user_id,
+           string_agg(tagname || ':' || cast(tag_uses as varchar), ', ' order by tag_rank) as top_tags_summary
+    from top_tags
+    where tag_rank <= 3
+    group by user_id
+),
+activity_calendar as (
+    select rp.owneruserid as user_id,
+           cast(date_trunc('week', rp.creationdate) as date) as activity_week,
+           count(*) as posts_in_week
+    from recent_posts rp
+    group by rp.owneruserid, cast(date_trunc('week', rp.creationdate) as date)
+),
+activity_streaks as (
+    select user_id,
+           max(posts_in_week) as max_posts_in_a_week,
+           count(case when posts_in_week >= 5 then 1 end) as weeks_with_5plus_posts
+    from activity_calendar
+    group by user_id
+),
+user_rank as (
+    select ru.user_id,
+           row_number() over (order by (coalesce(um.total_post_score,0)
+                                        + coalesce(qm.questions_total,0)*2
+                                        + coalesce(am.answers_total,0)*3
+                                        + coalesce(va.upvotes_cast,0)
+                                        - coalesce(va.downvotes_cast,0)) desc,
+                               ru.reputation desc,
+                               ru.creationdate asc) as rank_overall
+    from recent_users ru
+    left join user_post_activity um on um.user_id = ru.user_id
+    left join question_metrics qm on qm.user_id = ru.user_id
+    left join answer_metrics am on am.user_id = ru.user_id
+    left join vote_activity va on va.user_id = ru.user_id
+),
+null_sentinel as (
+    select cast(-1 as integer) as user_id, cast('' as varchar) as filler
+)
+select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.location,
+    ru.website_host,
+    ru.cohort_month,
+    coalesce(upa.questions_posted,0) as questions_posted_last_year,
+    coalesce(upa.answers_posted,0) as answers_posted_last_year,
+    coalesce(upa.total_post_score,0) as total_post_score_last_year,
+    coalesce(upa.avg_nonzero_post_score,0) as avg_nonzero_post_score_last_year,
+    coalesce(upa.max_question_views,0) as max_question_views_last_year,
+    coalesce(upa.active_posting_days,0) as active_posting_days_last_year,
+    coalesce(cm.comments_count,0) as comments_count_last_year,
+    coalesce(cm.comment_score,0) as comment_score_last_year,
+    cm.avg_comment_score as avg_comment_score_last_year,
+    cm.last_comment_at,
+    coalesce(va.upvotes_cast,0) as upvotes_cast_last_year,
+    coalesce(va.downvotes_cast,0) as downvotes_cast_last_year,
+    coalesce(va.favorites_cast,0) as favorites_cast_last_year,
+    coalesce(va.bounties_tx,0) as bounties_transactions_last_year,
+    coalesce(va.bounty_amount_total,0) as bounty_amount_total_last_year,
+    va.first_vote_at,
+    va.last_vote_at,
+    coalesce(ba.badges_earned,0) as badges_earned_last_year,
+    coalesce(ba.gold_badges,0) as gold_badges_last_year,
+    coalesce(ba.silver_badges,0) as silver_badges_last_year,
+    coalesce(ba.bronze_badges,0) as bronze_badges_last_year,
+    coalesce(ba.tag_badges,0) as tag_badges_last_year,
+    ba.last_badge_at,
+    coalesce(qm.questions_total,0) as questions_total_last_year,
+    coalesce(qm.questions_with_accepted,0) as questions_with_accepted_last_year,
+    coalesce(qm.avg_question_views,0) as avg_question_views_last_year,
+    coalesce(qm.p90_question_views,0) as p90_question_views_last_year,
+    coalesce(qm.avg_question_score,0) as avg_question_score_last_year,
+    coalesce(am.answers_total,0) as answers_total_last_year,
+    coalesce(am.answers_accepted,0) as answers_accepted_last_year,
+    coalesce(am.avg_answer_score,0) as avg_answer_score_last_year,
+    coalesce(am.p90_answer_score,0) as p90_answer_score_last_year,
+    coalesce(lk.links_count,0) as links_count_last_year,
+    coalesce(lk.duplicates_flagged,0) as duplicates_flagged_last_year,
+    coalesce(lk.duplicates_as_target,0) as duplicates_as_target_last_year,
+    coalesce(ed.edits_made,0) as edits_made_last_year,
+    coalesce(ed.closes,0) as closes_last_year,
+    coalesce(ed.reopens,0) as reopens_last_year,
+    coalesce(ed.delete_undelete,0) as delete_undelete_events_last_year,
+    ed.last_edit_at,
+    ed.edit_types_sample,
+    t3.top_tags_summary,
+    asr.max_posts_in_a_week,
+    asr.weeks_with_5plus_posts,
+    ur.rank_overall,
+    case
+      when (coalesce(va.upvotes_cast,0) + coalesce(va.downvotes_cast,0)) = 0 then null
+      else round(100.0 * coalesce(va.upvotes_cast,0) / nullif((coalesce(va.upvotes_cast,0) + coalesce(va.downvotes_cast,0)),0), 2)
+    end as upvote_ratio_percent,
+    case
+      when coalesce(qm.questions_total,0) = 0 then null
+      else round(100.0 * cast(coalesce(qm.questions_with_accepted,0) as numeric) / nullif(coalesce(qm.questions_total,0),0), 2)
+    end as question_accept_rate_percent,
+    case
+      when coalesce(am.answers_total,0) = 0 then null
+      else round(100.0 * cast(coalesce(am.answers_accepted,0) as numeric) / nullif(coalesce(am.answers_total,0),0), 2)
+    end as answer_accept_rate_percent
+from recent_users ru
+left join user_post_activity upa on upa.user_id = ru.user_id
+left join comment_activity cm on cm.user_id = ru.user_id
+left join vote_activity va on va.user_id = ru.user_id
+left join badge_activity ba on ba.user_id = ru.user_id
+left join question_metrics qm on qm.user_id = ru.user_id
+left join answer_metrics am on am.user_id = ru.user_id
+left join linkage lk on lk.user_id = ru.user_id
+left join edits ed on ed.user_id = ru.user_id
+left join top3_tags t3 on t3.user_id = ru.user_id
+left join activity_streaks asr on asr.user_id = ru.user_id
+left join user_rank ur on ur.user_id = ru.user_id
+left join null_sentinel ns on ns.user_id = -1
+where (coalesce(upa.questions_posted,0)
+    + coalesce(upa.answers_posted,0)
+    + coalesce(cm.comments_count,0)
+    + coalesce(va.upvotes_cast,0)
+    + coalesce(ba.badges_earned,0)) > 0
+order by ur.rank_overall
+limit 200;

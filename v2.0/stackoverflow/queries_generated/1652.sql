@@ -1,0 +1,269 @@
+-- {"query": "1652.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3723} 
+
+WITH PerformanceRelatedPosts AS (
+    -- Identify posts (questions or answers) related to 'performance' or 'optimization'
+    -- using various string matching techniques across title, body, and tags.
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.FavoriteCount,
+        -- Complex string matching with multiple conditions and case sensitivity for analysis
+        CASE
+            WHEN LOWER(p.Title) LIKE '%performance%' OR p.Tags LIKE '%<performance>%' THEN 'Performance'
+            WHEN LOWER(p.Body) LIKE '%performance%' THEN 'Performance_Body'
+            WHEN LOWER(p.Title) LIKE '%optimization%' OR p.Tags LIKE '%<optimization>%' THEN 'Optimization'
+            WHEN LOWER(p.Body) LIKE '%optimization%' THEN 'Optimization_Body'
+            ELSE 'General'
+        END AS MatchCategory,
+        -- Calculate post age at time of query
+        EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - p.CreationDate)) / (60 * 60 * 24) AS PostAgeDays
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+        AND (
+            LOWER(p.Title) LIKE '%performance%' OR
+            LOWER(p.Body) LIKE '%performance%' OR
+            p.Tags LIKE '%<performance>%' OR
+            LOWER(p.Title) LIKE '%optimization%' OR
+            LOWER(p.Body) LIKE '%optimization%' OR
+            p.Tags LIKE '%<optimization>%'
+        )
+        AND p.OwnerUserId IS NOT NULL -- Exclude community or deleted users for ownership
+),
+UserPostActivity AS (
+    -- Aggregate post-related metrics for each user based on their relevant posts.
+    SELECT
+        prp.OwnerUserId AS UserId,
+        COUNT(DISTINCT prp.PostId) AS TotalRelevantPosts,
+        SUM(prp.Score) AS TotalRelevantPostScore,
+        AVG(prp.Score) AS AvgRelevantPostScore,
+        SUM(prp.ViewCount) AS TotalRelevantPostViews,
+        SUM(CASE WHEN prp.PostTypeId = 1 THEN 1 ELSE 0 END) AS RelevantQuestionCount,
+        SUM(CASE WHEN prp.PostTypeId = 2 THEN 1 ELSE 0 END) AS RelevantAnswerCount,
+        COALESCE(SUM(CASE WHEN prp.PostTypeId = 1 THEN prp.AnswerCount ELSE 0 END), 0) AS TotalAnswersToRelevantQuestions,
+        -- Complicated calculation with NULL handling to avoid division by zero
+        CAST(SUM(CASE WHEN prp.PostTypeId = 1 THEN prp.FavoriteCount ELSE 0 END) AS DECIMAL) / NULLIF(SUM(CASE WHEN prp.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS AvgFavoritesPerRelevantQuestion,
+        -- Window function: Calculate the moving average score of their relevant posts, ordered by creation date
+        AVG(prp.Score) OVER (PARTITION BY prp.OwnerUserId ORDER BY prp.CreationDate ASC ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS RollingAvgScore
+    FROM
+        PerformanceRelatedPosts prp
+    GROUP BY
+        prp.OwnerUserId
+),
+UserCommentMetrics AS (
+    -- Aggregate comment-related metrics, including correlated and non-correlated subqueries.
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS TotalCommentsOnRelevantPosts,
+        SUM(c.Score) AS TotalCommentScoreOnRelevantPosts,
+        -- Correlated subquery: Count how many *unique* relevant posts a user has commented on more than once
+        (SELECT
+            COUNT(DISTINCT c2.PostId)
+         FROM
+            Comments c2
+         JOIN
+            PerformanceRelatedPosts prp2 ON c2.PostId = prp2.PostId
+         WHERE
+            c2.UserId = c.UserId
+         GROUP BY c2.PostId
+         HAVING COUNT(c2.Id) > 1
+        ) AS MultiCommentedRelevantPosts,
+        -- Correlated subquery: Average length of comments for relevant posts
+        (SELECT
+            AVG(LENGTH(c3.Text))
+         FROM
+            Comments c3
+         JOIN
+            PerformanceRelatedPosts prp3 ON c3.PostId = prp3.PostId
+         WHERE
+            c3.UserId = c.UserId
+        ) AS AvgRelevantCommentLength
+    FROM
+        Comments c
+    JOIN
+        PerformanceRelatedPosts prp ON c.PostId = prp.PostId
+    WHERE
+        c.UserId IS NOT NULL
+    GROUP BY
+        c.UserId
+),
+UserBadgeSummary AS (
+    -- Summarize user badges, including a non-correlated subquery for global comparison.
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeAwardDate,
+        -- Non-correlated subquery to compare against the average
+        (SELECT AVG(total_b.TotalBadges) FROM (SELECT COUNT(Id) AS TotalBadges FROM Badges GROUP BY UserId) AS total_b) AS AverageBadgesAcrossAllUsers
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+PostHistoryAggregated AS (
+    -- Aggregate revision details for relevant posts.
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalRevisions,
+        COUNT(DISTINCT ph.UserId) AS DistinctEditors,
+        MAX(ph.CreationDate) AS LastRevisionDate,
+        MIN(ph.CreationDate) AS FirstRevisionDate,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS SignificantEditCount, -- Title, Body, Tags edits
+        -- Identify complex revision patterns: multiple editors within a short time frame
+        CASE
+            WHEN COUNT(DISTINCT ph.UserId) > 1 AND MAX(ph.CreationDate) - MIN(ph.CreationDate) < INTERVAL '7 days' THEN TRUE
+            ELSE FALSE
+        END AS HasCollaborativeRapidEdits
+    FROM
+        PostHistory ph
+    WHERE
+        ph.PostId IN (SELECT PostId FROM PerformanceRelatedPosts)
+        AND ph.PostHistoryTypeId IN (1,2,3,4,5,6,7,8,9) -- Initial or Edit/Rollback of Title/Body/Tags
+    GROUP BY
+        ph.PostId
+),
+UserRevisionMetrics AS (
+    -- Aggregate revision metrics per user.
+    SELECT
+        prp.OwnerUserId AS UserId,
+        COUNT(DISTINCT pha.PostId) AS RelevantPostsWithRevisions,
+        CAST(SUM(pha.SignificantEditCount) AS DECIMAL) / NULLIF(COUNT(DISTINCT pha.PostId), 0) AS AvgSignificantEditsPerRelevantPost,
+        MAX(pha.LastRevisionDate - pha.FirstRevisionDate) AS MaxEditTimeSpanForAnyPost, -- Max duration of edits for any single post
+        SUM(CASE WHEN pha.HasCollaborativeRapidEdits THEN 1 ELSE 0 END) AS CollaborativeRapidEditPosts
+    FROM
+        PerformanceRelatedPosts prp
+    JOIN
+        PostHistoryAggregated pha ON prp.PostId = pha.PostId
+    GROUP BY
+        prp.OwnerUserId
+),
+QuestionLinkAnalysis AS (
+    -- Analyze duplicate links related to user's questions.
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT pl.PostId) AS QuestionsMarkedAsDuplicate, -- Questions owned by user that are duplicates
+        COUNT(DISTINCT pl.RelatedPostId) AS RelatedQuestionsWhereUserIsDuplicateSource -- Questions for which user's post is the "source" of duplication
+    FROM
+        Posts p
+    JOIN
+        PostLinks pl ON p.Id = pl.PostId
+    WHERE
+        p.PostTypeId = 1 -- Only questions can be linked as duplicates
+        AND pl.LinkTypeId = 3 -- Duplicate link type
+        AND p.OwnerUserId IS NOT NULL
+        AND EXISTS (SELECT 1 FROM PerformanceRelatedPosts prp WHERE prp.PostId = p.Id) -- Only consider relevant posts
+    GROUP BY
+        p.OwnerUserId
+),
+FinalUserRanking AS (
+    -- Combine all CTEs to generate a comprehensive user profile and ranking.
+    SELECT
+        u.Id AS UserId,
+        COALESCE(u.DisplayName, 'Deleted User (' || u.Id || ')') AS UserDisplayName, -- Handle NULL DisplayName
+        u.Reputation,
+        u.CreationDate AS AccountCreationDate,
+        AGE(CURRENT_TIMESTAMP, u.CreationDate) AS AccountAge, -- Date/time difference
+        COALESCE(upa.TotalRelevantPosts, 0) AS TotalRelevantPosts,
+        COALESCE(upa.TotalRelevantPostScore, 0) AS TotalRelevantPostScore,
+        COALESCE(upa.AvgRelevantPostScore, 0.0) AS AvgRelevantPostScore,
+        COALESCE(upa.TotalRelevantPostViews, 0) AS TotalRelevantPostViews,
+        COALESCE(upa.RelevantQuestionCount, 0) AS RelevantQuestionCount,
+        COALESCE(upa.RelevantAnswerCount, 0) AS RelevantAnswerCount,
+        COALESCE(upa.AvgFavoritesPerRelevantQuestion, 0.0) AS AvgFavoritesPerRelevantQuestion,
+        COALESCE(upa.RollingAvgScore, 0.0) AS LatestRollingAvgScore, -- From window function
+        COALESCE(ucm.TotalCommentsOnRelevantPosts, 0) AS TotalCommentsOnRelevantPosts,
+        COALESCE(ucm.TotalCommentScoreOnRelevantPosts, 0) AS TotalCommentScoreOnRelevantPosts,
+        COALESCE(ucm.MultiCommentedRelevantPosts, 0) AS MultiCommentedRelevantPosts,
+        COALESCE(ucm.AvgRelevantCommentLength, 0.0) AS AvgRelevantCommentLength,
+        COALESCE(ubs.TotalBadges, 0) AS TotalBadges,
+        COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+        ubs.LastBadgeAwardDate,
+        COALESCE(ubs.AverageBadgesAcrossAllUsers, 0.0) AS GlobalAvgBadges,
+        COALESCE(urm.RelevantPostsWithRevisions, 0) AS RelevantPostsWithRevisions,
+        COALESCE(urm.AvgSignificantEditsPerRelevantPost, 0.0) AS AvgSignificantEditsPerRelevantPost,
+        urm.MaxEditTimeSpanForAnyPost,
+        COALESCE(urm.CollaborativeRapidEditPosts, 0) AS CollaborativeRapidEditPosts,
+        COALESCE(qla.QuestionsMarkedAsDuplicate, 0) AS QuestionsMarkedAsDuplicate,
+        COALESCE(qla.RelatedQuestionsWhereUserIsDuplicateSource, 0) AS DuplicateSourceCount,
+        -- Elaborate scoring formula, incorporating various aspects with weights and NULL logic
+        (
+            (COALESCE(upa.TotalRelevantPostScore, 0) * 0.7) +
+            (COALESCE(upa.TotalRelevantPostViews, 0) * 0.005) +
+            (COALESCE(ucm.TotalCommentScoreOnRelevantPosts, 0) * 0.3) +
+            (COALESCE(ubs.GoldBadges, 0) * 150) +
+            (COALESCE(ubs.SilverBadges, 0) * 75) +
+            (COALESCE(urm.AvgSignificantEditsPerRelevantPost, 0.0) * 20) +
+            (COALESCE(ucm.MultiCommentedRelevantPosts, 0) * 10) -
+            (COALESCE(qla.QuestionsMarkedAsDuplicate, 0) * 50) -- Penalty for having duplicates
+        ) AS UserContributionScore,
+        -- Window function: Rank users based on their contribution score
+        RANK() OVER (ORDER BY (
+            (COALESCE(upa.TotalRelevantPostScore, 0) * 0.7) +
+            (COALESCE(upa.TotalRelevantPostViews, 0) * 0.005) +
+            (COALESCE(ucm.TotalCommentScoreOnRelevantPosts, 0) * 0.3) +
+            (COALESCE(ubs.GoldBadges, 0) * 150) +
+            (COALESCE(ubs.SilverBadges, 0) * 75) +
+            (COALESCE(urm.AvgSignificantEditsPerRelevantPost, 0.0) * 20) +
+            (COALESCE(ucm.MultiCommentedRelevantPosts, 0) * 10) -
+            (COALESCE(qla.QuestionsMarkedAsDuplicate, 0) * 50)
+        ) DESC, u.Reputation DESC, u.Id ASC) AS OverallContributionRank
+    FROM
+        Users u
+    LEFT JOIN UserPostActivity upa ON u.Id = upa.UserId
+    LEFT JOIN UserCommentMetrics ucm ON u.Id = ucm.UserId
+    LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+    LEFT JOIN UserRevisionMetrics urm ON u.Id = urm.UserId
+    LEFT JOIN QuestionLinkAnalysis qla ON u.Id = qla.UserId
+    WHERE
+        u.Reputation >= 1000 -- Filter for sufficiently active users
+        AND u.LastAccessDate >= CURRENT_DATE - INTERVAL '1 year' -- Recently active
+        AND (upa.TotalRelevantPosts > 0 OR ucm.TotalCommentsOnRelevantPosts > 0) -- Must have at least one relevant contribution
+        AND (LOWER(COALESCE(u.Location, '')) NOT LIKE '%space%' AND LOWER(COALESCE(u.WebsiteUrl, '')) NOT LIKE '%joke%') -- Filter out potential joke/spam profiles
+)
+-- Final selection and presentation of the top users.
+SELECT
+    fur.OverallContributionRank,
+    fur.UserDisplayName,
+    fur.Reputation,
+    fur.AccountAge,
+    fur.TotalRelevantPosts,
+    fur.RelevantQuestionCount,
+    fur.RelevantAnswerCount,
+    ROUND(fur.AvgRelevantPostScore, 2) AS AvgRelevantPostScore,
+    fur.TotalRelevantPostViews,
+    fur.TotalCommentsOnRelevantPosts,
+    fur.TotalCommentScoreOnRelevantPosts,
+    fur.GoldBadges,
+    fur.SilverBadges,
+    fur.BronzeBadges,
+    fur.LastBadgeAwardDate,
+    ROUND(fur.AvgSignificantEditsPerRelevantPost, 2) AS AvgSignificantEditsPerRelevantPost,
+    fur.MaxEditTimeSpanForAnyPost,
+    fur.QuestionsMarkedAsDuplicate,
+    ROUND(fur.UserContributionScore, 2) AS UserContributionScore,
+    -- Another Window function: Categorize users into quartiles based on their score
+    NTILE(5) OVER (ORDER BY fur.UserContributionScore DESC) AS ContributionQuintile,
+    -- String expression: Concatenate various details for a summary string
+    'User ID: ' || fur.UserId ||
+    ' | Posts: Q:' || fur.RelevantQuestionCount || ' A:' || fur.RelevantAnswerCount ||
+    ' | Badges (G/S/B): ' || fur.GoldBadges || '/' || fur.SilverBadges || '/' || fur.BronzeBadges AS UserSummaryDetails
+FROM
+    FinalUserRanking fur
+WHERE
+    fur.OverallContributionRank <= 200 -- Focus on the top 200 contributors
+    AND fur.UserContributionScore > 0 -- Ensure a positive contribution score
+ORDER BY
+    fur.OverallContributionRank ASC, fur.Reputation DESC
+LIMIT 200;

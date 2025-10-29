@@ -1,0 +1,112 @@
+-- {"query": "3202.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2180} 
+
+WITH AnswerStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*)                                            AS AnswerCount,
+        AVG(p.Score)                                        AS AvgScore,
+        MAX(p.CreationDate)                                 AS LastAnswerDate
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+      AND p.ParentId IN (
+          SELECT ph.PostId
+          FROM PostHistory ph
+          WHERE ph.PostHistoryTypeId = 10               -- Post Closed
+            AND ph.Comment IN ('101','102','103','104','105')   -- Duplicate close reasons
+      )
+    GROUP BY p.OwnerUserId
+),
+UserBadgeInfo AS (
+    SELECT
+        b.UserId,
+        STRING_AGG(
+            CASE b.Class
+                WHEN 1 THEN 'Gold'
+                WHEN 2 THEN 'Silver'
+                ELSE 'Bronze'
+            END, ','
+        )                                                   AS BadgeClasses,
+        COUNT(*) FILTER (WHERE b.TagBased = 1)              AS TagBadgeCount,
+        COUNT(*) FILTER (WHERE b.TagBased = 0)              AS NamedBadgeCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentVote AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        v.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3)                          -- Up/Down votes
+),
+UserRecentVotes AS (
+    SELECT
+        rv.PostId,
+        rv.VoteTypeId,
+        rv.CreationDate
+    FROM RecentVote rv
+    WHERE rv.rn = 1
+),
+TagInfo AS (
+    SELECT
+        t.TagName,
+        t.Count          AS TagUseCount,
+        COALESCE(p.Title, '') AS TagWikiTitle
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.WikiPostId
+    WHERE t.IsModeratorOnly = 0
+),
+Combined AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(as.AnswerCount, 0)               AS AnswerCount,
+        COALESCE(as.AvgScore, 0)                  AS AvgAnswerScore,
+        COALESCE(ubi.BadgeClasses, '')            AS BadgeClasses,
+        COALESCE(ubi.TagBadgeCount, 0)            AS TagBadgeCount,
+        COALESCE(ubi.NamedBadgeCount, 0)          AS NamedBadgeCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COALESCE(as.AnswerCount,0) DESC) AS RepRank,
+        PERCENT_RANK() OVER (ORDER BY u.Reputation DESC)                                     AS RepPercentile
+    FROM Users u
+    LEFT JOIN AnswerStats as ON as.UserId = u.Id
+    LEFT JOIN UserBadgeInfo ubi ON ubi.UserId = u.Id
+    WHERE u.Reputation > 1000
+      AND (as.AnswerCount IS NULL OR as.AnswerCount > 5)
+)
+SELECT
+    c.Id,
+    c.DisplayName,
+    c.Reputation,
+    c.AnswerCount,
+    ROUND(c.AvgAnswerScore, 2)                     AS AvgScore,
+    c.BadgeClasses,
+    c.TagBadgeCount,
+    c.NamedBadgeCount,
+    c.RepRank,
+    CAST(c.RepPercentile * 100 AS NUMERIC(5,2))    AS RepPercentile,
+    COALESCE(string_agg(DISTINCT ti.TagName, ', '), '') AS TopTags
+FROM Combined c
+LEFT JOIN Posts p
+       ON p.OwnerUserId = c.Id
+      AND p.PostTypeId = 2
+LEFT JOIN LATERAL (
+       SELECT trim(both '<>' FROM unnest(string_to_array(p.Tags, '><'))) AS TagName
+) lt ON true
+LEFT JOIN TagInfo ti
+       ON ti.TagName = lt.TagName
+WHERE p.CreationDate > DATE '2020-01-01' OR p.CreationDate IS NULL
+GROUP BY
+    c.Id, c.DisplayName, c.Reputation, c.AnswerCount,
+    c.AvgAnswerScore, c.BadgeClasses, c.TagBadgeCount,
+    c.NamedBadgeCount, c.RepRank, c.RepPercentile
+HAVING COUNT(ti.TagName) > 0
+ORDER BY c.RepRank
+LIMIT 10
+
+UNION ALL
+
+SELECT
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+ORDER BY RepRank NULLS LAST;

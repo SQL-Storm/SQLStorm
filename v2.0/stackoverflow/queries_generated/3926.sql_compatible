@@ -1,0 +1,108 @@
+WITH
+user_stats AS (
+    SELECT
+        u.id AS user_id,
+        u.displayname AS display_name,
+        u.reputation,
+        COUNT(b.id) AS total_badges,
+        SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        COUNT(DISTINCT p.id) AS distinct_posts,
+        COUNT(DISTINCT c.id) AS distinct_comments,
+        COALESCE(MAX(p.lastactivitydate), TIMESTAMP '1970-01-01') AS last_activity
+    FROM users u
+    LEFT JOIN badges b   ON b.userid = u.id
+    LEFT JOIN posts  p   ON p.owneruserid = u.id
+    LEFT JOIN comments c ON c.userid = u.id
+    GROUP BY u.id, u.displayname, u.reputation
+),
+recent_activity AS (
+    SELECT
+        COALESCE(p.owneruserid, c.userid, v.userid) AS user_id,
+        SUM(CASE WHEN p.creationdate >= (DATE '2024-10-01' - INTERVAL '30' DAY) THEN 1 ELSE 0 END) AS posts_last_30d,
+        SUM(CASE WHEN c.creationdate >= (DATE '2024-10-01' - INTERVAL '30' DAY) THEN 1 ELSE 0 END) AS comments_last_30d,
+        SUM(CASE WHEN v.creationdate >= (DATE '2024-10-01' - INTERVAL '30' DAY) AND v.votetypeid = 2 THEN 1 ELSE 0 END) AS upvotes_given_last_30d
+    FROM posts p
+    FULL JOIN comments c ON c.userid = p.owneruserid
+    FULL JOIN votes v ON v.userid = p.owneruserid
+    GROUP BY COALESCE(p.owneruserid, c.userid, v.userid)
+),
+popular_tags AS (
+    SELECT
+        t.tagname,
+        t.count,
+        ROW_NUMBER() OVER (ORDER BY t.count DESC) AS tag_rank
+    FROM tags t
+    WHERE t.count > 5000
+),
+question_details AS (
+    SELECT
+        p.id AS post_id,
+        p.title,
+        p.score,
+        p.viewcount,
+        p.creationdate,
+        COALESCE(NULLIF(p.tags, ''), '<>') AS raw_tags,
+        CARDINALITY(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM COALESCE(p.tags, '')), '><')) AS tag_cnt,
+        EXISTS (
+            SELECT 1
+            FROM popular_tags pt
+            WHERE pt.tagname = ANY (STRING_TO_ARRAY(TRIM(BOTH '<>' FROM COALESCE(p.tags, '')), '><'))
+        ) AS has_popular_tag,
+        ROW_NUMBER() OVER (PARTITION BY p.owneruserid ORDER BY p.score DESC, p.viewcount DESC) AS user_question_rank,
+        p.owneruserid
+    FROM posts p
+    WHERE p.posttypeid = 1
+),
+self_answered AS (
+    SELECT
+        q.post_id,
+        q.title,
+        q.tag_cnt,
+        q.has_popular_tag,
+        CASE WHEN EXISTS (
+            SELECT 1
+            FROM posts a
+            WHERE a.parentid = q.post_id
+              AND a.owneruserid = (SELECT owneruserid FROM posts WHERE id = q.post_id)
+              AND a.posttypeid = 2
+        ) THEN TRUE ELSE FALSE END AS is_self_answered
+    FROM question_details q
+),
+high_score_questions AS (
+    SELECT
+        q.post_id AS entity_id,
+        q.title AS description,
+        q.score AS metric,
+        'question' AS entity_type,
+        q.owneruserid AS owner_id
+    FROM posts q
+    WHERE q.posttypeid = 1
+      AND q.score >= 100
+),
+top_users AS (
+    SELECT
+        us.user_id AS entity_id,
+        us.display_name AS description,
+        us.reputation AS metric,
+        'user' AS entity_type,
+        us.user_id AS owner_id
+    FROM user_stats us
+    WHERE us.reputation >= 50000
+),
+combined AS (
+    SELECT * FROM high_score_questions
+    UNION ALL
+    SELECT * FROM top_users
+),
+ranked AS (
+    SELECT
+        c.*,
+        ROW_NUMBER() OVER (PARTITION BY c.entity_type ORDER BY c.metric DESC) AS rn
+    FROM combined c
+)
+SELECT entity_id, description, metric, entity_type, owner_id
+FROM ranked
+WHERE rn <= 10
+ORDER BY entity_type, metric DESC;

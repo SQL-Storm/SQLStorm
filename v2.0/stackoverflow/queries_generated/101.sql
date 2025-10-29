@@ -1,0 +1,316 @@
+-- {"query": "101.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3089} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           date_trunc('month', u.creationdate) as cohort_month
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+question_posts as (
+    select p.id as post_id,
+           p.owneruserid as user_id,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.title,
+           p.tags,
+           p.acceptedanswerid,
+           p.closeddate,
+           p.posttypeid
+    from posts p
+    where p.posttypeid = 1
+),
+answer_posts as (
+    select p.id as post_id,
+           p.parentid as question_id,
+           p.owneruserid as user_id,
+           p.creationdate,
+           p.score
+    from posts p
+    where p.posttypeid = 2
+),
+first_answer_per_question as (
+    select a.question_id,
+           a.post_id as answer_id,
+           a.user_id as answerer_id,
+           a.creationdate as answer_date,
+           row_number() over (partition by a.question_id order by a.creationdate asc, a.post_id) as rn
+    from answer_posts a
+),
+accepted_answers as (
+    select q.post_id as question_id,
+           q.acceptedanswerid as accepted_answer_id
+    from question_posts q
+    where q.acceptedanswerid is not null
+),
+votes_agg as (
+    select v.postid,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+           sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+           sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+           min(v.creationdate) as first_vote_at,
+           max(v.creationdate) as last_vote_at
+    from votes v
+    where v.creationdate >= (select min(creationdate) from recent_users)
+    group by v.postid
+),
+comment_activity as (
+    select c.postid,
+           count(*) as comment_count,
+           max(c.creationdate) as last_comment_at,
+           sum(case when c.score > 0 then 1 else 0 end) as pos_comments
+    from comments c
+    group by c.postid
+),
+tag_explode as (
+    select q.post_id,
+           unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+    from question_posts q
+    where q.tags is not null and q.tags like '<%>'
+),
+tag_stats as (
+    select t.tag,
+           count(distinct te.post_id) as questions_with_tag,
+           sum(coalesce(q.viewcount,0)) as total_views_for_tag,
+           avg(nullif(q.score,0)) filter (where q.score is not null) as avg_nonzero_score_for_tag
+    from tag_explode te
+    join question_posts q on q.post_id = te.post_id
+    join tags t on t.tagname = te.tag
+    group by t.tag
+),
+edits_cte as (
+    select ph.postid,
+           count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_count,
+           count(*) filter (where ph.posthistorytypeid in (24)) as suggested_edits_applied,
+           max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit_at,
+           max(ph.creationdate) filter (where ph.posthistorytypeid in (10)) as closed_at,
+           max(case when ph.posthistorytypeid = 10 then try_cast(ph.comment as int) end) as last_close_reason_id
+    from posthistory ph
+    group by ph.postid
+),
+close_reason_lookup as (
+    select crt.id as close_reason_id, crt.name as close_reason
+    from closereasontypes crt
+),
+linkage as (
+    select pl.postid,
+           sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_count,
+           sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_count
+    from postlinks pl
+    group by pl.postid
+),
+question_metrics as (
+    select q.post_id,
+           q.user_id,
+           q.creationdate,
+           q.score,
+           q.viewcount,
+           q.title,
+           q.tags,
+           qa.upvotes,
+           qa.downvotes,
+           qa.favorites,
+           qa.bounty_started,
+           qa.bounty_awarded,
+           qa.first_vote_at,
+           qa.last_vote_at,
+           coalesce(ca.comment_count,0) as comment_count,
+           ca.last_comment_at,
+           coalesce(ca.pos_comments,0) as positive_comments,
+           coalesce(e.edit_count,0) as edit_count,
+           coalesce(e.suggested_edits_applied,0) as suggested_edits_applied,
+           e.last_edit_at,
+           e.closed_at,
+           e.last_close_reason_id,
+           l.linked_count,
+           l.duplicate_count,
+           case when q.acceptedanswerid is not null then 1 else 0 end as has_accepted_answer
+    from question_posts q
+    left join votes_agg qa on qa.postid = q.post_id
+    left join comment_activity ca on ca.postid = q.post_id
+    left join edits_cte e on e.postid = q.post_id
+    left join linkage l on l.postid = q.post_id
+),
+answer_latency as (
+    select q.post_id as question_id,
+           min(a.creationdate) as first_answer_at,
+           avg(extract(epoch from (a.creationdate - q.creationdate))/3600.0) as avg_answer_latency_hours
+    from question_posts q
+    left join answer_posts a on a.question_id = q.post_id
+    group by q.post_id
+),
+first_answer_flags as (
+    select fa.question_id,
+           fa.answer_id,
+           case when fa.rn = 1 then 1 else 0 end as is_first_answer,
+           fa.answerer_id,
+           fa.answer_date
+    from first_answer_per_question fa
+),
+accept_match as (
+    select aa.question_id,
+           case when aa.accepted_answer_id is not null and aa.accepted_answer_id = faf.answer_id then 1 else 0 end as first_answer_was_accepted
+    from accepted_answers aa
+    left join first_answer_flags faf
+      on faf.question_id = aa.question_id
+      and faf.is_first_answer = 1
+),
+user_badge_stats as (
+    select b.userid as user_id,
+           count(*) as badge_count,
+           sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+           sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+           sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+           sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges,
+           max(b.date) as last_badge_at
+    from badges b
+    group by b.userid
+),
+user_activity as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           ru.cohort_month,
+           coalesce(ub.badge_count,0) as badge_count,
+           coalesce(ub.gold_badges,0) as gold_badges,
+           coalesce(ub.silver_badges,0) as silver_badges,
+           coalesce(ub.bronze_badges,0) as bronze_badges,
+           coalesce(ub.tag_badges,0) as tag_badges,
+           ub.last_badge_at
+    from users u
+    join recent_users ru on ru.user_id = u.id
+    left join user_badge_stats ub on ub.user_id = u.id
+),
+question_enriched as (
+    select qm.*,
+           al.first_answer_at,
+           al.avg_answer_latency_hours,
+           am.first_answer_was_accepted,
+           crl.close_reason
+    from question_metrics qm
+    left join answer_latency al on al.question_id = qm.post_id
+    left join accept_match am on am.question_id = qm.post_id
+    left join close_reason_lookup crl on crl.close_reason_id = qm.last_close_reason_id
+),
+per_user_rollup as (
+    select qe.user_id,
+           count(*) as questions_posted,
+           sum(qe.has_accepted_answer) as questions_with_accept,
+           avg(qe.avg_answer_latency_hours) as avg_answer_latency_hours,
+           sum(coalesce(qe.viewcount,0)) as total_views,
+           sum(coalesce(qe.upvotes,0) - coalesce(qe.downvotes,0)) as net_votes,
+           sum(coalesce(qe.favorites,0)) as favorites,
+           sum(coalesce(qe.bounty_awarded,0)) as bounty_awarded_sum,
+           sum(coalesce(qe.bounty_started,0)) as bounty_started_sum,
+           avg(case when qe.closed_at is null then 0 else 1 end) as close_rate,
+           avg(case when qe.duplicate_count > 0 then 1 else 0 end) as duplicate_rate,
+           max(qe.last_vote_at) as last_vote_at,
+           max(qe.last_comment_at) as last_comment_at,
+           max(qe.last_edit_at) as last_edit_at
+    from question_enriched qe
+    group by qe.user_id
+),
+cohort_stats as (
+    select ua.cohort_month,
+           count(distinct ua.user_id) as users_in_cohort,
+           avg(ua.reputation) as avg_rep,
+           percentile_cont(0.5) within group (order by ua.reputation) as median_rep,
+           avg(ua.badge_count) as avg_badges
+    from user_activity ua
+    group by ua.cohort_month
+),
+user_final as (
+    select ua.user_id,
+           ua.displayname,
+           ua.reputation,
+           ua.cohort_month,
+           ua.badge_count,
+           ua.gold_badges,
+           ua.silver_badges,
+           ua.bronze_badges,
+           pr.questions_posted,
+           pr.questions_with_accept,
+           pr.avg_answer_latency_hours,
+           pr.total_views,
+           pr.net_votes,
+           pr.favorites,
+           pr.bounty_awarded_sum,
+           pr.bounty_started_sum,
+           pr.close_rate,
+           pr.duplicate_rate,
+           pr.last_vote_at,
+           pr.last_comment_at,
+           pr.last_edit_at
+    from user_activity ua
+    left join per_user_rollup pr on pr.user_id = ua.user_id
+),
+tag_quality as (
+    select te.tag,
+           count(*) as q_count,
+           avg(qe.score) as avg_score,
+           avg(coalesce(qa.upvotes,0) - coalesce(qa.downvotes,0)) as avg_net_votes,
+           avg(case when qe.has_accepted_answer = 1 then 1 else 0 end) as accept_rate
+    from tag_explode te
+    join question_enriched qe on qe.post_id = te.post_id
+    left join votes_agg qa on qa.postid = te.post_id
+    group by te.tag
+),
+ranked_users as (
+    select uf.*,
+           row_number() over (partition by date_trunc('quarter', uf.cohort_month) order by coalesce(uf.net_votes,0) desc nulls last, coalesce(uf.total_views,0) desc nulls last) as rn_quarter,
+           dense_rank() over (order by coalesce(uf.bounty_awarded_sum,0) desc nulls last) as dr_bounty,
+           ntile(10) over (order by coalesce(uf.reputation,0) desc) as rep_decile
+    from user_final uf
+)
+select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.rep_decile,
+    to_char(ru.cohort_month, 'YYYY-MM') as cohort_month,
+    cs.users_in_cohort,
+    cs.avg_rep as cohort_avg_rep,
+    cs.median_rep as cohort_median_rep,
+    ru.badge_count,
+    ru.gold_badges,
+    ru.silver_badges,
+    ru.bronze_badges,
+    coalesce(ru.questions_posted,0) as questions_posted,
+    coalesce(ru.questions_with_accept,0) as questions_with_accept,
+    round(coalesce(ru.avg_answer_latency_hours,0)::numeric, 2) as avg_answer_latency_hours,
+    coalesce(ru.total_views,0) as total_views,
+    coalesce(ru.net_votes,0) as net_votes,
+    coalesce(ru.favorites,0) as favorites,
+    coalesce(ru.bounty_started_sum,0) as bounty_started_sum,
+    coalesce(ru.bounty_awarded_sum,0) as bounty_awarded_sum,
+    round(coalesce(ru.close_rate,0)::numeric, 4) as close_rate,
+    round(coalesce(ru.duplicate_rate,0)::numeric, 4) as duplicate_rate,
+    ru.last_vote_at,
+    ru.last_comment_at,
+    ru.last_edit_at,
+    tq.tag as top_tag_by_avg_score,
+    tq.avg_score as top_tag_avg_score,
+    tq.accept_rate as top_tag_accept_rate
+from ranked_users ru
+left join cohort_stats cs on cs.cohort_month = ru.cohort_month
+left join lateral (
+    select tq.tag, tq.avg_score, tq.accept_rate
+    from tag_quality tq
+    join (
+        select te.tag, count(*) as c
+        from tag_explode te
+        join question_posts qp on qp.post_id = te.post_id
+        where qp.owneruserid = ru.user_id
+        group by te.tag
+    ) ut on ut.tag = tq.tag
+    order by tq.avg_score desc nulls last, ut.c desc nulls last, tq.accept_rate desc nulls last
+    limit 1
+) tq on true
+where ru.rn_quarter <= 50
+order by ru.dr_bounty asc, ru.rn_quarter asc, ru.net_votes desc nulls last, ru.user_id asc;

@@ -1,0 +1,89 @@
+-- {"query": "3209.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2024} 
+
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, '(no location)')                     AS Location,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END)    AS AvgPostScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)       AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)       AS DownVoteCount,
+        MAX(p.LastActivityDate)                                 AS LastActivity,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadgeCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadgeCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadgeCount
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v   ON v.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+),
+TagUsage AS (
+    SELECT
+        pu.OwnerUserId                                 AS UserId,
+        COUNT(*) FILTER (WHERE t.TagName ILIKE '%sql%')        AS SqlTagPosts,
+        COUNT(*) FILTER (WHERE t.TagName ILIKE '%performance%') AS PerfTagPosts
+    FROM Posts pu
+    JOIN LATERAL regexp_split_to_table(pu.Tags, '[><]+') AS tg(tag) ON true
+    JOIN Tags t ON t.TagName = replace(tg.tag, '<', '')
+    WHERE pu.OwnerUserId IS NOT NULL
+    GROUP BY pu.OwnerUserId
+),
+RecentClosedQuestions AS (
+    SELECT
+        ph.UserId,
+        COUNT(*) AS RecentlyClosedCount
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    WHERE pht.Name = 'Post Closed'
+      AND ph.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY ph.UserId
+)
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.Location,
+    us.QuestionCount,
+    us.AnswerCount,
+    ROUND(us.AvgPostScore, 2)                                 AS AvgScore,
+    us.UpVoteCount,
+    us.DownVoteCount,
+    us.GoldBadgeCount,
+    us.SilverBadgeCount,
+    us.BronzeBadgeCount,
+    COALESCE(tu.SqlTagPosts, 0)                               AS SqlTagPosts,
+    COALESCE(tu.PerfTagPosts, 0)                              AS PerfTagPosts,
+    COALESCE(rc.RecentlyClosedCount, 0)                       AS RecentClosed,
+    ROW_NUMBER() OVER (ORDER BY us.Reputation DESC,
+                             us.AnswerCount DESC)          AS ReputationRank,
+    CASE
+        WHEN us.Reputation > 20000 THEN 'Legendary'
+        WHEN us.Reputation BETWEEN 10000 AND 20000 THEN 'Expert'
+        WHEN us.Reputation BETWEEN 5000  AND 9999  THEN 'Experienced'
+        ELSE 'Novice'
+    END                                                       AS ReputationTier,
+    CONCAT(us.DisplayName, ' (', us.Id, ')')                  AS UserLabel,
+    (SELECT MAX(p.CreationDate)
+       FROM Posts p
+       WHERE p.OwnerUserId = us.Id)                          AS LastPostDate,
+    EXISTS (SELECT 1
+              FROM Posts p2
+             WHERE p2.OwnerUserId = us.Id
+               AND p2.PostTypeId = 1
+               AND p2.ClosedDate IS NOT NULL
+               AND p2.ClosedDate > CURRENT_DATE - INTERVAL '7 days') AS HasRecentlyClosedQuestion
+FROM UserStats us
+LEFT JOIN TagUsage tu          ON tu.UserId = us.Id
+LEFT JOIN RecentClosedQuestions rc ON rc.UserId = us.Id
+WHERE us.Reputation > 1000
+ORDER BY us.Reputation DESC
+LIMIT 10
+
+UNION ALL
+
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE FALSE;

@@ -1,0 +1,240 @@
+-- {"query": "7767.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2239} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate) AS AccountAgeDays,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS FLOAT) / COUNT(DISTINCT p.Id)
+            ELSE 0 
+        END AS QuestionRatio,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS FLOAT) / COUNT(DISTINCT p.Id)
+            ELSE 0 
+        END AS AnswerRatio
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0 AND u.Reputation > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostScores AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreDenseRank,
+        NTILE(10) OVER (ORDER BY p.Score DESC) AS ScoreDecile,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScoreByType,
+        AVG(p.Score) OVER () AS OverallAvgScore,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = p.PostTypeId) THEN 'AboveAvg'
+            ELSE 'BelowAvg'
+        END AS ScorePerformance,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3)),
+            0
+        ) AS VoteCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id),
+            0
+        ) AS CommentCountSubquery,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            ELSE 'Active'
+        END AS PostStatus
+    FROM Posts p
+    WHERE p.Id IS NOT NULL
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.LastPostDate,
+        uas.AccountAgeDays,
+        uas.TotalScore,
+        uas.TotalViews,
+        uas.QuestionRatio,
+        uas.AnswerRatio,
+        CASE 
+            WHEN uas.TotalPosts > 100 THEN 'HighActivity'
+            WHEN uas.TotalPosts > 50 THEN 'MediumActivity'
+            WHEN uas.TotalPosts > 10 THEN 'LowActivity'
+            ELSE 'Inactive'
+        END AS ActivityLevel,
+        CASE 
+            WHEN uas.Reputation > 100000 THEN 'Elite'
+            WHEN uas.Reputation > 10000 THEN 'Advanced'
+            WHEN uas.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS RepLevel,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1 AND p.Score > 100),
+            0
+        ) AS HighScoreQuestions,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2 AND p.Score > 100),
+            0
+        ) AS HighScoreAnswers,
+        (uas.Reputation + uas.TotalScore) / NULLIF(uas.AccountAgeDays, 0) AS RepScorePerDay,
+        CASE 
+            WHEN uas.TotalViews > 10000 THEN 'Popular'
+            WHEN uas.TotalViews > 5000 THEN 'Moderate'
+            WHEN uas.TotalViews > 1000 THEN 'Basic'
+            ELSE 'Low'
+        END AS PopularityLevel,
+        DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), uas.LastPostDate) AS DaysSinceLastPost
+    FROM UserActivityStats uas
+    WHERE uas.UserId IS NOT NULL
+)
+SELECT 
+    cua.UserId,
+    cua.DisplayName,
+    cua.Reputation,
+    cua.TotalPosts,
+    cua.Questions,
+    cua.Answers,
+    cua.Comments,
+    cua.Badges,
+    cua.LastPostDate,
+    cua.AccountAgeDays,
+    cua.TotalScore,
+    cua.TotalViews,
+    cua.QuestionRatio,
+    cua.AnswerRatio,
+    cua.ActivityLevel,
+    cua.RepLevel,
+    cua.HighScoreQuestions,
+    cua.HighScoreAnswers,
+    cua.RepScorePerDay,
+    cua.PopularityLevel,
+    cua.DaysSinceLastPost,
+    
+    -- Complex aggregations and calculations
+    (
+        cua.HighScoreQuestions * 5 + 
+        cua.HighScoreAnswers * 3 + 
+        cua.Reputation / 1000 +
+        cua.TotalScore / 100 +
+        (cua.TotalViews / 1000)
+    ) AS ActivityScore,
+    
+    CASE 
+        WHEN cua.Reputation > 50000 AND cua.TotalPosts > 50 THEN 'Influential'
+        WHEN cua.Reputation > 10000 AND cua.TotalPosts > 20 THEN 'Respected'
+        WHEN cua.Reputation > 5000 AND cua.TotalPosts > 10 THEN 'Contributor'
+        ELSE 'Regular'
+    END AS ContributionLevel,
+    
+    -- Window functions for ranking
+    ROW_NUMBER() OVER (ORDER BY (
+        cua.HighScoreQuestions * 5 + 
+        cua.HighScoreAnswers * 3 + 
+        cua.Reputation / 1000 +
+        cua.TotalScore / 100 +
+        (cua.TotalViews / 1000)
+    ) DESC) AS OverallRank,
+    
+    DENSE_RANK() OVER (ORDER BY cua.Reputation DESC) AS ReputationRank,
+    DENSE_RANK() OVER (ORDER BY cua.TotalScore DESC) AS ScoreRank,
+    
+    -- Correlated subqueries
+    (
+        SELECT COUNT(*) 
+        FROM Posts p1 
+        WHERE p1.OwnerUserId = cua.UserId 
+        AND DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), p1.CreationDate) < 7
+    ) AS RecentPosts,
+    
+    (
+        SELECT AVG(p2.Score) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = cua.UserId 
+        AND p2.PostTypeId = 1
+    ) AS AvgQuestionScore,
+    
+    -- Set operators (union)
+    (
+        SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = cua.UserId AND p3.PostTypeId = 2
+        UNION ALL
+        SELECT COUNT(*) FROM Posts p4 WHERE p4.OwnerUserId = cua.UserId AND p4.PostTypeId = 1
+    ) AS TotalQuestionAnswerCount,
+    
+    -- String operations and manipulations
+    CONCAT(
+        'User:', cua.DisplayName, 
+        ' (ID:', cua.UserId, ')', 
+        ' | Rep:', cua.Reputation,
+        ' | Posts:', cua.TotalPosts,
+        ' | Score:', cua.TotalScore
+    ) AS UserSummary,
+    
+    -- NULL handling and CASE expressions
+    CASE 
+        WHEN cua.DaysSinceLastPost IS NULL THEN 'Never'
+        WHEN cua.DaysSinceLastPost > 365 THEN 'VeryLong'
+        WHEN cua.DaysSinceLastPost > 180 THEN 'Long'
+        WHEN cua.DaysSinceLastPost > 30 THEN 'Medium'
+        WHEN cua.DaysSinceLastPost > 7 THEN 'Short'
+        ELSE 'VeryRecent'
+    END AS ActivityTiming,
+    
+    -- Advanced conditionals
+    IIF(
+        cua.TotalScore > (SELECT AVG(TotalScore) FROM ComplexUserAnalysis),
+        'AboveAverage',
+        'BelowAverage'
+    ) AS ScoreComparison,
+    
+    -- Multiple joins with subqueries
+    (
+        SELECT STRING_AGG(DISTINCT t.TagName, ', ')
+        FROM Tags t
+        INNER JOIN PostLinks pl ON pl.RelatedPostId = t.ExcerptPostId OR pl.PostId = t.ExcerptPostId
+        WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = cua.UserId)
+        AND t.TagName IS NOT NULL
+        AND t.TagName != ''
+    ) AS AssociatedTags
+    
+FROM ComplexUserAnalysis cua
+WHERE cua.UserId IS NOT NULL
+AND cua.Reputation > 100
+AND cua.TotalPosts > 0
+AND cua.AccountAgeDays > 10
+AND (cua.HighScoreQuestions > 0 OR cua.HighScoreAnswers > 0)
+ORDER BY cua.RepScorePerDay DESC, cua.Reputation DESC
+LIMIT 1000;

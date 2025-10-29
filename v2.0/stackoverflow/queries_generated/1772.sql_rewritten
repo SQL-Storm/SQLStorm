@@ -1,0 +1,266 @@
+-- {"query": "1772.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3819} 
+WITH UserContributionStats AS (
+    -- Summarize user contributions and engagement metrics
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        -- Calculate the average post score for this user's questions
+        CAST(AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS DECIMAL(10, 2)) AS AvgQuestionScore,
+        -- Calculate the reputation tier based on user's reputation
+        CASE
+            WHEN u.Reputation >= 100000 THEN 'Legendary'
+            WHEN u.Reputation >= 20000 THEN 'Highly Esteemed'
+            WHEN u.Reputation >= 5000 THEN 'Esteemed'
+            WHEN u.Reputation >= 1000 THEN 'Experienced'
+            ELSE 'Novice'
+        END AS ReputationTier
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING
+        COUNT(DISTINCT p.Id) > 0 OR COUNT(DISTINCT c.Id) > 0 -- Only include users with some activity
+),
+PostVoteSummary AS (
+    -- Aggregate vote counts for posts
+    SELECT
+        PostId,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownvoteCount,
+        SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS FavoriteCount
+    FROM Votes AS v
+    JOIN VoteTypes AS vt ON v.VoteTypeId = vt.Id
+    GROUP BY PostId
+),
+HighlyEngagedPosts AS (
+    -- Use UNION ALL to combine different types of highly engaged posts based on specific criteria
+    -- Branch 1: Highly upvoted questions with many views
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.ViewCount,
+        p.Score,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.CommentCount,
+        p.ClosedDate
+    FROM Posts AS p
+    WHERE p.PostTypeId = 1 -- Questions
+      AND p.Score > 50 -- Highly upvoted questions
+      AND p.ViewCount > 10000
+    UNION ALL
+    -- Branch 2: Highly upvoted answers with many comments
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.ViewCount,
+        p.Score,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.CommentCount,
+        p.ClosedDate
+    FROM Posts AS p
+    WHERE p.PostTypeId = 2 -- Answers
+      AND p.Score > 20 -- Highly upvoted answers
+      AND p.CommentCount > 5 -- Many comments on the answer
+),
+PostActivitySummary AS (
+    -- Analyze post activity, edits, and comment engagement, restricted to HighlyEngagedPosts
+    SELECT
+        hep.PostId,
+        hep.PostTypeId,
+        hep.Title,
+        hep.CreationDate AS PostCreationDate,
+        hep.LastActivityDate,
+        hep.ViewCount,
+        hep.Score,
+        hep.OwnerUserId,
+        hep.AcceptedAnswerId,
+        hep.CommentCount,
+        hep.ClosedDate,
+        COUNT(DISTINCT ph.Id) AS EditHistoryCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS MajorEditCount, -- Title, Body, Tags edits
+        COUNT(DISTINCT ph.UserId) AS DistinctEditors,
+        pvs.UpvoteCount,
+        pvs.DownvoteCount,
+        pvs.FavoriteCount,
+        CAST(AVG(COALESCE(c.Score, 0)) AS DECIMAL(10, 2)) AS AvgCommentScore,
+        -- Calculate age of post in days until last activity
+        EXTRACT(EPOCH FROM (hep.LastActivityDate - hep.CreationDate)) / (60 * 60 * 24) AS PostActivityDays,
+        -- Check if post has controversial scores (many upvotes AND many downvotes)
+        (COALESCE(pvs.UpvoteCount, 0) > 10 AND COALESCE(pvs.DownvoteCount, 0) > 5) AS IsControversial,
+        -- Correlated subquery: Get the most recent significant edit comment (if any)
+        (
+            SELECT Comment
+            FROM PostHistory AS ph_corr
+            WHERE ph_corr.PostId = hep.PostId
+              AND ph_corr.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+              AND ph_corr.Comment IS NOT NULL
+            ORDER BY ph_corr.CreationDate DESC
+            LIMIT 1
+        ) AS LastEditComment
+    FROM HighlyEngagedPosts AS hep
+    LEFT JOIN PostHistory AS ph ON hep.PostId = ph.PostId
+    LEFT JOIN PostVoteSummary AS pvs ON hep.PostId = pvs.PostId
+    LEFT JOIN Comments AS c ON hep.PostId = c.PostId
+    GROUP BY
+        hep.PostId, hep.PostTypeId, hep.Title, hep.CreationDate, hep.LastActivityDate, hep.ViewCount, hep.Score,
+        hep.OwnerUserId, hep.AcceptedAnswerId, hep.CommentCount, hep.ClosedDate,
+        pvs.UpvoteCount, pvs.DownvoteCount, pvs.FavoriteCount
+),
+TagPerformance AS (
+    -- Analyze performance of tags associated with questions (only highly engaged ones now)
+    SELECT
+        UPPER(TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')))) AS TagName,
+        COUNT(p.Id) AS TaggedPostsCount,
+        SUM(p.Score) AS TotalTagScore,
+        CAST(AVG(p.ViewCount) AS DECIMAL(10, 2)) AS AvgTagViewCount,
+        DENSE_RANK() OVER (ORDER BY SUM(p.Score) DESC, COUNT(p.Id) DESC) AS TagScoreRank -- Rank tags by total score
+    FROM Posts AS p
+    -- Join with HighlyEngagedPosts to restrict tag analysis to these posts
+    JOIN HighlyEngagedPosts AS hep ON p.Id = hep.PostId
+    WHERE p.PostTypeId = 1 -- Only questions have tags in this context
+      AND p.Tags IS NOT NULL
+      AND LENGTH(p.Tags) > 2 -- Ensure tags string is not just '<>'
+    GROUP BY
+        UPPER(TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))))
+    HAVING
+        COUNT(p.Id) >= 5 -- Only consider tags with at least 5 posts
+),
+PostLinkAnalysis AS (
+    -- Identify linked and duplicate posts for highly engaged posts
+    SELECT
+        pl.PostId,
+        COUNT(CASE WHEN lt.Name = 'Linked' THEN 1 END) AS LinkedToCount,
+        COUNT(CASE WHEN lt.Name = 'Duplicate' THEN 1 END) AS IsDuplicateOfCount,
+        -- Aggregate duplicate post IDs into a comma-separated string
+        STRING_AGG(CASE WHEN lt.Name = 'Duplicate' THEN CAST(pl.RelatedPostId AS TEXT) ELSE NULL END, '; ' ORDER BY pl.RelatedPostId) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateOfPostsList,
+        -- Correlated subquery: Check if this post is itself referenced as a duplicate of another post
+        EXISTS (
+            SELECT 1
+            FROM PostLinks AS pl_rev
+            WHERE pl_rev.RelatedPostId = pl.PostId AND pl_rev.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate')
+        ) AS IsReferencedAsDuplicate
+    FROM PostLinks AS pl
+    JOIN LinkTypes AS lt ON pl.LinkTypeId = lt.Id
+    -- Only consider links for posts in HighlyEngagedPosts
+    JOIN HighlyEngagedPosts AS hep ON pl.PostId = hep.PostId
+    GROUP BY
+        pl.PostId
+)
+-- Main query combining all insights
+SELECT
+    ucs.DisplayName AS User_DisplayName,
+    ucs.Reputation,
+    ucs.ReputationTier,
+    TO_CHAR(ucs.UserCreationDate, 'YYYY-MM-DD HH24:MI:SS') AS User_CreationDate,
+    TO_CHAR(ucs.LastAccessDate, 'YYYY-MM-DD HH24:MI:SS') AS User_LastAccessDate,
+    ucs.TotalPosts,
+    ucs.TotalQuestions,
+    ucs.TotalAnswers,
+    ucs.TotalComments,
+    ucs.TotalPostScore,
+    ucs.TotalCommentScore,
+    ucs.TotalBadges,
+    ucs.AvgQuestionScore,
+    pa.PostId, -- Include PostId for easier debugging/identification
+    COALESCE(pa.Title, 'N/A') AS Post_Title,
+    pt.Name AS Post_Type,
+    pa.ViewCount AS Post_ViewCount,
+    pa.Score AS Post_Score,
+    pa.EditHistoryCount,
+    pa.MajorEditCount,
+    pa.DistinctEditors,
+    pa.UpvoteCount,
+    pa.DownvoteCount,
+    pa.FavoriteCount,
+    pa.CommentCount AS Post_CommentCount,
+    pa.AvgCommentScore AS Post_AvgCommentScore,
+    pa.PostActivityDays,
+    pa.IsControversial AS Post_IsControversial,
+    -- Attempt to get close reason: first from PostHistory comment, then from CloseReasonTypes
+    COALESCE(phist_close.Comment, crt.Name, 'N/A') AS Post_CloseReason,
+    COALESCE(pa.LastEditComment, 'No significant edit comment') AS Post_LastEditComment,
+    COALESCE(tperf.TagName, 'Untagged/Minor Tags') AS Dominant_TagName,
+    COALESCE(tperf.TaggedPostsCount, 0) AS Dominant_TagPostsCount,
+    COALESCE(tperf.TotalTagScore, 0) AS Dominant_TagTotalScore,
+    COALESCE(tperf.AvgTagViewCount, 0.0) AS Dominant_TagAvgViewCount,
+    COALESCE(tperf.TagScoreRank, 9999) AS Dominant_TagScoreRank,
+    COALESCE(pla.LinkedToCount, 0) AS Post_LinkedToCount,
+    COALESCE(pla.IsDuplicateOfCount, 0) AS Post_IsDuplicateOfCount,
+    COALESCE(pla.DuplicateOfPostsList, 'None') AS Post_DuplicateOfPosts,
+    pla.IsReferencedAsDuplicate AS Post_IsReferencedAsDuplicate,
+    -- Window function: Rank users by reputation globally
+    RANK() OVER (ORDER BY ucs.Reputation DESC) AS GlobalUserReputationRank,
+    -- Window function: Calculate average post score for posts owned by users in the same ReputationTier
+    CAST(AVG(pa.Score) OVER (PARTITION BY ucs.ReputationTier) AS DECIMAL(10, 2)) AS AvgPostScore_ByReputationTier,
+    -- Conditional check for 'hot' posts based on combined metrics and post type
+    CASE
+        WHEN pa.ViewCount > 5000 AND pa.Score > 100 AND pa.PostActivityDays < 30 AND pa.PostTypeId = 1 THEN 'Hot Question'
+        WHEN pa.ViewCount > 1000 AND pa.Score > 50 AND pa.PostActivityDays < 60 AND pa.PostTypeId = 2 THEN 'Hot Answer'
+        ELSE 'Warm/Cold'
+    END AS Post_HeatStatus,
+    -- More complex string manipulation example: masked user email hash
+    CASE
+        WHEN u.EmailHash IS NOT NULL AND LENGTH(u.EmailHash) > 8
+        THEN SUBSTRING(u.EmailHash FROM 1 FOR 4) || '...' || SUBSTRING(u.EmailHash FROM LENGTH(u.EmailHash) - 3 FOR 4)
+        ELSE COALESCE(u.EmailHash, 'N/A')
+    END AS Masked_EmailHash_Snippet,
+    -- Null logic: Display special message if AboutMe is null or too short, or a default for long ones
+    COALESCE(
+        CASE
+            WHEN u.AboutMe IS NULL THEN 'User has no "About Me" section.'
+            WHEN LENGTH(u.AboutMe) < 50 THEN 'User has a very short "About Me" section: ' || u.AboutMe
+            ELSE SUBSTRING(u.AboutMe FROM 1 FOR 100) || '...'
+        END,
+        'N/A' -- Fallback if COALESCE itself somehow fails, though it shouldn't for non-NULL expressions
+    ) AS AboutMe_Snippet
+FROM UserContributionStats AS ucs
+LEFT JOIN Users AS u ON ucs.UserId = u.Id
+-- Use INNER JOIN to focus on users who own posts that are deemed highly engaged
+INNER JOIN PostActivitySummary AS pa ON ucs.UserId = pa.OwnerUserId
+LEFT JOIN PostTypes AS pt ON pa.PostTypeId = pt.Id
+LEFT JOIN (
+    -- Subquery for identifying the dominant tag for a post's owner, based on highest scoring tag of their questions
+    SELECT
+        p.OwnerUserId,
+        UPPER(TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')))) AS TagName,
+        SUM(p.Score) AS TagScore,
+        -- Use ROW_NUMBER to pick the top tag per user
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY SUM(p.Score) DESC, COUNT(p.Id) DESC) AS rn
+    FROM Posts AS p
+    -- Restrict to posts owned by users in our stats and that are questions
+    JOIN UserContributionStats AS ucs_tag ON p.OwnerUserId = ucs_tag.UserId
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    GROUP BY p.OwnerUserId, UPPER(TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))))
+) AS DominantUserTag ON ucs.UserId = DominantUserTag.OwnerUserId AND DominantUserTag.rn = 1
+LEFT JOIN TagPerformance AS tperf ON DominantUserTag.TagName = tperf.TagName
+LEFT JOIN PostLinkAnalysis AS pla ON pa.PostId = pla.PostId
+LEFT JOIN PostHistory AS phist_close ON pa.PostId = phist_close.PostId
+    AND phist_close.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Closed')
+LEFT JOIN CloseReasonTypes AS crt ON CAST(phist_close.Comment AS SMALLINT) = crt.Id -- Assuming Comment contains CloseReasonId for type 10
+WHERE
+    (ucs.Reputation > 1000 AND pa.PostId IS NOT NULL) -- Filter for sufficiently reputable users and ensure a post is linked
+ORDER BY
+    GlobalUserReputationRank ASC,
+    pa.Post_HeatStatus DESC,
+    pa.CreationDate DESC
+LIMIT 500;

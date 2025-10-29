@@ -1,0 +1,153 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        NULL::integer AS ParentTagId
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+    UNION ALL
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Id
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r 
+      ON substring(t.TagName from 1 for 1) = 'p' 
+     AND r.TagName LIKE '%' || substring(t.TagName from 1 for 1) || '%' 
+     AND t.Id <> r.Id
+    WHERE r.Level < 3
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS Questions,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS Answers,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        COALESCE(SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END), 0) AS TotalUpVotes,
+        COALESCE(SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END), 0) AS TotalDownVotes,
+        MAX(b.Class) AS HighestBadgeClass
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate > u.CreationDate
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+        dense_rank() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        row_number() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) AS ViewRank
+    FROM Posts p
+    WHERE p.CreationDate BETWEEN TIMESTAMP '2022-01-01' AND TIMESTAMP '2024-01-01'
+),
+TopQuestionsWithAnswers AS (
+    SELECT 
+        psq.Id AS QuestionId,
+        psq.Tags,
+        psq.Score AS QuestionScore,
+        psa.Id AS AnswerId,
+        psa.Score AS AnswerScore,
+        psa.OwnerUserId AS AnswerOwnerUserId,
+        u.DisplayName AS AnswerOwnerName,
+        row_number() OVER (PARTITION BY psq.Id ORDER BY psa.Score DESC, psa.CreationDate ASC) AS AnswerRank
+    FROM PostStats psq
+    LEFT JOIN Posts psa ON psa.ParentId = psq.Id AND psa.PostTypeId = 2
+    LEFT JOIN Users u ON u.Id = psa.OwnerUserId
+    WHERE psq.PostTypeId = 1 AND psq.Score >= 10
+),
+CloseVotesSummary AS (
+    SELECT 
+        ph.PostId,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVotes,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN CAST(ph.Comment AS integer) ELSE NULL END) AS CloseReasonId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+PostsWithCloseInfo AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(cv.CloseVotes, 0) AS CloseVotes,
+        cv.CloseReasonId
+    FROM Posts p
+    LEFT JOIN CloseVotesSummary cv ON cv.PostId = p.Id
+    WHERE p.PostTypeId = 1
+)
+SELECT 
+    u.UserId,
+    u.DisplayName,
+    u.Questions,
+    u.Answers,
+    u.CommentsCount,
+    u.TotalUpVotes,
+    u.TotalDownVotes,
+    CASE u.HighestBadgeClass 
+        WHEN 1 THEN 'Gold'
+        WHEN 2 THEN 'Silver'
+        WHEN 3 THEN 'Bronze' 
+        ELSE 'None' END AS BestBadge,
+    q.QuestionId,
+    q.Tags AS QuestionTags,
+    q.QuestionScore,
+    q.AnswerId,
+    q.AnswerScore,
+    q.AnswerOwnerName,
+    p.Title AS PostTitle,
+    p.CloseVotes,
+    cr.Name AS CloseReason,
+    CASE WHEN POSITION('<sql>' IN COALESCE(p.Tags, '')) > 0 THEN 'Contains SQL Tag'
+         ELSE 'No SQL Tag' END AS SQLTagPresence,
+    row_number() OVER (PARTITION BY u.UserId ORDER BY q.QuestionScore DESC) AS UserQuestionRank
+FROM UserActivity u
+LEFT JOIN TopQuestionsWithAnswers q ON q.AnswerOwnerUserId = u.UserId AND q.AnswerRank = 1
+LEFT JOIN PostsWithCloseInfo p ON p.Id = q.QuestionId
+LEFT JOIN CloseReasonTypes cr ON cr.Id = p.CloseReasonId
+WHERE u.Questions > 0 AND u.TotalUpVotes > u.TotalDownVotes
+
+UNION
+
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    0 AS Questions,
+    0 AS Answers,
+    0 AS CommentsCount,
+    0 AS TotalUpVotes,
+    0 AS TotalDownVotes,
+    'None' AS BestBadge,
+    NULL::integer AS QuestionId,
+    NULL::text AS QuestionTags,
+    NULL::integer AS QuestionScore,
+    NULL::integer AS AnswerId,
+    NULL::integer AS AnswerScore,
+    NULL::text AS AnswerOwnerName,
+    NULL::text AS PostTitle,
+    NULL::integer AS CloseVotes,
+    NULL::text AS CloseReason,
+    NULL::text AS SQLTagPresence,
+    NULL::integer AS UserQuestionRank
+FROM Users u
+LEFT JOIN UserActivity ua ON ua.UserId = u.Id
+WHERE ua.UserId IS NULL
+ORDER BY UserId, UserQuestionRank NULLS LAST;

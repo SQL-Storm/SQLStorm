@@ -1,0 +1,141 @@
+WITH
+LargeTags AS (
+    SELECT  t.Id   AS TagId,
+            t.TagName,
+            t.Count
+    FROM    Tags t
+    WHERE   t.Count > 5000
+),
+RecentQuestions AS (
+    SELECT  p.Id                         AS QuestionId,
+            p.Title,
+            p.CreationDate,
+            p.OwnerUserId               AS QuestionOwnerId,
+            unnest(string_to_array(
+                     substring(p.Tags FROM 2 FOR length(p.Tags)-2),
+                     '><'))                AS TagName
+    FROM    Posts p
+    WHERE   p.PostTypeId = 1
+      AND   p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '12 months')
+),
+RecentAnswers AS (
+    SELECT  a.Id                         AS AnswerId,
+            a.ParentId                   AS QuestionId,
+            a.OwnerUserId                AS AnswerOwnerId,
+            a.Score,
+            a.CreationDate
+    FROM    Posts a
+    WHERE   a.PostTypeId = 2
+      AND   a.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '12 months')
+),
+AnswerLatestVote AS (
+    SELECT  v.PostId                     AS AnswerId,
+            MAX(v.CreationDate)          AS LatestVoteDate
+    FROM    Votes v
+    WHERE   v.VoteTypeId IN (2,3)
+    GROUP BY v.PostId
+),
+GoldBadgeUsers AS (
+    SELECT  DISTINCT b.UserId            AS UserId
+    FROM    Badges b
+    WHERE   b.Class = 1
+),
+TagUserStats AS (
+    SELECT
+        lt.TagName,
+        u.Id                                    AS UserId,
+        COALESCE(u.DisplayName, '[deleted]')   AS UserDisplay,
+        COUNT(DISTINCT ra.AnswerId)             AS AnswersGiven,
+        SUM(ra.Score)                           AS TotalAnswerScore,
+        AVG(ra.Score)                           AS AvgAnswerScore,
+        MAX(rq.CreationDate)                    AS MostRecentQuestionAnswered,
+        MAX(alv.LatestVoteDate)                 AS MostRecentVoteOnAnyAnswer,
+        COUNT(DISTINCT b.Id)                    AS BadgeCount,
+        MAX(CASE WHEN gb.UserId IS NOT NULL THEN 1 ELSE 0 END) AS HasGoldBadge,
+        ROW_NUMBER() OVER (PARTITION BY lt.TagName
+                           ORDER BY SUM(ra.Score) DESC,
+                                    COUNT(DISTINCT ra.AnswerId) DESC) AS TagRank
+    FROM
+        LargeTags lt
+        LEFT JOIN RecentQuestions rq
+               ON lt.TagName = rq.TagName
+        LEFT JOIN RecentAnswers ra
+               ON ra.QuestionId = rq.QuestionId
+        LEFT JOIN Users u
+               ON u.Id = ra.AnswerOwnerId
+        LEFT JOIN AnswerLatestVote alv
+               ON alv.AnswerId = ra.AnswerId
+        LEFT JOIN Badges b
+               ON b.UserId = u.Id
+        LEFT JOIN GoldBadgeUsers gb
+               ON gb.UserId = u.Id
+    WHERE
+        u.Id IS NOT NULL
+        AND (u.Reputation > 10000
+             OR gb.UserId IS NOT NULL)
+        AND (u.Location IS NOT NULL AND u.Location <> '')
+    GROUP BY
+        lt.TagName,
+        u.Id,
+        u.DisplayName,
+        gb.UserId
+),
+TopContributors AS (
+    SELECT *
+    FROM   TagUserStats
+    WHERE  TagRank <= 3
+),
+HighRepNoAnswers AS (
+    SELECT
+        NULL                              AS TagName,
+        u.Id                              AS UserId,
+        COALESCE(u.DisplayName, '[deleted]') AS UserDisplay,
+        0                                 AS AnswersGiven,
+        0                                 AS TotalAnswerScore,
+        NULL                              AS AvgAnswerScore,
+        NULL                              AS MostRecentQuestionAnswered,
+        NULL                              AS MostRecentVoteOnAnyAnswer,
+        COUNT(b.Id)                       AS BadgeCount,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        NULL                              AS TagRank
+    FROM   Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE  u.Reputation >= 20000
+      AND  NOT EXISTS (
+            SELECT 1
+            FROM   RecentAnswers ra
+            WHERE  ra.AnswerOwnerId = u.Id
+          )
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    COALESCE(t.TagName, 'N/A')                 AS Tag,
+    t.UserId,
+    t.UserDisplay,
+    t.AnswersGiven,
+    t.TotalAnswerScore,
+    ROUND(t.AvgAnswerScore::double precision::numeric,2)   AS AvgScore,
+    t.MostRecentQuestionAnswered,
+    t.MostRecentVoteOnAnyAnswer,
+    t.BadgeCount,
+    CASE WHEN t.HasGoldBadge = 1 THEN 'YES' ELSE 'NO' END AS HasGoldBadge,
+    t.TagRank
+FROM   TopContributors t
+UNION ALL
+SELECT
+    'N/A'                                      AS Tag,
+    h.UserId,
+    h.UserDisplay,
+    h.AnswersGiven,
+    h.TotalAnswerScore,
+    NULL                                       AS AvgScore,
+    NULL                                       AS MostRecentQuestionAnswered,
+    NULL                                       AS MostRecentVoteOnAnyAnswer,
+    h.BadgeCount,
+    CASE WHEN h.HasGoldBadge = 1 THEN 'YES' ELSE 'NO' END AS HasGoldBadge,
+    NULL                                       AS TagRank
+FROM   HighRepNoAnswers h
+ORDER BY
+    Tag,
+    TagRank NULLS LAST,
+    TotalAnswerScore DESC;

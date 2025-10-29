@@ -1,0 +1,215 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS AncestorTags,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.AncestorTags || t2.TagName,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id AND t2.Count < r.Count
+    WHERE r.Level < 3
+),
+
+QuestionStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        u.Reputation AS OwnerReputation,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST, p.CreationDate DESC) AS OwnerTopQuestionRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.AnswerCount, p.CommentCount, u.Reputation, u.DisplayName
+),
+
+AnswerDetails AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        u.Reputation AS AnswererReputation,
+        u.DisplayName AS AnswererDisplayName,
+        (CASE WHEN EXISTS (
+            SELECT 1
+            FROM Votes v
+            WHERE v.PostId = a.Id
+              AND v.VoteTypeId = 2
+              AND v.UserId IS NOT NULL
+              AND v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+        ) THEN TRUE ELSE FALSE END) AS HasRecentUpvotes
+    FROM Posts a
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate, u.Reputation, u.DisplayName
+),
+
+CloseHistories AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastCloseDate,
+        STRING_AGG(DISTINCT COALESCE(crt.Name, ph.Comment), ', ') AS CloseReasons
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON (CASE WHEN ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS INTEGER) ELSE NULL END) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year') AS QuestionsLastYear,
+        COUNT(DISTINCT p2.Id) FILTER (WHERE p2.PostTypeId = 2 AND p2.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year') AS AnswersLastYear,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+
+RecentComments AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS RecentCommentCount,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(SUBSTRING(COALESCE(c.Text, ''), 1, 30), ' | ' ORDER BY c.CreationDate DESC) AS RecentCommentSamples
+    FROM Comments c
+    WHERE c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+    GROUP BY c.PostId
+),
+
+CombinedPosts AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.OwnerDisplayName,
+        q.OwnerReputation,
+        q.CreationDate AS QuestionDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount AS QuestionCommentCount,
+        ad.AnswerId,
+        ad.AnswerScore,
+        ad.AnswerCreationDate,
+        ad.AnswererReputation,
+        ad.AnswererDisplayName,
+        ad.HasRecentUpvotes,
+        ch.LastCloseDate,
+        ch.CloseReasons,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalBadges,
+        rc.RecentCommentCount,
+        rc.LastCommentDate,
+        rc.RecentCommentSamples,
+        ua.QuestionsLastYear,
+        ua.AnswersLastYear,
+        ua.ReputationRank,
+        CASE
+            WHEN q.Tags IS NOT NULL AND LENGTH(q.Tags) > 4 THEN
+                SUBSTRING(split_part(q.Tags, '><', 1) FROM 2) || ';' || split_part(q.Tags, '><', 2)
+            ELSE 'NoTags'
+        END AS SampleTagExpression
+    FROM QuestionStats q
+    LEFT JOIN AnswerDetails ad ON q.QuestionId = ad.QuestionId
+    LEFT JOIN CloseHistories ch ON q.QuestionId = ch.PostId
+    LEFT JOIN UserBadgeCounts ub ON q.OwnerUserId = ub.UserId
+    LEFT JOIN RecentComments rc ON q.QuestionId = rc.PostId
+    LEFT JOIN UserActivityWindow ua ON q.OwnerUserId = ua.UserId
+    WHERE q.OwnerUserId IS NOT NULL
+),
+
+RankedPosts AS (
+    SELECT
+        cp.*,
+        DENSE_RANK() OVER (
+            PARTITION BY OwnerUserId
+            ORDER BY QuestionScore DESC, AnswerScore DESC NULLS LAST, QuestionDate DESC
+        ) AS UserPostRank,
+        ROW_NUMBER() OVER (
+            ORDER BY COALESCE(QuestionScore, 0) + COALESCE(AnswerScore, 0) DESC,
+                     COALESCE(ViewCount, 0) DESC
+        ) AS GlobalRank
+    FROM CombinedPosts cp
+)
+
+SELECT
+    rp.QuestionId,
+    rp.Title,
+    rp.OwnerDisplayName,
+    rp.OwnerReputation,
+    rp.QuestionDate,
+    rp.QuestionScore,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.AnswerId,
+    rp.AnswerScore,
+    rp.AnswerCreationDate,
+    rp.AnswererDisplayName,
+    rp.AnswererReputation,
+    rp.HasRecentUpvotes,
+    rp.LastCloseDate,
+    rp.CloseReasons,
+    rp.GoldBadges,
+    rp.SilverBadges,
+    rp.BronzeBadges,
+    rp.TotalBadges,
+    rp.RecentCommentCount,
+    rp.LastCommentDate,
+    rp.RecentCommentSamples,
+    rp.QuestionsLastYear,
+    rp.AnswersLastYear,
+    rp.ReputationRank,
+    rp.SampleTagExpression,
+    rp.UserPostRank,
+    rp.GlobalRank
+FROM RankedPosts rp
+WHERE
+    (
+        (rp.QuestionScore > 10 AND rp.AnswerScore > 5)
+        OR COALESCE(rp.GoldBadges, 0) > 0
+        OR (rp.LastCloseDate IS NULL AND rp.AnswerCount > 3)
+    )
+    AND rp.QuestionDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+    AND rp.OwnerReputation > 1000
+ORDER BY
+    rp.GlobalRank
+LIMIT 100;

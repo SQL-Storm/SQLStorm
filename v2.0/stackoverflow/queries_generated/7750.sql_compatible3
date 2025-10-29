@@ -1,0 +1,275 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvotesReceived,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownvotesReceived,
+        MAX(p.CreationDate) AS LastPostDate,
+        CAST((JULIANDAY('2024-10-01 12:34:56') - JULIANDAY(u.CreationDate)) AS INTEGER) AS AccountAgeDays,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostActivityRank,
+        AVG(CAST(p.Score AS FLOAT)) AS AvgPostScore,
+        GROUP_CONCAT(CASE WHEN p.PostTypeId = 1 THEN p.Title ELSE NULL END, '; ') AS QuestionTitles
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.Tags,
+        GROUP_CONCAT(CASE WHEN v.VoteTypeId = 2 THEN '1' ELSE NULL END, '') AS UpvoteCounts,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvoteCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownvoteCount,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2) AS AnswerCountWithDeleted,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2 AND a.DeletedDate IS NULL) AS AnswerCountActive,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountForQuestion,
+        CAST((JULIANDAY('2024-10-01 12:34:56') - JULIANDAY(p.CreationDate)) AS INTEGER) AS DaysSinceCreation,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS Status
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1 
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.CreationDate, p.OwnerUserId, u.DisplayName, p.Tags, p.ClosedDate
+),
+UserBadgesWithRanking AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS BadgeRank,
+        COUNT(*) OVER (PARTITION BY b.UserId) AS TotalBadges,
+        CASE 
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver'
+            WHEN b.Class = 3 THEN 'Bronze'
+            ELSE 'Unknown'
+        END AS BadgeTier,
+        DENSE_RANK() OVER (ORDER BY b.Class, b.Date) AS BadgeSequence
+    FROM Badges b
+    WHERE b.TagBased = 0
+),
+TagPerformance AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsageCount,
+        t.ExcerptPostId,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS RelatedPostCount,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS AvgScoreForTag,
+        (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS LastUsedTagDate,
+        CASE 
+            WHEN t.Count > 500 THEN 'High'
+            WHEN t.Count > 100 THEN 'Medium'
+            WHEN t.Count > 10 THEN 'Low'
+            ELSE 'Very Low'
+        END AS UsageLevel
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+),
+RecentActivity AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        CAST((JULIANDAY('2024-10-01 12:34:56') - JULIANDAY(p.CreationDate)) AS INTEGER) AS DaysOld
+    FROM Posts p
+    WHERE p.CreationDate >= DATETIME('2024-10-01 12:34:56', '-30 days')
+),
+TagBasedBadges AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date AS BadgeDate,
+        t.TagName,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId, t.TagName ORDER BY b.Date DESC) AS BadgeRowNumber
+    FROM Badges b
+    JOIN Tags t ON b.Name = t.TagName
+    WHERE b.TagBased = 1
+),
+ComplexAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.UpvotesReceived,
+        uas.DownvotesReceived,
+        uas.AccountAgeDays,
+        uas.ReputationRank,
+        uas.PostActivityRank,
+        uas.AvgPostScore,
+        uas.QuestionTitles,
+        COALESCE(tq.Title, 'No Top Questions') AS TopQuestionTitle,
+        COALESCE(tq.Score, 0) AS TopQuestionScore,
+        tq.AnswerCount AS TopQuestionAnswerCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = tq.QuestionId AND v.VoteTypeId IN (2,3)) AS TotalVotesOnTopQuestion,
+        (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.PostId = tq.QuestionId) AS LastVoteOnTopQuestion,
+        (SELECT AVG(CAST((JULIANDAY(p.LastActivityDate) - JULIANDAY(p.CreationDate)) AS FLOAT)) FROM Posts p WHERE p.ParentId = tq.QuestionId AND p.PostTypeId = 2) AS AvgAnswerAge,
+        CASE 
+            WHEN (uas.PostCount * 1.0 / NULLIF(uas.AccountAgeDays,0)) > 0.1 THEN 'High Activity'
+            WHEN (uas.PostCount * 1.0 / NULLIF(uas.AccountAgeDays,0)) > 0.05 THEN 'Moderate Activity'
+            ELSE 'Low Activity'
+        END AS ActivityLevel,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId = 1 AND ph.CreationDate >= DATETIME('2024-10-01 12:34:56', '-7 days')) AS RecentEditsInLastWeek,
+        (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (10, 11, 12) AND ph.CreationDate >= DATETIME('2024-10-01 12:34:56', '-30 days')) AS RecentPostActionCount,
+        (SELECT GROUP_CONCAT(b.BadgeName, ', ') FROM UserBadgesWithRanking b WHERE b.UserId = uas.UserId AND b.BadgeRank <= 3) AS Top3Badges,
+        (SELECT COUNT(*) FROM UserBadgesWithRanking b WHERE b.UserId = uas.UserId AND b.Class = 1) AS GoldBadgeCount,
+        (SELECT COUNT(*) FROM UserBadgesWithRanking b WHERE b.UserId = uas.UserId AND b.Class = 2) AS SilverBadgeCount,
+        (SELECT COUNT(*) FROM UserBadgesWithRanking b WHERE b.UserId = uas.UserId AND b.Class = 3) AS BronzeBadgeCount,
+        CASE 
+            WHEN uas.QuestionCount > 0 AND (uas.AnswerCount * 1.0 / NULLIF(uas.QuestionCount,0)) > 2 THEN 'Active Helper'
+            WHEN uas.QuestionCount > 0 AND (uas.AnswerCount * 1.0 / NULLIF(uas.QuestionCount,0)) > 1 THEN 'Regular Contributor'
+            ELSE 'Occasional Poster'
+        END AS ContributorType,
+        COALESCE(
+            (SELECT MAX(t.TagUsageCount) FROM TagPerformance t WHERE t.TagName IN (
+                SELECT DISTINCT SUBSTR(p.Tags,
+                    INSTR(p.Tags, '<') + 1,
+                    INSTR(p.Tags, '>', INSTR(p.Tags, '<')) - INSTR(p.Tags, '<') - 1
+                )
+                FROM Posts p
+                WHERE p.OwnerUserId = uas.UserId AND p.Tags IS NOT NULL AND p.Tags != ''
+            )), 0) AS MaxTagUsage,
+        (SELECT AVG(v.Score) FROM Votes v JOIN Posts p ON v.PostId = p.Id WHERE p.OwnerUserId = uas.UserId) AS AvgVoteScoreReceived,
+        (SELECT GROUP_CONCAT(ph.Comment || ': ' || ph.Text, '; ') 
+         FROM PostHistory ph 
+         WHERE ph.UserId = uas.UserId 
+         AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) 
+         AND ph.CreationDate >= DATETIME('2024-10-01 12:34:56', '-14 days')
+        ) AS RecentEditComments,
+        (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = uas.UserId AND ph.PostHistoryTypeId IN (10,11,12,13) AND CAST((JULIANDAY('2024-10-01 12:34:56') - JULIANDAY(ph.CreationDate)) AS INTEGER) <= 7) AS RecentPostChanges,
+        (SELECT t.UsageLevel FROM TagPerformance t 
+         WHERE EXISTS (
+             SELECT 1 FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.Tags LIKE '%' || t.TagName || '%'
+         ) AND t.TagName IS NOT NULL
+         ORDER BY t.TagUsageCount DESC
+         LIMIT 1
+        ) AS MostUsedTagLevel
+    FROM UserActivityStats uas
+    LEFT JOIN TopQuestions tq ON uas.QuestionCount > 0 AND tq.UpvoteCount = (SELECT MAX(UpvoteCount) FROM TopQuestions WHERE OwnerUserId = uas.UserId)
+    WHERE uas.PostCount > 0
+    GROUP BY
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.UpvotesReceived,
+        uas.DownvotesReceived,
+        uas.AccountAgeDays,
+        uas.ReputationRank,
+        uas.PostActivityRank,
+        uas.AvgPostScore,
+        uas.QuestionTitles,
+        tq.Title,
+        tq.Score,
+        tq.AnswerCount,
+        tq.QuestionId
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.PostCount,
+    ca.QuestionCount,
+    ca.AnswerCount,
+    ca.CommentCount,
+    ca.BadgeCount,
+    ca.UpvotesReceived,
+    ca.DownvotesReceived,
+    ca.ActivityLevel,
+    ca.ContributorType,
+    ca.TopQuestionTitle,
+    ca.TopQuestionScore,
+    ca.TopQuestionAnswerCount,
+    ca.RecentEditsInLastWeek,
+    ca.TotalVotesOnTopQuestion,
+    ca.MaxTagUsage,
+    ca.GoldBadgeCount,
+    ca.SilverBadgeCount,
+    ca.BronzeBadgeCount,
+    ca.Top3Badges,
+    (CASE WHEN ca.GoldBadgeCount > 0 THEN 'Gold Badge Holder' ELSE 'No Gold Badges' END) AS GoldBadgeStatus,
+    CASE WHEN ca.Reputation > 100000 THEN 'Elite' 
+         WHEN ca.Reputation > 50000 THEN 'Veteran' 
+         WHEN ca.Reputation > 10000 THEN 'Expert' 
+         ELSE 'Newbie' END AS ReputationTier,
+    COALESCE(ca.MostUsedTagLevel, 'None') AS TopTagUsageLevel,
+    (SELECT COUNT(*) FROM TagBasedBadges tb WHERE tb.UserId = ca.UserId) AS TagBasedBadgesCount,
+    (SELECT tb.TagName FROM TagBasedBadges tb WHERE tb.UserId = ca.UserId ORDER BY tb.BadgeDate DESC LIMIT 1) AS LastTagBadgeTag,
+    (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = ca.UserId AND ph.PostHistoryTypeId IN (10,11,12,13) AND CAST((JULIANDAY('2024-10-01 12:34:56') - JULIANDAY(ph.CreationDate)) AS INTEGER) <= 30) AS RecentPostActions30Days,
+    (SELECT MAX(rh.CreationDate) FROM PostHistory rh WHERE rh.UserId = ca.UserId) AS LastActionDate,
+    CAST((JULIANDAY('2024-10-01 12:34:56') - JULIANDAY((SELECT MIN(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = ca.UserId))) AS INTEGER) AS LifetimeActiveDays,
+    COALESCE(ca.AvgPostScore * 1.0 / NULLIF(ca.PostCount, 0), 0) AS ScorePerPostRatio,
+    (SELECT GROUP_CONCAT(u.DisplayName || '(' || u.Id || ')', ', ') 
+     FROM Users u 
+     WHERE u.Id IN (
+         SELECT DISTINCT p.OwnerUserId 
+         FROM Posts p 
+         WHERE p.ParentId IN (
+             SELECT Id FROM Posts WHERE OwnerUserId = ca.UserId AND PostTypeId = 1
+         )
+     )
+    ) AS QuestionsAskedByOthersOnUsersAnswers,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ca.UserId AND b.Class = 1 AND b.Date >= DATETIME('2024-10-01 12:34:56', '-1 years')) AS GoldBadgesLastYear,
+    (SELECT GROUP_CONCAT(t.TagName || ': ' || t.Count, '; ') 
+     FROM TagPerformance t 
+     WHERE t.TagUsageCount > (SELECT AVG(TagUsageCount) FROM TagPerformance) * 1.5
+    ) AS AboveAverageTagUsage,
+    CASE 
+        WHEN ca.QuestionCount > 0 AND (ca.AnswerCount * 1.0 / NULLIF(ca.QuestionCount,0)) > 3 THEN 'Overachiever'
+        WHEN ca.QuestionCount > 0 AND (ca.AnswerCount * 1.0 / NULLIF(ca.QuestionCount,0)) > 1 THEN 'Contributor'
+        ELSE 'Supporter'
+    END AS CommunityRole,
+    RANK() OVER (ORDER BY ca.Reputation DESC, ca.PostCount DESC) AS OverallRank,
+    (SELECT COUNT(*) FROM (
+        SELECT 1 FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 1
+        UNION ALL
+        SELECT 1 FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 2
+    ) x) AS TotalPostsAndAnswers
+FROM ComplexAnalysis ca
+WHERE ca.Reputation > 0
+AND ca.PostCount > 0
+AND (ca.Reputation > 1000 OR ca.BadgeCount > 5 OR ca.PostCount > 10 OR ca.QuestionCount > 0)
+ORDER BY ca.Reputation DESC, ca.PostCount DESC, ca.ReputationRank ASC
+LIMIT 10000 OFFSET 0;

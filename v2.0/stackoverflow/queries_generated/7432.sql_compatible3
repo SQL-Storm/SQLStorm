@@ -1,0 +1,279 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN COALESCE(p.Score,0) ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN COALESCE(p.Score,0) ELSE 0 END) AS TotalAnswerScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY SUM(COALESCE(p.Score,0)) DESC) AS RankByScore,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS RankByReputation,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS RankByPostCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, '; ') AS QuestionTitles,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Tags END, ', ') AS QuestionTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.PostCount,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.TotalQuestionScore,
+        ua.TotalAnswerScore,
+        ua.AvgQuestionScore,
+        ua.AvgAnswerScore,
+        ua.RankByScore,
+        ua.RankByReputation,
+        ua.RankByPostCount,
+        ua.QuestionTitles,
+        ua.QuestionTags,
+        CASE 
+            WHEN ua.PostCount > 0 THEN 
+                CASE 
+                    WHEN (ua.AnswerCount * 1.0 / ua.PostCount) > 0.7 THEN 'High Answerer'
+                    WHEN (ua.AnswerCount * 1.0 / ua.PostCount) > 0.3 THEN 'Moderate Answerer'
+                    ELSE 'Question Focused'
+                END
+            ELSE 'No Posts'
+        END AS UserType,
+        CASE 
+            WHEN ua.AvgQuestionScore > 10 THEN 'High Scoring Questioner'
+            WHEN ua.AvgQuestionScore > 5 THEN 'Medium Scoring Questioner'
+            ELSE 'Low Scoring Questioner'
+        END AS QuestionScoringLevel,
+        CASE 
+            WHEN ua.AvgAnswerScore > 15 THEN 'High Scoring Answerer'
+            WHEN ua.AvgAnswerScore > 7 THEN 'Medium Scoring Answerer'
+            ELSE 'Low Scoring Answerer'
+        END AS AnswerScoringLevel
+    FROM UserActivity ua
+    LEFT JOIN Posts p ON ua.UserId = p.OwnerUserId
+    GROUP BY 
+        ua.UserId, 
+        ua.DisplayName, 
+        ua.Reputation, 
+        ua.PostCount, 
+        ua.QuestionCount, 
+        ua.AnswerCount, 
+        ua.TotalQuestionScore, 
+        ua.TotalAnswerScore, 
+        ua.AvgQuestionScore, 
+        ua.AvgAnswerScore, 
+        ua.RankByScore, 
+        ua.RankByReputation, 
+        ua.RankByPostCount, 
+        ua.QuestionTitles, 
+        ua.QuestionTags
+),
+UserPosts AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.CreationDate,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Gold'
+            WHEN p.Score >= 50 THEN 'Silver'
+            WHEN p.Score >= 10 THEN 'Bronze'
+            ELSE 'Common'
+        END AS ScoreTier,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' AND (
+                 (CHAR_LENGTH(p.Tags) - CHAR_LENGTH(REPLACE(p.Tags, '>', ''))) + 1
+                 ) > 2 THEN 'Richly Tagged'
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 'Tagged'
+            ELSE 'Untagged'
+        END AS TagStatus,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostSequence,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostDate,
+        EXTRACT(DAY FROM (p.CreationDate - LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate))) AS DaysSinceLastPost
+    FROM Posts p
+),
+PostAggregations AS (
+    SELECT 
+        p.Id,
+        p.ParentId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.Title,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        CASE 
+            WHEN p.Score > 1000 THEN 'Viral'
+            WHEN p.Score > 500 THEN 'Popular'
+            WHEN p.Score > 100 THEN 'Notable'
+            WHEN p.Score > 50 THEN 'Interesting'
+            ELSE 'Ordinary'
+        END AS Popularity,
+        CASE 
+            WHEN p.Score > COALESCE(p.AnswerCount,0) THEN 'Question with High Engagement'
+            WHEN COALESCE(p.AnswerCount,0) > 0 THEN 'Answered Question'
+            WHEN p.PostTypeId = 1 THEN 'Unanswered Question'
+            ELSE 'Other'
+        END AS PostCategory,
+        STRING_AGG(DISTINCT CASE WHEN c.Text IS NOT NULL THEN c.Text END, '; ') AS Comments,
+        STRING_AGG(DISTINCT b.Name, ', ') AS BadgeNames
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN (
+        SELECT 
+            b.UserId,
+            STRING_AGG(b.Name, ', ') AS Name
+        FROM Badges b
+        GROUP BY b.UserId
+    ) b ON p.OwnerUserId = b.UserId
+    WHERE p.Id IS NOT NULL
+    GROUP BY 
+        p.Id, 
+        p.ParentId, 
+        p.OwnerUserId, 
+        p.PostTypeId, 
+        p.Score, 
+        p.Title, 
+        p.CreationDate, 
+        p.LastActivityDate, 
+        p.ViewCount, 
+        p.AnswerCount, 
+        p.CommentCount, 
+        p.Tags
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Extremely Popular'
+            WHEN t.Count > 500 THEN 'Very Popular'
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 10 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS PopularityLevel,
+        CASE 
+            WHEN t.IsRequired = TRUE THEN 'Required'
+            WHEN t.IsModeratorOnly = TRUE THEN 'Moderator Only'
+            ELSE 'Public'
+        END AS AccessLevel,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, '; ') AS QuestionTitles,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Body END, '; ') AS QuestionBodies
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE t.TagName IS NOT NULL
+    GROUP BY 
+        t.TagName, 
+        t.Count, 
+        t.ExcerptPostId, 
+        t.WikiPostId, 
+        t.IsRequired, 
+        t.IsModeratorOnly
+),
+ComplexQueries AS (
+    SELECT 
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.TotalQuestionScore,
+        ua.TotalAnswerScore,
+        ua.QuestionTitles,
+        ua.QuestionTags,
+        CASE 
+            WHEN ua.QuestionCount > 0 THEN (ua.TotalAnswerScore * 1.0 / ua.QuestionCount) 
+            ELSE 0 
+        END AS AvgAnswerScorePerQuestion,
+        CASE 
+            WHEN ua.QuestionCount > 0 THEN (ua.TotalQuestionScore * 1.0 / ua.QuestionCount) 
+            ELSE 0 
+        END AS AvgQuestionScorePerQuestion,
+        (ua.UpVotes * 1.0 / (ua.UpVotes + ua.DownVotes + 1)) AS UpvoteRatio,
+        COUNT(DISTINCT CASE WHEN pu.UserPostSequence = 1 THEN pu.Id END) AS LatestPostCount,
+        COUNT(DISTINCT CASE WHEN pu.UserPostSequence > 1 THEN pu.Id END) AS OlderPostCount,
+        MAX(pu.DaysSinceLastPost) AS MaxDaysSinceLastPost,
+        AVG(pu.Score) AS AvgPostScore,
+        MIN(pu.Score) AS MinPostScore,
+        MAX(pu.Score) AS MaxPostScore,
+        STRING_AGG(DISTINCT pu.ScoreTier, ', ') AS PostScoreTiers,
+        STRING_AGG(DISTINCT pu.TagStatus, ', ') AS TagStatuses,
+        STRING_AGG(DISTINCT CASE WHEN pa.PostCategory = 'Question with High Engagement' THEN pa.Title END, '; ') AS EngagedQuestions,
+        STRING_AGG(DISTINCT CASE WHEN pa.PostCategory = 'Answered Question' THEN pa.Title END, '; ') AS AnsweredQuestions,
+        STRING_AGG(DISTINCT CASE WHEN pa.Popularity = 'Popular' THEN pa.Title END, '; ') AS PopularPosts,
+        STRING_AGG(DISTINCT ta.TagName, ', ') AS UsedTags,
+        STRING_AGG(DISTINCT ta.PopularityLevel, ', ') AS TagPopularityLevels
+    FROM Users u
+    JOIN UserActivity ua ON u.Id = ua.UserId
+    LEFT JOIN UserPosts pu ON u.Id = pu.OwnerUserId
+    LEFT JOIN PostAggregations pa ON u.Id = pa.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON ta.Count > 0
+    WHERE u.Id IS NOT NULL
+    GROUP BY 
+        u.DisplayName, 
+        u.Reputation, 
+        u.Views, 
+        u.UpVotes, 
+        u.DownVotes, 
+        ua.QuestionCount, 
+        ua.AnswerCount, 
+        ua.TotalQuestionScore, 
+        ua.TotalAnswerScore, 
+        ua.QuestionTitles, 
+        ua.QuestionTags
+)
+SELECT 
+    COUNT(*) AS TotalUsers,
+    COUNT(DISTINCT CASE WHEN cq.AvgQuestionScorePerQuestion > 50 THEN cq.DisplayName END) AS HighScoringQuestioners,
+    COUNT(DISTINCT CASE WHEN cq.AvgAnswerScorePerQuestion > 20 THEN cq.DisplayName END) AS HighScoringAnswerers,
+    COUNT(DISTINCT CASE WHEN cq.MaxDaysSinceLastPost > 30 THEN cq.DisplayName END) AS LongInactiveUsers,
+    COUNT(DISTINCT CASE WHEN cq.UpvoteRatio > 0.8 THEN cq.DisplayName END) AS UpvoteMajorityUsers,
+    COUNT(DISTINCT CASE WHEN cq.LatestPostCount > 0 THEN cq.DisplayName END) AS PostActiveUsers,
+    AVG(cq.Reputation) AS MeanReputation,
+    AVG(cq.Views) AS MeanViews,
+    SUM(cq.UpVotes) AS TotalUpVotes,
+    SUM(cq.DownVotes) AS TotalDownVotes,
+    STRING_AGG(DISTINCT CASE WHEN cq.QuestionCount > 0 THEN cq.DisplayName END, '; ') AS QuestionAuthors,
+    STRING_AGG(DISTINCT CASE WHEN cq.AnswerCount > 0 THEN cq.DisplayName END, '; ') AS AnswerAuthors,
+    STRING_AGG(DISTINCT CASE WHEN cq.TotalQuestionScore > 1000 THEN cq.DisplayName END, '; ') AS HighScoreQuestioners,
+    STRING_AGG(DISTINCT CASE WHEN cq.TotalAnswerScore > 1000 THEN cq.DisplayName END, '; ') AS HighScoreAnswerers,
+    STRING_AGG(DISTINCT CASE WHEN cq.TagPopularityLevels LIKE '%Popular%' THEN cq.DisplayName END, '; ') AS PopularTagUsers,
+    STRING_AGG(DISTINCT CASE WHEN cq.QuestionTags IS NOT NULL AND cq.QuestionTags <> '' THEN cq.DisplayName END, '; ') AS TaggedQuestioners
+FROM ComplexQueries cq
+WHERE cq.DisplayName IS NOT NULL
+GROUP BY ()
+HAVING COUNT(*) > 0
+ORDER BY 
+    MAX(cq.Reputation) DESC,
+    MAX(cq.QuestionCount) DESC,
+    MAX(cq.AnswerCount) DESC;

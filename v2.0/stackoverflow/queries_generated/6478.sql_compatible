@@ -1,0 +1,76 @@
+SELECT 
+    u.DisplayName, 
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPost,
+    MAX(p.LastActivityDate) AS LastActivity,
+    b.Name AS LatestBadge,
+    ph.Comment AS LastPostEditComment,
+    v.VoteTypeId AS VoteType
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    (SELECT 
+         ph.PostId, 
+         ph.Comment, 
+         MAX(ph.CreationDate) AS LastEditDate
+     FROM 
+         PostHistory ph
+     WHERE 
+         ph.PostHistoryTypeId = 5 -- Edit Body
+     GROUP BY 
+         ph.PostId, ph.Comment) ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+         p.OwnerUserId, 
+         v.PostId,
+         v.VoteTypeId,
+         ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn
+     FROM 
+         Posts p
+     JOIN 
+         Votes v ON p.Id = v.PostId
+     WHERE 
+         v.VoteTypeId IN (2, 3)) vsub ON u.Id = vsub.OwnerUserId AND vsub.rn = 1
+LEFT JOIN
+    (SELECT OwnerUserId, PostId, VoteTypeId FROM
+         (SELECT p.OwnerUserId, v.PostId, v.VoteTypeId,
+                 ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn
+          FROM Posts p
+          JOIN Votes v ON p.Id = v.PostId
+          WHERE v.VoteTypeId IN (2,3)
+         ) t
+     WHERE rn = 1
+    ) v ON u.Id = v.OwnerUserId
+WHERE 
+    u.Id IN 
+        (SELECT 
+             UserId
+         FROM 
+             (SELECT 
+                  UserId, 
+                  COUNT(*) AS VoteCount
+              FROM 
+                  Votes
+              GROUP BY 
+                  UserId
+              HAVING 
+                  COUNT(*) > 100) sub
+         WHERE 
+             (sub.VoteCount % 2) = 0)
+GROUP BY 
+    u.DisplayName, 
+    u.Reputation, 
+    b.Name,
+    ph.Comment,
+    v.VoteTypeId
+ORDER BY 
+    TotalPosts DESC, 
+    HighestScoredPost DESC;

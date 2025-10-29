@@ -1,0 +1,204 @@
+-- {"query": "2877.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1889} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        array[t.Id] as Path
+    from Tags t
+    where not exists (
+        select 1 from Posts p 
+        where p.PostTypeId = 1 and p.Tags like '%' || '<' || t.TagName || '>' || '%'
+        limit 1
+    )
+    union all
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Path || t.Id
+    from Tags t
+    join Posts p on p.PostTypeId = 1 and p.Tags like '%' || '<' || t.TagName || '>' || '%'
+    join RecursiveTagHierarchy r on r.Id = p.OwnerUserId
+    where not t.Id = any(r.Path)
+), UserBadgeCounts as (
+    select 
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+), UserAggregates as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as TotalUpVotes,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as TotalDownVotes,
+        coalesce(inv.BadgeGold, 0) as GoldBadges,
+        coalesce(inv.BadgeSilver, 0) as SilverBadges,
+        coalesce(inv.BadgeBronze, 0) as BronzeBadges
+    from Users u
+    left join Votes v on v.UserId = u.Id
+    left join (
+        select 
+            UserId,
+            max(case when Class = 1 then BadgeCount else 0 end) as BadgeGold,
+            max(case when Class = 2 then BadgeCount else 0 end) as BadgeSilver,
+            max(case when Class = 3 then BadgeCount else 0 end) as BadgeBronze
+        from UserBadgeCounts
+        group by UserId
+    ) inv on inv.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, inv.BadgeGold, inv.BadgeSilver, inv.BadgeBronze
+), PostScoresWindow as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.OwnerUserId,
+        rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+        lag(p.Score) over (partition by p.PostTypeId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.PostTypeId order by p.CreationDate) as NextScore
+    from Posts p
+), QuestionAnswerCount as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.ViewCount,
+        q.CreationDate,
+        q.Score,
+        coalesce(a.AnswerCount, 0) as AnswerCount
+    from Posts q
+    left join (
+        select ParentId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) a on a.ParentId = q.Id
+    where q.PostTypeId = 1
+), DuplicateRelations as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        p1.Score as PostScore,
+        p2.Score as RelatedPostScore
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+), UserActivitySummary as (
+    select 
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        count(distinct c.Id) as CommentsCount,
+        count(distinct ph.Id) as PostEditsCount,
+        max(p.Score) filter (where p.PostTypeId = 1) as MaxQuestionScore,
+        max(p.Score) filter (where p.PostTypeId = 2) as MaxAnswerScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id and ph.PostId = p.Id
+    group by u.Id, u.DisplayName
+), PostsWithDuplicateInfo as (
+    select 
+        q.Id,
+        q.Title,
+        q.Score,
+        q.OwnerUserId,
+        dup.RelatedPostId,
+        dup.PostScore,
+        dup.RelatedPostScore,
+        dup.LinkTypeId
+    from Posts q
+    left join DuplicateRelations dup on dup.PostId = q.Id and dup.LinkTypeId = 3
+    where q.PostTypeId = 1
+)
+select 
+    uas.DisplayName as UserName,
+    uas.QuestionsCount,
+    uas.AnswersCount,
+    uas.CommentsCount,
+    uas.PostEditsCount,
+    ua.Reputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    qac.QuestionId,
+    qac.Title as QuestionTitle,
+    qac.ViewCount,
+    qac.AnswerCount,
+    qac.Score as QuestionScore,
+    pws.RelatedPostId as DuplicateOfQuestionId,
+    pws.RelatedPostScore as DuplicateOfQuestionScore,
+    coalesce(phc.ClosedReason, 'OPEN') as ClosedReason,
+    concat_ws(' | ', 
+        'Rank in Questions by Score: ' || psw.ScoreRank, 
+        'Prev Score: ' || coalesce(psw.PrevScore::text, 'NULL'), 
+        'Next Score: ' || coalesce(psw.NextScore::text, 'NULL')) as ScoreRankDetails,
+    case 
+        when ua.Reputation > 10000 then 'HighRep' 
+        when ua.Reputation > 1000 then 'MedRep' 
+        else 'LowRep' 
+    end as ReputationBucket,
+    count(distinct c.Id) filter (where c.CreationDate > current_date - interval '30 days') as RecentComments,
+    exists (
+        select 1 
+        from Votes v
+        where v.PostId = qac.QuestionId
+        and v.VoteTypeId = 5 -- Favorite votes (feature replaced but may still exist)
+    ) as HasFavorites,
+    string_agg(distinct bt.Name, ', ') as PostHistoryTypesEdited,
+    -- Complex predicate involving string and null logic
+    case 
+        when qac.Title is null or length(trim(qac.Title)) = 0 then 'No Title' 
+        when qac.Title ilike '%error%' then 'ErrorMentioned' 
+        else 'NormalTitle' 
+    end as TitleFlag,
+    -- Correlated subquery for last editor's name with NULL logic
+    (
+        select coalesce(u2.DisplayName, ph.UserDisplayName, 'Unknown') 
+        from PostHistory ph 
+        left join Users u2 on u2.Id = ph.UserId 
+        where ph.PostId = qac.QuestionId 
+        order by ph.CreationDate desc limit 1
+    ) as LastEditorName
+from UserActivitySummary uas
+join UserAggregates ua on ua.Id = uas.Id
+join QuestionAnswerCount qac on qac.OwnerUserId = uas.Id
+left join PostsWithDuplicateInfo pws on pws.Id = qac.QuestionId
+left join PostHistory ph on ph.PostId = qac.QuestionId and ph.PostHistoryTypeId = 10 -- Post Closed
+left join CloseReasonTypes phc on phc.Id::text = ph.Comment
+join PostScoresWindow psw on psw.Id = qac.QuestionId
+left join PostHistoryTypes bt on bt.Id = ph.PostHistoryTypeId
+left join Comments c on c.PostId = qac.QuestionId
+where uas.QuestionsCount > 5
+group by
+    uas.DisplayName,
+    uas.QuestionsCount,
+    uas.AnswersCount,
+    uas.CommentsCount,
+    uas.PostEditsCount,
+    ua.Reputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    qac.QuestionId,
+    qac.Title,
+    qac.ViewCount,
+    qac.AnswerCount,
+    qac.Score,
+    pws.RelatedPostId,
+    pws.RelatedPostScore,
+    phc.ClosedReason,
+    psw.ScoreRank,
+    psw.PrevScore,
+    psw.NextScore,
+    qac.Title
+order by ua.Reputation desc, qac.Score desc
+limit 100;

@@ -1,0 +1,145 @@
+WITH RECURSIVE RecursivePostHierarchy AS (
+    SELECT p.Id, p.ParentId, p.PostTypeId, p.Title, p.Score, p.ViewCount, p.OwnerUserId, 0 AS Depth
+    FROM Posts p
+    WHERE p.ParentId IS NULL AND p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT c.Id, c.ParentId, c.PostTypeId, c.Title, c.Score, c.ViewCount, c.OwnerUserId, r.Depth + 1
+    FROM Posts c
+    INNER JOIN RecursivePostHierarchy r ON c.ParentId = r.Id
+    WHERE c.PostTypeId = 2
+),
+BadgesByUserRanked AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        b.Date,
+        row_number() OVER (PARTITION BY b.UserId ORDER BY b.Class, b.Date DESC) AS BadgeRank
+    FROM Badges b
+    WHERE b.Class IN (1,2,3)
+),
+UserScoreStats AS (
+    SELECT 
+        u.Id AS UserId,
+        coalesce(sum(p.Score),0) AS TotalScore,
+        count(p.Id) AS PostCount,
+        max(p.CreationDate) AS LastPostDate,
+        sum(case when p.Score > 0 then 1 else 0 end) AS PositivePosts,
+        sum(case when p.Score <= 0 then 1 else 0 end) AS NonPositivePosts
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+CloseReasonCounts AS (
+    SELECT crt.Name AS CloseReasonName, count(ph.Id) AS CloseCount
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    INNER JOIN CloseReasonTypes crt ON CAST(ph.Comment AS integer) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY crt.Name
+),
+PostTagAggregates AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Tags,
+        array_agg(distinct t.TagName) FILTER (WHERE t.TagName IS NOT NULL) AS TagArray,
+        string_agg(distinct t.TagName, ',' ORDER BY t.TagName) FILTER (WHERE t.TagName IS NOT NULL) AS TagList
+    FROM Posts p
+    LEFT JOIN Tags t ON position('<' || t.TagName || '>' IN coalesce(p.Tags, '')) > 0 
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Tags
+),
+UserCommentStats AS (
+    SELECT 
+        c.UserId,
+        count(*) FILTER (WHERE lower(c.Text) LIKE '%error%' OR lower(c.Text) LIKE '%bug%') AS ErrorComments,
+        count(*) FILTER (WHERE c.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - interval '1 year') AS RecentComments,
+        count(*) AS TotalComments
+    FROM Comments c
+    GROUP BY c.UserId
+),
+UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        us.TotalScore,
+        us.PostCount,
+        coalesce(ucs.ErrorComments,0) AS ErrorComments,
+        coalesce(ucs.RecentComments,0) AS RecentComments,
+        coalesce(bbr.BadgeCount,0) AS BadgeCount,
+        u.CreationDate,
+        u.LastAccessDate,
+        first_value(bbr.TopBadgeName) OVER (PARTITION BY u.Id ORDER BY bbr.TopBadgeClass, bbr.TopBadgeDate DESC) AS TopBadgeName
+    FROM Users u
+    LEFT JOIN UserScoreStats us ON u.Id = us.UserId
+    LEFT JOIN UserCommentStats ucs ON u.Id = ucs.UserId
+    LEFT JOIN (
+        SELECT UserId, count(*) AS BadgeCount,
+        min(Class) AS TopBadgeClass,
+        max(Date) AS TopBadgeDate,
+        min(Name) AS TopBadgeName
+        FROM Badges
+        GROUP BY UserId
+    ) bbr ON u.Id = bbr.UserId
+)
+SELECT DISTINCT
+    ph.Id AS PostId,
+    p.Title AS QuestionTitle,
+    p.Score,
+    p.ViewCount,
+    rph.Depth AS PostDepth,
+    ph.CreationDate AS LastEdit,
+    concat(
+        'Score: ', CAST(ph.Score AS text),
+        ' | Views: ', CAST(ph.ViewCount AS text),
+        ' | Owner: ', coalesce(u.DisplayName, 'anonymous'),
+        ' | Badges: ', coalesce( (SELECT string_agg(distinct (b2.Name || '(' || CAST(b2.Class AS text) || ')'), ', ')
+            FROM Badges b2 WHERE b2.UserId = p.OwnerUserId ), 'none')
+    ) AS OwnerInfo,
+    count(distinct c.Id) OVER (PARTITION BY ph.Id) AS CommentCount,
+    us.TotalScore AS OwnerTotalScore,
+    us.PostCount AS OwnerPostCount,
+    us.PositivePosts,
+    us.NonPositivePosts,
+    crc.CloseReasonName,
+    crc.CloseCount,
+    (SELECT count(1) FROM PostLinks pl WHERE pl.PostId = ph.Id AND pl.LinkTypeId = 3) AS DuplicateLinksCount,
+    row_number() OVER (PARTITION BY ph.Id ORDER BY ph.CreationDate DESC) AS RevisionNum
+FROM Posts ph
+LEFT JOIN Posts p ON ph.Id = p.Id
+LEFT JOIN RecursivePostHierarchy rph ON rph.Id = ph.Id
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN UserScoreStats us ON u.Id = us.UserId
+LEFT JOIN Comments c ON c.PostId = ph.Id
+LEFT JOIN (
+    SELECT ph2.PostId, CAST(ph2.Comment AS integer) AS ReasonId, crt.Name AS CloseReasonName, count(*) CloseCount
+    FROM PostHistory ph2
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph2.Comment AS integer)
+    WHERE ph2.PostHistoryTypeId = 10
+    GROUP BY ph2.PostId, CAST(ph2.Comment AS integer), crt.Name
+) crc ON crc.PostId = ph.Id
+WHERE ph.PostTypeId IN (1, 2)
+  AND (ph.Score > (SELECT avg(Score) FROM Posts WHERE PostTypeId = ph.PostTypeId))
+  AND (p.Tags IS NOT NULL OR rph.Depth = 0)
+GROUP BY
+    ph.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    rph.Depth,
+    ph.CreationDate,
+    u.DisplayName,
+    u.Id,
+    us.TotalScore,
+    us.PostCount,
+    us.PositivePosts,
+    us.NonPositivePosts,
+    crc.CloseReasonName,
+    crc.CloseCount,
+    p.OwnerUserId
+ORDER BY ph.CreationDate DESC
+LIMIT 100;

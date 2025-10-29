@@ -1,0 +1,162 @@
+-- {"query": "2103.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1551} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        cast(t.TagName as varchar(3000)) as HierarchyPath
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        child.Id,
+        child.TagName,
+        child.Count,
+        p.Level + 1,
+        p.HierarchyPath || ' > ' || child.TagName
+    from Tags child
+    join RecursiveTagHierarchy p on child.Count < p.Count and child.Id <> p.Id
+    where p.Level < 3
+),
+BadgesSummary as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        bool_or(b.TagBased) as HasTagBasedBadge,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+UserPosts as (
+    select 
+        p.OwnerUserId as UserId,
+        p.PostTypeId,
+        count(*) as PostsCount,
+        avg(coalesce(p.Score,0)) as AvgScore,
+        avg(coalesce(p.ViewCount,0)) as AvgViews,
+        max(p.CreationDate) as LastPostDate,
+        sum(case when p.AcceptedAnswerId is not null then 1 else 0 end) as AcceptedAnswersCount
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId <> -1
+    group by p.OwnerUserId, p.PostTypeId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        row_number() over(partition by date_trunc('month', u.CreationDate) order by u.Reputation desc) as RankByReputationPerMonth,
+        rank() over(partition by u.Location order by u.Reputation desc) as RankByReputationPerLocation
+    from Users u
+    where u.Location is not null and length(trim(u.Location)) > 0
+),
+PostAnswersCount as (
+    select 
+        p.ParentId as QuestionId,
+        count(p.Id) as AnswerCount
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+PostCommentsAgg as (
+    select
+        p.Id as PostId,
+        count(c.Id) as CommentsCount,
+        coalesce(sum(c.Score), 0) as CommentsScoreSum,
+        bool_or(c.UserId is null) as HasAnonymousComments,
+        max(c.CreationDate) as LastCommentDate
+    from Posts p
+    left join Comments c on p.Id = c.PostId
+    group by p.Id
+),
+RecentClosedQuestions AS (
+    select distinct ph.PostId
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10 and ph.CreationDate >= cast('2024-10-01' as date) - interval '6 months'
+),
+UserDuplicateLinksCount as (
+    select
+        p.OwnerUserId as UserId,
+        count(distinct pl.Id) as DuplicateLinkCount
+    from Posts p
+    join PostLinks pl on pl.PostId = p.Id and pl.LinkTypeId = 3
+    where p.OwnerUserId is not null and p.OwnerUserId <> -1
+    group by p.OwnerUserId
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    coalesce(bs.GoldBadges,0) as GoldBadges,
+    coalesce(bs.SilverBadges,0) as SilverBadges,
+    coalesce(bs.BronzeBadges,0) as BronzeBadges,
+    upc.PostsCount as QuestionCount,
+    upa.PostsCount as AnswerCount,
+    coalesce(upa.AcceptedAnswersCount,0) as AcceptedAnswers,
+    ua.RankByReputationPerMonth,
+    ua.RankByReputationPerLocation,
+    case 
+        when bs.HasTagBasedBadge then 'Yes' 
+        else 'No' 
+    end as HasTagBasedBadge,
+    coalesce(ud.DuplicateLinkCount, 0) as DuplicateLinksMade,
+    string_agg(distinct rth.HierarchyPath, '; ') as RelatedTagHierarchyPaths,
+    exq.CommentCount as QuestionComments,
+    exa.CommentCount as AnswerComments,
+    exq.Score as QuestionScore,
+    exa.Score as AnswerScore,
+    pc.CommentsCount as LastPostCommentsCount,
+    pc.CommentsScoreSum as LastPostCommentsScoreSum,
+    coalesce(pc.HasAnonymousComments, false) as LastPostHasAnonymousComments,
+    pc.LastCommentDate as LastPostLastCommentDate
+from Users u
+left join BadgesSummary bs on bs.UserId = u.Id
+left join UserPosts upc on upc.UserId = u.Id and upc.PostTypeId = 1
+left join UserPosts upa on upa.UserId = u.Id and upa.PostTypeId = 2
+left join UserActivityWindow ua on ua.UserId = u.Id
+left join RecursiveTagHierarchy rth on rth.TagName = any(array(
+    select distinct unnest(string_to_array(coalesce(p.Tags, ''), '><')) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1 limit 10
+))
+left join Lateral (
+    select sum(c.CommentCount) as CommentCount, sum(p.Score) as Score
+    from Posts p
+    left join PostCommentsAgg c on p.Id = c.PostId
+    where p.OwnerUserId = u.Id and p.PostTypeId = 1
+) exq on true
+left join Lateral (
+    select sum(c.CommentCount) as CommentCount, sum(p.Score) as Score
+    from Posts p
+    left join PostCommentsAgg c on p.Id = c.PostId
+    where p.OwnerUserId = u.Id and p.PostTypeId = 2
+) exa on true
+left join Lateral (
+    select pc.CommentsCount, pc.CommentsScoreSum, pc.HasAnonymousComments, pc.LastCommentDate
+    from Posts p
+    left join PostCommentsAgg pc on p.Id = pc.PostId
+    where p.OwnerUserId = u.Id
+    order by p.LastActivityDate desc nulls last
+    limit 1
+) pc on true
+left join UserDuplicateLinksCount ud on ud.UserId = u.Id
+where 
+    (upc.PostsCount > 10 or upa.PostsCount > 10)
+    and u.Reputation > 100
+    and (u.LastAccessDate > cast('2024-10-01' as date) - interval '1 year' or upa.AcceptedAnswersCount > 0)
+    and exists (
+        select 1 
+        from RecentClosedQuestions rcq
+        join Posts pq on pq.Id = rcq.PostId and pq.OwnerUserId = u.Id
+        where pq.PostTypeId = 1
+        limit 1
+    )
+order by u.Reputation desc, exq.CommentCount desc nulls last
+limit 100;

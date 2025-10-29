@@ -1,0 +1,105 @@
+-- {"query": "3538.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1838} 
+
+WITH
+-- Aggregate per‑user statistics
+user_stats AS (
+    SELECT
+        u.Id                                      AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS net_votes,
+        COUNT(DISTINCT b.Id)                     AS badge_cnt,
+        SUM(
+            CASE b.Class
+                WHEN 1 THEN 100            -- gold
+                WHEN 2 THEN 50             -- silver
+                ELSE 10                    -- bronze
+            END
+        )                                         AS badge_score,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS q_cnt,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS a_cnt,
+        (SELECT COUNT(*) FROM Votes v  WHERE v.UserId = u.Id AND v.VoteTypeId = 2)   AS upvotes_given,
+        (SELECT COUNT(*) FROM Votes v  WHERE v.UserId = u.Id AND v.VoteTypeId = 3)   AS downvotes_given
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+-- Rank users for the benchmark
+ranked_users AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, badge_score DESC) AS rn
+    FROM user_stats
+    WHERE Reputation > 1000
+)
+
+SELECT
+    ru.user_id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.net_votes,
+    ru.badge_cnt,
+    ru.badge_score,
+    ru.q_cnt,
+    ru.a_cnt,
+    ru.upvotes_given,
+    ru.downvotes_given,
+    COALESCE(lq.title, 'No questions')               AS latest_question_title,
+    COALESCE(la.score, 0)                           AS latest_answer_score,
+    CASE
+        WHEN ru.a_cnt = 0 THEN NULL
+        ELSE ROUND(1.0 * ru.q_cnt / NULLIF(ru.a_cnt,0), 2)
+    END                                            AS q_to_a_ratio,
+    STRING_AGG(DISTINCT t.TagName, ', ') FILTER (WHERE t.TagName IS NOT NULL)
+          OVER (PARTITION BY ru.user_id)           AS top_tags
+FROM ranked_users ru
+LEFT JOIN LATERAL (
+    SELECT p.Title
+    FROM Posts p
+    WHERE p.OwnerUserId = ru.user_id AND p.PostTypeId = 1
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+) lq ON TRUE
+LEFT JOIN LATERAL (
+    SELECT p.Score
+    FROM Posts p
+    WHERE p.OwnerUserId = ru.user_id AND p.PostTypeId = 2
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+) la ON TRUE
+LEFT JOIN LATERAL (
+    SELECT pl.RelatedPostId
+    FROM PostLinks pl
+    WHERE pl.PostId = (
+        SELECT Id
+        FROM Posts p
+        WHERE p.OwnerUserId = ru.user_id AND p.PostTypeId = 1
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    ) AND pl.LinkTypeId = 3               -- duplicate link
+) dup ON TRUE
+LEFT JOIN Tags t ON t.Id = dup.RelatedPostId AND t.IsModeratorOnly = 0
+WHERE ru.rn <= 50
+
+UNION ALL
+
+SELECT
+    NULL,
+    '--- Summary Row ---',
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM (SELECT 1) s
+ORDER BY
+    3 DESC NULLS LAST,               -- order by Reputation (3rd column)
+    6 DESC NULLS LAST                -- then by badge_score (6th column)
+LIMIT 100;

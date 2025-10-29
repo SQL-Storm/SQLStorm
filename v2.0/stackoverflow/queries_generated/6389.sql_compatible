@@ -1,0 +1,47 @@
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.Reputation) AS MaxReputation,
+    MIN(u.CreationDate) AS EarliestUser,
+    STRING_AGG(DISTINCT CAST(b.Name AS VARCHAR), ', ') AS BadgesEarned,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(ph.RevisionGUID) AS LastRevisionGUID,
+    -- produce a comma-separated list of up to 10 RelatedPostId for link type id = 3
+    (SELECT STRING_AGG(r.RelatedPostId::text, ', ') FROM (
+         SELECT DISTINCT pl2.RelatedPostId
+         FROM PostLinks pl2
+         JOIN LinkTypes lt2 ON pl2.LinkTypeId = lt2.Id
+         WHERE pl2.PostId IN (SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = u.Id)
+           AND lt2.Id = 3
+         ORDER BY pl2.RelatedPostId
+         LIMIT 10
+     ) r) AS TopTenDuplicates
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    LinkTypes lt ON pl.LinkTypeId = lt.Id
+WHERE 
+    (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    AND u.Id NOT IN (
+        SELECT DISTINCT OwnerUserId 
+        FROM Posts 
+        WHERE PostTypeId = 1 AND ClosedDate IS NOT NULL
+    )
+GROUP BY 
+    u.Id,
+    u.DisplayName
+HAVING 
+    AVG(p.Score) > 100
+ORDER BY 
+    TotalPosts DESC
+LIMIT 100;

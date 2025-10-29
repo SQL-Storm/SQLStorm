@@ -1,0 +1,194 @@
+-- {"query": "7624.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1879} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) AS RankByReputation,
+        RANK() OVER (ORDER BY Views DESC) AS RankByViews,
+        DENSE_RANK() OVER (ORDER BY AvgPostScore DESC) AS RankByAvgScore
+    FROM UserStats
+),
+QuestionStats AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.CreationDate) AS LatestAnswerDate,
+        STRING_AGG(p.Body, ' | ') AS AllAnswerBodies,
+        COUNT(DISTINCT p.OwnerUserId) AS AnswererCount
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+AnswerStats AS (
+    SELECT 
+        a.PostId AS AnswerId,
+        a.OwnerUserId AS AnswererId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        p.Title AS QuestionTitle,
+        p.Score AS QuestionScore,
+        p.ViewCount AS QuestionViews,
+        CASE 
+            WHEN a.Id = p.AcceptedAnswerId THEN 'Yes'
+            ELSE 'No'
+        END AS IsAccepted,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2), 0) AS Upvotes,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 3), 0) AS Downvotes,
+        DATEDIFF(DAY, p.CreationDate, a.CreationDate) AS DaysBetweenQuestionAndAnswer,
+        CASE 
+            WHEN DATEDIFF(DAY, p.CreationDate, a.CreationDate) <= 1 THEN 'Same Day'
+            WHEN DATEDIFF(DAY, p.CreationDate, a.CreationDate) <= 7 THEN 'Within Week'
+            WHEN DATEDIFF(DAY, p.CreationDate, a.CreationDate) <= 30 THEN 'Within Month'
+            ELSE 'More Than Month'
+        END AS TimeToAnswer
+    FROM Posts a
+    INNER JOIN Posts p ON a.ParentId = p.Id
+    WHERE a.PostTypeId = 2
+),
+TopAnswerers AS (
+    SELECT 
+        AnswererId,
+        COUNT(*) AS TotalAnswers,
+        SUM(AnswerScore) AS TotalScore,
+        AVG(AnswerScore) AS AvgScore,
+        STRING_AGG(DISTINCT QuestionTitle, ', ') AS AnsweredQuestions
+    FROM AnswerStats
+    GROUP BY AnswererId
+    HAVING COUNT(*) >= 10
+),
+BadgesSummary AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges,
+        STRING_AGG(b.Name, ', ') AS BadgeNames,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PerformanceMetrics AS (
+    SELECT 
+        'User Engagement' AS MetricType,
+        COUNT(*) AS MetricValue,
+        'Users who have posted questions' AS Description
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    
+    UNION ALL
+    
+    SELECT 
+        'Average Answer Score' AS MetricType,
+        ROUND(AVG(AnswerScore), 2) AS MetricValue,
+        'Average score of answers' AS Description
+    FROM AnswerStats
+    
+    UNION ALL
+    
+    SELECT 
+        'Questions With Answers' AS MetricType,
+        COUNT(DISTINCT QuestionId) AS MetricValue,
+        'Questions that have received answers' AS Description
+    FROM QuestionStats
+    
+    UNION ALL
+    
+    SELECT 
+        'Top Answerers' AS MetricType,
+        COUNT(*) AS MetricValue,
+        'Number of top answerers' AS Description
+    FROM TopAnswerers
+)
+SELECT 
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.PostCount,
+    ru.CommentCount,
+    ru.BadgeCount,
+    ru.AvgPostScore,
+    ru.LastPostDate,
+    ru.AllTags,
+    ru.RankByReputation,
+    ru.RankByViews,
+    ru.RankByAvgScore,
+    qs.AnswerCount,
+    qs.AvgAnswerScore,
+    qs.LatestAnswerDate,
+    qs.AllAnswerBodies,
+    qs.AnswererCount,
+    ts.TotalAnswers,
+    ts.TotalScore,
+    ts.AvgScore,
+    ts.AnsweredQuestions,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    bs.TotalBadges,
+    bs.BadgeNames,
+    bs.LastBadgeDate,
+    AVG(pm.MetricValue) AS OverallAverageMetric,
+    STRING_AGG(pm.Description, '; ') AS MetricDescriptions,
+    CASE 
+        WHEN ru.Reputation > 10000 THEN 'Elite'
+        WHEN ru.Reputation > 5000 THEN 'Advanced'
+        WHEN ru.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserLevel,
+    ISNULL(NULLIF(LEFT(ru.AllTags, 100), ''), 'No Tags') AS SampleTags,
+    COALESCE((SELECT MAX(v.CreationDate) FROM Votes v WHERE v.UserId = ru.UserId), '1900-01-01') AS LastVoteDate,
+    CASE 
+        WHEN EXISTS(SELECT 1 FROM PostLinks pl WHERE pl.PostId = ru.UserId AND pl.LinkTypeId = 1) THEN 'Has Links'
+        ELSE 'No Links'
+    END AS HasLinks,
+    STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Other' END, ', ') AS PostTypes,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.Score > 100) AS HighScorePosts,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = ru.UserId AND c.Score > 5) AS HighScoreComments,
+    DATEDIFF(DAY, ru.LastPostDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceLastPost,
+    COALESCE((SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = ru.UserId), 0) AS PostHistoryCount
+FROM RankedUsers ru
+LEFT JOIN QuestionStats qs ON ru.UserId = qs.QuestionId
+LEFT JOIN TopAnswerers ts ON ru.UserId = ts.AnswererId
+LEFT JOIN BadgesSummary bs ON ru.UserId = bs.UserId
+LEFT JOIN PerformanceMetrics pm ON 1 = 1
+LEFT JOIN Posts p ON ru.UserId = p.OwnerUserId
+WHERE ru.UserId IN (SELECT TOP 100 UserId FROM UserStats ORDER BY Reputation DESC)
+GROUP BY 
+    ru.UserId, ru.DisplayName, ru.Reputation, ru.PostCount, ru.CommentCount,
+    ru.BadgeCount, ru.AvgPostScore, ru.LastPostDate, ru.AllTags, 
+    ru.RankByReputation, ru.RankByViews, ru.RankByAvgScore,
+    qs.AnswerCount, qs.AvgAnswerScore, qs.LatestAnswerDate, qs.AllAnswerBodies, qs.AnswererCount,
+    ts.TotalAnswers, ts.TotalScore, ts.AvgScore, ts.AnsweredQuestions,
+    bs.GoldBadges, bs.SilverBadges, bs.BronzeBadges, bs.TotalBadges, bs.BadgeNames, bs.LastBadgeDate
+HAVING 
+    COUNT(DISTINCT p.Id) >= 1 
+    OR COUNT(DISTINCT c.Id) >= 1
+    OR COUNT(DISTINCT b.Id) >= 1
+ORDER BY 
+    ru.Reputation DESC,
+    ru.PostCount DESC,
+    ru.CommentCount DESC,
+    ru.BadgeCount DESC;

@@ -1,0 +1,262 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(u.DisplayName, 'Anonymous User') AS UserName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId IN (1, 2) THEN p.Score ELSE 0 END) AS TotalPostScore,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        AVG(CASE WHEN p.PostTypeId IN (1, 2) THEN p.Score ELSE NULL END) AS AvgPostScore,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC, u.Id) AS ReputationRank,
+        (EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / 86400.0) AS DaysActive,
+        SUM(CASE WHEN b.Class = 1 THEN 3 WHEN b.Class = 2 THEN 2 WHEN b.Class = 3 THEN 1 ELSE 0 END) AS TotalBadgeValue
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.Reputation >= 100
+        AND u.Views > 10
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostHistoricalAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        COALESCE(p.Title, SUBSTRING(p.Body, 1, 50) || '...') AS PostTitlePreview,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.ViewCount,
+        p.Score AS CurrentScore,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        LOWER(TRIM(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2))) AS RawTagsString,
+        (SELECT phc.Comment FROM PostHistory phc WHERE phc.PostId = p.Id AND phc.PostHistoryTypeId = 10 ORDER BY phc.CreationDate ASC LIMIT 1) AS FirstCloseReason,
+        EXISTS (SELECT 1 FROM PostHistory phx WHERE phx.PostId = p.Id AND phx.PostHistoryTypeId = 11 AND (p.ClosedDate IS NULL OR phx.CreationDate >= p.ClosedDate)) AS WasReopenedAfterClose,
+        EXISTS (SELECT 1 FROM PostHistory phx WHERE phx.PostId = p.Id AND phx.PostHistoryTypeId IN (35, 36)) AS WasMigrated,
+        (LENGTH(p.Body) - LENGTH(REPLACE(p.Body, ' ', '')) + 1) AS BodyWordCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId, EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.Score DESC, p.Id) AS RankInTypeByYear,
+        LAG(p.LastEditDate, 1, p.CreationDate) OVER (PARTITION BY p.Id ORDER BY COALESCE(p.LastEditDate, p.CreationDate)) AS PreviousEditDate,
+        p.CreationDate AS CreationDate -- include for downstream grouping/window references
+    FROM
+        Posts p
+    WHERE
+        p.OwnerUserId IS NOT NULL
+        AND p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= DATE '2020-01-01'
+        AND p.Body IS NOT NULL AND LENGTH(p.Body) > 100
+),
+PostTaggingInfo AS (
+    SELECT
+        pha.PostId,
+        pha.OwnerUserId,
+        pha.PostTitlePreview,
+        TRIM(tag_str) AS TagName,
+        t.Count AS GlobalTagCount,
+        t.IsModeratorOnly,
+        pha.PostCreationDate,
+        pha.CurrentScore,
+        pha.ViewCount
+    FROM
+        PostHistoricalAnalysis pha,
+        UNNEST(string_to_array(pha.RawTagsString, '><')) AS tag_str
+    JOIN
+        Tags t ON TRIM(tag_str) = t.TagName
+    WHERE
+        TRIM(tag_str) IS NOT NULL AND TRIM(tag_str) <> ''
+),
+UserPostInteractionSummary AS (
+    SELECT
+        ue.UserId,
+        ue.UserName,
+        ue.Reputation,
+        ue.TotalPosts,
+        ue.TotalQuestions,
+        ue.TotalAnswers,
+        ue.TotalPostScore,
+        ue.TotalComments,
+        ue.AvgPostScore,
+        ue.DaysActive,
+        ue.TotalBadgeValue,
+        SUM(CASE WHEN ph.PostTypeId = 1 THEN ph.CurrentScore ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN ph.PostTypeId = 2 THEN ph.CurrentScore ELSE 0 END) AS TotalAnswerScore,
+        COUNT(DISTINCT ph.PostId) AS TotalPostsAnalyzed,
+        MAX(ph.LastActivityDate) AS LastActivityOnUserPosts,
+        AVG(ph.CurrentScore) OVER (PARTITION BY ue.UserId ORDER BY ph.CreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS MovingAvgPostScore,
+        COUNT(DISTINCT pli.RelatedPostId) AS LinkedPostsCount,
+        COUNT(DISTINCT CASE WHEN pli.LinkTypeId = 3 THEN pli.RelatedPostId ELSE NULL END) AS DuplicatePostsCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceived,
+        COALESCE(
+            CAST(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS NUMERIC) /
+            NULLIF(SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END), 0),
+            0.0
+        ) AS UpvoteRatio,
+        ph.CreationDate AS CreationDate -- included because used in window ORDER BY context
+    FROM
+        UserEngagement ue
+    JOIN
+        PostHistoricalAnalysis ph ON ue.UserId = ph.OwnerUserId
+    LEFT JOIN
+        PostLinks pli ON ph.PostId = pli.PostId
+    LEFT JOIN
+        Votes v ON ph.PostId = v.PostId
+    GROUP BY
+        ue.UserId, ue.UserName, ue.Reputation, ue.TotalPosts, ue.TotalQuestions, ue.TotalAnswers,
+        ue.TotalPostScore, ue.TotalComments, ue.AvgPostScore, ue.DaysActive, ue.TotalBadgeValue,
+        ph.CreationDate
+),
+ProblematicPosts AS (
+    SELECT
+        pha.PostId,
+        pha.OwnerUserId,
+        pha.PostTitlePreview,
+        pha.PostCreationDate,
+        pha.ClosedDate,
+        pha.WasReopenedAfterClose,
+        pha.WasMigrated
+    FROM
+        PostHistoricalAnalysis pha
+    WHERE
+        (pha.ClosedDate IS NOT NULL AND pha.WasReopenedAfterClose = TRUE)
+        OR pha.WasMigrated = TRUE
+),
+HighImpactUserPosts AS (
+    SELECT
+        pha.PostId,
+        pha.OwnerUserId,
+        pha.PostTitlePreview,
+        pha.PostCreationDate,
+        upsi.UpvoteRatio,
+        upsi.Reputation
+    FROM
+        PostHistoricalAnalysis pha
+    JOIN
+        UserPostInteractionSummary upsi ON pha.OwnerUserId = upsi.UserId
+    WHERE
+        upsi.Reputation >= 10000
+        AND upsi.UpvoteRatio >= 0.7
+),
+UsersWithReopenedOrMigratedPosts AS (
+    SELECT
+        upsi.UserId,
+        upsi.UserName,
+        upsi.Reputation,
+        upsi.UpvoteRatio,
+        COUNT(DISTINCT pp.PostId) AS ProblematicPostCount,
+        STRING_AGG(pp.PostTitlePreview, ' || ' ORDER BY pp.PostCreationDate DESC) AS SampleProblematicPosts
+    FROM
+        UserPostInteractionSummary upsi
+    JOIN
+        ProblematicPosts pp ON upsi.UserId = pp.OwnerUserId
+    GROUP BY
+        upsi.UserId, upsi.UserName, upsi.Reputation, upsi.UpvoteRatio
+)
+SELECT
+    upsi.UserId,
+    upsi.UserName,
+    upsi.Reputation,
+    upsi.TotalPostsAnalyzed,
+    upsi.TotalQuestions,
+    upsi.TotalAnswers,
+    upsi.TotalUpvotesReceived,
+    upsi.TotalDownvotesReceived,
+    upsi.UpvoteRatio,
+    upsi.MovingAvgPostScore,
+    upsi.LastActivityOnUserPosts,
+    upsi.DaysActive,
+    upsi.TotalBadgeValue,
+    (
+        SELECT STRING_AGG(top_tags.TagName, ', ' ORDER BY top_tags.tag_count DESC)
+        FROM (
+            SELECT pti_inner2.TagName, COUNT(pti_inner2.PostId) AS tag_count
+            FROM PostTaggingInfo pti_inner2
+            WHERE pti_inner2.OwnerUserId = upsi.UserId
+            GROUP BY pti_inner2.TagName
+            ORDER BY tag_count DESC, MAX(pti_inner2.GlobalTagCount) DESC
+            LIMIT 3
+        ) top_tags
+    ) AS Top3TagsByPostCount,
+    (
+        SELECT AVG(pti_avg.CurrentScore)
+        FROM PostTaggingInfo pti_avg
+        WHERE pti_avg.OwnerUserId = upsi.UserId
+          AND pti_avg.TagName IN (
+            SELECT pti_inner3.TagName
+            FROM PostTaggingInfo pti_inner3
+            WHERE pti_inner3.OwnerUserId = upsi.UserId
+            GROUP BY pti_inner3.TagName
+            ORDER BY COUNT(pti_inner3.PostId) DESC
+            LIMIT 3
+          )
+    ) AS AvgScoreOnTopTags,
+    CASE
+        WHEN upsi.UpvoteRatio >= 0.8 AND upsi.TotalPostsAnalyzed > 100 AND upsi.Reputation >= 5000 THEN 'High Impact Author'
+        WHEN upsi.UpvoteRatio BETWEEN 0.5 AND 0.8 AND upsi.TotalPostsAnalyzed > 50 THEN 'Engaged Contributor'
+        WHEN upsi.DaysActive IS NULL OR upsi.DaysActive < 30 OR upsi.TotalPostsAnalyzed < 5 THEN 'New/Infrequent User'
+        ELSE 'Regular User'
+    END AS UserCategory,
+    ph.PostId AS SamplePostId,
+    ph.PostTitlePreview,
+    ph.BodyWordCount,
+    ph.CurrentScore AS SamplePostScore,
+    ph.ViewCount AS SamplePostViews,
+    ph.RankInTypeByYear,
+    ph.FirstCloseReason,
+    ph.WasReopenedAfterClose,
+    ph.WasMigrated,
+    ph.PreviousEditDate,
+    t.TagName AS MostPopularTagOnSamplePost,
+    ph.PostCreationDate,
+    ph.LastEditDate,
+    ph.ClosedDate,
+    COALESCE(ph.ClosedDate, ph.LastEditDate, ph.PostCreationDate) AS LastSignificantPostEventDate,
+    (SELECT COUNT(DISTINCT co.Id) FROM Comments co WHERE co.PostId = ph.PostId AND co.UserId = upsi.UserId AND co.CreationDate BETWEEN ph.PostCreationDate AND ph.LastActivityDate) AS CommentsByOwnerOnTheirPost,
+    CASE
+        WHEN upsi.UserId IN (SELECT hip.OwnerUserId FROM HighImpactUserPosts hip INTERSECT SELECT pp.OwnerUserId FROM ProblematicPosts pp) THEN 'HighImpactWithProblematicPosts'
+        WHEN upsi.UserId IN (SELECT UserId FROM UsersWithReopenedOrMigratedPosts) THEN 'InvolvedInProblematicPosts'
+        WHEN upsi.UserId IN (SELECT hip.OwnerUserId FROM HighImpactUserPosts hip EXCEPT SELECT pp.OwnerUserId FROM ProblematicPosts pp) THEN 'HighImpactNoProblematicPosts'
+        ELSE 'StandardUser'
+    END AS UserProblematicEngagementStatus
+FROM
+    UserPostInteractionSummary upsi
+LEFT JOIN LATERAL (
+    SELECT pha_inner.*
+    FROM PostHistoricalAnalysis pha_inner
+    WHERE pha_inner.OwnerUserId = upsi.UserId
+    ORDER BY pha_inner.CreationDate DESC
+    LIMIT 1
+) ph ON TRUE
+LEFT JOIN
+    PostTaggingInfo t ON ph.PostId = t.PostId AND t.TagName = (
+        SELECT pti_max.TagName
+        FROM PostTaggingInfo pti_max
+        WHERE pti_max.PostId = ph.PostId
+        ORDER BY pti_max.GlobalTagCount DESC
+        LIMIT 1
+    )
+WHERE
+    upsi.Reputation >= 500
+    AND upsi.TotalPostsAnalyzed >= 5
+    AND upsi.UpvoteRatio > 0.1
+    AND (upsi.TotalQuestions > 0 OR upsi.TotalAnswers > 0)
+    AND ph.PostId IS NOT NULL
+    AND ph.RankInTypeByYear <= 100
+ORDER BY
+    upsi.Reputation DESC,
+    upsi.UpvoteRatio DESC,
+    upsi.LastActivityOnUserPosts DESC
+LIMIT 1000;

@@ -1,0 +1,190 @@
+-- {"query": "4688.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1795} 
+
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(DISTINCT p.Id) AS QuestionCount,
+      COUNT(DISTINCT a.Id) AS AnswerCount,
+      SUM(CASE WHEN c.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN c.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      MAX(p.CreationDate) AS LastQuestionDate,
+      MAX(a.CreationDate) AS LastAnswerDate,
+      COALESCE(u.LastAccessDate, u.CreationDate) AS LastSeenDate
+    FROM
+      Users AS u
+      LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+      LEFT JOIN Posts AS a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+      LEFT JOIN Votes AS c ON u.Id = c.UserId
+    WHERE
+      u.DisplayName IS NOT NULL
+      AND u.Reputation > 1000
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.LastAccessDate,
+      u.CreationDate
+  ),
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      u.DisplayName AS OwnerDisplayName,
+      p.CreationDate,
+      p.LastActivityDate,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+      CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+      COALESCE(p.OwnerUserId, -1) AS OwnerUserId
+    FROM
+      Posts AS p
+      LEFT JOIN Users AS u ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 1
+      AND p.Title IS NOT NULL
+      AND p.Score > 10
+  ),
+  RecentEdits AS (
+    SELECT
+      rpe.PostId,
+      rpe.UserId AS EditorUserId,
+      rpe.CreationDate AS EditDate,
+      rpe.PostHistoryTypeId,
+      u.DisplayName AS EditorDisplayName
+    FROM
+      RankedPostEdits AS rpe
+      JOIN Users AS u ON rpe.UserId = u.Id
+    WHERE
+      rpe.rn <= 3
+  )
+SELECT
+  pe.PostId,
+  pe.Title,
+  pe.Score,
+  pe.AnswerCount,
+  pe.CommentCount,
+  pe.FavoriteCount,
+  pe.OwnerDisplayName,
+  pe.CreationDate,
+  pe.LastActivityDate,
+  pe.IsClosed,
+  pe.IsCommunityOwned,
+  ua.DisplayName AS TopAnswererDisplayName,
+  ua.Reputation AS TopAnswererReputation,
+  re1.EditorDisplayName AS FirstEditor,
+  re2.EditorDisplayName AS SecondEditor,
+  re3.EditorDisplayName AS ThirdEditor,
+  CASE
+    WHEN pe.Score > 100 AND pe.AnswerCount > 10 THEN 'High Engagement'
+    WHEN pe.Score > 50 OR pe.FavoriteCount > 5 THEN 'Popular'
+    WHEN pe.IsClosed = 1 THEN 'Closed'
+    WHEN pe.IsCommunityOwned = 1 THEN 'Community Owned'
+    ELSE 'Standard'
+  END AS PostCategory,
+  LENGTH(pe.Title) AS TitleLength,
+  SUBSTRING(pe.Title FROM 1 FOR 50) AS TruncatedTitle,
+  IFNULL(ua.AnswerCount, 0) AS UserAnswerCountForThisPost,
+  CASE
+    WHEN ua.UserId IS NOT NULL AND ua.LastAnswerDate > pe.CreationDate THEN 1
+    ELSE 0
+  END AS UserAnsweredThisPost,
+  (pe.Score + pe.AnswerCount * 5 + pe.CommentCount * 2) AS WeightedScore
+FROM
+  PostEngagement AS pe
+LEFT JOIN
+  (
+    SELECT
+      a.PostId,
+      a.OwnerUserId,
+      ROW_NUMBER() OVER (PARTITION BY a.PostId ORDER BY a.Score DESC, a.CreationDate ASC) AS answer_rank
+    FROM
+      Posts AS a
+    WHERE
+      a.PostTypeId = 2
+  ) AS RankedAnswers
+  ON pe.PostId = RankedAnswers.PostId AND RankedAnswers.answer_rank = 1
+LEFT JOIN
+  UserActivity AS ua
+  ON RankedAnswers.OwnerUserId = ua.UserId
+LEFT JOIN
+  RecentEdits AS re1
+  ON pe.PostId = re1.PostId AND re1.PostHistoryTypeId IN (4, 5, 6) AND re1.rn = 1
+LEFT JOIN
+  RecentEdits AS re2
+  ON pe.PostId = re2.PostId AND re2.PostHistoryTypeId IN (4, 5, 6) AND re2.rn = 2
+LEFT JOIN
+  RecentEdits AS re3
+  ON pe.PostId = re3.PostId AND re3.PostHistoryTypeId IN (4, 5, 6) AND re3.rn = 3
+WHERE
+  pe.Score > 0
+  AND pe.LastActivityDate BETWEEN DATE('now', '-30 day') AND DATE('now')
+GROUP BY
+  pe.PostId,
+  pe.Title,
+  pe.Score,
+  pe.AnswerCount,
+  pe.CommentCount,
+  pe.FavoriteCount,
+  pe.OwnerDisplayName,
+  pe.CreationDate,
+  pe.LastActivityDate,
+  pe.IsClosed,
+  pe.IsCommunityOwned,
+  TopAnswererDisplayName,
+  TopAnswererReputation,
+  FirstEditor,
+  SecondEditor,
+  ThirdEditor
+HAVING
+  COUNT(pe.PostId) > 1
+UNION
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.Score,
+  p.AnswerCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  u.DisplayName AS OwnerDisplayName,
+  p.CreationDate,
+  p.LastActivityDate,
+  CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+  CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+  NULL AS TopAnswererDisplayName,
+  NULL AS TopAnswererReputation,
+  NULL AS FirstEditor,
+  NULL AS SecondEditor,
+  NULL AS ThirdEditor,
+  'Low Engagement' AS PostCategory,
+  LENGTH(p.Title) AS TitleLength,
+  SUBSTRING(p.Title FROM 1 FOR 50) AS TruncatedTitle,
+  0 AS UserAnswerCountForThisPost,
+  0 AS UserAnsweredThisPost,
+  (p.Score + p.AnswerCount * 5 + p.CommentCount * 2) AS WeightedScore
+FROM
+  Posts AS p
+  LEFT JOIN Users AS u ON p.OwnerUserId = u.Id
+WHERE
+  p.PostTypeId = 1
+  AND p.Score <= 0
+  AND p.CreationDate > DATE('now', '-1 year')
+ORDER BY
+  WeightedScore DESC;

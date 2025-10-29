@@ -1,0 +1,247 @@
+WITH UserEngagementMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        U.WebsiteUrl,
+        U.Location,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(P.FavoriteCount, 0)) AS TotalFavoritesReceived,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Posts Q WHERE Q.Id = P.ParentId AND Q.AcceptedAnswerId = P.Id) THEN P.Id ELSE NULL END) AS TotalAcceptedAnswersWritten,
+        (CAST(U.Reputation AS NUMERIC)
+         + COALESCE(SUM(C.Score), 0) * 0.5
+         + COALESCE(COUNT(DISTINCT B.Id), 0) * 10
+         + COALESCE((SELECT AVG(S.Score) FROM Posts S WHERE S.OwnerUserId = U.Id AND S.PostTypeId IN (1,2)), 0) * 2) AS KarmaScore,
+        COUNT(DISTINCT Tag.TagName) AS DistinctTagsContributed,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE NULL END) AS AvgQuestionViewCount,
+        MAX(P.CreationDate) AS LastPostDate,
+        MIN(P.CreationDate) AS FirstPostDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN (
+        SELECT DISTINCT OwnerUserId,
+               TRIM(value) AS TagName
+        FROM (
+          SELECT OwnerUserId,
+                 UNNEST(string_to_array(SUBSTRING(Tags, 2, LENGTH(Tags) - 2), '><')) AS value
+          FROM Posts
+          WHERE Tags IS NOT NULL AND Tags <> '<>' AND OwnerUserId IS NOT NULL
+        ) t
+    ) AS Tag ON U.Id = Tag.OwnerUserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes, U.WebsiteUrl, U.Location
+),
+PostQualityMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.OwnerUserId,
+        P.Title,
+        P.Body,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 8) THEN PH.Id ELSE NULL END) AS EditCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 8) THEN PH.CreationDate ELSE NULL END) AS LastEditRevisionDate,
+        (SELECT MIN(A.CreationDate - P.CreationDate) FROM Posts A WHERE A.ParentId = P.Id AND A.PostTypeId = 2) AS TimeToFirstAnswer,
+        (SELECT MIN(A.CreationDate - P.CreationDate) FROM Posts A WHERE A.Id = P.AcceptedAnswerId) AS TimeToAcceptedAnswer,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS ActualUpVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS ActualDownVoteCount,
+        (SELECT COUNT(*) FROM UNNEST(string_to_array(SUBSTRING(COALESCE(P.Tags, '<>'), 2, LENGTH(COALESCE(P.Tags, '<>')) - 2), '><')) AS t(value)) AS NumberOfTags,
+        COALESCE(LENGTH(P.Title), 0) AS TitleLength,
+        CASE WHEN LOWER(P.Body) LIKE '%performance%' OR LOWER(P.Body) LIKE '%optimization%' OR LOWER(P.Title) LIKE '%benchmark%' THEN TRUE ELSE FALSE END AS ContainsPerfKeyword,
+        (COALESCE(P.Score, 0) * 1.0 + COALESCE(P.ViewCount, 0) * 0.01 + COALESCE(P.AnswerCount, 0) * 5.0 + COALESCE(P.CommentCount, 0) * 0.5 + COALESCE(P.FavoriteCount, 0) * 2.0) AS EngagementScore,
+        CASE
+            WHEN LOWER(P.Title) LIKE '%how to%' THEN 'How-to'
+            WHEN LOWER(P.Title) LIKE '%best practice%' THEN 'Best Practice'
+            WHEN LOWER(P.Title) LIKE '%error%' THEN 'Error Troubleshooting'
+            WHEN P.Title IS NULL THEN 'No Title'
+            ELSE 'General'
+        END AS TitleCategory
+    FROM Posts P
+    LEFT JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    GROUP BY P.Id, P.PostTypeId, PT.Name, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.CommunityOwnedDate, P.OwnerUserId, P.Title, P.Body, P.AcceptedAnswerId, P.Tags
+),
+TagPerformance AS (
+    SELECT
+        TRIM(value) AS TagName,
+        COUNT(DISTINCT P.Id) AS TotalTaggedPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalTaggedQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalTaggedAnswers,
+        SUM(COALESCE(P.Score, 0)) AS TotalTagScore,
+        AVG(COALESCE(P.Score, 0)) AS AvgTagScore,
+        MAX(P.CreationDate) AS LatestTagUsageDate,
+        MIN(P.CreationDate) AS EarliestTagUsageDate,
+        COUNT(DISTINCT P.OwnerUserId) AS UniqueTagContributors
+    FROM Posts P,
+         LATERAL UNNEST(string_to_array(SUBSTRING(COALESCE(P.Tags, '<>'), 2, LENGTH(COALESCE(P.Tags, '<>')) - 2), '><')) AS value
+    WHERE P.Tags IS NOT NULL AND P.Tags <> '<>'
+    GROUP BY TRIM(value)
+    HAVING COUNT(DISTINCT P.Id) > 50
+),
+AggregatedData AS (
+    SELECT
+        UEM.UserId,
+        UEM.DisplayName,
+        UEM.Reputation,
+        UEM.UserCreationDate,
+        UEM.LastAccessDate,
+        UEM.UserProfileViews,
+        UEM.TotalPosts,
+        UEM.TotalQuestions,
+        UEM.TotalAnswers,
+        UEM.TotalComments,
+        UEM.TotalPostScore,
+        UEM.TotalFavoritesReceived,
+        UEM.TotalAcceptedAnswersWritten,
+        UEM.KarmaScore,
+        UEM.DistinctTagsContributed,
+        UEM.AvgQuestionViewCount,
+        UEM.LastPostDate,
+        UEM.FirstPostDate,
+        PQM.PostId,
+        PQM.PostTypeName,
+        PQM.PostCreationDate,
+        PQM.Score AS PostScore,
+        PQM.ViewCount AS PostViewCount,
+        PQM.AnswerCount,
+        PQM.CommentCount AS PostCommentCount,
+        PQM.FavoriteCount AS PostFavoriteCount,
+        PQM.ClosedDate,
+        PQM.CommunityOwnedDate,
+        PQM.EditCount,
+        PQM.LastEditRevisionDate,
+        PQM.TimeToFirstAnswer,
+        PQM.TimeToAcceptedAnswer,
+        PQM.ActualUpVoteCount,
+        PQM.ActualDownVoteCount,
+        PQM.NumberOfTags,
+        PQM.TitleLength,
+        PQM.ContainsPerfKeyword,
+        PQM.EngagementScore,
+        PQM.TitleCategory,
+        TP.TagName,
+        TP.TotalTaggedPosts,
+        TP.TotalTaggedQuestions,
+        TP.TotalTaggedAnswers,
+        TP.TotalTagScore,
+        TP.AvgTagScore,
+        TP.LatestTagUsageDate,
+        TP.UniqueTagContributors,
+        RANK() OVER (ORDER BY UEM.KarmaScore DESC, UEM.Reputation DESC, UEM.TotalPosts DESC) AS UserKarmaRank,
+        AVG(PQM.Score) OVER (PARTITION BY UEM.UserId ORDER BY PQM.PostCreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS UserMovingAvgPostScore,
+        LAG(PQM.Score, 1, 0) OVER (PARTITION BY UEM.UserId ORDER BY PQM.PostCreationDate) AS PreviousPostScore,
+        (UEM.TotalPosts * 1.0 + UEM.TotalComments * 0.5 + UEM.TotalAcceptedAnswersWritten * 2.0 + (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - UEM.LastAccessDate)) / 86400.0) * -0.01) AS UserActivityScore,
+        UEM.Location
+    FROM UserEngagementMetrics UEM
+    LEFT JOIN PostQualityMetrics PQM ON UEM.UserId = PQM.OwnerUserId
+    LEFT JOIN (
+        SELECT P.Id, TRIM(value) AS TagName
+        FROM Posts P,
+             LATERAL UNNEST(string_to_array(SUBSTRING(COALESCE(P.Tags, '<>'), 2, LENGTH(COALESCE(P.Tags, '<>')) - 2), '><')) AS value
+        WHERE P.Tags IS NOT NULL AND P.Tags <> '<>'
+    ) AS PostTag ON PQM.PostId = PostTag.Id
+    LEFT JOIN TagPerformance TP ON PostTag.TagName = TP.TagName
+    WHERE UEM.Reputation > 100
+      AND PQM.PostId IS NOT NULL
+),
+ProblematicQuestionsAndExemplaryAnswers AS (
+    SELECT
+        P.Id AS PostId,
+        PT.Name AS PostTypeName,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.OwnerUserId AS AffectedUserId,
+        'Problematic Question' AS PostCategory,
+        (SELECT MAX(PH.CreationDate) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId = 10) AS EventTime,
+        ('Views: ' || COALESCE(CAST(P.ViewCount AS VARCHAR), '0') || ', Score: ' || COALESCE(CAST(P.Score AS VARCHAR), '0') || ', Closed: ' || CASE WHEN P.ClosedDate IS NOT NULL THEN 'Yes' ELSE 'No' END) AS Insights
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE P.PostTypeId = 1
+      AND COALESCE(P.ViewCount, 0) > 5000
+      AND COALESCE(P.Score, 0) < 5
+      AND P.ClosedDate IS NOT NULL
+    UNION ALL
+    SELECT
+        P.Id AS PostId,
+        PT.Name AS PostTypeName,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.OwnerUserId AS AffectedUserId,
+        'Exemplary Answer' AS PostCategory,
+        P.CreationDate AS EventTime,
+        ('Accepted: Yes, Score: ' || COALESCE(CAST(P.Score AS VARCHAR), '0')) AS Insights
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE P.PostTypeId = 2
+      AND P.Score > 20
+      AND EXISTS (SELECT 1 FROM Posts Q WHERE Q.Id = P.ParentId AND Q.AcceptedAnswerId = P.Id)
+)
+SELECT
+    AD.UserId,
+    AD.DisplayName,
+    AD.Reputation,
+    AD.UserKarmaRank,
+    AD.UserActivityScore,
+    AD.TotalPosts,
+    AD.TotalQuestions,
+    AD.TotalAnswers,
+    AD.TotalAcceptedAnswersWritten,
+    AD.DistinctTagsContributed,
+    AD.PostId,
+    AD.PostTypeName,
+    AD.PostCreationDate,
+    AD.PostScore,
+    AD.PostViewCount,
+    AD.EngagementScore,
+    AD.ContainsPerfKeyword,
+    AD.TitleCategory,
+    AD.TagName,
+    AD.AvgTagScore,
+    AD.UserMovingAvgPostScore,
+    AD.PreviousPostScore,
+    COALESCE(AD.TimeToFirstAnswer, INTERVAL '9999 year') AS ResolvedTimeToFirstAnswer,
+    NULLIF(AD.ActualUpVoteCount, 0) / NULLIF(AD.ActualDownVoteCount, 0) AS UpDownVoteRatio,
+    UPPER(SUBSTRING(AD.DisplayName FROM 1 FOR 3)) || LPAD(CAST(AD.UserId AS VARCHAR), 5, '0') AS UserCustomCode,
+    (CAST(AD.PostCreationDate AS DATE) - CAST(AD.UserCreationDate AS DATE)) AS DaysSinceUserCreationToPost,
+    CASE WHEN AD.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostLifecycleStatus,
+    PQA.PostCategory,
+    PQA.Insights,
+    (SELECT COUNT(DISTINCT C.Id) FROM Comments C WHERE C.PostId = AD.PostId AND C.CreationDate > COALESCE(AD.LastEditRevisionDate, AD.PostCreationDate)) AS NewCommentsAfterLastEdit,
+    COALESCE(AD.EngagementScore / NULLIF(AD.PostViewCount, 0), 0.0) AS EngagementPerViewRatio,
+    COALESCE(TRIM(SUBSTRING(AD.Location FROM 1 FOR 20)), 'Unknown Location') AS UserLocationSnippet
+FROM AggregatedData AD
+LEFT JOIN ProblematicQuestionsAndExemplaryAnswers PQA ON AD.PostId = PQA.PostId
+WHERE
+    AD.TotalPosts > 5
+    AND AD.Reputation > 500
+    AND AD.TagName IS NOT NULL
+    AND AD.AvgTagScore > 0
+    AND AD.ContainsPerfKeyword = TRUE
+    AND AD.UserProfileViews > 100
+    AND AD.PostCreationDate BETWEEN AD.UserCreationDate AND TIMESTAMP '2024-10-01 12:34:56'
+ORDER BY
+    AD.UserKarmaRank ASC,
+    AD.EngagementScore DESC,
+    AD.PostCreationDate DESC
+LIMIT 10000;

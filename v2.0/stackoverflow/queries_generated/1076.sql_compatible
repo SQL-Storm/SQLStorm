@@ -1,0 +1,195 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.Views,
+        U.UpVotes,
+        U.DownVotes,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        (CAST(U.Reputation AS numeric) / NULLIF(EXTRACT(YEAR FROM AGE(U.LastAccessDate, U.CreationDate)), 0)) AS RepPerYearActive,
+        NTILE(10) OVER (ORDER BY U.Reputation DESC) AS ReputationDecile
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+    HAVING U.Reputation > 500 AND COUNT(DISTINCT P.Id) > 5
+),
+PostComplexMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        COALESCE(P.OwnerDisplayName, 'Community User') AS EffectiveOwnerDisplayName,
+        (SELECT AVG(SC.Score) FROM Comments SC WHERE SC.PostId = P.Id) AS AvgCommentScore,
+        (SELECT COUNT(DISTINCT SHE.UserId) FROM PostHistory SHE WHERE SHE.PostId = P.Id AND SHE.PostHistoryTypeId IN (4,5,6,8)) AS UniqueEditorsCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceived,
+        STRING_AGG(CASE WHEN LT.Name = 'Duplicate' THEN CAST(PL.RelatedPostId AS varchar) ELSE NULL END, ',') AS DuplicateOfPosts,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS ClosedDateHist,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate ELSE NULL END) AS ReopenedDateHist,
+        (P.Score + COALESCE(P.FavoriteCount, 0) * 5) AS WeightedScore
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId AND PL.LinkTypeId = 3 -- Duplicates
+    LEFT JOIN LinkTypes LT ON PL.LinkTypeId = LT.Id
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId IN (10, 11)
+    WHERE P.CreationDate >= '2020-01-01' AND P.PostTypeId IN (1, 2)
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount, P.Title, P.Tags, P.OwnerDisplayName
+),
+PostLifecycleAnalysis AS (
+    SELECT
+        PC.PostId,
+        PC.PostCreationDate,
+        PC.OwnerUserId,
+        PC.PostScore,
+        PC.ClosedDateHist,
+        PC.ReopenedDateHist,
+        LAG(PC.ClosedDateHist) OVER (PARTITION BY PC.PostId ORDER BY PC.PostCreationDate, PC.PostId) AS PreviousClosedDate,
+        CASE
+            WHEN PC.ClosedDateHist IS NOT NULL AND PC.ReopenedDateHist IS NOT NULL AND PC.ReopenedDateHist > PC.ClosedDateHist
+            THEN EXTRACT(DAY FROM (PC.ReopenedDateHist - PC.ClosedDateHist))
+            ELSE NULL
+        END AS DaysToReopen,
+        (SELECT COUNT(*) FROM PostHistory PH_INNER WHERE PH_INNER.PostId = PC.PostId AND PH_INNER.PostHistoryTypeId = 50) AS CommunityBumps,
+        ROW_NUMBER() OVER (PARTITION BY PC.OwnerUserId ORDER BY PC.PostScore DESC, PC.PostCreationDate DESC, PC.PostId) AS UserPostRank
+    FROM PostComplexMetrics PC
+    GROUP BY
+        PC.PostId,
+        PC.PostCreationDate,
+        PC.OwnerUserId,
+        PC.PostScore,
+        PC.ClosedDateHist,
+        PC.ReopenedDateHist
+),
+PostTagsExpanded AS (
+    SELECT
+        P.Id AS PostId,
+        LOWER(TRIM(SUBSTRING(tag, 1, 50))) AS TagName
+    FROM Posts P,
+    LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(P.Tags, 2, GREATEST(LENGTH(P.Tags)-2,0)), '><')) AS tag
+    ) s
+    WHERE P.Tags IS NOT NULL AND P.PostTypeId = 1
+),
+TagPerformance AS (
+    SELECT
+        PTE.TagName,
+        COUNT(PTE.PostId) AS PostsWithTag,
+        AVG(P.Score) AS AvgTagScore,
+        SUM(P.ViewCount) AS TotalTagViews
+    FROM PostTagsExpanded PTE
+    JOIN Posts P ON PTE.PostId = P.Id
+    GROUP BY PTE.TagName
+    HAVING COUNT(PTE.PostId) > 100
+),
+UserPostTagOverlap AS (
+    SELECT
+        UE.UserId,
+        PTE.TagName
+    FROM UserEngagement UE
+    JOIN Posts P ON UE.UserId = P.OwnerUserId
+    JOIN PostTagsExpanded PTE ON P.Id = PTE.PostId
+    GROUP BY UE.UserId, PTE.TagName
+    HAVING COUNT(DISTINCT PTE.PostId) > 1
+),
+PostAggregatedTagPerformance AS (
+    SELECT
+        PTE_MAIN.PostId,
+        AVG(TP_MAIN.AvgTagScore) AS PostAvgRelatedTagScore,
+        SUM(TP_MAIN.TotalTagViews) AS PostSumRelatedTagViews
+    FROM PostTagsExpanded PTE_MAIN
+    JOIN TagPerformance TP_MAIN ON PTE_MAIN.TagName = TP_MAIN.TagName
+    GROUP BY PTE_MAIN.PostId
+)
+SELECT
+    UE.DisplayName,
+    UE.Reputation,
+    UE.ReputationDecile,
+    UE.TotalPosts,
+    UE.TotalComments,
+    UE.RepPerYearActive,
+    PCA.PostId,
+    PCM.PostTypeId,
+    PT.Name AS PostTypeName,
+    PCM.Title,
+    PCM.PostScore,
+    PCM.ViewCount,
+    PCM.AnswerCount,
+    PCM.FavoriteCount,
+    PCM.AvgCommentScore,
+    PCM.UniqueEditorsCount,
+    PCM.TotalUpVotesReceived,
+    PCM.TotalDownVotesReceived,
+    PCA.DaysToReopen,
+    PATP.PostAvgRelatedTagScore AS RelatedTagAvgScore,
+    PATP.PostSumRelatedTagViews AS RelatedTagTotalViews,
+    COALESCE(PCM.DuplicateOfPosts, 'N/A') AS DuplicatedPostsList,
+    (SELECT COUNT(DISTINCT B.Name) FROM Badges B WHERE B.UserId = UE.UserId AND B.Date > '2022-01-01') AS RecentUniqueBadges,
+    (SELECT STRING_AGG(DISTINCT VT.Name, ', ') FROM Votes V_INNER JOIN VoteTypes VT ON V_INNER.VoteTypeId = VT.Id WHERE V_INNER.PostId = PCA.PostId AND V_INNER.UserId = UE.UserId) AS UserVoteTypesOnPost,
+    CASE
+        WHEN PCM.TotalUpVotesReceived IS NOT NULL AND PCM.TotalDownVotesReceived IS NOT NULL
+             AND PCM.TotalDownVotesReceived > (PCM.TotalUpVotesReceived * 0.5)
+        THEN 'Potentially Controversial'
+        WHEN PCM.TotalUpVotesReceived > 100 THEN 'Highly Upvoted'
+        ELSE 'Normal'
+    END AS PostSentimentCategory,
+    'https://stackoverflow.com/questions/' || CAST(PCA.PostId AS varchar) AS PostUrl,
+    LOWER(REPLACE(REPLACE(COALESCE(PCM.Title, ''), ' ', '-'), '.', '')) AS TitleSlug
+FROM UserEngagement UE
+JOIN PostLifecycleAnalysis PCA ON UE.UserId = PCA.OwnerUserId
+JOIN PostComplexMetrics PCM ON PCA.PostId = PCM.PostId
+LEFT JOIN PostTypes PT ON PCM.PostTypeId = PT.Id
+LEFT JOIN (
+    SELECT
+        UPTO.UserId,
+        UPTO.TagName,
+        TP_INNER.AvgTagScore,
+        TP_INNER.TotalTagViews,
+        ROW_NUMBER() OVER (PARTITION BY UPTO.UserId ORDER BY TP_INNER.AvgTagScore DESC) as rn
+    FROM UserPostTagOverlap UPTO
+    JOIN TagPerformance TP_INNER ON UPTO.TagName = TP_INNER.TagName
+) AS TopUserTagPerformance ON UE.UserId = TopUserTagPerformance.UserId
+                           AND (PCM.Tags LIKE '%' || '<' || TopUserTagPerformance.TagName || '>' || '%'
+                                OR PCM.Tags LIKE '<' || TopUserTagPerformance.TagName || '>'
+                                OR PCM.Tags LIKE '<' || TopUserTagPerformance.TagName || '%>'
+                                OR PCM.Tags LIKE '%<' || TopUserTagPerformance.TagName || '>')
+                           AND TopUserTagPerformance.rn = 1
+LEFT JOIN PostAggregatedTagPerformance PATP ON PCM.PostId = PATP.PostId
+WHERE
+    UE.ReputationDecile <= 3
+    AND PCA.UserPostRank <= 5
+    AND PCM.PostScore > 10
+    AND (
+        (PCM.ViewCount > 5000 AND PCM.AnswerCount >= 3)
+        OR
+        (PCA.DaysToReopen IS NOT NULL AND PCA.DaysToReopen < 30 AND PCA.CommunityBumps = 0)
+    )
+    AND PCM.Title ILIKE '%sql%'
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Comments C_EXISTS
+        WHERE C_EXISTS.PostId = PCM.PostId
+          AND C_EXISTS.CreationDate < PCM.PostCreationDate + INTERVAL '1 hour'
+          AND C_EXISTS.Score < -2
+    )
+ORDER BY
+    UE.Reputation DESC,
+    PCA.DaysToReopen NULLS LAST,
+    PCM.WeightedScore DESC,
+    PCM.PostCreationDate ASC
+LIMIT 1000;

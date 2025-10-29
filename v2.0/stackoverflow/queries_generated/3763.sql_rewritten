@@ -1,0 +1,158 @@
+-- {"query": "3763.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1671} 
+WITH
+/*-------------------------------------------------------------
+  1️⃣  Gather per‑user activity aggregates (posts, answers, votes)
+-------------------------------------------------------------*/
+user_agg AS (
+    SELECT
+        u.Id                                   AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                AS question_cnt,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                AS answer_cnt,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2)                AS upvote_cnt,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3)                AS downvote_cnt,
+        MAX(p.CreationDate)                                        AS last_post_date,
+        MAX(v.CreationDate) FILTER (WHERE v.VoteTypeId = 2)        AS last_upvote_date
+    FROM Users u
+    LEFT JOIN Posts p      ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v      ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+/*-------------------------------------------------------------
+  2️⃣  Compute recent badge activity per user (last 90 days)
+-------------------------------------------------------------*/
+recent_badges AS (
+    SELECT
+        b.UserId                                 AS user_id,
+        COUNT(*)                                 AS badge_cnt_90d,
+        MAX(b.Date)                              AS last_badge_date,
+        STRING_AGG(DISTINCT b.Name, ', ')        AS badge_list
+    FROM Badges b
+    WHERE b.Date >= cast('2024-10-01' as date) - INTERVAL '90 days'
+    GROUP BY b.UserId
+),
+
+/*-------------------------------------------------------------
+  3️⃣  Extract individual tags from Posts.Tags and aggregate
+      score & view statistics per tag (latest 30 days)
+-------------------------------------------------------------*/
+tag_stats AS (
+    SELECT
+        TRIM(t)                                   AS tag,
+        COUNT(*)                                  AS post_cnt,
+        AVG(p.Score)                              AS avg_score,
+        AVG(p.ViewCount)                          AS avg_views,
+        MAX(p.CreationDate)                       AS latest_post
+    FROM Posts p
+    CROSS JOIN LATERAL
+        (SELECT unnest(string_to_array(
+                regexp_replace(p.Tags, '^<|>$', '', 'g'), '><')) AS t) AS tags
+    WHERE p.PostTypeId = 1                     -- only questions
+      AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+    GROUP BY TRIM(t)
+),
+
+/*-------------------------------------------------------------
+  4️⃣  Identify “hot” posts: high score, many answers, recent activity
+-------------------------------------------------------------*/
+hot_posts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.AnswerCount,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn_owner,
+        ROW_NUMBER() OVER (ORDER BY (p.Score * COALESCE(p.AnswerCount,0)) DESC, p.CreationDate DESC)   AS global_rank
+    FROM Posts p
+    WHERE p.PostTypeId = 1                     -- questions only
+      AND p.Score >= 10
+      AND p.AnswerCount >= 3
+      AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '180 days'
+),
+
+/*-------------------------------------------------------------
+  5️⃣  Correlated subquery to fetch the most recent comment per post
+-------------------------------------------------------------*/
+post_latest_comment AS (
+    SELECT
+        p.Id                                 AS post_id,
+        c.Id                                 AS comment_id,
+        c.Text                               AS comment_text,
+        c.CreationDate                       AS comment_date
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT *
+        FROM Comments c
+        WHERE c.PostId = p.Id
+        ORDER BY c.CreationDate DESC
+        LIMIT 1
+    ) c ON true
+),
+
+/*-------------------------------------------------------------
+  6️⃣  Union of top‑10 users by reputation and top‑10 users by badge count
+-------------------------------------------------------------*/
+top_users AS (
+    SELECT user_id, DisplayName, Reputation, badge_cnt_90d,
+           ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS rank_rep
+    FROM user_agg ua
+    LEFT JOIN recent_badges rb ON rb.user_id = ua.user_id
+    WHERE ua.Reputation > 0
+    UNION ALL
+    SELECT user_id, DisplayName, Reputation, badge_cnt_90d,
+           ROW_NUMBER() OVER (ORDER BY badge_cnt_90d DESC NULLS LAST) AS rank_badge
+    FROM user_agg ua
+    LEFT JOIN recent_badges rb ON rb.user_id = ua.user_id
+    WHERE rb.badge_cnt_90d IS NOT NULL
+),
+
+/*-------------------------------------------------------------
+  7️⃣  Final assembly with outer joins and additional calculations
+-------------------------------------------------------------*/
+final_assembly AS (
+    SELECT
+        hp.Id                                   AS post_id,
+        hp.Title,
+        hp.Score,
+        hp.AnswerCount,
+        hp.ViewCount,
+        hp.global_rank,
+        COALESCE(plc.comment_text, '<no comment>')      AS latest_comment,
+        COALESCE(ua.question_cnt,0)                     AS total_questions,
+        COALESCE(ua.answer_cnt,0)                       AS total_answers,
+        COALESCE(ua.upvote_cnt,0) - COALESCE(ua.downvote_cnt,0) AS net_votes,
+        COALESCE(rb.badge_cnt_90d,0)                    AS recent_badges,
+        CASE
+            WHEN hp.Score >= 50 AND hp.AnswerCount >= 5 THEN 'Very Hot'
+            WHEN hp.Score >= 20 THEN 'Hot'
+            ELSE 'Warm'
+        END                                            AS heat_level,
+        STRING_AGG(DISTINCT ts.tag, ', ') FILTER (WHERE ts.tag IS NOT NULL) AS tags_aggregated
+    FROM hot_posts hp
+    LEFT JOIN post_latest_comment plc ON plc.post_id = hp.Id
+    LEFT JOIN user_agg ua                ON ua.user_id = hp.OwnerUserId
+    LEFT JOIN recent_badges rb          ON rb.user_id = ua.user_id
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(
+                regexp_replace(p.Tags, '^<|>$', '', 'g'), '><')) AS tag
+        FROM Posts p
+        WHERE p.Id = hp.Id
+    ) taglist ON true
+    LEFT JOIN tag_stats ts
+        ON ts.tag = TRIM(taglist.tag)
+    GROUP BY
+        hp.Id, hp.Title, hp.Score, hp.AnswerCount, hp.ViewCount,
+        hp.global_rank, plc.comment_text, ua.question_cnt,
+        ua.answer_cnt, ua.upvote_cnt, ua.downvote_cnt,
+        rb.badge_cnt_90d, hp.Score, hp.AnswerCount
+)
+
+SELECT *
+FROM final_assembly
+ORDER BY global_rank
+LIMIT 100;

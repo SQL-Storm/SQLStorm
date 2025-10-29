@@ -1,0 +1,340 @@
+with recent_activity as (
+    select
+        p.id as post_id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.lastactivitydate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        coalesce(p.answercount, 0) as answercount,
+        p.closeddate,
+        p.acceptedanswerid,
+        row_number() over (partition by p.owneruserid order by p.lastactivitydate desc, p.id desc) as rn_user_last
+    from posts p
+    where p.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from posts)
+),
+user_stats as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate as user_created,
+        u.location,
+        u.websiteurl,
+        u.upvotes,
+        u.downvotes,
+        u.views as profileviews,
+        count(distinct b.id) filter (where b.class = 1) as gold_badges,
+        count(distinct b.id) filter (where b.class = 2) as silver_badges,
+        count(distinct b.id) filter (where b.class = 3) as bronze_badges,
+        count(distinct b.id) as total_badges
+    from users u
+    left join badges b
+      on b.userid = u.id
+      and b.date >= (select coalesce(min(creationdate), (cast('2024-10-01 12:34:56' as timestamp)) - interval '10 years') from posts)
+    group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.websiteurl, u.upvotes, u.downvotes, u.views
+),
+votes_agg as (
+    select
+        v.postid,
+        count(*) filter (where v.votetypeid = 2) as upvotes,
+        count(*) filter (where v.votetypeid = 3) as downvotes,
+        count(*) filter (where v.votetypeid = 5) as favorites,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+        min(v.creationdate) as first_vote_at,
+        max(v.creationdate) as last_vote_at
+    from votes v
+    where v.creationdate >= (select min(creationdate) from recent_activity)
+    group by v.postid
+),
+comments_agg as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        max(c.score) as max_comment_score,
+        sum(case when c.score > 0 then 1 else 0 end) as pos_comments,
+        sum(case when c.score < 0 then 1 else 0 end) as neg_comments,
+        string_agg(distinct coalesce(c.userdisplayname, '∅'), ', ' order by coalesce(c.userdisplayname, '∅')) as commenters
+    from comments c
+    where c.creationdate >= (select min(creationdate) from recent_activity)
+    group by c.postid
+),
+accepted_answerers as (
+    select
+        q.id as question_id,
+        a.owneruserid as answerer_id
+    from posts q
+    join posts a
+      on a.id = q.acceptedanswerid
+),
+tag_expanded as (
+    select
+        ra.post_id,
+        unnest(string_to_array(substring(ra.tags, 2, greatest(length(ra.tags)-2, 0)), '><')) as tag
+    from recent_activity ra
+    where ra.posttypeid = 1
+),
+tag_scores as (
+    select
+        te.post_id,
+        avg(t.count) as avg_tag_popularity,
+        sum(case when lower(te.tag) like '%sql%' then 1 else 0 end) as sqlish_tags
+    from tag_expanded te
+    left join tags t
+      on lower(t.tagname) = lower(te.tag)
+    group by te.post_id
+),
+link_info as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 1) as linked_out,
+        count(*) filter (where pl.linktypeid = 3) as duplicates,
+        count(distinct case when pl.linktypeid = 3 then pl.relatedpostid end) as distinct_dupe_targets,
+        min(pl.creationdate) as first_link_at,
+        max(pl.creationdate) as last_link_at
+    from postlinks pl
+    group by pl.postid
+),
+history_flags as (
+    select
+        ph.postid,
+        max(case when ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35,36,37,38) then 1 else 0 end) as had_moderation_events,
+        max(case when ph.posthistorytypeid = 10 then 1 else 0 end) as was_closed,
+        max(case when ph.posthistorytypeid = 11 then 1 else 0 end) as was_reopened,
+        max(case when ph.posthistorytypeid in (52,53) then 1 else 0 end) as hot_network_touched,
+        max(case when ph.posthistorytypeid = 50 then 1 else 0 end) as community_bumped,
+        max(case when ph.posthistorytypeid = 24 then 1 else 0 end) as suggested_edit_applied,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9)) as edit_events
+    from posthistory ph
+    group by ph.postid
+),
+recent_user_post as (
+    select ra.*
+    from recent_activity ra
+    where ra.rn_user_last = 1
+),
+pop_posts as (
+    select
+        ra.post_id,
+        ra.owneruserid,
+        ra.creationdate,
+        ra.lastactivitydate,
+        ra.score,
+        coalesce(va.upvotes,0) - coalesce(va.downvotes,0) as net_votes,
+        coalesce(va.favorites,0) as favorites,
+        coalesce(va.bounty_total,0) as bounty_total,
+        coalesce(ca.comment_count,0) as comment_count,
+        coalesce(ca.max_comment_score,0) as max_comment_score,
+        coalesce(li.linked_out,0) as linked_out,
+        coalesce(li.duplicates,0) as duplicates,
+        coalesce(hf.had_moderation_events,0) as had_moderation_events,
+        coalesce(hf.edit_events,0) as edit_events,
+        coalesce(ts.avg_tag_popularity,0) as avg_tag_popularity,
+        coalesce(ts.sqlish_tags,0) as sqlish_tags,
+        ra.title,
+        ra.tags,
+        ra.viewcount,
+        ra.answercount,
+        ra.closeddate,
+        ra.acceptedanswerid
+    from recent_activity ra
+    left join votes_agg va on va.postid = ra.post_id
+    left join comments_agg ca on ca.postid = ra.post_id
+    left join link_info li on li.postid = ra.post_id
+    left join history_flags hf on hf.postid = ra.post_id
+    left join tag_scores ts on ts.post_id = ra.post_id
+),
+question_answerer_mix as (
+    select
+        q.post_id as question_id,
+        q.owneruserid as asker_id,
+        aa.answerer_id,
+        case when aa.answerer_id = q.owneruserid then 1 else 0 end as self_answer
+    from recent_activity q
+    left join accepted_answerers aa on aa.question_id = q.post_id
+    where q.posttypeid = 1
+),
+ranked_posts as (
+    select
+        pp.*,
+        dense_rank() over (order by
+            (pp.score + greatest(pp.net_votes,0)) desc,
+            pp.favorites desc,
+            pp.comment_count desc,
+            pp.bounty_total desc,
+            pp.avg_tag_popularity desc
+        ) as popularity_rank,
+        row_number() over (partition by pp.owneruserid order by pp.score desc, pp.net_votes desc) as within_user_rank
+    from pop_posts pp
+),
+user_quality as (
+    select
+        us.user_id,
+        percentile_cont(0.5) within group (order by rp.score) as median_post_score,
+        avg(case when rp.post_id is not null then rp.score end) as avg_post_score,
+        avg(rp.net_votes) as avg_net_votes,
+        sum(case when rp.within_user_rank <= 3 then 1 else 0 end) as top3_posts_last_year,
+        sum(case when rp.popularity_rank <= 50 then 1 else 0 end) as top50_posts_last_year
+    from user_stats us
+    left join ranked_posts rp
+      on rp.owneruserid = us.user_id
+    group by us.user_id
+),
+user_rollup as (
+    select
+        us.*,
+        uq.median_post_score,
+        uq.avg_post_score,
+        uq.avg_net_votes,
+        uq.top3_posts_last_year,
+        uq.top50_posts_last_year,
+        coalesce(ru.post_id, -1) as most_recent_post_id
+    from user_stats us
+    left join user_quality uq on uq.user_id = us.user_id
+    left join recent_user_post ru on ru.owneruserid = us.user_id
+),
+anomalies as (
+    select
+        rp.post_id,
+        case
+            when rp.duplicates > 0 and rp.score > 0 and coalesce(hf.was_reopened,0) = 1 then 'dupe-but-positive-reopened'
+            when rp.had_moderation_events = 1 and rp.favorites > 50 then 'controversial-favorite'
+            when rp.sqlish_tags > 0 and rp.avg_tag_popularity < (select avg(count) from tags) then 'niche-sql'
+            when rp.comment_count > 100 and rp.net_votes between -2 and 2 then 'discussion-heavy-low-votes'
+            else null
+        end as anomaly_label
+    from pop_posts rp
+    left join history_flags hf on hf.postid = rp.post_id
+),
+final as (
+    select
+        rp.post_id,
+        rp.owneruserid,
+        u.displayname,
+        u.reputation,
+        u.location,
+        u.websiteurl,
+        ur.total_badges,
+        rp.score,
+        rp.net_votes,
+        rp.favorites,
+        rp.comment_count,
+        rp.bounty_total,
+        rp.linked_out,
+        rp.duplicates,
+        rp.had_moderation_events,
+        rp.edit_events,
+        rp.avg_tag_popularity,
+        rp.sqlish_tags,
+        rq.popularity_rank,
+        rq.within_user_rank,
+        coalesce(a.anomaly_label, 'normal') as anomaly_label,
+        case when lower(coalesce(u.location,'')) similar to '%(remote|anywhere|earth|world)%' then 'remote-ish' else 'local-ish' end as location_group,
+        case when coalesce(u.websiteurl,'') ~* 'github|gitlab|bitbucket' then 1 else 0 end as has_code_profile,
+        case when rp.score < 0 and rp.net_votes > 0 then 1 else 0 end as score_votes_inconsistent,
+        rp.title,
+        rp.tags,
+        rp.viewcount,
+        rp.answercount,
+        rp.closeddate,
+        rp.acceptedanswerid,
+        rp.lastactivitydate,
+        rp.creationdate
+    from ranked_posts rp
+    left join ranked_posts rq on rq.post_id = rp.post_id
+    left join users u on u.id = rp.owneruserid
+    left join user_rollup ur on ur.user_id = rp.owneruserid
+    left join anomalies a on a.post_id = rp.post_id
+    where
+      (
+        (rp.avg_tag_popularity is null and rp.sqlish_tags >= 0)
+        or (rp.avg_tag_popularity >= 0 and coalesce(rp.sqlish_tags,0) >= 0)
+      )
+      and (
+        rp.lastactivitydate >= rp.creationdate
+        and (coalesce(rp.favorites,0) + coalesce(rp.comment_count,0)) >=
+            greatest(0, cast(coalesce(rp.net_votes,0) - coalesce(rp.score,0) as integer))
+      )
+)
+select
+    f.post_id,
+    f.owneruserid,
+    f.displayname,
+    f.reputation,
+    f.location,
+    f.websiteurl,
+    f.total_badges,
+    f.score,
+    f.net_votes,
+    f.favorites,
+    f.comment_count,
+    f.bounty_total,
+    f.linked_out,
+    f.duplicates,
+    f.had_moderation_events,
+    f.edit_events,
+    f.avg_tag_popularity,
+    f.sqlish_tags,
+    f.popularity_rank,
+    f.within_user_rank,
+    f.anomaly_label,
+    f.location_group,
+    f.has_code_profile,
+    f.score_votes_inconsistent,
+    f.title,
+    f.tags,
+    f.viewcount,
+    f.answercount,
+    f.closeddate,
+    f.acceptedanswerid,
+    f.lastactivitydate,
+    f.creationdate,
+    qam.self_answer,
+    case when qam.answerer_id is null then 'unanswered'
+         when qam.self_answer = 1 then 'self-answered'
+         else 'answered-by-others' end as answer_category,
+    (
+      select 1 + count(*)
+      from final f2
+      where f2.owneruserid = f.owneruserid
+        and f2.anomaly_label = f.anomaly_label
+        and (f2.popularity_rank < f.popularity_rank or (f2.popularity_rank = f.popularity_rank and f2.post_id < f.post_id))
+    ) as anomaly_peer_rank,
+    (
+      trim(both ' ' from
+        coalesce(f.displayname,'') || ' | rep=' || cast(coalesce(f.reputation,0) as text) ||
+        case when f.has_code_profile=1 then ' | has-code' else '' end ||
+        case when f.score_votes_inconsistent=1 then ' | score-vote-mismatch' else '' end
+      )
+    ) as profile_blurb,
+    f.most_recent_post_id,
+    f.median_post_score,
+    f.avg_post_score,
+    f.avg_net_votes,
+    f.top3_posts_last_year,
+    f.top50_posts_last_year
+from final f
+left join question_answerer_mix qam
+  on qam.question_id = f.post_id
+where
+  f.reputation >= coalesce((select avg(reputation) from users), 0) / 10
+  and coalesce(f.avg_post_score, 0) > -5
+  and (
+    f.total_badges > 0
+    or exists (
+        select 1
+        from posts pz
+        where pz.owneruserid = f.owneruserid
+          and pz.creationdate >= f.creationdate - interval '30 days'
+          and pz.score >= 1
+    )
+  )
+order by
+  f.popularity_rank,
+  f.net_votes desc,
+  f.score desc,
+  f.post_id desc
+limit 250;

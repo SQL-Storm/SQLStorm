@@ -1,0 +1,60 @@
+-- {"query": "6644.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 449} 
+
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.DisplayName AS Owner,
+        U.Reputation,
+        U.Location,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0 AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.Owner AS OwnerDisplayName,
+    RP.Reputation,
+    RP.Location,
+    RP.Rank,
+    BC.BadgeCount,
+    SUM(V.Score) AS TotalVotes,
+    CASE 
+        WHEN RP.Rank <= 5 THEN 'Top'
+        WHEN RP.Rank <= 10 THEN 'High'
+        ELSE 'Low'
+    END AS RankStatus
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.Owner = BC.UserId
+LEFT JOIN 
+    Votes V ON RP.Id = V.PostId
+GROUP BY 
+    RP.Id, RP.Title, RP.Score, RP.ViewCount, RP.CreationDate, RP.LastActivityDate, RP.Owner, RP.Reputation, RP.Location, RP.Rank, BC.BadgeCount
+ORDER BY 
+    TotalVotes DESC, RP.Score DESC, RP.ViewCount DESC;

@@ -1,0 +1,268 @@
+WITH
+  UserPostInteraction AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.ViewCount AS PostViewCount,
+      p.CommentCount AS PostCommentCount,
+      p.FavoriteCount AS PostFavoriteCount,
+      pt.Name AS PostTypeName,
+      ph.PostHistoryTypeId,
+      ph.CreationDate AS HistoryCreationDate,
+      ph.UserId AS HistoryUserId,
+      ph.Comment AS HistoryComment,
+      u.Reputation AS OwnerReputation,
+      u.CreationDate AS OwnerCreationDate,
+      u.Views AS OwnerViews,
+      u.UpVotes AS OwnerUpVotes,
+      u.DownVotes AS OwnerDownVotes,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Comments c
+        WHERE
+          c.PostId = p.Id
+      ) AS ActualCommentCount,
+      ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn
+    FROM
+      Posts p
+      JOIN PostTypes pt
+        ON p.PostTypeId = pt.Id
+      LEFT JOIN PostHistory ph
+        ON p.Id = ph.PostId
+      LEFT JOIN Users u
+        ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId IN (1, 2)
+  ),
+  RankedPostHistory AS (
+    SELECT
+      PostId,
+      OwnerUserId,
+      PostCreationDate,
+      PostScore,
+      PostViewCount,
+      PostCommentCount,
+      PostFavoriteCount,
+      PostTypeName,
+      PostHistoryTypeId,
+      HistoryCreationDate,
+      HistoryUserId,
+      HistoryComment,
+      OwnerReputation,
+      OwnerCreationDate,
+      OwnerViews,
+      OwnerUpVotes,
+      OwnerDownVotes,
+      ActualCommentCount,
+      rn
+    FROM
+      UserPostInteraction
+    WHERE
+      rn = 1
+  ),
+  QuestionAnswers AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.Title AS QuestionTitle,
+      q.OwnerUserId AS QuestionOwnerUserId,
+      q.CreationDate AS QuestionCreationDate,
+      q.Score AS QuestionScore,
+      q.ViewCount AS QuestionViewCount,
+      q.AnswerCount AS QuestionAnswerCount,
+      a.Id AS AnswerId,
+      a.OwnerUserId AS AnswerOwnerUserId,
+      a.CreationDate AS AnswerCreationDate,
+      a.Score AS AnswerScore,
+      a.CommentCount AS AnswerCommentCount,
+      a.FavoriteCount AS AnswerFavoriteCount,
+      ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM
+      Posts q
+      JOIN Posts a
+        ON q.Id = a.ParentId
+    WHERE
+      q.PostTypeId = 1
+      AND a.PostTypeId = 2
+  ),
+  UserActivitySummary AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+      SUM(p.Score) AS TotalScore,
+      SUM(p.ViewCount) AS TotalViews,
+      AVG(p.Score) AS AvgScore,
+      MAX(p.CreationDate) AS LastPostDate,
+      COUNT(DISTINCT b.Id) AS TotalBadges,
+      SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+      SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+      SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM
+      Users u
+      LEFT JOIN Posts p
+        ON u.Id = p.OwnerUserId
+      LEFT JOIN Badges b
+        ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  HighEngagementQuestions AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.Title AS QuestionTitle,
+      q.OwnerUserId AS QuestionOwnerUserId,
+      q.CreationDate AS QuestionCreationDate,
+      q.Score AS QuestionScore,
+      q.ViewCount AS QuestionViewCount,
+      q.AnswerCount AS QuestionAnswerCount,
+      COUNT(DISTINCT c.Id) AS TotalCommentsOnQuestion,
+      ROW_NUMBER() OVER (ORDER BY q.ViewCount DESC, q.Score DESC) AS QuestionRank
+    FROM
+      Posts q
+      LEFT JOIN Comments c
+        ON q.Id = c.PostId
+    WHERE
+      q.PostTypeId = 1
+      AND q.OwnerUserId <> -1
+      AND q.CreationDate > DATE '2023-01-01'
+    GROUP BY
+      q.Id,
+      q.Title,
+      q.OwnerUserId,
+      q.CreationDate,
+      q.Score,
+      q.ViewCount,
+      q.AnswerCount
+    HAVING
+      COUNT(DISTINCT c.Id) > 5
+  )
+SELECT
+  rph.PostId,
+  rph.PostTypeName,
+  rph.OwnerUserId,
+  rph.OwnerReputation,
+  rph.OwnerCreationDate,
+  rph.OwnerViews,
+  rph.OwnerUpVotes,
+  rph.OwnerDownVotes,
+  rph.PostScore,
+  rph.PostViewCount,
+  rph.PostFavoriteCount,
+  rph.ActualCommentCount,
+  rph.HistoryCreationDate,
+  rph.HistoryUserId,
+  rph.HistoryComment,
+  CASE
+    WHEN rph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35, 36) THEN 'Status Change'
+    WHEN rph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9) THEN 'Content Edit'
+    WHEN rph.PostHistoryTypeId IN (16, 50) THEN 'Community Action'
+    ELSE 'Other'
+  END AS HistoryTypeCategory,
+  qa.AnswerId,
+  qa.AnswerScore,
+  qa.AnswerCommentCount,
+  qa.AnswerRank,
+  uas.DisplayName AS OwnerDisplayName,
+  uas.TotalPosts AS OwnerTotalPosts,
+  uas.TotalQuestions AS OwnerTotalQuestions,
+  uas.TotalAnswers AS OwnerTotalAnswers,
+  uas.TotalScore AS OwnerTotalScore,
+  uas.TotalViews AS OwnerTotalViews,
+  uas.AvgScore AS OwnerAvgScore,
+  uas.GoldBadges AS OwnerGoldBadges,
+  uas.SilverBadges AS OwnerSilverBadges,
+  uas.BronzeBadges AS OwnerBronzeBadges,
+  heq.QuestionTitle AS HighEngagementQuestionTitle,
+  heq.QuestionScore AS HighEngagementQuestionScore,
+  heq.QuestionViewCount AS HighEngagementQuestionViewCount,
+  heq.QuestionRank AS GlobalQuestionRank
+FROM
+  RankedPostHistory rph
+  LEFT JOIN QuestionAnswers qa
+    ON rph.PostId = qa.QuestionId
+    AND qa.AnswerRank = 1
+  LEFT JOIN UserActivitySummary uas
+    ON rph.OwnerUserId = uas.UserId
+  LEFT JOIN HighEngagementQuestions heq
+    ON rph.PostId = heq.QuestionId
+WHERE
+  rph.PostScore > 0
+  AND uas.Reputation > 10000
+  AND rph.PostCreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+  AND (
+    rph.HistoryComment LIKE '%performance%'
+    OR rph.HistoryComment LIKE '%benchmark%'
+    OR rph.PostTypeName = 'Question'
+  )
+  AND COALESCE(uas.DisplayName, 'Unknown') <> 'Community'
+UNION
+SELECT
+  rph.PostId,
+  rph.PostTypeName,
+  rph.OwnerUserId,
+  rph.OwnerReputation,
+  rph.OwnerCreationDate,
+  rph.OwnerViews,
+  rph.OwnerUpVotes,
+  rph.OwnerDownVotes,
+  rph.PostScore,
+  rph.PostViewCount,
+  rph.PostFavoriteCount,
+  rph.ActualCommentCount,
+  rph.HistoryCreationDate,
+  rph.HistoryUserId,
+  rph.HistoryComment,
+  CASE
+    WHEN rph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35, 36) THEN 'Status Change'
+    WHEN rph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9) THEN 'Content Edit'
+    WHEN rph.PostHistoryTypeId IN (16, 50) THEN 'Community Action'
+    ELSE 'Other'
+  END AS HistoryTypeCategory,
+  qa.AnswerId,
+  qa.AnswerScore,
+  qa.AnswerCommentCount,
+  qa.AnswerRank,
+  uas.DisplayName AS OwnerDisplayName,
+  uas.TotalPosts AS OwnerTotalPosts,
+  uas.TotalQuestions AS OwnerTotalQuestions,
+  uas.TotalAnswers AS OwnerTotalAnswers,
+  uas.TotalScore AS OwnerTotalScore,
+  uas.TotalViews AS OwnerTotalViews,
+  uas.AvgScore AS OwnerAvgScore,
+  uas.GoldBadges AS OwnerGoldBadges,
+  uas.SilverBadges AS OwnerSilverBadges,
+  uas.BronzeBadges AS OwnerBronzeBadges,
+  heq.QuestionTitle AS HighEngagementQuestionTitle,
+  heq.QuestionScore AS HighEngagementQuestionScore,
+  heq.QuestionViewCount AS HighEngagementQuestionViewCount,
+  heq.QuestionRank AS GlobalQuestionRank
+FROM
+  RankedPostHistory rph
+  LEFT JOIN QuestionAnswers qa
+    ON rph.PostId = qa.AnswerId
+  LEFT JOIN UserActivitySummary uas
+    ON rph.OwnerUserId = uas.UserId
+  LEFT JOIN HighEngagementQuestions heq
+    ON qa.QuestionId = heq.QuestionId
+WHERE
+  rph.PostScore > 10
+  AND uas.Reputation > 50000
+  AND rph.PostCreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+  AND rph.PostTypeName = 'Answer'
+  AND rph.HistoryComment IS NOT NULL
+  AND CHAR_LENGTH(rph.HistoryComment) > 50
+  AND COALESCE(uas.DisplayName, 'Unknown') <> 'Community'
+ORDER BY
+  GlobalQuestionRank NULLS LAST,
+  rph.PostScore DESC;

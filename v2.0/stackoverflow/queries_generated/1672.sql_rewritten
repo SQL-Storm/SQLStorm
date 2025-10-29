@@ -1,0 +1,259 @@
+-- {"query": "1672.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3283} 
+WITH RelevantTags AS (
+    SELECT 'performance' AS TagName
+    UNION ALL SELECT 'optimization'
+    UNION ALL SELECT 'benchmark'
+    UNION ALL SELECT 'speed'
+    UNION ALL SELECT 'scalability'
+),
+PostWithParsedTags AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        p.Title,
+        CASE
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+            THEN string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')
+            ELSE ARRAY[]::VARCHAR(50)[]
+        END AS ParsedTags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2, 4, 5) -- Questions, Answers, TagWikiExcerpt, TagWiki
+),
+RelevantPostsWithDetails AS (
+    SELECT
+        ppt.PostId,
+        ppt.PostTypeId,
+        ppt.ParentId,
+        ppt.AcceptedAnswerId,
+        ppt.PostCreationDate,
+        ppt.PostScore,
+        ppt.ViewCount,
+        ppt.OwnerUserId,
+        ppt.LastActivityDate,
+        ppt.Title,
+        ppt.AnswerCount,
+        ppt.CommentCount,
+        ppt.FavoriteCount,
+        ppt.ClosedDate,
+        ppt.CommunityOwnedDate,
+        (SELECT COUNT(DISTINCT c.Id) FROM Comments c WHERE c.PostId = ppt.PostId AND c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days') AS RecentCommentCount,
+        (SELECT AVG(c.Score) FROM Comments c WHERE c.PostId = ppt.PostId AND c.Score > 0) AS AvgPositiveCommentScore,
+        CASE
+            WHEN ppt.ClosedDate IS NOT NULL THEN
+                (SELECT crt.Name FROM PostHistory ph INNER JOIN CloseReasonTypes crt ON ph.Comment::smallint = crt.Id
+                 WHERE ph.PostId = ppt.PostId AND ph.PostHistoryTypeId = 10 ORDER BY ph.CreationDate DESC LIMIT 1)
+            ELSE NULL
+        END AS CloseReason,
+        (cast('2024-10-01 12:34:56' as timestamp) - ppt.PostCreationDate) AS PostAgeInterval,
+        (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = ppt.PostId AND pl.LinkTypeId = 1) AS NumLinkedToOthers,
+        (SELECT COUNT(DISTINCT pl.PostId) FROM PostLinks pl WHERE pl.RelatedPostId = ppt.PostId AND pl.LinkTypeId = 3) AS NumDuplicatesOfThis
+    FROM PostWithParsedTags ppt
+    WHERE EXISTS (
+        SELECT 1
+        FROM UNNEST(ppt.ParsedTags) AS post_tag
+        INNER JOIN RelevantTags rt ON LOWER(post_tag) = LOWER(rt.TagName)
+    ) OR LOWER(ppt.Title) SIMILAR TO '%(performance|optimization|benchmark|speed|scalability)%'
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserPostAggregates AS (
+    SELECT
+        rpd.OwnerUserId AS UserId,
+        COUNT(rpd.PostId) AS TotalRelevantPosts,
+        SUM(CASE WHEN rpd.PostTypeId = 1 THEN 1 ELSE 0 END) AS RelevantQuestions,
+        SUM(CASE WHEN rpd.PostTypeId = 2 THEN 1 ELSE 0 END) AS RelevantAnswers,
+        SUM(rpd.PostScore) AS TotalRelevantPostScore,
+        AVG(rpd.PostScore) AS AvgRelevantPostScore,
+        MAX(rpd.LastActivityDate) AS LastRelevantPostActivity,
+        SUM(COALESCE(rpd.FavoriteCount, 0)) AS TotalRelevantFavorites,
+        SUM(rpd.NumLinkedToOthers) AS TotalLinkedPosts,
+        SUM(rpd.NumDuplicatesOfThis) AS TotalDuplicatedPostsByOthers,
+        SUM(rpd.RecentCommentCount) AS TotalRecentCommentsOnRelevantPosts,
+        AVG(rpd.AvgPositiveCommentScore) AS AvgPositiveCommentScoreOnRelevantPosts,
+        LAG(rpd.PostCreationDate, 1, '1970-01-01 00:00:00'::timestamp) OVER (PARTITION BY rpd.OwnerUserId ORDER BY rpd.PostCreationDate) AS PreviousPostDate
+    FROM RelevantPostsWithDetails rpd
+    GROUP BY rpd.OwnerUserId
+),
+UserVotesAndComments AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.UpVotes,
+        u.DownVotes,
+        u.LastAccessDate,
+        u.Views AS UserViews,
+        u.DisplayName,
+        u.Location,
+        u.AboutMe,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScoreMade,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Users u
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes, u.LastAccessDate, u.Views, u.DisplayName, u.Location, u.AboutMe
+),
+CombinedUserData AS (
+    SELECT
+        uvc.UserId,
+        uvc.DisplayName,
+        uvc.Reputation,
+        uvc.UserCreationDate,
+        uvc.UpVotes,
+        uvc.DownVotes,
+        uvc.LastAccessDate,
+        uvc.UserViews,
+        uvc.Location,
+        uvc.AboutMe,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.TotalBadges,
+        upa.TotalRelevantPosts,
+        upa.RelevantQuestions,
+        upa.RelevantAnswers,
+        upa.TotalRelevantPostScore,
+        upa.AvgRelevantPostScore,
+        upa.LastRelevantPostActivity,
+        upa.TotalRelevantFavorites,
+        upa.TotalLinkedPosts,
+        upa.TotalDuplicatedPostsByOthers,
+        upa.TotalRecentCommentsOnRelevantPosts,
+        upa.AvgPositiveCommentScoreOnRelevantPosts,
+        uvc.TotalCommentsMade,
+        uvc.TotalCommentScoreMade,
+        uvc.LastCommentDate,
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - uvc.UserCreationDate)) / 86400.0 AS UserAccountAgeDays,
+        (EXTRACT(EPOCH FROM (upa.LastRelevantPostActivity - upa.PreviousPostDate)) / 86400.0) AS DaysBetweenLastTwoPosts -- Example of LAG use, potentially NULL if only one post
+    FROM UserVotesAndComments uvc
+    LEFT JOIN UserBadgeSummary ubs ON uvc.UserId = ubs.UserId
+    LEFT JOIN UserPostAggregates upa ON uvc.UserId = upa.UserId
+),
+WeightedUserScores AS (
+    SELECT
+        cud.UserId,
+        cud.DisplayName,
+        cud.Reputation,
+        cud.Location,
+        cud.GoldBadges,
+        cud.SilverBadges,
+        cud.BronzeBadges,
+        cud.TotalRelevantPosts,
+        cud.RelevantQuestions,
+        cud.RelevantAnswers,
+        cud.AvgRelevantPostScore,
+        cud.LastRelevantPostActivity,
+        cud.TotalRecentCommentsOnRelevantPosts,
+        cud.UserAccountAgeDays,
+        cud.DaysBetweenLastTwoPosts,
+        -- Complex weighted score calculation incorporating various metrics
+        (
+            (cud.Reputation / 1000.0) * 0.25                                                               -- Reputation contribution
+            + COALESCE(cud.AvgRelevantPostScore, 0) * 0.20                                                  -- Average score of relevant posts
+            + (COALESCE(cud.TotalRelevantPosts, 0) / 100.0) * 0.15                                          -- Quantity of relevant posts
+            + (COALESCE(cud.GoldBadges, 0) * 5 + COALESCE(cud.SilverBadges, 0) * 2 + COALESCE(cud.BronzeBadges, 0) * 0.5) * 0.1 -- Badge recognition
+            + (CASE                                                                                         -- Recency of relevant activity
+                WHEN cud.LastRelevantPostActivity > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' THEN 0.1
+                WHEN cud.LastRelevantPostActivity > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days' THEN 0.05
+                ELSE 0
+              END)
+            + (COALESCE(cud.TotalRecentCommentsOnRelevantPosts, 0) / 5.0) * 0.05                             -- Recent engagement on posts
+            + (CASE WHEN cud.UserAccountAgeDays > 365 * 3 THEN 0.05 ELSE 0 END)                             -- Longevity bonus for older accounts
+            + (COALESCE(cud.TotalLinkedPosts, 0) / 20.0) * 0.05                                             -- Weight for being linked by others
+            - (COALESCE(cud.TotalDuplicatedPostsByOthers, 0) / 10.0) * 0.05                                  -- Penalty for having posts marked as duplicate sources
+            + (COALESCE(cud.TotalRelevantFavorites, 0) / 20.0) * 0.05                                       -- Favorite count on relevant posts
+        ) AS WeightedActivityScore,
+        (SELECT AVG(p_sub.Score) FROM Posts p_sub WHERE p_sub.OwnerUserId = cud.UserId AND p_sub.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days' AND p_sub.PostTypeId = 1) AS UserAvgRecentQuestionScore,
+        AVG(cud.Reputation) OVER (PARTITION BY cud.Location) AS AvgReputationInLocation,
+        DENSE_RANK() OVER (PARTITION BY cud.Location ORDER BY cud.Reputation DESC) AS RankInLocationByReputation
+    FROM CombinedUserData cud
+),
+GlobalAverages AS (
+    SELECT
+        AVG(Reputation) AS GlobalAvgReputation,
+        AVG(Score) AS GlobalAvgPostScore,
+        AVG(CASE WHEN PostTypeId = 1 THEN Score END) AS GlobalAvgQuestionScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+),
+FinalUserSelection AS (
+    SELECT
+        wus.UserId,
+        wus.DisplayName,
+        REPLACE(REPLACE(REPLACE(REPLACE(LOWER(wus.Location), ' ', '_'), ',', ''), '.', ''), '''', '') AS NormalizedLocation,
+        wus.Reputation,
+        wus.WeightedActivityScore,
+        wus.TotalRelevantPosts,
+        wus.RelevantQuestions,
+        wus.RelevantAnswers,
+        wus.AvgRelevantPostScore,
+        wus.LastRelevantPostActivity,
+        wus.GoldBadges,
+        wus.SilverBadges,
+        wus.BronzeBadges,
+        wus.UserAccountAgeDays,
+        COALESCE(wus.DaysBetweenLastTwoPosts, 0.0) AS DaysBetweenLastTwoPosts, -- NULL logic example
+        wus.UserAvgRecentQuestionScore,
+        wus.AvgReputationInLocation,
+        wus.RankInLocationByReputation,
+        ga.GlobalAvgReputation,
+        ga.GlobalAvgQuestionScore,
+        -- String operations and NULL logic on user details
+        SUBSTRING(COALESCE(u.AboutMe, 'No info provided'), 1, 200) AS AboutMeExcerpt,
+        CASE WHEN u.WebsiteUrl IS NOT NULL THEN 'Has Website' ELSE 'No Website' END AS HasWebsiteInfo,
+        (SELECT COUNT(DISTINCT ph.Id) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (4,5,6) AND ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days') AS UserEditCountLastYear
+    FROM WeightedUserScores wus
+    INNER JOIN Users u ON wus.UserId = u.Id
+    CROSS JOIN GlobalAverages ga
+    WHERE wus.WeightedActivityScore > 0.0 -- Filter out users with no relevant activity
+)
+SELECT
+    f.UserId,
+    f.DisplayName,
+    f.NormalizedLocation,
+    f.Reputation,
+    f.WeightedActivityScore,
+    f.TotalRelevantPosts,
+    f.RelevantQuestions,
+    f.RelevantAnswers,
+    f.AvgRelevantPostScore,
+    f.LastRelevantPostActivity,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    f.UserAccountAgeDays,
+    f.DaysBetweenLastTwoPosts,
+    f.UserAvgRecentQuestionScore,
+    f.AvgReputationInLocation,
+    f.RankInLocationByReputation,
+    f.GlobalAvgReputation,
+    f.GlobalAvgQuestionScore,
+    f.AboutMeExcerpt,
+    f.HasWebsiteInfo,
+    f.UserEditCountLastYear,
+    ROW_NUMBER() OVER (ORDER BY f.WeightedActivityScore DESC, f.Reputation DESC) AS OverallRank
+FROM FinalUserSelection f
+WHERE f.Reputation > f.GlobalAvgReputation -- At least average reputation
+   OR f.WeightedActivityScore > f.GlobalAvgReputation / 1000.0 -- Or significant weighted score
+ORDER BY f.WeightedActivityScore DESC, f.Reputation DESC
+LIMIT 100;

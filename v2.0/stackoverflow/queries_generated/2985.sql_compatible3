@@ -1,0 +1,211 @@
+with RecursiveUserBadgeRanks as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        dense_rank() over (partition by b.UserId order by b.Class) as BadgeRank
+    from Badges b
+    where b.TagBased = false
+),
+TopUserBadges as (
+    select
+        UserId,
+        max(BadgeRank) as MaxBadgeRank
+    from RecursiveUserBadgeRanks
+    group by UserId
+),
+PostScoresWithVotes as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        coalesce(v.UpVotes, 0) as UpVotes,
+        coalesce(v.DownVotes, 0) as DownVotes,
+        p.AnswerCount,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() over (
+            partition by p.OwnerUserId order by p.Score desc, p.CreationDate
+        ) as UserPostRank,
+        case 
+            when p.ClosedDate is not null then 1 else 0
+        end as IsClosed
+    from Posts p
+    left join (
+        select
+            PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        where VoteTypeId in (2,3)
+        group by PostId
+    ) v on v.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+),
+FilteredPosts as (
+    select *
+    from PostScoresWithVotes psv
+    where psv.UserPostRank <= 5
+),
+UserPostRankingWithBadges as (
+    select
+        fp.PostId,
+        fp.PostTypeId,
+        fp.OwnerUserId,
+        fp.CreationDate,
+        fp.Score,
+        fp.UpVotes,
+        fp.DownVotes,
+        fp.AnswerCount,
+        fp.ViewCount,
+        fp.Tags,
+        fp.IsClosed,
+        coalesce(tub.MaxBadgeRank, 99) as UserTopBadgeRank
+    from FilteredPosts fp
+    left join TopUserBadges tub on fp.OwnerUserId = tub.UserId
+),
+QuestionWithAcceptedAnswer as (
+    select
+        q.PostId as QuestionId,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.Tags,
+        q.AnswerCount,
+        aa.Id as AcceptedAnswerId,
+        aa.Score as AcceptedAnswerScore,
+        aa.OwnerUserId as AcceptedAnswerOwner,
+        aa.CreationDate as AcceptedAnswerCreationDate
+    from UserPostRankingWithBadges q
+    left join Posts aa on aa.Id = q.PostId and aa.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+PostWithQuestionInfo as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        q.QuestionId,
+        q.QuestionScore,
+        q.QuestionViews,
+        q.Tags,
+        q.AnswerCount,
+        q.AcceptedAnswerId,
+        q.AcceptedAnswerScore,
+        q.AcceptedAnswerOwner,
+        q.AcceptedAnswerCreationDate
+    from Posts p
+    left join QuestionWithAcceptedAnswer q on (p.Id = q.QuestionId or p.Id = q.AcceptedAnswerId)
+    where p.PostTypeId in (1, 2)
+),
+VotesWithUsers as (
+    select
+        v.Id as VoteId,
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId as VoteUserId,
+        u.Reputation as VoterReputation,
+        u.DisplayName as VoterDisplayName,
+        v.CreationDate as VoteDate,
+        p.OwnerUserId as PostOwner,
+        p.PostTypeId
+    from Votes v
+    left join Users u on v.UserId = u.Id
+    inner join Posts p on p.Id = v.PostId
+),
+CorrelatedVotesSum as (
+    select
+        p.Id,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as TotalUpVotes,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as TotalDownVotes,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 5) as TotalFavorites
+    from Posts p
+    where p.PostTypeId = 1
+),
+UserPostAggregates as (
+    -- avoid nesting window functions by computing rank separately then aggregating
+    select
+        upb.OwnerUserId,
+        upb.Score,
+        rn.rank_pos,
+        rn.prev_score,
+        rn.cum_score,
+        agg.avg_score,
+        agg.avg_rank_score_per_user
+    from UserPostRankingWithBadges upb
+    join (
+        select
+            OwnerUserId,
+            Score,
+            ROW_NUMBER() over (partition by OwnerUserId order by Score desc) as rank_pos,
+            lag(Score) over (partition by OwnerUserId order by Score desc) as prev_score,
+            sum(Score) over (partition by OwnerUserId order by Score desc rows between unbounded preceding and current row) as cum_score
+        from UserPostRankingWithBadges
+    ) rn on rn.OwnerUserId = upb.OwnerUserId and rn.Score = upb.Score
+    join (
+        select
+            OwnerUserId,
+            avg(Score) as avg_score,
+            avg(cast(ROW_NUMBER() over (partition by OwnerUserId order by Score desc) as numeric)) as avg_rank_score_per_user
+        from UserPostRankingWithBadges
+        group by OwnerUserId
+    ) agg on agg.OwnerUserId = upb.OwnerUserId
+)
+select distinct
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    upb.PostId,
+    upb.PostTypeId,
+    case when upb.PostTypeId = 1 then 'Question' else 'Answer' end as PostTypeName,
+    upb.Score,
+    upb.UpVotes,
+    upb.DownVotes,
+    upb.AnswerCount,
+    upb.ViewCount,
+    upb.Tags,
+    upb.IsClosed,
+    upb.UserTopBadgeRank,
+    coalesce(cv.TotalUpVotes, 0) as QuestionUpVotes,
+    coalesce(cv.TotalDownVotes, 0) as QuestionDownVotes,
+    coalesce(cv.TotalFavorites, 0) as QuestionFavorites,
+    upa.rank_pos as rank_pos,
+    (upb.Score - upa.prev_score) as post_score_diff,
+    upa.cum_score,
+    upa.avg_score,
+    upa.avg_rank_score_per_user as avg_rank_score
+from Users u
+inner join UserPostRankingWithBadges upb on u.Id = upb.OwnerUserId
+left join CorrelatedVotesSum cv on cv.Id = upb.PostId
+left join UserPostAggregates upa on upa.OwnerUserId = u.Id and upa.rank_pos = 1
+where u.Reputation > 1000
+  and (upb.IsClosed = 0 or upb.IsClosed is null)
+group by
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    upb.PostId,
+    upb.PostTypeId,
+    upb.Score,
+    upb.UpVotes,
+    upb.DownVotes,
+    upb.AnswerCount,
+    upb.ViewCount,
+    upb.Tags,
+    upb.IsClosed,
+    upb.UserTopBadgeRank,
+    cv.TotalUpVotes,
+    cv.TotalDownVotes,
+    cv.TotalFavorites,
+    upa.rank_pos,
+    upa.prev_score,
+    upa.cum_score,
+    upa.avg_score,
+    upa.avg_rank_score_per_user
+order by u.Reputation desc, upb.Score desc
+limit 100;

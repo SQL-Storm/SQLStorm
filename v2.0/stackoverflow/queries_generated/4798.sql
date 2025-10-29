@@ -1,0 +1,218 @@
+-- {"query": "4798.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1831} 
+
+WITH
+  PostEditStats AS (
+    SELECT
+      ph.PostId,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5) THEN 1 ELSE NULL END) AS EditCount,
+      MAX(ph.CreationDate) AS LastEditDate,
+      AVG(ph.CreationDate - LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate)) AS AvgEditInterval,
+      COUNT(DISTINCT ph.UserId) AS DistinctEditors,
+      RANK() OVER (ORDER BY COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5) THEN 1 ELSE NULL END) DESC) AS EditRank
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5) AND ph.CreationDate >= '2023-01-01'
+    GROUP BY
+      ph.PostId
+  ),
+  QuestionDetails AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.CreationDate AS QuestionCreationDate,
+      p.OwnerUserId,
+      u.DisplayName AS OwnerDisplayName,
+      p.Score AS QuestionScore,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.CommentCount,
+      p.ViewCount,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+      ph.LastEditDate,
+      ph.EditCount,
+      ph.AvgEditInterval,
+      ph.DistinctEditors,
+      ph.EditRank
+    FROM
+      Posts AS p
+    LEFT JOIN
+      Users AS u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN
+      PostEditStats AS ph
+      ON p.Id = ph.PostId
+    WHERE
+      p.PostTypeId = 1 AND p.CreationDate >= '2023-01-01'
+  ),
+  AnswerDetails AS (
+    SELECT
+      p.ParentId AS QuestionId,
+      COUNT(p.Id) AS AnswerCount,
+      SUM(p.Score) AS TotalAnswerScore,
+      AVG(p.Score) AS AvgAnswerScore,
+      COUNT(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 ELSE NULL END) AS AcceptedAnswerCount
+    FROM
+      Posts AS p
+    JOIN
+      Posts AS q
+      ON p.ParentId = q.Id
+    WHERE
+      p.PostTypeId = 2 AND p.CreationDate >= '2023-01-01'
+    GROUP BY
+      p.ParentId
+  ),
+  CommentStats AS (
+    SELECT
+      c.PostId AS QuestionId,
+      COUNT(c.Id) AS CommentCount,
+      SUM(c.Score) AS TotalCommentScore,
+      AVG(c.Score) AS AvgCommentScore,
+      COUNT(CASE WHEN c.UserId IS NULL THEN 1 ELSE NULL END) AS AnonymousCommentCount
+    FROM
+      Comments AS c
+    JOIN
+      Posts AS p
+      ON c.PostId = p.Id
+    WHERE
+      p.PostTypeId = 1 AND c.CreationDate >= '2023-01-01'
+    GROUP BY
+      c.PostId
+  ),
+  UserActivity AS (
+    SELECT
+      UserId,
+      COUNT(*) AS PostCount,
+      SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      MAX(CreationDate) AS LastPostDate
+    FROM
+      Posts
+    WHERE
+      OwnerUserId IS NOT NULL AND OwnerUserId <> -1
+    GROUP BY
+      UserId
+  ),
+  TagPerformance AS (
+    SELECT
+      t.TagName,
+      SUM(p.Score) AS TotalTagScore,
+      AVG(p.Score) AS AvgTagScore,
+      COUNT(DISTINCT p.OwnerUserId) AS DistinctTagAuthors,
+      COUNT(p.Id) AS TagPostCount
+    FROM
+      Tags AS t
+    JOIN
+      Posts AS p
+      ON t.TagName = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+    WHERE
+      p.PostTypeId = 1 AND p.CreationDate >= '2023-01-01'
+    GROUP BY
+      t.TagName
+    HAVING
+      COUNT(p.Id) > 10
+  )
+SELECT
+  qd.QuestionId,
+  qd.Title,
+  qd.QuestionCreationDate,
+  qd.OwnerDisplayName,
+  qd.QuestionScore,
+  qd.AnswerCount AS QuestionAnswerCount,
+  qd.FavoriteCount,
+  qd.CommentCount AS QuestionCommentCount,
+  qd.ViewCount,
+  qd.IsClosed,
+  qd.LastEditDate,
+  qd.EditCount,
+  qd.AvgEditInterval,
+  qd.DistinctEditors,
+  qd.EditRank,
+  COALESCE(ad.AnswerCount, 0) AS TotalAnswers,
+  COALESCE(ad.TotalAnswerScore, 0) AS TotalAnswerScore,
+  COALESCE(ad.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+  ad.AcceptedAnswerCount,
+  COALESCE(cs.CommentCount, 0) AS TotalComments,
+  COALESCE(cs.TotalCommentScore, 0) AS TotalCommentScore,
+  COALESCE(cs.AvgCommentScore, 0.0) AS AvgCommentScore,
+  COALESCE(cs.AnonymousCommentCount, 0) AS AnonymousComments,
+  ua.PostCount AS OwnerTotalPosts,
+  ua.QuestionCount AS OwnerQuestionCount,
+  ua.AnswerCount AS OwnerAnswerCount,
+  ua.LastPostDate AS OwnerLastActivity,
+  tp.TotalTagScore AS TopTagScore,
+  tp.AvgTagScore AS TopTagAvgScore,
+  tp.DistinctTagAuthors AS TopTagAuthors,
+  tp.TagPostCount AS TopTagPosts
+FROM
+  QuestionDetails AS qd
+LEFT JOIN
+  AnswerDetails AS ad
+  ON qd.QuestionId = ad.QuestionId
+LEFT JOIN
+  CommentStats AS cs
+  ON qd.QuestionId = cs.QuestionId
+LEFT JOIN
+  UserActivity AS ua
+  ON qd.OwnerUserId = ua.UserId
+LEFT JOIN
+  TagPerformance AS tp
+  ON SUBSTRING(qd.Title FROM '^(?:.*[+-] *)?(.*?)') = tp.TagName -- Simplified tag extraction for example
+WHERE
+  qd.QuestionScore > 10
+  AND qd.AnswerCount > 0
+  AND qd.EditCount > 5
+  AND qd.AvgEditInterval IS NOT NULL
+  AND qd.OwnerDisplayName LIKE 'A%'
+  AND qd.Title ILIKE '%SQL%'
+  AND EXISTS (
+    SELECT 1
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = qd.QuestionId AND pl.LinkTypeId = 3
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM Badges AS b
+    WHERE
+      b.UserId = qd.OwnerUserId AND b.Name = 'Analytical' AND b.Class = 1
+  )
+UNION
+SELECT
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+FROM
+  PostHistoryTypes AS pht
+WHERE
+  pht.Id = 100;

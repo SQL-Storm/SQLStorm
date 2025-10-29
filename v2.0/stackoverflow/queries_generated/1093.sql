@@ -1,0 +1,189 @@
+-- {"query": "1093.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2786} 
+
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes,
+        U.DownVotes,
+        U.Views AS UserProfileViews,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        CASE
+            WHEN U.Reputation >= 100000 THEN 'Legend'
+            WHEN U.Reputation >= 25000 THEN 'Expert'
+            WHEN U.Reputation >= 5000 THEN 'Veteran'
+            WHEN U.Reputation >= 1000 THEN 'Active'
+            ELSE 'Novice'
+        END AS ReputationTier,
+        EXTRACT(DAY FROM (U.LastAccessDate - U.CreationDate)) AS DaysOnPlatform,
+        (U.UpVotes - U.DownVotes) * 1.0 / NULLIF(U.Views, 0) AS VotePerViewRatio
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes, U.Views
+),
+PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        P.AcceptedAnswerId,
+        P.ClosedDate,
+        P.LastActivityDate,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEntries,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate ELSE NULL END) AS LastEditByHistory,
+        MIN(CASE WHEN PH.PostHistoryTypeId = 1 THEN PH.CreationDate ELSE NULL END) AS InitialPostDate,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS CloseVoteCount,
+        (SELECT COUNT(*) FROM Comments C WHERE C.PostId = P.Id AND C.CreationDate > P.CreationDate - INTERVAL '7 day') AS RecentCommentCount
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    WHERE P.PostTypeId = 1
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount,
+        P.CommentCount, P.FavoriteCount, P.Title, P.Tags, P.AcceptedAnswerId, P.ClosedDate, P.LastActivityDate
+),
+PostTagging AS (
+    SELECT
+        PHM.PostId,
+        UNNEST(string_to_array(substring(PHM.Tags, 2, length(PHM.Tags)-2), '><')) AS TagName
+    FROM PostHistoricalMetrics PHM
+    WHERE PHM.Tags IS NOT NULL AND LENGTH(PHM.Tags) > 2
+),
+TagAnalysis AS (
+    SELECT
+        PT.TagName,
+        T.Id AS TagId,
+        AVG(PHM.Score) AS AvgScoreForTag,
+        COUNT(PHM.PostId) AS TotalPostsWithTag,
+        SUM(PHM.ViewCount) AS TotalViewsForTag
+    FROM PostTagging PT
+    JOIN PostHistoricalMetrics PHM ON PT.PostId = PHM.PostId
+    JOIN Tags T ON PT.TagName = T.TagName
+    GROUP BY PT.TagName, T.Id
+    HAVING COUNT(PHM.PostId) > 50
+),
+PostLinkSummary AS (
+    SELECT
+        PL.PostId,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateOfCount,
+        MAX(PL.CreationDate) AS LatestLinkDate
+    FROM PostLinks PL
+    GROUP BY PL.PostId
+),
+QuestionAnswerPerformance AS (
+    SELECT
+        Q.PostId AS QuestionId,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.AcceptedAnswerId,
+        A.CreationDate AS AcceptedAnswerCreationDate,
+        A.Score AS AcceptedAnswerScore,
+        EXTRACT(EPOCH FROM (A.CreationDate - Q.PostCreationDate)) / 3600.0 AS TimeToAcceptanceHours
+    FROM PostHistoricalMetrics Q
+    LEFT JOIN Posts A ON Q.AcceptedAnswerId = A.Id AND A.PostTypeId = 2
+    WHERE Q.AcceptedAnswerId IS NOT NULL
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.ReputationTier,
+    PHM.PostId,
+    PHM.Title,
+    PHM.Score AS QuestionScore,
+    PHM.ViewCount AS QuestionViews,
+    PHM.AnswerCount,
+    PHM.FavoriteCount,
+    PHM.TotalHistoryEntries,
+    PHM.RecentCommentCount,
+    PHM.CloseVoteCount,
+    QA.TimeToAcceptanceHours,
+    COALESCE(PLS.LinkedPostsCount, 0) AS TotalLinkedPosts,
+    COALESCE(PLS.DuplicateOfCount, 0) AS TotalDuplicateOfPosts,
+    STRING_AGG(TA.TagName, ';') WITHIN GROUP (ORDER BY TA.TagName) AS RelatedTags,
+    (PHM.Score * 0.5 + COALESCE(PHM.FavoriteCount, 0) * 2 + PHM.AnswerCount * 3 + PHM.RecentCommentCount * 1.5) / NULLIF(PHM.ViewCount, 0) AS EngagementIndex,
+    CASE
+        WHEN PHM.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN PHM.AcceptedAnswerId IS NOT NULL AND QA.TimeToAcceptanceHours IS NOT NULL AND QA.TimeToAcceptanceHours <= 24 THEN 'AnsweredQuickly'
+        WHEN PHM.AnswerCount > 5 AND PHM.Score >= 10 THEN 'PopularWellAnswered'
+        ELSE 'ActiveUnresolved'
+    END AS QuestionStatusCategory,
+    RANK() OVER (PARTITION BY UE.ReputationTier ORDER BY PHM.Score DESC, PHM.ViewCount DESC) AS RankWithinReputationTier,
+    NTILE(5) OVER (ORDER BY PHM.LastActivityDate DESC) AS ActivityQuintile
+FROM UserEngagement UE
+JOIN PostHistoricalMetrics PHM ON UE.UserId = PHM.OwnerUserId
+LEFT JOIN PostLinkSummary PLS ON PHM.PostId = PLS.PostId
+LEFT JOIN QuestionAnswerPerformance QA ON PHM.PostId = QA.QuestionId
+LEFT JOIN PostTagging PT ON PHM.PostId = PT.PostId
+LEFT JOIN TagAnalysis TA ON PT.TagName = TA.TagName
+WHERE
+    PHM.PostTypeId = 1
+    AND PHM.Score >= 5
+    AND PHM.ViewCount >= 100
+    AND (EXISTS (SELECT 1 FROM PostTagging PT_sub WHERE PT_sub.PostId = PHM.PostId AND PT_sub.TagName IN ('sql', 'database', 'performance')))
+    AND UE.DaysOnPlatform > 365
+    AND UE.VotePerViewRatio > 0.01
+    AND PHM.LastActivityDate > CURRENT_TIMESTAMP - INTERVAL '6 month'
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.ReputationTier, PHM.PostId, PHM.Title, PHM.Score, PHM.ViewCount,
+    PHM.AnswerCount, PHM.FavoriteCount, PHM.TotalHistoryEntries, PHM.RecentCommentCount, PHM.CloseVoteCount,
+    QA.TimeToAcceptanceHours, PLS.LinkedPostsCount, PLS.DuplicateOfCount, PHM.ClosedDate, PHM.AcceptedAnswerId, PHM.LastActivityDate
+
+UNION ALL
+
+SELECT
+    UE_Sub.UserId,
+    UE_Sub.DisplayName,
+    UE_Sub.ReputationTier,
+    PHM_Sub.PostId,
+    PHM_Sub.Title,
+    PHM_Sub.Score AS QuestionScore,
+    PHM_Sub.ViewCount AS QuestionViews,
+    PHM_Sub.AnswerCount,
+    PHM_Sub.FavoriteCount,
+    PHM_Sub.TotalHistoryEntries,
+    PHM_Sub.RecentCommentCount,
+    PHM_Sub.CloseVoteCount,
+    QA_Sub.TimeToAcceptanceHours,
+    COALESCE(PLS_Sub.LinkedPostsCount, 0) AS TotalLinkedPosts,
+    COALESCE(PLS_Sub.DuplicateOfCount, 0) AS TotalDuplicateOfPosts,
+    STRING_AGG(TA_Sub.TagName, ';') WITHIN GROUP (ORDER BY TA_Sub.TagName) AS RelatedTags,
+    (PHM_Sub.Score * 0.7 + PHM_Sub.CommentCount * 0.5 + PHM_Sub.TotalHistoryEntries * 0.2) / NULLIF(PHM_Sub.ViewCount + 1, 0) AS EngagementIndex,
+    CASE
+        WHEN PHM_Sub.ClosedDate IS NOT NULL AND PHM_Sub.CloseVoteCount > 1 THEN 'MultipleCloseVotes'
+        WHEN PHM_Sub.TotalHistoryEntries > 10 THEN 'HeavilyEdited'
+        ELSE 'RecentlyActive'
+    END AS QuestionStatusCategory,
+    RANK() OVER (PARTITION BY UE_Sub.ReputationTier ORDER BY PHM_Sub.LastActivityDate DESC, PHM_Sub.Score DESC) AS RankWithinReputationTier,
+    NTILE(5) OVER (ORDER BY PHM_Sub.TotalHistoryEntries DESC) AS ActivityQuintile
+FROM UserEngagement UE_Sub
+JOIN PostHistoricalMetrics PHM_Sub ON UE_Sub.UserId = PHM_Sub.OwnerUserId
+LEFT JOIN PostLinkSummary PLS_Sub ON PHM_Sub.PostId = PLS_Sub.PostId
+LEFT JOIN QuestionAnswerPerformance QA_Sub ON PHM_Sub.PostId = QA_Sub.QuestionId
+LEFT JOIN PostTagging PT_Sub ON PHM_Sub.PostId = PT_Sub.PostId
+LEFT JOIN TagAnalysis TA_Sub ON PT_Sub.TagName = TA_Sub.TagName
+WHERE
+    PHM_Sub.PostTypeId = 1
+    AND PHM_Sub.Score > 2
+    AND PHM_Sub.LastActivityDate > CURRENT_TIMESTAMP - INTERVAL '30 day'
+    AND PHM_Sub.LastEditByHistory IS NOT NULL
+    AND UE_Sub.ReputationTier IN ('Active', 'Veteran')
+    AND NOT EXISTS (SELECT 1 FROM PostTagging PT_no_common WHERE PT_no_common.PostId = PHM_Sub.PostId AND PT_no_common.TagName IN ('javascript', 'python', 'java', 'c#'))
+GROUP BY
+    UE_Sub.UserId, UE_Sub.DisplayName, UE_Sub.ReputationTier, PHM_Sub.PostId, PHM_Sub.Title, PHM_Sub.Score, PHM_Sub.ViewCount,
+    PHM_Sub.AnswerCount, PHM_Sub.FavoriteCount, PHM_Sub.TotalHistoryEntries, PHM_Sub.RecentCommentCount, PHM_Sub.CloseVoteCount,
+    QA_Sub.TimeToAcceptanceHours, PLS_Sub.LinkedPostsCount, PLS_Sub.DuplicateOfCount, PHM_Sub.ClosedDate, PHM_Sub.AcceptedAnswerId, PHM_Sub.LastActivityDate
+HAVING COUNT(PT_Sub.TagName) BETWEEN 1 AND 4
+ORDER BY QuestionScore DESC, ActivityQuintile ASC;

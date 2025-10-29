@@ -1,0 +1,174 @@
+-- {"query": "4587.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1634} 
+
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.PostHistoryTypeId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory AS ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+  ),
+  LatestPostEdits AS (
+    SELECT
+      rpe.PostId,
+      rpe.UserId,
+      rpe.PostHistoryTypeId,
+      rpe.CreationDate
+    FROM RankedPostEdits AS rpe
+    WHERE rpe.rn = 1
+  ),
+  UserEditCounts AS (
+    SELECT
+      UserId,
+      COUNT(DISTINCT PostId) AS DistinctEditedPosts
+    FROM LatestPostEdits
+    GROUP BY UserId
+  ),
+  PostEditFrequency AS (
+    SELECT
+      pe.PostId,
+      COUNT(pe.PostHistoryTypeId) AS EditCount,
+      MAX(pe.CreationDate) AS LastEditTimestamp
+    FROM PostHistory AS pe
+    WHERE pe.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY pe.PostId
+  ),
+  QuestionAnswerRatios AS (
+    SELECT
+      p.Id AS QuestionId,
+      CAST(COUNT(CASE WHEN p_ans.PostTypeId = 2 THEN 1 END) AS REAL) / COUNT(p.Id) AS AnswerRatio
+    FROM Posts AS p
+    LEFT JOIN Posts AS p_ans
+      ON p.Id = p_ans.ParentId
+    WHERE
+      p.PostTypeId = 1 -- Questions
+    GROUP BY
+      p.Id
+    HAVING
+      COUNT(p.Id) > 0
+  )
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  pt.Name AS PostTypeName,
+  u.DisplayName AS OwnerDisplayName,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  COALESCE(u.Reputation, 0) AS OwnerReputation,
+  COALESCE(pr.AnswerRatio, 0) AS QuestionAnswerRatio,
+  COALESCE(uec.DistinctEditedPosts, 0) AS UserDistinctEditedPosts,
+  COALESCE(p_edit_freq.EditCount, 0) AS PostEditFrequency,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+    ELSE 'Active'
+  END AS PostStatus,
+  CASE
+    WHEN p.OwnerUserId IS NULL THEN 'Deleted Owner'
+    WHEN p.OwnerDisplayName IS NULL THEN 'Unknown Owner'
+    ELSE 'Known Owner'
+  END AS OwnerStatus,
+  DATEDIFF(
+    day,
+    p.CreationDate,
+    COALESCE(p.ClosedDate, p.LastActivityDate, p.LastEditDate, p.CreationDate)
+  ) AS PostAgeInDays,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments AS c
+    WHERE
+      c.PostId = p.Id AND c.Score > 5
+  ) AS HighScoringCommentCount,
+  LEAST(
+    COALESCE(p.AnswerCount, 0),
+    COALESCE(p.CommentCount, 0)
+  ) AS MinAnswerOrComment,
+  IIF(p.Tags LIKE '%<sql>%', 'Contains SQL Tag', 'Does not contain SQL Tag') AS ContainsSQLTag
+FROM Posts AS p
+JOIN PostTypes AS pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN Users AS u
+  ON p.OwnerUserId = u.Id
+LEFT JOIN UserEditCounts AS uec
+  ON p.OwnerUserId = uec.UserId
+LEFT JOIN PostEditFrequency AS p_edit_freq
+  ON p.Id = p_edit_freq.PostId
+LEFT JOIN QuestionAnswerRatios AS pr
+  ON p.Id = pr.QuestionId
+WHERE
+  p.Score > 10
+  AND p.ViewCount > 1000
+  AND p.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+  AND EXISTS (
+    SELECT
+      1
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = p.Id AND pl.LinkTypeId = 1
+  ) -- Posts that have at least one outgoing link
+UNION ALL
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  pt.Name AS PostTypeName,
+  u.DisplayName AS OwnerDisplayName,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  COALESCE(u.Reputation, 0) AS OwnerReputation,
+  COALESCE(pr.AnswerRatio, 0) AS QuestionAnswerRatio,
+  COALESCE(uec.DistinctEditedPosts, 0) AS UserDistinctEditedPosts,
+  COALESCE(p_edit_freq.EditCount, 0) AS PostEditFrequency,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+    ELSE 'Active'
+  END AS PostStatus,
+  CASE
+    WHEN p.OwnerUserId IS NULL THEN 'Deleted Owner'
+    WHEN p.OwnerDisplayName IS NULL THEN 'Unknown Owner'
+    ELSE 'Known Owner'
+  END AS OwnerStatus,
+  DATEDIFF(
+    day,
+    p.CreationDate,
+    COALESCE(p.ClosedDate, p.LastActivityDate, p.LastEditDate, p.CreationDate)
+  ) AS PostAgeInDays,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments AS c
+    WHERE
+      c.PostId = p.Id AND c.Score > 5
+  ) AS HighScoringCommentCount,
+  LEAST(
+    COALESCE(p.AnswerCount, 0),
+    COALESCE(p.CommentCount, 0)
+  ) AS MinAnswerOrComment,
+  IIF(p.Tags LIKE '%<sql>%', 'Contains SQL Tag', 'Does not contain SQL Tag') AS ContainsSQLTag
+FROM Posts AS p
+JOIN PostTypes AS pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN Users AS u
+  ON p.OwnerUserId = u.Id
+LEFT JOIN UserEditCounts AS uec
+  ON p.OwnerUserId = uec.UserId
+LEFT JOIN PostEditFrequency AS p_edit_freq
+  ON p.Id = p_edit_freq.PostId
+LEFT JOIN QuestionAnswerRatios AS pr
+  ON p.Id = pr.QuestionId
+WHERE
+  p.Score < -5
+  AND p.CreationDate < '2022-01-01'
+  AND NOT EXISTS (
+    SELECT
+      1
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = p.Id AND pl.LinkTypeId = 3
+  ); -- Posts that are NOT duplicates of other posts

@@ -1,0 +1,127 @@
+-- {"query": "4068.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1358} 
+WITH RecentQuestions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate AS QuestionCreationDate,
+    p.Score AS QuestionScore,
+    p.AnswerCount,
+    ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts AS p
+  WHERE
+    p.PostTypeId = 1 AND p.CommunityOwnedDate IS NULL
+), RankedAnswers AS (
+  SELECT
+    p.Id AS AnswerId,
+    p.ParentId AS QuestionId,
+    p.OwnerUserId,
+    p.CreationDate AS AnswerCreationDate,
+    p.Score AS AnswerScore,
+    ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS answer_rank
+  FROM Posts AS p
+  WHERE
+    p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+), UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+    MAX(u.LastAccessDate) AS LastAccess,
+    AVG(COALESCE(ph.Comment, 'No Comment')) AS AvgCommentLength
+  FROM Users AS u
+  LEFT JOIN Posts AS p
+    ON u.Id = p.OwnerUserId
+  LEFT JOIN Votes AS v
+    ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+  LEFT JOIN PostHistory AS ph
+    ON u.Id = ph.UserId AND ph.PostHistoryTypeId = 5 -- Edit Body
+  GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.LastAccessDate
+), TopQuestionsWithBestAnswers AS (
+  SELECT
+    rq.QuestionId,
+    rq.Title AS QuestionTitle,
+    rq.QuestionScore,
+    rq.AnswerCount,
+    ra.AnswerId AS BestAnswerId,
+    ra.AnswerScore AS BestAnswerScore,
+    u_q.DisplayName AS QuestionOwnerName,
+    u_a.DisplayName AS AnswerOwnerName,
+    DATEDIFF(day, rq.QuestionCreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceCreation,
+    CASE
+      WHEN rq.Score > 100 THEN 'HighScore'
+      WHEN rq.Score > 20 THEN 'MediumScore'
+      ELSE 'LowScore'
+    END AS ScoreCategory,
+    IIF(rq.AnswerCount > 0, CAST(rq.AnswerCount AS DECIMAL(10, 2)) / (DATEDIFF(day, rq.QuestionCreationDate, cast('2024-10-01 12:34:56' as timestamp)) + 1), 0) AS AnswersPerDay
+  FROM RecentQuestions AS rq
+  LEFT JOIN RankedAnswers AS ra
+    ON rq.QuestionId = ra.QuestionId AND ra.answer_rank = 1
+  LEFT JOIN Users AS u_q
+    ON rq.OwnerUserId = u_q.Id
+  LEFT JOIN Users AS u_a
+    ON ra.OwnerUserId = u_a.Id
+  WHERE
+    rq.rn <= 1000
+)
+SELECT
+  tq.QuestionId,
+  tq.QuestionTitle,
+  tq.QuestionScore,
+  tq.AnswerCount,
+  tq.BestAnswerId,
+  tq.BestAnswerScore,
+  tq.QuestionOwnerName,
+  tq.AnswerOwnerName,
+  tq.DaysSinceCreation,
+  tq.ScoreCategory,
+  tq.AnswersPerDay,
+  ua.Reputation AS AnswerOwnerReputation,
+  ua.QuestionsAsked AS AnswerOwnerQuestions,
+  ua.AnswersGiven AS AnswerOwnerAnswers,
+  ua.UpVotesReceived AS AnswerOwnerUpvotes,
+  ua.DownVotesReceived AS AnswerOwnerDownvotes,
+  ua.LastAccess AS AnswerOwnerLastAccess,
+  ua.AvgCommentLength
+FROM TopQuestionsWithBestAnswers AS tq
+LEFT JOIN UserActivity AS ua
+  ON tq.AnswerOwnerName = ua.DisplayName -- Correlated Subquery logic by joining with UserActivity
+WHERE
+  tq.QuestionScore > 5
+  AND tq.BestAnswerScore IS NOT NULL
+  AND tq.DaysSinceCreation > 1
+UNION ALL
+SELECT
+  NULL AS QuestionId,
+  '--- Aggregate Statistics ---' AS QuestionTitle,
+  NULL AS QuestionScore,
+  COUNT(*) AS AnswerCount,
+  NULL AS BestAnswerId,
+  AVG(CAST(tq.BestAnswerScore AS FLOAT)) AS BestAnswerScore,
+  NULL AS QuestionOwnerName,
+  NULL AS AnswerOwnerName,
+  AVG(CAST(tq.DaysSinceCreation AS FLOAT)) AS DaysSinceCreation,
+  NULL AS ScoreCategory,
+  AVG(tq.AnswersPerDay) AS AnswersPerDay,
+  AVG(CAST(ua.Reputation AS FLOAT)) AS AnswerOwnerReputation,
+  AVG(CAST(ua.QuestionsAsked AS FLOAT)) AS AnswerOwnerQuestions,
+  AVG(CAST(ua.AnswersGiven AS FLOAT)) AS AnswerOwnerAnswers,
+  AVG(CAST(ua.UpVotesReceived AS FLOAT)) AS AnswerOwnerUpvotes,
+  AVG(CAST(ua.DownVotesReceived AS FLOAT)) AS AnswerOwnerDownvotes,
+  NULL AS AnswerOwnerLastAccess,
+  NULL AS AvgCommentLength
+FROM TopQuestionsWithBestAnswers AS tq
+LEFT JOIN UserActivity AS ua
+  ON tq.AnswerOwnerName = ua.DisplayName
+WHERE
+  tq.QuestionScore > 5
+  AND tq.BestAnswerScore IS NOT NULL
+  AND tq.DaysSinceCreation > 1;

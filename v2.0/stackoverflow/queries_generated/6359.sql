@@ -1,0 +1,51 @@
+-- {"query": "6359.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 525} 
+
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 1 THEN p.Id END) AS TotalTitleEdits,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 2 THEN p.Id END) AS TotalBodyEdits,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN p.Id END) AS TotalCloses,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN p.Id END) AS TotalReopens,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 7 THEN p.Id END) AS TotalCloseVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN p.Id END) AS TotalUpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN p.Id END) AS TotalDownVotes,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.Score) AS LowestScoredPost,
+    SUM(p.ViewCount) AS TotalViews,
+    AVG(p.Score) AS AvgScore,
+    AVG(p.ViewCount) AS AvgViews,
+    AVG(u.Reputation) AS AvgReputation,
+    AVG(b.Class) AS AvgBadgeClass,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS PopularTags,
+    (
+        SELECT 
+            STRING_AGG(DISTINCT cl.Name, ', ')
+        FROM 
+            CloseReasonTypes cl
+        WHERE 
+            cl.Id = ph.Comment
+    ) AS CloseReasons
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+WHERE 
+    p.PostTypeId = 1
+    AND p.LastActivityDate > DATEADD(month, -12, CURRENT_TIMESTAMP)
+GROUP BY 
+    u.DisplayName
+HAVING 
+    AVG(p.Score) > 10
+ORDER BY 
+    TotalPosts DESC;

@@ -1,0 +1,206 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        GREATEST(
+            u.LastAccessDate,
+            COALESCE(MAX(p.LastActivityDate), u.CreationDate),
+            COALESCE(MAX(c.CreationDate), u.CreationDate),
+            COALESCE(MAX(b.Date), u.CreationDate)
+        ) AS LastObservedActivity,
+        COALESCE(AVG(CASE WHEN c.Score IS NOT NULL THEN c.Score END), 0.0) AS AvgCommentScore,
+        COUNT(DISTINCT CASE WHEN b.TagBased = TRUE THEN b.Id END) AS TagBasedBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostDetailedMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        LENGTH(p.Body) AS BodyLength,
+        COUNT(DISTINCT ph.Id) AS HistoryEntryCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN ph.Id END) AS EditRevertCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVoteCount,
+        COUNT(DISTINCT pl_in.PostId) AS IncomingLinkCount,
+        COUNT(DISTINCT pl_out.RelatedPostId) AS OutgoingLinkCount,
+        COALESCE(AVG(LENGTH(com.Text)), 0.0) AS AvgCommentLength,
+        (SELECT COUNT(DISTINCT T2.Id) FROM Posts T2 WHERE T2.ParentId = p.Id AND T2.AcceptedAnswerId IS NOT NULL AND T2.CreationDate > p.CreationDate - INTERVAL '1 month') AS AcceptedAnswersForQuestionCount,
+        CARDINALITY(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS TagCount,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><') AS TagArray,
+        p.Title,
+        parent_p.Title AS ParentQuestionTitle,
+        parent_p.ViewCount AS ParentQuestionViewCount,
+        p.Body,
+        p.ClosedDate,
+        p.ParentId
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts parent_p ON p.ParentId = parent_p.Id
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Comments com ON p.Id = com.PostId
+    LEFT JOIN PostLinks pl_in ON p.Id = pl_in.RelatedPostId AND pl_in.LinkTypeId = 1
+    LEFT JOIN PostLinks pl_out ON p.Id = pl_out.PostId AND pl_out.LinkTypeId = 1
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, u.DisplayName, p.CreationDate, p.LastEditDate, p.LastActivityDate,
+        p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Body, p.Title, p.Tags,
+        p.ClosedDate, p.ParentId, parent_p.Title, parent_p.ViewCount
+),
+TagPopularityExploded AS (
+    SELECT
+        pdm.PostId,
+        UNNEST(pdm.TagArray) AS TagName,
+        pdm.Score
+    FROM PostDetailedMetrics pdm
+    WHERE pdm.PostTypeId = 1 AND pdm.TagArray IS NOT NULL AND CARDINALITY(pdm.TagArray) > 0
+),
+AggregatedTagMetrics AS (
+    SELECT
+        tp.TagName,
+        COUNT(DISTINCT tp.PostId) AS PostsWithTag,
+        SUM(tp.Score) AS TotalScoreForTag,
+        COALESCE(AVG(tp.Score), 0.0) AS AvgScoreForTag,
+        RANK() OVER (ORDER BY COUNT(DISTINCT tp.PostId) DESC, SUM(tp.Score) DESC) AS TagRankByUsage
+    FROM TagPopularityExploded tp
+    GROUP BY tp.TagName
+),
+TopQuestionAuthors AS (
+    SELECT
+        ranked_questions.PostId,
+        ranked_questions.OwnerUserId,
+        ranked_questions.Title,
+        ranked_questions.Score,
+        ranked_questions.ViewCount,
+        ranked_questions.QuestionCreationDate,
+        ranked_questions.Reputation,
+        ranked_questions.TotalPosts,
+        ranked_questions.GoldBadges
+    FROM (
+        SELECT
+            pdm.PostId,
+            pdm.OwnerUserId,
+            pdm.Title,
+            pdm.Score,
+            pdm.ViewCount,
+            pdm.PostCreationDate AS QuestionCreationDate,
+            uas.Reputation,
+            uas.TotalPosts,
+            uas.GoldBadges,
+            RANK() OVER (ORDER BY pdm.Score DESC, pdm.ViewCount DESC) AS QuestionScoreRank
+        FROM PostDetailedMetrics pdm
+        INNER JOIN UserActivitySummary uas ON pdm.OwnerUserId = uas.UserId
+        WHERE pdm.PostTypeId = 1 AND pdm.Score > 100 AND pdm.ViewCount > 5000 AND uas.Reputation > 5000
+    ) AS ranked_questions
+    WHERE ranked_questions.QuestionScoreRank <= 100
+)
+SELECT
+    'HighImpactQuestion' AS ReportCategory,
+    pdm.PostId,
+    pdm.Title,
+    pdm.PostTypeId,
+    uas.UserId,
+    uas.DisplayName AS OwnerDisplayName,
+    uas.Reputation,
+    pdm.Score AS PostScore,
+    pdm.ViewCount,
+    pdm.UpVoteCount,
+    pdm.DownVoteCount,
+    pdm.EditRevertCount,
+    pdm.AvgCommentLength,
+    atm.TagName AS PrimaryTag,
+    atm.AvgScoreForTag AS PrimaryTagAvgScore,
+    (uas.Reputation * 0.1 + uas.TotalPostScore * 0.05 + pdm.Score * 0.5 + pdm.ViewCount * 0.01 + pdm.FavoriteCount * 2) AS DerivedImpactScore,
+    DATE_TRUNC('hour', pdm.PostCreationDate) AS CreationHourBucket,
+    COALESCE(
+        SUBSTRING(pdm.Body FROM 1 FOR POSITION('</p>' IN pdm.Body) + 3),
+        SUBSTRING(pdm.Body FROM 1 FOR 100)
+    ) AS BodyExcerpt,
+    CASE
+        WHEN pdm.ClosedDate IS NOT NULL THEN 'CLOSED_QUESTION'
+        WHEN pdm.AcceptedAnswersForQuestionCount > 0 THEN 'ACCEPTED_ANSWERED'
+        WHEN pdm.LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 month' THEN 'RECENTLY_ACTIVE'
+        ELSE 'STALE'
+    END AS PostStatus
+FROM PostDetailedMetrics pdm
+INNER JOIN UserActivitySummary uas ON pdm.OwnerUserId = uas.UserId
+LEFT JOIN LATERAL (
+    SELECT atm_inner.TagName, atm_inner.AvgScoreForTag
+    FROM AggregatedTagMetrics atm_inner
+    WHERE atm_inner.TagName = ANY(pdm.TagArray)
+    ORDER BY atm_inner.AvgScoreForTag DESC
+    LIMIT 1
+) atm ON TRUE
+WHERE pdm.PostTypeId = 1
+  AND uas.Reputation > 5000
+  AND pdm.Score > 200
+  AND pdm.ViewCount > 10000
+  AND pdm.EditRevertCount >= 3
+  AND (pdm.Title ILIKE '%performance%' OR pdm.Title ILIKE '%scaling%' OR pdm.Title ILIKE '%optimization%')
+  AND pdm.ParentId IS NULL
+  AND NOT EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = uas.UserId AND b.Name = 'Disciplined')
+UNION ALL
+SELECT
+    'DebatedAnswer' AS ReportCategory,
+    pdm.PostId,
+    pdm.ParentQuestionTitle AS Title,
+    pdm.PostTypeId,
+    uas.UserId,
+    uas.DisplayName AS OwnerDisplayName,
+    uas.Reputation,
+    pdm.Score AS PostScore,
+    pdm.ParentQuestionViewCount AS ViewCount,
+    pdm.UpVoteCount,
+    pdm.DownVoteCount,
+    pdm.EditRevertCount,
+    pdm.AvgCommentLength,
+    NULL AS PrimaryTag,
+    NULL AS PrimaryTagAvgScore,
+    (pdm.Score * 0.8 + pdm.CommentCount * 3 + pdm.EditRevertCount * 5 + pdm.IncomingLinkCount * 10) AS DerivedImpactScore,
+    DATE_TRUNC('day', pdm.PostCreationDate) AS CreationHourBucket,
+    COALESCE(SUBSTRING(pdm.Body FROM 1 FOR 150), 'No body provided') AS BodyExcerpt,
+    CASE
+        WHEN pdm.AcceptedVoteCount > 0 THEN 'ACCEPTED_ANSWER'
+        WHEN pdm.CommentCount >= 10 AND pdm.EditRevertCount >= 5 THEN 'HIGHLY_DEBATED'
+        WHEN pdm.LastActivityDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years' THEN 'ARCHIVED_ANSWER'
+        ELSE 'STANDARD_ANSWER'
+    END AS PostStatus
+FROM PostDetailedMetrics pdm
+INNER JOIN UserActivitySummary uas ON pdm.OwnerUserId = uas.UserId
+WHERE pdm.PostTypeId = 2
+  AND pdm.Score > 50
+  AND pdm.CommentCount >= 5
+  AND pdm.EditRevertCount >= 2
+  AND uas.GoldBadges >= 1
+  AND pdm.ParentId IN (SELECT tqa.PostId FROM TopQuestionAuthors tqa)
+  AND EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = pdm.PostId AND c.Text ILIKE '%thanks%')
+  AND pdm.Body ILIKE '%example%'
+  AND pdm.AvgCommentLength IS NOT NULL AND pdm.AvgCommentLength BETWEEN 40 AND 120
+ORDER BY DerivedImpactScore DESC, PostCreationDate DESC, ReportCategory, pdm.PostId
+LIMIT 500;

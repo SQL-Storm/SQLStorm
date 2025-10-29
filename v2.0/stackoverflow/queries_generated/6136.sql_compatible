@@ -1,0 +1,82 @@
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.Reputation) AS MaxReputation,
+    MIN(u.CreationDate) AS EarliestUser,
+    AVG(p.Score) AS AvgPostScore,
+    SUM(v.BountyAmount) AS TotalBountyAmount,
+    b.Name AS TopBadge,
+    t.TagName AS MostUsedTag
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+         UserId, 
+         MAX(Date) AS MaxDate 
+     FROM 
+         Badges 
+     GROUP BY 
+         UserId) bb ON u.Id = bb.UserId
+LEFT JOIN 
+    (SELECT 
+         UserId, 
+         Name 
+     FROM 
+         Badges b2
+     WHERE 
+         Date = (SELECT MAX(Date) FROM Badges WHERE UserId = b2.UserId)
+    ) b ON u.Id = b.UserId
+LEFT JOIN 
+    Votes v ON u.Id = v.UserId AND v.VoteTypeId = 8
+LEFT JOIN 
+    (SELECT 
+         p.OwnerUserId, 
+         COUNT(DISTINCT t.Id) AS TagCount 
+     FROM 
+         Posts p
+     JOIN 
+         Tags t ON replace(replace(substring(p.Tags FROM '<([^>]+)>' FOR 1), '<', ''), '>', '') = t.Id::text
+     GROUP BY 
+         p.OwnerUserId) tt ON u.Id = tt.OwnerUserId
+LEFT JOIN 
+    (SELECT 
+         UserId, 
+         TagName 
+     FROM 
+         Tags t_outer
+     WHERE 
+         Id = (
+             SELECT MAX(t2.Id) 
+             FROM Tags t2
+             JOIN (
+                 SELECT 
+                     UserId, 
+                     MAX(Count) AS MaxCount 
+                 FROM 
+                     Tags 
+                 GROUP BY 
+                     UserId
+             ) tc ON t2.Id = tc.UserId
+         )
+    ) t ON u.Id = t.UserId
+WHERE 
+    u.Reputation > 1000
+    AND p.LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR
+    AND v.BountyAmount > 0
+GROUP BY 
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    b.Name,
+    t.TagName
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    AvgPostScore DESC, 
+    TotalPosts DESC;

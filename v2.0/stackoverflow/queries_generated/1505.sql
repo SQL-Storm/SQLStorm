@@ -1,0 +1,276 @@
+-- {"query": "1505.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4003} 
+
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT V.Id) AS TotalVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        SUM(P.Score) AS TotalPostScoreReceived,
+        SUM(C.Score) AS TotalCommentScoreReceived,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / (60 * 60 * 24) AS UserActiveDays
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+UserActivityLog AS (
+    SELECT U.Id AS UserId, U.CreationDate AS ActivityDate, 'UserCreated' AS ActivityType, NULL::int AS Score, U.DisplayName AS TextBody, NULL::int AS ParentId, NULL::varchar AS Tags FROM Users U
+    UNION ALL
+    SELECT P.OwnerUserId AS UserId, P.CreationDate AS ActivityDate, 'PostCreated' AS ActivityType, P.Score, P.Title AS TextBody, P.ParentId, P.Tags FROM Posts P WHERE P.OwnerUserId IS NOT NULL
+    UNION ALL
+    SELECT C.UserId AS UserId, C.CreationDate AS ActivityDate, 'CommentCreated' AS ActivityType, C.Score, C.Text, C.PostId AS ParentId, NULL::varchar AS Tags FROM Comments C WHERE C.UserId IS NOT NULL
+    UNION ALL
+    SELECT V.UserId AS UserId, V.CreationDate AS ActivityDate, 'VoteCast' AS ActivityType, NULL::int AS Score, VT.Name AS TextBody, V.PostId AS ParentId, NULL::varchar AS Tags FROM Votes V JOIN VoteTypes VT ON V.VoteTypeId = VT.Id WHERE V.UserId IS NOT NULL
+    UNION ALL
+    SELECT B.UserId AS UserId, B.Date AS ActivityDate, 'BadgeAwarded' AS ActivityType, NULL::int AS Score, B.Name AS TextBody, NULL::int AS ParentId, NULL::varchar AS Tags FROM Badges B
+),
+PostDetailedMetrics AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.ViewCount,
+        Q.Score AS QuestionScore,
+        Q.FavoriteCount,
+        Q.AnswerCount,
+        Q.OwnerUserId,
+        COUNT(DISTINCT A.Id) AS ActualAnswerCount,
+        SUM(A.Score) AS TotalAnswerScore,
+        COALESCE(AVG(A.Score) FILTER (WHERE A.Score IS NOT NULL), 0) AS AvgAnswerScore,
+        COUNT(DISTINCT C.Id) AS TotalQuestionComments,
+        SUM(C.Score) AS TotalQuestionCommentScore,
+        Q.Tags AS RawTags,
+        Q.LastActivityDate,
+        PH.CreationDate AS LastEditDate_PostHistory,
+        PH.UserId AS LastEditorUserId_PostHistory,
+        U_Editor.DisplayName AS LastEditorDisplayName_PostHistory,
+        COALESCE(Q.LastEditDate, Q.CreationDate) AS EffectiveLastEditDate,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = Q.Id AND V.VoteTypeId = 2) AS QuestionUpvoteCount,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = Q.Id AND V.VoteTypeId = 3) AS QuestionDownvoteCount,
+        (SELECT COUNT(PL.RelatedPostId) FROM PostLinks PL WHERE PL.PostId = Q.Id AND PL.LinkTypeId = 1) AS LinkedPostsCount,
+        (SELECT COUNT(PL.RelatedPostId) FROM PostLinks PL WHERE PL.PostId = Q.Id AND PL.LinkTypeId = 3) AS DuplicatePostsCount,
+        (SELECT COUNT(PH2.Id) FROM PostHistory PH2 WHERE PH2.PostId = Q.Id AND PH2.PostHistoryTypeId IN (4,5,6)) AS EditHistoryCount,
+        (SELECT MAX(PH3.CreationDate) FROM PostHistory PH3 WHERE PH3.PostId = Q.Id AND PH3.PostHistoryTypeId IN (10,11)) AS LastClosureReopenDate
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN Comments C ON Q.Id = C.PostId
+    LEFT JOIN PostHistory PH ON Q.Id = PH.PostId AND PH.PostHistoryTypeId IN (4,5,6) AND PH.CreationDate = (SELECT MAX(PH_inner.CreationDate) FROM PostHistory PH_inner WHERE PH_inner.PostId = Q.Id AND PH_inner.PostHistoryTypeId IN (4,5,6))
+    LEFT JOIN Users U_Editor ON PH.UserId = U_Editor.Id
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id, Q.Title, Q.CreationDate, Q.ViewCount, Q.Score, Q.FavoriteCount, Q.AnswerCount, Q.OwnerUserId, Q.Tags, Q.LastActivityDate, Q.LastEditDate, PH.CreationDate, PH.UserId, U_Editor.DisplayName
+),
+TopUserBadges AS (
+    SELECT
+        B.UserId,
+        B.Name AS BadgeName,
+        B.Class AS BadgeClass,
+        B.Date AS BadgeAwardDate,
+        ROW_NUMBER() OVER (PARTITION BY B.UserId, B.Class ORDER BY B.Date DESC) AS rn_badge_date,
+        COUNT(B.Id) OVER (PARTITION BY B.UserId, B.Class) AS ClassBadgeCount
+    FROM Badges B
+    WHERE B.Class IN (1, 2)
+),
+PostPerformanceRankings AS (
+    SELECT
+        PM.QuestionId,
+        PM.QuestionTitle,
+        PM.QuestionScore,
+        PM.ViewCount,
+        PM.FavoriteCount,
+        PM.ActualAnswerCount,
+        PM.TotalAnswerScore,
+        NTILE(10) OVER (ORDER BY PM.QuestionScore DESC) AS ScoreDecile,
+        RANK() OVER (ORDER BY PM.ViewCount DESC, PM.QuestionCreationDate ASC) AS ViewRank,
+        DENSE_RANK() OVER (ORDER BY PM.FavoriteCount DESC) AS FavoriteRank,
+        LAG(PM.QuestionCreationDate, 1) OVER (PARTITION BY PM.QuestionCreationDate::date ORDER BY PM.QuestionCreationDate) AS PrevQuestionCreationDate,
+        LEAD(PM.QuestionCreationDate, 1) OVER (PARTITION BY PM.QuestionCreationDate::date ORDER BY PM.QuestionCreationDate) AS NextQuestionCreationDate,
+        EXTRACT(EPOCH FROM (LEAD(PM.QuestionCreationDate) OVER (ORDER BY PM.QuestionCreationDate) - PM.QuestionCreationDate)) / 60 AS TimeToNextQuestionMins
+    FROM PostDetailedMetrics PM
+    WHERE PM.ActualAnswerCount > 0 OR PM.QuestionScore > 0 OR PM.ViewCount > 0
+),
+UserReputationTier AS (
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        UE.Reputation,
+        UE.TotalPosts,
+        UE.TotalComments,
+        UE.UserActiveDays,
+        CASE
+            WHEN UE.Reputation >= 100000 THEN 'Legendary'
+            WHEN UE.Reputation >= 25000 THEN 'Expert'
+            WHEN UE.Reputation >= 5000 THEN 'Pro'
+            WHEN UE.Reputation >= 1000 THEN 'Active'
+            ELSE 'Novice'
+        END AS ReputationTier,
+        AVG(UE.TotalPosts) OVER (PARTITION BY
+            CASE
+                WHEN UE.Reputation >= 100000 THEN 'Legendary'
+                WHEN UE.Reputation >= 25000 THEN 'Expert'
+                WHEN UE.Reputation >= 5000 THEN 'Pro'
+                WHEN UE.Reputation >= 1000 THEN 'Active'
+                ELSE 'Novice'
+            END
+        ) AS AvgPostsInTier,
+        SUM(UE.TotalUpVotesGiven) OVER (PARTITION BY UE.Reputation) AS TotalUpVotesSameReputation
+    FROM UserEngagement UE
+),
+PostClosureAnalysis AS (
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS ClosureDate,
+        PH.UserId AS CloserUserId,
+        U_Closer.DisplayName AS CloserDisplayName,
+        CR.Name AS CloseReason,
+        LAG(PH.CreationDate, 1) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousClosureEventDate,
+        LEAD(PH.CreationDate, 1) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS NextClosureEventDate,
+        CASE
+            WHEN PH.Text ILIKE '%OriginalQuestionIds%' THEN 'Duplicate (JSON)'
+            ELSE 'Standard'
+        END AS ClosureDetailsType,
+        (SELECT COUNT(PL.PostId) FROM PostLinks PL WHERE PL.RelatedPostId = PH.PostId AND PL.LinkTypeId = 3) AS DuplicatedByCount
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    LEFT JOIN Users U_Closer ON PH.UserId = U_Closer.Id
+    LEFT JOIN CloseReasonTypes CR ON PH.Comment IS NOT NULL AND CR.Id = CAST(PH.Comment AS SMALLINT)
+    WHERE PH.PostHistoryTypeId = 10
+),
+TagUsageStats AS (
+    SELECT
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS QuestionCount,
+        SUM(P.Score) AS TotalScore,
+        AVG(P.Score) AS AverageScore,
+        COUNT(DISTINCT B.Id) FILTER (WHERE B.TagBased = TRUE) AS TagBasedBadgeCount
+    FROM Tags T
+    LEFT JOIN LATERAL (
+        SELECT P.Id, P.Score
+        FROM Posts P
+        WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND P.Tags LIKE '%' || '<' || T.TagName || '>' || '%'
+    ) P ON TRUE
+    LEFT JOIN Badges B ON B.Name = T.TagName
+    GROUP BY T.TagName
+    HAVING COUNT(DISTINCT P.Id) > 50
+)
+SELECT
+    U.UserId,
+    U.DisplayName AS UserDisplayName,
+    U.Reputation,
+    URT.ReputationTier,
+    URT.AvgPostsInTier,
+    U.TotalQuestions AS UserTotalQuestions,
+    U.TotalAnswers AS UserTotalAnswers,
+    U.TotalComments AS UserTotalComments,
+    U.TotalUpVotesGiven AS UserTotalUpVotesGiven,
+    U.TotalPostScoreReceived AS UserTotalPostScoreReceived,
+    TR.BadgeName AS TopGoldBadge,
+    TR.BadgeClass AS TopGoldBadgeClass,
+    TR.BadgeAwardDate AS TopGoldBadgeAwardDate,
+    TR_SILVER.BadgeName AS TopSilverBadge,
+    TR_SILVER.BadgeClass AS TopSilverBadgeClass,
+    TR_SILVER.BadgeAwardDate AS TopSilverBadgeAwardDate,
+    COALESCE(U.UserActiveDays, 0) AS UserActiveDays,
+    U.TotalPosts / NULLIF(U.UserActiveDays, 0) AS PostsPerActiveDay,
+    (SELECT COUNT(DISTINCT UAL.ActivityType) FROM UserActivityLog UAL WHERE UAL.UserId = U.UserId) AS DistinctActivityTypes,
+    (SELECT AVG(UAL.Score) FILTER (WHERE UAL.UserId = U.UserId AND UAL.ActivityType = 'PostCreated')) AS AvgPostCreationScore,
+
+    Q.QuestionId,
+    Q.QuestionTitle,
+    Q.QuestionCreationDate,
+    Q.QuestionScore,
+    Q.ViewCount AS QuestionViewCount,
+    Q.FavoriteCount AS QuestionFavoriteCount,
+    Q.ActualAnswerCount,
+    Q.AvgAnswerScore,
+    Q.TotalQuestionComments,
+    Q.RawTags AS QuestionRawTags,
+    PPR.ScoreDecile AS QuestionScoreDecile,
+    PPR.ViewRank AS QuestionViewRank,
+    PPR.FavoriteRank AS QuestionFavoriteRank,
+    PPR.TimeToNextQuestionMins,
+    Q.LastEditorDisplayName_PostHistory AS QuestionLastEditor,
+    Q.LastEditDate_PostHistory AS QuestionLastEditDate,
+    Q.LastClosureReopenDate,
+    (SELECT AVG(PM_inner.QuestionScore) FROM PostDetailedMetrics PM_inner WHERE PM_inner.QuestionCreationDate BETWEEN Q.QuestionCreationDate - INTERVAL '7 day' AND Q.QuestionCreationDate + INTERVAL '7 day') AS AvgQuestionScoreAroundDate,
+    (
+        SELECT EXISTS (
+            SELECT 1
+            FROM Badges B
+            WHERE B.UserId = U.UserId
+              AND B.Class = 1
+              AND B.TagBased = TRUE
+              AND (
+                    CASE
+                        WHEN Q.RawTags IS NOT NULL AND LENGTH(Q.RawTags) > 2 THEN
+                            B.Name = ANY(string_to_array(substring(Q.RawTags, 2, LENGTH(Q.RawTags)-2), '><'))
+                        ELSE FALSE
+                    END
+                )
+        )
+    ) AS HasGoldBadgeForQuestionTag,
+
+    PCA.ClosureDate,
+    PCA.CloseReason,
+    PCA.CloserDisplayName,
+    PCA.DuplicatedByCount AS TimesDuplicatedByOthers,
+    COALESCE(TO_CHAR(PCA.ClosureDate, 'YYYY-MM-DD'), 'N/A') AS FormattedClosureDate,
+
+    QuestionTagSummary.QuestionAssociatedTags,
+    QuestionTagSummary.AssociatedTagQuestionCount,
+    QuestionTagSummary.AssociatedTagAverageScore,
+    QuestionTagSummary.AssociatedTagBadgeCount,
+    NTILE(5) OVER (ORDER BY QuestionTagSummary.AssociatedTagQuestionCount DESC) AS TagPopularityQuintile
+
+FROM UserEngagement U
+LEFT JOIN UserReputationTier URT ON U.UserId = URT.UserId
+LEFT JOIN PostDetailedMetrics Q ON U.UserId = Q.OwnerUserId
+LEFT JOIN PostPerformanceRankings PPR ON Q.QuestionId = PPR.QuestionId
+LEFT JOIN TopUserBadges TR ON U.UserId = TR.UserId AND TR.BadgeClass = 1 AND TR.rn_badge_date = 1
+LEFT JOIN TopUserBadges TR_SILVER ON U.UserId = TR_SILVER.UserId AND TR_SILVER.BadgeClass = 2 AND TR_SILVER.rn_badge_date = 1
+LEFT JOIN PostClosureAnalysis PCA ON Q.QuestionId = PCA.PostId
+LEFT JOIN LATERAL (
+    SELECT
+        STRING_AGG(DISTINCT TUS_inner.TagName, ', ') AS QuestionAssociatedTags,
+        SUM(TUS_inner.QuestionCount) AS AssociatedTagQuestionCount,
+        AVG(TUS_inner.AverageScore) AS AssociatedTagAverageScore,
+        SUM(TUS_inner.TagBasedBadgeCount) AS AssociatedTagBadgeCount
+    FROM TagUsageStats TUS_inner
+    WHERE Q.RawTags IS NOT NULL AND Q.RawTags LIKE '%' || '<' || TUS_inner.TagName || '>' || '%'
+) AS QuestionTagSummary ON Q.QuestionId IS NOT NULL
+
+WHERE U.Reputation > 500
+  AND (Q.QuestionScore > 10 OR Q.ViewCount > 1000 OR Q.QuestionId IS NULL)
+  AND (U.DisplayName IS NOT NULL AND LENGTH(U.DisplayName) > 3)
+  AND (U.WebsiteUrl IS NOT NULL OR U.Location IS NOT NULL OR U.AboutMe IS NOT NULL)
+  AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory PH_Del
+        WHERE PH_Del.PostId = Q.QuestionId
+          AND PH_Del.PostHistoryTypeId = 12
+          AND Q.QuestionId IS NOT NULL -- Only check for non-null QuestionId
+    )
+  AND (
+        (Q.QuestionCreationDate >= '2020-01-01' AND Q.QuestionCreationDate < '2023-01-01')
+        OR Q.QuestionId IS NULL
+      )
+  AND (U.TotalComments > 5
+       OR (Q.QuestionId IS NOT NULL AND Q.ActualAnswerCount > 0 AND Q.AvgAnswerScore > 5)
+       OR U.TotalBadges > 2
+      )
+ORDER BY
+    U.Reputation DESC,
+    Q.QuestionCreationDate DESC NULLS LAST,
+    PCA.ClosureDate DESC NULLS LAST
+LIMIT 100000;

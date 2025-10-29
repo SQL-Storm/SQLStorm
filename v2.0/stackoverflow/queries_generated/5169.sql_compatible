@@ -1,0 +1,137 @@
+WITH TopQuestions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.LastActivityDate,
+    p.FavoriteCount,
+    u.Reputation,
+    u.DisplayName AS OwnerName,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn_owner
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+),
+RecentActivity AS (
+  SELECT
+    t.QuestionId,
+    t.Title,
+    t.CreationDate,
+    t.OwnerUserId,
+    t.OwnerName,
+    t.Reputation,
+    t.Score,
+    t.ViewCount,
+    t.AnswerCount,
+    t.CommentCount,
+    t.LastActivityDate,
+    t.Tags,
+    t.FavoriteCount,
+    COUNT(*) OVER () AS total_questions
+  FROM TopQuestions t
+  WHERE t.rn_owner = 1
+),
+-- Replace UNNEST + string_to_array with a set-returning approach using a recursive CTE to split tags
+TagPairs AS (
+  SELECT
+    r.QuestionId,
+    -- remove surrounding angle brackets if present
+    CASE
+      WHEN r.Tags IS NULL THEN NULL
+      WHEN LEFT(r.Tags,1) = '<' AND RIGHT(r.Tags,1) = '>' THEN SUBSTR(r.Tags, 2, LENGTH(r.Tags) - 2)
+      ELSE r.Tags
+    END AS TagsFlat
+  FROM RecentActivity r
+),
+TagSplit AS (
+  -- recursive splitter: returns one row per tag per question
+  SELECT
+    QuestionId,
+    CASE WHEN instr(TagsFlat, '><') = 0 THEN TagsFlat
+         WHEN instr(TagsFlat, '><') > 0 THEN substr(TagsFlat, 1, instr(TagsFlat, '><') - 1)
+         ELSE TagsFlat END AS TagName,
+    CASE WHEN instr(TagsFlat, '><') = 0 THEN NULL
+         ELSE substr(TagsFlat, instr(TagsFlat, '><') + 2) END AS rest
+  FROM TagPairs
+  WHERE TagsFlat IS NOT NULL
+  UNION ALL
+  SELECT
+    QuestionId,
+    CASE WHEN instr(rest, '><') = 0 THEN rest
+         ELSE substr(rest, 1, instr(rest, '><') - 1) END AS TagName,
+    CASE WHEN instr(rest, '><') = 0 THEN NULL
+         ELSE substr(rest, instr(rest, '><') + 2) END AS rest
+  FROM TagSplit
+  WHERE rest IS NOT NULL
+),
+TagStats AS (
+  SELECT
+    ts.TagName,
+    COUNT(DISTINCT ts.QuestionId) AS TagQuestionCount,
+    AVG(r.Score) AS AvgScorePerTag,
+    MAX(r.ViewCount) AS MaxViewsForTag
+  FROM TagSplit ts
+  JOIN RecentActivity r ON ts.QuestionId = r.QuestionId
+  GROUP BY ts.TagName
+),
+CrossJoinStats AS (
+  SELECT
+    r.QuestionId,
+    r.Title,
+    r.OwnerUserId,
+    r.OwnerName,
+    r.Reputation,
+    r.Score,
+    r.ViewCount,
+    r.AnswerCount,
+    r.CommentCount,
+    r.LastActivityDate,
+    r.Tags,
+    r.FavoriteCount,
+    COALESCE(vt.ClosedCnt, 0) AS CloseVotes,
+    COALESCE(vt.UpVotes, 0) AS UpVotes,
+    COALESCE(vt.DownVotes, 0) AS DownVotes,
+    vt.LastVoteDate
+  FROM RecentActivity r
+  LEFT JOIN (
+    SELECT
+      PostId,
+      SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+      MAX(CreationDate) AS LastVoteDate,
+      SUM(CASE WHEN VoteTypeId = 6 THEN 1 ELSE 0 END) AS ClosedCnt
+    FROM Votes
+    GROUP BY PostId
+  ) vt ON r.QuestionId = vt.PostId
+)
+SELECT
+  c.QuestionId,
+  c.Title,
+  c.OwnerName,
+  c.Reputation,
+  c.Score,
+  c.ViewCount,
+  c.AnswerCount,
+  c.CommentCount,
+  c.LastActivityDate,
+  c.Tags,
+  c.FavoriteCount,
+  c.CloseVotes,
+  c.UpVotes,
+  c.DownVotes,
+  c.LastVoteDate,
+  tsg.TagName,
+  tsg.TagQuestionCount,
+  tsg.AvgScorePerTag,
+  tsg.MaxViewsForTag
+FROM CrossJoinStats c
+LEFT JOIN TagStats tsg
+  ON ',' || COALESCE(c.Tags, '') || ',' LIKE '%,' || tsg.TagName || ',%'
+ORDER BY c.LastActivityDate DESC, c.Score DESC
+LIMIT 200;

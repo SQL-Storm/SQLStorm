@@ -1,0 +1,114 @@
+-- {"query": "3410.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1664} 
+
+WITH 
+-- Basic per‑user aggregates
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id)               AS BadgeCount
+    FROM Users u
+),
+
+-- How many answer‑posts each user contributed per tag (tags are stored as “<tag1><tag2>…”)
+UserTagContrib AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag,
+        COUNT(*) AS PostsWithTag
+    FROM Posts p
+    WHERE p.PostTypeId = 2               -- only answers
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, Tag
+),
+
+-- Pick the top tag per user
+TopTagPerUser AS (
+    SELECT 
+        utc.UserId,
+        utc.Tag,
+        utc.PostsWithTag,
+        ROW_NUMBER() OVER (PARTITION BY utc.UserId ORDER BY utc.PostsWithTag DESC) AS rn
+    FROM UserTagContrib utc
+),
+
+-- Recent voting activity per voter
+RecentVotes AS (
+    SELECT 
+        v.UserId,
+        MAX(v.CreationDate)                                          AS LastVoteDate,
+        COUNT(*) FILTER (WHERE vt.Name = 'UpMod')    AS UpVotesGiven,
+        COUNT(*) FILTER (WHERE vt.Name = 'DownMod')  AS DownVotesGiven
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.UserId
+),
+
+-- Combine everything, keeping users even when they have no votes or tags (LEFT JOINs)
+Combined AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.AnswerCount,
+        us.QuestionCount,
+        us.BadgeCount,
+        COALESCE(rv.UpVotesGiven, 0)   AS UpVotesGiven,
+        COALESCE(rv.DownVotesGiven, 0) AS DownVotesGiven,
+        rv.LastVoteDate,
+        tt.Tag,
+        tt.PostsWithTag
+    FROM UserStats us
+    LEFT JOIN RecentVotes rv ON rv.UserId = us.Id
+    LEFT JOIN (
+        SELECT UserId, Tag, PostsWithTag
+        FROM TopTagPerUser
+        WHERE rn = 1
+    ) tt ON tt.UserId = us.Id
+)
+
+-- Main result set with a correlated sub‑query for avg answer score
+SELECT 
+    c.Id,
+    c.DisplayName,
+    c.Reputation,
+    c.AnswerCount,
+    c.QuestionCount,
+    c.BadgeCount,
+    c.UpVotesGiven,
+    c.DownVotesGiven,
+    c.LastVoteDate,
+    c.Tag,
+    c.PostsWithTag
+FROM Combined c
+WHERE 
+      c.Reputation > 10000
+   OR (c.AnswerCount > 0 
+       AND (SELECT AVG(p.Score) 
+            FROM Posts p 
+            WHERE p.OwnerUserId = c.Id 
+              AND p.PostTypeId = 2) > 5)
+ORDER BY c.Reputation DESC, c.AnswerCount DESC
+LIMIT 100
+
+UNION ALL
+
+-- Fallback row if the main query returns nothing
+SELECT
+    -1 AS Id,
+    'Community' AS DisplayName,
+    NULL AS Reputation,
+    NULL AS AnswerCount,
+    NULL AS QuestionCount,
+    NULL AS BadgeCount,
+    NULL AS UpVotesGiven,
+    NULL AS DownVotesGiven,
+    NULL AS LastVoteDate,
+    NULL AS Tag,
+    NULL AS PostsWithTag
+WHERE NOT EXISTS (SELECT 1 FROM Combined);

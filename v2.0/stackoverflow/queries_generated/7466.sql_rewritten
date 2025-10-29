@@ -1,0 +1,365 @@
+-- {"query": "7466.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3557} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as ActivityRank,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Gold'
+            WHEN u.Reputation >= 1000 THEN 'Silver'
+            ELSE 'Bronze'
+        END as Tier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        u.Id as OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                CASE 
+                    WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+                    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+                    ELSE 'Unanswered'
+                END
+            ELSE 'N/A'
+        END as QuestionStatus,
+        COALESCE(p.Tags, '') as Tags,
+        STRING_AGG(CASE WHEN p.Tags IS NOT NULL THEN SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2) END, ', ') as TagList,
+        CASE WHEN COALESCE(p.Tags, '') != '' THEN 
+            (SELECT COUNT(*) FROM unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) as tag) 
+        ELSE 0 END as TagCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as PostSequence
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, 
+             p.CreationDate, p.LastActivityDate, u.Id, u.DisplayName, p.PostTypeId, pt.Name, 
+             p.AcceptedAnswerId, p.ClosedDate, p.Tags
+),
+TopQuestions AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.Tags,
+        pa.OwnerUserId,
+        pa.OwnerDisplayName,
+        pa.PostTypeName,
+        pa.QuestionStatus,
+        pa.TagCount,
+        pa.PostSequence,
+        RANK() OVER (ORDER BY pa.Score DESC, pa.ViewCount DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY pa.CreationDate DESC) as RecentRank,
+        AVG(pa.Score) OVER (PARTITION BY pa.OwnerUserId) as AvgUserScore,
+        MAX(pa.Score) OVER (PARTITION BY pa.OwnerUserId) as MaxUserScore,
+        LAG(pa.Score) OVER (ORDER BY pa.Score DESC) as PrevScore,
+        NTILE(10) OVER (ORDER BY pa.Score DESC) as ScoreDecile,
+        CASE 
+            WHEN pa.Score > 500 THEN 'Viral'
+            WHEN pa.Score > 200 THEN 'Popular'
+            WHEN pa.Score > 50 THEN 'Interesting'
+            ELSE 'Average'
+        END as PopularityLevel
+    FROM PostAnalysis pa
+    WHERE pa.PostTypeId = 1 AND pa.Score > 0
+),
+ComplexBadges AS (
+    SELECT 
+        b.Id,
+        b.UserId,
+        b.Name,
+        b.Date,
+        b.Class,
+        b.TagBased,
+        CASE 
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver'
+            WHEN b.Class = 3 THEN 'Bronze'
+            ELSE 'Unknown'
+        END as BadgeTier,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId, b.Name ORDER BY b.Date DESC) as BadgeCount,
+        DATEDIFF('day', b.Date, cast('2024-10-01 12:34:56' as timestamp)) as DaysSinceAwarded,
+        LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) as PreviousBadgeDate,
+        AVG(b.Date) OVER (PARTITION BY b.UserId) as AvgBadgeDate
+    FROM Badges b
+),
+PerformanceMetrics AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.ReputationRank,
+        uas.ActivityRank,
+        uas.Tier,
+        uas.LastPostDate,
+        uas.LastCommentDate,
+        CASE 
+            WHEN uas.TotalPosts > 0 THEN 
+                (CAST(uas.Answers AS FLOAT) / NULLIF(uas.Questions, 0)) * 100
+            ELSE 0
+        END as AnswerRate,
+        CASE 
+            WHEN uas.TotalPosts > 0 THEN 
+                CAST(uas.Comments AS FLOAT) / NULLIF(uas.TotalPosts, 0)
+            ELSE 0
+        END as CommentRate,
+        CASE 
+            WHEN uas.Badges > 0 THEN 
+                (CAST(uas.Comments AS FLOAT) / NULLIF(uas.Badges, 0))
+            ELSE 0
+        END as CommentPerBadge,
+        CASE 
+            WHEN uas.Reputation > 0 THEN 
+                (CAST(uas.TotalPosts AS FLOAT) / NULLIF(uas.Reputation, 0)) * 100
+            ELSE 0
+        END as PostPerReputation,
+        NTILE(5) OVER (ORDER BY uas.Reputation DESC) as ReputationPercentile,
+        (SELECT COUNT(*) FROM ComplexBadges cb WHERE cb.UserId = uas.UserId AND cb.BadgeTier = 'Gold') as GoldBadges,
+        (SELECT COUNT(*) FROM ComplexBadges cb WHERE cb.UserId = uas.UserId AND cb.BadgeTier = 'Silver') as SilverBadges,
+        (SELECT COUNT(*) FROM ComplexBadges cb WHERE cb.UserId = uas.UserId AND cb.BadgeTier = 'Bronze') as BronzeBadges
+    FROM UserActivityStats uas
+)
+SELECT TOP 100
+    pm.UserId,
+    pm.DisplayName,
+    pm.Reputation,
+    pm.TotalPosts,
+    pm.Questions,
+    pm.Answers,
+    pm.Comments,
+    pm.Badges,
+    pm.ReputationRank,
+    pm.ActivityRank,
+    pm.Tier,
+    pm.LastPostDate,
+    pm.LastCommentDate,
+    pm.AnswerRate,
+    pm.CommentRate,
+    pm.CommentPerBadge,
+    pm.PostPerReputation,
+    pm.ReputationPercentile,
+    pm.GoldBadges,
+    pm.SilverBadges,
+    pm.BronzeBadges,
+    COALESCE(tq.Title, 'No Top Questions') as TopQuestion,
+    COALESCE(tq.Score, 0) as TopQuestionScore,
+    COALESCE(tq.ViewCount, 0) as TopQuestionViews,
+    COALESCE(tq.AnswerCount, 0) as TopQuestionAnswers,
+    CASE 
+        WHEN tq.Score IS NOT NULL AND tq.Score > 0 THEN 
+            (CAST(tq.Score AS FLOAT) / NULLIF(pm.Reputation, 0)) * 100
+        ELSE NULL
+    END as ScoreReputationRatio,
+    CASE 
+        WHEN tq.ViewCount IS NOT NULL AND tq.ViewCount > 0 THEN 
+            (CAST(tq.CommentCount AS FLOAT) / NULLIF(tq.ViewCount, 0)) * 100
+        ELSE NULL
+    END as CommentToViewRatio,
+    CASE 
+        WHEN COALESCE(tq.Score, 0) > 0 AND pm.Reputation > 0 THEN 
+            (CAST(tq.Score AS FLOAT) / NULLIF(pm.Reputation, 0)) / 
+            (CAST(tq.ViewCount AS FLOAT) / NULLIF(pm.ViewCount, 0))
+        ELSE NULL
+    END as EfficiencyRatio,
+    CASE 
+        WHEN pm.Reputation > 10000 THEN 'Elite'
+        WHEN pm.Reputation > 1000 THEN 'Expert'
+        WHEN pm.Reputation > 100 THEN 'Novice'
+        ELSE 'Beginner'
+    END as ExpertiseLevel,
+    CASE 
+        WHEN pm.Comments > pm.Answers THEN 'Comment Heavy'
+        WHEN pm.Answers > pm.Comments THEN 'Answer Heavy'
+        WHEN pm.Answers = pm.Comments AND pm.Answers > 0 THEN 'Balanced'
+        ELSE 'Inactive'
+    END as ContributionStyle,
+    LAG(pm.Reputation) OVER (ORDER BY pm.Reputation DESC) as PrevReputation,
+    LEAD(pm.Reputation) OVER (ORDER BY pm.Reputation DESC) as NextReputation,
+    (SELECT COUNT(*) FROM Users u2 WHERE u2.Reputation > pm.Reputation) as AboveReputation,
+    (SELECT COUNT(*) FROM Users u3 WHERE u3.Reputation < pm.Reputation) as BelowReputation,
+    AVG(pm.Reputation) OVER (ORDER BY pm.Reputation DESC ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) as ReputationMovingAvg,
+    CASE 
+        WHEN pm.Reputation > (
+            SELECT AVG(Reputation) 
+            FROM Users 
+            WHERE Reputation > 0
+        ) THEN 'Above Average'
+        ELSE 'Below Average'
+    END as ReputationComparison,
+    CASE 
+        WHEN pm.Comments > 0 THEN 
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = pm.UserId AND p.PostTypeId = 1 AND p.Score > 0)
+        ELSE 0
+    END as HighScoringQuestions,
+    CASE 
+        WHEN pm.Answers > 0 THEN 
+            (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = pm.UserId AND p2.PostTypeId = 2 AND p2.Score > 0)
+        ELSE 0
+    END as HighScoringAnswers,
+    CASE 
+        WHEN pm.Badges > 0 THEN 
+            (SELECT COUNT(*) FROM Badges bg WHERE bg.UserId = pm.UserId AND bg.Class = 1)
+        ELSE 0
+    END as GoldBadgeCount,
+    COALESCE(
+        (SELECT STRING_AGG(CONCAT(cb.Name, ' (', cb.Date, ')'), ', ') 
+         FROM ComplexBadges cb 
+         WHERE cb.UserId = pm.UserId 
+         AND cb.BadgeTier = 'Gold' 
+         ORDER BY cb.Date DESC 
+         LIMIT 5
+        ), 
+        'No Gold Badges'
+    ) as RecentGoldBadges,
+    ROW_NUMBER() OVER (ORDER BY pm.Reputation DESC, pm.TotalPosts DESC) as OverallRank,
+    PERCENT_RANK() OVER (ORDER BY pm.Reputation DESC) as ReputationPercentileRank,
+    CUME_DIST() OVER (ORDER BY pm.TotalPosts) as PostDistribution,
+    NTILE(4) OVER (ORDER BY pm.Reputation DESC) as ReputationQuartile,
+    DENSE_RANK() OVER (ORDER BY pm.GoldBadges DESC) as GoldBadgeRank,
+    CASE 
+        WHEN pm.Reputation >= 10000 AND pm.GoldBadges >= 5 THEN 'Legendary'
+        WHEN pm.Reputation >= 1000 AND pm.Badges >= 20 THEN 'Master'
+        WHEN pm.Reputation >= 100 AND pm.Badges >= 10 THEN 'Veteran'
+        ELSE 'Regular'
+    END as CommunityStatus,
+    CASE 
+        WHEN pm.Questions > 0 THEN 
+            (CAST(pm.Answers AS FLOAT) / NULLIF(pm.Questions, 0)) 
+        ELSE 0
+    END as AnswerToQuestionRatio,
+    CASE 
+        WHEN pm.Comments > 0 THEN 
+            (CAST(pm.Badges AS FLOAT) / NULLIF(pm.Comments, 0)) 
+        ELSE 0
+    END as BadgeToCommentRatio,
+    CASE 
+        WHEN pm.Views > 0 THEN 
+            (CAST(pm.Views AS FLOAT) / NULLIF(pm.Reputation, 0)) 
+        ELSE 0
+    END as ViewsPerReputation,
+    CASE 
+        WHEN pm.Reputation > 0 THEN 
+            (CAST(pm.Badges AS FLOAT) / NULLIF(pm.Reputation, 0)) * 100 
+        ELSE 0
+    END as BadgeReputationRatio,
+    CASE 
+        WHEN pm.Answers > 0 THEN 
+            (CAST(pm.Comments AS FLOAT) / NULLIF(pm.Answers, 0)) 
+        ELSE 0
+    END as CommentToAnswerRatio,
+    CASE 
+        WHEN pm.Reputation > 0 THEN 
+            LOG(pm.Reputation) 
+        ELSE 0
+    END as ReputationLog,
+    CASE 
+        WHEN pm.Comments > 0 THEN 
+            SQRT(pm.Comments) 
+        ELSE 0
+    END as CommentSqrt,
+    CASE 
+        WHEN pm.Views > 0 THEN 
+            (pm.Views - pm.Reputation) / NULLIF(pm.Views + pm.Reputation, 0) 
+        ELSE 0
+    END as ViewReputationDiff,
+    CASE 
+        WHEN pm.Reputation > 0 AND pm.TotalPosts > 0 THEN 
+            (CAST(pm.Answers AS FLOAT) / NULLIF(pm.TotalPosts, 0)) * 100 
+        ELSE 0
+    END as AnswerContribution,
+    CASE 
+        WHEN pm.Reputation > 0 AND pm.Badges > 0 THEN 
+            (pm.Badges * 100.0) / NULLIF(pm.Reputation, 0) 
+        ELSE 0
+    END as BadgeReputationPercentage,
+    CASE 
+        WHEN pm.Reputation > 0 AND pm.Comments > 0 THEN 
+            (pm.Comments * 1.0) / NULLIF(pm.Reputation, 0) 
+        ELSE 0
+    END as CommentReputation,
+    CASE 
+        WHEN pm.Views > 0 AND pm.Reputation > 0 THEN 
+            (CAST(pm.Views AS FLOAT) / NULLIF(pm.Reputation, 0)) 
+        ELSE NULL
+    END as ViewReputationRatio,
+    CASE 
+        WHEN pm.Answers > 0 AND pm.Questions > 0 THEN 
+            (CAST(pm.Answers AS FLOAT) / NULLIF(pm.Questions, 0)) 
+        ELSE NULL
+    END as AnswerQuestionRatio
+FROM PerformanceMetrics pm
+LEFT JOIN TopQuestions tq ON pm.UserId = tq.OwnerUserId AND tq.ScoreRank = 1
+WHERE pm.Reputation > 0 
+AND pm.TotalPosts > 0
+AND (tq.Score IS NULL OR tq.Score > 0)
+GROUP BY 
+    pm.UserId, 
+    pm.DisplayName, 
+    pm.Reputation, 
+    pm.TotalPosts, 
+    pm.Questions, 
+    pm.Answers, 
+    pm.Comments, 
+    pm.Badges, 
+    pm.ReputationRank, 
+    pm.ActivityRank, 
+    pm.Tier, 
+    pm.LastPostDate, 
+    pm.LastCommentDate,
+    tq.Title, 
+    tq.Score, 
+    tq.ViewCount, 
+    tq.AnswerCount, 
+    tq.CommentCount,
+    pm.AnswerRate,
+    pm.CommentRate,
+    pm.CommentPerBadge,
+    pm.PostPerReputation,
+    pm.ReputationPercentile,
+    pm.GoldBadges,
+    pm.SilverBadges,
+    pm.BronzeBadges,
+    pm.Reputation,
+    pm.ViewCount
+HAVING 
+    (pm.Reputation > 100 OR pm.TotalPosts > 10 OR pm.Badges > 5)
+    AND (pm.Answers > 0 OR pm.Comments > 0 OR pm.Questions > 0)
+ORDER BY pm.Reputation DESC, pm.TotalPosts DESC, pm.Badges DESC
+OPTION (MAXDOP 8);

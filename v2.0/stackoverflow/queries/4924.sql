@@ -1,0 +1,193 @@
+WITH
+  PostInteraction AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.CreationDate AS PostCreationDate,
+      p.Title,
+      p.Score AS PostScore,
+      p.ViewCount AS PostViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      pt.Name AS PostTypeName,
+      CASE
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        ELSE 'Other'
+      END AS ActualPostType,
+      u.DisplayName AS OwnerDisplayName,
+      u.Reputation AS OwnerReputation,
+      COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+      LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostCreationDate,
+      COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCountForPost,
+      SUM(v.VoteTypeId) OVER (PARTITION BY p.Id) AS TotalVoteSumForPost,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        ELSE 'Open'
+      END AS PostStatus,
+      p.Tags
+    FROM Posts p
+    JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c
+      ON p.Id = c.PostId
+    LEFT JOIN Votes v
+      ON p.Id = v.PostId
+    WHERE
+      p.CreationDate >= TIMESTAMP '2023-01-01 00:00:00' AND p.CreationDate < TIMESTAMP '2024-01-01 00:00:00'
+  ),
+  UserActivitySummary AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName AS UserDisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT CASE WHEN pi.ActualPostType = 'Question' THEN pi.PostId ELSE NULL END) AS QuestionCount,
+      COUNT(DISTINCT CASE WHEN pi.ActualPostType = 'Answer' THEN pi.PostId ELSE NULL END) AS AnswerCount,
+      AVG(pi.PostScore) AS AveragePostScore,
+      SUM(pi.PostViewCount) AS TotalViewCount,
+      MAX(pi.PostCreationDate) AS LastPostDate,
+      (
+        SELECT
+          COUNT(DISTINCT b.Id)
+        FROM Badges b
+        WHERE
+          b.UserId = u.Id
+      ) AS BadgeCount,
+      CASE
+        WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '' THEN 'HasWebsite'
+        ELSE 'NoWebsite'
+      END AS WebsiteStatus,
+      CASE
+        WHEN u.DownVotes > u.UpVotes * 5 THEN 'HighDownVoteRatio'
+        ELSE 'NormalRatio'
+      END AS VoteRatioCategory,
+      CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400 AS INTEGER) AS AccountAgeDays
+    FROM Users u
+    JOIN PostInteraction pi
+      ON u.Id = pi.OwnerUserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.WebsiteUrl,
+      u.DownVotes,
+      u.UpVotes
+  )
+SELECT
+  pi.PostId,
+  pi.Title,
+  pi.PostTypeName,
+  pi.ActualPostType,
+  pi.PostScore,
+  pi.PostViewCount,
+  pi.AnswerCount AS PostAnswerCount,
+  pi.CommentCountForPost,
+  pi.TotalVoteSumForPost,
+  pi.OwnerDisplayName,
+  pi.OwnerReputation,
+  pi.UserPostRank,
+  pi.PreviousPostCreationDate,
+  pi.PostStatus,
+  uas.UserCreationDate,
+  uas.QuestionCount,
+  uas.AnswerCount AS UserAnswerCount,
+  uas.AveragePostScore,
+  uas.TotalViewCount,
+  uas.LastPostDate,
+  uas.BadgeCount,
+  uas.WebsiteStatus,
+  uas.VoteRatioCategory,
+  uas.AccountAgeDays,
+  CASE
+    WHEN pi.Title ~ '[0-9]' THEN 'HasNumbers'
+    ELSE 'NoNumbers'
+  END AS TitleNumericIndicator,
+  SUBSTRING(pi.Title FROM 1 FOR 5) AS FirstFiveCharsOfTitle,
+  CASE
+    WHEN pi.AcceptedAnswerId = -1 THEN 'NoAcceptedAnswer'
+    ELSE 'HasAcceptedAnswer'
+  END AS AcceptanceStatus,
+  pi.PostCreationDate,
+  CAST(EXTRACT(EPOCH FROM (pi.PostCreationDate - pi.PreviousPostCreationDate)) / 86400 AS INTEGER) AS DaysSincePreviousPost,
+  CONCAT(COALESCE(pi.OwnerDisplayName, 'AnonymousUser'), '_' , CAST(pi.OwnerUserId AS VARCHAR)) AS OwnerIdentifier,
+  CASE
+    WHEN pi.Tags IS NOT NULL AND pi.Tags <> '' THEN 'HasTags'
+    ELSE 'NoTags'
+  END AS TagPresence,
+  CASE
+    WHEN pi.PostScore > 0 THEN CAST(pi.AnswerCount AS DOUBLE PRECISION) / pi.PostScore
+    ELSE 0.0
+  END AS AnswerScoreRatio,
+  CASE
+    WHEN EXISTS (
+      SELECT 1
+      FROM Posts p2
+      WHERE
+        p2.Id != pi.PostId
+        AND pi.PostTypeId = 1
+        AND p2.PostTypeId = 1
+        AND ABS(EXTRACT(EPOCH FROM (p2.CreationDate - pi.PostCreationDate)) / 60) < 60
+        AND LOWER(p2.Title) = LOWER(pi.Title)
+    ) THEN 'PotentialDuplicate'
+    ELSE 'NotPotentialDuplicate'
+  END AS DuplicateHeuristic
+FROM PostInteraction pi
+LEFT JOIN UserActivitySummary uas
+  ON pi.OwnerUserId = uas.UserId
+
+UNION ALL
+
+SELECT
+  ph.PostId,
+  NULL AS Title,
+  pht.Name AS PostTypeName,
+  'History' AS ActualPostType,
+  NULL AS PostScore,
+  NULL AS PostViewCount,
+  NULL AS PostAnswerCount,
+  NULL AS CommentCountForPost,
+  NULL AS TotalVoteSumForPost,
+  ph.UserDisplayName AS OwnerDisplayName,
+  NULL AS OwnerReputation,
+  NULL AS UserPostRank,
+  NULL AS PreviousPostCreationDate,
+  CASE
+    WHEN ph.PostHistoryTypeId IN (10, 12, 14) THEN 'Closed/Deleted/Locked'
+    WHEN ph.PostHistoryTypeId IN (11, 13, 15) THEN 'Reopened/Undeleted/Unlocked'
+    ELSE 'OtherHistory'
+  END AS PostStatus,
+  NULL AS UserCreationDate,
+  NULL AS QuestionCount,
+  NULL AS UserAnswerCount,
+  NULL AS AveragePostScore,
+  NULL AS TotalViewCount,
+  NULL AS LastPostDate,
+  NULL AS BadgeCount,
+  NULL AS WebsiteStatus,
+  NULL AS VoteRatioCategory,
+  NULL AS AccountAgeDays,
+  NULL AS TitleNumericIndicator,
+  NULL AS FirstFiveCharsOfTitle,
+  NULL AS AcceptanceStatus,
+  ph.CreationDate AS PostCreationDate,
+  NULL AS DaysSincePreviousPost,
+  CONCAT(COALESCE(ph.UserDisplayName, 'AnonymousUser'), '_' , CAST(ph.UserId AS VARCHAR)) AS OwnerIdentifier,
+  NULL AS TagPresence,
+  NULL AS AnswerScoreRatio,
+  NULL AS DuplicateHeuristic
+FROM PostHistory ph
+JOIN PostHistoryTypes pht
+  ON ph.PostHistoryTypeId = pht.Id
+WHERE
+  ph.CreationDate >= TIMESTAMP '2023-01-01 00:00:00' AND ph.CreationDate < TIMESTAMP '2024-01-01 00:00:00'
+  AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15)
+ORDER BY
+  PostCreationDate DESC
+LIMIT 1000;

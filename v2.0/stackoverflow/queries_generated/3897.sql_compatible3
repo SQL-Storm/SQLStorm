@@ -1,0 +1,151 @@
+WITH
+badge_counts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt,
+        COUNT(*) AS total_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+post_stats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS question_cnt,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS answer_cnt,
+        AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS avg_score,
+        CASE
+            WHEN COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) = 0 THEN NULL
+            ELSE SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) * 1.0
+                 / COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END)
+        END AS answered_ratio,
+        MAX(p.CreationDate) AS last_post_date
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+latest_post AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        p.Id AS PostId,
+        SUBSTRING(p.Title FROM 1 FOR 30) AS short_title,
+        p.CreationDate,
+        p.Score,
+        CASE WHEN p.Tags IS NOT NULL THEN
+            (
+             SELECT STRING_AGG(t.tag, ',' ORDER BY t.tag)
+             FROM (
+               SELECT TRIM(tk) AS tag, rn
+               FROM (
+                 SELECT
+                   REGEXP_SPLIT_TO_TABLE(TRIM(BOTH '<>' FROM p.Tags), '><') AS tk,
+                   ROW_NUMBER() OVER () AS rn
+               ) x
+             ) t
+             WHERE t.rn <= 3
+            )
+        END AS top_3_tags
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    -- emulate DISTINCT ON by picking max creation date per owner via window
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC, p.Id DESC) = 1
+),
+user_tag_usage AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        t.tag AS Tag,
+        COUNT(*) AS tag_used_cnt
+    FROM Posts p,
+    LATERAL (
+      SELECT TRIM(tk) AS tag
+      FROM (
+        SELECT REGEXP_SPLIT_TO_TABLE(TRIM(BOTH '<>' FROM p.Tags), '><') AS tk
+      ) s
+    ) t
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, t.tag
+),
+top_tags AS (
+    SELECT
+        utu.UserId,
+        STRING_AGG(utu.Tag, ', ' ORDER BY utu.tag_used_cnt DESC, utu.Tag) AS top_tags_csv
+    FROM (
+        SELECT
+            utu.*,
+            ROW_NUMBER() OVER (PARTITION BY utu.UserId ORDER BY utu.tag_used_cnt DESC, utu.Tag) AS rn
+        FROM user_tag_usage utu
+    ) utu
+    WHERE utu.rn <= 5
+    GROUP BY utu.UserId
+),
+cond_a AS (
+    SELECT u.Id AS UserId
+    FROM Users u
+    JOIN badge_counts bc ON bc.UserId = u.Id
+    WHERE bc.gold_cnt >= 1
+),
+cond_b AS (
+    SELECT u.Id AS UserId
+    FROM Users u
+    LEFT JOIN badge_counts bc ON bc.UserId = u.Id
+    WHERE u.Reputation > 1000 AND COALESCE(bc.total_badges,0) = 0
+),
+qualified_users AS (
+    SELECT UserId FROM cond_a
+    UNION
+    SELECT UserId FROM cond_b
+),
+recent_vote AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        (SELECT vt.Name
+         FROM Votes v
+         JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+         WHERE v.PostId = p.Id
+         ORDER BY v.CreationDate DESC
+         LIMIT 1) AS last_vote_type
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, p.Id
+),
+final AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(bc.gold_cnt,0) AS gold_badges,
+        COALESCE(bc.silver_cnt,0) AS silver_badges,
+        COALESCE(bc.bronze_cnt,0) AS bronze_badges,
+        COALESCE(ps.question_cnt,0) AS questions,
+        COALESCE(ps.answer_cnt,0) AS answers,
+        ROUND(COALESCE(ps.avg_score,0),2) AS avg_post_score,
+        ROUND(COALESCE(ps.answered_ratio,0),4) AS answered_ratio,
+        lp.PostId AS latest_post_id,
+        lp.short_title,
+        lp.CreationDate AS last_post_date,
+        lp.top_3_tags,
+        tt.top_tags_csv,
+        rv.last_vote_type,
+        CASE
+            WHEN u.CreationDate < DATE '2010-01-01' THEN 'veteran'
+            WHEN u.Reputation > 20000 THEN 'power_user'
+            ELSE 'regular'
+        END AS user_category,
+        CASE
+            WHEN COALESCE(bc.total_badges,0) = 0 AND u.Reputation > 5000 THEN 'high_rep_no_badge'
+            WHEN COALESCE(bc.gold_cnt,0) > 0 THEN 'gold_holder'
+            ELSE NULL
+        END AS special_flag
+    FROM Users u
+    LEFT JOIN badge_counts bc ON bc.UserId = u.Id
+    LEFT JOIN post_stats ps ON ps.UserId = u.Id
+    LEFT JOIN latest_post lp ON lp.UserId = u.Id
+    LEFT JOIN top_tags tt ON tt.UserId = u.Id
+    LEFT JOIN recent_vote rv ON rv.UserId = u.Id
+    WHERE u.Id IN (SELECT UserId FROM qualified_users)
+)
+
+SELECT *
+FROM final
+ORDER BY Reputation DESC, gold_badges DESC, answers DESC
+LIMIT 100;

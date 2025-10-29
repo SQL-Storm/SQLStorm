@@ -1,0 +1,207 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        AVG(P.Score) FILTER (WHERE P.Score IS NOT NULL) AS AvgPostScore,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        AVG(CASE WHEN B.Class = 1 THEN 1.0 ELSE 0.0 END) AS GoldBadgeRatio,
+        COUNT(DISTINCT PH.Id) AS TotalPostHistoryEvents,
+        SUM(CASE WHEN P.CreationDate BETWEEN U.CreationDate AND U.CreationDate + INTERVAL '1 month' THEN 1 ELSE 0 END) AS PostsInFirstMonth,
+        U.Location
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    LEFT JOIN PostHistory AS PH ON U.Id = PH.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes, U.CreationDate, U.Location
+),
+QuestionDetailedStats AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.AnswerCount AS RawAnswerCount,
+        Q.CommentCount AS RawCommentCount,
+        Q.FavoriteCount,
+        COALESCE(Q.Title, 'Untitled Question') AS QuestionTitle,
+        COALESCE(Q.Tags, '') AS QuestionTags,
+        Q.ClosedDate,
+        (SELECT COUNT(DISTINCT A.Id) FROM Posts AS A WHERE A.ParentId = Q.Id AND A.PostTypeId = 2 AND A.CommunityOwnedDate IS NULL) AS ActualAnswerCount,
+        (SELECT SUM(A.Score) FROM Posts AS A WHERE A.ParentId = Q.Id AND A.PostTypeId = 2) AS SumOfAnswerScores,
+        (SELECT AVG(A.Score) FROM Posts AS A WHERE A.ParentId = Q.Id AND A.PostTypeId = 2 AND A.Score IS NOT NULL) AS AvgAnswerScore,
+        (SELECT MAX(CM.CreationDate) FROM Comments AS CM WHERE CM.PostId = Q.Id) AS LastCommentDateOnQuestion,
+        P.OwnerUserId AS AcceptedAnswerOwnerId,
+        P.Score AS AcceptedAnswerScore,
+        DENSE_RANK() OVER (ORDER BY Q.ViewCount DESC, Q.Score DESC, Q.CreationDate ASC) AS QuestionPopularityRank,
+        CASE
+            WHEN Q.ClosedDate IS NOT NULL AND Q.CommunityOwnedDate IS NOT NULL THEN 'Closed & Community Owned'
+            WHEN Q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN Q.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Open'
+        END AS QuestionStatus,
+        COALESCE(
+            SUBSTRING(
+                Q.Tags FROM POSITION('<' IN Q.Tags) + 1 FOR POSITION('>' IN Q.Tags) - POSITION('<' IN Q.Tags) - 1
+            ),
+            'untagged'
+        ) AS FirstTag,
+        LENGTH(Q.Body) AS BodyLength,
+        Q.LastActivityDate,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - Q.CreationDate)) / (60 * 60 * 24) AS DaysSinceCreation,
+        Q.LastEditDate,
+        LAG(Q.LastEditDate) OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.CreationDate) AS PreviousQuestionEditDate,
+        Q.Body,
+        Q.Title
+    FROM Posts AS Q
+    LEFT JOIN Posts AS P ON Q.AcceptedAnswerId = P.Id AND P.PostTypeId = 2
+    WHERE Q.PostTypeId = 1
+),
+PostHistoryLifecycle AS (
+    SELECT
+        PH.PostId,
+        PH.PostHistoryTypeId,
+        PH.CreationDate AS HistoryDate,
+        PH.UserId AS HistoryEditorId,
+        PH.Comment AS CloseReasonComment,
+        CRT.Name AS CloseReasonTypeName,
+        LAG(PH.PostHistoryTypeId) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate, PH.Id) AS PrevHistoryType,
+        LEAD(PH.PostHistoryTypeId) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate, PH.Id) AS NextHistoryType,
+        LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate, PH.Id) AS PrevHistoryDate,
+        LEAD(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate, PH.Id) AS NextHistoryDate
+    FROM PostHistory AS PH
+    LEFT JOIN CloseReasonTypes AS CRT ON PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND PH.Comment ~ '^[0-9]+$' AND CAST(PH.Comment AS smallint) = CRT.Id
+    WHERE PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 16, 19, 20)
+),
+ReopenedClosedPosts AS (
+    SELECT
+        PH1.PostId,
+        PH1.HistoryDate AS ClosedDateEvent,
+        PH2.HistoryDate AS ReopenedDateEvent,
+        PH1.CloseReasonTypeName,
+        EXTRACT(EPOCH FROM (PH2.HistoryDate - PH1.HistoryDate)) / (60 * 60 * 24) AS DaysUntilReopened,
+        COUNT(*) OVER (PARTITION BY PH1.PostId) AS TotalCloseReopenCycles
+    FROM PostHistoryLifecycle AS PH1
+    JOIN PostHistoryLifecycle AS PH2 ON PH1.PostId = PH2.PostId
+    WHERE PH1.PostHistoryTypeId = 10
+      AND PH2.PostHistoryTypeId = 11
+      AND PH2.HistoryDate > PH1.HistoryDate
+      AND NOT EXISTS (
+            SELECT 1 FROM PostHistoryLifecycle AS PH3
+            WHERE PH3.PostId = PH1.PostId
+              AND PH3.HistoryDate > PH1.HistoryDate
+              AND PH3.HistoryDate < PH2.HistoryDate
+              AND PH3.PostHistoryTypeId = 11
+          )
+),
+PostLinkSummary AS (
+    SELECT
+        PL.PostId,
+        COUNT(DISTINCT CASE WHEN PL.LinkTypeId = 1 THEN PL.RelatedPostId END) AS LinkedPostCount,
+        COUNT(DISTINCT CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId END) AS DuplicateOfCount,
+        MAX(PL.CreationDate) AS LatestLinkDate
+    FROM PostLinks AS PL
+    GROUP BY PL.PostId
+),
+UserBadgeAchievements AS (
+    SELECT
+        B.UserId,
+        MAX(B.Date) AS LastBadgeDate,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges AS B
+    GROUP BY B.UserId
+)
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.TotalPosts,
+    UES.TotalQuestions,
+    QDS.QuestionId,
+    QDS.QuestionTitle,
+    QDS.QuestionCreationDate,
+    QDS.QuestionStatus,
+    QDS.QuestionScore,
+    QDS.ViewCount,
+    QDS.ActualAnswerCount,
+    QDS.AvgAnswerScore,
+    QDS.FirstTag,
+    QDS.BodyLength,
+    RCS.ClosedDateEvent,
+    RCS.ReopenedDateEvent,
+    RCS.CloseReasonTypeName,
+    RCS.DaysUntilReopened,
+    PLS.LinkedPostCount,
+    PLS.DuplicateOfCount,
+    COALESCE(QDS.ActualAnswerCount * 1.0 / NULLIF(QDS.ViewCount, 0), 0.0) AS AnswerViewRatio,
+    (UES.AvgPostScore * UES.Reputation) / NULLIF(UES.TotalPosts, 0) AS UserWeightedAvgScore,
+    CASE
+        WHEN LOWER(QDS.Body) LIKE '%performance%' OR LOWER(QDS.Body) LIKE '%benchmark%' OR LOWER(QDS.Title) LIKE '%performance%' OR LOWER(QDS.Title) LIKE '%benchmark%' THEN TRUE
+        ELSE FALSE
+    END AS ContainsPerformanceBenchmarkTerms,
+    COALESCE(AAO.DisplayName, 'N/A User') AS AcceptedAnswerOwnerDisplayName,
+    QDS.AcceptedAnswerScore,
+    QDS.QuestionPopularityRank,
+    UES.GoldBadgeRatio,
+    CASE
+        WHEN UES.Reputation >= 100000 AND UES.TotalQuestions >= 50 AND UES.TotalAnswers >= 200 THEN 'Legendary'
+        WHEN UES.Reputation >= 20000 AND UES.TotalQuestions >= 20 AND UES.TotalAnswers >= 100 THEN 'Veteran'
+        WHEN UES.Reputation >= 5000 AND UES.TotalQuestions >= 10 AND UES.TotalAnswers >= 50 THEN 'Experienced'
+        WHEN UES.Reputation >= 1000 AND UES.TotalQuestions >= 5 AND UES.TotalAnswers >= 10 THEN 'Active'
+        ELSE 'Contributor'
+    END AS UserActivityTier,
+    CASE
+        WHEN QDS.ActualAnswerCount = 0 AND QDS.RawCommentCount > 5 THEN 'Unanswered & Heavily Discussed'
+        WHEN QDS.ActualAnswerCount > 0 AND QDS.AcceptedAnswerOwnerId IS NULL THEN 'Answered but Unaccepted'
+        ELSE 'Resolved or Standard'
+    END AS QuestionResolutionStatus,
+    (UES.Reputation * 0.5 + UES.UserUpVotes * 0.3 + UBA.GoldBadges * 10 + UBA.SilverBadges * 5 + UBA.BronzeBadges * 1 + QDS.QuestionScore * 0.2 + COALESCE(QDS.AvgAnswerScore, 0) * 5) AS CompositeInfluenceScore,
+    COALESCE(RCS.DaysUntilReopened, 0) AS DaysPostClosedBeforeReopening,
+    COALESCE(RCS.TotalCloseReopenCycles, 0) AS CloseReopenCycleCount,
+    CASE
+        WHEN UES.Location LIKE '%California%' OR UES.Location LIKE '%New York%' THEN 'High-Tech Hub'
+        WHEN UES.Location IS NULL THEN 'Location Unknown'
+        ELSE 'Other Location'
+    END AS UserLocationCategory,
+    EXTRACT(DOW FROM QDS.QuestionCreationDate) AS DayOfWeekCreated,
+    QDS.PreviousQuestionEditDate,
+    EXTRACT(EPOCH FROM (QDS.LastEditDate - QDS.QuestionCreationDate)) / (60 * 60 * 24) AS DaysUntilFirstEdit
+FROM UserEngagementSummary AS UES
+INNER JOIN QuestionDetailedStats AS QDS ON UES.UserId = QDS.OwnerUserId
+LEFT JOIN ReopenedClosedPosts AS RCS ON QDS.QuestionId = RCS.PostId
+LEFT JOIN PostLinkSummary AS PLS ON QDS.QuestionId = PLS.PostId
+LEFT JOIN Users AS AAO ON QDS.AcceptedAnswerOwnerId = AAO.Id
+LEFT JOIN Posts AS Q ON QDS.QuestionId = Q.Id
+LEFT JOIN UserBadgeAchievements AS UBA ON UES.UserId = UBA.UserId
+WHERE
+    UES.Reputation > 750
+    AND QDS.QuestionCreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 year')
+    AND QDS.QuestionScore >= 10
+    AND QDS.ViewCount >= 200
+    AND (
+        (RCS.PostId IS NOT NULL AND RCS.ReopenedDateEvent IS NOT NULL) OR
+        (QDS.ClosedDate IS NULL AND QDS.QuestionStatus = 'Open')
+    )
+    AND (
+        QDS.QuestionTags LIKE '%<sql>%' OR QDS.QuestionTags LIKE '%<database>%' OR QDS.QuestionTags LIKE '%<performance>%' OR QDS.QuestionTags LIKE '%<benchmark>%'
+    )
+    AND (COALESCE(PLS.LinkedPostCount, 0) > 0 OR COALESCE(PLS.DuplicateOfCount, 0) > 0 OR QDS.ActualAnswerCount > 0)
+    AND UES.TotalBadges > 0
+    AND (UES.PostsInFirstMonth IS NULL OR UES.PostsInFirstMonth > 0)
+ORDER BY
+    CompositeInfluenceScore DESC,
+    QDS.QuestionPopularityRank ASC,
+    UES.LastPostActivity DESC,
+    QDS.DaysSinceCreation ASC
+LIMIT 2000;

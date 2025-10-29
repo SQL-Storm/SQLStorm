@@ -1,0 +1,199 @@
+WITH
+  RankedPostHistory AS (
+    SELECT
+      PostId,
+      PostHistoryTypeId,
+      UserId,
+      CreationDate,
+      LAG(CreationDate, 1, CreationDate) OVER (PARTITION BY PostId ORDER BY CreationDate) AS PreviousCreationDate,
+      ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY CreationDate DESC) AS rn
+    FROM PostHistory
+    WHERE
+      PostHistoryTypeId IN (2, 5)
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS PostCount,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      AVG(p.Score) AS AverageScore,
+      MAX(p.CreationDate) AS LastPostCreationDate,
+      COUNT(DISTINCT c.Id) AS CommentCount
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c
+      ON u.Id = c.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName
+    HAVING
+      COUNT(DISTINCT p.Id) > 0
+  ),
+  RecentEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ph.PreviousCreationDate,
+      ph.rn
+    FROM RankedPostHistory AS ph
+    WHERE
+      ph.rn <= 10
+  )
+SELECT
+  p.Id AS PostId,
+  pt.Name AS PostType,
+  p.Title,
+  u.DisplayName AS OwnerDisplayName,
+  p.CreationDate AS PostCreationDate,
+  p.LastActivityDate,
+  p.Score AS PostScore,
+  p.ViewCount AS PostViewCount,
+  p.AnswerCount,
+  p.CommentCount AS PostCommentCount,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    ELSE 'Open'
+  END AS PostStatus,
+  p.FavoriteCount,
+  ph_last.CreationDate AS LastEditDate,
+  ph_last.PreviousCreationDate AS PreviousEditDate,
+  (ph_last.CreationDate - ph_last.PreviousCreationDate) AS TimeBetweenLastTwoEdits,
+  ua.PostCount AS UserTotalPosts,
+  ua.QuestionCount AS UserQuestionCount,
+  ua.AnswerCount AS UserAnswerCount,
+  ua.AverageScore AS UserAverageScore,
+  ua.CommentCount AS UserCommentCount,
+  COALESCE(u.Location, 'Unknown') AS UserLocation,
+  CASE
+    WHEN u.WebsiteUrl IS NULL THEN 'No Website'
+    WHEN POSITION('stackoverflow.com' IN u.WebsiteUrl) > 0 THEN 'Stack Overflow Related'
+    ELSE 'External Website'
+  END AS UserWebsiteType,
+  CASE
+    WHEN p.OwnerUserId = -1 THEN 'Community'
+    WHEN u.Reputation > 50000 THEN 'High Reputation'
+    WHEN u.Reputation BETWEEN 10000 AND 50000 THEN 'Medium Reputation'
+    ELSE 'Low Reputation'
+  END AS UserReputationLevel,
+  -- convert XML/HTML-like tag string '<tag1><tag2>' into an array of tags in standard SQL
+  (SELECT ARRAY_AGG(tag) FROM (
+     SELECT TRIM(BOTH '<>' FROM regexp_split_to_table(p.Tags, '><')) AS tag
+  ) t) AS ParsedTags,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments AS c
+    WHERE
+      c.PostId = p.Id AND c.Score > 5
+  ) AS HighScoreCommentCount,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM PostLinks AS pl
+      WHERE
+        pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ) THEN 'IsDuplicate'
+    ELSE 'NotDuplicate'
+  END AS DuplicateStatus,
+  (
+    SELECT
+      COUNT(*)
+    FROM Votes AS v
+    WHERE
+      v.PostId = p.Id AND v.VoteTypeId = 2
+  ) AS TotalUpvotes,
+  (
+    SELECT
+      COUNT(*)
+    FROM Votes AS v
+    WHERE
+      v.PostId = p.Id AND v.VoteTypeId = 3
+  ) AS TotalDownvotes
+FROM Posts AS p
+LEFT JOIN PostTypes AS pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN Users AS u
+  ON p.OwnerUserId = u.Id
+LEFT JOIN RecentEdits AS ph_last
+  ON p.Id = ph_last.PostId AND ph_last.rn = 1
+LEFT JOIN UserActivity AS ua
+  ON p.OwnerUserId = ua.UserId
+WHERE
+  p.PostTypeId IN (1, 2)
+  AND p.CreationDate >= DATE '2023-01-01'
+  AND u.Id IS NOT NULL
+  AND ua.PostCount >= 10
+UNION ALL
+SELECT
+  p.Id AS PostId,
+  pt.Name AS PostType,
+  p.Title,
+  NULL AS OwnerDisplayName,
+  p.CreationDate AS PostCreationDate,
+  p.LastActivityDate,
+  p.Score AS PostScore,
+  p.ViewCount AS PostViewCount,
+  p.AnswerCount,
+  p.CommentCount AS PostCommentCount,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    ELSE 'Open'
+  END AS PostStatus,
+  p.FavoriteCount,
+  NULL AS LastEditDate,
+  NULL AS PreviousEditDate,
+  NULL AS TimeBetweenLastTwoEdits,
+  0 AS UserTotalPosts,
+  0 AS UserQuestionCount,
+  0 AS UserAnswerCount,
+  NULL AS UserAverageScore,
+  0 AS UserCommentCount,
+  'Community' AS UserLocation,
+  'Community' AS UserWebsiteType,
+  'Community' AS UserReputationLevel,
+  (SELECT ARRAY_AGG(tag) FROM (
+     SELECT TRIM(BOTH '<>' FROM regexp_split_to_table(p.Tags, '><')) AS tag
+  ) t) AS ParsedTags,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments AS c
+    WHERE
+      c.PostId = p.Id AND c.Score > 5
+  ) AS HighScoreCommentCount,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM PostLinks AS pl
+      WHERE
+        pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ) THEN 'IsDuplicate'
+    ELSE 'NotDuplicate'
+  END AS DuplicateStatus,
+  (
+    SELECT
+      COUNT(*)
+    FROM Votes AS v
+    WHERE
+      v.PostId = p.Id AND v.VoteTypeId = 2
+  ) AS TotalUpvotes,
+  (
+    SELECT
+      COUNT(*)
+    FROM Votes AS v
+    WHERE
+      v.PostId = p.Id AND v.VoteTypeId = 3
+  ) AS TotalDownvotes
+FROM Posts AS p
+LEFT JOIN PostTypes AS pt
+  ON p.PostTypeId = pt.Id
+WHERE
+  p.PostTypeId IN (1, 2)
+  AND p.CreationDate >= DATE '2023-01-01'
+  AND p.OwnerUserId = -1;

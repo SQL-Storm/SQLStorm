@@ -1,0 +1,120 @@
+-- {"query": "5280.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 800} 
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= NOW() - INTERVAL '180 days'
+),
+recent_answers AS (
+  SELECT
+    a.Id AS PostId,
+    a.ParentId AS QuestionId,
+    a.Score,
+    a.CreationDate,
+    a.OwnerUserId,
+    a.OwnerDisplayName
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= NOW() - INTERVAL '180 days'
+),
+top_tags AS (
+  SELECT
+    t.TagName AS tag,
+    t.Count AS tag_count,
+    t.ExcerptPostId
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+    AND t.IsRequired = 0
+),
+popular_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes
+  FROM Users u
+  WHERE u.Reputation >= 10000
+),
+activity AS (
+  SELECT
+    q.PostId AS QuestionId,
+    q.Title AS QuestionTitle,
+    q.CreationDate,
+    q.LastActivityDate,
+    q.OwnerUserId,
+    q.OwnerDisplayName,
+    q.ViewCount,
+    q.Score,
+    string_agg(DISTINCT to_char(a.CreationDate, 'YYYY-MM-DD') , ',') FILTER (WHERE a.PostId IS NOT NULL) AS AnswerDates,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = q.PostId AND p2.PostTypeId = 2) AS AnswerCount
+  FROM recent_questions q
+  LEFT JOIN recent_answers a ON a.ParentId = q.PostId
+  GROUP BY
+    q.PostId, q.Title, q.CreationDate, q.LastActivityDate, q.OwnerUserId, q.OwnerDisplayName, q.ViewCount, q.Score
+),
+correlated AS (
+  SELECT
+    a.QuestionId,
+    a.QuestionTitle,
+    a.CreationDate AS QuestionCreation,
+    a.LastActivityDate,
+    a.OwnerUserId,
+    a.OwnerDisplayName,
+    a.ViewCount,
+    a.Score,
+    a.AnswerCount,
+    r.tag
+  FROM activity a
+  LEFT JOIN (
+    SELECT p.Id AS qid, t.TagName AS tag
+    FROM Posts p
+    JOIN Tags t ON t.Id = p.Tags::text::int -- placeholder for tag linkage in this schema; adapt if needed
+  ) r ON r.qid = a.QuestionId
+),
+windowed AS (
+  SELECT
+    c.QuestionId,
+    c.QuestionTitle,
+    c.QuestionCreation,
+    c.LastActivityDate,
+    c.OwnerUserId,
+    c.OwnerDisplayName,
+    c.ViewCount,
+    c.Score,
+    c.AnswerCount,
+    c.tag,
+    ROW_NUMBER() OVER (PARTITION BY c.QuestionId ORDER BY c.LastActivityDate DESC) AS rn
+  FROM correlated c
+)
+SELECT
+  w.QuestionId,
+  w.QuestionTitle,
+  w.QuestionCreation,
+  w.LastActivityDate,
+  w.OwnerUserId,
+  w.OwnerDisplayName,
+  w.ViewCount,
+  w.Score,
+  w.AnswerCount,
+  w.tag
+FROM windowed w
+WHERE w.rn = 1
+ORDER BY w.LastActivityDate DESC
+LIMIT 100;

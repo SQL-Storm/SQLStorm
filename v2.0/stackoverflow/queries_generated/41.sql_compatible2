@@ -1,0 +1,290 @@
+WITH recent_users AS (
+    SELECT u.id AS user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') AS country_guess,
+           row_number() OVER (ORDER BY u.creationdate DESC, u.id DESC) AS rn
+    FROM users u
+    WHERE u.creationdate >= (SELECT max(creationdate) - INTERVAL '365 days' FROM users)
+),
+user_activity AS (
+    SELECT
+      u.user_id,
+      count(DISTINCT p.id) FILTER (WHERE p.posttypeid IN (1,2)) AS total_posts,
+      count(*) FILTER (WHERE c.id IS NOT NULL) AS total_comments,
+      sum(votes_up) AS upvotes_received,
+      sum(votes_down) AS downvotes_received,
+      sum(CASE WHEN vt.votetypeid = 5 THEN 1 ELSE 0 END) AS favorites_received,
+      max(coalesce(p.lastactivitydate, p.creationdate)) AS last_post_activity,
+      avg(nullif(p.score,0)) AS avg_nonzero_score
+    FROM recent_users u
+    LEFT JOIN posts p
+      ON p.owneruserid = u.user_id
+    LEFT JOIN LATERAL (
+        SELECT
+          p2.id AS pid,
+          count(*) FILTER (WHERE v.votetypeid = 2) AS votes_up,
+          count(*) FILTER (WHERE v.votetypeid = 3) AS votes_down
+        FROM posts p2
+        LEFT JOIN votes v ON v.postid = p2.id AND v.votetypeid IN (2,3,5)
+        WHERE p2.owneruserid = u.user_id
+        GROUP BY p2.id
+    ) vagg ON vagg.pid = p.id
+    LEFT JOIN votes vt ON vt.postid = p.id AND vt.votetypeid = 5
+    LEFT JOIN comments c ON c.postid = p.id
+    GROUP BY u.user_id
+),
+question_stats AS (
+    SELECT
+      u.user_id,
+      count(*) FILTER (WHERE q.posttypeid = 1) AS q_count,
+      avg(nullif(q.viewcount,0)) AS avg_nonzero_views,
+      sum(coalesce(q.answercount,0)) AS answers_received,
+      count(*) FILTER (WHERE q.acceptedanswerid IS NOT NULL) AS accepted_count,
+      count(DISTINCT CASE WHEN q.closeddate IS NOT NULL THEN q.id END) AS closed_count
+    FROM recent_users u
+    LEFT JOIN posts q
+      ON q.owneruserid = u.user_id AND q.posttypeid = 1
+    GROUP BY u.user_id
+),
+answer_stats AS (
+    SELECT
+      u.user_id,
+      count(*) FILTER (WHERE a.posttypeid = 2) AS a_count,
+      avg(a.score) AS avg_answer_score,
+      count(*) FILTER (WHERE a.score > 0) AS positive_answers,
+      count(*) FILTER (WHERE a.score < 0) AS negative_answers
+    FROM recent_users u
+    LEFT JOIN posts a
+      ON a.owneruserid = u.user_id AND a.posttypeid = 2
+    GROUP BY u.user_id
+),
+badge_rollup AS (
+    SELECT
+      b.userid AS user_id,
+      count(*) AS badges_total,
+      count(*) FILTER (WHERE b.class = 1) AS gold,
+      count(*) FILTER (WHERE b.class = 2) AS silver,
+      count(*) FILTER (WHERE b.class = 3) AS bronze,
+      count(*) FILTER (WHERE b.tagbased = TRUE) AS tag_badges,
+      min(b.date) AS first_badge_date,
+      max(b.date) AS last_badge_date
+    FROM badges b
+    GROUP BY b.userid
+),
+postlink_graph AS (
+    SELECT
+      u.user_id,
+      count(*) FILTER (WHERE pl.linktypeid = 1) AS linked_edges,
+      count(*) FILTER (WHERE pl.linktypeid = 3) AS duplicate_edges,
+      count(DISTINCT pl.relatedpostid) FILTER (WHERE pl.linktypeid = 1) AS distinct_linked_targets,
+      count(DISTINCT pl.relatedpostid) FILTER (WHERE pl.linktypeid = 3) AS distinct_dup_targets
+    FROM recent_users u
+    LEFT JOIN posts p ON p.owneruserid = u.user_id
+    LEFT JOIN postlinks pl ON pl.postid = p.id
+    GROUP BY u.user_id
+),
+tag_exposure AS (
+    SELECT
+      u.user_id,
+      lower(trim(t.tagname)) AS tagname,
+      sum(coalesce(p.viewcount,0)) AS views_for_tag,
+      count(*) AS posts_with_tag
+    FROM recent_users u
+    JOIN posts p ON p.owneruserid = u.user_id AND p.posttypeid = 1 AND p.tags IS NOT NULL
+    JOIN LATERAL unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) AS tag(tagname) ON TRUE
+    LEFT JOIN tags t ON t.tagname = tag.tagname
+    GROUP BY u.user_id, lower(trim(t.tagname))
+),
+top_tag_per_user AS (
+    SELECT DISTINCT ON (te.user_id)
+      te.user_id,
+      te.tagname AS top_tag,
+      te.views_for_tag,
+      te.posts_with_tag
+    FROM tag_exposure te
+    ORDER BY te.user_id, te.views_for_tag DESC NULLS LAST, te.posts_with_tag DESC, te.tagname
+),
+edit_activity AS (
+    SELECT
+      u.user_id,
+      count(*) FILTER (WHERE ph.posthistorytypeid IN (4,5,6)) AS edits_made,
+      count(*) FILTER (WHERE ph.posthistorytypeid IN (10,11,12,13,14,15,19,20)) AS mod_actions_seen,
+      count(DISTINCT ph.postid) AS distinct_posts_touched,
+      max(ph.creationdate) AS last_edit_date
+    FROM recent_users u
+    LEFT JOIN posthistory ph ON ph.userid = u.user_id
+    GROUP BY u.user_id
+),
+close_reasons AS (
+    SELECT
+      q.owneruserid AS user_id,
+      crt.name AS reason_name,
+      count(*) AS reason_count
+    FROM posts q
+    JOIN posthistory ph ON ph.postid = q.id AND ph.posthistorytypeid = 10
+    LEFT JOIN closereasontypes crt
+      ON crt.id = NULLIF(ph.comment, '')::integer
+    WHERE q.posttypeid = 1 AND q.owneruserid IS NOT NULL
+    GROUP BY q.owneruserid, crt.name
+),
+top_close_reason AS (
+    SELECT DISTINCT ON (cr.user_id)
+      cr.user_id,
+      coalesce(cr.reason_name, 'Unknown') AS top_close_reason,
+      cr.reason_count
+    FROM close_reasons cr
+    ORDER BY cr.user_id, cr.reason_count DESC NULLS LAST, coalesce(cr.reason_name, 'Unknown')
+),
+vote_velocity AS (
+    SELECT
+      p.owneruserid AS user_id,
+      avg(extract(epoch FROM (v.creationdate - p.creationdate)) / 3600.0) FILTER (WHERE v.votetypeid IN (2,3)) AS avg_hours_to_vote,
+      count(*) FILTER (WHERE v.votetypeid = 2) AS up_count,
+      count(*) FILTER (WHERE v.votetypeid = 3) AS down_count
+    FROM posts p
+    LEFT JOIN votes v ON v.postid = p.id AND v.votetypeid IN (2,3)
+    WHERE p.owneruserid IS NOT NULL
+    GROUP BY p.owneruserid
+),
+ranked_users AS (
+    SELECT
+      u.user_id,
+      u.displayname,
+      u.reputation,
+      u.creationdate,
+      u.country_guess,
+      coalesce(ua.total_posts,0) AS total_posts,
+      coalesce(ua.total_comments,0) AS total_comments,
+      coalesce(ua.upvotes_received,0) AS upvotes_received,
+      coalesce(ua.downvotes_received,0) AS downvotes_received,
+      coalesce(ua.favorites_received,0) AS favorites_received,
+      qs.q_count,
+      qs.avg_nonzero_views,
+      qs.answers_received,
+      qs.accepted_count,
+      qs.closed_count,
+      ast.a_count,
+      ast.avg_answer_score,
+      ast.positive_answers,
+      ast.negative_answers,
+      br.badges_total,
+      br.gold, br.silver, br.bronze, br.tag_badges,
+      br.first_badge_date, br.last_badge_date,
+      pg.linked_edges, pg.duplicate_edges, pg.distinct_linked_targets, pg.distinct_dup_targets,
+      tt.top_tag, tt.views_for_tag AS top_tag_views, tt.posts_with_tag AS top_tag_posts,
+      ea.edits_made, ea.mod_actions_seen, ea.distinct_posts_touched, ea.last_edit_date,
+      coalesce(tcr.top_close_reason, 'Unknown') AS top_close_reason,
+      vv.avg_hours_to_vote, vv.up_count, vv.down_count,
+      (
+        coalesce(qs.q_count,0) * 1.0
+        + coalesce(ast.a_count,0) * 1.2
+        + greatest(coalesce(ua.upvotes_received,0) - coalesce(ua.downvotes_received,0), 0) * 0.5
+        + coalesce(br.gold,0) * 5
+        + coalesce(br.silver,0) * 2
+        + coalesce(br.bronze,0) * 1
+        + coalesce(pg.linked_edges,0) * 0.2
+        + coalesce(ua.favorites_received,0) * 0.3
+        + coalesce(ea.edits_made,0) * 0.1
+        + CASE WHEN coalesce(vv.avg_hours_to_vote, 999999) < 12 THEN 2 ELSE 0 END
+        - coalesce(qs.closed_count,0) * 0.5
+      ) AS composite_score
+    FROM recent_users u
+    LEFT JOIN user_activity ua ON ua.user_id = u.user_id
+    LEFT JOIN question_stats qs ON qs.user_id = u.user_id
+    LEFT JOIN answer_stats ast ON ast.user_id = u.user_id
+    LEFT JOIN badge_rollup br ON br.user_id = u.user_id
+    LEFT JOIN postlink_graph pg ON pg.user_id = u.user_id
+    LEFT JOIN top_tag_per_user tt ON tt.user_id = u.user_id
+    LEFT JOIN edit_activity ea ON ea.user_id = u.user_id
+    LEFT JOIN top_close_reason tcr ON tcr.user_id = u.user_id
+    LEFT JOIN vote_velocity vv ON vv.user_id = u.user_id
+),
+outliers AS (
+    SELECT
+      r.*,
+      avg(r.composite_score) OVER () AS avg_score,
+      stddev_pop(r.composite_score) OVER () AS sd_score,
+      -- percentile_cont as an ordered-set aggregate is not supported with OVER() in some dialects.
+      -- Replace p95 with a windowed approximation using percentile_disc within windowed aggregation via subquery.
+      NULL::double precision AS p95_score,
+      rank() OVER (ORDER BY r.composite_score DESC NULLS LAST) AS rank_desc,
+      dense_rank() OVER (ORDER BY coalesce(r.upvotes_received,0) - coalesce(r.downvotes_received,0) DESC) AS net_vote_rank
+    FROM ranked_users r
+),
+outliers_with_p95 AS (
+    SELECT o.*,
+           p.p95_score
+    FROM outliers o
+    CROSS JOIN LATERAL (
+      SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY ru.composite_score) AS p95_score
+      FROM ranked_users ru
+    ) p
+),
+final AS (
+    SELECT
+      o.*,
+      CASE
+        WHEN o.composite_score IS NULL THEN 'Unknown'
+        WHEN o.composite_score >= o.p95_score THEN 'Top 5%'
+        WHEN o.composite_score >= o.avg_score + coalesce(o.sd_score,0) THEN 'Above Average'
+        WHEN o.composite_score <= o.avg_score - coalesce(o.sd_score,0) THEN 'Below Average'
+        ELSE 'Average'
+      END AS perf_bucket,
+      CASE WHEN o.rank_desc <= 10 THEN 1 ELSE 0 END AS is_top10,
+      CASE WHEN o.net_vote_rank <= 25 THEN 1 ELSE 0 END AS is_top25_netvotes
+    FROM outliers_with_p95 o
+),
+dupe_pairs AS (
+    SELECT
+      q.owneruserid AS user_id,
+      count(*) AS dup_self_links
+    FROM posts q
+    JOIN postlinks pl ON pl.postid = q.id AND pl.linktypeid = 3
+    JOIN posts r ON r.id = pl.relatedpostid
+    WHERE r.owneruserid = q.owneruserid
+    GROUP BY q.owneruserid
+)
+SELECT
+  f.user_id,
+  coalesce(f.displayname, concat('user#', CAST(f.user_id AS text))) AS displayname,
+  f.reputation,
+  f.country_guess,
+  f.total_posts,
+  f.total_comments,
+  f.upvotes_received,
+  f.downvotes_received,
+  f.favorites_received,
+  f.q_count,
+  f.avg_nonzero_views,
+  f.answers_received,
+  f.accepted_count,
+  f.closed_count,
+  f.a_count,
+  f.avg_answer_score,
+  f.positive_answers,
+  f.negative_answers,
+  f.badges_total, f.gold, f.silver, f.bronze, f.tag_badges,
+  f.linked_edges, f.duplicate_edges, f.distinct_linked_targets, f.distinct_dup_targets,
+  f.top_tag,
+  f.top_tag_views,
+  f.top_tag_posts,
+  f.edits_made, f.mod_actions_seen, f.distinct_posts_touched,
+  f.last_edit_date,
+  f.top_close_reason,
+  f.avg_hours_to_vote,
+  f.up_count AS vote_up_events,
+  f.down_count AS vote_down_events,
+  coalesce(dp.dup_self_links, 0) AS duplicate_self_links,
+  f.composite_score,
+  f.perf_bucket,
+  f.rank_desc,
+  f.net_vote_rank,
+  (SELECT count(*) FROM ranked_users) AS population_size
+FROM final f
+LEFT JOIN dupe_pairs dp ON dp.user_id = f.user_id
+WHERE (f.is_top10 = 1 OR f.is_top25_netvotes = 1 OR f.perf_bucket IN ('Top 5%','Above Average'))
+  AND (f.total_posts + coalesce(f.badges_total,0)) > 0
+ORDER BY f.perf_bucket ASC, f.rank_desc ASC
+LIMIT 200;

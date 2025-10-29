@@ -1,0 +1,149 @@
+-- {"query": "5436.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1035} 
+WITH
+EarlyPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '180 days'
+),
+TagTagged AS (
+  SELECT
+    p.PostId,
+    unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag
+  FROM EarlyPosts p
+),
+TagAggregates AS (
+  SELECT
+    Tag,
+    COUNT(*) AS PostCount,
+    AVG(Score) AS AvgScore,
+    SUM(ViewCount) AS TotalViews,
+    MAX(CreationDate) AS LastCreated
+  FROM TagTagged
+  GROUP BY Tag
+),
+TopTags AS (
+  SELECT
+    t.Tag,
+    t.PostCount,
+    t.AvgScore,
+    t.TotalViews,
+    t.LastCreated,
+    ROW_NUMBER() OVER (ORDER BY t.PostCount DESC, t.TotalViews DESC, t.AvgScore DESC) AS rn
+  FROM TagAggregates t
+),
+Qualified AS (
+  SELECT
+    tt.Tag,
+    tt.PostCount,
+    tt.AvgScore,
+    tt.TotalViews,
+    tt.LastCreated
+  FROM TopTags tt
+  WHERE tt.rn <= 10
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS PostsOwned,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgesEarned
+  FROM Users u
+  WHERE u.Reputation >= 1000
+),
+RecentVotes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    vt.Name AS VoteName,
+    u.DisplayName AS VoterName
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  LEFT JOIN Users u ON v.UserId = u.Id
+  WHERE v.CreationDate >= NOW() - INTERVAL '30 days'
+),
+PostLinksSummary AS (
+  SELECT
+    pl.PostId,
+    COUNT(*) AS LinkCount,
+    SUM(CASE WHEN lt.Name ILIKE 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateLinks
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  GROUP BY pl.PostId
+),
+Combined AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    COALESCE(ls.LinkCount, 0) AS LinkCount,
+    COALESCE(dt.DuplicateLinks, 0) AS DuplicateLinks
+  FROM EarlyPosts p
+  LEFT JOIN PostLinksSummary ls ON ls.PostId = p.Id
+  LEFT JOIN PostLinksSummary dt ON dt.PostId = p.Id
+),
+Windowed AS (
+  SELECT
+    c.*,
+    ROW_NUMBER() OVER (PARTITION BY c.OwnerUserId ORDER BY c.LastActivityDate DESC) AS rn_per_user
+  FROM Combined c
+  WHERE c.ViewCount > 0
+)
+SELECT
+  w.PostId,
+  w.Title,
+  w.OwnerUserId,
+  w.CreationDate,
+  w.Score,
+  w.ViewCount,
+  w.LastActivityDate,
+  w.CommentCount,
+  w.FavoriteCount,
+  w.ContentLicense,
+  w.LinkCount,
+  w.DuplicateLinks,
+  ua.UserId AS TopAuthorUserId,
+  ua.DisplayName AS TopAuthorName,
+  ua.Reputation AS TopAuthorRep,
+  wt.Tag,
+  ta.PostCount AS TagPostCount,
+  ta.AvgScore AS TagAvgScore,
+  ta.TotalViews AS TagTotalViews,
+  ta.LastCreated AS TagLastCreated,
+  rv.VoteTypeId AS RecentVoteTypeId,
+  rv.VoteName AS RecentVoteName,
+  rv.CreationDate AS RecentVoteDate
+FROM Windowed w
+LEFT JOIN UserActivity ua ON w.OwnerUserId = ua.UserId
+LEFT JOIN Qualified ta ON ta.Tag = ANY(string_to_array(substr(w.Tags, 2, length(w.Tags)-2), '><'))
+LEFT JOIN RecentVotes rv ON rv.PostId = w.PostId
+ORDER BY w.LastActivityDate DESC
+LIMIT 200;

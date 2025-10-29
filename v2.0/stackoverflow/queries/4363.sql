@@ -1,0 +1,141 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.PostHistoryTypeId,
+      ph.UserId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) as rn
+    FROM
+      PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  RecentEdits AS (
+    SELECT
+      rpe.PostId,
+      rpe.UserId,
+      rpe.CreationDate
+    FROM
+      RankedPostEdits rpe
+    WHERE
+      rpe.rn = 1
+  ),
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      AVG(p.Score) AS AverageScore,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM
+      Posts p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserEditFrequency AS (
+    SELECT
+      re.UserId,
+      COUNT(DISTINCT re.PostId) AS EditedPostCount,
+      MAX(re.CreationDate) AS LastEditDate
+    FROM
+      RecentEdits re
+    GROUP BY
+      re.UserId
+  ),
+  HighReputationUsers AS (
+    SELECT
+      u.Id
+    FROM
+      Users u
+    WHERE
+      u.Reputation > 10000
+  )
+SELECT
+  COALESCE(upa.OwnerUserId, uef.UserId, hru.Id) AS UserId,
+  COALESCE(upa.TotalPosts, 0) AS TotalPostsOwned,
+  COALESCE(upa.QuestionCount, 0) AS TotalQuestionsOwned,
+  COALESCE(upa.AnswerCount, 0) AS TotalAnswersOwned,
+  ROUND(COALESCE(upa.AverageScore, 0.0), 2) AS AveragePostScore,
+  upa.LastPostDate,
+  COALESCE(uef.EditedPostCount, 0) AS PostsEditedCount,
+  uef.LastEditDate AS LastPostEditedDate,
+  CASE
+    WHEN hru.Id IS NOT NULL THEN 'High Rep User'
+    WHEN upa.OwnerUserId IS NOT NULL AND upa.TotalPosts > 100 THEN 'Prolific Owner'
+    WHEN uef.UserId IS NOT NULL AND uef.EditedPostCount > 50 THEN 'Frequent Editor'
+    ELSE 'Other'
+  END AS UserCategory,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Badges b
+    WHERE
+      b.UserId = COALESCE(upa.OwnerUserId, uef.UserId, hru.Id)
+      AND b.Class = 1
+  ) AS GoldBadgeCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Badges b
+    WHERE
+      b.UserId = COALESCE(upa.OwnerUserId, uef.UserId, hru.Id)
+      AND b.Class = 2
+  ) AS SilverBadgeCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Badges b
+    WHERE
+      b.UserId = COALESCE(upa.OwnerUserId, uef.UserId, hru.Id)
+      AND b.Class = 3
+  ) AS BronzeBadgeCount,
+  CONCAT(
+    COALESCE(u.DisplayName, 'Anonymous'),
+    ' (ID: ',
+    COALESCE(CAST(u.Id AS VARCHAR), 'N/A'),
+    ')'
+  ) AS DisplayIdentifier
+FROM
+  UserPostActivity upa
+FULL OUTER JOIN
+  UserEditFrequency uef
+ON
+  upa.OwnerUserId = uef.UserId
+FULL OUTER JOIN
+  HighReputationUsers hru
+ON
+  COALESCE(upa.OwnerUserId, uef.UserId) = hru.Id
+LEFT JOIN
+  Users u
+ON
+  u.Id = COALESCE(upa.OwnerUserId, uef.UserId, hru.Id)
+WHERE
+  COALESCE(upa.TotalPosts, 0) + COALESCE(uef.EditedPostCount, 0) > 0
+  OR hru.Id IS NOT NULL
+GROUP BY
+  COALESCE(upa.OwnerUserId, uef.UserId, hru.Id),
+  upa.OwnerUserId,
+  upa.TotalPosts,
+  upa.QuestionCount,
+  upa.AnswerCount,
+  upa.AverageScore,
+  upa.LastPostDate,
+  uef.UserId,
+  uef.EditedPostCount,
+  uef.LastEditDate,
+  hru.Id,
+  u.DisplayName,
+  u.Id
+ORDER BY
+  UserCategory,
+  hru.Id DESC,
+  AveragePostScore DESC,
+  LastPostEditedDate DESC,
+  LastPostDate DESC;

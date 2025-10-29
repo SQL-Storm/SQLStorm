@@ -1,0 +1,176 @@
+-- {"query": "1042.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2868} 
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views,
+        U.UpVotes AS UserGivenUpVotes, -- Upvotes given by user (as recorded in Users table)
+        U.DownVotes AS UserGivenDownVotes, -- Downvotes given by user (as recorded in Users table)
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersPosted,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        -- Calculate average score of all posts owned by this user, defaulting to 0 if no posts
+        COALESCE(AVG(P.Score) FILTER (WHERE P.OwnerUserId = U.Id), 0) AS AvgPostScoreOwned,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        -- Correlated subquery: Get the count of unique tags associated with this user's questions
+        (SELECT COUNT(DISTINCT tag_name.value)
+         FROM Posts P_sub
+         CROSS JOIN LATERAL UNNEST(string_to_array(substring(P_sub.Tags, 2, length(P_sub.Tags)-2), '><')) AS tag_name(value)
+         WHERE P_sub.OwnerUserId = U.Id AND P_sub.PostTypeId = 1 AND P_sub.Tags IS NOT NULL AND LENGTH(P_sub.Tags) > 2
+        ) AS UniqueTagsAskedCount,
+        -- Determine if user has any "gold" badges (Class = 1)
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        -- Categorize users into reputation tiers
+        CASE
+            WHEN U.Reputation >= 50000 THEN 'Legend'
+            WHEN U.Reputation >= 10000 THEN 'Guru'
+            WHEN U.Reputation >= 2000 THEN 'Expert'
+            WHEN U.Reputation >= 500 THEN 'Pro'
+            ELSE 'Novice'
+        END AS ReputationTier
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+LatestPostCloseHistory AS (
+    -- Identify the most recent closing event for each post
+    SELECT
+        PH.PostId,
+        PH.Comment AS CloseReasonIdComment,
+        PH.CreationDate AS CloseDate,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) as rn
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId = 10 -- Post Closed event type
+),
+PostHistoricalInsights AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.OwnerUserId,
+        P.Title,
+        P.Tags,
+        P.ClosedDate,
+        -- Count unique users who edited this post
+        COUNT(DISTINCT PH_edit.UserId) FILTER (WHERE PH_edit.PostHistoryTypeId IN (4,5,6)) AS UniqueEditorsCount,
+        -- Count how many times this post was closed
+        COUNT(CASE WHEN PH_close.PostHistoryTypeId = 10 THEN 1 END) AS CloseEventsCount,
+        -- Retrieve the name of the latest close reason, with NULL handling
+        COALESCE(CR.Name, 'Unknown Reason (ID: ' || LPCH.CloseReasonIdComment || ')') AS LatestCloseReason,
+        -- Window function: Rank posts by ViewCount within their PostType, ordered by creation date for tie-breaking
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.ViewCount DESC, P.CreationDate DESC) AS ViewRankForAnsweredPosts,
+        -- Window function: Calculate average score of the previous 5 posts by the same owner
+        AVG(P.Score) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING) AS AvgPrev5PostsScore
+    FROM Posts P
+    LEFT JOIN PostHistory PH_edit ON P.Id = PH_edit.PostId -- Join for edit counts
+    LEFT JOIN PostHistory PH_close ON P.Id = PH_close.PostId AND PH_close.PostHistoryTypeId = 10 -- Join for close event counts
+    LEFT JOIN LatestPostCloseHistory LPCH ON P.Id = LPCH.PostId AND LPCH.rn = 1 -- Join to get latest close history
+    LEFT JOIN CloseReasonTypes CR ON LPCH.CloseReasonIdComment = CR.Id::varchar -- Join to get close reason name
+    WHERE P.PostTypeId IN (1,2) -- Focus on Questions (1) and Answers (2)
+    GROUP BY P.Id, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount, P.OwnerUserId, P.Title, P.Tags, P.ClosedDate, LPCH.CloseReasonIdComment, CR.Name
+),
+TagPerformanceOverview AS (
+    SELECT
+        tag_name.value AS TagName,
+        COUNT(DISTINCT P.Id) AS TotalQuestionsUsingTag,
+        AVG(P.Score) AS AverageQuestionScoreWithTag,
+        SUM(P.ViewCount) AS TotalViewCountForTag,
+        MAX(T.Count) AS TagGlobalCount,
+        -- Calculate the proportion of questions with an accepted answer for this tag, using numeric casting for division
+        CAST(COUNT(DISTINCT CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN P.Id END) AS NUMERIC) / COUNT(DISTINCT P.Id) AS AcceptedAnswerRatio,
+        -- Check if this tag is ever associated with a question that received a bounty (VoteTypeId = 8)
+        MAX(CASE WHEN EXISTS (SELECT 1 FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 8) THEN 1 ELSE 0 END) AS HasBountiedQuestions
+    FROM Posts P
+    CROSS JOIN LATERAL UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS tag_name(value)
+    LEFT JOIN Tags T ON tag_name.value = T.TagName
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY tag_name.value
+    HAVING COUNT(DISTINCT P.Id) > 100 -- Filter for tags with a significant number of questions
+),
+IntersectingPostRelationships AS (
+    -- Find posts that are both 'Linked' (LinkTypeId = 1) and 'Duplicate' (LinkTypeId = 3)
+    SELECT PostId FROM PostLinks WHERE LinkTypeId = 1
+    INTERSECT
+    SELECT PostId FROM PostLinks WHERE LinkTypeId = 3
+)
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.ReputationTier,
+    UES.TotalQuestionsAsked,
+    UES.TotalAnswersPosted,
+    UES.TotalCommentsMade,
+    UES.TotalBadgesEarned,
+    UES.AvgPostScoreOwned,
+    UES.UniqueTagsAskedCount,
+    UES.HasGoldBadge,
+    PHI.PostId,
+    PHI.PostCreationDate,
+    PHI.Title,
+    PHI.Score AS PostScore,
+    PHI.ViewCount AS PostViewCount,
+    PHI.CloseEventsCount,
+    COALESCE(PHI.LatestCloseReason, 'N/A') AS PostClosureReason,
+    PHI.ViewRankForAnsweredPosts,
+    TPO.TagName,
+    TPO.AverageQuestionScoreWithTag,
+    TPO.AcceptedAnswerRatio,
+    -- String expression: Format post title excerpt based on PostType
+    CASE
+        WHEN PHI.PostTypeId = 1 THEN 'Q: ' || SUBSTRING(PHI.Title, 1, 50) ||
+                                    CASE WHEN LENGTH(PHI.Title) > 50 THEN '...' ELSE '' END
+        WHEN PHI.PostTypeId = 2 THEN 'A: N/A' -- Answers do not have a title in this schema
+        ELSE 'P: ' || SUBSTRING(PHI.Title, 1, 50) ||
+                                    CASE WHEN LENGTH(PHI.Title) > 50 THEN '...' ELSE '' END
+    END AS FormattedPostTitleExcerpt,
+    -- Combined string expression with NULL logic and conditional influence label
+    COALESCE(UES.DisplayName, 'Anonymous User') ||
+    CASE
+        WHEN UES.Reputation >= 10000 AND PHI.Score >= 100 THEN ' (Highly Influential)'
+        WHEN UES.Reputation >= 2000 AND PHI.Score >= 50 THEN ' (Influential Contributor)'
+        ELSE ''
+    END AS UserInfluenceLabel,
+    -- Count of duplicate links for this specific post
+    SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinkCountForPost,
+    -- Window function: Total posts by users within the same reputation tier
+    COUNT(PHI.PostId) OVER (PARTITION BY UES.ReputationTier) AS TotalPostsInRepTier,
+    -- Correlated subquery: Count of recent 'ModeratorReview' votes on the post
+    (SELECT COUNT(V.Id)
+     FROM Votes V
+     WHERE V.PostId = PHI.PostId
+       AND V.VoteTypeId = 15 -- ModeratorReview
+       AND V.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') -- Only count reviews from the last year
+    ) AS RecentModeratorReviewsForPost
+FROM UserEngagementSummary UES
+LEFT JOIN PostHistoricalInsights PHI ON UES.UserId = PHI.OwnerUserId
+CROSS JOIN LATERAL UNNEST(string_to_array(substring(PHI.Tags, 2, length(PHI.Tags)-2), '><')) AS post_tag(value)
+LEFT JOIN TagPerformanceOverview TPO ON post_tag.value = TPO.TagName
+LEFT JOIN PostLinks PL ON PHI.PostId = PL.PostId
+LEFT JOIN IntersectingPostRelationships IPR ON PHI.PostId = IPR.PostId
+WHERE UES.Reputation >= 1000 -- Filter for users with a minimum reputation
+  AND PHI.PostId IS NOT NULL -- Ensure we only include users who own posts
+  AND PHI.PostTypeId = 1 -- Focus primarily on Questions
+  AND PHI.CloseEventsCount > 0 -- Only consider questions that have been closed at least once
+  AND PHI.PostCreationDate >= '2022-01-01' -- Focus on recent posts
+  AND (TPO.AcceptedAnswerRatio > 0.5 OR TPO.HasBountiedQuestions = 1) -- Complex predicate involving tag performance
+  AND IPR.PostId IS NOT NULL -- Only include posts that are both linked and marked as duplicate
+GROUP BY
+    UES.UserId, UES.DisplayName, UES.Reputation, UES.ReputationTier, UES.TotalQuestionsAsked, UES.TotalAnswersPosted,
+    UES.TotalCommentsMade, UES.TotalBadgesEarned, UES.AvgPostScoreOwned, UES.UniqueTagsAskedCount, UES.HasGoldBadge,
+    PHI.PostId, PHI.PostCreationDate, PHI.Title, PHI.Score, PHI.ViewCount, PHI.CloseEventsCount, PHI.LatestCloseReason,
+    PHI.ViewRankForAnsweredPosts, PHI.PostTypeId,
+    TPO.TagName, TPO.AverageQuestionScoreWithTag, TPO.AcceptedAnswerRatio
+HAVING SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) > 0 -- Redundant given IPR join, but demonstrates HAVING use
+ORDER BY UES.Reputation DESC, PHI.PostCreationDate DESC, PHI.Score DESC
+LIMIT 1000;

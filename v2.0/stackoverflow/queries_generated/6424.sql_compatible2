@@ -1,0 +1,72 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LastPostActivity,
+    SUM(v.BountyAmount) AS TotalBountyPoints,
+    MAX(ph.RevisionGUID) AS LastRevisionGUID,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.LastActivityDate) DESC) AS MostActivePost,
+    (
+        SELECT STRING_AGG(tg.TagName, ', ')
+        FROM Tags tg
+        WHERE tg.Id IN (
+            SELECT DISTINCT CAST((sub.Tags_array[1]) AS INTEGER)
+            FROM (
+                SELECT
+                    CASE
+                        WHEN p2.Tags LIKE '<%>' THEN
+                            SUBSTRING(p2.Tags FROM '<([^>]+)>')
+                        WHEN p2.Tags LIKE '[%' THEN
+                            TRIM(BOTH '["{' FROM TRIM(BOTH '"]}' FROM p2.Tags))
+                        ELSE
+                            p2.Tags
+                    END AS Tags_normalized,
+                    ARRAY[CASE
+                        WHEN p2.Tags LIKE '<%>' THEN SUBSTRING(p2.Tags FROM '<([^>]+)>')
+                        WHEN p2.Tags LIKE '[%' THEN TRIM(BOTH '["{' FROM TRIM(BOTH '"]}' FROM p2.Tags))
+                        ELSE p2.Tags
+                    END] AS Tags_array
+                FROM Posts p2
+                WHERE p2.Id = p.Id
+                LIMIT 1
+            ) AS sub
+        )
+    ) AS TagsUsed,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ) AS DuplicateCount,
+    (
+        SELECT COUNT(DISTINCT b.Id)
+        FROM Badges b
+        WHERE b.UserId = u.Id AND b.Class = 1
+    ) AS GoldBadgeCount
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+WHERE 
+    u.Reputation > 10000
+    AND p.LastEditDate > (
+        SELECT MAX(LastEditDate) 
+        FROM Posts 
+        WHERE PostTypeId = 1
+    )
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation
+HAVING 
+    COUNT(DISTINCT p.Id) > 100
+ORDER BY 
+    TotalBountyPoints DESC, 
+    TotalPosts DESC
+LIMIT 100;

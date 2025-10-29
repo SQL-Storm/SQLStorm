@@ -1,0 +1,100 @@
+WITH
+recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.PostTypeId,
+    u.Reputation AS OwnerReputation,
+    u.DisplayName AS OwnerDisplayName
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '60' DAY)
+),
+tag_summary AS (
+  SELECT
+    trim(BOTH ' ' FROM t) AS tag,
+    COUNT(*) AS questions_with_tag
+  FROM Posts p,
+       LATERAL (
+         SELECT unnest(string_to_array(p.Tags, '><')) AS t
+       ) s
+  WHERE p.PostTypeId = 1
+  GROUP BY trim(BOTH ' ' FROM t)
+),
+top_tags AS (
+  SELECT
+    tag,
+    questions_with_tag
+  FROM tag_summary
+  ORDER BY questions_with_tag DESC
+  LIMIT 5
+),
+recent_activity AS (
+  SELECT
+    p.Id AS post_id,
+    p.Title,
+    p.LastActivityDate,
+    COALESCE(b.BountyAmount, 0) AS current_bounty,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN COALESCE(v.Score,0) ELSE 0 END) AS upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN COALESCE(v.Score,0) ELSE 0 END) AS downvotes
+  FROM Posts p
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  LEFT JOIN (
+    SELECT PostId, SUM(BountyAmount) AS BountyAmount
+    FROM Votes
+    WHERE VoteTypeId = 8
+    GROUP BY PostId
+  ) b ON p.Id = b.PostId
+  WHERE p.PostTypeId = 1
+    AND p.LastActivityDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '14' DAY)
+  GROUP BY p.Id, p.Title, p.LastActivityDate, b.BountyAmount
+),
+complex_filter AS (
+  SELECT
+    r.post_id,
+    r.Title,
+    r.LastActivityDate,
+    r.current_bounty,
+    r.upvotes,
+    r.downvotes,
+    CASE
+      WHEN r.current_bounty > 0 THEN 'Has Bounty'
+      WHEN COALESCE(r.upvotes,0) - COALESCE(r.downvotes,0) > 5 THEN 'Strong Positive'
+      ELSE 'Normal'
+    END AS activity_tag
+  FROM recent_activity r
+  ORDER BY r.LastActivityDate DESC
+  LIMIT 100
+)
+SELECT
+  q.PostId,
+  q.Title,
+  q.CreationDate,
+  q.ViewCount,
+  q.Score AS QuestionScore,
+  q.OwnerDisplayName,
+  q.OwnerReputation,
+  ts.tag AS TopTag,
+  ts.questions_with_tag,
+  ca.activity_tag,
+  ca.current_bounty,
+  ca.upvotes,
+  ca.downvotes,
+  q.LastActivityDate AS LastActivity
+FROM recent_questions q
+LEFT JOIN top_tags ts
+  ON 1 = 1
+LEFT JOIN complex_filter ca
+  ON ca.post_id = q.PostId
+ORDER BY q.LastActivityDate DESC
+LIMIT 200;

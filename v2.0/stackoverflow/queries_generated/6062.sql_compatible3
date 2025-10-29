@@ -1,0 +1,49 @@
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    MAX(ph.CreationDate) AS LatestPostHistory,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(b.Date) AS LatestBadgeEarned,
+    STRING_AGG(tn.TagName, ', ' ORDER BY tn.TagCount DESC) AS TopTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN (
+    SELECT
+        t.ExcerptPostId,
+        t.TagName,
+        COUNT(*) AS TagCount,
+        ROW_NUMBER() OVER (PARTITION BY t.ExcerptPostId, t.TagName ORDER BY t.TagName) AS rn
+    FROM Tags t
+    GROUP BY t.ExcerptPostId, t.TagName
+) tn ON p.Id = tn.ExcerptPostId
+WHERE 
+    u.Reputation > 1000
+    AND (p.LastActivityDate IS NULL OR p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '12 months'))
+    AND (u.Location IS NOT NULL AND u.Location <> '')
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    u.Reputation DESC, 
+    AvgPostScore DESC
+LIMIT 100;

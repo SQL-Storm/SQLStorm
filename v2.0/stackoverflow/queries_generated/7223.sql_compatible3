@@ -1,0 +1,182 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as UserAvgScore,
+        NTILE(4) OVER (ORDER BY p.Score) as ScoreQuartile,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                cardinality(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><'))
+            ELSE 0 
+        END as TagCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= TIMESTAMP '2022-01-01'
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore,
+        MAX(p.CreationDate) as LatestPostDate,
+        STRING_AGG(p.Title, ' || ') as AllTitles,
+        STRING_AGG(p.Tags, ' || ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= TIMESTAMP '2022-01-01'
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.Count > 100 THEN 'High' ELSE 'Low' END as PopularityLevel,
+        COALESCE(p.Title, 'No Title') as ExcerptTitle,
+        COALESCE((SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%'), 0) as RelatedQuestionCount
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+),
+PostActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.Comment,
+        ph.Text,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (1, 4, 6) THEN 'Title/Tag Edit'
+            WHEN ph.PostHistoryTypeId IN (2, 5) THEN 'Content Edit'
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'Status Change'
+            ELSE 'Other'
+        END as ActivityCategory,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate ASC) as ActivitySequence,
+        LAG(ph.PostHistoryTypeId) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) as PreviousActivity,
+        EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) / 60.0 as MinutesSinceLastActivity
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= TIMESTAMP '2022-01-01'
+),
+CombinedAnalysis AS (
+    SELECT 
+        rp.Id as PostId,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.Title,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.UserPostRank,
+        rp.PrevScore,
+        rp.UserAvgScore,
+        rp.ScoreQuartile,
+        rp.TagCount,
+        us.DisplayName as OwnerDisplayName,
+        us.TotalPosts,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.TotalQuestionScore,
+        us.AvgQuestionScore,
+        us.TotalAnswerScore,
+        us.AvgAnswerScore,
+        us.LatestPostDate,
+        ta.TagName,
+        ta.PopularityLevel,
+        ta.RelatedQuestionCount,
+        pa.ActivityCategory,
+        pa.ActivitySequence,
+        pa.MinutesSinceLastActivity
+    FROM RankedPosts rp
+    LEFT JOIN UserStats us ON rp.OwnerUserId = us.UserId
+    LEFT JOIN Tags ta ON rp.Tags IS NOT NULL AND rp.Tags LIKE '%' || ta.TagName || '%'
+    LEFT JOIN PostActivity pa ON rp.Id = pa.PostId
+    WHERE rp.UserPostRank <= 100
+)
+SELECT 
+    ca.PostId,
+    ca.PostTypeId,
+    ca.OwnerUserId,
+    ca.Score,
+    ca.ViewCount,
+    ca.Title,
+    ca.AnswerCount,
+    ca.CommentCount,
+    ca.FavoriteCount,
+    ca.UserPostRank,
+    ca.PrevScore,
+    ca.UserAvgScore,
+    ca.ScoreQuartile,
+    ca.TagCount,
+    ca.OwnerDisplayName,
+    ca.TotalPosts,
+    ca.QuestionCount,
+    ca.AnswerCount,
+    ca.TotalQuestionScore,
+    ca.AvgQuestionScore,
+    ca.TotalAnswerScore,
+    ca.AvgAnswerScore,
+    ca.LatestPostDate,
+    ca.TagName,
+    ca.PopularityLevel,
+    ca.RelatedQuestionCount,
+    ca.ActivityCategory,
+    ca.ActivitySequence,
+    ca.MinutesSinceLastActivity,
+    CASE 
+        WHEN ca.Score > (SELECT AVG(Score) * 1.5 FROM Posts WHERE PostTypeId = 1) THEN 'Highly Popular'
+        WHEN ca.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Popular'
+        WHEN ca.Score > 0 THEN 'Neutral'
+        ELSE 'Low'
+    END as PopularityRank,
+    CASE 
+        WHEN ca.ActivityCategory = 'Title/Tag Edit' AND ca.MinutesSinceLastActivity < 10 THEN 'Rapid Editing'
+        WHEN ca.ActivityCategory = 'Content Edit' AND ca.Score > 50 THEN 'High Engagement'
+        WHEN ca.ActivitySequence > 10 AND ca.TagCount > 5 THEN 'Complex Post'
+        ELSE 'Standard'
+    END as ComplexityLevel,
+    COALESCE(ca.RelatedQuestionCount, 0) - COALESCE((SELECT COUNT(*) FROM Posts WHERE ParentId = ca.PostId AND PostTypeId = 2), 0) as NetTagQuestions,
+    COALESCE((SELECT COUNT(*) FROM Votes WHERE PostId = ca.PostId AND VoteTypeId IN (2, 3)), 0) - 
+    COALESCE((SELECT AVG(UpVotes - DownVotes) FROM Users WHERE Id = ca.OwnerUserId GROUP BY Id), 0) as ScoreDeviation,
+    CASE 
+        WHEN ca.AvgAnswerScore > ca.AvgQuestionScore THEN 'Answer Dominant'
+        WHEN ca.AvgAnswerScore < ca.AvgQuestionScore THEN 'Question Dominant'
+        ELSE 'Balanced'
+    END as ContributionStyle
+FROM CombinedAnalysis ca
+WHERE ca.PostTypeId IS NOT NULL 
+    AND ca.OwnerUserId IS NOT NULL
+    AND (ca.Score IS NOT NULL OR ca.ViewCount IS NOT NULL)
+    AND ca.OwnerDisplayName IS NOT NULL
+    AND (ca.TagName IS NULL OR char_length(ca.TagName) > 3)
+    AND (ca.ActivitySequence IS NULL OR ca.ActivitySequence > 1)
+ORDER BY 
+    CASE WHEN ca.ScoreQuartile = 1 THEN 1 ELSE 0 END DESC,
+    ca.Score DESC,
+    ca.ViewCount DESC,
+    ca.UserPostRank ASC,
+    ca.ActivitySequence DESC
+LIMIT 1000;

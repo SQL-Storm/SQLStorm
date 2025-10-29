@@ -1,0 +1,235 @@
+-- {"query": "2620.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2232} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        r.Level + 1,
+        r.Path || t.TagName
+    FROM Tags t
+    JOIN PostLinks pl ON pl.PostId = t.ExcerptPostId OR pl.RelatedPostId = t.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON 
+        (pl.PostId = r.Id OR pl.RelatedPostId = r.Id)
+        AND NOT t.TagName = ANY(r.Path)
+    WHERE r.Level < 3
+), LatestUserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.WebsiteUrl,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        -- Calculate average badge class weight for user (Gold=3, Silver=2, Bronze=1, weighted)
+        COALESCE(AVG(CASE b.Class WHEN 1 THEN 3 WHEN 2 THEN 2 WHEN 3 THEN 1 ELSE 0 END), 0) AS AvgBadgeClassWeight,
+        -- Last access in days ago
+        EXTRACT(EPOCH FROM (now() - u.LastAccessDate)) / 86400 AS DaysSinceLastAccess,
+        -- concatenate top 3 badge names as string for user, using STRING_AGG with ordering
+        (SELECT STRING_AGG(b2.Name, ', ' ORDER BY b2.Date DESC)
+         FROM Badges b2 WHERE b2.UserId = u.Id LIMIT 3) AS RecentBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) AS RankGlobal
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.WebsiteUrl, u.Views, u.UpVotes, u.DownVotes, u.AccountId, u.LastAccessDate
+), PostWithAggregates AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        COALESCE(votes_totals.UpVotes,0) AS TotalUpVotes,
+        COALESCE(votes_totals.DownVotes,0) AS TotalDownVotes,
+        COALESCE(comm_counts.CommentCount,0) AS TotalComments,
+        COALESCE(latest_edit.LastEditDate, p.CreationDate) AS LastEditDate,
+        -- Length of body in characters
+        LENGTH(p.Body) AS BodyLength,
+        -- Extract number of tags (counting '><' substrings + 1 if tags not null)
+        CASE 
+            WHEN p.Tags IS NULL THEN 0 
+            ELSE LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', '')) + 1 
+        END AS TagCount
+    FROM Posts p
+    LEFT JOIN (
+        SELECT 
+            v.PostId, 
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.PostId
+    ) votes_totals ON votes_totals.PostId = p.Id
+    LEFT JOIN (
+        SELECT 
+            c.PostId,
+            COUNT(*) AS CommentCount
+        FROM Comments c
+        GROUP BY c.PostId
+    ) comm_counts ON comm_counts.PostId = p.Id
+    LEFT JOIN (
+        SELECT 
+            ph.PostId, 
+            MAX(ph.CreationDate) AS LastEditDate
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9,14,19,20)  -- edits of various types
+        GROUP BY ph.PostId
+    ) latest_edit ON latest_edit.PostId = p.Id
+), QuestionsWithAnswersAndScores AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        q.AnswerCount,
+        q.AcceptedAnswerId,
+        COALESCE(ans.AggregateAnswerScore,0) AS TotalAnswerScore,
+        COALESCE(ans.HighestAnswerScore,0) AS HighestAnswerScore,
+        COALESCE(ans.MedianAnswerScore,0) AS MedianAnswerScore,
+        COALESCE(ans.SumAnswerBodyLength,0) AS SumAnswerBodyLength
+    FROM PostWithAggregates q
+    LEFT JOIN (
+        SELECT 
+            a.ParentId,
+            SUM(a.Score) AS AggregateAnswerScore,
+            MAX(a.Score) AS HighestAnswerScore,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a.Score) AS MedianAnswerScore,
+            SUM(LENGTH(a.Body)) AS SumAnswerBodyLength
+        FROM Posts a 
+        WHERE a.PostTypeId = 2
+        GROUP BY a.ParentId
+    ) ans ON ans.ParentId = q.Id
+    WHERE q.PostTypeId = 1
+), QuestionAnswerComparison AS (
+    SELECT 
+        q.QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate,
+        q.QuestionScore,
+        q.QuestionViewCount,
+        q.AnswerCount,
+        q.AcceptedAnswerId,
+        q.TotalAnswerScore,
+        q.HighestAnswerScore,
+        q.MedianAnswerScore,
+        q.SumAnswerBodyLength,
+        ua.DisplayName AS QuestionAsker,
+        ua.Reputation AS AskerReputation,
+        ua.AvgBadgeClassWeight AS AskerBadgeScore,
+        -- Check if AcceptedAnswerId exists and is answer by high rep user
+        CASE WHEN ans_posts.Id IS NOT NULL THEN au.Reputation ELSE NULL END AS AcceptedAnswererReputation,
+        CASE WHEN ans_posts.Id IS NOT NULL THEN au.DisplayName ELSE NULL END AS AcceptedAnswererName,
+        -- Number of distinct Users who answered
+        (SELECT COUNT(DISTINCT a.OwnerUserId) FROM Posts a WHERE a.PostTypeId=2 AND a.ParentId = q.QuestionId AND a.OwnerUserId IS NOT NULL) AS DistinctAnswerers,
+        -- Whether question is closed - join PostHistory for close event and null or not
+        CASE WHEN EXISTS (
+            SELECT 1 FROM PostHistory ph WHERE ph.PostId = q.QuestionId AND ph.PostHistoryTypeId = 10 /* Post Closed */
+        ) THEN 1 ELSE 0 END AS IsClosed,
+
+        -- Array of comments text concatenated for question
+        (SELECT STRING_AGG(COALESCE(c.Text, ''), ' | ' ORDER BY c.CreationDate)
+         FROM Comments c WHERE c.PostId = q.QuestionId) AS QuestionCommentsSummary
+
+    FROM QuestionsWithAnswersAndScores q
+    LEFT JOIN Users ua ON ua.Id = (SELECT OwnerUserId FROM Posts WHERE Id = q.QuestionId)
+    LEFT JOIN Posts ans_posts ON ans_posts.Id = q.AcceptedAnswerId
+    LEFT JOIN Users au ON au.Id = ans_posts.OwnerUserId
+), ComplexFilteredQuestions AS (
+    SELECT 
+        qac.*,
+        -- Check for complex tag condition: at least one tag includes 'sql' or 'performance' AND tagcount > 2
+        CASE 
+            WHEN (qac.Tags LIKE '%<sql>%'
+                  OR qac.Tags LIKE '%<performance>%')
+                 AND TagCount > 2 THEN 1 ELSE 0 END AS TagConditionMet,
+        -- String expression: abbreviated title (first 40 chars with ellipsis if longer)
+        CASE WHEN LENGTH(qac.Title) > 40 THEN CONCAT(SUBSTRING(qac.Title FROM 1 FOR 40), '...') ELSE qac.Title END AS ShortTitle
+    FROM (
+        SELECT qac_inner.*, p.TagCount
+        FROM QuestionAnswerComparison qac_inner
+        JOIN PostWithAggregates p ON p.Id = qac_inner.QuestionId
+    ) qac
+), FinalRankedResults AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY TagConditionMet
+            ORDER BY 
+                (QuestionScore + TotalAnswerScore) DESC, 
+                AskerReputation DESC, 
+                DistinctAnswerers DESC,
+                QuestionViewCount DESC
+        ) AS RankWithinTagGroup
+    FROM ComplexFilteredQuestions
+)
+SELECT 
+    fr.QuestionId,
+    fr.ShortTitle,
+    fr.CreationDate,
+    fr.QuestionScore,
+    fr.TotalAnswerScore,
+    fr.HighestAnswerScore,
+    fr.AnswerCount,
+    fr.DistinctAnswerers,
+    fr.AskerReputation,
+    fr.AskerBadgeScore,
+    fr.AcceptedAnswererName,
+    fr.AcceptedAnswererReputation,
+    fr.IsClosed,
+    fr.TagConditionMet,
+    fr.QuestionCommentsSummary,
+    fr.Tags,
+    -- Show longest tag extracted from Tags string with complex NULL logic and regex
+    (SELECT MAX(tag) FROM unnest(string_to_array(substring(fr.Tags FROM 2 FOR length(fr.Tags)-2), '><')) tag) AS LongestTag,
+    fr.RankWithinTagGroup
+FROM FinalRankedResults fr
+WHERE fr.TagConditionMet = 1
+AND fr.RankWithinTagGroup <= 20
+
+UNION
+
+SELECT 
+    fr.QuestionId,
+    fr.ShortTitle,
+    fr.CreationDate,
+    fr.QuestionScore,
+    fr.TotalAnswerScore,
+    fr.HighestAnswerScore,
+    fr.AnswerCount,
+    fr.DistinctAnswerers,
+    fr.AskerReputation,
+    fr.AskerBadgeScore,
+    fr.AcceptedAnswererName,
+    fr.AcceptedAnswererReputation,
+    fr.IsClosed,
+    fr.TagConditionMet,
+    fr.QuestionCommentsSummary,
+    fr.Tags,
+    (SELECT MAX(tag) FROM unnest(string_to_array(substring(fr.Tags FROM 2 FOR length(fr.Tags)-2), '><')) tag) AS LongestTag,
+    fr.RankWithinTagGroup
+FROM FinalRankedResults fr
+WHERE fr.TagConditionMet = 0
+AND fr.RankWithinTagGroup <= 10
+
+ORDER BY TagConditionMet DESC, RankWithinTagGroup ASC;

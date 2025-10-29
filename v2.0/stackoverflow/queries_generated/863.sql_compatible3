@@ -1,0 +1,357 @@
+with recent_users as (
+    select
+        u.id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as country_hint,
+        extract(year from u.creationdate) as signup_year,
+        row_number() over (order by u.reputation desc, u.id) as rn
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+tagged_questions as (
+    select
+        p.id as question_id,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><') as tag_arr
+    from posts p
+    where p.posttypeid = 1
+),
+answer_stats as (
+    select
+        q.id as question_id,
+        count(a.id) filter (where a.posttypeid = 2) as answer_count,
+        max(a.score) filter (where a.posttypeid = 2) as max_answer_score,
+        avg(cast(a.score as numeric)) filter (where a.posttypeid = 2) as avg_answer_score
+    from posts q
+    left join posts a
+      on a.parentid = q.id
+    where q.posttypeid = 1
+    group by q.id
+),
+comment_activity as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        sum(case when c.score > 0 then 1 else 0 end) as pos_comment_count,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    group by c.postid
+),
+user_badge_rollup as (
+    select
+        b.userid,
+        count(*) as total_badges,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where b.tagbased = true) as tag_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_votes as (
+    select
+        v.postid,
+        count(*) filter (where v.votetypeid = 2) as upvotes,
+        count(*) filter (where v.votetypeid = 3) as downvotes,
+        count(*) filter (where v.votetypeid = 8) as bounties_started,
+        sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_amount_total
+    from votes v
+    group by v.postid
+),
+duplicate_links as (
+    select
+        pl.postid as dup_post_id,
+        pl.relatedpostid as canonical_post_id,
+        count(*) as dup_link_count,
+        min(pl.creationdate) as first_dup_link_date
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+edits_cte as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+        count(*) filter (where ph.posthistorytypeid in (12,13)) as delete_undelete_events,
+        max(ph.creationdate) as last_history_date,
+        max(case when ph.posthistorytypeid = 10 then ph.creationdate end) as last_close_date,
+        max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as last_reopen_date
+    from posthistory ph
+    group by ph.postid
+),
+hotness as (
+    select
+        q.id as question_id,
+        0.6 * ln(greatest(q.viewcount,1)) +
+        2.0 * coalesce(v.upvotes,0) -
+        1.5 * coalesce(v.downvotes,0) +
+        3.0 * coalesce(a.answer_count,0) +
+        0.1 * extract(epoch from (timestamp '2024-10-01 12:34:56' - q.creationdate)) / 86400.0 * -1 as hot_score
+    from posts q
+    left join question_votes v on v.postid = q.id
+    left join answer_stats a on a.question_id = q.id
+    where q.posttypeid = 1
+),
+owner_activity as (
+    select
+        u.id as user_id,
+        count(distinct p.id) filter (where p.posttypeid = 1) as questions_posted,
+        count(distinct p.id) filter (where p.posttypeid = 2) as answers_posted,
+        sum(p.score) as total_post_score,
+        max(p.creationdate) as last_post_date
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+tag_unpivot as (
+    select
+        tq.question_id,
+        lower(trim(t.tag)) as tag
+    from tagged_questions tq
+    cross join lateral unnest(tq.tag_arr) as t(tag)
+),
+top_tags as (
+    select
+        question_id,
+        array_agg(tag order by tag) as tags_normalized,
+        count(*) as tag_count
+    from tag_unpivot
+    group by question_id
+),
+ranked_questions as (
+    select
+        q.id as question_id,
+        q.owneruserid,
+        q.creationdate,
+        q.score,
+        q.viewcount,
+        coalesce(h.hot_score, 0) as hot_score,
+        dense_rank() over (order by coalesce(h.hot_score,0) desc, q.viewcount desc, q.score desc, q.id) as hot_rank,
+        row_number() over (partition by q.owneruserid order by coalesce(h.hot_score,0) desc, q.creationdate desc) as user_hot_rank
+    from posts q
+    left join hotness h on h.question_id = q.id
+    where q.posttypeid = 1
+),
+owner_quality_bucket as (
+    select
+        u.id as user_id,
+        ntile(5) over (order by coalesce(oa.total_post_score,0) desc, u.reputation desc, u.id) as quality_quintile
+    from users u
+    left join owner_activity oa on oa.user_id = u.id
+),
+last_user_question as (
+    select
+        u.id as user_id,
+        (
+            select p.id from posts p
+            where p.posttypeid = 1 and p.owneruserid = u.id
+            order by p.creationdate desc, p.id desc
+            limit 1
+        ) as last_qid,
+        (
+            select p.score from posts p
+            where p.posttypeid = 1 and p.owneruserid = u.id
+            order by p.creationdate desc, p.id desc
+            limit 1
+        ) as last_qscore,
+        (
+            select count(*) from comments c
+            where c.postid = (
+                select p2.id from posts p2
+                where p2.posttypeid = 1 and p2.owneruserid = u.id
+                order by p2.creationdate desc, p2.id desc
+                limit 1
+            )
+        ) as last_q_comment_count
+    from users u
+),
+duplicate_enriched as (
+    select
+        d.dup_post_id,
+        d.canonical_post_id,
+        d.dup_link_count,
+        d.first_dup_link_date,
+        case when exists (
+            select 1 from postlinks pl2
+            where pl2.linktypeid = 3
+              and pl2.postid = d.canonical_post_id
+        ) then 2 else 1 end as dup_chain_degree
+    from duplicate_links d
+),
+activity_span as (
+    select
+        q.id as question_id,
+        q.creationdate as created_at,
+        coalesce(e.last_history_date, q.lastactivitydate, q.creationdate) as last_activity_at,
+        extract(epoch from (coalesce(e.last_history_date, q.lastactivitydate, q.creationdate) - q.creationdate)) / 86400.0 as active_days
+    from posts q
+    left join edits_cte e on e.postid = q.id
+    where q.posttypeid = 1
+),
+close_reasons as (
+    select
+        ph.postid,
+        count(*) as close_events,
+        count(*) filter (
+            where (ph.comment ~ '(^|[^0-9])101([^0-9]|$)' or ph.text ilike '%duplicate%')
+        ) as duplicate_events,
+        count(*) filter (
+            where (ph.comment ~ '(^|[^0-9])102([^0-9]|$)' or ph.text ilike '%off-topic%')
+        ) as offtopic_events
+    from posthistory ph
+    where ph.posthistorytypeid = 10
+    group by ph.postid
+),
+cohort as (
+    select
+        ru.id as user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.country_hint,
+        ru.signup_year,
+        row_number() over (partition by ru.country_hint order by ru.reputation desc, ru.id) as country_rank
+    from recent_users ru
+    where ru.rn <= 5000
+),
+title_features as (
+    select
+        q.id as question_id,
+        char_length(coalesce(q.title, '')) as title_len,
+        char_length(regexp_replace(coalesce(q.title,''), '\s+', '', 'g')) as title_nonspace_len,
+        (char_length(coalesce(q.title,'')) - char_length(replace(coalesce(q.title,''), '?', ''))) as question_marks,
+        (char_length(coalesce(q.title,'')) - char_length(replace(coalesce(q.title,''), '!', ''))) as exclamations,
+        case when coalesce(q.title,'') ~* '\bhow\b|\bwhy\b|\bwhat\b|\bwhere\b|\bwhen\b|\bcan\b|\bis\b' then 1 else 0 end as wh_word_flag
+    from posts q
+    where q.posttypeid = 1
+),
+tag_stats as (
+    select
+        tu.question_id,
+        sum(t.count) as total_tag_usage,
+        max(t.count) as max_tag_popularity,
+        avg(cast(t.count as numeric)) as avg_tag_popularity
+    from tag_unpivot tu
+    left join tags t
+      on lower(t.tagname) = tu.tag
+    group by tu.question_id
+)
+select
+    q.id as question_id,
+    q.owneruserid as owner_user_id,
+    co.displayname as owner_display_name,
+    co.country_hint,
+    oq.quality_quintile,
+    q.creationdate as question_created_at,
+    q.score as question_score,
+    q.viewcount as question_views,
+    coalesce(v.upvotes,0) as upvotes,
+    coalesce(v.downvotes,0) as downvotes,
+    coalesce(v.bounties_started,0) as bounties_started,
+    coalesce(v.bounty_amount_total,0) as bounty_amount_total,
+    coalesce(a.answer_count,0) as answer_count,
+    coalesce(a.max_answer_score,0) as max_answer_score,
+    coalesce(a.avg_answer_score,0) as avg_answer_score,
+    coalesce(ca.comment_count,0) as comment_count,
+    ca.last_comment_date,
+    coalesce(e.edit_events,0) as edit_events,
+    coalesce(e.close_events,0) as close_events,
+    coalesce(e.reopen_events,0) as reopen_events,
+    coalesce(e.delete_undelete_events,0) as delete_undelete_events,
+    ar.active_days,
+    coalesce(cr.duplicate_events,0) as duplicate_close_events,
+    coalesce(cr.offtopic_events,0) as offtopic_close_events,
+    coalesce(h.hot_score,0) as hot_score,
+    rq.hot_rank,
+    rq.user_hot_rank,
+    lt.total_badges,
+    lt.gold_badges,
+    lt.silver_badges,
+    lt.bronze_badges,
+    lt.tag_badges,
+    lt.first_badge_date,
+    lt.last_badge_date,
+    lq.last_qid as last_owner_question_id,
+    lq.last_qscore as last_owner_question_score,
+    lq.last_q_comment_count as last_owner_question_comments,
+    tt.tags_normalized,
+    coalesce(ts.total_tag_usage,0) as total_tag_usage,
+    coalesce(ts.max_tag_popularity,0) as max_tag_popularity,
+    coalesce(ts.avg_tag_popularity,0) as avg_tag_popularity,
+    tf.title_len,
+    tf.title_nonspace_len,
+    tf.question_marks,
+    tf.exclamations,
+    tf.wh_word_flag,
+    coalesce(de.dup_chain_degree,0) as duplicate_chain_degree,
+    case
+        when q.acceptedanswerid is not null then 1
+        when exists (
+            select 1 from posts a2
+            where a2.parentid = q.id and a2.score >= 1
+        ) then 1
+        else 0
+    end as has_solution_signal,
+    case
+        when q.closeddate is not null then 'Closed'
+        when coalesce(a.answer_count,0) = 0 and (timestamp '2024-10-01 12:34:56' - q.creationdate) > interval '365 days' then 'Stale'
+        when coalesce(a.answer_count,0) > 0 and q.acceptedanswerid is null then 'Answered-Unaccepted'
+        when q.acceptedanswerid is not null then 'Accepted'
+        else 'Open'
+    end as lifecycle_status,
+    case
+        when coalesce(v.upvotes,0) >= 10 and coalesce(a.answer_count,0) >= 2 and tf.title_len between 15 and 120 then 1
+        when coalesce(v.upvotes,0) - coalesce(v.downvotes,0) >= 5 and coalesce(ts.avg_tag_popularity,0) > 1000 then 1
+        when rq.hot_rank <= 100 then 1
+        else 0
+    end as high_interest_flag
+from posts q
+left join answer_stats a on a.question_id = q.id
+left join comment_activity ca on ca.postid = q.id
+left join edits_cte e on e.postid = q.id
+left join question_votes v on v.postid = q.id
+left join hotness h on h.question_id = q.id
+left join ranked_questions rq on rq.question_id = q.id
+left join activity_span ar on ar.question_id = q.id
+left join duplicate_enriched de on de.dup_post_id = q.id
+left join close_reasons cr on cr.postid = q.id
+left join title_features tf on tf.question_id = q.id
+left join top_tags tt on tt.question_id = q.id
+left join tag_stats ts on ts.question_id = q.id
+left join users u on u.id = q.owneruserid
+left join cohort co on co.user_id = q.owneruserid and co.country_rank <= 50
+left join owner_quality_bucket oq on oq.user_id = q.owneruserid
+left join user_badge_rollup lt on lt.userid = q.owneruserid
+left join last_user_question lq on lq.user_id = q.owneruserid
+where q.posttypeid = 1
+  and (
+    q.creationdate >= timestamp '2024-10-01 12:34:56' - interval '3 years'
+    or coalesce(v.upvotes,0) >= 50
+    or rq.hot_rank <= 1000
+  )
+  and (
+    tt.tag_count is null
+    or tt.tag_count between 1 and 7
+  )
+  and (
+    q.title is not null
+    and btrim(q.title) <> ''
+  )
+order by
+    high_interest_flag desc,
+    rq.hot_rank nulls last,
+    coalesce(h.hot_score,0) desc,
+    q.viewcount desc,
+    q.score desc,
+    q.id
+limit 1000;

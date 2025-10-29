@@ -1,0 +1,303 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           date_trunc('month', u.creationdate) as cohort_month,
+           lead(u.lastaccessdate) over (order by u.id) as next_user_last_access
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+user_posts as (
+    select p.owneruserid as user_id,
+           p.id as post_id,
+           p.posttypeid,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.favoritecount,
+           p.commentcount,
+           p.tags,
+           p.title,
+           coalesce(p.answercount, 0) as answercount,
+           case when p.closeddate is not null then 1 else 0 end as is_closed,
+           coalesce(p.acceptedanswerid, -1) as acceptedanswerid
+    from posts p
+    where p.owneruserid is not null
+      and p.owneruserid > 0
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+user_activity as (
+    select up.user_id,
+           count(*) filter (where up.posttypeid = 1) as q_count,
+           count(*) filter (where up.posttypeid = 2) as a_count,
+           avg(nullif(up.score, 0)) as avg_nonzero_score,
+           sum(greatest(up.viewcount, 0)) as total_views,
+           sum(up.favoritecount) as total_favs,
+           sum(up.commentcount) as total_comments,
+           sum(up.answercount) as total_answers_on_questions,
+           sum(up.is_closed) as closed_qs,
+           max(up.creationdate) as last_post_date
+    from user_posts up
+    group by up.user_id
+),
+votes_agg as (
+    select v.postid,
+           count(*) filter (where v.votetypeid = 2) as upvotes,
+           count(*) filter (where v.votetypeid = 3) as downvotes,
+           count(*) filter (where v.votetypeid = 8) as bounties_started,
+           count(*) filter (where v.votetypeid = 9) as bounties_awarded,
+           sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_amount_total
+    from votes v
+    where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by v.postid
+),
+postlinks_agg as (
+    select pl.postid,
+           count(*) filter (where pl.linktypeid = 1) as linked_count,
+           count(*) filter (where pl.linktypeid = 3) as duplicate_count
+    from postlinks pl
+    where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by pl.postid
+),
+tag_exploded as (
+    select up.user_id,
+           unnest(string_to_array(nullif(substring(up.tags, 2, greatest(length(up.tags)-2,0)), ''), '><')) as tag
+    from user_posts up
+    where up.posttypeid = 1
+      and up.tags is not null
+      and up.tags like '<%>'
+),
+top_tags as (
+    select te.user_id,
+           t.tagname,
+           row_number() over (partition by te.user_id order by sum(t.count) desc nulls last, te.user_id) as rn,
+           sum(t.count) as tag_popularity_proxy
+    from tag_exploded te
+    join tags t on lower(t.tagname) = lower(te.tag)
+    group by te.user_id, t.tagname
+),
+user_top3_tags as (
+    select user_id,
+           string_agg(tagname, ', ' order by rn) as top_3_tags
+    from top_tags
+    where rn <= 3
+    group by user_id
+),
+comments_agg as (
+    select c.userid as user_id,
+           count(*) as comment_count,
+           avg(c.score) as avg_comment_score,
+           max(c.creationdate) as last_comment_date,
+           count(*) filter (where position('thanks' in lower(c.text)) > 0) as thanked_comments,
+           count(*) filter (where c.text is null or btrim(c.text) = '') as empty_comments
+    from comments c
+    where c.userid is not null
+      and c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by c.userid
+),
+badges_agg as (
+    select b.userid as user_id,
+           count(*) as total_badges,
+           count(*) filter (where b.class = 1) as gold_badges,
+           count(*) filter (where b.class = 2) as silver_badges,
+           count(*) filter (where b.class = 3) as bronze_badges,
+           count(*) filter (where b.tagbased = true) as tag_badges,
+           min(b.date) as first_badge_date,
+           max(b.date) as last_badge_date
+    from badges b
+    where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by b.userid
+),
+question_quality as (
+    select up.user_id,
+           count(*) as questions,
+           avg(up.score) as avg_q_score,
+           avg(coalesce(va.upvotes - va.downvotes, 0)) as avg_q_net_votes,
+           sum(case when coalesce(va.upvotes - va.downvotes,0) >= 5 then 1 else 0 end) as high_vote_qs,
+           sum(case when coalesce(pl.duplicate_count,0) > 0 then 1 else 0 end) as dup_marked_qs,
+           sum(case when up.acceptedanswerid > 0 then 1 else 0 end) as accepted_qs
+    from user_posts up
+    left join votes_agg va on va.postid = up.post_id
+    left join postlinks_agg pl on pl.postid = up.post_id
+    where up.posttypeid = 1
+    group by up.user_id
+),
+answer_quality as (
+    select up.user_id,
+           count(*) as answers,
+           avg(up.score) as avg_a_score,
+           avg(coalesce(va.upvotes - va.downvotes, 0)) as avg_a_net_votes,
+           sum(case when coalesce(va.upvotes - va.downvotes,0) >= 5 then 1 else 0 end) as high_vote_as
+    from user_posts up
+    left join votes_agg va on va.postid = up.post_id
+    where up.posttypeid = 2
+    group by up.user_id
+),
+posthistory_flags as (
+    select ph.postid,
+           count(*) filter (where ph.posthistorytypeid in (10,11)) as close_reopen_events,
+           count(*) filter (where ph.posthistorytypeid in (12,13)) as delete_restore_events,
+           count(*) filter (where ph.posthistorytypeid in (14,15)) as lock_unlock_events,
+           count(*) filter (where ph.posthistorytypeid in (50)) as community_bumps,
+           min(ph.creationdate) as first_event_date,
+           max(ph.creationdate) as last_event_date
+    from posthistory ph
+    where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by ph.postid
+),
+user_moderation_impact as (
+    select up.user_id,
+           sum(phf.close_reopen_events) as total_close_reopen,
+           sum(phf.delete_restore_events) as total_delete_restore,
+           sum(phf.lock_unlock_events) as total_lock_unlock,
+           sum(phf.community_bumps) as total_community_bumps
+    from user_posts up
+    join posthistory_flags phf on phf.postid = up.post_id
+    group by up.user_id
+),
+normalized_metrics as (
+    select ru.user_id,
+           ru.displayname,
+           ru.reputation,
+           ru.cohort_month,
+           ua.q_count,
+           ua.a_count,
+           ua.total_views,
+           ua.total_favs,
+           ua.total_comments,
+           ua.total_answers_on_questions,
+           ua.closed_qs,
+           qa.questions,
+           qa.avg_q_score,
+           qa.avg_q_net_votes,
+           qa.high_vote_qs,
+           qa.dup_marked_qs,
+           qa.accepted_qs,
+           aq.answers,
+           aq.avg_a_score,
+           aq.avg_a_net_votes,
+           aq.high_vote_as,
+           coalesce(ca.comment_count,0) as comment_count,
+           ca.avg_comment_score,
+           ca.last_comment_date,
+           coalesce(ca.thanked_comments,0) as thanked_comments,
+           coalesce(ca.empty_comments,0) as empty_comments,
+           coalesce(ba.total_badges,0) as total_badges,
+           coalesce(ba.gold_badges,0) as gold_badges,
+           coalesce(ba.silver_badges,0) as silver_badges,
+           coalesce(ba.bronze_badges,0) as bronze_badges,
+           coalesce(ba.tag_badges,0) as tag_badges,
+           ba.first_badge_date,
+           ba.last_badge_date,
+           coalesce(umi.total_close_reopen,0) as total_close_reopen,
+           coalesce(umi.total_delete_restore,0) as total_delete_restore,
+           coalesce(umi.total_lock_unlock,0) as total_lock_unlock,
+           coalesce(umi.total_community_bumps,0) as total_community_bumps,
+           utt.top_3_tags,
+           ua.last_post_date,
+           ru.next_user_last_access
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join question_quality qa on qa.user_id = ru.user_id
+    left join answer_quality aq on aq.user_id = ru.user_id
+    left join comments_agg ca on ca.user_id = ru.user_id
+    left join badges_agg ba on ba.user_id = ru.user_id
+    left join user_moderation_impact umi on umi.user_id = ru.user_id
+    left join user_top3_tags utt on utt.user_id = ru.user_id
+),
+ranked as (
+    select nm.*,
+           (coalesce(qa.high_vote_qs,0) + coalesce(aq.high_vote_as,0)) as high_vote_posts,
+           case
+               when (coalesce(qa.questions,0) + coalesce(aq.answers,0)) = 0 then null
+               else round((coalesce(qa.high_vote_qs,0) + coalesce(aq.high_vote_as,0))::numeric / nullif((coalesce(qa.questions,0) + coalesce(aq.answers,0)),0), 4)
+           end as high_vote_rate,
+           dense_rank() over (partition by nm.cohort_month order by nm.reputation desc, nm.total_badges desc nulls last) as rep_rank_in_cohort,
+           percent_rank() over (order by coalesce(nm.total_views,0) + coalesce(nm.total_favs,0) desc) as engagement_percentile,
+           row_number() over (order by
+               (coalesce(nm.gold_badges,0)*3 + coalesce(nm.silver_badges,0)*2 + coalesce(nm.bronze_badges,0)) desc,
+               nm.reputation desc
+           ) as badge_power_rank
+    from normalized_metrics nm
+    left join question_quality qa on qa.user_id = nm.user_id
+    left join answer_quality aq on aq.user_id = nm.user_id
+),
+bench_union as (
+    select user_id, 'high_rep' as bucket
+    from ranked
+    where reputation >= (select percentile_cont(0.9) within group (order by reputation) from ranked)
+    union all
+    select user_id, 'mid_rep' as bucket
+    from ranked
+    where reputation between (select percentile_cont(0.5) within group (order by reputation) from ranked)
+                        and (select percentile_cont(0.9) within group (order by reputation) from ranked)
+    union all
+    select user_id, 'low_rep' as bucket
+    from ranked
+    where reputation < (select percentile_cont(0.5) within group (order by reputation) from ranked)
+),
+final_select as (
+    select r.user_id,
+           r.displayname,
+           r.cohort_month,
+           r.reputation,
+           r.rep_rank_in_cohort,
+           r.badge_power_rank,
+           r.engagement_percentile,
+           r.q_count,
+           r.a_count,
+           r.questions,
+           r.answers,
+           r.avg_q_score,
+           r.avg_a_score,
+           r.high_vote_posts,
+           r.high_vote_rate,
+           r.total_views,
+           r.total_favs,
+           r.total_comments,
+           r.total_close_reopen,
+           r.total_delete_restore,
+           r.total_lock_unlock,
+           r.total_community_bumps,
+           r.top_3_tags,
+           r.last_post_date,
+           r.next_user_last_access,
+           bu.bucket as rep_bucket
+    from ranked r
+    left join bench_union bu on bu.user_id = r.user_id
+)
+select fs.*
+from final_select fs
+left join users u on u.id = fs.user_id
+left join lateral (
+    select avg(len) as avg_title_len
+    from (
+        select length(coalesce(p.title,'')) as len
+        from posts p
+        where p.owneruserid = fs.user_id
+        order by p.creationdate desc
+        limit 50
+    ) s
+) ttl on true
+where (
+        fs.reputation > 0
+        and coalesce(fs.questions,0) + coalesce(fs.answers,0) > 0
+      )
+  and not (u.websiteurl is null and u.location is null)
+  and coalesce(ttl.avg_title_len, 0) >= 10
+  and exists (
+        select 1
+        from posts p2
+        where p2.owneruserid = fs.user_id
+          and p2.posttypeid in (1,2)
+          and p2.score >= all (
+              select coalesce(score, -2147483648)
+              from posts
+              where owneruserid = fs.user_id
+                and posttypeid in (1,2)
+          )
+    )
+order by fs.badge_power_rank nulls last, fs.rep_rank_in_cohort, fs.user_id
+limit 500;

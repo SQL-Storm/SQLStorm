@@ -1,0 +1,323 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as avg_score_3_posts,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as view_rank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+      AND p.CreationDate >= CAST('2020-01-01' AS timestamp)
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as post_count,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        MAX(p.CreationDate) as last_post_date,
+        STRING_AGG(DISTINCT p.Title, ' | ') as post_titles,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answer_count,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Tags END, '; ') as all_tags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= CAST('2018-01-01' AS timestamp)
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'High'
+            WHEN t.Count > 100 THEN 'Medium'
+            ELSE 'Low'
+        END as popularity_level,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as popularity_rank,
+        AVG(t.Count) OVER () as avg_tag_count
+    FROM Tags t
+    WHERE t.Count > 0
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        rp.Id as PostId,
+        rp.Title,
+        rp.Tags,
+        rp.Score,
+        rp.ViewCount,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.OwnerUserId,
+        rp.CreationDate,
+        rp.view_rank,
+        rp.prev_score,
+        rp.avg_score_3_posts,
+        CASE 
+            WHEN rp.Score > 100 THEN 'High'
+            WHEN rp.Score > 20 THEN 'Medium'
+            ELSE 'Low'
+        END as score_category,
+        CASE 
+            WHEN rp.AnswerCount > 0 THEN CAST(rp.AnswerCount AS DECIMAL) / NULLIF(rp.ViewCount, 0)
+            ELSE NULL
+        END as answer_to_view_ratio,
+        CAST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - rp.CreationDate)) / 86400 AS INTEGER) as days_since_creation,
+        CASE 
+            WHEN (rp.Score * 1.0 / NULLIF(rp.ViewCount, 0)) > 0.1 THEN 'High Engagement'
+            ELSE 'Normal Engagement'
+        END as engagement_level,
+        COALESCE(rp.prev_score, 0) - COALESCE(rp.avg_score_3_posts, 0) as score_deviation,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM Comments c 
+                WHERE c.PostId = rp.Id AND c.UserId IS NOT NULL
+            ) THEN 'Has Comments'
+            ELSE 'No Comments'
+        END as comment_status,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM Votes v 
+                WHERE v.PostId = rp.Id AND v.VoteTypeId = 2
+            ) THEN 1
+            ELSE 0
+        END as has_upvotes,
+        STRING_AGG(DISTINCT b.Name, ', ') as badge_names
+    FROM RankedPosts rp
+    LEFT JOIN Badges b ON b.UserId = rp.OwnerUserId
+    WHERE rp.rn = 1 
+      AND rp.PostTypeId = 1
+    GROUP BY 
+        rp.Id, rp.Title, rp.Tags, rp.Score, rp.ViewCount, rp.AnswerCount, 
+        rp.CommentCount, rp.FavoriteCount, rp.OwnerUserId, rp.CreationDate, 
+        rp.view_rank, rp.prev_score, rp.avg_score_3_posts
+)
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    pa.PostId,
+    pa.Title,
+    pa.Tags,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.CreationDate,
+    pa.score_category,
+    pa.answer_to_view_ratio,
+    pa.days_since_creation,
+    pa.engagement_level,
+    pa.score_deviation,
+    pa.comment_status,
+    pa.has_upvotes,
+    pa.badge_names,
+    ta.TagName,
+    ta.Count as TagCount,
+    ta.popularity_level,
+    ta.popularity_rank,
+    CASE 
+        WHEN u.Reputation > 10000 AND u.Views > 1000 THEN 'Elite User'
+        WHEN u.Reputation > 1000 AND u.Views > 100 THEN 'Moderate User'
+        ELSE 'Regular User'
+    END as user_category,
+    CASE 
+        WHEN pa.Score > 50 AND pa.ViewCount > 1000 THEN 'Trending Post'
+        WHEN pa.Score > 20 AND pa.ViewCount > 100 THEN 'Popular Post'
+        ELSE 'Regular Post'
+    END as post_category,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.UserId AND p.PostTypeId = 1) as user_question_count,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.UserId AND p.PostTypeId = 2) as user_answer_count,
+    DENSE_RANK() OVER (ORDER BY pa.Score DESC) as post_rank_score,
+    DENSE_RANK() OVER (ORDER BY pa.ViewCount DESC) as post_rank_views,
+    NTILE(4) OVER (ORDER BY pa.Score) as score_quartile,
+    AVG(pa.Score) OVER (PARTITION BY u.UserId) as user_avg_score,
+    MAX(pa.Score) OVER (PARTITION BY u.UserId) as user_max_score,
+    STRING_AGG(DISTINCT CASE WHEN pa.Score > 0 THEN ta.TagName END, ', ') as positive_tag_list,
+    (
+        SELECT STRING_AGG(vt_count, ', ')
+        FROM (
+            SELECT vt.Name || ':' || COUNT(*) as vt_count
+            FROM Votes v
+            JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+            WHERE v.PostId = pa.PostId
+            GROUP BY vt.Name
+        ) sub
+    ) as vote_breakdown
+FROM UserStats u
+INNER JOIN ComplexPostAnalysis pa ON u.UserId = pa.OwnerUserId
+LEFT JOIN TagAnalysis ta ON pa.Tags LIKE '%' || ta.TagName || '%'
+WHERE 
+    u.post_count > 0
+    AND (pa.Score > 0 OR pa.ViewCount > 0)
+    AND (
+        ta.Count > (
+            SELECT AVG(t.Count) FROM TagAnalysis t
+        ) 
+        OR ta.TagName IS NULL
+    )
+    AND EXISTS (
+        SELECT 1 FROM Posts p 
+        WHERE p.OwnerUserId = u.UserId 
+        AND p.PostTypeId = 1
+        AND p.CreationDate >= CAST('2020-01-01' AS timestamp)
+    )
+    AND (
+        pa.engagement_level IN ('High Engagement', 'Normal Engagement')
+        OR pa.engagement_level IS NULL
+    )
+GROUP BY 
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.UserId,
+    pa.PostId,
+    pa.Title,
+    pa.Tags,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.CreationDate,
+    pa.score_category,
+    pa.answer_to_view_ratio,
+    pa.days_since_creation,
+    pa.engagement_level,
+    pa.score_deviation,
+    pa.comment_status,
+    pa.has_upvotes,
+    pa.badge_names,
+    ta.TagName,
+    ta.Count,
+    ta.popularity_level,
+    ta.popularity_rank
+HAVING 
+    COUNT(pa.PostId) > 0
+    AND (
+        (pa.Score > 10 OR pa.ViewCount > 100)
+        OR (ta.Count > 50 OR ta.TagName IS NULL)
+    )
+EXCEPT
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    pa.PostId,
+    pa.Title,
+    pa.Tags,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.CreationDate,
+    pa.score_category,
+    pa.answer_to_view_ratio,
+    pa.days_since_creation,
+    pa.engagement_level,
+    pa.score_deviation,
+    pa.comment_status,
+    pa.has_upvotes,
+    pa.badge_names,
+    ta.TagName,
+    ta.Count as TagCount,
+    ta.popularity_level,
+    ta.popularity_rank,
+    CASE 
+        WHEN u.Reputation > 10000 AND u.Views > 1000 THEN 'Elite User'
+        WHEN u.Reputation > 1000 AND u.Views > 100 THEN 'Moderate User'
+        ELSE 'Regular User'
+    END as user_category,
+    CASE 
+        WHEN pa.Score > 50 AND pa.ViewCount > 1000 THEN 'Trending Post'
+        WHEN pa.Score > 20 AND pa.ViewCount > 100 THEN 'Popular Post'
+        ELSE 'Regular Post'
+    END as post_category,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.UserId AND p.PostTypeId = 1) as user_question_count,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.UserId AND p.PostTypeId = 2) as user_answer_count,
+    DENSE_RANK() OVER (ORDER BY pa.Score DESC) as post_rank_score,
+    DENSE_RANK() OVER (ORDER BY pa.ViewCount DESC) as post_rank_views,
+    NTILE(4) OVER (ORDER BY pa.Score) as score_quartile,
+    AVG(pa.Score) OVER (PARTITION BY u.UserId) as user_avg_score,
+    MAX(pa.Score) OVER (PARTITION BY u.UserId) as user_max_score,
+    STRING_AGG(DISTINCT CASE WHEN pa.Score > 0 THEN ta.TagName END, ', ') as positive_tag_list,
+    (
+        SELECT STRING_AGG(vt_count, ', ')
+        FROM (
+            SELECT vt.Name || ':' || COUNT(*) as vt_count
+            FROM Votes v
+            JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+            WHERE v.PostId = pa.PostId
+            GROUP BY vt.Name
+        ) sub
+    ) as vote_breakdown
+FROM UserStats u
+INNER JOIN ComplexPostAnalysis pa ON u.UserId = pa.OwnerUserId
+LEFT JOIN TagAnalysis ta ON pa.Tags LIKE '%' || ta.TagName || '%'
+WHERE 
+    u.post_count > 0
+    AND pa.Score < 0 
+    AND u.Reputation < 1000
+    AND ta.Count < 10
+    AND pa.engagement_level = 'Normal Engagement'
+GROUP BY 
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.UserId,
+    pa.PostId,
+    pa.Title,
+    pa.Tags,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.CreationDate,
+    pa.score_category,
+    pa.answer_to_view_ratio,
+    pa.days_since_creation,
+    pa.engagement_level,
+    pa.score_deviation,
+    pa.comment_status,
+    pa.has_upvotes,
+    pa.badge_names,
+    ta.TagName,
+    ta.Count,
+    ta.popularity_level,
+    ta.popularity_rank
+ORDER BY 
+    pa.Score DESC,
+    u.Reputation DESC,
+    pa.ViewCount DESC,
+    pa.days_since_creation ASC;

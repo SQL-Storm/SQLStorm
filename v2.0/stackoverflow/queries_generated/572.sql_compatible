@@ -1,0 +1,333 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl,
+        row_number() over (order by u.creationdate desc, u.id desc) as rn
+    from users u
+    where u.creationdate >= (
+        select date_trunc('month', max(creationdate)) - interval '12 months' from users
+    )
+),
+questions as (
+    select
+        p.id,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.title,
+        p.tags,
+        p.closeddate,
+        p.acceptedanswerid
+    from posts p
+    where p.posttypeid = 1
+),
+answers as (
+    select
+        a.id,
+        a.parentid as question_id,
+        a.owneruserid as answerer_id,
+        a.creationdate,
+        a.score
+    from posts a
+    where a.posttypeid = 2
+),
+tag_unpivot as (
+    select
+        q.id as question_id,
+        lower(trim(tg)) as tag
+    from questions q,
+    lateral (
+      select unnest(string_to_array(substring(q.tags, 2, char_length(q.tags)-2), '><')) as tg
+    ) u
+),
+user_badges as (
+    select
+        b.userid,
+        count(*) as total_badges,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_activity as (
+    select
+        q.id as question_id,
+        q.owneruserid as asker_id,
+        q.creationdate as q_created,
+        q.score as q_score,
+        q.viewcount,
+        q.answercount,
+        q.title,
+        q.closeddate,
+        q.acceptedanswerid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        count(distinct c.id) as comment_count,
+        count(distinct a.id) as actual_answer_count,
+        min(a.creationdate) filter (where a.id is not null) as first_answer_time
+    from questions q
+    left join votes v on v.postid = q.id
+    left join comments c on c.postid = q.id
+    left join answers a on a.question_id = q.id
+    group by q.id, q.owneruserid, q.creationdate, q.score, q.viewcount, q.answercount, q.title, q.closeddate, q.acceptedanswerid
+),
+accepted_answer_stats as (
+    select
+        q.question_id,
+        a.id as accepted_answer_id,
+        a.answerer_id,
+        a.creationdate as accepted_time,
+        a.score as accepted_score
+    from question_activity q
+    left join answers a on a.id = q.acceptedanswerid
+),
+tag_stats as (
+    select
+        t.tag,
+        count(*) as tag_question_count,
+        avg(cast(qa.q_score as numeric)) as avg_q_score,
+        percentile_disc(0.9) within group (order by qa.viewcount) as p90_views
+    from tag_unpivot t
+    join question_activity qa on qa.question_id = t.question_id
+    group by t.tag
+),
+user_posting as (
+    select
+        u.id as user_id,
+        sum(case when p.posttypeid = 1 then 1 else 0 end) as questions_posted,
+        sum(case when p.posttypeid = 2 then 1 else 0 end) as answers_posted,
+        sum(case when p.posttypeid in (1,2) then p.score else 0 end) as total_post_score,
+        avg(nullif(p.score, 0)) filter (where p.posttypeid in (1,2)) as avg_nonzero_score
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+hot_network_events as (
+    select
+        ph.postid as question_id,
+        min(ph.creationdate) as first_hot,
+        max(ph.creationdate) as last_hot,
+        count(*) as hot_events
+    from posthistory ph
+    where ph.posthistorytypeid in (52, 53)
+    group by ph.postid
+),
+duplicate_links as (
+    select
+        pl.postid as dup_post_id,
+        pl.relatedpostid as original_post_id,
+        min(pl.creationdate) as first_dup_link_time,
+        count(*) as dup_links
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+recent_activity_window as (
+    select
+        qa.question_id,
+        qa.asker_id,
+        qa.q_created,
+        qa.q_score,
+        qa.viewcount,
+        qa.answercount,
+        qa.title,
+        qa.closeddate,
+        qa.upvotes,
+        qa.downvotes,
+        qa.favorites,
+        qa.comment_count,
+        qa.actual_answer_count,
+        qa.first_answer_time,
+        a2.accepted_answer_id,
+        a2.answerer_id as accepted_answerer_id,
+        a2.accepted_time,
+        a2.accepted_score,
+        hne.first_hot,
+        hne.hot_events,
+        dl.original_post_id,
+        ts.tag,
+        ts.tag_question_count,
+        ts.avg_q_score,
+        ts.p90_views,
+        row_number() over (partition by qa.asker_id order by qa.q_created desc, qa.question_id desc) as rn_by_asker,
+        rank() over (order by coalesce(qa.upvotes - qa.downvotes, 0) desc, qa.viewcount desc) as global_popularity_rank
+    from question_activity qa
+    left join accepted_answer_stats a2 on a2.question_id = qa.question_id
+    left join hot_network_events hne on hne.question_id = qa.question_id
+    left join duplicate_links dl on dl.dup_post_id = qa.question_id
+    left join lateral (
+        select t.tag, ts.tag_question_count, ts.avg_q_score, ts.p90_views
+        from tag_unpivot t
+        join tag_stats ts on ts.tag = t.tag
+        where t.question_id = qa.question_id
+        order by ts.tag_question_count desc, ts.avg_q_score desc
+        limit 1
+    ) ts on true
+),
+user_enriched as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.creationdate,
+        ru.location,
+        ru.websiteurl,
+        up.questions_posted,
+        up.answers_posted,
+        up.total_post_score,
+        up.avg_nonzero_score,
+        ub.total_badges,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        ub.last_badge_date,
+        coalesce(ru.rn, 0) as recent_rank
+    from recent_users ru
+    left join user_posting up on up.user_id = ru.user_id
+    left join user_badges ub on ub.userid = ru.user_id
+),
+quality_flags as (
+    select
+        raw.question_id,
+        (raw.q_score >= 5 and raw.viewcount >= coalesce(raw.p90_views, 0)) as is_high_impact,
+        (raw.accepted_answer_id is not null and raw.accepted_score >= 0) as is_answered_accept,
+        (raw.closeddate is not null) as is_closed,
+        (raw.hot_events >= 1) as was_hot,
+        (raw.original_post_id is not null) as is_marked_duplicate
+    from recent_activity_window raw
+),
+user_question_rollup as (
+    select
+        rew.asker_id as user_id,
+        count(*) as q_count,
+        sum(case when qf.is_high_impact then 1 else 0 end) as high_impact_q,
+        sum(case when qf.is_answered_accept then 1 else 0 end) as accepted_q,
+        sum(case when qf.is_closed then 1 else 0 end) as closed_q,
+        sum(case when qf.was_hot then 1 else 0 end) as hot_q,
+        sum(case when qf.is_marked_duplicate then 1 else 0 end) as dup_q,
+        avg(cast(rew.q_score as numeric)) as avg_q_score,
+        percentile_disc(0.5) within group (order by rew.viewcount) as p50_views
+    from recent_activity_window rew
+    join quality_flags qf on qf.question_id = rew.question_id
+    group by rew.asker_id
+),
+final_candidates as (
+    select
+        ue.user_id,
+        ue.displayname,
+        ue.reputation,
+        ue.location,
+        ue.websiteurl,
+        coalesce(uqr.q_count, 0) as q_count,
+        coalesce(uqr.high_impact_q, 0) as high_impact_q,
+        coalesce(uqr.accepted_q, 0) as accepted_q,
+        coalesce(uqr.closed_q, 0) as closed_q,
+        coalesce(uqr.hot_q, 0) as hot_q,
+        coalesce(uqr.dup_q, 0) as dup_q,
+        coalesce(uqr.avg_q_score, 0) as avg_q_score,
+        coalesce(uqr.p50_views, 0) as p50_views,
+        ue.questions_posted,
+        ue.answers_posted,
+        ue.total_post_score,
+        ue.avg_nonzero_score,
+        ue.total_badges,
+        ue.gold_badges,
+        ue.silver_badges,
+        ue.bronze_badges,
+        ue.last_badge_date,
+        ue.recent_rank,
+        case
+            when coalesce(uqr.q_count,0) = 0 then null
+            else (coalesce(uqr.high_impact_q,0)::numeric / nullif(uqr.q_count,0))
+        end as high_impact_ratio,
+        case
+            when coalesce(uqr.q_count,0) = 0 then null
+            else (coalesce(uqr.accepted_q,0)::numeric / nullif(uqr.q_count,0))
+        end as accepted_ratio
+    from user_enriched ue
+    left join user_question_rollup uqr on uqr.user_id = ue.user_id
+),
+top_k as (
+    select
+        fc.*,
+        dense_rank() over (
+            order by
+                coalesce(fc.high_impact_ratio, 0) desc,
+                coalesce(fc.accepted_ratio, 0) desc,
+                fc.reputation desc,
+                coalesce(fc.total_post_score, 0) desc,
+                fc.total_badges desc
+        ) as drnk
+    from final_candidates fc
+    where
+        (coalesce(fc.q_count,0) + coalesce(fc.answers_posted,0)) > 0
+        and (fc.location is null or position('remote' in lower(fc.location)) = 0)
+        and (fc.websiteurl is null or lower(fc.websiteurl) not like '%example.%')
+)
+select
+    tk.user_id,
+    tk.displayname,
+    tk.reputation,
+    tk.questions_posted,
+    tk.answers_posted,
+    tk.q_count,
+    tk.high_impact_q,
+    tk.accepted_q,
+    tk.closed_q,
+    tk.hot_q,
+    tk.dup_q,
+    tk.avg_q_score,
+    tk.p50_views,
+    tk.high_impact_ratio,
+    tk.accepted_ratio,
+    tk.total_badges,
+    tk.gold_badges,
+    tk.silver_badges,
+    tk.bronze_badges,
+    tk.total_post_score,
+    tk.avg_nonzero_score,
+    tk.websiteurl,
+    tk.location,
+    tk.last_badge_date,
+    array(
+        select distinct ts.tag
+        from recent_activity_window rew
+        join tag_unpivot tu on tu.question_id = rew.question_id
+        join tag_stats ts on ts.tag = tu.tag
+        where rew.asker_id = tk.user_id
+        order by ts.tag_question_count desc, ts.avg_q_score desc
+        limit 5
+    ) as top_tags,
+    (
+        select jsonb_agg(x order by x.global_popularity_rank)
+        from (
+            select
+                rew.question_id,
+                coalesce(rew.title, '(no title)') as title,
+                rew.q_score,
+                rew.viewcount,
+                rew.upvotes,
+                rew.downvotes,
+                rew.favorites,
+                rew.accepted_answer_id,
+                rew.accepted_score,
+                rew.tag,
+                rew.global_popularity_rank
+            from recent_activity_window rew
+            where rew.asker_id = tk.user_id
+            order by rew.global_popularity_rank
+            limit 10
+        ) x
+    ) as sample_questions
+from top_k tk
+where tk.drnk <= 50
+order by tk.drnk, tk.user_id;

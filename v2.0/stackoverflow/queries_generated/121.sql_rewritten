@@ -1,0 +1,297 @@
+-- {"query": "121.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3019} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           coalesce(nullif(trim(split_part(coalesce(u.websiteurl,''), '/', 3)),''), 'unknown.host') as website_host,
+           row_number() over (order by u.creationdate desc, u.id desc) as rn
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+user_activity as (
+    select
+        u.user_id,
+        count(distinct p.id) filter (where p.posttypeid in (1,2)) as total_posts,
+        count(distinct p.id) filter (where p.posttypeid = 1) as questions,
+        count(distinct p.id) filter (where p.posttypeid = 2) as answers,
+        sum(greatest(p.score,0)) as nonneg_score_sum,
+        avg(nullif(p.viewcount,0)) as avg_views_nonzero,
+        max(p.creationdate) as last_post_date,
+        sum(case when p.closeddate is not null then 1 else 0 end) as closed_posts,
+        sum(case when p.communityowneddate is not null then 1 else 0 end) as community_owned,
+        sum(case when p.acceptedanswerid is not null then 1 else 0 end) as questions_with_accept
+    from recent_users u
+    left join posts p
+      on p.owneruserid = u.user_id
+    group by u.user_id
+),
+answer_accept_rate as (
+    -- accepted answers authored by user relative to their answers
+    select
+        u.user_id,
+        count(*) filter (where q.acceptedanswerid = a.id) as accepted_answers_by_user,
+        count(*) as total_answers_by_user
+    from recent_users u
+    left join posts a
+      on a.owneruserid = u.user_id
+     and a.posttypeid = 2
+    left join posts q
+      on q.id = a.parentid
+     and q.posttypeid = 1
+    group by u.user_id
+),
+comment_stats as (
+    select
+        u.user_id,
+        count(c.id) as comments_count,
+        coalesce(sum(c.score),0) as comment_score_sum,
+        max(c.creationdate) as last_comment_date,
+        percentile_cont(0.9) within group (order by c.score) as p90_comment_score
+    from recent_users u
+    left join comments c
+      on c.userid = u.user_id
+    group by u.user_id
+),
+badge_rollup as (
+    select
+        u.user_id,
+        count(b.id) as total_badges,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where b.tagbased = 1) as tag_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from recent_users u
+    left join badges b
+      on b.userid = u.user_id
+    group by u.user_id
+),
+vote_agg as (
+    select
+        u.user_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+        count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+        count(*) filter (where v.votetypeid = 5) as favorites_cast,
+        count(*) filter (where v.votetypeid in (8,9)) as bounty_events,
+        sum(coalesce(v.bountyamount,0)) as bounty_amount_total,
+        max(v.creationdate) as last_vote_date
+    from recent_users u
+    left join votes v
+      on v.userid = u.user_id
+    group by u.user_id
+),
+postvote_received as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_received,
+        count(*) filter (where v.votetypeid = 3) as downvotes_received
+    from posts p
+    left join votes v
+      on v.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+linkage as (
+    select
+        u.user_id,
+        count(*) filter (where pl.linktypeid = 1) as linked_refs,
+        count(*) filter (where pl.linktypeid = 3 and q.posttypeid = 1) as duplicate_marks_out,
+        count(*) filter (where pl.linktypeid = 3 and q.posttypeid = 1 and q.owneruserid = u.user_id) as self_dup_marks_out,
+        count(*) filter (where pl.linktypeid = 3 and r.posttypeid = 1 and r.owneruserid = u.user_id) as duplicates_of_their_questions
+    from recent_users u
+    left join posts q
+      on q.owneruserid = u.user_id
+    left join postlinks pl
+      on pl.postid = q.id
+    left join posts r
+      on r.id = pl.relatedpostid
+    group by u.user_id
+),
+edits_cte as (
+    select
+        u.user_id,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edits_made,
+        count(*) filter (where ph.posthistorytypeid = 24) as suggested_edits_applied,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_votes_events,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+        count(*) filter (where ph.posthistorytypeid in (35,36)) as migration_events,
+        max(ph.creationdate) as last_edit_event
+    from recent_users u
+    left join posthistory ph
+      on ph.userid = u.user_id
+    group by u.user_id
+),
+tags_exploded as (
+    select
+        p.owneruserid as user_id,
+        lower(trim(tg)) as tagname
+    from posts p
+    cross join lateral unnest(
+        case
+            when p.tags is null then array[]::varchar[]
+            else string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+        end
+    ) as tg
+    where p.owneruserid is not null
+      and p.posttypeid = 1
+),
+top_tags as (
+    select
+        te.user_id,
+        array_agg(tt.tagname order by tt.cnt desc, tt.tagname asc)[:3] as top3_tags
+    from (
+        select user_id, tagname, count(*) as cnt
+        from tags_exploded
+        group by user_id, tagname
+    ) tt
+    join (select distinct user_id from tags_exploded) te using (user_id)
+    group by te.user_id
+),
+reputation_buckets as (
+    select
+        u.user_id,
+        case
+            when u.reputation >= 100000 then 'legend'
+            when u.reputation >= 25000 then 'veteran'
+            when u.reputation >= 5000 then 'experienced'
+            when u.reputation >= 1000 then 'intermediate'
+            when u.reputation >= 100 then 'novice'
+            else 'newbie'
+        end as rep_bucket
+    from recent_users u
+),
+user_null_logic as (
+    select
+        u.user_id,
+        coalesce(nullif(trim(u.displayname), ''), concat('user#', u.user_id::varchar)) as canonical_displayname,
+        nullif(trim(u.location), '') as location_norm,
+        case when position('@' in coalesce(u.displayname,'')) > 0 then 1 else 0 end as looks_like_email_name
+    from recent_users u
+),
+rankings as (
+    select
+        u.user_id,
+        row_number() over (order by ua.nonneg_score_sum desc nulls last, ua.total_posts desc nulls last, u.user_id) as activity_rank,
+        dense_rank() over (order by coalesce(pv.upvotes_received,0) - coalesce(pv.downvotes_received,0) desc, u.user_id) as net_votes_rank,
+        percent_rank() over (order by ua.questions desc nulls last) as question_percentile,
+        ntile(10) over (order by coalesce(ua.avg_views_nonzero,0) desc) as views_decile
+    from recent_users u
+    left join user_activity ua on ua.user_id = u.user_id
+    left join postvote_received pv on pv.user_id = u.user_id
+),
+heavy_calc as (
+    select
+        u.user_id,
+        -- Arbitrary heavy expression mixing types, nulls, conditionals, and windowed aggregates
+        (
+            coalesce(ua.nonneg_score_sum,0)
+            + coalesce(pv.upvotes_received,0)*2
+            - coalesce(pv.downvotes_received,0)*3
+            + coalesce(va.bounty_amount_total,0)/10
+            + case when aa.total_answers_by_user > 0 then round(100.0 * aa.accepted_answers_by_user::numeric / aa.total_answers_by_user, 2) else 0 end::numeric
+        )::numeric as influence_score_base
+    from recent_users u
+    left join user_activity ua on ua.user_id = u.user_id
+    left join postvote_received pv on pv.user_id = u.user_id
+    left join vote_agg va on va.user_id = u.user_id
+    left join answer_accept_rate aa on aa.user_id = u.user_id
+),
+influence_norm as (
+    select
+        h.user_id,
+        h.influence_score_base,
+        avg(h.influence_score_base) over () as avg_influence,
+        stddev_pop(h.influence_score_base) over () as std_influence,
+        case
+            when stddev_pop(h.influence_score_base) over () = 0 then 0
+            else (h.influence_score_base - avg(h.influence_score_base) over ()) / nullif(stddev_pop(h.influence_score_base) over (),0)
+        end as z_influence
+    from heavy_calc h
+)
+select
+    u.user_id,
+    unl.canonical_displayname as display_name,
+    coalesce(unl.location_norm, 'Unknown') as location,
+    u.website_host,
+    rb.rep_bucket,
+    ua.total_posts,
+    ua.questions,
+    ua.answers,
+    ua.questions_with_accept,
+    aa.accepted_answers_by_user,
+    aa.total_answers_by_user,
+    round(case when aa.total_answers_by_user > 0 then 100.0 * aa.accepted_answers_by_user::numeric / aa.total_answers_by_user else null end, 2) as answer_accept_rate_pct,
+    ua.closed_posts,
+    ua.community_owned,
+    ua.avg_views_nonzero,
+    ua.last_post_date,
+    cs.comments_count,
+    cs.comment_score_sum,
+    cs.last_comment_date,
+    cs.p90_comment_score,
+    br.total_badges,
+    br.gold_badges,
+    br.silver_badges,
+    br.bronze_badges,
+    br.tag_badges,
+    va.upvotes_cast,
+    va.downvotes_cast,
+    va.favorites_cast,
+    va.bounty_events,
+    va.bounty_amount_total,
+    va.last_vote_date,
+    coalesce(pv.upvotes_received,0) as upvotes_received,
+    coalesce(pv.downvotes_received,0) as downvotes_received,
+    coalesce(pv.upvotes_received,0) - coalesce(pv.downvotes_received,0) as net_votes_received,
+    l.linked_refs,
+    l.duplicate_marks_out,
+    l.self_dup_marks_out,
+    l.duplicates_of_their_questions,
+    e.edits_made,
+    e.suggested_edits_applied,
+    e.close_votes_events,
+    e.reopen_events,
+    e.migration_events,
+    e.last_edit_event,
+    tt.top3_tags,
+    r.activity_rank,
+    r.net_votes_rank,
+    r.question_percentile,
+    r.views_decile,
+    h.influence_score_base,
+    i.z_influence,
+    case
+        when coalesce(pv.upvotes_received,0) - coalesce(pv.downvotes_received,0) >= 100 then 'highly_upvoted'
+        when coalesce(pv.upvotes_received,0) - coalesce(pv.downvotes_received,0) <= -10 then 'controversial'
+        else 'normal'
+    end as vote_profile,
+    case when unl.looks_like_email_name = 1 then 'anonymize' else 'ok' end as displayname_flag
+from recent_users u
+left join user_activity ua on ua.user_id = u.user_id
+left join answer_accept_rate aa on aa.user_id = u.user_id
+left join comment_stats cs on cs.user_id = u.user_id
+left join badge_rollup br on br.user_id = u.user_id
+left join vote_agg va on va.user_id = u.user_id
+left join postvote_received pv on pv.user_id = u.user_id
+left join linkage l on l.user_id = u.user_id
+left join edits_cte e on e.user_id = u.user_id
+left join top_tags tt on tt.user_id = u.user_id
+left join reputation_buckets rb on rb.user_id = u.user_id
+left join user_null_logic unl on unl.user_id = u.user_id
+left join rankings r on r.user_id = u.user_id
+left join heavy_calc h on h.user_id = u.user_id
+left join influence_norm i on i.user_id = u.user_id
+where coalesce(ua.total_posts,0) + coalesce(cs.comments_count,0) > 0
+  and (
+    u.reputation >= 100
+    or (coalesce(pv.upvotes_received,0) - coalesce(pv.downvotes_received,0)) >= 10
+    or coalesce(br.total_badges,0) >= 3
+  )
+order by
+    i.z_influence desc nulls last,
+    r.activity_rank asc,
+    u.user_id
+limit 500;

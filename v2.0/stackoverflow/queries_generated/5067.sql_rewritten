@@ -1,0 +1,108 @@
+-- {"query": "5067.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 890} 
+WITH
+-- 1) Top tags by recent activity with window functions and correlated subqueries
+RecentTagStats AS (
+  SELECT
+    t.TagName,
+    t.Id AS TagId,
+    COUNT(p.Id) AS PostCount,
+    SUM(p.Score) AS ScoreSum,
+    AVG(p.ViewCount) AS AvgViews,
+    ROW_NUMBER() OVER (ORDER BY COUNT(p.Id) DESC, SUM(p.Score) DESC) AS rn
+  FROM Posts p
+  JOIN UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tagname ON true
+  JOIN Tags t ON t.TagName = UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+  WHERE p.PostTypeId = 1 -- Questions only
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+  GROUP BY t.TagName, t.Id
+),
+-- 2) Posts with correlated subquery: for each post, latest edit by same user
+PostsWithLatestEdit AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastEditDate,
+    (SELECT MAX(le.CreationDate)
+     FROM PostHistory le
+     WHERE le.PostId = p.Id
+       AND le.PostHistoryTypeId IN (4,5,6)) AS LatestEditDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+-- 3) Complex predicate: find posts closed but reopened with a specific sequence
+ClosedReopened AS (
+  SELECT
+    ph1.PostId,
+    ph1.CreationDate AS CloseDate,
+    ph2.CreationDate AS ReopenDate,
+    CASE
+      WHEN ph2.CreationDate IS NULL THEN false
+      ELSE ph2.CreationDate > ph1.CreationDate
+    END AS ReopenAfterClose
+  FROM PostHistory ph1
+  LEFT JOIN PostHistory ph2
+    ON ph2.PostId = ph1.PostId
+   AND ph2.PostHistoryTypeId = 11 -- Post Reopened
+  WHERE ph1.PostHistoryTypeId = 10 -- Post Closed
+),
+-- 4) Window function on users: cumulative reputation rank within creation date window
+UserRanks AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate,
+    RANK() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS RepRank
+  FROM Users u
+  WHERE u.AccountId IS NOT NULL
+)
+SELECT
+  -- Tag benchmarking metrics
+  rts.TagName,
+  rts.TagId,
+  rts.PostCount,
+  rts.ScoreSum,
+  rts.AvgViews,
+
+  -- Posts with latest edit per post
+  pwle.Id AS PostId,
+  pwle.Title,
+  pwle.OwnerUserId,
+  pwle.CreationDate AS PostCreationDate,
+  pwle.LastEditDate,
+
+  -- Closed then reopened indicator
+  cr.PostId AS ClosedPostId,
+  cr.CloseDate,
+  cr.ReopenDate,
+  cr.ReopenAfterClose,
+
+  -- Top user ranks
+  ur.UserId,
+  ur.Reputation,
+  ur.CreationDate AS UserCreationDate,
+  ur.RepRank,
+
+  -- String and NULL expressions demonstration
+  CASE
+    WHEN p.OwnerUserId IS NULL THEN 'Anonymous'
+    ELSE COALESCE(u.DisplayName, 'Unknown')
+  END AS DisplayNameAlias,
+  CASE
+    WHEN b.Id IS NULL THEN 0
+    ELSE b.Class
+  END AS BadgedClass
+FROM RecentTagStats rts
+LEFT JOIN PostsWithLatestEdit pwle
+  ON pwle.OwnerUserId IS NOT NULL
+LEFT JOIN ClosedReopened cr
+  ON cr.PostId = pwle.Id
+LEFT JOIN Users u
+  ON u.Id = pwle.OwnerUserId
+LEFT JOIN Badges b
+  ON b.UserId = pwle.OwnerUserId
+LEFT JOIN UserRanks ur
+  ON ur.UserId = pwle.OwnerUserId
+ORDER BY rts.rn, pwle.LastEditDate DESC
+LIMIT 100;

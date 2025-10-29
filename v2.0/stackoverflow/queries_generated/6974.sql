@@ -1,0 +1,35 @@
+-- {"query": "6974.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 339} 
+
+SELECT 
+    u.DisplayName, 
+    COUNT(DISTINCT p.Id) AS TotalPosts, 
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.Reputation) AS MaxReputation,
+    MIN(u.CreationDate) AS EarliestUserCreationDate,
+    STRING_AGG(DISTINCT b.Name, ', ') AS BadgesEarned,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC) AS TopScorePost,
+    AVG(ph.Score) AS AvgCommentScore
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+WHERE 
+    p.PostTypeId IN (1, 2) AND 
+    ph.PostHistoryTypeId = 10 AND 
+    ph.Comment IS NOT NULL AND 
+    (ph.Score > 0 OR ph.Comment LIKE '%thank%')
+GROUP BY 
+    u.DisplayName
+HAVING 
+    AVG(ph.Score) > 0 AND 
+    COUNT(DISTINCT c.Id) > 5
+ORDER BY 
+    TotalPosts DESC, 
+    MaxReputation DESC;

@@ -1,0 +1,480 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostRankings AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        u.DisplayName as AuthorName,
+        p.PostTypeId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) as ViewRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as OverallScoreRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+        LAG(p.Title, 1) OVER (ORDER BY p.CreationDate) as PreviousPostTitle,
+        LEAD(p.Title, 1) OVER (ORDER BY p.CreationDate) as NextPostTitle
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+ComplexTagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Highly Popular'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Low'
+        END as PopularityLevel,
+        STRING_AGG(
+            CASE 
+                WHEN POSITION('>' IN COALESCE(t.Tags, '')) > 0 THEN SUBSTRING(COALESCE(t.Tags, '') FROM 2 FOR POSITION('>' IN COALESCE(t.Tags, '')) - 2)
+                ELSE COALESCE(t.Tags, '')
+            END, ', '
+        ) as TagExtract,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p2
+            WHERE p2.Tags LIKE '%' || t.TagName || '%'
+            AND p2.PostTypeId = 1
+        ) as RelatedQuestions,
+        (
+            SELECT AVG(p3.Score) 
+            FROM Posts p3
+            WHERE p3.Tags LIKE '%' || t.TagName || '%'
+            AND p3.PostTypeId = 1
+        ) as AvgQuestionScore
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName <> ''
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.Tags
+),
+UserPostTrends AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(p.Id) as MonthlyPosts,
+        DATE_TRUNC('month', p.CreationDate) as PostMonth,
+        SUM(p.Score) as MonthlyScore,
+        SUM(p.ViewCount) as MonthlyViews,
+        AVG(p.Score) as AvgMonthlyScore,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p2 
+            WHERE p2.OwnerUserId = u.Id 
+            AND p2.CreationDate BETWEEN (p.CreationDate - INTERVAL '1 month') AND p.CreationDate
+        ) as PrevMonthPosts,
+        LAG(COUNT(p.Id), 1, 0) OVER (PARTITION BY u.Id ORDER BY DATE_TRUNC('month', p.CreationDate)) as PrevMonthPostsLag,
+        CASE 
+            WHEN COUNT(p.Id) > LAG(COUNT(p.Id), 1, 0) OVER (PARTITION BY u.Id ORDER BY DATE_TRUNC('month', p.CreationDate)) 
+            THEN 'Growth'
+            WHEN COUNT(p.Id) < LAG(COUNT(p.Id), 1, 0) OVER (PARTITION BY u.Id ORDER BY DATE_TRUNC('month', p.CreationDate)) 
+            THEN 'Decline'
+            ELSE 'Stable'
+        END as TrendStatus
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+    GROUP BY u.Id, u.DisplayName, DATE_TRUNC('month', p.CreationDate)
+)
+SELECT 
+    'Performance Benchmark Report' as ReportName,
+    (SELECT COUNT(DISTINCT u1.Id) FROM Users u1) as TotalUsers,
+    (SELECT COUNT(DISTINCT p1.Id) FROM Posts p1) as TotalPosts,
+    (SELECT COUNT(DISTINCT c1.Id) FROM Comments c1) as TotalComments,
+    (SELECT COUNT(DISTINCT b1.Id) FROM Badges b1) as TotalBadges,
+    (SELECT COUNT(DISTINCT t1.Id) FROM Tags t1) as TotalTags,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1 
+        AND p.Score > 100
+    ) as HighScoreQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 2 
+        AND p.Score > 50
+    ) as HighScoreAnswers,
+    (
+        SELECT AVG(u2.Reputation) 
+        FROM Users u2 
+        WHERE u2.Reputation > 1000
+    ) as AvgHighReputation,
+    (
+        SELECT COUNT(*) 
+        FROM Users u3 
+        WHERE u3.Reputation BETWEEN 1000 AND 10000
+    ) as MidTierUsers,
+    (
+        SELECT COUNT(*) 
+        FROM Users u4 
+        WHERE u4.Reputation >= 10000
+    ) as HighTierUsers,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        JOIN Users u5 ON p.OwnerUserId = u5.Id 
+        WHERE u5.Reputation >= 10000
+        AND p.PostTypeId = 1
+    ) as HighRepQuestionCount,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        JOIN Users u6 ON p.OwnerUserId = u6.Id 
+        WHERE u6.Reputation >= 10000
+        AND p.PostTypeId = 2
+    ) as HighRepAnswerCount,
+    (
+        SELECT STRING_AGG(u7_entry, ', ')
+        FROM (
+            SELECT u7.DisplayName || ': ' || CAST(u7.Reputation AS text) as u7_entry
+            FROM Users u7
+            WHERE u7.Reputation >= 10000
+            ORDER BY u7.Reputation DESC
+            LIMIT 10
+        ) s
+    ) as TopReputationUsers,
+    (SELECT COUNT(*) FROM Posts WHERE Score < 0) as NegativeScorePosts,
+    (SELECT COUNT(*) FROM Posts WHERE ViewCount > 10000) as HighViewPosts,
+    (
+        SELECT COUNT(*) FROM Posts p 
+        WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+    ) as RecentPosts30Days,
+    (
+        SELECT COUNT(*) FROM Posts p 
+        WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 days')
+    ) as RecentPosts7Days,
+    (
+        SELECT AVG(p4.ViewCount) 
+        FROM Posts p4 
+        WHERE p4.PostTypeId = 1
+    ) as AvgQuestionViews,
+    (
+        SELECT AVG(p5.ViewCount) 
+        FROM Posts p5 
+        WHERE p5.PostTypeId = 2
+    ) as AvgAnswerViews,
+    (
+        SELECT STRING_AGG(q_entry, '; ')
+        FROM (
+            SELECT 'Q' || CAST(p6.Id AS text) || ': ' || p6.Title as q_entry
+            FROM Posts p6 
+            WHERE p6.PostTypeId = 1 
+            AND p6.Score > 100
+            ORDER BY p6.Score DESC
+            LIMIT 5
+        ) sq
+    ) as TopScoreQuestions,
+    (
+        SELECT STRING_AGG(a_entry, '; ')
+        FROM (
+            SELECT 'A' || CAST(p7.Id AS text) || ': ' || p7.Title as a_entry
+            FROM Posts p7 
+            WHERE p7.PostTypeId = 2 
+            AND p7.Score > 50
+            ORDER BY p7.Score DESC
+            LIMIT 5
+        ) sa
+    ) as TopScoreAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM Users u8 
+        WHERE u8.AccountId IS NOT NULL
+    ) as UsersWithAccounts,
+    (
+        SELECT COUNT(*) 
+        FROM Users u9 
+        WHERE u9.WebsiteUrl IS NOT NULL AND u9.WebsiteUrl <> ''
+    ) as UsersWithWebsites,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+    ) as PostsHavingTags,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c2 
+        WHERE c2.Text LIKE '%help%'
+    ) as CommentsWithHelp,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.Body LIKE '%code%' AND p.PostTypeId = 1
+    ) as QuestionsWithCode,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.Body LIKE '%question%' AND p.PostTypeId = 2
+    ) as AnswerWithQuestion,
+    (
+        SELECT COUNT(DISTINCT p.OwnerUserId) 
+        FROM Posts p 
+        WHERE p.PostTypeId IN (1, 2)
+    ) as ActiveAuthors,
+    (
+        SELECT COUNT(DISTINCT u10.Id) 
+        FROM Users u10 
+        WHERE u10.Id IN (
+            SELECT DISTINCT UserId 
+            FROM Badges
+            WHERE Date >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months')
+        )
+    ) as RecentBadgeRecipients,
+    (
+        SELECT COUNT(DISTINCT p.PostTypeId) 
+        FROM Posts p
+    ) as DifferentPostTypes,
+    (
+        SELECT COUNT(DISTINCT p.ParentId) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 2
+    ) as AnsweredQuestions,
+    (
+        SELECT COUNT(DISTINCT p.AcceptedAnswerId) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1
+    ) as AcceptedAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.ClosedDate IS NOT NULL
+    ) as ClosedQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.CommunityOwnedDate IS NOT NULL
+    ) as CommunityOwnedPosts,
+    (
+        SELECT COUNT(DISTINCT ph.UserId) 
+        FROM PostHistory ph 
+        WHERE ph.PostHistoryTypeId = 10
+    ) as CloseVoteUsers,
+    (
+        SELECT COUNT(DISTINCT ph2.UserId) 
+        FROM PostHistory ph2 
+        WHERE ph2.PostHistoryTypeId = 6
+    ) as TagEditUsers,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        WHERE pl.LinkTypeId = 3
+    ) as DuplicateLinks,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl2 
+        WHERE pl2.LinkTypeId = 1
+    ) as RegularLinks,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.VoteTypeId = 2
+    ) as UpVotes,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v2 
+        WHERE v2.VoteTypeId = 3
+    ) as DownVotes,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v3 
+        WHERE v3.VoteTypeId = 5
+    ) as FavoriteVotes,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v4 
+        WHERE v4.VoteTypeId = 6
+    ) as CloseVotes,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v5 
+        WHERE v5.VoteTypeId = 14
+    ) as ModeratorVotes,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b2 
+        WHERE b2.Class = 1
+    ) as GoldBadges,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b3 
+        WHERE b3.Class = 2
+    ) as SilverBadges,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b4 
+        WHERE b4.Class = 3
+    ) as BronzeBadges,
+    (
+        SELECT COUNT(DISTINCT u11.Id) 
+        FROM Users u11 
+        WHERE u11.Views > 10000
+    ) as HighViewUsers,
+    (
+        SELECT COUNT(*) 
+        FROM Users u12 
+        WHERE u12.UpVotes > 1000
+    ) as HighUpVoteUsers,
+    (
+        SELECT COUNT(*) 
+        FROM Users u13 
+        WHERE u13.DownVotes > 1000
+    ) as HighDownVoteUsers,
+    (
+        SELECT COUNT(*) 
+        FROM Tags t2 
+        WHERE t2.Count > 5000
+    ) as PopularTags,
+    (
+        SELECT COUNT(*) 
+        FROM Tags t3 
+        WHERE t3.Count > 1000 AND t3.Count < 5000
+    ) as MediumTags,
+    (
+        SELECT COUNT(*) 
+        FROM Tags t4 
+        WHERE t4.Count < 1000
+    ) as LessPopularTags,
+    (
+        SELECT AVG(u14.Reputation) 
+        FROM Users u14 
+        WHERE u14.Reputation > 0
+    ) as AvgReputation,
+    (
+        SELECT MAX(u15.Reputation) 
+        FROM Users u15
+    ) as MaxReputation,
+    (
+        SELECT MIN(u16.Reputation) 
+        FROM Users u16
+    ) as MinReputation,
+    (
+        SELECT AVG(p8.Score) 
+        FROM Posts p8
+    ) as AvgPostScore,
+    (
+        SELECT MAX(p9.Score) 
+        FROM Posts p9
+    ) as MaxPostScore,
+    (
+        SELECT MIN(p10.Score) 
+        FROM Posts p10
+    ) as MinPostScore,
+    (
+        SELECT AVG(p11.ViewCount) 
+        FROM Posts p11
+    ) as AvgPostViews,
+    (
+        SELECT MAX(p12.ViewCount) 
+        FROM Posts p12
+    ) as MaxPostViews,
+    (
+        SELECT MIN(p13.ViewCount) 
+        FROM Posts p13
+    ) as MinPostViews,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p14 
+        WHERE p14.Title IS NOT NULL AND p14.Title <> ''
+    ) as PostsHavingTitles,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p15 
+        WHERE p15.Body IS NOT NULL AND p15.Body <> ''
+    ) as PostsHavingBodies,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c3 
+        WHERE c3.Text IS NOT NULL AND c3.Text <> ''
+    ) as CommentsWithText,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph3 
+        WHERE ph3.Text IS NOT NULL AND ph3.Text <> ''
+    ) as PostHistoryWithText,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b5 
+        WHERE b5.Name IS NOT NULL AND b5.Name <> ''
+    ) as BadgesWithNames,
+    (
+        SELECT COUNT(*) 
+        FROM Users u17 
+        WHERE u17.DisplayName IS NOT NULL AND u17.DisplayName <> ''
+    ) as UsersWithDisplayNames,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p16 
+        WHERE p16.Tags IS NOT NULL AND p16.Tags <> '' AND POSITION('<' IN COALESCE(p16.Tags, '')) > 0
+    ) as QuestionTagsPresent,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p17 
+        WHERE p17.Tags IS NULL OR p17.Tags = ''
+    ) as QuestionTagsMissing,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p18 
+        WHERE p18.LastActivityDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 days')
+    ) as RecentlyActivePosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p19 
+        WHERE p19.LastActivityDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+    ) as RecentlyActivePosts30Days,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p20 
+        WHERE p20.CreationDate < (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    ) as OldPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p21 
+        WHERE p21.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    ) as RecentPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p22 
+        WHERE p22.CreationDate BETWEEN (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years') AND CAST('2024-10-01 12:34:56' AS timestamp)
+    ) as PostsLast2Years,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p23 
+        WHERE p23.PostTypeId IN (1, 2) 
+        AND p23.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    ) as RecentQuestionsAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p24 
+        WHERE p24.PostTypeId IN (1, 2) 
+        AND p24.CreationDate <= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    ) as OldQuestionsAnswers
+;

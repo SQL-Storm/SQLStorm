@@ -1,0 +1,205 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT 
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        r.Level + 1
+    FROM Tags child
+    JOIN Tags parent ON child.WikiPostId = parent.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON parent.Id = r.Id
+    WHERE child.Id <> parent.Id
+),
+UserActivityCTE AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        COALESCE(SUM(vb.UpVotes),0) AS TotalUpVotes,
+        COALESCE(SUM(vb.DownVotes),0) AS TotalDownVotes,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(LENGTH(COALESCE(p.Body, ''))) AS AvgPostBodyLength,
+        COUNT(DISTINCT b.Id) AS BadgesCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            COUNT(*) FILTER (WHERE VoteTypeId = 2) AS UpVotes,
+            COUNT(*) FILTER (WHERE VoteTypeId = 3) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) vb ON vb.PostId = p.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopPostsWithCommentsAndVotes AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.Tags, '') AS Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        c.CommentCount,
+        v.UpVotes,
+        v.DownVotes,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN (SELECT Score FROM Posts WHERE Id = p.AcceptedAnswerId)
+            ELSE NULL
+        END AS AcceptedAnswerScore
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            COUNT(*) FILTER (WHERE VoteTypeId = 2) AS UpVotes,
+            COUNT(*) FILTER (WHERE VoteTypeId = 3) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    WHERE p.PostTypeId IN (1,2)
+),
+RankedPosts AS (
+    SELECT 
+        tp.*,
+        ROW_NUMBER() OVER (PARTITION BY tp.PostTypeId ORDER BY tp.Score DESC NULLS LAST, tp.ViewCount DESC NULLS LAST) AS RankWithinType,
+        RANK() OVER (ORDER BY tp.Score DESC NULLS LAST) AS GlobalRank,
+        DENSE_RANK() OVER (PARTITION BY tp.PostTypeId ORDER BY tp.OwnerUserId) AS OwnerRank,
+        COUNT(*) OVER (PARTITION BY tp.OwnerUserId) AS PostsByOwnerCount
+    FROM TopPostsWithCommentsAndVotes tp
+),
+AggregatedRecentPostHistory AS (
+    SELECT 
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) AS EditsCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS CloseEvents,
+        MAX(ph.CreationDate) AS LastEditDate,
+        STRING_AGG(DISTINCT pht.Name, ', ') AS HistoryTypesAffected
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    WHERE ph.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days'
+    GROUP BY ph.PostId
+),
+DuplicateLinks AS (
+    SELECT DISTINCT pl.PostId, pl.RelatedPostId
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+),
+AllLinkedPosts AS (
+    SELECT pl.PostId, pl.RelatedPostId, lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+FilteredPostsWithLinks AS (
+    SELECT 
+        rp.Id,
+        rp.Title,
+        rp.PostTypeId,
+        rp.Score,
+        rp.ViewCount,
+        rp.OwnerUserId,
+        rp.OwnerName,
+        rp.CommentCount,
+        rp.UpVotes,
+        rp.DownVotes,
+        rp.AcceptedAnswerScore,
+        ar.EditsCount,
+        ar.CloseEvents,
+        ar.LastEditDate,
+        ar.HistoryTypesAffected,
+        dl.RelatedPostId AS DuplicateOfPostId
+    FROM RankedPosts rp
+    LEFT JOIN AggregatedRecentPostHistory ar ON ar.PostId = rp.Id
+    LEFT JOIN DuplicateLinks dl ON dl.PostId = rp.Id
+    WHERE rp.RankWithinType <= 50
+)
+SELECT 
+    fpl.Id AS PostId,
+    fpl.Title,
+    CASE fpl.PostTypeId WHEN 1 THEN 'Question' WHEN 2 THEN 'Answer' ELSE 'Other' END AS PostType,
+    fpl.Score,
+    fpl.ViewCount,
+    CONCAT(fpl.OwnerName, ' (UserId:', COALESCE(CAST(fpl.OwnerUserId AS TEXT), 'Anonymous'), ')') AS OwnerInfo,
+    fpl.CommentCount,
+    fpl.UpVotes,
+    fpl.DownVotes,
+    fpl.AcceptedAnswerScore,
+    fpl.EditsCount,
+    fpl.CloseEvents,
+    fpl.LastEditDate,
+    fpl.HistoryTypesAffected,
+    CASE WHEN fpl.DuplicateOfPostId IS NOT NULL THEN 'Yes' ELSE 'No' END AS IsDuplicate,
+    COALESCE(t.TagName, 'No Required Tag') AS ImportantTag,
+    uac.QuestionsCount,
+    uac.AnswersCount,
+    uac.TotalUpVotes,
+    uac.TotalDownVotes,
+    uac.BadgesCount,
+    uac.GoldBadges,
+    uac.SilverBadges,
+    uac.BronzeBadges,
+    ROW_NUMBER() OVER (PARTITION BY fpl.OwnerUserId ORDER BY fpl.Score DESC NULLS LAST) AS OwnerPostRank,
+    encode(digest(REPLACE(REPLACE(fpl.Title, '''', ''), '"', ''), 'md5'), 'hex') AS TitleHash
+FROM FilteredPostsWithLinks fpl
+LEFT JOIN RecursiveTagHierarchy t ON fpl.Id = t.ExcerptPostId
+LEFT JOIN UserActivityCTE uac ON uac.UserId = fpl.OwnerUserId
+WHERE 
+    (fpl.Score > 10 OR fpl.UpVotes > 20)
+    AND (fpl.CloseEvents IS NULL OR fpl.CloseEvents = 0)
+GROUP BY
+    fpl.Id,
+    fpl.Title,
+    fpl.PostTypeId,
+    fpl.Score,
+    fpl.ViewCount,
+    fpl.OwnerUserId,
+    fpl.OwnerName,
+    fpl.CommentCount,
+    fpl.UpVotes,
+    fpl.DownVotes,
+    fpl.AcceptedAnswerScore,
+    fpl.EditsCount,
+    fpl.CloseEvents,
+    fpl.LastEditDate,
+    fpl.HistoryTypesAffected,
+    fpl.DuplicateOfPostId,
+    t.TagName,
+    uac.QuestionsCount,
+    uac.AnswersCount,
+    uac.TotalUpVotes,
+    uac.TotalDownVotes,
+    uac.BadgesCount,
+    uac.GoldBadges,
+    uac.SilverBadges,
+    uac.BronzeBadges,
+    fpl.OwnerUserId,
+    fpl.Title
+ORDER BY fpl.Score DESC, fpl.ViewCount DESC, fpl.Id
+LIMIT 100;

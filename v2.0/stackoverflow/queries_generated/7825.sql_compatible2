@@ -1,0 +1,174 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) AS HighViewQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 10 THEN p.Id END) AS HighScoreAnswers,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score END), 0) AS TotalQuestionScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score END), 0) AS TotalAnswerScore,
+    COUNT(DISTINCT b.Id) AS BadgesCount,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    COUNT(DISTINCT c.Id) AS CommentsMade,
+    COUNT(DISTINCT ph.Id) AS PostHistoryActions,
+    AVG(COALESCE(p.Score, 0)) AS AvgPostScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    MAX(ph.CreationDate) AS LastHistoryActionDate,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+          AND p2.PostTypeId = 1 
+          AND p2.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY)
+    ) AS RecentQuestionsLast30Days,
+    (
+        SELECT AVG(EXTRACT(EPOCH FROM (p3.LastActivityDate - p3.CreationDate)) / 86400.0)
+        FROM Posts p3
+        WHERE p3.OwnerUserId = u.Id
+          AND p3.PostTypeId = 1
+    ) AS AvgDaysToFirstActivity,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p4 
+        WHERE p4.OwnerUserId = u.Id 
+          AND p4.PostTypeId = 1 
+          AND p4.AcceptedAnswerId IS NOT NULL
+    ) AS QuestionsWithAcceptedAnswer,
+    (
+        SELECT p5.Title 
+        FROM Posts p5 
+        WHERE p5.OwnerUserId = u.Id 
+          AND p5.PostTypeId = 1 
+        ORDER BY p5.CreationDate DESC
+        LIMIT 1
+    ) AS MostRecentQuestionTitle,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b2 
+        WHERE b2.UserId = u.Id 
+          AND b2.Date > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6' MONTH)
+    ) AS RecentBadgesLast6Months,
+    (
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) * 100.0 / NULLIF(COUNT(*), 0)
+    ) AS QuestionPercentage,
+    CASE 
+        WHEN u.Reputation >= 10000 THEN 'Elite'
+        WHEN u.Reputation >= 1000 THEN 'Expert'
+        WHEN u.Reputation >= 100 THEN 'Novice'
+        ELSE 'Beginner'
+    END AS ReputationTier,
+    (
+        SELECT STRING_AGG(TagName, ', ')
+        FROM Tags t1
+        INNER JOIN (
+            SELECT DISTINCT SUBSTRING(p6.Tags FROM 2 FOR CHAR_LENGTH(p6.Tags)-2) AS TagsArray
+            FROM Posts p6
+            WHERE p6.OwnerUserId = u.Id AND p6.PostTypeId = 1
+        ) t2 ON POSITION('|' || t1.TagName || '|' IN '|' || t2.TagsArray || '|') > 0
+        WHERE t1.TagName IS NOT NULL
+    ) AS UserTagsUsed,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p7 
+        WHERE p7.ParentId = u.Id
+    ) AS AnswersAsParent,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p8 
+        WHERE p8.OwnerUserId = u.Id 
+          AND p8.CreationDate BETWEEN (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '7' DAY) AND TIMESTAMP '2024-10-01 12:34:56'
+    ) AS RecentPostsLastWeek,
+    ROW_NUMBER() OVER(ORDER BY u.Reputation DESC) AS RankedByReputation,
+    RANK() OVER(PARTITION BY CASE WHEN u.Reputation > 1000 THEN 1 ELSE 0 END ORDER BY u.Reputation DESC) AS ReputationRankPartitioned,
+    DENSE_RANK() OVER(ORDER BY u.Reputation DESC) AS DenseReputationRank,
+    (
+        SELECT STRING_AGG(LOWER(vote_type.Name), ', ')
+        FROM Votes v
+        INNER JOIN VoteTypes vote_type ON v.VoteTypeId = vote_type.Id
+        WHERE v.UserId = u.Id
+    ) AS VoteTypesUsed,
+    NTILE(4) OVER(ORDER BY u.Reputation DESC) AS ReputationQuartile,
+    LAG(u.Reputation, 1, 0) OVER(ORDER BY u.Reputation DESC) AS PreviousUserReputation,
+    LEAD(u.Reputation, 1, 0) OVER(ORDER BY u.Reputation DESC) AS NextUserReputation,
+    (
+        SELECT COUNT(*)
+        FROM (
+            SELECT p9.Id
+            FROM Posts p9
+            WHERE p9.OwnerUserId = u.Id
+            GROUP BY p9.Id, p9.Score, p9.PostTypeId
+            HAVING COUNT(*) > 1
+        ) dups
+    ) AS DuplicatePosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p10 
+        WHERE p10.OwnerUserId = u.Id 
+          AND p10.PostTypeId = 1 
+          AND p10.AnswerCount > 0
+    ) AS QuestionWithAnswers,
+    (
+        SELECT COUNT(*)
+        FROM Posts p11
+        WHERE p11.OwnerUserId = u.Id
+          AND p11.PostTypeId = 1
+          AND p11.ClosedDate IS NOT NULL
+    ) AS ClosedQuestions,
+    (
+        SELECT COUNT(*)
+        FROM Posts p12
+        WHERE p12.OwnerUserId = u.Id
+          AND p12.PostTypeId = 2
+          AND p12.Score = (
+              SELECT MAX(p13.Score)
+              FROM Posts p13
+              WHERE p13.OwnerUserId = u.Id
+                AND p13.PostTypeId = 2
+          )
+    ) AS MaxScoreAnswers,
+    (
+        SELECT COUNT(*)
+        FROM Posts p14
+        WHERE p14.OwnerUserId = u.Id
+          AND (
+            CHAR_LENGTH(p14.Title) > 50 
+            OR CHAR_LENGTH(p14.Body) > 2000
+          )
+    ) AS LongPosts,
+    (
+        SELECT COUNT(*)
+        FROM Comments c2
+        WHERE c2.UserId = u.Id
+          AND c2.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3' MONTH)
+    ) AS RecentComments,
+    (
+        SELECT COUNT(*)
+        FROM Badges b3
+        WHERE b3.UserId = u.Id
+          AND b3.Date > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR)
+          AND b3.Class = 1
+    ) AS RecentGoldBadges,
+    COALESCE(STRING_AGG(DISTINCT p15.Tags, '; '), 'No Tags') AS UserPostTagsCombined
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN Posts p15 ON u.Id = p15.OwnerUserId AND p15.PostTypeId = 1
+WHERE u.Id IN (
+    SELECT DISTINCT u2.Id
+    FROM Users u2
+    INNER JOIN Posts p16 ON u2.Id = p16.OwnerUserId
+    WHERE p16.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2' YEAR)
+    GROUP BY u2.Id
+    HAVING COUNT(DISTINCT p16.Id) >= 50
+)
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) >= 10
+ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC
+OFFSET 100 ROWS
+FETCH NEXT 50 ROWS ONLY;

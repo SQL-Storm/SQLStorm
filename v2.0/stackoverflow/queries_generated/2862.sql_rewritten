@@ -1,0 +1,169 @@
+-- {"query": "2862.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1439} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        coalesce(p.ViewCount, 0) as TotalViews,
+        coalesce(p.Score, 0) as TotalScore,
+        u.Reputation as OwnerReputation,
+        row_number() over (partition by t.TagName order by p.CreationDate desc nulls last) as rn
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 -- questions only
+),
+FilteredRecentTags as (
+    select TagId, TagName, Count, TotalViews, TotalScore, OwnerReputation
+    from RecursiveTagCounts
+    where rn = 1
+),
+UserBadgeStats as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+TopActiveUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalBadges,
+        coalesce(ans.AnswerCount,0) as AnswerCount,
+        coalesce(ques.QuestionCount,0) as QuestionCount,
+        coalesce(avgV.AvgScore, 0)::numeric(10,2) as AvgPostScore,
+        row_number() over (order by u.Reputation desc, ub.GoldBadges desc) as rn
+    from Users u
+    left join UserBadgeStats ub on ub.UserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2
+        group by OwnerUserId
+    ) ans on ans.OwnerUserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as QuestionCount
+        from Posts
+        where PostTypeId = 1
+        group by OwnerUserId
+    ) ques on ques.OwnerUserId = u.Id
+    left join (
+        select OwnerUserId, avg(Score) as AvgScore
+        from Posts
+        where OwnerUserId is not null
+        group by OwnerUserId
+    ) avgV on avgV.OwnerUserId = u.Id
+    where u.Reputation > 1000 -- filter for more active users
+),
+PostLinkAnalysis as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.PostTypeId as PostType,
+        p2.PostTypeId as RelatedPostType,
+        case 
+            when pl.LinkTypeId = 3 then 'Duplicate Link'
+            else 'Regular Link'
+        end as LinkCategory
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+),
+DuplicateLinkCounts as (
+    select
+        PostId,
+        count(*) filter (where LinkTypeName = 'Duplicate') as DuplicateCount,
+        count(*) filter (where LinkTypeName <> 'Duplicate') as NonDuplicateCount
+    from PostLinkAnalysis
+    group by PostId
+),
+RecentEditedQuestions as (
+    select distinct
+        ph.PostId,
+        max(ph.CreationDate) over (partition by ph.PostId) as LastEditDate,
+        ph2.UserDisplayName as LastEditor,
+        ph.PostHistoryTypeId,
+        ph.Comment,
+        ph.Text
+    from PostHistory ph
+    join PostTypes pt on pt.Id = (select PostTypeId from Posts where Id = ph.PostId limit 1)
+    left join PostHistory ph2 on ph2.Id = ph.Id
+    where pt.Id = 1 -- questions only
+    and ph.PostHistoryTypeId in (4,5,6) -- edits: Title, Body, Tags
+),
+FinalResult as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        ta.TagName,
+        ta.Count as TagQuestionCount,
+        ta.TotalViews,
+        ta.TotalScore,
+        coalesce(dl.DuplicateCount,0) as DupLinks,
+        coalesce(dl.NonDuplicateCount,0) as OtherLinks,
+        coalesce(re.LastEditDate, timestamp '1970-01-01') as LatestQuestionEdit,
+        re.LastEditor,
+        coalesce(ta.OwnerReputation,0) as TagOwnerRep,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.TotalBadges,
+        ua.AnswerCount,
+        ua.QuestionCount,
+        ua.AvgPostScore,
+        (select count(*) from Comments c where c.UserId = u.Id and c.CreationDate > cast('2024-10-01' as date) - interval '365 days') as CommentsLastYear,
+        case 
+            when u.WebsiteUrl is not null and u.WebsiteUrl != '' then lower(u.WebsiteUrl)
+            else 'N/A'
+        end as UserWebsite,
+        case 
+            when u.Location is null then 'Unknown'
+            else initcap(u.Location)
+        end as UserLocation,
+        row_number() over (partition by ta.TagName order by u.Reputation desc) as TagTopUserRank
+    from TopActiveUsers u
+    left join FilteredRecentTags ta on ta.OwnerReputation < u.Reputation * 1.5 and ta.TotalScore > 10
+    left join DuplicateLinkCounts dl on dl.PostId = ta.TagId
+    left join RecentEditedQuestions re on re.PostId = ta.TagId
+    left join UserBadgeStats ua on ua.UserId = u.Id
+    where ua.TotalBadges is not null
+)
+select 
+    UserId,
+    DisplayName,
+    Reputation,
+    TagName,
+    TagQuestionCount,
+    TotalViews,
+    TotalScore,
+    DupLinks,
+    OtherLinks,
+    LatestQuestionEdit,
+    coalesce(LastEditor, 'Unknown') as LastEditor,
+    TagOwnerRep,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    TotalBadges,
+    AnswerCount,
+    QuestionCount,
+    AvgPostScore,
+    CommentsLastYear,
+    UserWebsite,
+    UserLocation,
+    TagTopUserRank
+from FinalResult
+where TagTopUserRank <= 3
+order by TagName, TagTopUserRank
+limit 100;

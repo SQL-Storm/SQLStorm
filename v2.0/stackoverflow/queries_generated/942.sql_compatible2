@@ -1,0 +1,309 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl,
+        row_number() over (order by u.creationdate desc, u.id desc) as rn_recent
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+tagged_questions as (
+    select
+        p.id as question_id,
+        p.owneruserid as owner_id,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        array_length(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><'), 1) as tag_count
+    from posts p
+    where p.posttypeid = 1
+),
+answers as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        a.owneruserid as owner_id,
+        a.score as answer_score,
+        a.creationdate as answer_creationdate
+    from posts a
+    where a.posttypeid = 2
+),
+question_activity as (
+    select
+        q.question_id,
+        q.owner_id,
+        q.creationdate as question_creationdate,
+        q.score as question_score,
+        q.viewcount,
+        q.title,
+        q.tags,
+        q.tag_count,
+        count(a.answer_id) as answer_count,
+        max(a.answer_score) as max_answer_score,
+        min(a.answer_score) as min_answer_score,
+        avg(a.answer_score) as avg_answer_score,
+        count(distinct c.id) as comment_count
+    from tagged_questions q
+    left join answers a on a.question_id = q.question_id
+    left join comments c on c.postid = q.question_id
+    group by q.question_id, q.owner_id, q.creationdate, q.score, q.viewcount, q.title, q.tags, q.tag_count
+),
+vote_rollup as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+        max(v.creationdate) as last_vote_at
+    from votes v
+    group by v.postid
+),
+closed_reasons as (
+    select
+        ph.postid,
+        min(ph.creationdate) as first_closed_at,
+        max(case when ph.posthistorytypeid = 10 then cast(ph.comment as integer) end) as close_reason_id,
+        max(
+            nullif(
+                regexp_replace(ph.text, '.*"OriginalQuestionIds":\\s*\\[(\\d+)\\].*', '\\1'),
+                ph.text
+            )
+        ) as duplicate_of_str
+    from posthistory ph
+    where ph.posthistorytypeid = 10
+    group by ph.postid
+),
+links as (
+    select
+        pl.postid,
+        sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_links,
+        sum(case when pl.linktypeid = 1 then 1 else 0 end) as related_links,
+        max(pl.creationdate) as last_link_at
+    from postlinks pl
+    group by pl.postid
+),
+owner_stats as (
+    select
+        u.id as user_id,
+        count(distinct b.id) filter (where b.class = 1) as gold_badges,
+        count(distinct b.id) filter (where b.class = 2) as silver_badges,
+        count(distinct b.id) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where p.posttypeid = 1) as total_questions,
+        count(*) filter (where p.posttypeid = 2) as total_answers,
+        sum(p.score) as total_post_score,
+        max(u.lastaccessdate) as last_seen
+    from users u
+    left join badges b on b.userid = u.id
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+tag_popularity as (
+    select
+        t.tagname,
+        t.count,
+        row_number() over (order by t.count desc nulls last, t.tagname) as rn_pop
+    from tags t
+),
+question_tag_expanded as (
+    select
+        qa.question_id,
+        qa.owner_id,
+        unnest(string_to_array(substring(coalesce(qa.tags,''), 2, greatest(length(coalesce(qa.tags,''))-2,0)), '><')) as tagname
+    from question_activity qa
+),
+question_tag_rank as (
+    select
+        qte.question_id,
+        qte.owner_id,
+        qte.tagname,
+        tp.count as tag_global_count,
+        dense_rank() over (partition by qte.question_id order by tp.count desc nulls last, qte.tagname) as tag_rank_within_question
+    from question_tag_expanded qte
+    left join tag_popularity tp on lower(tp.tagname) = lower(qte.tagname)
+),
+accepted_answer as (
+    select
+        q.id as question_id,
+        q.acceptedanswerid as accepted_answer_id,
+        a.owneruserid as accepted_answer_owner_id,
+        a.score as accepted_answer_score
+    from posts q
+    left join posts a on a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+),
+question_quality as (
+    select
+        qa.question_id,
+        qa.owner_id,
+        qa.question_creationdate,
+        qa.question_score,
+        qa.viewcount,
+        qa.answer_count,
+        qa.avg_answer_score,
+        qr.upvotes,
+        qr.downvotes,
+        qr.favorites,
+        cr.first_closed_at,
+        cr.close_reason_id,
+        l.duplicate_links,
+        l.related_links,
+        aa.accepted_answer_id,
+        aa.accepted_answer_owner_id,
+        aa.accepted_answer_score,
+        (
+            coalesce(qa.question_score,0) * 2
+            + coalesce(qr.upvotes,0) * 1.5
+            - coalesce(qr.downvotes,0) * 1.0
+            + coalesce(qr.favorites,0) * 0.5
+            + coalesce(qa.answer_count,0) * 0.75
+            + least(greatest(coalesce(qa.avg_answer_score,0), -10), 50) * 0.4
+            + coalesce(qa.viewcount,0) / nullif((extract(epoch from age(cast('2024-10-01 12:34:56' as timestamp), qa.question_creationdate))/86400.0), 0)
+            - case when cr.first_closed_at is not null then 10 else 0 end
+            - coalesce(l.duplicate_links,0) * 2
+        ) as quality_score
+    from question_activity qa
+    left join vote_rollup qr on qr.postid = qa.question_id
+    left join closed_reasons cr on cr.postid = qa.question_id
+    left join links l on l.postid = qa.question_id
+    left join accepted_answer aa on aa.question_id = qa.question_id
+),
+owner_enriched as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.creationdate,
+        ru.location,
+        ru.websiteurl,
+        os.gold_badges,
+        os.silver_badges,
+        os.bronze_badges,
+        os.total_questions,
+        os.total_answers,
+        os.total_post_score,
+        os.last_seen,
+        row_number() over (order by coalesce(os.total_post_score,0) desc, ru.reputation desc, ru.user_id) as rn_contrib
+    from recent_users ru
+    left join owner_stats os on os.user_id = ru.user_id
+),
+owner_question_rank as (
+    select
+        qq.owner_id,
+        qq.question_id,
+        qq.quality_score,
+        row_number() over (partition by qq.owner_id order by qq.quality_score desc nulls last, qq.question_id) as rn_best_question
+    from question_quality qq
+),
+-- compute percentiles without ordered-set aggregate OVER by calculating them in a separate aggregation
+percentiles as (
+    select
+        p.quantile,
+        p.value
+    from (
+        select 0.5 as quantile union all select 0.9 union all select 0.99
+    ) q
+    cross join lateral (
+        select
+            percentile_cont(q.quantile) within group (order by qq.quality_score) as value
+        from question_quality qq
+    ) p
+),
+flag_outliers as (
+    select
+        qq.question_id,
+        qq.owner_id,
+        qq.quality_score,
+        -- join percentile values by quantile
+        (select value from percentiles where quantile = 0.5) as p50,
+        (select value from percentiles where quantile = 0.9) as p90,
+        (select value from percentiles where quantile = 0.99) as p99
+    from question_quality qq
+),
+dupe_network as (
+    select
+        qa.question_id,
+        count(distinct pl.relatedpostid) filter (where pl.linktypeid = 3) as dupes_outgoing,
+        count(distinct pl.postid) filter (where pl.linktypeid = 3) as dupes_incoming
+    from question_activity qa
+    left join postlinks pl on pl.postid = qa.question_id or pl.relatedpostid = qa.question_id
+    group by qa.question_id
+)
+select
+    oe.user_id,
+    oe.displayname,
+    oe.reputation,
+    oe.creationdate as user_created_at,
+    oe.location,
+    oe.websiteurl,
+    oe.gold_badges,
+    oe.silver_badges,
+    oe.bronze_badges,
+    oe.total_questions,
+    oe.total_answers,
+    oe.total_post_score,
+    oe.last_seen,
+    qq.question_id,
+    qq.quality_score,
+    qa.question_creationdate,
+    qa.title,
+    qa.tag_count,
+    coalesce(string_agg(distinct qtr.tagname order by qtr.tag_rank_within_question, qtr.tagname) filter (where qtr.tag_rank_within_question <= 3), '') as top3_tags,
+    vr.upvotes,
+    vr.downvotes,
+    vr.favorites,
+    coalesce(aa.accepted_answer_id, 0) as accepted_answer_id,
+    coalesce(aa.accepted_answer_owner_id, 0) as accepted_answer_owner_id,
+    coalesce(aa.accepted_answer_score, 0) as accepted_answer_score,
+    coalesce(cr.close_reason_id, 0) as close_reason_id,
+    coalesce(l.related_links, 0) as related_links,
+    coalesce(l.duplicate_links, 0) as duplicate_links,
+    dn.dupes_outgoing,
+    dn.dupes_incoming,
+    case
+        when qq.quality_score >= fo.p99 then 'p99+'
+        when qq.quality_score >= fo.p90 then 'p90-99'
+        when qq.quality_score >= fo.p50 then 'p50-90'
+        else 'p0-50'
+    end as quality_bucket
+from owner_enriched oe
+join owner_question_rank oqr on oqr.owner_id = oe.user_id and oqr.rn_best_question <= 5
+join question_quality qq on qq.question_id = oqr.question_id
+join question_activity qa on qa.question_id = qq.question_id
+left join vote_rollup vr on vr.postid = qq.question_id
+left join accepted_answer aa on aa.question_id = qq.question_id
+left join closed_reasons cr on cr.postid = qq.question_id
+left join links l on l.postid = qq.question_id
+left join flag_outliers fo on fo.question_id = qq.question_id
+left join dupe_network dn on dn.question_id = qq.question_id
+left join lateral (
+    select qtr.tagname, qtr.tag_rank_within_question
+    from question_tag_rank qtr
+    where qtr.question_id = qq.question_id
+      and qtr.tag_rank_within_question <= 3
+    order by qtr.tag_rank_within_question, qtr.tagname
+) top_tags on true
+left join question_tag_rank qtr on qtr.question_id = qq.question_id and qtr.tag_rank_within_question <= 3
+where
+    coalesce(oe.total_questions,0) + coalesce(oe.total_answers,0) >= 1
+    and (qa.question_creationdate >= oe.creationdate or qa.question_creationdate is null)
+    and (oe.reputation >= 0 or oe.reputation is null)
+group by
+    oe.user_id, oe.displayname, oe.reputation, oe.creationdate, oe.location, oe.websiteurl,
+    oe.gold_badges, oe.silver_badges, oe.bronze_badges, oe.total_questions, oe.total_answers, oe.total_post_score, oe.last_seen,
+    qq.question_id, qq.quality_score, qa.question_creationdate, qa.title, qa.tag_count,
+    vr.upvotes, vr.downvotes, vr.favorites,
+    aa.accepted_answer_id, aa.accepted_answer_owner_id, aa.accepted_answer_score,
+    cr.close_reason_id, l.related_links, l.duplicate_links,
+    dn.dupes_outgoing, dn.dupes_incoming,
+    fo.p50, fo.p90, fo.p99
+order by
+    oe.rn_contrib,
+    oqr.rn_best_question,
+    qq.quality_score desc nulls last;

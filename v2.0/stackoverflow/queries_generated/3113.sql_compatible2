@@ -1,0 +1,132 @@
+WITH TagList AS (
+    SELECT 
+        t.Id                AS TagId,
+        t.TagName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.ViewCount),0)                AS TagQuestionViews
+    FROM Tags t
+    LEFT JOIN Posts p 
+        ON p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.Id, t.TagName
+),
+UserMetrics AS (
+    SELECT 
+        u.Id                           AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        SUM(CASE 
+                WHEN v.VoteTypeId = 2 THEN 1
+                WHEN v.VoteTypeId = 3 THEN -1
+                ELSE 0 
+            END)                         AS NetScore,
+        MAX(p.CreationDate)            AS LastPostDate,
+        MAX(COALESCE(v.CreationDate, p.LastActivityDate)) AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT *
+    FROM UserMetrics
+    WHERE Reputation > 10000
+    ORDER BY NetScore DESC
+    LIMIT 50
+),
+UserTagScore AS (
+    SELECT 
+        tu.UserId,
+        tl.TagId,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScore,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersInTag,
+        ROW_NUMBER() OVER (PARTITION BY tu.UserId ORDER BY 
+            SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) DESC) AS rn
+    FROM TopUsers tu
+    JOIN Posts p 
+        ON p.OwnerUserId = tu.UserId 
+        AND p.PostTypeId = 2
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(substr(p.Tags,2,length(p.Tags)-2), '><')) AS tag
+    ) pt ON true
+    JOIN TagList tl 
+        ON tl.TagName = pt.tag
+    GROUP BY tu.UserId, tl.TagId
+),
+UserBadges AS (
+    SELECT 
+        ub.Id                                           AS UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1)             AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)             AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)             AS BronzeBadges
+    FROM Users ub
+    LEFT JOIN Badges b ON b.UserId = ub.Id
+    GROUP BY ub.Id
+),
+RecentClosedQuestions AS (
+    SELECT 
+        p.Id                     AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        ph.CreationDate          AS ClosedDate,
+        COALESCE(ph.Comment, '') AS CloseReason,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn
+    FROM Posts p
+    LEFT JOIN PostHistory ph 
+        ON ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId = 10
+    WHERE p.PostTypeId = 1
+),
+FinalResult AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        uts.TagId,
+        tl.TagName,
+        uts.AnswerScore,
+        uts.AnswersInTag,
+        rcq.QuestionId,
+        rcq.Title               AS ClosedQuestionTitle,
+        rcq.CloseReason
+    FROM TopUsers tu
+    LEFT JOIN UserBadges ub 
+        ON ub.UserId = tu.UserId
+    LEFT JOIN UserTagScore uts 
+        ON uts.UserId = tu.UserId AND uts.rn = 1
+    LEFT JOIN TagList tl 
+        ON tl.TagId = uts.TagId
+    LEFT JOIN LATERAL (
+        SELECT 
+            rcq.QuestionId,
+            rcq.Title,
+            rcq.CloseReason,
+            rcq.ClosedDate
+        FROM RecentClosedQuestions rcq
+        WHERE rcq.rn = 1 
+          AND rcq.QuestionId IN (
+              SELECT p.ParentId 
+              FROM Posts p 
+              WHERE p.OwnerUserId = tu.UserId 
+                AND p.PostTypeId = 2
+          )
+        ORDER BY rcq.ClosedDate DESC
+        LIMIT 1
+    ) rcq ON true
+)
+SELECT *
+FROM FinalResult
+WHERE GoldBadges IS NOT NULL
+  AND AnswerScore > 0
+  AND (ClosedQuestionTitle IS NULL OR ClosedQuestionTitle <> '')
+ORDER BY Reputation DESC, AnswerScore DESC
+UNION ALL
+SELECT 
+    CAST(NULL AS bigint), CAST(NULL AS text), CAST(NULL AS integer), CAST(NULL AS integer), CAST(NULL AS integer), CAST(NULL AS integer),
+    CAST(NULL AS bigint), CAST(NULL AS text), CAST(NULL AS integer), CAST(NULL AS integer), CAST(NULL AS bigint), CAST(NULL AS text)
+WHERE NOT EXISTS (SELECT 1 FROM FinalResult);

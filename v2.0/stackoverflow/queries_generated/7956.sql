@@ -1,0 +1,214 @@
+-- {"query": "7956.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1954} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) as RankByReputation,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score >= 100 THEN 'HighlyVoted'
+            WHEN p.Score >= 50 THEN 'ModeratelyVoted'
+            WHEN p.Score >= 10 THEN 'LowVoted'
+            ELSE 'VeryLowVoted'
+        END as VoteCategory,
+        COALESCE(p.Tags, '') as Tags,
+        LENGTH(COALESCE(p.Tags, '')) as TagsLength,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                (SELECT COUNT(*) FROM unnest(string_to_array(trim(trim(p.Tags, '<>'), '><')) as tag)
+            ELSE 0
+        END as TagCount,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= '2020-01-01'
+),
+UserPostActivity AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        ps.PostId,
+        ps.Title,
+        ps.Score,
+        ps.ViewCount,
+        ps.CommentCount as PostCommentCount,
+        ps.AnswerCount,
+        ps.CreationDate,
+        ps.PostType,
+        ps.VoteCategory,
+        ps.Tags,
+        ps.TagCount,
+        ps.ScoreRank,
+        CASE 
+            WHEN ps.Score >= 100 THEN 'Elite'
+            WHEN ps.Score >= 50 THEN 'Experienced'
+            WHEN ps.Score >= 10 THEN 'Beginner'
+            ELSE 'Newbie'
+        END as ContributionLevel,
+        ABS(ps.Score - AVG(ps.Score) OVER (PARTITION BY ps.PostTypeId)) as ScoreDeviationFromTypeAvg,
+        CONCAT(ps.Title, ' - ', ps.VoteCategory, ' - Tags:', ps.TagCount) as PostSummary
+    FROM UserActivity ua
+    INNER JOIN PostStats ps ON ua.UserId = ps.OwnerUserId
+    WHERE ps.Score > 0
+),
+HighImpactPosts AS (
+    SELECT 
+        upa.PostId,
+        upa.Title,
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.Score,
+        upa.ViewCount,
+        upa.PostCommentCount,
+        upa.AnswerCount,
+        upa.CreationDate,
+        upa.PostType,
+        upa.VoteCategory,
+        upa.TagCount,
+        upa.ContributionLevel,
+        upa.ScoreDeviationFromTypeAvg,
+        upa.PostSummary,
+        CASE 
+            WHEN upa.Score > 100 AND upa.ViewCount > 1000 THEN 'Viral'
+            WHEN upa.Score > 50 AND upa.ViewCount > 500 THEN 'Popular'
+            WHEN upa.Score > 25 AND upa.ViewCount > 250 THEN 'Notable'
+            WHEN upa.Score >= 10 THEN 'Standard'
+            ELSE 'Sparse'
+        END as ImpactLevel,
+        PERCENT_RANK() OVER (ORDER BY upa.Score DESC) as ScorePercentile,
+        NTILE(4) OVER (ORDER BY upa.Score DESC) as ScoreQuartile,
+        ROW_NUMBER() OVER (PARTITION BY upa.UserId ORDER BY upa.Score DESC) as UserRanking
+    FROM UserPostActivity upa
+    WHERE upa.Score > 10 AND upa.ViewCount > 10
+),
+TagAnalysis AS (
+    SELECT 
+        ta.TagName,
+        ta.Count,
+        ta.ExcerptPostId,
+        ta.WikiPostId,
+        CASE 
+            WHEN ta.Count > 1000 THEN 'Trending'
+            WHEN ta.Count > 500 THEN 'Popular'
+            WHEN ta.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as PopularityLevel,
+        COALESCE(ta.Count, 0) as TagCount,
+        ABS(COALESCE(ta.Count, 0) - AVG(COALESCE(ta.Count, 0)) OVER()) as PopularityDeviation
+    FROM Tags ta
+    WHERE ta.Count >= 50
+),
+UserContributions AS (
+    SELECT 
+        h.UserRanking,
+        h.ImpactLevel,
+        h.Score,
+        h.ViewCount,
+        h.PostCommentCount,
+        h.AnswerCount,
+        h.ScoreDeviationFromTypeAvg,
+        h.ContributionLevel,
+        h.ScorePercentile,
+        h.ScoreQuartile,
+        h.PostSummary,
+        ROW_NUMBER() OVER (PARTITION BY h.ImpactLevel ORDER BY h.Score DESC) as ImpactRank,
+        RANK() OVER (ORDER BY h.Score DESC) as GlobalRank,
+        DENSE_RANK() OVER (ORDER BY h.ViewCount DESC) as ViewRank,
+        AVG(h.Score) OVER (PARTITION BY h.ContributionLevel) as AvgScoreByLevel,
+        CASE 
+            WHEN h.Score >= AVG(h.Score) OVER() THEN 'AboveAverage'
+            WHEN h.Score >= AVG(h.Score) OVER() * 0.8 THEN 'NearAverage'
+            ELSE 'BelowAverage'
+        END as PerformanceLevel
+    FROM HighImpactPosts h
+)
+SELECT 
+    uc.GlobalRank,
+    uc.UserRanking,
+    uc.ImpactLevel,
+    uc.Score as PostScore,
+    uc.ViewCount,
+    uc.PostCommentCount,
+    uc.AnswerCount,
+    uc.ContributionLevel,
+    uc.ScorePercentile,
+    uc.ScoreQuartile,
+    uc.AvgScoreByLevel,
+    uc.PerformanceLevel,
+    CASE 
+        WHEN uc.GlobalRank <= 10 THEN 'Top10'
+        WHEN uc.GlobalRank <= 50 THEN 'Top50'
+        WHEN uc.GlobalRank <= 100 THEN 'Top100'
+        ELSE 'Others'
+    END as GlobalPerformanceTier,
+    uc.PostSummary,
+    CASE 
+        WHEN uc.ScoreQuartile = 1 AND uc.ImpactLevel = 'Viral' THEN 'Prime'
+        WHEN uc.ScoreQuartile = 4 AND uc.ImpactLevel = 'Sparse' THEN 'Struggling'
+        ELSE 'Standard'
+    END as PerformanceCategory,
+    ROUND(uc.ScorePercentile * 100, 2) as ScorePercentilePercentage,
+    ROUND(uc.ScoreDeviationFromTypeAvg, 2) as ScoreDeviation,
+    COALESCE(NULLIF(uc.PostSummary, ''), 'No Summary') as SafePostSummary
+FROM UserContributions uc
+WHERE uc.GlobalRank BETWEEN 1 AND 100
+AND uc.PostSummary IS NOT NULL
+AND uc.PostSummary != ''
+UNION ALL
+SELECT 
+    NULL as GlobalRank,
+    NULL as UserRanking,
+    'Aggregate' as ImpactLevel,
+    AVG(uc.Score) as PostScore,
+    SUM(uc.ViewCount) as ViewCount,
+    SUM(uc.PostCommentCount) as PostCommentCount,
+    SUM(uc.AnswerCount) as AnswerCount,
+    'Overall' as ContributionLevel,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY uc.ScorePercentile) as ScorePercentile,
+    NULL as ScoreQuartile,
+    AVG(uc.AvgScoreByLevel) as AvgScoreByLevel,
+    'Aggregate' as PerformanceLevel,
+    'Overall' as GlobalPerformanceTier,
+    'Aggregate Metrics' as PostSummary,
+    'Standard' as PerformanceCategory,
+    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY uc.ScorePercentile) * 100, 2) as ScorePercentilePercentage,
+    ROUND(AVG(uc.ScoreDeviationFromTypeAvg), 2) as ScoreDeviation,
+    'Aggregate' as SafePostSummary
+FROM UserContributions uc
+ORDER BY GlobalRank, Score DESC NULLS LAST

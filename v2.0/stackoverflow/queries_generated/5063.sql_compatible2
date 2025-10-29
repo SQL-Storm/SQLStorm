@@ -1,0 +1,179 @@
+WITH
+RecentTopQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+TopContributors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    (SELECT COUNT(*) FROM Posts t WHERE t.OwnerUserId = u.Id AND t.PostTypeId = 1) AS QuestionCount,
+    (SELECT COUNT(*) FROM Posts a WHERE a.OwnerUserId = u.Id AND a.PostTypeId = 2) AS AnswerCount
+  FROM Users u
+  WHERE u.Reputation > 1000
+),
+PostTags AS (
+  SELECT
+    p.Id AS PostId,
+    TRIM(BOTH '<>' FROM tag) AS TagName
+  FROM Posts p
+  JOIN (
+    -- split tags like '<tag1><tag2>' into array then unnest in a portable way where regexp_split_to_array/unnest not available.
+    -- Using a recursive approach: extract between <> pairs
+    WITH RECURSIVE tag_extract(post_id, tags_str, tag, rest) AS (
+      SELECT p.Id, p.Tags, 
+             NULL::text, p.Tags
+      FROM (SELECT p.Id, p.Tags FROM Posts p) p
+      UNION ALL
+      SELECT post_id,
+             rest,
+             CASE
+               WHEN rest LIKE '<%>%' THEN SUBSTRING(rest FROM 2 FOR (POSITION('>' IN rest) - 2))
+               WHEN rest LIKE '<%>' THEN SUBSTRING(rest FROM 2 FOR (LENGTH(rest) - 2))
+               ELSE NULL
+             END,
+             CASE
+               WHEN rest LIKE '<%>%' THEN SUBSTRING(rest FROM (POSITION('>' IN rest) + 1))
+               ELSE ''
+             END
+      FROM tag_extract
+      WHERE rest IS NOT NULL AND rest <> ''
+    )
+    SELECT post_id, tag FROM tag_extract WHERE tag IS NOT NULL
+  ) t ON t.post_id = p.Id
+),
+TagActivity AS (
+  SELECT
+    pt.TagName,
+    COUNT(*) AS TagQuestionCount,
+    AVG(p.ViewCount) AS AvgViewsPerQuestion,
+    MAX(p.Score) AS MaxScore
+  FROM Posts p
+  JOIN PostTags pt ON pt.PostId = p.Id
+  JOIN Tags tg ON tg.TagName = pt.TagName
+  GROUP BY pt.TagName
+),
+ComplexBenchmark AS (
+  SELECT
+    ro.Id AS PostId,
+    ro.Title,
+    ro.CreationDate,
+    ro.LastEditDate,
+    ro.OwnerUserId,
+    ro.Tags,
+    COALESCE(vc.BountyAmount, 0) AS Bounty,
+    vc.CreationDate AS BountyDate,
+    vtn.VoteCount
+  FROM Posts ro
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) FILTER (WHERE VoteTypeId = 2) AS votes_type_2,
+           COUNT(*) FILTER (WHERE VoteTypeId = 3) AS votes_type_3
+    FROM Votes
+    GROUP BY PostId
+  ) v ON v.PostId = ro.Id
+  LEFT JOIN (
+    SELECT PostId, MAX(CreationDate) AS CreationDate, SUM(COALESCE(BountyAmount,0)) AS BountyAmount
+    FROM Votes
+    GROUP BY PostId
+  ) vc ON vc.PostId = ro.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS VoteCount
+    FROM Votes
+    GROUP BY PostId
+  ) vtn ON vtn.PostId = ro.Id
+  WHERE ro.PostTypeId IN (1,2)
+)
+SELECT
+  t.UserId,
+  t.DisplayName,
+  t.Reputation,
+  t.QuestionCount,
+  t.AnswerCount,
+  rcp.PostId AS MostViewedQuestionId,
+  rcp.Title AS MostViewedQuestionTitle,
+  rcp.ViewCount AS MostViewedQuestionViews,
+  rcp.CreationDate AS MostViewedQuestionDate,
+  q.PostId AS QPostId,
+  q.Title AS QTitle,
+  q.ViewCount AS QViews,
+  q.CreationDate AS QCreationDate,
+  q.rn AS RankForUser,
+  ta.TagName,
+  ta.TagQuestionCount,
+  ta.AvgViewsPerQuestion,
+  ta.MaxScore,
+  cb.PostId AS BenchmarkPostId,
+  cb.Title AS BenchmarkPostTitle,
+  cb.Bounty,
+  cb.BountyDate,
+  cb.VoteCount
+FROM TopContributors t
+LEFT JOIN (
+  SELECT
+    p.OwnerUserId,
+    p.Id AS PostId,
+    p.Title,
+    p.ViewCount,
+    p.CreationDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+) q ON q.OwnerUserId = t.UserId
+LEFT JOIN (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId
+  FROM Posts p
+  ORDER BY p.ViewCount DESC
+  LIMIT 1
+) rcp ON rcp.OwnerUserId = t.UserId
+LEFT JOIN TagActivity ta ON 1=1
+LEFT JOIN ComplexBenchmark cb ON cb.PostId = rcp.PostId
+GROUP BY
+  t.UserId,
+  t.DisplayName,
+  t.Reputation,
+  t.QuestionCount,
+  t.AnswerCount,
+  rcp.PostId,
+  rcp.Title,
+  rcp.ViewCount,
+  rcp.CreationDate,
+  q.PostId,
+  q.Title,
+  q.ViewCount,
+  q.CreationDate,
+  q.rn,
+  ta.TagName,
+  ta.TagQuestionCount,
+  ta.AvgViewsPerQuestion,
+  ta.MaxScore,
+  cb.PostId,
+  cb.Title,
+  cb.Bounty,
+  cb.BountyDate,
+  cb.VoteCount
+ORDER BY t.Reputation DESC, t.UserId
+LIMIT 100;

@@ -1,0 +1,425 @@
+-- {"query": "620.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 4165} 
+with
+-- Active question base with tag array
+q as (
+  select
+    p.Id as QuestionId,
+    p.Title,
+    p.CreationDate as QuestionDate,
+    p.OwnerUserId,
+    p.Score as QuestionScore,
+    p.ViewCount,
+    string_to_array(substring(p.Tags, 2, nullif(length(p.Tags)-2,0)), '><') as tag_arr,
+    coalesce(p.AnswerCount, 0) as AnswerCount
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select date_trunc('year', min(CreationDate)) from Posts where PostTypeId = 1)
+),
+-- Answers joined to questions (including accepted flag), window ranks by score and recency
+a as (
+  select
+    pa.Id as AnswerId,
+    pa.ParentId as QuestionId,
+    pa.OwnerUserId as AnswerUserId,
+    pa.Score as AnswerScore,
+    pa.CreationDate as AnswerDate,
+    case when pq.AcceptedAnswerId = pa.Id then 1 else 0 end as IsAccepted,
+    row_number() over (partition by pa.ParentId order by pa.Score desc nulls last, pa.CreationDate desc nulls last, pa.Id) as rn_score_desc,
+    row_number() over (partition by pa.ParentId order by pa.CreationDate asc nulls last, pa.Id) as rn_oldest
+  from Posts pa
+  join Posts pq on pq.Id = pa.ParentId and pa.PostTypeId = 2 and pq.PostTypeId = 1
+),
+-- Comment activity per question and answer, last 30 days sliding window relative to question date
+c_act as (
+  select
+    c.PostId,
+    count(*) filter (where c.Score > 0) as PosComments,
+    count(*) filter (where c.Score <= 0 or c.Score is null) as NonPosComments,
+    max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+),
+-- Votes aggregation and entropy-like distribution per post
+v_agg as (
+  select
+    v.PostId,
+    count(*) filter (where v.VoteTypeId = 2) as UpVotes,
+    count(*) filter (where v.VoteTypeId = 3) as DownVotes,
+    count(*) filter (where v.VoteTypeId = 5) as Favorites,
+    count(*) as TotalVotes,
+    -- simple dispersion metric to stress CPU
+    case
+      when count(*) = 0 then 0.0
+      else
+        -1.0 * (
+          coalesce(count(*) filter (where v.VoteTypeId = 2)::numeric / count(*), 0) * nullif(ln(coalesce(count(*) filter (where v.VoteTypeId = 2)::numeric / nullif(count(*),0),0)),0)
+          +
+          coalesce(count(*) filter (where v.VoteTypeId = 3)::numeric / count(*), 0) * nullif(ln(coalesce(count(*) filter (where v.VoteTypeId = 3)::numeric / nullif(count(*),0),0)),0)
+        )
+    end as VoteDispersion
+  from Votes v
+  group by v.PostId
+),
+-- Tag popularity snapshot
+tag_pop as (
+  select
+    t.TagName,
+    t.Count as TagCount,
+    dense_rank() over (order by t.Count desc nulls last, t.TagName) as TagRankDesc
+  from Tags t
+),
+-- Users baseline
+u as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate as UserCreated,
+    u.Location,
+    coalesce(u.UpVotes,0) as GivenUpVotes,
+    coalesce(u.DownVotes,0) as GivenDownVotes,
+    coalesce(u.Views,0) as ProfileViews
+  from Users u
+),
+-- Badge summary per user with windowed last badge date
+ub as (
+  select
+    b.UserId,
+    count(*) as BadgeCount,
+    count(*) filter (where b.Class = 1) as GoldBadges,
+    count(*) filter (where b.Class = 2) as SilverBadges,
+    count(*) filter (where b.Class = 3) as BronzeBadges,
+    max(b.Date) as LastBadgeDate
+  from Badges b
+  group by b.UserId
+),
+-- Closed or migrated events per question
+q_events as (
+  select
+    ph.PostId,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (10,35,36)) as LastClosureOrMigrationDate,
+    string_agg(distinct crt.Name, ', ' order by crt.Name) filter (where ph.PostHistoryTypeId = 10 and ph.Comment ~ '^[0-9]+$') as CloseReasons
+  from PostHistory ph
+  left join CloseReasonTypes crt
+    on ph.PostHistoryTypeId = 10
+   and ph.Comment ~ '^[0-9]+$'
+   and crt.Id::text = ph.Comment
+  group by ph.PostId
+),
+-- Duplicate link graph
+dup_links as (
+  select
+    pl.PostId as DuplicateOf,
+    pl.RelatedPostId as Original,
+    count(*) as DupLinkCount
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+  group by pl.PostId, pl.RelatedPostId
+),
+-- Questions with normalized tags exploded
+q_tags as (
+  select
+    q.QuestionId,
+    lower(trim(t)) as tag
+  from q
+  left join lateral unnest(q.tag_arr) as t on true
+),
+-- Compute rolling activity windows over answers
+ans_windows as (
+  select
+    a.QuestionId,
+    count(*) as AnswerTotal,
+    count(*) filter (where a.IsAccepted = 1) as AcceptedAnswers,
+    max(a.AnswerScore) as MaxAnswerScore,
+    avg(a.AnswerScore::numeric) as AvgAnswerScore,
+    min(a.AnswerDate) as FirstAnswerDate,
+    max(a.AnswerDate) as LastAnswerDate,
+    count(*) filter (where a.rn_score_desc = 1) as HasTopScoredAnswer,
+    count(*) filter (where a.rn_oldest = 1) as HasOldestAnswer
+  from a
+  group by a.QuestionId
+),
+-- Rank questions by multiple criteria using window functions
+q_rank as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.QuestionDate,
+    q.OwnerUserId,
+    q.QuestionScore,
+    q.ViewCount,
+    coalesce(aw.AnswerTotal, 0) as AnswerTotal,
+    coalesce(aw.AvgAnswerScore, 0) as AvgAnswerScore,
+    coalesce(aw.MaxAnswerScore, 0) as MaxAnswerScore,
+    row_number() over (order by q.ViewCount desc nulls last, q.QuestionScore desc nulls last, q.CreationDate desc nulls last, q.Id) as RN_Popularity,
+    row_number() over (order by coalesce(aw.AvgAnswerScore,0) desc nulls last, q.QuestionScore desc nulls last, q.Id) as RN_AnswerQuality
+  from q
+  left join ans_windows aw on aw.QuestionId = q.QuestionId
+),
+-- Combine question and post-level votes/comments
+post_metrics as (
+  select
+    q.QuestionId,
+    coalesce(vq.UpVotes,0) as QUpVotes,
+    coalesce(vq.DownVotes,0) as QDownVotes,
+    coalesce(vq.TotalVotes,0) as QTotalVotes,
+    coalesce(vq.VoteDispersion,0) as QVoteDispersion,
+    coalesce(cq.PosComments,0) as QPosComments,
+    coalesce(cq.NonPosComments,0) as QNonPosComments,
+    cq.LastCommentDate as QLastCommentDate
+  from q
+  left join v_agg vq on vq.PostId = q.QuestionId
+  left join c_act cq on cq.PostId = q.QuestionId
+),
+-- Heaviest interacting answers per question (for outer join volume)
+answer_top as (
+  select distinct on (a.QuestionId)
+    a.QuestionId,
+    a.AnswerId,
+    a.AnswerScore,
+    a.AnswerDate,
+    a.AnswerUserId
+  from a
+  order by a.QuestionId, a.Score desc nulls last, a.CreationDate desc nulls last, a.Id
+),
+-- Users merged with badge stats
+user_stats as (
+  select
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    coalesce(ub.BadgeCount,0) as BadgeCount,
+    coalesce(ub.GoldBadges,0) as GoldBadges,
+    coalesce(ub.SilverBadges,0) as SilverBadges,
+    coalesce(ub.BronzeBadges,0) as BronzeBadges,
+    ub.LastBadgeDate,
+    u.Location,
+    u.ProfileViews,
+    u.GivenUpVotes,
+    u.GivenDownVotes,
+    -- engagement score with non-linear scaling
+    (u.Reputation::numeric * 0.6)
+      + (coalesce(ub.BadgeCount,0) * 5)
+      + (u.ProfileViews::numeric * 0.02)
+      + (greatest(u.GivenUpVotes - u.GivenDownVotes, 0) * 0.5) as EngagementScore
+  from u
+  left join ub on ub.UserId = u.UserId
+),
+-- Aggregate tag ranks for each question
+q_tag_rank as (
+  select
+    qt.QuestionId,
+    avg(tp.TagRankDesc::numeric) as AvgTagRank,
+    min(tp.TagRankDesc) as BestTagRank,
+    max(tp.TagRankDesc) as WorstTagRank,
+    count(*) as TagCount
+  from q_tags qt
+  join tag_pop tp on tp.TagName = qt.tag
+  group by qt.QuestionId
+),
+-- Analytic scoring for questions
+q_score as (
+  select
+    qr.QuestionId,
+    qr.Title,
+    qr.QuestionDate,
+    qr.OwnerUserId,
+    qr.QuestionScore,
+    qr.ViewCount,
+    qr.AnswerTotal,
+    qr.AvgAnswerScore,
+    qr.MaxAnswerScore,
+    pm.QUpVotes, pm.QDownVotes, pm.QTotalVotes, pm.QVoteDispersion, pm.QPosComments, pm.QNonPosComments, pm.QLastCommentDate,
+    qtr.AvgTagRank, qtr.BestTagRank, qtr.WorstTagRank, qtr.TagCount,
+    qe.LastClosureOrMigrationDate,
+    nullif(length(coalesce(q.Title,'')),0) as TitleLen,
+    -- composite quality metric
+    (
+      (coalesce(qr.QuestionScore,0) * 1.0)
+      + (coalesce(qr.ViewCount,0) / nullif(10.0 + qtr.AvgTagRank, 0))
+      + (coalesce(pm.QUpVotes,0) * 0.8 - coalesce(pm.QDownVotes,0) * 1.2)
+      + (coalesce(qr.AvgAnswerScore,0) * 2.0)
+      + (case when qe.LastClosureOrMigrationDate is not null then -25 else 0 end)
+      + (case when qtr.TagCount >= 5 then -2 else 0 end)
+      + (least(nullif(length(coalesce(q.Title,'')),0), 150) / 10.0)
+    ) as CompositeScore
+  from q_rank qr
+  left join post_metrics pm on pm.QuestionId = qr.QuestionId
+  left join q_tag_rank qtr on qtr.QuestionId = qr.QuestionId
+  left join q_events qe on qe.PostId = qr.QuestionId
+  join q on q.Id = qr.QuestionId
+),
+-- Deduplicate and enrich duplicates via PostLinks
+dup_enrich as (
+  select
+    d.DuplicateOf as QuestionId,
+    count(*) as DuplicateEdges,
+    count(distinct d.Original) as DistinctOriginals
+  from dup_links d
+  group by d.DuplicateOf
+),
+-- Top related by link graph (non-duplicate)
+related_links as (
+  select
+    pl.PostId as QuestionId,
+    count(*) filter (where pl.LinkTypeId = 1) as LinkedCount
+  from PostLinks pl
+  group by pl.PostId
+),
+-- Bring in answer top user stats
+answer_user as (
+  select
+    at.QuestionId,
+    us.DisplayName as TopAnswerer,
+    us.Reputation as TopAnswererReputation,
+    us.EngagementScore as TopAnswererEngagement,
+    at.AnswerScore as TopAnswerScore,
+    at.AnswerDate as TopAnswerDate
+  from answer_top at
+  left join user_stats us on us.UserId = at.AnswerUserId
+),
+-- Question owner stats
+owner_user as (
+  select
+    q.OwnerUserId,
+    us.DisplayName as OwnerName,
+    us.Reputation as OwnerReputation,
+    us.EngagementScore as OwnerEngagement
+  from q
+  left join user_stats us on us.UserId = q.OwnerUserId
+  group by q.OwnerUserId, us.DisplayName, us.Reputation, us.EngagementScore
+),
+-- Normalize NULLs and construct text fields
+final_prep as (
+  select
+    qs.QuestionId,
+    qs.Title,
+    coalesce(qs.CompositeScore, 0) as CompositeScore,
+    coalesce(qs.QuestionScore, 0) as QuestionScore,
+    coalesce(qs.ViewCount, 0) as ViewCount,
+    coalesce(qs.AnswerTotal, 0) as AnswerTotal,
+    coalesce(qs.AvgAnswerScore, 0) as AvgAnswerScore,
+    coalesce(qs.MaxAnswerScore, 0) as MaxAnswerScore,
+    coalesce(qs.QUpVotes, 0) as QUpVotes,
+    coalesce(qs.QDownVotes, 0) as QDownVotes,
+    coalesce(qs.QTotalVotes, 0) as QTotalVotes,
+    coalesce(qs.QVoteDispersion, 0) as QVoteDispersion,
+    coalesce(qs.QPosComments, 0) as QPosComments,
+    coalesce(qs.QNonPosComments, 0) as QNonPosComments,
+    qs.QLastCommentDate,
+    coalesce(qs.AvgTagRank, 0) as AvgTagRank,
+    coalesce(qs.BestTagRank, 0) as BestTagRank,
+    coalesce(qs.WorstTagRank, 0) as WorstTagRank,
+    coalesce(qs.TagCount, 0) as TagCount,
+    coalesce(de.DuplicateEdges, 0) as DuplicateEdges,
+    coalesce(de.DistinctOriginals, 0) as DistinctOriginals,
+    coalesce(rl.LinkedCount, 0) as LinkedCount,
+    au.TopAnswerer,
+    au.TopAnswererReputation,
+    au.TopAnswererEngagement,
+    ou.OwnerName,
+    ou.OwnerReputation,
+    ou.OwnerEngagement,
+    case
+      when qs.LastClosureOrMigrationDate is not null then 1
+      else 0
+    end as HasClosureOrMigration,
+    qs.TitleLen,
+    -- human-friendly label with string manipulation and null handling
+    trim(both ' ' from coalesce(ou.OwnerName, '(community)')) || ' :: ' ||
+    coalesce(left(qs.Title, least(coalesce(qs.TitleLen,0), 100)), '(no title)') as OwnerAndTitle
+  from q_score qs
+  left join dup_enrich de on de.QuestionId = qs.QuestionId
+  left join related_links rl on rl.QuestionId = qs.QuestionId
+  left join answer_user au on au.QuestionId = qs.QuestionId
+  left join owner_user ou on ou.OwnerUserId = qs.OwnerUserId
+),
+-- Rank by multiple criteria using set operators to stress planner
+rank_sets as (
+  select QuestionId, 1 as src, dense_rank() over (order by CompositeScore desc, ViewCount desc, QUpVotes desc, QDownVotes asc) as rnk from final_prep
+  union all
+  select QuestionId, 2 as src, dense_rank() over (order by AnswerTotal desc, AvgAnswerScore desc, MaxAnswerScore desc) as rnk from final_prep
+  union all
+  select QuestionId, 3 as src, dense_rank() over (order by DuplicateEdges desc, DistinctOriginals desc, LinkedCount desc) as rnk from final_prep
+),
+-- Aggregate the ranks
+rank_agg as (
+  select
+    QuestionId,
+    min(case when src = 1 then rnk end) as RankComposite,
+    min(case when src = 2 then rnk end) as RankAnswers,
+    min(case when src = 3 then rnk end) as RankGraph,
+    avg(rnk::numeric) as AvgRank
+  from rank_sets
+  group by QuestionId
+),
+-- Correlated subquery example: most recent comment text snippet per question
+recent_comment as (
+  select
+    p.Id as QuestionId,
+    (
+      select left(c.Text, 120)
+      from Comments c
+      where c.PostId = p.Id
+      order by c.CreationDate desc, c.Id desc
+      limit 1
+    ) as LastCommentSnippet
+  from Posts p
+  where p.PostTypeId = 1
+)
+select
+  fp.QuestionId,
+  fp.OwnerAndTitle as Display,
+  fp.CompositeScore,
+  fp.QuestionScore,
+  fp.ViewCount,
+  fp.AnswerTotal,
+  fp.AvgAnswerScore,
+  fp.MaxAnswerScore,
+  fp.QUpVotes,
+  fp.QDownVotes,
+  fp.QTotalVotes,
+  fp.QVoteDispersion,
+  fp.QPosComments,
+  fp.QNonPosComments,
+  fp.TagCount,
+  fp.AvgTagRank,
+  fp.BestTagRank,
+  fp.WorstTagRank,
+  fp.DuplicateEdges,
+  fp.DistinctOriginals,
+  fp.LinkedCount,
+  fp.TopAnswerer,
+  fp.TopAnswererReputation,
+  fp.TopAnswererEngagement,
+  fp.OwnerName,
+  fp.OwnerReputation,
+  fp.OwnerEngagement,
+  fp.HasClosureOrMigration,
+  rc.LastCommentSnippet,
+  ra.RankComposite,
+  ra.RankAnswers,
+  ra.RankGraph,
+  ra.AvgRank
+from final_prep fp
+left join rank_agg ra on ra.QuestionId = fp.QuestionId
+left join recent_comment rc on rc.QuestionId = fp.QuestionId
+where
+  -- complicated predicate for benchmarking:
+  (
+    (fp.CompositeScore > 0 and (fp.QUpVotes >= fp.QDownVotes or fp.AnswerTotal > 0))
+    or
+    (fp.CompositeScore <= 0 and fp.QDownVotes > 0 and fp.TagCount between 1 and 5)
+  )
+  and coalesce(fp.TopAnswererReputation, 0) + coalesce(fp.OwnerReputation, 0) >= 0
+  and (
+    fp.LinkedCount > 0
+    or (fp.DuplicateEdges = 0 and fp.TagCount >= 2)
+    or (fp.QPosComments + fp.QNonPosComments) > 3
+  )
+order by
+  ra.RankComposite nulls last,
+  fp.CompositeScore desc,
+  fp.ViewCount desc,
+  fp.QuestionId
+limit 500;

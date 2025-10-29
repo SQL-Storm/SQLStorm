@@ -1,0 +1,266 @@
+-- {"query": "7739.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2820} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        SUM(COALESCE(p.Score, 0)) as TotalScore,
+        AVG(COALESCE(p.Score, 0)) as AvgScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') as TagList
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        LastCommentDate,
+        QuestionCount,
+        AnswerCount,
+        TotalScore,
+        AvgScore,
+        TagList,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, PostCount DESC) as RankByScore,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) as RankByReputation
+    FROM UserActivityStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Yes'
+            ELSE 'No'
+        END as HasAcceptedAnswer,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Active'
+        END as PostStatus,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as UpVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) as DownVotes,
+        COALESCE(p.FavoriteCount, 0) as FavoriteCount,
+        DATEDIFF('day', p.CreationDate, COALESCE(p.LastActivityDate, p.CreationDate)) as DaysActive,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Popular'
+            WHEN p.Score > 50 THEN 'Popular'
+            WHEN p.Score > 10 THEN 'Moderate'
+            ELSE 'Low'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as RankByScorePerType
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.Id IS NOT NULL
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, 
+             p.CreationDate, p.OwnerUserId, u.DisplayName, p.Tags, p.PostTypeId, 
+             p.AcceptedAnswerId, p.ClosedDate, p.CommunityOwnedDate, p.FavoriteCount, 
+             p.LastActivityDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(p1.ViewCount, 0) as ExcerptViews,
+        COALESCE(p2.ViewCount, 0) as WikiViews,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'Required'
+            WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only'
+            ELSE 'Regular'
+        END as TagType,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as TagRank
+    FROM Tags t
+    LEFT JOIN Posts p1 ON t.ExcerptPostId = p1.Id
+    LEFT JOIN Posts p2 ON t.WikiPostId = p2.Id
+),
+CombinedAnalysis AS (
+    SELECT 
+        'User' as AnalysisType,
+        CAST(tu.UserId as VARCHAR) as EntityId,
+        tu.DisplayName as EntityName,
+        'Reputation: ' + CAST(tu.Reputation as VARCHAR) + ', Posts: ' + CAST(tu.PostCount as VARCHAR) + ', Badges: ' + CAST(tu.BadgeCount as VARCHAR) as Details,
+        CAST(tu.TotalScore as VARCHAR) as Score,
+        'Rank: ' + CAST(tu.RankByScore as VARCHAR) + '/' + CAST(COUNT(*) OVER() as VARCHAR) as Ranking,
+        'Tags: ' + COALESCE(tu.TagList, 'N/A') as AdditionalInfo
+    FROM TopUsers tu
+    
+    UNION ALL
+    
+    SELECT 
+        'Post' as AnalysisType,
+        CAST(pa.PostId as VARCHAR) as EntityId,
+        COALESCE(pa.Title, 'No Title') as EntityName,
+        'Score: ' + CAST(pa.Score as VARCHAR) + ', Views: ' + CAST(pa.ViewCount as VARCHAR) + ', Answers: ' + CAST(pa.AnswerCount as VARCHAR) as Details,
+        CAST(pa.Score as VARCHAR) as Score,
+        'Rank: ' + CAST(pa.RankByScorePerType as VARCHAR) + '/' + CAST(COUNT(*) OVER() as VARCHAR) as Ranking,
+        pa.PostStatus + ' | Tags: ' + COALESCE(pa.Tags, 'N/A') as AdditionalInfo
+    FROM PostAnalysis pa
+    
+    UNION ALL
+    
+    SELECT 
+        'Tag' as AnalysisType,
+        CAST(ta.TagName as VARCHAR) as EntityId,
+        ta.TagName as EntityName,
+        'Count: ' + CAST(ta.TagCount as VARCHAR) + ', Excerpt Views: ' + CAST(ta.ExcerptViews as VARCHAR) + ', Wiki Views: ' + CAST(ta.WikiViews as VARCHAR) as Details,
+        CAST(ta.TagCount as VARCHAR) as Score,
+        'Rank: ' + CAST(ta.TagRank as VARCHAR) + '/' + CAST(COUNT(*) OVER() as VARCHAR) as Ranking,
+        ta.TagType + ' | ' +CASE WHEN ta.ExcerptPostId IS NOT NULL THEN 'Has Excerpt' ELSE 'No Excerpt' END as AdditionalInfo
+    FROM TagAnalysis ta
+),
+ComplexCalcs AS (
+    SELECT 
+        ca.AnalysisType,
+        ca.EntityId,
+        ca.EntityName,
+        ca.Details,
+        ca.Score,
+        ca.Ranking,
+        ca.AdditionalInfo,
+        CASE 
+            WHEN ca.AnalysisType = 'User' THEN 
+                (CAST(SUBSTRING(ca.Ranking, POSITION('Rank: ' in ca.Ranking)+6, POSITION('/' in ca.Ranking)-POSITION('Rank: ' in ca.Ranking)-6) as INTEGER) * 10 / 
+                 NULLIF(COUNT(*) OVER(), 0))
+            WHEN ca.AnalysisType = 'Post' THEN 
+                ((CASE WHEN ca.Score = '' THEN 0 ELSE CAST(ca.Score as INTEGER) END) * 100 / 
+                 NULLIF(MAX(CASE WHEN ca.AnalysisType = 'Post' THEN CAST(ca.Score as INTEGER) END) OVER(), 0))
+            ELSE 
+                (CAST(SUBSTRING(ca.Ranking, POSITION('Rank: ' in ca.Ranking)+6, POSITION('/' in ca.Ranking)-POSITION('Rank: ' in ca.Ranking)-6) as INTEGER) * 5 / 
+                 NULLIF(COUNT(*) OVER(), 0))
+        END as ComplexScore,
+        UPPER(SUBSTRING(ca.EntityName, 1, 1)) as FirstLetter,
+        LENGTH(ca.EntityName) as NameLength,
+        POSITION(' ' in ca.EntityName) as FirstSpacePosition,
+        CASE 
+            WHEN ca.AnalysisType = 'User' AND ca.Score != '0' THEN 'High'
+            WHEN ca.AnalysisType = 'Post' AND CAST(ca.Score as INTEGER) > 50 THEN 'High'
+            ELSE 'Medium'
+        END as RiskLevel,
+        CONCAT(
+            CASE WHEN ca.AnalysisType = 'Tag' THEN 'TAG_' ELSE '' END,
+            CASE WHEN ca.AnalysisType = 'Post' THEN 'POST_' ELSE '' END,
+            CASE WHEN ca.AnalysisType = 'User' THEN 'USER_' ELSE '' END,
+            ca.EntityId
+        ) as Identifier
+    FROM CombinedAnalysis ca
+),
+FinalAnalysis AS (
+    SELECT 
+        cc.AnalysisType,
+        cc.EntityId,
+        cc.EntityName,
+        cc.Details,
+        cc.Score,
+        cc.Ranking,
+        cc.AdditionalInfo,
+        cc.ComplexScore,
+        cc.FirstLetter,
+        cc.NameLength,
+        cc.FirstSpacePosition,
+        cc.RiskLevel,
+        cc.Identifier,
+        ROW_NUMBER() OVER (ORDER BY cc.ComplexScore DESC) as FinalRank,
+        LAG(cc.ComplexScore, 1) OVER (ORDER BY cc.ComplexScore DESC) as PrevScore,
+        LEAD(cc.ComplexScore, 1) OVER (ORDER BY cc.ComplexScore DESC) as NextScore,
+        AVG(cc.ComplexScore) OVER (ORDER BY cc.ComplexScore ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) as MovingAvg,
+        MIN(cc.ComplexScore) OVER (ORDER BY cc.ComplexScore) as MinScore,
+        MAX(cc.ComplexScore) OVER (ORDER BY cc.ComplexScore) as MaxScore,
+        COUNT(*) OVER() as TotalEntities,
+        CASE 
+            WHEN cc.Identification IS NOT NULL THEN 
+                CASE WHEN cc.AnalysisType = 'User' THEN 'User Analysis' 
+                     WHEN cc.AnalysisType = 'Post' THEN 'Post Analysis' 
+                     ELSE 'Tag Analysis' END
+            ELSE 'Unknown Analysis'
+        END as AnalysisCategory
+    FROM ComplexCalcs cc
+    LEFT JOIN (
+        SELECT DISTINCT AnalysisType, EntityId 
+        FROM ComplexCalcs
+    ) sub ON cc.AnalysisType = sub.AnalysisType AND cc.EntityId = sub.EntityId
+)
+SELECT 
+    fa.AnalysisType,
+    fa.EntityId,
+    fa.EntityName,
+    fa.Details,
+    fa.Score,
+    fa.Ranking,
+    fa.AdditionalInfo,
+    fa.ComplexScore,
+    fa.FirstLetter,
+    fa.NameLength,
+    fa.FirstSpacePosition,
+    fa.RiskLevel,
+    fa.Identifier,
+    fa.FinalRank,
+    fa.PrevScore,
+    fa.NextScore,
+    fa.MovingAvg,
+    fa.MinScore,
+    fa.MaxScore,
+    fa.TotalEntities,
+    fa.AnalysisCategory,
+    CASE 
+        WHEN fa.ComplexScore > (SELECT AVG(ComplexScore) FROM FinalAnalysis) THEN 'Above Average'
+        WHEN fa.ComplexScore < (SELECT AVG(ComplexScore) FROM FinalAnalysis) THEN 'Below Average'
+        ELSE 'Average'
+    END as ScoreStatus,
+    CASE 
+        WHEN fa.AnalysisType = 'User' AND fa.TotalEntities > 100 THEN 'High Volume User'
+        WHEN fa.AnalysisType = 'Post' AND fa.NameLength > 50 THEN 'Long Title Post'
+        WHEN fa.AnalysisType = 'Tag' AND fa.TagCount > 500 THEN 'Popular Tag'
+        ELSE 'Standard Entity'
+    END as EntityClassification,
+    DENSE_RANK() OVER (ORDER BY CASE WHEN fa.AnalysisType = 'User' THEN 1 ELSE 2 END, fa.ComplexScore DESC) as OverallRank,
+    IIF(fa.PrevScore IS NOT NULL, 
+        CASE WHEN fa.ComplexScore > fa.PrevScore THEN 'Increase' ELSE 'Decrease' END, 'Unknown') as Trend,
+    'Analysis Complete' as Status,
+    cast('2024-10-01 12:34:56' as timestamp) as AnalysisTimestamp,
+    COALESCE(NULLIF(fa.FirstLetter, ''), 'N/A') as LetterFix,
+    COALESCE(NULLIF(fa.FirstSpacePosition, 0), -1) as SpaceFix,
+    CAST(fa.TotalEntities AS FLOAT) / NULLIF(COUNT(*) OVER(), 0) as Proportion,
+    CASE 
+        WHEN fa.FinalRank = 1 THEN 'Top Performer'
+        WHEN fa.FinalRank <= (SELECT COUNT(*) FROM FinalAnalysis) * 0.2 THEN 'Top 20%'
+        WHEN fa.FinalRank <= (SELECT COUNT(*) FROM FinalAnalysis) * 0.5 THEN 'Top 50%'
+        ELSE 'Lower Tier'
+    END as PerformanceTier
+FROM FinalAnalysis fa
+WHERE fa.AnalysisType IN ('User', 'Post', 'Tag')
+  AND fa.AnalysisCategory IS NOT NULL
+  AND (fa.ComplexScore > 0 OR fa.ComplexScore IS NOT NULL)
+ORDER BY fa.ComplexScore DESC, fa.FinalRank
+LIMIT 100;

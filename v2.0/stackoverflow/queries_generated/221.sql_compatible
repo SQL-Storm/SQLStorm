@@ -1,0 +1,545 @@
+with recent_questions as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.OwnerUserId,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.Tags,
+    coalesce(q.FavoriteCount, 0) as FavoriteCount
+  from Posts q
+  where q.PostTypeId = 1
+    and q.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+),
+answers as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId as AnswererId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerDate,
+    a.LastActivityDate as AnswerLastActivity,
+    a.CommunityOwnedDate
+  from Posts a
+  where a.PostTypeId = 2
+),
+first_answer as (
+  select distinct on (QuestionId)
+    QuestionId,
+    AnswerId,
+    AnswererId,
+    AnswerScore,
+    AnswerDate
+  from answers
+  order by QuestionId, AnswerDate asc, AnswerScore desc, AnswerId asc
+),
+vote_aggs as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+    sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal,
+    min(case when v.VoteTypeId in (8,9) then v.CreationDate end) as FirstBountyDate
+  from Votes v
+  group by v.PostId
+),
+comment_density as (
+  select
+    c.PostId,
+    count(*) as CommentCount,
+    avg(nullif(length(c.Text),0)) as AvgCommentLen,
+    sum(case when c.Score >= 5 then 1 else 0 end) as HighScoreComments
+  from Comments c
+  group by c.PostId
+),
+tag_split as (
+  select
+    q.QuestionId,
+    unnest(string_to_array(substring(coalesce(q.Tags,'') from 2 for greatest(length(coalesce(q.Tags,'')) - 2, 0)), '><')) as tag
+  from recent_questions q
+),
+tag_quality as (
+  select
+    ts.QuestionId,
+    sum(case when t.Count >= 10000 then 2 when t.Count >= 1000 then 1 else 0 end) as TagWeight,
+    max(case when t.IsModeratorOnly then 1 else 0 end) as HasModOnly,
+    max(case when t.IsRequired then 1 else 0 end) as HasRequired
+  from tag_split ts
+  left join Tags t on lower(ts.tag) = lower(t.TagName)
+  group by ts.QuestionId
+),
+link_info as (
+  select
+    pl.PostId as QuestionId,
+    sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as LinkedCount,
+    sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateMarks
+  from PostLinks pl
+  group by pl.PostId
+),
+history_flags as (
+  select
+    ph.PostId as QuestionId,
+    max(case when ph.PostHistoryTypeId in (10,35) then 1 else 0 end) as WasClosedOrMigrated,
+    max(case when ph.PostHistoryTypeId in (11) then 1 else 0 end) as WasReopened,
+    max(case when ph.PostHistoryTypeId in (24) then 1 else 0 end) as HasSuggestedEdits,
+    max(case when ph.PostHistoryTypeId in (50) then 1 else 0 end) as WasCommunityBumped
+  from PostHistory ph
+  group by ph.PostId
+),
+user_stats as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    date_part('day', cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate) as AccountAgeDays,
+    coalesce(u.UpVotes,0) as UpVotesGiven,
+    coalesce(u.DownVotes,0) as DownVotesGiven,
+    coalesce(u.Views,0) as ProfileViews
+  from Users u
+),
+badge_summary as (
+  select
+    b.UserId,
+    sum(case when b.Class = 1 then 1 else 0 end) as Gold,
+    sum(case when b.Class = 2 then 1 else 0 end) as Silver,
+    sum(case when b.Class = 3 then 1 else 0 end) as Bronze,
+    sum(case when b.TagBased = true then 1 else 0 end) as TagBadges,
+    min(b.Date) as FirstBadgeDate,
+    max(b.Date) as LastBadgeDate
+  from Badges b
+  group by b.UserId
+),
+question_user as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.Tags,
+    q.FavoriteCount,
+    qu.UserId as OwnerUserId,
+    qu.DisplayName as OwnerName,
+    qu.Reputation as OwnerRep,
+    qu.AccountAgeDays as OwnerAgeDays,
+    coalesce(bs.Gold,0) as OwnerGold,
+    coalesce(bs.Silver,0) as OwnerSilver,
+    coalesce(bs.Bronze,0) as OwnerBronze,
+    coalesce(bs.TagBadges,0) as OwnerTagBadges
+  from recent_questions q
+  left join user_stats qu on q.OwnerUserId = qu.UserId
+  left join badge_summary bs on q.OwnerUserId = bs.UserId
+),
+accepted_answer as (
+  select
+    q.Id as QuestionId,
+    q.AcceptedAnswerId
+  from Posts q
+  where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+answer_agg as (
+  select
+    a.QuestionId,
+    count(*) as AnswersTotal,
+    max(a.AnswerScore) as MaxAnswerScore,
+    avg(a.AnswerScore) as AvgAnswerScore,
+    min(a.AnswerDate) as FirstAnswerDate,
+    max(a.AnswerDate) as LastAnswerDate
+  from answers a
+  group by a.QuestionId
+),
+answerer_stats as (
+  select
+    fa.QuestionId,
+    us.UserId as FirstAnswererId,
+    us.DisplayName as FirstAnswererName,
+    us.Reputation as FirstAnswererRep,
+    coalesce(bs.Gold,0) as FirstAnswererGold,
+    coalesce(bs.Silver,0) as FirstAnswererSilver,
+    coalesce(bs.Bronze,0) as FirstAnswererBronze
+  from first_answer fa
+  left join user_stats us on fa.AnswererId = us.UserId
+  left join badge_summary bs on fa.AnswererId = bs.UserId
+),
+engagement as (
+  select
+    qu.QuestionId,
+    coalesce(va.UpVotes,0) as UpVotes,
+    coalesce(va.DownVotes,0) as DownVotes,
+    coalesce(va.Favorites,0) as FavoritesVotes,
+    coalesce(va.BountyTotal,0) as BountyTotal,
+    va.FirstBountyDate,
+    coalesce(cd.CommentCount,0) as CommentCount,
+    coalesce(cd.AvgCommentLen,0) as AvgCommentLen,
+    coalesce(cd.HighScoreComments,0) as HighScoreComments,
+    coalesce(li.LinkedCount,0) as LinkedCount,
+    coalesce(li.DuplicateMarks,0) as DuplicateMarks
+  from question_user qu
+  left join vote_aggs va on qu.QuestionId = va.PostId
+  left join comment_density cd on qu.QuestionId = cd.PostId
+  left join link_info li on qu.QuestionId = li.QuestionId
+),
+quality_score as (
+  select
+    qu.QuestionId,
+    qu.Title,
+    qu.CreationDate,
+    qu.Score,
+    qu.ViewCount,
+    qu.AnswerCount,
+    qu.Tags,
+    qu.FavoriteCount,
+    qu.OwnerUserId,
+    qu.OwnerName,
+    qu.OwnerRep,
+    qu.OwnerAgeDays,
+    qu.OwnerGold,
+    qu.OwnerSilver,
+    qu.OwnerBronze,
+    qu.OwnerTagBadges,
+    an.AnswersTotal,
+    an.MaxAnswerScore,
+    an.AvgAnswerScore,
+    an.FirstAnswerDate,
+    an.LastAnswerDate,
+    aa.AcceptedAnswerId,
+    af.FirstAnswererId,
+    af.FirstAnswererName,
+    af.FirstAnswererRep,
+    af.FirstAnswererGold,
+    af.FirstAnswererSilver,
+    af.FirstAnswererBronze,
+    tg.TagWeight,
+    tg.HasModOnly,
+    tg.HasRequired,
+    e.UpVotes,
+    e.DownVotes,
+    e.FavoritesVotes,
+    e.BountyTotal,
+    e.FirstBountyDate,
+    e.CommentCount,
+    e.AvgCommentLen,
+    e.HighScoreComments,
+    e.LinkedCount,
+    e.DuplicateMarks,
+    hf.WasClosedOrMigrated,
+    hf.WasReopened,
+    hf.HasSuggestedEdits,
+    hf.WasCommunityBumped,
+    case
+      when qu.Score is null then 0
+      else
+        least(1000,
+          coalesce(qu.Score,0) * 4
+          + coalesce(e.UpVotes,0) * 2
+          - coalesce(e.DownVotes,0)
+          + coalesce(qu.ViewCount,0) / 50
+          + coalesce(e.FavoritesVotes,0) * 3
+          + coalesce(e.BountyTotal,0) / 50
+          + coalesce(an.AnswersTotal,0) * 5
+          + coalesce(an.MaxAnswerScore,0) * 2
+          + coalesce(tg.TagWeight,0) * 10
+          + case when hf.WasClosedOrMigrated = 1 then -100 else 0 end
+          + case when hf.WasReopened = 1 then 20 else 0 end
+          + case when hf.HasSuggestedEdits = 1 then 10 else 0 end
+          + case when hf.WasCommunityBumped = 1 then 5 else 0 end
+          + case when e.DuplicateMarks > 0 then -50 else 0 end
+          + case when e.LinkedCount > 0 then least(50, e.LinkedCount * 2) else 0 end
+          + case when qu.OwnerRep >= 10000 then 25 when qu.OwnerRep >= 1000 then 10 else 0 end
+          + case when af.FirstAnswererRep >= 10000 then 10 when af.FirstAnswererRep >= 1000 then 5 else 0 end
+          + case when aa.AcceptedAnswerId is not null then 30 else 0 end
+          + greatest(0, 20 - coalesce(date_part('day', cast('2024-10-01 12:34:56' as timestamp) - qu.CreationDate), 0) / 7)
+        )
+    end as QualityScore
+  from question_user qu
+  left join answer_agg an on qu.QuestionId = an.QuestionId
+  left join accepted_answer aa on qu.QuestionId = aa.QuestionId
+  left join answerer_stats af on qu.QuestionId = af.QuestionId
+  left join tag_quality tg on qu.QuestionId = tg.QuestionId
+  left join engagement e on qu.QuestionId = e.QuestionId
+  left join history_flags hf on qu.QuestionId = hf.QuestionId
+),
+ranked as (
+  select
+    qs.QuestionId,
+    qs.Title,
+    qs.CreationDate,
+    qs.Score,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.Tags,
+    qs.FavoriteCount,
+    qs.OwnerUserId,
+    qs.OwnerName,
+    qs.OwnerRep,
+    qs.OwnerAgeDays,
+    qs.OwnerGold,
+    qs.OwnerSilver,
+    qs.OwnerBronze,
+    qs.OwnerTagBadges,
+    qs.AnswersTotal,
+    qs.MaxAnswerScore,
+    qs.AvgAnswerScore,
+    qs.FirstAnswerDate,
+    qs.LastAnswerDate,
+    qs.AcceptedAnswerId,
+    qs.FirstAnswererId,
+    qs.FirstAnswererName,
+    qs.FirstAnswererRep,
+    qs.FirstAnswererGold,
+    qs.FirstAnswererSilver,
+    qs.FirstAnswererBronze,
+    qs.TagWeight,
+    qs.HasModOnly,
+    qs.HasRequired,
+    qs.UpVotes,
+    qs.DownVotes,
+    qs.FavoritesVotes,
+    qs.BountyTotal,
+    qs.FirstBountyDate,
+    qs.CommentCount,
+    qs.AvgCommentLen,
+    qs.HighScoreComments,
+    qs.LinkedCount,
+    qs.DuplicateMarks,
+    qs.WasClosedOrMigrated,
+    qs.WasReopened,
+    qs.HasSuggestedEdits,
+    qs.WasCommunityBumped,
+    qs.QualityScore,
+    row_number() over (order by qs.QualityScore desc, qs.ViewCount desc, qs.Score desc, qs.QuestionId desc) as rn,
+    percentile_disc(0.9) within group (order by qs.QualityScore) over () as p90,
+    avg(qs.QualityScore) over () as avg_qs,
+    stddev_pop(qs.QualityScore) over () as std_qs,
+    ntile(10) over (order by qs.QualityScore desc) as decile
+  from quality_score qs
+),
+outliers as (
+  select
+    r.QuestionId,
+    r.Title,
+    r.CreationDate,
+    r.Score,
+    r.ViewCount,
+    r.AnswerCount,
+    r.Tags,
+    r.FavoriteCount,
+    r.OwnerUserId,
+    r.OwnerName,
+    r.OwnerRep,
+    r.OwnerAgeDays,
+    r.OwnerGold,
+    r.OwnerSilver,
+    r.OwnerBronze,
+    r.OwnerTagBadges,
+    r.AnswersTotal,
+    r.MaxAnswerScore,
+    r.AvgAnswerScore,
+    r.FirstAnswerDate,
+    r.LastAnswerDate,
+    r.AcceptedAnswerId,
+    r.FirstAnswererId,
+    r.FirstAnswererName,
+    r.FirstAnswererRep,
+    r.FirstAnswererGold,
+    r.FirstAnswererSilver,
+    r.FirstAnswererBronze,
+    r.TagWeight,
+    r.HasModOnly,
+    r.HasRequired,
+    r.UpVotes,
+    r.DownVotes,
+    r.FavoritesVotes,
+    r.BountyTotal,
+    r.FirstBountyDate,
+    r.CommentCount,
+    r.AvgCommentLen,
+    r.HighScoreComments,
+    r.LinkedCount,
+    r.DuplicateMarks,
+    r.WasClosedOrMigrated,
+    r.WasReopened,
+    r.HasSuggestedEdits,
+    r.WasCommunityBumped,
+    r.QualityScore,
+    r.rn,
+    r.p90,
+    r.avg_qs,
+    r.std_qs,
+    r.decile,
+    case when r.QualityScore >= r.avg_qs + 3 * coalesce(r.std_qs,0) then 1 else 0 end as IsHighOutlier,
+    case when r.QualityScore <= r.avg_qs - 3 * coalesce(r.std_qs,0) then 1 else 0 end as IsLowOutlier
+  from ranked r
+),
+dupe_clusters as (
+  select
+    q.QuestionId,
+    coalesce(string_agg(distinct cast(pl.RelatedPostId as varchar), ','), '') as DuplicateOfIds,
+    count(distinct pl.RelatedPostId) as DuplicateOfCount
+  from recent_questions q
+  left join PostLinks pl
+    on pl.PostId = q.QuestionId and pl.LinkTypeId = 3
+  group by q.QuestionId
+),
+finalized as (
+  select
+    o.QuestionId,
+    o.Title,
+    o.CreationDate,
+    o.Score,
+    o.ViewCount,
+    o.AnswerCount,
+    o.Tags,
+    o.FavoriteCount,
+    o.OwnerUserId,
+    o.OwnerName,
+    o.OwnerRep,
+    o.OwnerAgeDays,
+    o.OwnerGold,
+    o.OwnerSilver,
+    o.OwnerBronze,
+    o.OwnerTagBadges,
+    o.AnswersTotal,
+    o.MaxAnswerScore,
+    o.AvgAnswerScore,
+    o.FirstAnswerDate,
+    o.LastAnswerDate,
+    o.AcceptedAnswerId,
+    o.FirstAnswererId,
+    o.FirstAnswererName,
+    o.FirstAnswererRep,
+    o.FirstAnswererGold,
+    o.FirstAnswererSilver,
+    o.FirstAnswererBronze,
+    o.TagWeight,
+    o.HasModOnly,
+    o.HasRequired,
+    o.UpVotes,
+    o.DownVotes,
+    o.FavoritesVotes,
+    o.BountyTotal,
+    o.FirstBountyDate,
+    o.CommentCount,
+    o.AvgCommentLen,
+    o.HighScoreComments,
+    o.LinkedCount,
+    o.DuplicateMarks,
+    o.WasClosedOrMigrated,
+    o.WasReopened,
+    o.HasSuggestedEdits,
+    o.WasCommunityBumped,
+    o.QualityScore,
+    o.rn,
+    o.p90,
+    o.avg_qs,
+    o.std_qs,
+    o.decile,
+    o.IsHighOutlier,
+    o.IsLowOutlier,
+    dc.DuplicateOfIds,
+    dc.DuplicateOfCount,
+    length(coalesce(o.Title,'')) as TitleLen,
+    regexp_replace(coalesce(o.Title,''), '\s+', ' ', 'g') as NormalizedTitle,
+    strpos(lower(coalesce(o.Title,'')), 'how to') as HasHowTo,
+    strpos(lower(coalesce(o.Title,'')), 'error') as HasErrorWord,
+    case when o.OwnerName is null then 1 else 0 end as OwnerIsNull,
+    case when o.AcceptedAnswerId is null then 0 else 1 end as HasAccepted,
+    case when o.TagWeight is null then 0 else o.TagWeight end as TagWeightSafe
+  from outliers o
+  left join dupe_clusters dc on o.QuestionId = dc.QuestionId
+)
+select
+  f.QuestionId,
+  f.Title,
+  f.NormalizedTitle,
+  f.TitleLen,
+  f.CreationDate,
+  f.OwnerUserId,
+  coalesce(f.OwnerName, '[unknown]') as OwnerName,
+  f.OwnerRep,
+  f.OwnerAgeDays,
+  f.OwnerGold,
+  f.OwnerSilver,
+  f.OwnerBronze,
+  f.OwnerTagBadges,
+  f.Score,
+  f.ViewCount,
+  f.AnswerCount,
+  f.Tags,
+  f.FavoriteCount,
+  f.UpVotes,
+  f.DownVotes,
+  f.FavoritesVotes,
+  f.BountyTotal,
+  f.FirstBountyDate,
+  f.CommentCount,
+  round(coalesce(f.AvgCommentLen,0), 2) as AvgCommentLen,
+  f.HighScoreComments,
+  f.LinkedCount,
+  f.DuplicateMarks,
+  f.DuplicateOfIds,
+  f.DuplicateOfCount,
+  f.AnswersTotal,
+  f.MaxAnswerScore,
+  round(coalesce(f.AvgAnswerScore,0), 2) as AvgAnswerScore,
+  f.FirstAnswerDate,
+  f.LastAnswerDate,
+  f.AcceptedAnswerId,
+  f.FirstAnswererId,
+  f.FirstAnswererName,
+  f.FirstAnswererRep,
+  f.FirstAnswererGold,
+  f.FirstAnswererSilver,
+  f.FirstAnswererBronze,
+  f.TagWeightSafe as TagWeight,
+  f.HasModOnly,
+  f.HasRequired,
+  f.WasClosedOrMigrated,
+  f.WasReopened,
+  f.HasSuggestedEdits,
+  f.WasCommunityBumped,
+  f.QualityScore,
+  f.decile as QualityDecile,
+  f.p90 as P90Quality,
+  f.avg_qs as AvgQuality,
+  f.std_qs as StdQuality,
+  f.IsHighOutlier,
+  f.IsLowOutlier,
+  f.HasHowTo > 0 as TitleHasHowTo,
+  f.HasErrorWord > 0 as TitleHasErrorWord,
+  f.OwnerIsNull = 1 as OwnerUnknown,
+  case
+    when f.DuplicateMarks > 0 and f.WasReopened = 1 then 'reopened-duplicate'
+    when f.DuplicateMarks > 0 then 'duplicate'
+    when f.WasClosedOrMigrated = 1 then 'closed/migrated'
+    when f.HasAccepted = 1 then 'resolved'
+    when f.AnswersTotal > 0 then 'answered'
+    else 'unanswered'
+  end as ResolutionState,
+  case
+    when f.decile <= 2 then 'top'
+    when f.decile <= 5 then 'upper-mid'
+    when f.decile <= 8 then 'lower-mid'
+    else 'bottom'
+  end as QualityBand,
+  row_number() over (
+    partition by case when f.OwnerRep >= 10000 then 'veteran' when f.OwnerRep >= 1000 then 'regular' else 'new' end
+    order by f.QualityScore desc, f.ViewCount desc
+  ) as RankWithinOwnerTier
+from finalized f
+where (
+    coalesce(f.TagWeightSafe, 0) + coalesce(f.UpVotes, 0) + (case when f.OwnerRep is null then 0 else 1 end) >= 1
+    and (f.TitleLen > 10 or f.Tags is not null)
+    and not (f.WasClosedOrMigrated = 1 and f.WasReopened = 0 and f.DuplicateMarks > 0)
+  )
+  and (
+    f.QualityScore >= f.p90
+    or (f.AnswersTotal >= 3 and f.MaxAnswerScore >= 5)
+    or (f.ViewCount >= 10000 and f.UpVotes - f.DownVotes >= 5)
+  )
+order by f.QualityScore desc, f.ViewCount desc, f.Score desc, f.QuestionId desc
+limit 250;

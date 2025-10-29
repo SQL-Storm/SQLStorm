@@ -1,0 +1,179 @@
+-- {"query": "3295.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2596} 
+
+/*  Benchmark‑heavy query using the full StackOverflow schema  */
+WITH
+/* ------------------------------------------------------------------
+   1️⃣  Per‑user aggregated statistics (including correlated sub‑queries)
+   ------------------------------------------------------------------ */
+UserStats AS (
+    SELECT
+        u.Id                              AS UserId,
+        COALESCE(u.DisplayName,'<deleted>') AS DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVoteBalance,
+        /* Gold / Silver / Bronze badge counts */
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        /* Questions & Answers authored */
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS ACount
+    FROM Users u
+),
+
+/* ------------------------------------------------------------------
+   2️⃣  Tag usage derived table (string ops, aggregation, filtering)
+   ------------------------------------------------------------------ */
+TagUsage AS (
+    SELECT
+        t.TagName,
+        COUNT(*)                                          AS TagPostCount,
+        SUM(CASE WHEN p.Score > 0 THEN p.Score ELSE 0 END) AS PositiveScoreSum,
+        /* top three contributors for the tag, concatenated */
+        STRING_AGG(DISTINCT u.DisplayName, ', ') 
+            FILTER (WHERE u.Id IS NOT NULL) 
+            OVER (PARTITION BY t.TagName ORDER BY u.Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) 
+            AS TopContributors
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE CONCAT('%<',t.TagName,'%>')
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    GROUP BY t.TagName
+    HAVING COUNT(*) > 50                                 -- keep only “busy” tags
+),
+
+/* ------------------------------------------------------------------
+   3️⃣  Window‑function‑rich post ranking (outer join to vote aggregates)
+   ------------------------------------------------------------------ */
+PostRanks AS (
+    SELECT
+        p.Id                                   AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate) AS RankByScore,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC)                             AS GlobalViewRank,
+        COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0)                           AS NetVotes,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL        THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community'
+            ELSE 'Open'
+        END                                                                      AS Status
+    FROM Posts p
+    LEFT JOIN (
+        SELECT
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    WHERE p.PostTypeId IN (1,2)               -- questions & answers only
+),
+
+/* ------------------------------------------------------------------
+   4️⃣  Combine user, their best post, and most‑used tag (correlated sub‑queries)
+   ------------------------------------------------------------------ */
+Combined AS (
+    SELECT
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.NetVoteBalance,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.QCount,
+        us.ACount,
+        pr.PostId,
+        pr.Title,
+        pr.RankByScore,
+        pr.GlobalViewRank,
+        pr.Status,
+        /* Most frequent tag for this user (null‑safe) */
+        ISNULL(
+            (SELECT tu.TagName
+             FROM Tags t
+             JOIN Posts p ON p.Tags LIKE CONCAT('%<',t.TagName,'%>')
+             WHERE p.OwnerUserId = us.UserId
+             GROUP BY t.TagName
+             ORDER BY COUNT(*) DESC
+             OFFSET 0 ROWS FETCH NEXT 1 ROW ONLY),
+            'NoTag')                                           AS TopTag,
+        /* Tag‑level stats for that tag */
+        tu.TagPostCount,
+        tu.PositiveScoreSum,
+        tu.TopContributors
+    FROM UserStats us
+    LEFT OUTER JOIN PostRanks pr
+        ON pr.PostId = (
+            SELECT TOP 1 p2.Id
+            FROM Posts p2
+            WHERE p2.OwnerUserId = us.UserId
+            ORDER BY p2.Score DESC, p2.CreationDate DESC
+        )
+    LEFT OUTER JOIN TagUsage tu
+        ON tu.TagName = (
+            SELECT TOP 1 t2.TagName
+            FROM Tags t2
+            JOIN Posts p3 ON p3.Tags LIKE CONCAT('%<',t2.TagName,'%>')
+            WHERE p3.OwnerUserId = us.UserId
+            GROUP BY t2.TagName
+            ORDER BY COUNT(*) DESC
+        )
+)
+
+/* ------------------------------------------------------------------
+   5️⃣  Final SELECT with filtering, ordering, pagination, and a set operator
+   ------------------------------------------------------------------ */
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    NetVoteBalance,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    QCount,
+    ACount,
+    PostId,
+    Title,
+    RankByScore,
+    GlobalViewRank,
+    Status,
+    TopTag,
+    TagPostCount,
+    PositiveScoreSum,
+    TopContributors
+FROM Combined
+WHERE
+    Reputation >= 10000                     -- heavyweight users
+    OR GoldBadges >= 3
+    OR (QCount + ACount) > 250
+ORDER BY Reputation DESC, GoldBadges DESC, NetVoteBalance DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+
+UNION ALL
+
+/* ------------------------------------------------------------------
+   6️⃣  Dummy row set to keep the UNION shape stable (NULL logic)
+   ------------------------------------------------------------------ */
+SELECT
+    NULL AS UserId,
+    '---' AS DisplayName,
+    NULL AS Reputation,
+    NULL AS NetVoteBalance,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS QCount,
+    NULL AS ACount,
+    NULL AS PostId,
+    NULL AS Title,
+    NULL AS RankByScore,
+    NULL AS GlobalViewRank,
+    NULL AS Status,
+    NULL AS TopTag,
+    NULL AS TagPostCount,
+    NULL AS PositiveScoreSum,
+    NULL AS TopContributors
+FROM (SELECT 1) AS dummy;

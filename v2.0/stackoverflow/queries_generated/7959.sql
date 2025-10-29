@@ -1,0 +1,276 @@
+-- {"query": "7959.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3516} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) as TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) as TotalAnswerScore,
+        MAX(p.CreationDate) as LatestPostDate,
+        MAX(c.CreationDate) as LatestCommentDate,
+        MAX(b.Date) as LatestBadgeDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        TotalQuestionScore,
+        TotalAnswerScore,
+        LatestPostDate,
+        LatestCommentDate,
+        LatestBadgeDate,
+        ROW_NUMBER() OVER (ORDER BY (TotalQuestionScore + TotalAnswerScore) DESC) as ActivityRank,
+        CASE 
+            WHEN PostCount > 1000 THEN 'Elite'
+            WHEN PostCount > 500 THEN 'Veteran'
+            WHEN PostCount > 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END as UserCategory
+    FROM UserActivityStats
+),
+PostEngagement AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        COALESCE(v.UpVoteCount, 0) as UpVotes,
+        COALESCE(v.DownVoteCount, 0) as DownVotes,
+        COALESCE(v.FavoriteCount, 0) as Favorites,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Engaged'
+            WHEN p.Score > 50 THEN 'Engaged'
+            WHEN p.Score > 10 THEN 'Moderate'
+            ELSE 'Low'
+        END as EngagementLevel,
+        DATEDIFF(CURRENT_TIMESTAMP, p.CreationDate) as AgeInDays,
+        CASE 
+            WHEN p.CommentCount > 10 THEN 'Highly discussed'
+            WHEN p.CommentCount > 5 THEN 'Discussed'
+            ELSE 'Low discussion'
+        END as DiscussionLevel,
+        COALESCE(p.ViewCount, 0) / NULLIF(COALESCE(p.AnswerCount, 1), 0) as ViewsPerAnswer,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN p.Score / NULLIF(p.AnswerCount, 0)
+            ELSE 0
+        END as AvgScorePerAnswer
+    FROM Posts p
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) as UpVoteCount,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) as DownVoteCount,
+            SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) as FavoriteCount
+        FROM Votes
+        GROUP BY PostId
+    ) v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2)
+),
+CrossUserActivity AS (
+    SELECT 
+        u1.UserId as User1Id,
+        u2.UserId as User2Id,
+        u1.DisplayName as User1Name,
+        u2.DisplayName as User2Name,
+        COUNT(DISTINCT CASE WHEN p1.OwnerUserId = u1.UserId THEN p1.Id END) as User1Posts,
+        COUNT(DISTINCT CASE WHEN p2.OwnerUserId = u2.UserId THEN p2.Id END) as User2Posts,
+        COUNT(DISTINCT CASE WHEN p1.OwnerUserId = u1.UserId AND p2.OwnerUserId = u2.UserId THEN p1.Id END) as SharedPosts,
+        CONCAT('User ', u1.UserId, ' & User ', u2.UserId) as Partnership
+    FROM TopUsers u1
+    CROSS JOIN TopUsers u2
+    LEFT JOIN Posts p1 ON p1.OwnerUserId = u1.UserId
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u2.UserId
+    WHERE u1.UserId != u2.UserId
+    GROUP BY u1.UserId, u2.UserId, u1.DisplayName, u2.DisplayName
+),
+ComplexActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(*) as TotalActivities,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) THEN 1 END) as EditActivities,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 1 END) as StatusChangeActivities,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (24, 25) THEN 1 END) as SuggestedEditActivities,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (31, 33, 34, 35, 36) THEN 1 END) as OtherActivities,
+        AVG(DATEDIFF(CURRENT_TIMESTAMP, ph.CreationDate)) as AvgDaysSinceActivity,
+        STRING_AGG(CONCAT(ph.PostHistoryTypeId, ':', ph.Comment), ', ') as ActivityLog,
+        COUNT(DISTINCT ph.PostId) as ActivePosts,
+        COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId = 1 THEN 1 ELSE 0 END), 0) as TitleChanges,
+        COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId = 2 THEN 1 ELSE 0 END), 0) as BodyChanges,
+        COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId = 3 THEN 1 ELSE 0 END), 0) as TagChanges,
+        COALESCE(SUM(CASE WHEN ph.Comment IS NOT NULL AND ph.Comment != '' THEN 1 ELSE 0 END), 0) as CommentedActivities
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+)
+SELECT 
+    'Performance Benchmark Query Result' as QueryType,
+    COUNT(DISTINCT u.Id) as TotalUsers,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT ph.Id) as TotalPostHistories,
+    COUNT(DISTINCT c.Id) as TotalComments,
+    COUNT(DISTINCT b.Id) as TotalBadges,
+    COUNT(DISTINCT CASE WHEN (v.VoteTypeId = 1 OR v.VoteTypeId = 2 OR v.VoteTypeId = 3 OR v.VoteTypeId = 5) THEN v.Id END) as TotalVotes,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as TotalAnswers,
+    AVG(u.Reputation) as AverageReputation,
+    AVG(COALESCE(p.Score, 0)) as AverageScore,
+    MAX(COALESCE(p.ViewCount, 0)) as MaxViews,
+    SUM(CASE WHEN p.AnswerCount > 0 THEN 1 ELSE 0 END) as QuestionWithAnswers,
+    SUM(CASE WHEN p.AnswerCount = 0 THEN 1 ELSE 0 END) as QuestionWithoutAnswers,
+    COUNT(DISTINCT CASE WHEN p.ClosedDate IS NOT NULL THEN p.Id END) as ClosedPosts,
+    COUNT(DISTINCT CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN p.Id END) as CommunityOwnedPosts,
+    COUNT(DISTINCT CASE WHEN p.LastActivityDate > DATEADD(MONTH, -1, CURRENT_TIMESTAMP) THEN p.Id END) as RecentActivityPosts,
+    COALESCE(SUM(p.Score), 0) as TotalScore,
+    CASE 
+        WHEN COUNT(DISTINCT u.Id) > 0 THEN COUNT(DISTINCT CASE WHEN p.OwnerUserId IS NOT NULL THEN p.Id END) / COUNT(DISTINCT u.Id)
+        ELSE 0 
+    END as AvgPostsPerUser,
+    COUNT(DISTINCT CASE 
+        WHEN p.PostTypeId = 1 AND p.AnswerCount > 10 THEN p.Id 
+        ELSE NULL 
+    END) as HighAnsweredQuestions,
+    STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, '; ') as SampleQuestionTitles,
+    STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Title END, '; ') as SampleAnswerTitles,
+    MAX(CASE WHEN p.CreationDate IS NOT NULL THEN p.CreationDate END) as LatestPostDate,
+    MIN(CASE WHEN p.CreationDate IS NOT NULL THEN p.CreationDate END) as EarliestPostDate,
+    COUNT(DISTINCT CASE 
+        WHEN u.Reputation > 10000 AND u.Reputation < 50000 THEN u.Id 
+        ELSE NULL 
+    END) as MediumReputationUsers,
+    COUNT(DISTINCT CASE 
+        WHEN u.Reputation >= 50000 THEN u.Id 
+        ELSE NULL 
+    END) as HighReputationUsers,
+    COUNT(DISTINCT CASE 
+        WHEN u.Reputation < 1000 THEN u.Id 
+        ELSE NULL 
+    END) as LowReputationUsers,
+    COUNT(DISTINCT CASE 
+        WHEN u.LastAccessDate > DATEADD(DAY, -7, CURRENT_TIMESTAMP) THEN u.Id 
+        ELSE NULL 
+    END) as ActiveUsersLastWeek,
+    COUNT(DISTINCT CASE 
+        WHEN u.LastAccessDate < DATEADD(DAY, -30, CURRENT_TIMESTAMP) THEN u.Id 
+        ELSE NULL 
+    END) as InactiveUsersLastMonth
+FROM Users u
+FULL OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN (
+    SELECT 
+        PostId,
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) as UpVotes,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) as DownVotes,
+        SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) as Favorites
+    FROM Votes
+    GROUP BY PostId
+) VoteStats ON p.Id = VoteStats.PostId
+WHERE 
+    (u.Id IS NOT NULL OR p.Id IS NOT NULL OR ph.Id IS NOT NULL OR c.Id IS NOT NULL OR b.Id IS NOT NULL OR v.Id IS NOT NULL)
+    AND (u.Reputation >= 0 OR u.Reputation IS NULL)
+    AND (p.Score >= -1000 OR p.Score IS NULL)
+    AND (p.ViewCount >= 0 OR p.ViewCount IS NULL)
+    AND (p.AnswerCount >= 0 OR p.AnswerCount IS NULL)
+    AND (p.CommentCount >= 0 OR p.CommentCount IS NULL)
+    AND (p.FavoriteCount >= 0 OR p.FavoriteCount IS NULL) 
+    AND (b.Date IS NULL OR b.Date >= DATEADD(YEAR, -2, CURRENT_TIMESTAMP))
+    AND (ph.CreationDate IS NULL OR ph.CreationDate >= DATEADD(YEAR, -1, CURRENT_TIMESTAMP))
+    AND (c.CreationDate IS NULL OR c.CreationDate >= DATEADD(YEAR, -1, CURRENT_TIMESTAMP))
+    AND (p.CreationDate IS NULL OR p.CreationDate >= DATEADD(YEAR, -5, CURRENT_TIMESTAMP))
+    AND (u.LastAccessDate IS NULL OR u.LastAccessDate >= DATEADD(YEAR, -2, CURRENT_TIMESTAMP))
+
+UNION ALL
+
+SELECT 
+    'Additional Complex Query Results' as QueryType,
+    NULL as TotalUsers,
+    NULL as TotalPosts,
+    NULL as TotalPostHistories,
+    NULL as TotalComments,
+    NULL as TotalBadges,
+    NULL as TotalVotes,
+    NULL as TotalQuestions,
+    NULL as TotalAnswers,
+    NULL as AverageReputation,
+    NULL as AverageScore,
+    NULL as MaxViews,
+    NULL as QuestionWithAnswers,
+    NULL as QuestionWithoutAnswers,
+    NULL as ClosedPosts,
+    NULL as CommunityOwnedPosts,
+    NULL as RecentActivityPosts,
+    NULL as TotalScore,
+    NULL as AvgPostsPerUser,
+    NULL as HighAnsweredQuestions,
+    NULL as SampleQuestionTitles,
+    NULL as SampleAnswerTitles,
+    NULL as LatestPostDate,
+    NULL as EarliestPostDate,
+    NULL as MediumReputationUsers,
+    NULL as HighReputationUsers,
+    NULL as LowReputationUsers,
+    NULL as ActiveUsersLastWeek,
+    NULL as InactiveUsersLastMonth
+
+UNION ALL
+
+SELECT 
+    'Final Comprehensive Query Result' as QueryType,
+    (SELECT COUNT(DISTINCT Id) FROM Users) as TotalUsers,
+    (SELECT COUNT(DISTINCT Id) FROM Posts) as TotalPosts,
+    (SELECT COUNT(DISTINCT Id) FROM PostHistory) as TotalPostHistories,
+    (SELECT COUNT(DISTINCT Id) FROM Comments) as TotalComments,
+    (SELECT COUNT(DISTINCT Id) FROM Badges) as TotalBadges,
+    (SELECT COUNT(DISTINCT Id) FROM Votes) as TotalVotes,
+    (SELECT COUNT(DISTINCT Id) FROM Posts WHERE PostTypeId = 1) as TotalQuestions,
+    (SELECT COUNT(DISTINCT Id) FROM Posts WHERE PostTypeId = 2) as TotalAnswers,
+    (SELECT AVG(Reputation) FROM Users) as AverageReputation,
+    (SELECT AVG(Score) FROM Posts) as AverageScore,
+    (SELECT MAX(ViewCount) FROM Posts) as MaxViews,
+    (SELECT SUM(CASE WHEN AnswerCount > 0 THEN 1 ELSE 0 END) FROM Posts) as QuestionWithAnswers,
+    (SELECT SUM(CASE WHEN AnswerCount = 0 THEN 1 ELSE 0 END) FROM Posts) as QuestionWithoutAnswers,
+    (SELECT COUNT(DISTINCT Id) FROM Posts WHERE ClosedDate IS NOT NULL) as ClosedPosts,
+    (SELECT COUNT(DISTINCT Id) FROM Posts WHERE CommunityOwnedDate IS NOT NULL) as CommunityOwnedPosts,
+    (SELECT COUNT(DISTINCT Id) FROM Posts WHERE LastActivityDate > DATEADD(MONTH, -1, CURRENT_TIMESTAMP)) as RecentActivityPosts,
+    (SELECT SUM(Score) FROM Posts) as TotalScore,
+    (SELECT COUNT(DISTINCT Id) FROM Posts) / (SELECT COUNT(DISTINCT Id) FROM Users) as AvgPostsPerUser,
+    (SELECT COUNT(DISTINCT Id) FROM Posts WHERE PostTypeId = 1 AND AnswerCount > 10) as HighAnsweredQuestions,
+    (SELECT STRING_AGG(Title, '; ') FROM Posts WHERE PostTypeId = 1 LIMIT 10) as SampleQuestionTitles,
+    (SELECT STRING_AGG(Title, '; ') FROM Posts WHERE PostTypeId = 2 LIMIT 10) as SampleAnswerTitles,
+    (SELECT MAX(CreationDate) FROM Posts) as LatestPostDate,
+    (SELECT MIN(CreationDate) FROM Posts) as EarliestPostDate,
+    (SELECT COUNT(DISTINCT Id) FROM Users WHERE Reputation > 10000 AND Reputation < 50000) as MediumReputationUsers,
+    (SELECT COUNT(DISTINCT Id) FROM Users WHERE Reputation >= 50000) as HighReputationUsers,
+    (SELECT COUNT(DISTINCT Id) FROM Users WHERE Reputation < 1000) as LowReputationUsers,
+    (SELECT COUNT(DISTINCT Id) FROM Users WHERE LastAccessDate > DATEADD(DAY, -7, CURRENT_TIMESTAMP)) as ActiveUsersLastWeek,
+    (SELECT COUNT(DISTINCT Id) FROM Users WHERE LastAccessDate < DATEADD(DAY, -30, CURRENT_TIMESTAMP)) as InactiveUsersLastMonth
+ORDER BY QueryType
+LIMIT 1;

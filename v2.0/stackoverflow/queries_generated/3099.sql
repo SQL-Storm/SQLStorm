@@ -1,0 +1,141 @@
+-- {"query": "3099.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1425} 
+
+WITH 
+-- 1️⃣ Aggregate core user statistics
+usr_stats AS (
+    SELECT 
+        u.Id                                   AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)               AS question_cnt,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)               AS answer_cnt,
+        COALESCE(SUM(p.Score),0)                                 AS total_score,
+        COALESCE(AVG(p.Score),0)                                 AS avg_score,
+        MAX(p.CreationDate)                                      AS last_post_date,
+        COUNT(DISTINCT t.TagName) FILTER (WHERE p.PostTypeId = 1) AS distinct_tag_cnt
+    FROM Users u
+    LEFT JOIN Posts p        ON p.OwnerUserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(
+                COALESCE(TRIM(BOTH '><' FROM p.Tags), ''), 
+                '><')) AS tag_raw
+    ) AS tag_split ON TRUE
+    LEFT JOIN Tags t        ON t.TagName = tag_raw
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+-- 2️⃣ Determine top‑scoring post per user (question or answer)
+top_post AS (
+    SELECT 
+        p.OwnerUserId                         AS user_id,
+        p.Id                                 AS post_id,
+        p.Title,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+
+-- 3️⃣ Recent activity window (last 30 days) with a correlated subquery
+recent_activity AS (
+    SELECT 
+        ua.Id                                          AS user_id,
+        MAX(v.CreationDate) FILTER (WHERE v.VoteTypeId = 2) AS last_upvote,
+        MAX(c.CreationDate) FILTER (WHERE c.Score >= 5)   AS last_high_comment,
+        (SELECT MAX(ph.CreationDate) 
+         FROM PostHistory ph 
+         WHERE ph.UserId = ua.Id 
+           AND ph.CreationDate >= CURRENT_DATE - INTERVAL '30 days') AS last_edit
+    FROM Users ua
+    LEFT JOIN Votes v  ON v.UserId = ua.Id
+    LEFT JOIN Comments c ON c.UserId = ua.Id
+    GROUP BY ua.Id
+),
+
+-- 4️⃣ Badge summarisation per user (gold, silver, bronze)
+badge_summary AS (
+    SELECT 
+        b.UserId                         AS user_id,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS gold_cnt,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS silver_cnt,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS bronze_cnt,
+        STRING_AGG(DISTINCT b.Name, ', ')   AS badge_names
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- 5️⃣ Tag popularity snapshot (top 5 tags overall)
+top_tags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+top5_tags AS (
+    SELECT STRING_AGG(TagName, ', ') AS top5_tag_list
+    FROM top_tags
+    WHERE rn <= 5
+),
+
+-- 6️⃣ Union of two user cohorts for set‑operator stress test
+high_rep_users AS (
+    SELECT 
+        us.user_id,
+        us.DisplayName,
+        us.Reputation,
+        'HIGH' AS cohort
+    FROM usr_stats us
+    WHERE us.Reputation >= 20000
+),
+low_rep_users AS (
+    SELECT 
+        us.user_id,
+        us.DisplayName,
+        us.Reputation,
+        'LOW' AS cohort
+    FROM usr_stats us
+    WHERE us.Reputation < 2000
+),
+cohort_union AS (
+    SELECT * FROM high_rep_users
+    UNION ALL
+    SELECT * FROM low_rep_users
+)
+
+-- 🎯 Final result set joining all CTEs together
+SELECT 
+    cu.user_id,
+    cu.DisplayName,
+    cu.Reputation,
+    cu.cohort,
+    us.question_cnt,
+    us.answer_cnt,
+    us.total_score,
+    ROUND(us.avg_score,2)                         AS avg_score,
+    us.last_post_date,
+    us.distinct_tag_cnt,
+    tp.post_id                                    AS top_post_id,
+    tp.Title                                      AS top_post_title,
+    tp.Score                                      AS top_post_score,
+    ra.last_upvote,
+    ra.last_high_comment,
+    ra.last_edit,
+    bs.gold_cnt,
+    bs.silver_cnt,
+    bs.bronze_cnt,
+    bs.badge_names,
+    t5.top5_tag_list
+FROM cohort_union cu
+INNER JOIN usr_stats us      ON us.user_id = cu.user_id
+LEFT JOIN top_post tp       ON tp.user_id = cu.user_id AND tp.rn = 1
+LEFT JOIN recent_activity ra ON ra.user_id = cu.user_id
+LEFT JOIN badge_summary bs  ON bs.user_id = cu.user_id
+CROSS JOIN top5_tags t5
+ORDER BY 
+    cu.cohort DESC,
+    cu.Reputation DESC,
+    us.total_score DESC
+LIMIT 500;

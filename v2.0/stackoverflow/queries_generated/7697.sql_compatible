@@ -1,0 +1,238 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreDenseRank,
+        LAG(p.Score) OVER (ORDER BY p.Score DESC) as PrevScore,
+        LEAD(p.Score) OVER (ORDER BY p.Score DESC) as NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as RollingAvgScore,
+        NTILE(100) OVER (ORDER BY p.Score) as ScorePercentile,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score >= 100 THEN 'Highly_Voted_Question'
+            WHEN p.PostTypeId = 1 AND p.Score >= 10 THEN 'Moderately_Voted_Question'
+            WHEN p.PostTypeId = 2 AND p.Score >= 50 THEN 'Highly_Voted_Answer'
+            ELSE 'Other'
+        END as PostCategory,
+        COALESCE(
+            CASE 
+                WHEN p.Tags LIKE '%<c>%' THEN SUBSTRING(p.Tags FROM POSITION('<c>' IN p.Tags) + 3 FOR POSITION('<' IN SUBSTRING(p.Tags FROM POSITION('<c>' IN p.Tags) + 3)) - 3)
+                WHEN p.Tags LIKE '%<python>%' THEN SUBSTRING(p.Tags FROM POSITION('<python>' IN p.Tags) + 8 FOR POSITION('<' IN SUBSTRING(p.Tags FROM POSITION('<python>' IN p.Tags) + 8)) - 8)
+                WHEN p.Tags LIKE '%<java>%' THEN SUBSTRING(p.Tags FROM POSITION('<java>' IN p.Tags) + 6 FOR POSITION('<' IN SUBSTRING(p.Tags FROM POSITION('<java>' IN p.Tags) + 6)) - 6)
+                WHEN p.Tags LIKE '%<javascript>%' THEN SUBSTRING(p.Tags FROM POSITION('<javascript>' IN p.Tags) + 12 FOR POSITION('<' IN SUBSTRING(p.Tags FROM POSITION('<javascript>' IN p.Tags) + 12)) - 12)
+                ELSE NULL
+            END,
+            'No_Specific_Language'
+        ) as DominantLanguage
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score IS NOT NULL
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%'),
+            0
+        ) as UsageCount,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as TagPopularity,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.PostTypeId = 1 AND p.Tags LIKE '%' || t.TagName || '%' AND p.CreationDate > DATE '2022-01-01'
+        ) as RecentUsage
+    FROM Tags t
+    WHERE t.Count > 0
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(p.Score) as MaxPostScore,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        CASE 
+            WHEN u.Reputation > 100000 THEN 'Super_User'
+            WHEN u.Reputation > 50000 THEN 'Expert'
+            WHEN u.Reputation > 10000 THEN 'Advanced_User'
+            ELSE 'Regular'
+        END as UserTier,
+        CASE 
+            WHEN u.Reputation < 100 THEN 'Newbie'
+            WHEN u.Reputation < 1000 THEN 'Beginner'
+            WHEN u.Reputation < 10000 THEN 'Intermediate'
+            WHEN u.Reputation < 100000 THEN 'Advanced'
+            ELSE 'Expert'
+        END as UserLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate, u.Views, u.UpVotes, u.DownVotes, u.LastAccessDate
+),
+ComplexJoinAnalysis AS (
+    SELECT DISTINCT 
+        rp.Id AS PostId,
+        rp.Title,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.DominantLanguage,
+        rp.PostCategory,
+        rp.PostTypeId,
+        rp.PrevScore,
+        rp.NextScore,
+        rp.RollingAvgScore,
+        rp.ScorePercentile,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.OwnerUserId,
+        u.DisplayName AS Author,
+        u.Reputation AS AuthorReputation,
+        ua.UserTier,
+        ua.UserLevel,
+        ta.TagName,
+        ta.TagPopularity,
+        ta.UsageCount,
+        CASE 
+            WHEN rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above_Avg_Question'
+            WHEN rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2) THEN 'Above_Avg_Answer'
+            ELSE 'Below_Avg'
+        END as ScoreComparison,
+        CASE 
+            WHEN rp.Score = (SELECT MAX(Score) FROM Posts) THEN 'Highest_Score'
+            WHEN rp.Score = (SELECT MIN(Score) FROM Posts) THEN 'Lowest_Score'
+            ELSE 'Normal'
+        END as ScoreStatus,
+        EXTRACT(YEAR FROM DATE '2024-10-01') - EXTRACT(YEAR FROM rp.CreationDate) as PostAgeYears,
+        (rp.Score - COALESCE(rp.PrevScore, 0)) as ScoreChangeFromPrev,
+        (COALESCE(rp.NextScore, 0) - rp.Score) as ScoreChangeToNext,
+        CASE 
+            WHEN rp.AnswerCount > 0 AND rp.AnswerCount >= (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId = 1) THEN 'Well_Answered'
+            WHEN rp.AnswerCount = 0 THEN 'No_Answers'
+            ELSE 'Few_Answers'
+        END as AnswerStatus,
+        CASE 
+            WHEN rp.CommentCount > 0 THEN 'Has_Comments'
+            ELSE 'No_Comments'
+        END as CommentStatus,
+        CASE 
+            WHEN rp.FavoriteCount > (SELECT AVG(FavoriteCount) FROM Posts) THEN 'Favorited'
+            ELSE 'Not_Favorited'
+        END as FavoriteStatus
+    FROM RankedPosts rp
+    INNER JOIN Users u ON rp.OwnerUserId = u.Id
+    INNER JOIN UserActivity ua ON u.Id = ua.UserId
+    LEFT JOIN TagAnalysis ta ON 
+        ta.TagName IN (
+            SELECT TRIM(SUBSTRING(SUBSTRING(p.Tags FROM POSITION('<' IN p.Tags) + 1) FROM 1 FOR POSITION('>' IN SUBSTRING(p.Tags FROM POSITION('<' IN p.Tags) + 1)) - 1))
+            FROM Posts p
+            WHERE p.Id = rp.Id AND p.Tags IS NOT NULL AND p.Tags LIKE '%<%>%'
+        )
+    WHERE 
+       rp.Score > 0 
+        AND (rp.PostTypeId = 1 OR (rp.PostTypeId = 2 AND rp.Score >= 5))
+        AND u.Reputation > 0
+        AND ua.UserTier IN ('Super_User', 'Expert', 'Advanced_User')
+)
+SELECT 
+    cja.*,
+    ROW_NUMBER() OVER (ORDER BY cja.Score DESC) as GlobalRank,
+    RANK() OVER (ORDER BY cja.Score DESC) as GlobalRankWithTies,
+    DENSE_RANK() OVER (ORDER BY cja.Score DESC) as GlobalRankDense,
+    PERCENT_RANK() OVER (ORDER BY cja.Score DESC) as RankPercentile,
+    CUME_DIST() OVER (ORDER BY cja.Score DESC) as CumulativeDistribution,
+    NTILE(4) OVER (ORDER BY cja.Score DESC) as Quartile,
+    LAG(cja.Score) OVER (ORDER BY cja.Score DESC) as PreviousScore,
+    LEAD(cja.Score) OVER (ORDER BY cja.Score DESC) as NextScore,
+    FIRST_VALUE(cja.Score) OVER (ORDER BY cja.Score DESC) as HighestScore,
+    LAST_VALUE(cja.Score) OVER (ORDER BY cja.Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as LowestScore,
+    NTH_VALUE(cja.Score, 10) OVER (ORDER BY cja.Score DESC) as ScoreTenthPlace,
+    SUM(cja.Score) OVER (ORDER BY cja.Score DESC ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as RollingSum10,
+    AVG(cja.Score) OVER (ORDER BY cja.Score DESC ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) as MovingAvg5,
+    STDDEV_POP(cja.Score) OVER () as ScoreStdDev,
+    VAR_POP(cja.Score) OVER () as ScoreVariance,
+    MIN(cja.Score) OVER (ORDER BY cja.Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as RunningMin,
+    MAX(cja.Score) OVER (ORDER BY cja.Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as RunningMax,
+    NTILE(10) OVER (ORDER BY cja.Score DESC) as ScoreDecile,
+    CASE 
+        WHEN cja.Score > 500 THEN 'High_Score'
+        WHEN cja.Score > 100 THEN 'Medium_Score'
+        WHEN cja.Score > 10 THEN 'Low_Score'
+        ELSE 'Very_Low_Score'
+    END as ScoreCategory,
+    CASE 
+        WHEN cja.PostAgeYears >= 5 THEN 'Old_Post'
+        WHEN cja.PostAgeYears >= 1 THEN 'Recent_Post'
+        ELSE 'Very_Recent_Post'
+    END as PostAgeGroup,
+    CASE 
+        WHEN cja.ScoreChangeFromPrev > 10 THEN 'Sharp_Increase'
+        WHEN cja.ScoreChangeFromPrev < -10 THEN 'Sharp_Decrease'
+        ELSE 'Stable'
+    END as ScoreMovementTrend
+FROM ComplexJoinAnalysis cja
+WHERE 
+    (cja.Score > 100 OR (cja.PostTypeId = 2 AND cja.Score > 10))
+    AND cja.AuthorReputation > 1000
+    AND cja.TagPopularity IN ('Popular', 'Moderate')
+    AND cja.UserTier IN ('Super_User', 'Expert')
+    AND cja.AnswerStatus IN ('Well_Answered', 'No_Answers')
+    AND cja.CommentStatus IN ('Has_Comments', 'No_Comments')
+    AND cja.FavoriteStatus IN ('Favorited', 'Not_Favorited')
+    AND (
+        CASE 
+            WHEN cja.Score > 500 THEN 'High_Score'
+            WHEN cja.Score > 100 THEN 'Medium_Score'
+            WHEN cja.Score > 10 THEN 'Low_Score'
+            ELSE 'Very_Low_Score'
+        END
+    ) IN ('High_Score', 'Medium_Score')
+    AND (
+        CASE 
+            WHEN cja.PostAgeYears >= 5 THEN 'Old_Post'
+            WHEN cja.PostAgeYears >= 1 THEN 'Recent_Post'
+            ELSE 'Very_Recent_Post'
+        END
+    ) IN ('Old_Post', 'Recent_Post')
+    AND (
+        CASE 
+            WHEN cja.ScoreChangeFromPrev > 10 THEN 'Sharp_Increase'
+            WHEN cja.ScoreChangeFromPrev < -10 THEN 'Sharp_Decrease'
+            ELSE 'Stable'
+        END
+    ) IN ('Sharp_Increase', 'Sharp_Decrease')
+ORDER BY cja.Score DESC, cja.ViewCount DESC, cja.CreationDate DESC
+LIMIT 100000
+OFFSET 0;

@@ -1,0 +1,232 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.ViewCount, 0) AS ViewCount,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        MAX(u.CreationDate) AS LatestActivity,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), ',') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount
+),
+RankedUsers AS (
+    SELECT 
+        us.*,
+        ROW_NUMBER() OVER (ORDER BY TotalPostScore DESC, PostCount DESC) AS RankByScore,
+        RANK() OVER (ORDER BY Reputation DESC, ViewCount DESC) AS RankByReputation,
+        DENSE_RANK() OVER (ORDER BY BadgeCount DESC, VoteCount DESC) AS RankByActivity
+    FROM UserStats us
+),
+FilteredPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            ELSE 'Unknown'
+        END AS PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            WHEN p.Score > 10 THEN 'LowVoted'
+            ELSE 'VeryLowVoted'
+        END AS ScoreCategory,
+        COALESCE(LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate), 0) AS NextPostScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS UserPostSequence,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScorePerUser,
+        COALESCE(SUM(p.ViewCount) OVER (PARTITION BY p.OwnerUserId), 0) AS TotalUserViews,
+        CASE 
+            WHEN p.AnswerCount > 10 THEN 'HighlyAnswered'
+            WHEN p.AnswerCount > 5 THEN 'ModeratelyAnswered'
+            WHEN p.AnswerCount > 0 THEN 'SlightlyAnswered'
+            ELSE 'Unanswered'
+        END AS AnswerStatus
+    FROM Posts p
+    WHERE p.CreationDate > DATE '2020-01-01'
+        AND p.Score IS NOT NULL
+        AND p.ViewCount IS NOT NULL
+),
+PostAnalysis AS (
+    SELECT 
+        fp.Id,
+        fp.PostTypeId,
+        fp.OwnerUserId,
+        fp.Score,
+        fp.ViewCount,
+        fp.CreationDate,
+        fp.Title,
+        fp.Tags,
+        fp.PostType,
+        fp.ScoreCategory,
+        fp.AnswerStatus,
+        fp.UserPostSequence,
+        fp.AvgScorePerUser,
+        fp.TotalUserViews,
+        fp.NextPostScore,
+        CASE 
+            WHEN fp.Score > fp.AvgScorePerUser THEN 'AboveAverage'
+            WHEN fp.Score < fp.AvgScorePerUser THEN 'BelowAverage'
+            ELSE 'Average'
+        END AS PerformanceAgainstUserAvg,
+        CASE 
+            WHEN fp.ViewCount > 1000 THEN 'Viral'
+            WHEN fp.ViewCount > 500 THEN 'Popular'
+            WHEN fp.ViewCount > 100 THEN 'Notable'
+            ELSE 'LowVisibility'
+        END AS VisibilityLevel,
+        DENSE_RANK() OVER (ORDER BY fp.ViewCount DESC, fp.Score DESC) AS PopularityRank
+    FROM FilteredPosts fp
+),
+UserPostAnalysis AS (
+    SELECT 
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.PostCount,
+        r.TotalPostScore,
+        r.TotalViews,
+        r.RankByScore,
+        r.RankByReputation,
+        r.RankByActivity,
+        COALESCE(SUM(pa.Score), 0) AS UserTotalScore,
+        COALESCE(AVG(pa.Score), 0) AS AvgUserPostScore,
+        MAX(pa.ViewCount) AS MaxUserViewCount,
+        COUNT(pa.Id) AS UserPostCount,
+        STRING_AGG(DISTINCT pa.Tags, ',') AS UserTags
+    FROM RankedUsers r
+    LEFT JOIN PostAnalysis pa ON r.UserId = pa.OwnerUserId
+    GROUP BY r.UserId, r.DisplayName, r.Reputation, r.PostCount, r.TotalPostScore, r.TotalViews, r.RankByScore, r.RankByReputation, r.RankByActivity
+),
+CrossPostAnalysis AS (
+    SELECT 
+        pa1.Id AS Post1Id,
+        pa2.Id AS Post2Id,
+        pa1.Title AS Post1Title,
+        pa2.Title AS Post2Title,
+        pa1.Score AS Post1Score,
+        pa2.Score AS Post2Score,
+        pa1.Tags AS Post1Tags,
+        pa2.Tags AS Post2Tags,
+        pa1.ViewCount AS Post1Views,
+        pa2.ViewCount AS Post2Views,
+        pa1.AnswerStatus AS Post1AnswerStatus,
+        pa2.AnswerStatus AS Post2AnswerStatus,
+        CAST((julianday(pa2.CreationDate) - julianday(pa1.CreationDate)) AS INTEGER) AS TimeDifferenceDays,
+        CASE 
+            WHEN CHAR_LENGTH(pa1.Tags) > CHAR_LENGTH(pa2.Tags) THEN 'Post1HasMoreTags'
+            WHEN CHAR_LENGTH(pa2.Tags) > CHAR_LENGTH(pa1.Tags) THEN 'Post2HasMoreTags'
+            ELSE 'SameTagLength'
+        END AS TagLengthComparison,
+        CASE 
+            WHEN pa1.Score > pa2.Score THEN 1
+            WHEN pa2.Score > pa1.Score THEN -1
+            ELSE 0
+        END AS ScoreComparison,
+        ABS(pa1.Score - pa2.Score) AS ScoreDifference,
+        (pa1.ViewCount + pa2.ViewCount) / 2.0 AS AverageViews,
+        (pa1.Score + pa2.Score) / 2.0 AS AverageScore
+    FROM PostAnalysis pa1
+    INNER JOIN PostAnalysis pa2 ON pa1.Id <> pa2.Id
+    WHERE pa1.Score IS NOT NULL 
+        AND pa2.Score IS NOT NULL
+        AND pa1.ViewCount IS NOT NULL
+        AND pa2.ViewCount IS NOT NULL
+        AND pa1.CreationDate < pa2.CreationDate
+        AND ABS(CAST((julianday(pa2.CreationDate) - julianday(pa1.CreationDate)) AS INTEGER)) <= 30
+),
+FinalResult AS (
+    SELECT 
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.PostCount,
+        upa.UserTotalScore,
+        upa.AvgUserPostScore,
+        upa.MaxUserViewCount,
+        upa.UserPostCount,
+        upa.UserTags,
+        upa.RankByScore,
+        upa.RankByReputation,
+        upa.RankByActivity,
+        COALESCE(SUM(CASE WHEN cpa.ScoreComparison = 1 THEN 1 ELSE 0 END), 0) AS PostsAboveAvgScore,
+        COALESCE(SUM(CASE WHEN cpa.ScoreComparison = -1 THEN 1 ELSE 0 END), 0) AS PostsBelowAvgScore,
+        COALESCE(AVG(cpa.ScoreDifference), 0) AS AvgScoreDifference,
+        COUNT(cpa.Post1Id) AS CrossPostComparisons,
+        STRING_AGG('Post-' || CAST(cpa.Post2Id AS VARCHAR) || ':' || CAST(cpa.ScoreDifference AS VARCHAR), ', ') AS ScoreDifferenceDetails,
+        CASE 
+            WHEN upa.UserTotalScore > 10000 THEN 'Elite'
+            WHEN upa.UserTotalScore > 5000 THEN 'Veteran'
+            WHEN upa.UserTotalScore > 1000 THEN 'Experienced'
+            ELSE 'Novice'
+        END AS UserLevel,
+        STRING_AGG(DISTINCT CASE WHEN pa.AnswerStatus = 'HighlyAnswered' THEN pa.Title ELSE NULL END, ' | ') AS HighlyAnsweredPosts,
+        STRING_AGG(DISTINCT CASE WHEN pa.VisibilityLevel = 'Viral' THEN pa.Title ELSE NULL END, ' | ') AS ViralPosts,
+        CASE 
+            WHEN COUNT(pa.Id) > 0 THEN 
+                AVG(CASE WHEN pa.ViewCount > 0 THEN pa.ViewCount END)
+            ELSE 0
+        END AS AvgPostViews
+    FROM UserPostAnalysis upa
+    LEFT JOIN CrossPostAnalysis cpa ON upa.UserId IN (
+        SELECT pa.OwnerUserId 
+        FROM PostAnalysis pa 
+        WHERE pa.Id IN (cpa.Post1Id, cpa.Post2Id)
+        LIMIT 1
+    )
+    LEFT JOIN PostAnalysis pa ON upa.UserId = pa.OwnerUserId
+    WHERE upa.Reputation > 100
+    GROUP BY upa.UserId, upa.DisplayName, upa.Reputation, upa.PostCount, upa.UserTotalScore, upa.AvgUserPostScore, upa.MaxUserViewCount, upa.UserPostCount, upa.UserTags, upa.RankByScore, upa.RankByReputation, upa.RankByActivity
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    PostCount,
+    UserTotalScore,
+    AvgUserPostScore,
+    MaxUserViewCount,
+    UserPostCount,
+    UserTags,
+    RankByScore,
+    RankByReputation,
+    RankByActivity,
+    PostsAboveAvgScore,
+    PostsBelowAvgScore,
+    AvgScoreDifference,
+    CrossPostComparisons,
+    ScoreDifferenceDetails,
+    UserLevel,
+    HighlyAnsweredPosts,
+    ViralPosts,
+    AvgPostViews
+FROM FinalResult
+WHERE UserTotalScore > 1000
+    AND CrossPostComparisons > 5
+    AND AvgPostViews > 100
+ORDER BY UserTotalScore DESC, AvgScoreDifference DESC
+LIMIT 1000;

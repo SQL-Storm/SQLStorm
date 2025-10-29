@@ -1,0 +1,163 @@
+WITH
+  HighReputationUsers AS (
+    SELECT
+      UserId
+    FROM
+      Badges
+    WHERE
+      Name LIKE '%Expert%'
+      AND Class = 1
+  ),
+  RecentQuestions AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.OwnerUserId,
+      p.Title,
+      p.Tags,
+      p.CreationDate AS QuestionCreationDate,
+      ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS rn_recent
+    FROM
+      Posts AS p
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)
+      AND p.OwnerUserId IN (
+        SELECT
+          UserId
+        FROM
+          HighReputationUsers
+      )
+  ),
+  AnswerQuality AS (
+    SELECT
+      a.ParentId AS QuestionId,
+      COUNT(a.Id) AS AnswerCount,
+      SUM(CASE WHEN a.Score > 5 THEN 1 ELSE 0 END) AS GoodAnswerCount,
+      AVG(a.Score) AS AverageAnswerScore,
+      MAX(a.Score) AS MaxAnswerScore
+    FROM
+      Posts AS a
+    WHERE
+      a.PostTypeId = 2
+      AND a.ParentId IS NOT NULL
+    GROUP BY
+      a.ParentId
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Posts AS p_user
+        WHERE
+          p_user.OwnerUserId = u.Id
+      ) AS PostCount,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Comments AS c_user
+        WHERE
+          c_user.UserId = u.Id
+      ) AS CommentCount,
+      (
+        SELECT
+          SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)
+        FROM
+          Votes AS v
+        WHERE
+          v.UserId = u.Id
+      ) AS TotalUpVotesCast,
+      (
+        SELECT
+          SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)
+        FROM
+          Votes AS v
+        WHERE
+          v.UserId = u.Id
+      ) AS TotalDownVotesCast
+    FROM
+      Users AS u
+    WHERE
+      u.Reputation > 1000
+  ),
+  QuestionAnalysis AS (
+    SELECT
+      rq.QuestionId,
+      rq.Title,
+      rq.Tags,
+      rq.QuestionCreationDate,
+      ua.DisplayName AS OwnerDisplayName,
+      ua.Reputation AS OwnerReputation,
+      COALESCE(aq.AnswerCount, 0) AS AnswerCount,
+      COALESCE(aq.GoodAnswerCount, 0) AS GoodAnswerCount,
+      aq.AverageAnswerScore,
+      aq.MaxAnswerScore,
+      CASE WHEN COALESCE(aq.AnswerCount, 0) > 0 THEN CAST(COALESCE(aq.GoodAnswerCount, 0) AS DOUBLE PRECISION) / COALESCE(aq.AnswerCount, 0) ELSE 0 END AS GoodAnswerRatio,
+      COALESCE(ua.TotalUpVotesCast, 0) - COALESCE(ua.TotalDownVotesCast, 0) AS NetVotesCast
+    FROM
+      RecentQuestions AS rq
+      LEFT JOIN UserActivity AS ua
+        ON rq.OwnerUserId = ua.UserId
+      LEFT JOIN AnswerQuality AS aq
+        ON rq.QuestionId = aq.QuestionId
+  )
+SELECT
+  qa.QuestionId,
+  qa.Title,
+  qa.Tags,
+  qa.QuestionCreationDate,
+  qa.OwnerDisplayName,
+  qa.OwnerReputation,
+  qa.AnswerCount,
+  qa.GoodAnswerCount,
+  qa.AverageAnswerScore,
+  qa.MaxAnswerScore,
+  qa.GoodAnswerRatio,
+  qa.NetVotesCast,
+  (UPPER(SUBSTRING(qa.Title FROM 1 FOR 1)) || SUBSTRING(qa.Title FROM 2)) AS FormattedTitle,
+  CASE
+    WHEN qa.AverageAnswerScore > 10 THEN 'High'
+    WHEN qa.AverageAnswerScore > 5 THEN 'Medium'
+    ELSE 'Low'
+  END AS AnswerScoreCategory,
+  CASE
+    WHEN qa.Tags LIKE '%<performance>%' THEN 'Performance Related'
+    ELSE 'Other'
+  END AS TagCategory
+FROM
+  QuestionAnalysis AS qa
+WHERE
+  qa.AverageAnswerScore IS NOT NULL
+  AND qa.AnswerCount > 1
+  AND LENGTH(qa.Tags) > 5
+
+UNION ALL
+
+SELECT
+  CAST(NULL AS BIGINT) AS QuestionId,
+  'Aggregate Analysis' AS Title,
+  CAST(NULL AS TEXT) AS Tags,
+  CAST(NULL AS TIMESTAMP) AS QuestionCreationDate,
+  CAST(NULL AS TEXT) AS OwnerDisplayName,
+  AVG(OwnerReputation) AS OwnerReputation,
+  SUM(AnswerCount) AS AnswerCount,
+  SUM(GoodAnswerCount) AS GoodAnswerCount,
+  AVG(AverageAnswerScore) AS AverageAnswerScore,
+  MAX(MaxAnswerScore) AS MaxAnswerScore,
+  AVG(GoodAnswerRatio) AS GoodAnswerRatio,
+  SUM(NetVotesCast) AS NetVotesCast,
+  CAST(NULL AS TEXT) AS FormattedTitle,
+  CAST(NULL AS TEXT) AS AnswerScoreCategory,
+  CAST(NULL AS TEXT) AS TagCategory
+FROM
+  QuestionAnalysis
+WHERE
+  AverageAnswerScore IS NOT NULL
+  AND AnswerCount > 1
+  AND LENGTH(Tags) > 5;

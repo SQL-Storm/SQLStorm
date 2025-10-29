@@ -1,0 +1,356 @@
+-- {"query": "98.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3471} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           coalesce(nullif(trim(u.websiteurl), ''), 'unknown') as norm_website,
+           date_trunc('month', u.creationdate) as cohort_month
+    from users u
+    where u.creationdate >= now() - interval '5 years'
+),
+user_activity as (
+    select p.owneruserid as user_id,
+           count(*) filter (where p.posttypeid = 1) as q_cnt,
+           count(*) filter (where p.posttypeid = 2) as a_cnt,
+           count(*) filter (where p.posttypeid not in (1,2) or p.posttypeid is null) as other_cnt,
+           sum(coalesce(p.score,0)) as post_score,
+           sum(coalesce(p.viewcount,0)) as views,
+           max(p.lastactivitydate) as last_post_activity,
+           count(distinct p.id) as post_cnt
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+user_votes as (
+    select v.userid as user_id,
+           count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+           count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+           count(*) filter (where v.votetypeid = 5) as favorites_cast,
+           count(*) filter (where v.votetypeid in (8,9)) as bounties_events,
+           sum(coalesce(v.bountyamount,0)) as bounty_amount_total,
+           min(v.creationdate) as first_vote_date,
+           max(v.creationdate) as last_vote_date
+    from votes v
+    where v.userid is not null
+    group by v.userid
+),
+user_comments as (
+    select c.userid as user_id,
+           count(*) as comment_cnt,
+           sum(coalesce(c.score,0)) as comment_score,
+           max(c.creationdate) as last_comment_date
+    from comments c
+    where c.userid is not null
+    group by c.userid
+),
+user_badges as (
+    select b.userid as user_id,
+           count(*) as badge_cnt,
+           count(*) filter (where b.class = 1) as gold_cnt,
+           count(*) filter (where b.class = 2) as silver_cnt,
+           count(*) filter (where b.class = 3) as bronze_cnt,
+           count(*) filter (where b.tagbased = 1) as tag_badge_cnt,
+           min(b.date) as first_badge_date,
+           max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_metrics as (
+    select p.owneruserid as user_id,
+           count(*) as q_total,
+           avg(nullif(p.answercount,0)) as avg_answers_per_q,
+           avg(nullif(p.viewcount,0)) as avg_views_per_q,
+           avg(nullif(p.score,0)) as avg_q_score,
+           count(*) filter (where p.acceptedanswerid is not null) as q_with_accepted,
+           count(*) filter (where p.closeddate is not null) as q_closed
+    from posts p
+    where p.posttypeid = 1 and p.owneruserid is not null
+    group by p.owneruserid
+),
+answer_metrics as (
+    select p.owneruserid as user_id,
+           count(*) as a_total,
+           avg(nullif(p.score,0)) as avg_a_score,
+           count(*) filter (where p.score > 0) as a_positive,
+           count(*) filter (where p.score < 0) as a_negative
+    from posts p
+    where p.posttypeid = 2 and p.owneruserid is not null
+    group by p.owneruserid
+),
+duplicates_flag as (
+    select distinct p.owneruserid as user_id,
+           1 as has_duplicate_linked
+    from posts p
+    join postlinks pl on pl.postid = p.id and pl.linktypeid = 3
+    where p.owneruserid is not null
+),
+edits_cte as (
+    select ph.userid as user_id,
+           count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edits_made,
+           count(*) filter (where ph.posthistorytypeid in (24)) as suggested_applied,
+           count(*) filter (where ph.posthistorytypeid in (10)) as closes_voted,
+           min(ph.creationdate) as first_edit_date,
+           max(ph.creationdate) as last_edit_date
+    from posthistory ph
+    where ph.userid is not null
+    group by ph.userid
+),
+tag_expertise as (
+    select p.owneruserid as user_id,
+           lower(unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><'))) as tag,
+           count(*) as posts_in_tag,
+           avg(coalesce(p.score,0)) as avg_score_in_tag
+    from posts p
+    where p.posttypeid in (1,2) and p.tags is not null and p.owneruserid is not null
+    group by p.owneruserid, lower(unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')))
+),
+top_tag_per_user as (
+    select user_id,
+           tag,
+           posts_in_tag,
+           avg_score_in_tag,
+           row_number() over (partition by user_id order by posts_in_tag desc, avg_score_in_tag desc, tag) as rn
+    from tag_expertise
+),
+activity_timeline as (
+    select u.id as user_id,
+           date_trunc('month', p.creationdate) as month,
+           count(*) filter (where p.posttypeid = 1) as q_month_cnt,
+           count(*) filter (where p.posttypeid = 2) as a_month_cnt,
+           count(*) as posts_month_cnt
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id, date_trunc('month', p.creationdate)
+),
+activity_rank as (
+    select at.user_id,
+           at.month,
+           posts_month_cnt,
+           sum(posts_month_cnt) over (partition by at.user_id order by at.month rows between unbounded preceding and current row) as cum_posts,
+           rank() over (partition by at.user_id order by posts_month_cnt desc nulls last, month) as month_rank
+    from activity_timeline at
+),
+recent_peak as (
+    select ar.user_id,
+           max(case when ar.month >= now() - interval '1 year' and ar.month_rank = 1 then ar.posts_month_cnt end) as peak_posts_last_year
+    from activity_rank ar
+    group by ar.user_id
+),
+user_baseline as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.upvotes,
+           u.downvotes,
+           u.views as profile_views,
+           u.creationdate,
+           u.lastaccessdate,
+           u.location,
+           case
+               when u.location is null then 'unknown'
+               when position(',' in u.location) > 0 then trim(split_part(u.location, ',', 2))
+               else trim(u.location)
+           end as country_guess
+    from users u
+),
+post_engagement as (
+    select p.owneruserid as user_id,
+           percentile_disc(0.5) within group (order by coalesce(p.viewcount,0)) as median_post_views,
+           percentile_disc(0.5) within group (order by coalesce(p.score,0)) as median_post_score
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+null_safety as (
+    select ru.user_id,
+           coalesce(ua.q_cnt,0) as q_cnt,
+           coalesce(ua.a_cnt,0) as a_cnt,
+           coalesce(ua.other_cnt,0) as other_cnt,
+           coalesce(ua.post_score,0) as post_score,
+           coalesce(ua.views,0) as views,
+           ua.last_post_activity,
+           coalesce(ua.post_cnt,0) as post_cnt,
+           coalesce(uv.upvotes_cast,0) as upvotes_cast,
+           coalesce(uv.downvotes_cast,0) as downvotes_cast,
+           coalesce(uv.favorites_cast,0) as favorites_cast,
+           coalesce(uv.bounties_events,0) as bounties_events,
+           coalesce(uv.bounty_amount_total,0) as bounty_amount_total,
+           uv.first_vote_date,
+           uv.last_vote_date,
+           coalesce(uc.comment_cnt,0) as comment_cnt,
+           coalesce(uc.comment_score,0) as comment_score,
+           uc.last_comment_date,
+           coalesce(ub.badge_cnt,0) as badge_cnt,
+           coalesce(ub.gold_cnt,0) as gold_cnt,
+           coalesce(ub.silver_cnt,0) as silver_cnt,
+           coalesce(ub.bronze_cnt,0) as bronze_cnt,
+           coalesce(ub.tag_badge_cnt,0) as tag_badge_cnt,
+           ub.first_badge_date,
+           ub.last_badge_date,
+           coalesce(qm.q_total,0) as q_total,
+           qm.avg_answers_per_q,
+           qm.avg_views_per_q,
+           qm.avg_q_score,
+           coalesce(qm.q_with_accepted,0) as q_with_accepted,
+           coalesce(qm.q_closed,0) as q_closed,
+           coalesce(am.a_total,0) as a_total,
+           am.avg_a_score,
+           coalesce(am.a_positive,0) as a_positive,
+           coalesce(am.a_negative,0) as a_negative,
+           coalesce(df.has_duplicate_linked,0) as has_duplicate_linked,
+           ec.edits_made,
+           ec.suggested_applied,
+           ec.closes_voted,
+           ec.first_edit_date,
+           ec.last_edit_date
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join user_votes uv on uv.user_id = ru.user_id
+    left join user_comments uc on uc.user_id = ru.user_id
+    left join user_badges ub on ub.user_id = ru.user_id
+    left join question_metrics qm on qm.user_id = ru.user_id
+    left join answer_metrics am on am.user_id = ru.user_id
+    left join duplicates_flag df on df.user_id = ru.user_id
+    left join edits_cte ec on ec.user_id = ru.user_id
+),
+final_agg as (
+    select
+        ub.user_id,
+        ub.displayname,
+        ub.reputation,
+        ub.upvotes,
+        ub.downvotes,
+        ub.profile_views,
+        ub.creationdate,
+        ub.lastaccessdate,
+        ub.location,
+        ub.country_guess,
+        ru.cohort_month,
+        ns.q_cnt,
+        ns.a_cnt,
+        ns.other_cnt,
+        ns.post_score,
+        ns.views,
+        ns.last_post_activity,
+        ns.post_cnt,
+        ns.upvotes_cast,
+        ns.downvotes_cast,
+        ns.favorites_cast,
+        ns.bounties_events,
+        ns.bounty_amount_total,
+        ns.first_vote_date,
+        ns.last_vote_date,
+        ns.comment_cnt,
+        ns.comment_score,
+        ns.last_comment_date,
+        ns.badge_cnt,
+        ns.gold_cnt,
+        ns.silver_cnt,
+        ns.bronze_cnt,
+        ns.tag_badge_cnt,
+        ns.first_badge_date,
+        ns.last_badge_date,
+        ns.q_total,
+        ns.avg_answers_per_q,
+        ns.avg_views_per_q,
+        ns.avg_q_score,
+        ns.q_with_accepted,
+        ns.q_closed,
+        ns.a_total,
+        ns.avg_a_score,
+        ns.a_positive,
+        ns.a_negative,
+        ns.has_duplicate_linked,
+        coalesce(ec.edits_made,0) as edits_made,
+        coalesce(ec.suggested_applied,0) as suggested_applied,
+        coalesce(ec.closes_voted,0) as closes_voted
+    from user_baseline ub
+    join recent_users ru on ru.user_id = ub.user_id
+    left join null_safety ns on ns.user_id = ub.user_id
+    left join edits_cte ec on ec.user_id = ub.user_id
+),
+ranked as (
+    select
+        fa.*,
+        tt.tag as top_tag,
+        tt.posts_in_tag as top_tag_posts,
+        tt.avg_score_in_tag as top_tag_avg_score,
+        pe.median_post_views,
+        pe.median_post_score,
+        rp.peak_posts_last_year,
+        case
+            when coalesce(fa.a_total,0) + coalesce(fa.q_total,0) = 0 then null
+            else round(100.0 * coalesce(fa.q_with_accepted,0) / nullif(fa.q_total,0), 2)
+        end as accepted_rate_pct,
+        case
+            when coalesce(fa.a_total,0) = 0 then null
+            else round(1.0 * coalesce(fa.a_positive,0) / nullif(fa.a_total,0), 4)
+        end as answer_pos_ratio,
+        dense_rank() over (order by fa.reputation desc, coalesce(fa.post_score,0) desc, fa.user_id) as rep_rank,
+        row_number() over (partition by fa.cohort_month order by coalesce(fa.post_cnt,0) desc, fa.user_id) as cohort_activity_rank,
+        sum(coalesce(fa.post_cnt,0)) over (partition by fa.country_guess) as country_total_posts,
+        avg(coalesce(fa.avg_a_score,0)) over (partition by fa.cohort_month) as cohort_avg_answer_score
+    from final_agg fa
+    left join top_tag_per_user tt on tt.user_id = fa.user_id and tt.rn = 1
+    left join post_engagement pe on pe.user_id = fa.user_id
+    left join recent_peak rp on rp.user_id = fa.user_id
+)
+select
+    r.user_id,
+    r.displayname,
+    r.reputation,
+    r.country_guess,
+    r.cohort_month,
+    r.rep_rank,
+    r.cohort_activity_rank,
+    r.q_total,
+    r.a_total,
+    r.post_cnt,
+    r.post_score,
+    r.comment_cnt,
+    r.badge_cnt,
+    r.gold_cnt,
+    r.silver_cnt,
+    r.bronze_cnt,
+    r.accepted_rate_pct,
+    r.answer_pos_ratio,
+    r.top_tag,
+    r.top_tag_posts,
+    r.top_tag_avg_score,
+    r.median_post_views,
+    r.median_post_score,
+    r.peak_posts_last_year,
+    r.country_total_posts,
+    r.cohort_avg_answer_score,
+    case
+        when r.lastaccessdate < now() - interval '180 days' then 'inactive'
+        when r.last_post_activity is not null and r.last_post_activity >= now() - interval '30 days' then 'active'
+        when r.last_comment_date is not null and r.last_comment_date >= now() - interval '30 days' then 'active-commenter'
+        else 'occasional'
+    end as activity_tier,
+    case
+        when r.has_duplicate_linked = 1 then 'touched-duplicate-network'
+        when r.q_closed > 0 then 'touched-close'
+        else 'clean'
+    end as moderation_touch,
+    case
+        when coalesce(r.edits_made,0) + coalesce(r.suggested_applied,0) >= 50 then 'editor'
+        when coalesce(r.tag_badge_cnt,0) >= 10 then 'tag-specialist'
+        when coalesce(r.bounty_amount_total,0) >= 500 then 'bounty-hunter'
+        else 'generalist'
+    end as persona_bucket
+from ranked r
+where (r.q_total + r.a_total) > 0
+  and coalesce(r.reputation,0) >= 1
+  and (
+        r.top_tag is null
+        or length(r.top_tag) between 1 and 35
+      )
+  and (
+        r.country_guess is null
+        or r.country_guess !~* '(antarctica|moon)'
+      )
+order by r.rep_rank, r.cohort_activity_rank, r.user_id
+limit 500;

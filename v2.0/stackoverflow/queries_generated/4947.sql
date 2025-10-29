@@ -1,0 +1,152 @@
+-- {"query": "4947.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1362} 
+
+WITH
+  RecentPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate AS PostCreationDate,
+      pt.Name AS PostTypeName,
+      CASE
+        WHEN p.PostTypeId = 1
+        THEN p.AnswerCount
+        ELSE 0
+      END AS NumberOfAnswers,
+      CASE
+        WHEN p.PostTypeId = 1
+        THEN p.FavoriteCount
+        ELSE 0
+      END AS NumberOfFavorites,
+      p.Score,
+      p.ViewCount,
+      p.ClosedDate,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL
+        THEN 1
+        ELSE 0
+      END AS IsClosed,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRankForUser
+    FROM Posts AS p
+    JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    WHERE
+      p.CreationDate >= DATE('now', '-365 day') AND p.OwnerUserId IS NOT NULL
+  ),
+  UserPostStats AS (
+    SELECT
+      rp.OwnerUserId,
+      COUNT(rp.PostId) AS TotalPosts,
+      SUM(rp.Score) AS TotalScore,
+      AVG(rp.Score) AS AverageScore,
+      SUM(rp.NumberOfAnswers) AS TotalAnswersGiven,
+      SUM(rp.NumberOfFavorites) AS TotalFavoritesReceived,
+      COUNT(CASE WHEN rp.IsClosed = 1 THEN 1 END) AS TotalClosedPosts
+    FROM RecentPosts AS rp
+    GROUP BY
+      rp.OwnerUserId
+  ),
+  CommentActivity AS (
+    SELECT
+      c.UserId,
+      COUNT(c.Id) AS TotalComments,
+      AVG(c.Score) AS AverageCommentScore
+    FROM Comments AS c
+    WHERE
+      c.CreationDate >= DATE('now', '-365 day')
+    GROUP BY
+      c.UserId
+  ),
+  VoteActivity AS (
+    SELECT
+      v.UserId,
+      COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS TotalUpVotes,
+      COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS TotalDownVotes,
+      COUNT(CASE WHEN v.VoteTypeId = 8 THEN 1 END) AS TotalBountyStarts
+    FROM Votes AS v
+    WHERE
+      v.CreationDate >= DATE('now', '-365 day')
+    GROUP BY
+      v.UserId
+  ),
+  HighReputationUsers AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COALESCE(ups.TotalPosts, 0) AS UserTotalPosts,
+      COALESCE(ups.TotalScore, 0) AS UserTotalScore,
+      COALESCE(ups.AverageScore, 0.0) AS UserAverageScore,
+      COALESCE(ca.TotalComments, 0) AS UserTotalComments,
+      COALESCE(ca.AverageCommentScore, 0.0) AS UserAverageCommentScore,
+      COALESCE(va.TotalUpVotes, 0) AS UserTotalUpVotes,
+      COALESCE(va.TotalDownVotes, 0) AS UserTotalDownVotes,
+      COALESCE(va.TotalBountyStarts, 0) AS UserTotalBountyStarts,
+      CASE WHEN rp.PostRankForUser <= 5 THEN TRUE ELSE FALSE END AS IsTop5Poster
+    FROM Users AS u
+    LEFT JOIN UserPostStats AS ups
+      ON u.Id = ups.OwnerUserId
+    LEFT JOIN CommentActivity AS ca
+      ON u.Id = ca.UserId
+    LEFT JOIN VoteActivity AS va
+      ON u.Id = va.UserId
+    LEFT JOIN RecentPosts AS rp
+      ON u.Id = rp.OwnerUserId
+    WHERE
+      u.Reputation >= 10000
+  )
+SELECT
+  hru.DisplayName,
+  hru.Reputation,
+  hru.UserCreationDate,
+  hru.UserTotalPosts,
+  hru.UserTotalScore,
+  hru.UserAverageScore,
+  hru.UserTotalComments,
+  hru.UserAverageCommentScore,
+  hru.UserTotalUpVotes,
+  hru.UserTotalDownVotes,
+  hru.UserTotalBountyStarts,
+  hru.IsTop5Poster,
+  COALESCE(b.Name, 'No Badges') AS MostRecentBadgeName,
+  CASE
+    WHEN hru.UserTotalUpVotes > hru.UserTotalDownVotes * 2
+    THEN 'Positive Contributor'
+    WHEN hru.UserTotalDownVotes > hru.UserTotalUpVotes * 2
+    THEN 'Negative Contributor'
+    ELSE 'Neutral Contributor'
+  END AS ContributionStyle,
+  (
+    SELECT
+      COUNT(*)
+    FROM Posts AS p_sub
+    WHERE
+      p_sub.OwnerUserId = hru.UserId
+      AND p_sub.ClosedDate IS NOT NULL
+  ) AS SubqueryClosedPostsCount,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM Badges AS b_exists
+      WHERE
+        b_exists.UserId = hru.UserId AND b_exists.Class = 1
+    )
+    THEN 'Has Gold Badge'
+    ELSE 'No Gold Badge'
+  END AS GoldBadgeStatus
+FROM HighReputationUsers AS hru
+LEFT JOIN (
+  SELECT
+    UserId,
+    Name,
+    ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY Date DESC) AS rn
+  FROM Badges
+) AS b
+  ON hru.UserId = b.UserId AND b.rn = 1
+WHERE
+  hru.UserTotalPosts > 10
+ORDER BY
+  hru.Reputation DESC,
+  hru.UserAverageScore DESC;

@@ -1,0 +1,147 @@
+-- {"query": "3746.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1758} 
+
+/*  Complex benchmark query using CTEs, window functions, outer joins,
+    correlated subqueries, set operators, string manipulation and NULL logic   */
+WITH 
+-- 1. Top 100 users by reputation with their latest activity date
+TopUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        MAX(p.LastActivityDate) AS LastActivity,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS RepRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(*) > 0
+),
+
+-- 2. Badge summary per user (gold, silver, bronze) and tag‑based flag
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeCount,
+        MAX(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS HasTagBasedBadge
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- 3. Recent activity per user: last vote date and last comment date
+RecentActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        MAX(v.CreationDate) AS LastVoteDate,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id
+),
+
+-- 4. Tag usage for questions posted by top users (explode Tags column)
+UserTagUsage AS (
+    SELECT 
+        tu.Id          AS UserId,
+        LOWER(TRIM(t.tag)) AS Tag,
+        COUNT(*)       AS TagCount
+    FROM TopUsers tu
+    JOIN Posts p ON p.OwnerUserId = tu.Id AND p.PostTypeId = 1   -- only questions
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(
+            SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), 
+            '><')) AS tag
+    ) t
+    GROUP BY tu.Id, LOWER(TRIM(t.tag))
+),
+
+-- 5. Compute a “quality score” per post using window functions and correlated subqueries
+PostQuality AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.AnswerCount,
+        COALESCE(p.Score,0) * 0.4 +
+        COALESCE(p.ViewCount,0) * 0.2 +
+        COALESCE(p.FavoriteCount,0) * 0.2 +
+        COALESCE(p.AnswerCount,0) * 0.2 AS RawQuality,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY 
+            (COALESCE(p.Score,0) * 0.4 +
+             COALESCE(p.ViewCount,0) * 0.2 +
+             COALESCE(p.FavoriteCount,0) * 0.2 +
+             COALESCE(p.AnswerCount,0) * 0.2) DESC) AS PostRank,
+        /* Correlated subquery: max score among this owner's other posts */
+        (SELECT MAX(p2.Score)
+         FROM Posts p2
+         WHERE p2.OwnerUserId = p.OwnerUserId AND p2.Id <> p.Id) AS MaxPeerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1                -- only questions
+      AND p.CreationDate > CURRENT_DATE - INTERVAL '180 days'
+)
+
+-- Final result set: combine everything, apply outer joins, UNION for extra rows
+SELECT 
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.LastActivity,
+    ub.GoldCount,
+    ub.SilverCount,
+    ub.BronzeCount,
+    CASE WHEN ub.HasTagBasedBadge = 1 THEN TRUE ELSE FALSE END AS HasTagBadge,
+    ra.LastVoteDate,
+    ra.LastCommentDate,
+    COALESCE(tq.RawQuality,0) AS QualityScore,
+    tq.PostRank,
+    tq.MaxPeerScore,
+    COALESCE(ut.TagCount,0) AS TotalTagUsage,
+    /* Example string expression: create a pseudo‑slug */
+    LOWER(REPLACE(tu.DisplayName, ' ', '-')) || '-' || tu.Id AS UserSlug,
+    /* Null logic: if a user never voted, show a default date */
+    COALESCE(ra.LastVoteDate, TIMESTAMP '2000-01-01') AS EffectiveLastVoteDate
+FROM TopUsers tu
+LEFT JOIN UserBadgeStats ub      ON ub.UserId = tu.Id
+LEFT JOIN RecentActivity ra     ON ra.UserId = tu.Id
+LEFT JOIN PostQuality tq        ON tq.OwnerUserId = tu.Id AND tq.PostRank = 1
+LEFT JOIN (
+    SELECT UserId, SUM(TagCount) AS TagCount
+    FROM UserTagUsage
+    GROUP BY UserId
+) ut                           ON ut.UserId = tu.Id
+WHERE tu.RepRank <= 100
+
+UNION ALL
+
+/*  Additional slice: users with no badges but recent activity on the platform   */
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    MAX(p.LastActivityDate) AS LastActivity,
+    0 AS GoldCount,
+    0 AS SilverCount,
+    0 AS BronzeCount,
+    FALSE AS HasTagBadge,
+    MAX(v.CreationDate) AS LastVoteDate,
+    MAX(c.CreationDate) AS LastCommentDate,
+    NULL::numeric AS QualityScore,
+    NULL::int AS PostRank,
+    NULL::int AS MaxPeerScore,
+    0 AS TotalTagUsage,
+    LOWER(REPLACE(u.DisplayName, ' ', '-')) || '-' || u.Id AS UserSlug,
+    COALESCE(MAX(v.CreationDate), TIMESTAMP '2000-01-01') AS EffectiveLastVoteDate
+FROM Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.UserId = u.Id
+LEFT JOIN Comments c ON c.UserId = u.Id
+WHERE NOT EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id)
+  AND u.Reputation > 0
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(p.Id) = 0
+ORDER BY Reputation DESC, Id
+LIMIT 200;

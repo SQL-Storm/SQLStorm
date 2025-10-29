@@ -1,0 +1,167 @@
+-- {"query": "2054.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1510} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as AncestorPath
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+
+    union all
+
+    select
+        c.Id,
+        c.TagName,
+        c.Count,
+        p.Level + 1,
+        p.AncestorPath || c.TagName
+    from Tags c
+    join RecursiveTagHierarchy p on p.TagName <> c.TagName
+    where array_length(p.AncestorPath, 1) < 3 -- limiting recursion depth to avoid cycles
+      and not c.TagName = any(p.AncestorPath)
+      and c.IsModeratorOnly = 0
+      and c.IsRequired = 0
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount,
+        max(b.Date) as LatestBadgeDate
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserAggregateStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(sum(p.Score), 0) as TotalPostScore,
+        coalesce(avg(p.ViewCount), 0) as AvgPostViews,
+        count(distinct p.Id) as PostCount,
+        coalesce(max(voteUp.CountUpVotes), 0) as MaxUpVotesOnPost,
+        coalesce(min(voteDown.CountDownVotes), 0) as MinDownVotesOnPost
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join lateral (
+        select count(*) as CountUpVotes
+        from Votes v
+        where v.PostId = p.Id and v.VoteTypeId = 2
+    ) voteUp on true
+    left join lateral (
+        select count(*) as CountDownVotes
+        from Votes v2
+        where v2.PostId = p.Id and v2.VoteTypeId = 3
+    ) voteDown on true
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+QuestionAnswerRanks as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreationDate,
+        a.Score as AnswerScore,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+CloseReasonsWithCount as (
+    select
+        crt.Id,
+        crt.Name,
+        count(ph.Id) as CloseCount
+    from CloseReasonTypes crt
+    left join PostHistory ph on ph.PostHistoryTypeId = 10 and ph.Comment = cast(crt.Id as varchar)
+    group by crt.Id, crt.Name
+),
+PopularTags as (
+    select
+       t.Id,
+       t.TagName,
+       t.Count,
+       p.Title as ExcerptTitle,
+       p.Body as ExcerptBody
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId
+    where t.Count > 50000
+),
+UserActivityWindow as (
+    select 
+        u.Id,
+        u.DisplayName,
+        p.Id as PostId,
+        p.CreationDate,
+        lag(p.CreationDate) over (partition by u.Id order by p.CreationDate) as PrevPostDate,
+        lead(p.CreationDate) over (partition by u.Id order by p.CreationDate) as NextPostDate,
+        p.PostTypeId,
+        (extract(epoch from (p.CreationDate - lag(p.CreationDate) over (partition by u.Id order by p.CreationDate))) / 3600.0) as HoursSincePrev,
+        (extract(epoch from (lead(p.CreationDate) over (partition by u.Id order by p.CreationDate) - p.CreationDate)) / 3600.0) as HoursToNext
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id
+),
+HighActivityUsers AS (
+    select distinct
+        u.Id,
+        u.DisplayName,
+        count(p.Id) as PostsLast30Days
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id
+    where p.CreationDate > cast('2024-10-01' as date) - interval '30 days'
+    group by u.Id, u.DisplayName
+    having count(p.Id) > 100
+)
+select distinct
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    ubc.Class as BadgeClass,
+    ubc.BadgeCount,
+    q.Title as PopularQuestionTitle,
+    q.QuestionCreationDate,
+    a.AnswerId,
+    a.AnswerScore,
+    close.Name as FrequentCloseReason,
+    close.CloseCount,
+    pt.TagName as PopularTag,
+    pt.Count as TagUsageCount,
+    ua.HoursSincePrev,
+    ua.HoursToNext,
+    case 
+        when u.Reputation > 10000 and ubc.BadgeCount > 5 then 'HighRepActive'
+        when ua.HoursSincePrev is not null and ua.HoursSincePrev < 1 then 'VeryActiveRecently'
+        else 'NormalUser'
+    end as UserActivityClassification,
+    coalesce(
+        (
+            select string_agg(distinct tag, ', ' order by tag)
+            from unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as tag
+        ), ''
+    ) as ParsedTags,
+    coalesce(
+        (
+            select count(*) 
+            from PostLinks pl 
+            where pl.PostId = p.Id and pl.LinkTypeId = 3 -- duplicates links
+        ), 0
+    ) as DuplicateLinksCount
+from Users u
+left join UserBadgeCounts ubc on ubc.UserId = u.Id and ubc.Class = 1 -- Gold badges only
+left join QuestionAnswerRanks a on a.AnswerRank = 1 and a.AnswerScore >= 10 and a.QuestionCreationDate > cast('2024-10-01' as date) - interval '365 days'
+left join Posts q on q.Id = a.QuestionId
+left join CloseReasonsWithCount close on close.CloseCount > 1000
+left join PopularTags pt on pt.TagName = any(string_to_array(coalesce(q.Tags, ''), '><'))
+left join UserActivityWindow ua on ua.Id = u.Id
+left join HighActivityUsers h on h.Id = u.Id
+left join Posts p on p.OwnerUserId = u.Id
+where u.Reputation > 1000
+  and (h.PostsLast30Days is not null or ubc.BadgeCount is not null)
+order by u.Reputation desc, ubc.BadgeCount desc, a.AnswerScore desc
+limit 50;

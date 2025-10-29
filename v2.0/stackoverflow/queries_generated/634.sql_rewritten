@@ -1,0 +1,323 @@
+-- {"query": "634.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3114} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        u.websiteurl,
+        coalesce(nullif(trim(u.aboutme), ''), '(no about)') as about_snippet,
+        row_number() over (order by u.creationdate desc, u.id desc) as rn
+    from users u
+    where u.creationdate >= (select date_trunc('month', max(p.creationdate)) - interval '12 months' from posts p)
+),
+user_badge_agg as (
+    select
+        b.userid,
+        count(*) as total_badges,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+q_and_a as (
+    select
+        p.owneruserid as user_id,
+        sum(case when p.posttypeid = 1 then 1 else 0 end) as questions,
+        sum(case when p.posttypeid = 2 then 1 else 0 end) as answers,
+        sum(coalesce(p.viewcount,0)) as total_views,
+        sum(coalesce(p.score,0)) as net_score,
+        avg(nullif(p.answercount,0)) filter (where p.posttypeid = 1) as avg_answers_per_q
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+post_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35,36)) as mod_events,
+        count(*) filter (where ph.posthistorytypeid = 50) as community_bumps,
+        max(ph.creationdate) as last_hist_dt
+    from posts p
+    left join posthistory ph on ph.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+vote_rollup as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_received,
+        count(*) filter (where v.votetypeid = 3) as downvotes_received,
+        count(*) filter (where v.votetypeid = 8) as bounties_started,
+        sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_total
+    from posts p
+    left join votes v on v.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+linking as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where pl.linktypeid = 1) as links_out,
+        count(*) filter (where pl.linktypeid = 3) as dup_marks,
+        count(distinct case when pl.linktypeid = 3 then pl.relatedpostid end) as distinct_dup_targets
+    from posts p
+    left join postlinks pl on pl.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+comments_agg as (
+    select
+        coalesce(c.userid, -1) as user_id,
+        count(*) as comments_made,
+        sum(coalesce(c.score,0)) as comment_score,
+        max(c.creationdate) as last_comment_date,
+        count(*) filter (
+            where position(lower(':)') in lower(c.text)) > 0
+               or position(lower('thanks') in lower(c.text)) > 0
+               or position(lower('sorry') in lower(c.text)) > 0
+        ) as polite_comments
+    from comments c
+    group by coalesce(c.userid, -1)
+),
+tag_influence as (
+    select
+        p.owneruserid as user_id,
+        unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tag_name,
+        count(*) as tag_posts,
+        sum(coalesce(p.score,0)) as tag_score
+    from posts p
+    where p.owneruserid is not null
+      and p.posttypeid = 1
+      and p.tags is not null
+    group by p.owneruserid, unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><'))
+),
+tag_rank as (
+    select
+        user_id,
+        tag_name,
+        tag_posts,
+        tag_score,
+        row_number() over (partition by user_id order by tag_score desc, tag_posts desc, tag_name) as rnk
+    from tag_influence
+),
+dup_pairs as (
+    select
+        q.id as question_id,
+        q.owneruserid as owner_id,
+        d.relatedpostid as master_id,
+        dense_rank() over (partition by q.owneruserid order by q.creationdate desc) as recency_rank
+    from posts q
+    join postlinks d on d.postid = q.id and d.linktypeid = 3
+    where q.posttypeid = 1
+),
+accepted_answerers as (
+    select
+        a.owneruserid as user_id,
+        count(*) as accepted_answers
+    from posts q
+    join posts a on a.id = q.acceptedanswerid and a.posttypeid = 2
+    where q.posttypeid = 1
+      and a.owneruserid is not null
+    group by a.owneruserid
+),
+quality_score as (
+    select
+        u.id as user_id,
+        coalesce(qa.net_score,0)
+        + coalesce(vr.upvotes_received,0)*2
+        - coalesce(vr.downvotes_received,0)
+        + coalesce(aa.accepted_answers,0)*5
+        + coalesce(ub.gold_badges,0)*8
+        + coalesce(ub.silver_badges,0)*3
+        + coalesce(ub.bronze_badges,0) as qscore
+    from users u
+    left join q_and_a qa on qa.user_id = u.id
+    left join vote_rollup vr on vr.user_id = u.id
+    left join accepted_answerers aa on aa.user_id = u.id
+    left join user_badge_agg ub on ub.userid = u.id
+),
+top_users as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.creationdate,
+        ru.location,
+        ru.websiteurl,
+        ru.about_snippet,
+        qs.qscore,
+        row_number() over (order by qs.qscore desc nulls last, ru.reputation desc, ru.user_id) as global_rank
+    from recent_users ru
+    left join quality_score qs on qs.user_id = ru.user_id
+),
+dupe_detail as (
+    select
+        dp.owner_id as user_id,
+        count(*) as dup_questions,
+        count(distinct dp.master_id) as distinct_masters,
+        min(dp.recency_rank) as most_recent_dup_rank
+    from dup_pairs dp
+    group by dp.owner_id
+),
+null_safety as (
+    select
+        tu.*,
+        coalesce(qa.questions,0) as questions,
+        coalesce(qa.answers,0) as answers,
+        coalesce(qa.total_views,0) as total_views,
+        coalesce(qa.net_score,0) as net_score,
+        coalesce(qa.avg_answers_per_q,0) as avg_answers_per_q,
+        coalesce(pa.mod_events,0) as mod_events,
+        coalesce(pa.community_bumps,0) as community_bumps,
+        pa.last_hist_dt,
+        coalesce(vr.upvotes_received,0) as upvotes_received,
+        coalesce(vr.downvotes_received,0) as downvotes_received,
+        coalesce(vr.bounties_started,0) as bounties_started,
+        coalesce(vr.bounty_total,0) as bounty_total,
+        coalesce(ub.total_badges,0) as total_badges,
+        coalesce(ub.gold_badges,0) as gold_badges,
+        coalesce(ub.silver_badges,0) as silver_badges,
+        coalesce(ub.bronze_badges,0) as bronze_badges,
+        ub.first_badge_date,
+        ub.last_badge_date,
+        coalesce(ca.comments_made,0) as comments_made,
+        coalesce(ca.comment_score,0) as comment_score,
+        ca.last_comment_date,
+        coalesce(ca.polite_comments,0) as polite_comments,
+        coalesce(li.links_out,0) as links_out,
+        coalesce(li.dup_marks,0) as dup_marks,
+        coalesce(li.distinct_dup_targets,0) as distinct_dup_targets,
+        coalesce(dd.dup_questions,0) as dup_questions,
+        coalesce(dd.distinct_masters,0) as distinct_masters,
+        dd.most_recent_dup_rank
+    from top_users tu
+    left join q_and_a qa on qa.user_id = tu.user_id
+    left join post_activity pa on pa.user_id = tu.user_id
+    left join vote_rollup vr on vr.user_id = tu.user_id
+    left join user_badge_agg ub on ub.userid = tu.user_id
+    left join comments_agg ca on ca.user_id = tu.user_id
+    left join linking li on li.user_id = tu.user_id
+    left join dupe_detail dd on dd.user_id = tu.user_id
+),
+best_tag as (
+    select
+        tr.user_id,
+        tr.tag_name,
+        tr.tag_posts,
+        tr.tag_score
+    from tag_rank tr
+    where tr.rnk = 1
+),
+activity_windows as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as posts_30d,
+        count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as posts_90d,
+        sum(coalesce(p.score,0)) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as score_30d,
+        sum(coalesce(p.score,0)) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as score_365d
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+rank_within_location as (
+    select
+        ns.user_id,
+        dense_rank() over (partition by coalesce(nullif(trim(lower(ns.location)),'') , '(unknown)') order by ns.qscore desc nulls last, ns.reputation desc, ns.user_id) as loc_rank
+    from null_safety ns
+)
+select
+    ns.user_id,
+    ns.displayname,
+    ns.reputation,
+    ns.creationdate,
+    coalesce(nullif(trim(ns.location),''), '(unknown)') as location,
+    ns.websiteurl,
+    ns.about_snippet,
+    ns.qscore,
+    ns.global_rank,
+    ns.questions,
+    ns.answers,
+    ns.total_views,
+    ns.net_score,
+    round(ns.avg_answers_per_q::numeric, 2) as avg_answers_per_q,
+    ns.upvotes_received,
+    ns.downvotes_received,
+    ns.bounties_started,
+    ns.bounty_total,
+    ns.total_badges,
+    ns.gold_badges,
+    ns.silver_badges,
+    ns.bronze_badges,
+    ns.first_badge_date,
+    ns.last_badge_date,
+    ns.comments_made,
+    ns.comment_score,
+    ns.polite_comments,
+    ns.last_comment_date,
+    ns.mod_events,
+    ns.community_bumps,
+    ns.last_hist_dt,
+    ns.links_out,
+    ns.dup_marks,
+    ns.distinct_dup_targets,
+    ns.dup_questions,
+    ns.distinct_masters,
+    ns.most_recent_dup_rank,
+    coalesce(bt.tag_name, '(no tag)') as top_tag,
+    coalesce(bt.tag_posts,0) as top_tag_posts,
+    coalesce(bt.tag_score,0) as top_tag_score,
+    aw.posts_30d,
+    aw.posts_90d,
+    aw.score_30d,
+    aw.score_365d,
+    rwl.loc_rank,
+    case
+        when ns.answers > 0 then round((ns.upvotes_received::numeric - ns.downvotes_received) / nullif(ns.answers,0), 3)
+        else null
+    end as vote_delta_per_answer,
+    case
+        when ns.questions > 0 then round(ns.total_views::numeric / nullif(ns.questions,0), 2)
+        else null
+    end as avg_views_per_question,
+    case
+        when ns.total_badges > 0 then concat(ns.gold_badges, '/', ns.silver_badges, '/', ns.bronze_badges)
+        else null
+    end as badge_mix,
+    case
+        when ns.qscore >= percentile_disc(0.95) within group (order by ns.qscore) over ()
+            then 'top 5%'
+        when ns.qscore >= percentile_disc(0.75) within group (order by ns.qscore) over ()
+            then 'top 25%'
+        when ns.qscore is null then 'unscored'
+        else 'other'
+    end as qscore_bucket
+from null_safety ns
+left join best_tag bt on bt.user_id = ns.user_id
+left join activity_windows aw on aw.user_id = ns.user_id
+left join rank_within_location rwl on rwl.user_id = ns.user_id
+where
+    -- complex predicate combining several dimensions
+    (
+        (ns.reputation >= 1000 and coalesce(ns.answers,0) >= 25)
+        or (ns.gold_badges >= 1 and coalesce(ns.net_score,0) > 0)
+        or (ns.qscore is not null and ns.qscore > 50 and coalesce(ns.questions,0) >= 5)
+    )
+    and (
+        ns.last_comment_date is null
+        or ns.last_comment_date >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+    )
+    and (
+        ns.location is null
+        or position('remote' in lower(ns.location)) = 0
+    )
+order by
+    ns.qscore desc nulls last,
+    ns.reputation desc,
+    ns.answers desc,
+    ns.user_id
+limit 200 offset 0;

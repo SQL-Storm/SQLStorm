@@ -1,0 +1,307 @@
+-- {"query": "1575.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4216} 
+WITH UserActivitySummary AS (
+    -- Aggregates user-specific activity and reputation metrics, including a correlated subquery for recent badges.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.WebsiteUrl,
+        U.Location,
+        U.Views,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(P.Id) AS UserTotalPosts,
+        SUM(P.Score) AS UserTotalPostScore,
+        COUNT(CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS UserQuestions,
+        COUNT(CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS UserAnswers,
+        COUNT(C.Id) AS UserTotalComments,
+        AVG(C.Score) FILTER (WHERE C.Score IS NOT NULL) AS UserAvgCommentScore,
+        (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1 AND B.Date >= U.LastAccessDate - INTERVAL '1 year') AS GoldBadgesLastYear,
+        COALESCE(U.Location, 'Unknown') AS NormalizedLocation,
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - U.CreationDate)) / (3600 * 24 * 365.25) AS YearsOnPlatform
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.WebsiteUrl, U.Location, U.Views, U.UpVotes, U.DownVotes
+),
+PostHistoricalAnalysis AS (
+    -- Analyzes post history for questions, calculating edit counts, close status, and average edit length.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.Title,
+        P.Tags,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edits
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 'Closed' ELSE 'Open' END) AS CurrentCloseStatus,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS LastEditHistoryDate,
+        MIN(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId = 10) AS FirstCloseDate,
+        AVG(CASE WHEN PH.PostHistoryTypeId = 5 THEN LENGTH(PH.Text) END) FILTER (WHERE PH.Text IS NOT NULL) AS AvgBodyEditLength
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    WHERE P.PostTypeId = 1 -- Focus on questions
+    GROUP BY P.Id, P.PostTypeId, P.CreationDate, P.LastEditDate, P.LastActivityDate, P.ClosedDate, P.Title, P.Tags, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount
+),
+TagPerformance AS (
+    -- Aggregates performance metrics for individual tags.
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><'))) AS TagName,
+        COUNT(DISTINCT P.Id) AS PostsTagged,
+        SUM(P.Score) AS TotalTagScore,
+        AVG(P.Score) AS AvgTagScore,
+        SUM(P.ViewCount) AS TotalTagViews,
+        AVG(P.ViewCount) AS AvgTagViews,
+        COUNT(DISTINCT P.OwnerUserId) AS UniqueOwners
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><')))
+),
+QuestionDetails AS (
+    -- Combines question, owner, accepted answer, and historical analysis data. Includes multiple correlated subqueries.
+    SELECT
+        P.Id AS QuestionId,
+        P.Title AS QuestionTitle,
+        P.Body AS QuestionBody,
+        P.Tags AS QuestionTagsRaw,
+        string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><') AS QuestionTagsArray,
+        P.CreationDate AS QuestionCreationDate,
+        P.Score AS QuestionScore,
+        P.ViewCount AS QuestionViewCount,
+        P.AnswerCount AS QuestionAnswerCount,
+        P.CommentCount AS QuestionCommentCount,
+        P.FavoriteCount AS QuestionFavoriteCount,
+        P.OwnerUserId AS QuestionOwnerId,
+        U.DisplayName AS QuestionOwnerDisplayName,
+        U.Reputation AS QuestionOwnerReputation,
+        P.AcceptedAnswerId,
+        AA.CreationDate AS AcceptedAnswerCreationDate,
+        AA.Score AS AcceptedAnswerScore,
+        AA.OwnerUserId AS AcceptedAnswerOwnerId,
+        AA_U.DisplayName AS AcceptedAnswerOwnerDisplayName,
+        AA_U.Reputation AS AcceptedAnswerOwnerReputation,
+        PHA.EditCount AS QuestionEditCount,
+        PHA.TotalHistoryEntries AS QuestionTotalHistoryEntries,
+        PHA.CurrentCloseStatus AS QuestionCloseStatus,
+        COALESCE(PHA.LastEditHistoryDate, P.LastEditDate) AS EffectiveLastEditDate,
+        COALESCE(PHA.FirstCloseDate, P.ClosedDate) AS EffectiveClosedDate,
+        (SELECT MAX(V.CreationDate) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 2) AS LatestUpvoteDate,
+        (SELECT MAX(V.CreationDate) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 3) AS LatestDownvoteDate,
+        (SELECT COUNT(DISTINCT PL.RelatedPostId) FROM PostLinks PL WHERE PL.PostId = P.Id AND PL.LinkTypeId = 1) AS LinkedPostsCount,
+        (SELECT COUNT(DISTINCT PL.RelatedPostId) FROM PostLinks PL WHERE PL.PostId = P.Id AND PL.LinkTypeId = 3) AS DuplicatePostsCount,
+        (SELECT SUM(C.Score) FROM Comments C WHERE C.PostId = P.Id) AS TotalCommentScores,
+        (SELECT AVG(C.Score) FROM Comments C WHERE C.PostId = P.Id) AS AvgCommentScore,
+        (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = P.OwnerUserId AND B.Class = 1) AS QuestionOwnerGoldBadges,
+        EXISTS (
+            SELECT 1 FROM Badges B
+            WHERE B.UserId = P.OwnerUserId
+            AND B.Name ILIKE '%Pioneer%'
+            AND B.Date BETWEEN P.CreationDate - INTERVAL '90 days' AND P.CreationDate + INTERVAL '90 days'
+        ) AS OwnerHasEarlyBadge
+    FROM Posts P
+    INNER JOIN Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN Posts AA ON P.AcceptedAnswerId = AA.Id -- Accepted Answer
+    LEFT JOIN Users AA_U ON AA.OwnerUserId = AA_U.Id -- Accepted Answer Owner
+    INNER JOIN PostHistoricalAnalysis PHA ON P.Id = PHA.PostId
+    WHERE P.PostTypeId = 1 -- Only questions
+      AND P.CreationDate BETWEEN '2020-01-01' AND '2023-12-31' -- Specific time range
+      AND P.Score >= 10
+      AND P.ViewCount >= 100
+),
+QuestionDerivedMetrics AS (
+    -- Calculates complex derived metrics and applies various window functions.
+    SELECT
+        QD.QuestionId,
+        QD.QuestionTitle,
+        QD.QuestionTagsRaw,
+        QD.QuestionCreationDate,
+        QD.QuestionScore,
+        QD.QuestionViewCount,
+        QD.QuestionAnswerCount,
+        QD.QuestionCommentCount,
+        QD.QuestionFavoriteCount,
+        QD.QuestionOwnerId,
+        QD.QuestionOwnerDisplayName,
+        QD.QuestionOwnerReputation,
+        QD.AcceptedAnswerId,
+        QD.AcceptedAnswerScore,
+        QD.AcceptedAnswerOwnerDisplayName,
+        QD.QuestionEditCount,
+        QD.QuestionCloseStatus,
+        QD.OwnerHasEarlyBadge,
+        QD.TotalCommentScores,
+        QD.AvgCommentScore,
+        QD.LinkedPostsCount,
+        QD.DuplicatePostsCount,
+        COALESCE(QD.AcceptedAnswerScore, 0) AS NormalizedAcceptedAnswerScore,
+        COALESCE(QD.AvgCommentScore, 0.0) AS NormalizedAvgCommentScore,
+        CASE
+            WHEN QD.QuestionCloseStatus = 'Closed' THEN -50
+            WHEN QD.AcceptedAnswerId IS NULL THEN -20
+            ELSE 0
+        END AS CloseAnswerPenalty,
+        (QD.QuestionScore * 0.4 + QD.QuestionViewCount / 100.0 + QD.QuestionAnswerCount * 5 + QD.QuestionFavoriteCount * 10 + COALESCE(QD.AcceptedAnswerScore, 0) * 0.3 + COALESCE(QD.AvgCommentScore, 0) * 2 + QD.QuestionEditCount * 2 + QD.LinkedPostsCount * 3 + QD.DuplicatePostsCount * -5 + CloseAnswerPenalty + (CASE WHEN QD.OwnerHasEarlyBadge THEN 10 ELSE 0 END)) AS CompositeScore,
+        RANK() OVER (PARTITION BY QD.QuestionOwnerId ORDER BY QD.QuestionScore DESC, QD.QuestionViewCount DESC) AS RankByOwnerScore,
+        NTILE(4) OVER (ORDER BY QD.QuestionScore DESC) AS QuestionScoreQuartile,
+        AVG(QD.QuestionScore) OVER (ORDER BY QD.QuestionCreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS RollingAvgScore30Days,
+        MAX(QD.QuestionFavoriteCount) OVER (PARTITION BY QD.QuestionOwnerId) AS MaxFavCountByOwner,
+        LAG(QD.QuestionScore, 1, 0) OVER (PARTITION BY QD.QuestionOwnerId ORDER BY QD.QuestionCreationDate) AS PrevQuestionScoreByOwner,
+        STRING_AGG(T.TagName, ', ') FILTER (WHERE T.PostsTagged > 1000) AS TopTagsSummary,
+        LENGTH(QD.QuestionBody) AS BodyLength
+    FROM QuestionDetails QD
+    LEFT JOIN TagPerformance T ON T.TagName = ANY(QD.QuestionTagsArray)
+    GROUP BY
+        QD.QuestionId, QD.QuestionTitle, QD.QuestionTagsRaw, QD.QuestionCreationDate, QD.QuestionScore, QD.QuestionViewCount, QD.QuestionAnswerCount, QD.QuestionCommentCount, QD.QuestionFavoriteCount,
+        QD.QuestionOwnerId, QD.QuestionOwnerDisplayName, QD.QuestionOwnerReputation, QD.AcceptedAnswerId, QD.AcceptedAnswerScore, QD.AcceptedAnswerOwnerDisplayName,
+        QD.QuestionEditCount, QD.QuestionCloseStatus, QD.OwnerHasEarlyBadge, QD.TotalCommentScores, QD.AvgCommentScore, QD.LinkedPostsCount, QD.DuplicatePostsCount, QD.QuestionBody
+)
+-- Main query combining three distinct categories of questions using UNION ALL, with extensive filtering and calculations.
+SELECT
+    'HighScore_Accepted' AS Category,
+    QDM.QuestionId,
+    QDM.QuestionTitle,
+    QDM.QuestionTagsRaw,
+    QDM.QuestionCreationDate,
+    QDM.QuestionScore,
+    QDM.QuestionViewCount,
+    QDM.QuestionAnswerCount,
+    QDM.QuestionCommentCount,
+    QDM.QuestionFavoriteCount,
+    QDM.QuestionOwnerDisplayName,
+    QDM.QuestionOwnerReputation,
+    QDM.AcceptedAnswerScore,
+    QDM.AcceptedAnswerOwnerDisplayName,
+    QDM.QuestionEditCount,
+    QDM.QuestionCloseStatus,
+    QDM.CompositeScore,
+    QDM.RankByOwnerScore,
+    QDM.QuestionScoreQuartile,
+    QDM.RollingAvgScore30Days,
+    UAS.YearsOnPlatform,
+    UAS.NormalizedLocation,
+    UAS.GoldBadgesLastYear,
+    COALESCE(QDM.TopTagsSummary, 'N/A') AS DominantTags,
+    QDM.BodyLength,
+    ABS(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - QDM.QuestionCreationDate))) AS AgeInSeconds,
+    CASE
+        WHEN QDM.QuestionTitle ILIKE '%SQL%' THEN 'SQL Related'
+        WHEN QDM.QuestionTitle ILIKE '%Database%' THEN 'Database Related'
+        WHEN QDM.QuestionTitle ILIKE '%API%' THEN 'API Related'
+        ELSE 'General Tech'
+    END AS TitleKeywordCategory
+FROM QuestionDerivedMetrics QDM
+INNER JOIN UserActivitySummary UAS ON QDM.QuestionOwnerId = UAS.UserId
+WHERE QDM.AcceptedAnswerId IS NOT NULL
+  AND QDM.QuestionScore >= 50
+  AND QDM.QuestionAnswerCount > 0
+  AND QDM.AcceptedAnswerScore > 0
+  AND QDM.QuestionEditCount BETWEEN 2 AND 10
+  AND UAS.YearsOnPlatform > 1
+  AND LENGTH(TRIM(QDM.QuestionTitle)) > 0
+  AND QDM.QuestionTagsRaw IS NOT NULL AND POSITION('<javascript>' IN LOWER(QDM.QuestionTagsRaw)) = 0
+  AND QDM.QuestionCloseStatus = 'Open'
+
+UNION ALL
+
+SELECT
+    'HighlyEdited_NoAccepted' AS Category,
+    QDM.QuestionId,
+    QDM.QuestionTitle,
+    QDM.QuestionTagsRaw,
+    QDM.QuestionCreationDate,
+    QDM.QuestionScore,
+    QDM.QuestionViewCount,
+    QDM.QuestionAnswerCount,
+    QDM.QuestionCommentCount,
+    QDM.QuestionFavoriteCount,
+    QDM.QuestionOwnerDisplayName,
+    QDM.QuestionOwnerReputation,
+    QDM.AcceptedAnswerScore,
+    QDM.AcceptedAnswerOwnerDisplayName,
+    QDM.QuestionEditCount,
+    QDM.QuestionCloseStatus,
+    QDM.CompositeScore,
+    QDM.RankByOwnerScore,
+    QDM.QuestionScoreQuartile,
+    QDM.RollingAvgScore30Days,
+    UAS.YearsOnPlatform,
+    UAS.NormalizedLocation,
+    UAS.GoldBadgesLastYear,
+    COALESCE(QDM.TopTagsSummary, 'N/A') AS DominantTags,
+    QDM.BodyLength,
+    ABS(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - QDM.QuestionCreationDate))) AS AgeInSeconds,
+    CASE
+        WHEN QDM.QuestionTitle ILIKE '%performance%' THEN 'Performance Topic'
+        WHEN QDM.QuestionTitle ILIKE '%optimization%' THEN 'Optimization Topic'
+        WHEN QDM.QuestionTitle ILIKE '%slow%' THEN 'Performance Issue'
+        ELSE 'Other Tech'
+    END AS TitleKeywordCategory
+FROM QuestionDerivedMetrics QDM
+INNER JOIN UserActivitySummary UAS ON QDM.QuestionOwnerId = UAS.UserId
+WHERE QDM.AcceptedAnswerId IS NULL
+  AND QDM.QuestionEditCount >= 5
+  AND QDM.QuestionCommentCount >= 10
+  AND QDM.QuestionCloseStatus = 'Open'
+  AND QDM.QuestionScore BETWEEN 10 AND 49
+  AND UAS.GoldBadgesLastYear > 0
+  AND QDM.QuestionTagsRaw IS NOT NULL AND POSITION('<python>' IN LOWER(QDM.QuestionTagsRaw)) > 0
+  AND QDM.BodyLength > 500
+
+UNION ALL
+
+SELECT
+    'LowScore_HighEngagement' AS Category,
+    QDM.QuestionId,
+    QDM.QuestionTitle,
+    QDM.QuestionTagsRaw,
+    QDM.QuestionCreationDate,
+    QDM.QuestionScore,
+    QDM.QuestionViewCount,
+    QDM.QuestionAnswerCount,
+    QDM.QuestionCommentCount,
+    QDM.QuestionFavoriteCount,
+    QDM.QuestionOwnerDisplayName,
+    QDM.QuestionOwnerReputation,
+    QDM.AcceptedAnswerScore,
+    QDM.AcceptedAnswerOwnerDisplayName,
+    QDM.QuestionEditCount,
+    QDM.QuestionCloseStatus,
+    QDM.CompositeScore,
+    QDM.RankByOwnerScore,
+    QDM.QuestionScoreQuartile,
+    QDM.RollingAvgScore30Days,
+    UAS.YearsOnPlatform,
+    UAS.NormalizedLocation,
+    UAS.GoldBadgesLastYear,
+    COALESCE(QDM.TopTagsSummary, 'N/A') AS DominantTags,
+    QDM.BodyLength,
+    ABS(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - QDM.QuestionCreationDate))) AS AgeInSeconds,
+    CASE
+        WHEN QDM.QuestionOwnerReputation < 1000 THEN 'New User Question'
+        WHEN QDM.QuestionOwnerReputation >= 1000 AND QDM.QuestionOwnerReputation < 5000 THEN 'Mid User Question'
+        ELSE 'Experienced User Question'
+    END AS TitleKeywordCategory
+FROM QuestionDerivedMetrics QDM
+INNER JOIN UserActivitySummary UAS ON QDM.QuestionOwnerId = UAS.UserId
+WHERE QDM.QuestionScore BETWEEN 1 AND 9
+  AND QDM.QuestionCommentCount >= 5
+  AND QDM.QuestionAnswerCount > 0
+  AND QDM.QuestionEditCount < 2
+  AND QDM.AcceptedAnswerId IS NOT NULL
+  AND UAS.Views > 1000
+  AND QDM.QuestionTagsRaw IS NOT NULL AND POSITION('<c#>' IN LOWER(QDM.QuestionTagsRaw)) > 0
+  AND QDM.QuestionCloseStatus = 'Open'
+  AND QDM.FavoriteCount > 0
+
+ORDER BY CompositeScore DESC, QuestionCreationDate DESC
+LIMIT 1000;

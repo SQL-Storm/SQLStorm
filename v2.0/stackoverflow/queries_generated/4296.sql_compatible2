@@ -1,0 +1,165 @@
+WITH
+  QuestionDetails AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title AS QuestionTitle,
+      p.OwnerUserId AS QuestionOwnerUserId,
+      u.DisplayName AS QuestionOwnerDisplayName,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.ViewCount AS QuestionViewCount,
+      p.AnswerCount AS QuestionAnswerCount,
+      p.FavoriteCount AS QuestionFavoriteCount,
+      p.ClosedDate AS QuestionClosedDate,
+      pt.Name AS QuestionPostType,
+      SUM(CASE WHEN c.UserId IS NOT NULL THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS CommentCountOnQuestion,
+      COUNT(ph.Id) OVER (PARTITION BY p.Id) AS PostHistoryCountForQuestion,
+      ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC, p.Score DESC) AS rn_view_score
+    FROM Posts p
+    JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c
+      ON p.Id = c.PostId
+    LEFT JOIN PostHistory ph
+      ON p.Id = ph.PostId
+    WHERE
+      p.PostTypeId = 1 AND p.Score > 0 AND p.AnswerCount > 0 AND p.CreationDate >= DATE '2023-01-01'
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      u.DisplayName,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      pt.Name
+  ),
+  AnswerDetails AS (
+    SELECT
+      p.Id AS AnswerId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId AS AnswerOwnerUserId,
+      u.DisplayName AS AnswerOwnerDisplayName,
+      p.CreationDate AS AnswerCreationDate,
+      p.Score AS AnswerScore,
+      p.CommentCount AS AnswerCommentCount,
+      COUNT(v.Id) OVER (PARTITION BY p.Id) AS VoteCountOnAnswer,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn_answer_score
+    FROM Posts p
+    LEFT JOIN Users u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v
+      ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE
+      p.PostTypeId = 2
+    GROUP BY
+      p.Id,
+      p.ParentId,
+      p.OwnerUserId,
+      u.DisplayName,
+      p.CreationDate,
+      p.Score,
+      p.CommentCount
+  ),
+  UserActivity AS (
+    SELECT
+      OwnerUserId AS UserId,
+      COUNT(Id) AS TotalPosts,
+      SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionPosts,
+      SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerPosts,
+      AVG(Score) AS AveragePostScore,
+      MAX(CreationDate) AS LastPostDate
+    FROM Posts
+    WHERE
+      OwnerUserId IS NOT NULL AND OwnerUserId <> -1
+    GROUP BY
+      OwnerUserId
+  ),
+  TopQuestionsWithAnswers AS (
+    SELECT
+      qd.QuestionId,
+      qd.QuestionTitle,
+      qd.QuestionOwnerDisplayName,
+      qd.QuestionCreationDate,
+      qd.QuestionScore,
+      qd.QuestionViewCount,
+      qd.QuestionFavoriteCount,
+      qd.QuestionAnswerCount,
+      ad.AnswerId,
+      ad.AnswerOwnerDisplayName,
+      ad.AnswerScore,
+      ad.AnswerCommentCount,
+      ad.VoteCountOnAnswer,
+      ad.rn_answer_score,
+      ud.TotalPosts AS OwnerTotalPosts,
+      ud.AveragePostScore AS OwnerAveragePostScore,
+      ud.LastPostDate AS OwnerLastPostDate,
+      CASE WHEN qd.QuestionClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsQuestionClosed,
+      COALESCE(qd.QuestionTitle, 'No Title') AS SanitizedTitle,
+      UPPER(SUBSTRING(ud.DisplayName FROM 1 FOR 1)) AS UserInitial
+    FROM QuestionDetails qd
+    LEFT JOIN AnswerDetails ad
+      ON qd.QuestionId = ad.QuestionId AND ad.rn_answer_score = 1
+    LEFT JOIN Users ud
+      ON qd.QuestionOwnerUserId = ud.Id
+    WHERE
+      qd.rn_view_score <= 100
+  )
+SELECT
+  tqwa.QuestionId,
+  tqwa.QuestionTitle,
+  tqwa.QuestionOwnerDisplayName,
+  tqwa.QuestionCreationDate,
+  tqwa.QuestionScore,
+  tqwa.QuestionViewCount,
+  tqwa.QuestionFavoriteCount,
+  tqwa.QuestionAnswerCount,
+  tqwa.AnswerId,
+  tqwa.AnswerOwnerDisplayName,
+  tqwa.AnswerScore,
+  tqwa.AnswerCommentCount,
+  tqwa.VoteCountOnAnswer,
+  tqwa.OwnerTotalPosts,
+  tqwa.OwnerAveragePostScore,
+  tqwa.OwnerLastPostDate,
+  tqwa.IsQuestionClosed,
+  tqwa.SanitizedTitle,
+  tqwa.UserInitial,
+  COALESCE(
+    (
+      SELECT
+        COUNT(*)
+      FROM PostLinks pl
+      WHERE
+        pl.PostId = tqwa.QuestionId AND pl.LinkTypeId = 3
+    ),
+    0
+  ) AS DuplicateLinkCount,
+  CASE
+    WHEN tqwa.QuestionScore > 1000 THEN 'High Score'
+    WHEN tqwa.QuestionScore BETWEEN 100 AND 1000 THEN 'Medium Score'
+    ELSE 'Low Score'
+  END AS ScoreCategory,
+  EXTRACT(YEAR FROM tqwa.QuestionCreationDate) AS QuestionYear,
+  DATE_PART('doy', tqwa.QuestionCreationDate) AS QuestionDayOfYear,
+  LEAST(tqwa.QuestionAnswerCount, 5) AS LimitedAnswerCount,
+  CASE
+    WHEN tqwa.QuestionOwnerDisplayName IS NULL OR tqwa.QuestionOwnerDisplayName = '' THEN 'Anonymous'
+    WHEN LOWER(tqwa.QuestionOwnerDisplayName) LIKE '%community%' THEN 'Community'
+    ELSE tqwa.QuestionOwnerDisplayName
+  END AS DisplayNameOrCategory,
+  LAG(tqwa.QuestionScore, 1, 0) OVER (ORDER BY tqwa.QuestionCreationDate) AS PreviousQuestionScore,
+  LEAD(tqwa.QuestionScore, 1, 0) OVER (ORDER BY tqwa.QuestionCreationDate) AS NextQuestionScore,
+  SUM(tqwa.AnswerScore) OVER (ORDER BY tqwa.QuestionCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeAnswerScore
+FROM TopQuestionsWithAnswers tqwa
+WHERE
+  tqwa.AnswerScore IS NOT NULL OR tqwa.QuestionAnswerCount > 0
+ORDER BY
+  tqwa.QuestionCreationDate DESC,
+  tqwa.QuestionScore DESC
+LIMIT 1000;

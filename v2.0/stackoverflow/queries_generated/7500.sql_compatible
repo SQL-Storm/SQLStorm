@@ -1,0 +1,171 @@
+WITH TopUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as rn
+    FROM Users u
+    WHERE u.Reputation > 10000
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        MAX(p.CreationDate) as LastPostDate,
+        AVG(p.Score) as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IN (SELECT Id FROM TopUsers)
+    GROUP BY u.Id, u.DisplayName
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        p.PostTypeId,
+        COUNT(p.Id) as PostCount,
+        AVG(p.Score) as AvgScore,
+        STRING_AGG(p.Title, ' | ') as SampleTitles,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY AVG(p.Score) DESC) as ScoreRank
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate > '2020-01-01'
+    GROUP BY t.TagName, t.Count, p.PostTypeId
+),
+ComplexVotes AS (
+    SELECT 
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        v.CreationDate,
+        v.BountyAmount,
+        CASE 
+            WHEN v.VoteTypeId = 8 THEN 'BountyStart'
+            WHEN v.VoteTypeId = 9 THEN 'BountyClose'
+            WHEN v.VoteTypeId = 2 THEN 'UpVote'
+            WHEN v.VoteTypeId = 3 THEN 'DownVote'
+            WHEN v.VoteTypeId = 4 THEN 'Offensive'
+            ELSE 'Other'
+        END as VoteTypeDesc,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) as VoteRank
+    FROM Votes v
+    WHERE v.CreationDate > '2021-01-01' AND v.PostId IN (SELECT Id FROM Posts WHERE Score > 50)
+),
+CombinedAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.LastPostDate,
+        uas.AvgPostScore,
+        uas.AllTags,
+        COALESCE(SUM(CASE WHEN ta.PostTypeId = 1 THEN 1 ELSE 0 END), 0) as PopularQuestions,
+        COALESCE(SUM(CASE WHEN ta.PostTypeId = 2 THEN 1 ELSE 0 END), 0) as PopularAnswers,
+        STRING_AGG(CASE WHEN ta.ScoreRank = 1 THEN ta.TagName END, ', ') as TopTag,
+        STRING_AGG(CASE WHEN ta.ScoreRank = 1 THEN ta.SampleTitles END, ' | ') as TopTagSampleTitles,
+        (SELECT COUNT(*) FROM ComplexVotes cv WHERE cv.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)) as TotalVotes
+    FROM UserActivityStats uas
+    LEFT JOIN TagAnalysis ta ON EXISTS (
+        SELECT 1 FROM Posts p 
+        WHERE p.OwnerUserId = uas.UserId 
+        AND p.Tags LIKE '%' || ta.TagName || '%'
+    )
+    GROUP BY uas.UserId, uas.DisplayName, uas.PostCount, uas.CommentCount, uas.BadgeCount, 
+             uas.QuestionCount, uas.AnswerCount, uas.LastPostDate, uas.AvgPostScore, uas.AllTags
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.PostCount,
+    ca.CommentCount,
+    ca.BadgeCount,
+    ca.QuestionCount,
+    ca.AnswerCount,
+    ca.LastPostDate,
+    ca.AvgPostScore,
+    ca.AllTags,
+    ca.PopularQuestions,
+    ca.PopularAnswers,
+    ca.TopTag,
+    ca.TopTagSampleTitles,
+    ca.TotalVotes,
+    CASE 
+        WHEN ca.TotalVotes > 100 THEN 'Highly Active'
+        WHEN ca.TotalVotes > 50 THEN 'Active'
+        WHEN ca.TotalVotes > 10 THEN 'Moderate'
+        ELSE 'Low'
+    END as ActivityLevel,
+    ROUND(
+        (CASE WHEN ca.PostCount > 0 THEN (ca.QuestionCount * 100.0 / ca.PostCount) ELSE 0 END), 
+        2
+    ) as QuestionPercentage,
+    CASE WHEN ca.QuestionCount > 0 THEN 
+        (SELECT AVG(v.Score) FROM Votes v 
+         INNER JOIN Posts p ON v.PostId = p.Id 
+         WHERE p.OwnerUserId = ca.UserId AND v.VoteTypeId = 2)
+    ELSE NULL END as AvgUpvoteScore,
+    CASE WHEN ca.AnswerCount > 0 THEN 
+        (SELECT AVG(v.Score) FROM Votes v 
+         INNER JOIN Posts p ON v.PostId = p.Id 
+         WHERE p.OwnerUserId = ca.UserId AND v.VoteTypeId = 3)
+    ELSE NULL END as AvgDownvoteScore,
+    (SELECT COUNT(*) FROM Posts p 
+     WHERE p.OwnerUserId = ca.UserId 
+     AND p.PostTypeId = 1 
+     AND p.CreationDate > '2022-01-01') as RecentQuestions,
+    (SELECT COUNT(*) FROM Posts p 
+     WHERE p.OwnerUserId = ca.UserId 
+     AND p.PostTypeId = 2 
+     AND p.CreationDate > '2022-01-01') as RecentAnswers,
+    (SELECT COUNT(DISTINCT r.PostId) FROM PostHistory r 
+     WHERE r.UserId = ca.UserId 
+     AND r.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) 
+     AND r.CreationDate > '2021-01-01') as EditCount,
+    CASE 
+        WHEN ca.PostCount > 0 THEN 
+            (CASE WHEN ca.QuestionCount > 0 THEN 
+                (SELECT t.TagName FROM Tags t 
+                 INNER JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%' 
+                 WHERE p.OwnerUserId = ca.UserId 
+                 GROUP BY t.TagName 
+                 ORDER BY COUNT(p.Id) DESC
+                 LIMIT 1)
+            ELSE NULL END)
+        ELSE NULL 
+    END as MostActiveTag,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ca.UserId AND b.Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ca.UserId AND b.Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ca.UserId AND b.Class = 3) as BronzeBadges
+FROM CombinedAnalysis ca
+WHERE ca.PostCount >= 5
+AND (
+    NOT EXISTS (
+        SELECT 1 FROM Posts p 
+        INNER JOIN PostHistory ph ON p.Id = ph.PostId 
+        WHERE p.OwnerUserId = ca.UserId 
+        AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15) 
+        AND ph.CreationDate >= '2021-01-01'
+    )
+    OR EXISTS (
+        SELECT 1 FROM Posts p 
+        WHERE p.OwnerUserId = ca.UserId 
+        AND p.ParentId IS NULL 
+        AND p.PostTypeId = 1
+        AND p.CreationDate > '2020-01-01'
+    )
+)
+ORDER BY 
+    -- RecentQuestions is a derived column in the outer select, reference by expression
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 1 AND p.CreationDate > '2022-01-01') DESC,
+    ca.PostCount DESC,
+    ca.TotalVotes DESC
+LIMIT 50;

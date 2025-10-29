@@ -1,0 +1,144 @@
+-- {"query": "1690.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2387} 
+WITH UserActivitySummary AS (
+    -- Summarizes user's primary activities and categorizes them, including a correlated subquery for gold badges.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        CASE
+            WHEN u.Reputation >= 50000 THEN 'Elite'
+            WHEN u.Reputation >= 10000 THEN 'Veteran'
+            WHEN u.Reputation >= 2000 THEN 'Active'
+            ELSE 'Newbie'
+        END AS ReputationTier,
+        COUNT(DISTINCT p.Id) AS UserTotalPosts,
+        SUM(COALESCE(p.Score, 0)) AS UserTotalPostScore,
+        AVG(COALESCE(p.Score, 0)) AS UserAvgPostScore,
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadgesCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostContentAndHistory AS (
+    -- Gathers detailed information about posts, their types, and relevant history events, including string parsing and window functions.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.OwnerUserId,
+        p.LastEditorUserId,
+        p.Title,
+        p.Body,
+        p.Tags,
+        (SELECT AVG(c.Score) FROM Comments c WHERE c.PostId = p.Id AND c.UserId IS NOT NULL) AS AvgCommentScoreByUsers, -- Correlated subquery for average comment score by users
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN 1 ELSE 0 END) AS TotalEdits,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 'Closed' WHEN ph.PostHistoryTypeId = 11 THEN 'Reopened' ELSE 'Active' END) AS PostClosureState,
+        FIRST_VALUE(ph.CreationDate) OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS LatestHistoryDate,
+        FIRST_VALUE(ph.UserId) OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS LatestHistoryUserId,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><') AS TagArray, -- String function for splitting tags
+        LENGTH(p.Body) AS BodyLength,
+        LEFT(p.Title, 50) || '...' AS ShortTitle -- String expression for truncated title
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6, 8, 9, 10, 11, 12, 13)
+    WHERE p.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+    GROUP BY
+        p.Id, p.PostTypeId, pt.Name, p.CreationDate, p.LastEditDate, p.LastActivityDate, p.Score,
+        p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.OwnerUserId,
+        p.LastEditorUserId, p.Title, p.Body, p.Tags
+),
+TagPerformanceMetrics AS (
+    -- Aggregates performance metrics for individual tags, using UNNEST for tag extraction.
+    SELECT
+        LOWER(TRIM(unnested_tag.tag_name_unnested)) AS TagName,
+        COUNT(PCH.PostId) AS TaggedPostCount,
+        AVG(PCH.Score) AS AvgTagScore,
+        SUM(PCH.ViewCount) AS TotalTagViewCount,
+        MAX(t.IsModeratorOnly) AS TagIsModeratorOnly
+    FROM PostContentAndHistory PCH
+    CROSS JOIN LATERAL UNNEST(PCH.TagArray) AS unnested_tag (tag_name_unnested)
+    JOIN Tags t ON LOWER(TRIM(unnested_tag.tag_name_unnested)) = LOWER(t.TagName)
+    WHERE PCH.TagArray IS NOT NULL AND array_length(PCH.TagArray, 1) > 0
+    GROUP BY LOWER(TRIM(unnested_tag.tag_name_unnested))
+    HAVING COUNT(PCH.PostId) > 100 -- Focus on more frequently used tags
+)
+-- Main query to combine user, post, and tag insights with complex analytics.
+SELECT
+    UAS.UserId,
+    UAS.UserName,
+    UAS.Reputation,
+    UAS.ReputationTier,
+    UAS.UserTotalPosts,
+    UAS.UserAvgPostScore,
+    UAS.GoldBadgesCount,
+    DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - UAS.LastAccessDate) AS DaysSinceUserLastAccess, -- Date difference calculation
+    PCH.PostId,
+    PCH.ShortTitle,
+    PCH.PostTypeName,
+    PCH.PostCreationDate,
+    PCH.Score AS PostScore,
+    PCH.ViewCount AS PostViews,
+    PCH.AnswerCount AS PostAnswers,
+    PCH.CommentCount AS PostComments,
+    PCH.FavoriteCount AS PostFavorites,
+    PCH.TotalEdits AS PostEditCount,
+    PCH.PostClosureState,
+    PCH.AvgCommentScoreByUsers,
+    PCH.BodyLength,
+    COALESCE(U_Owner.DisplayName, 'Deleted User') AS OwnerDisplayName, -- NULL logic for display name
+    COALESCE(U_LastEditor.DisplayName, 'Community') AS LastEditorDisplayName, -- NULL logic for display name
+    unnested_tag.tag_name_unnested AS PrimaryTagName, -- Uses the unnested tag from the CROSS JOIN LATERAL
+    TFM.TaggedPostCount,
+    TFM.AvgTagScore,
+    TFM.TotalTagViewCount,
+    -- Various window functions for ranking, distribution, and aggregations.
+    ROW_NUMBER() OVER (PARTITION BY UAS.ReputationTier ORDER BY PCH.Score DESC, PCH.ViewCount DESC) AS RankWithinRepTier,
+    NTILE(4) OVER (ORDER BY PCH.CreationDate) AS CreationDateQuartile, -- NTILE for temporal distribution
+    AVG(PCH.Score) OVER (PARTITION BY PCH.PostTypeId, unnested_tag.tag_name_unnested) AS AvgScoreForPostTypeAndTag,
+    SUM(PCH.Score) OVER (PARTITION BY PCH.OwnerUserId ORDER BY PCH.CreationDate) AS CumulativeScoreByOwner,
+    -- Complex CASE WHEN expressions for categorization.
+    CASE
+        WHEN PCH.PostTypeId = 1 AND PCH.AnswerCount > 0 AND PCH.ClosedDate IS NULL AND PCH.Score > 5 THEN 'Highly Engaged Open Question'
+        WHEN PCH.PostTypeId = 2 AND PCH.Score >= 10 AND PCH.LastActivityDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months') THEN 'Popular Recent Answer'
+        WHEN PCH.PostClosureState = 'Closed' AND PCH.PostCreationDate < (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') THEN 'Old Closed Post'
+        ELSE 'Miscellaneous Post'
+    END AS PostEngagementCategory,
+    ABS(DATE_PART('day', PCH.LastActivityDate - PCH.PostCreationDate)) AS DaysUntilLastActivity, -- Absolute date difference
+    (SELECT COUNT(DISTINCT V.UserId) FROM Votes V WHERE V.PostId = PCH.PostId AND V.VoteTypeId = 5) AS TotalPostBookmarks, -- Correlated subquery for total bookmarks
+    PL_Dup.RelatedPostId AS DuplicateOfPostId, -- Outer join for duplicate links
+    PL_Link.RelatedPostId AS LinkedToPostId -- Outer join for linked posts
+FROM UserActivitySummary UAS
+JOIN PostContentAndHistory PCH ON UAS.UserId = PCH.OwnerUserId
+LEFT JOIN Users U_Owner ON PCH.OwnerUserId = U_Owner.Id
+LEFT JOIN Users U_LastEditor ON PCH.LastEditorUserId = U_LastEditor.Id
+CROSS JOIN LATERAL UNNEST(PCH.TagArray) AS unnested_tag (tag_name_unnested) -- Expands array of tags into individual rows
+LEFT JOIN TagPerformanceMetrics TFM ON LOWER(TRIM(unnested_tag.tag_name_unnested)) = TFM.TagName
+LEFT JOIN PostLinks PL_Dup ON PCH.PostId = PL_Dup.PostId AND PL_Dup.LinkTypeId = 3
+LEFT JOIN PostLinks PL_Link ON PCH.PostId = PL_Link.PostId AND PL_Link.LinkTypeId = 1
+WHERE
+    UAS.Reputation >= 500 -- Minimum reputation filter
+    AND PCH.Score >= 0 -- Only non-negative score posts
+    AND PCH.PostCreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 year') -- Filters for posts from the last 3 years
+    AND PCH.PostTypeName LIKE '%Question%' -- String pattern matching for post type
+    AND PCH.BodyLength > 100 -- Only posts with substantial content
+    AND (TFM.TaggedPostCount IS NULL OR TFM.TaggedPostCount >= 500) -- Filters for sufficiently popular tags or untagged posts
+    AND (
+        (PCH.PostTypeId = 1 AND PCH.AnswerCount > 0) OR
+        (PCH.PostTypeId = 2 AND PCH.Score > 5 AND PCH.TotalEdits > 0) -- Conditional logic for post types
+    )
+ORDER BY
+    UAS.Reputation DESC,
+    PCH.Score DESC,
+    DaysSinceUserLastAccess ASC
+LIMIT 2000;

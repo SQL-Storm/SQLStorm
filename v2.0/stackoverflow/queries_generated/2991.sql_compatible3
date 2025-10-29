@@ -1,0 +1,134 @@
+with RecursiveBadgeRank as (
+    select 
+        UserId,
+        Name as BadgeName,
+        Class,
+        TagBased,
+        Date,
+        row_number() over (partition by UserId order by Date desc, Class asc) as BadgeRank
+    from Badges
+    where TagBased = false
+),
+TopUsers as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce((select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1), 0) as QuestionCount,
+        coalesce((select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2), 0) as AnswerCount,
+        coalesce((select count(*) from Comments c where c.UserId = u.Id), 0) as CommentCount,
+        coalesce((select count(distinct VoteTypeId) from Votes v where v.UserId = u.Id), 0) as DistinctVoteTypesGiven,
+        (select count(*) from RecursiveBadgeRank br where br.UserId = u.Id and br.BadgeRank <= 5) as Top5BadgesCount
+    from Users u
+    where u.Reputation > 10000
+),
+PostAgg as (
+    select 
+        p.OwnerUserId,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionsPosted,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswersPosted,
+        avg(p.Score) as AvgPostScore,
+        sum(p.ViewCount) as TotalViews,
+        max(p.CreationDate) as LatestPostDate
+    from Posts p
+    group by p.OwnerUserId
+),
+QuestionWithDuplicationStatus as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        case when pl.Id is null then 'No Duplicates' else 'Has Duplicates' end as DuplicateStatus,
+        q.OwnerUserId
+    from Posts q
+    left join PostLinks pl on q.Id = pl.PostId and pl.LinkTypeId = 3
+    where q.PostTypeId = 1
+),
+QuestionTagsExpanded as (
+    select
+        q.QuestionId,
+        trim(tag) as TagName
+    from (
+        select 
+            q.QuestionId,
+            unnest(string_to_array(coalesce(q.Tags, ''), '><')) as tag
+        from (
+            select 
+                Id as QuestionId,
+                case when Tags is null then '' else substring(Tags from 2 for char_length(Tags) - 2) end as Tags
+            from Posts where PostTypeId = 1
+        ) q
+    ) s
+    where trim(tag) <> ''
+),
+UserTagActivity as (
+    select
+        p.OwnerUserId,
+        t.TagName,
+        count(*) as PostsCount,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionsCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswersCount,
+        avg(p.Score) as AvgScore
+    from Posts p
+    join QuestionTagsExpanded t on t.QuestionId = p.Id or t.QuestionId = p.ParentId
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId, t.TagName
+),
+UserLastActivity as (
+    select
+        u.Id,
+        greatest(
+            u.LastAccessDate,
+            coalesce(max(p.LastActivityDate), timestamp '1970-01-01')
+        ) as MostRecentActivity
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.LastAccessDate
+)
+select 
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.Location,
+    pa.QuestionsPosted,
+    pa.AnswersPosted,
+    pa.AvgPostScore,
+    pa.TotalViews,
+    ua.TagName as TopTag,
+    ua.PostsCount as PostsInTopTag,
+    ua.AvgScore as AvgScoreInTopTag,
+    qds.DuplicateStatus,
+    max(br.BadgeRank) as MaxBadgeRank,
+    ul.MostRecentActivity,
+    (
+      tu.Reputation * 0.5 +
+      coalesce(pa.QuestionsPosted,0) * 2 +
+      coalesce(pa.AnswersPosted,0) * 1.5 +
+      coalesce(tu.CommentCount,0) * 0.5 +
+      coalesce(tu.DistinctVoteTypesGiven,0) * 3 +
+      (5 - coalesce(max(br.BadgeRank),5)) * 10 +
+      coalesce(ua.PostsCount,0) * coalesce(ua.AvgScore,0)
+    ) as UserInfluenceScore,
+    coalesce(
+      (select substring(pq.Title from 1 for 100) from Posts pq where pq.OwnerUserId = tu.UserId and pq.PostTypeId = 1 order by pq.CreationDate desc limit 1),
+      'No Questions'
+    ) as LatestQuestionTitleSnippet
+from TopUsers tu
+left join PostAgg pa on pa.OwnerUserId = tu.UserId
+left join UserTagActivity ua on ua.OwnerUserId = tu.UserId
+    and ua.PostsCount = (
+        select max(ua2.PostsCount) from UserTagActivity ua2 where ua2.OwnerUserId = tu.UserId
+    )
+left join RecursiveBadgeRank br on br.UserId = tu.UserId and br.BadgeRank <= 5
+left join QuestionWithDuplicationStatus qds on qds.OwnerUserId = tu.UserId
+    and qds.CreationDate = (
+        select max(q2.CreationDate) from QuestionWithDuplicationStatus q2 where q2.OwnerUserId = tu.UserId
+    )
+left join UserLastActivity ul on ul.Id = tu.UserId
+group by 
+    tu.UserId, tu.DisplayName, tu.Reputation, tu.Location, pa.QuestionsPosted, pa.AnswersPosted, pa.AvgPostScore, 
+    pa.TotalViews, ua.TagName, ua.PostsCount, ua.AvgScore, qds.DuplicateStatus, ul.MostRecentActivity, tu.CommentCount, tu.DistinctVoteTypesGiven;

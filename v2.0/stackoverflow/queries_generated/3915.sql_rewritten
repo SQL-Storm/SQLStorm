@@ -1,0 +1,148 @@
+-- {"query": "3915.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1435} 
+WITH 
+/* 1. Base user performance metrics */
+UserPerf AS (
+    SELECT 
+        u.Id                     AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(p.Score),0) AS TotalPostScore,
+        COUNT(p.Id)              AS PostCount,
+        COALESCE(SUM(b.Class),0) AS BadgeClassSum,
+        COUNT(DISTINCT b.Id)     AS BadgeCount,
+        MAX(u.CreationDate)      AS FirstSeen,
+        MIN(p.CreationDate)      AS FirstPostDate,
+        /* window: rank users by reputation within the last 5 years */
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Posts p           ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b          ON b.UserId = u.Id
+    WHERE u.CreationDate >= DATEADD(year, -5, cast('2024-10-01 12:34:56' as timestamp))
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+/* 2. Tag activity per user (extract tags from Questions) */
+UserTagStats AS (
+    SELECT 
+        p.OwnerUserId               AS UserId,
+        t.TagName,
+        COUNT(*)                    AS QuestionsWithTag,
+        SUM(p.Score)                AS TagScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY SUM(p.Score) DESC) AS TagRank
+    FROM Posts p
+    CROSS APPLY (
+        SELECT TRIM(value) AS Tag
+        FROM STRING_SPLIT(
+            /* remove surrounding <> and split */
+            REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ',')
+    ) AS s
+    LEFT JOIN Tags t ON t.TagName = s.Tag
+    WHERE p.PostTypeId = 1               -- only questions
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, t.TagName
+),
+
+/* 3. Recent voting activity (last 30 days) */
+RecentVotes AS (
+    SELECT 
+        v.PostId,
+        v.VoteTypeId,
+        COUNT(*)                AS VoteCount,
+        MAX(v.CreationDate)     AS LastVoteDate
+    FROM Votes v
+    WHERE v.CreationDate >= DATEADD(day, -30, cast('2024-10-01 12:34:56' as timestamp))
+    GROUP BY v.PostId, v.VoteTypeId
+),
+
+/* 4. Correlated subquery to find the most recent close reason for each closed question */
+ClosedQuestions AS (
+    SELECT 
+        p.Id               AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        ph.CreationDate    AS ClosedDate,
+        CAST(ph.Comment AS int) AS CloseReasonId,
+        cr.Name            AS CloseReasonName
+    FROM Posts p
+    LEFT JOIN PostHistory ph 
+        ON ph.PostId = p.Id
+       AND ph.PostHistoryTypeId = 10            -- Post Closed
+    LEFT JOIN CloseReasonTypes cr 
+        ON cr.Id = CAST(ph.Comment AS int)
+    WHERE p.PostTypeId = 1                     -- Question
+      AND ph.Id IS NOT NULL
+),
+
+/* 5. Union of top‑scoring questions and top‑scoring answers */
+TopContent AS (
+    SELECT 
+        p.Id                AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        u.Id                AS OwnerId,
+        u.DisplayName,
+        'Question'          AS ContentType,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS RankByScore
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1                     -- Questions
+    UNION ALL
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        NULL                AS Title,
+        p.Score,
+        u.Id,
+        u.DisplayName,
+        'Answer'            AS ContentType,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS RankByScore
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 2                     -- Answers
+)
+
+/* Final result set merging all the above pieces */
+SELECT 
+    up.UserId,
+    up.DisplayName,
+    up.Reputation,
+    up.TotalPostScore,
+    up.PostCount,
+    up.BadgeCount,
+    up.BadgeClassSum,
+    up.RepRank,
+    ISNULL(uts.TagName, 'N/A')               AS TopTag,
+    ISNULL(uts.QuestionsWithTag,0)           AS TagQuestionCount,
+    ISNULL(uts.TagScore,0)                   AS TagScore,
+    ISNULL(rv.VoteCount,0)                   AS RecentVoteCount,
+    cq.QuestionId,
+    cq.Title                                 AS ClosedQuestionTitle,
+    cq.CloseReasonName,
+    tc.PostId,
+    tc.ContentType,
+    tc.Score                                 AS ContentScore,
+    tc.RankByScore
+FROM UserPerf up
+LEFT JOIN (
+    SELECT *
+    FROM UserTagStats
+    WHERE TagRank = 1
+) uts ON uts.UserId = up.UserId
+LEFT JOIN RecentVotes rv 
+    ON rv.PostId = (
+        SELECT TOP 1 p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = up.UserId
+        ORDER BY p.CreationDate DESC
+    )
+LEFT JOIN ClosedQuestions cq 
+    ON cq.OwnerUserId = up.UserId
+LEFT JOIN (
+    SELECT *
+    FROM TopContent
+    WHERE RankByScore <= 5
+) tc ON tc.OwnerId = up.UserId
+WHERE up.RepRank <= 1000                         -- limit to top 1000 users
+ORDER BY up.RepRank, tc.RankByScore DESC;

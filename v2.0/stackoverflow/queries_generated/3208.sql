@@ -1,0 +1,184 @@
+-- {"query": "3208.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1981} 
+
+/*  Benchmark query:  user activity, badge prestige, tag contribution, and recent post trends */
+WITH
+    /* 1. Tag popularity snapshot */
+    tag_stats AS (
+        SELECT
+            t.TagName,
+            t.Count                                   AS tag_total_posts,
+            COALESCE(SUM(p.Score),0)                 AS tag_score_sum,
+            COUNT(DISTINCT p.OwnerUserId)            AS distinct_contributors,
+            ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS tag_rank
+        FROM Tags t
+        LEFT JOIN Posts p
+               ON p.Id = t.ExcerptPostId OR p.Id = t.WikiPostId
+        GROUP BY t.TagName, t.Count
+    ),
+
+    /* 2. Users with their most recent activity (question or answer) */
+    recent_activity AS (
+        SELECT
+            u.Id                                     AS user_id,
+            MAX(p.CreationDate)                     AS last_post_date,
+            MAX(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS last_question_id,
+            MAX(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS last_answer_id
+        FROM Users u
+        LEFT JOIN Posts p
+               ON p.OwnerUserId = u.Id
+        GROUP BY u.Id
+    ),
+
+    /* 3. Badge aggregation with NULL‑safe logic */
+    user_badges AS (
+        SELECT
+            b.UserId,
+            COUNT(*)                                 AS total_badges,
+            COUNT(*) FILTER (WHERE b.Class = 1)      AS gold_badges,
+            COUNT(*) FILTER (WHERE b.Class = 2)      AS silver_badges,
+            COUNT(*) FILTER (WHERE b.Class = 3)      AS bronze_badges,
+            STRING_AGG(DISTINCT b.Name, ';')         AS badge_list
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    /* 4. Answer acceptance rate per user (correlated subquery) */
+    answer_stats AS (
+        SELECT
+            u.Id                                     AS user_id,
+            COUNT(*)                                 AS total_answers,
+            COUNT(*) FILTER (WHERE p.Id = q.AcceptedAnswerId) AS accepted_answers,
+            CASE
+                WHEN COUNT(*) = 0 THEN 0
+                ELSE ROUND(100.0 * COUNT(*) FILTER (WHERE p.Id = q.AcceptedAnswerId) / COUNT(*), 2)
+            END                                     AS accept_rate_pct
+        FROM Users u
+        LEFT JOIN Posts p
+               ON p.OwnerUserId = u.Id AND p.PostTypeId = 2          -- answers
+        LEFT JOIN Posts q
+               ON q.Id = p.ParentId AND q.PostTypeId = 1            -- parent questions
+        GROUP BY u.Id
+    ),
+
+    /* 5. Users with high‑rep, recent activity, and badge prestige */
+    elite_users AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(rb.last_post_date, TIMESTAMP '1970-01-01')   AS last_activity,
+            COALESCE(ab.total_answers,0)                         AS answer_count,
+            COALESCE(ab.accept_rate_pct,0)                       AS accept_rate,
+            COALESCE(bb.total_badges,0)                          AS badge_total,
+            COALESCE(bb.gold_badges,0)                           AS gold_badges,
+            COALESCE(bb.silver_badges,0)                         AS silver_badges,
+            COALESCE(bb.bronze_badges,0)                         AS bronze_badges,
+            COALESCE(rb.last_question_id,0)                      AS recent_question_id,
+            COALESCE(rb.last_answer_id,0)                        AS recent_answer_id,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC,
+                                         COALESCE(bb.gold_badges,0) DESC,
+                                         COALESCE(bb.silver_badges,0) DESC) AS elite_rank
+        FROM Users u
+        LEFT JOIN recent_activity rb      ON rb.user_id = u.Id
+        LEFT JOIN answer_stats ab        ON ab.user_id = u.Id
+        LEFT JOIN user_badges bb         ON bb.UserId = u.Id
+        WHERE u.Reputation > 20000
+          AND (rb.last_post_date IS NOT NULL
+               AND rb.last_post_date > (CURRENT_TIMESTAMP - INTERVAL '180 days'))
+    )
+
+/* ---- Final result set combines elite users with their top tags ---- */
+SELECT
+    eu.elite_rank,
+    eu.Id                     AS UserId,
+    eu.DisplayName,
+    eu.Reputation,
+    eu.last_activity,
+    eu.answer_count,
+    eu.accept_rate,
+    eu.badge_total,
+    eu.gold_badges,
+    eu.silver_badges,
+    eu.bronze_badges,
+    eu.recent_question_id,
+    eu.recent_answer_id,
+    COALESCE(ts.TagName,'<no‑tag>')      AS TopTag,
+    ts.tag_total_posts,
+    ts.tag_score_sum,
+    ts.distinct_contributors,
+    ts.tag_rank,
+    /* Composite score: weighted mix of rep, badge prestige, and tag influence */
+    ROUND(
+        (eu.Reputation / 1000.0) * 0.4 +
+        (eu.gold_badges   * 5   + eu.silver_badges * 3 + eu.bronze_badges) * 0.3 +
+        (ts.tag_score_sum / NULLIF(ts.tag_total_posts,0)) * 0.3,
+        2)                                 AS composite_score
+FROM elite_users eu
+LEFT JOIN LATERAL (
+    SELECT
+        t.TagName,
+        t.tag_total_posts,
+        t.tag_score_sum,
+        t.distinct_contributors,
+        t.tag_rank
+    FROM tag_stats t
+    WHERE t.TagName ILIKE ANY (ARRAY[
+        CONCAT('%', LOWER(eu.DisplayName), '%'),
+        '%sql%',
+        '%performance%'
+        ])
+    ORDER BY t.tag_rank
+    LIMIT 1
+) ts ON true
+WHERE eu.elite_rank <= 100
+ORDER BY eu.elite_rank
+LIMIT 100
+
+UNION ALL
+
+/* ---- Supplementary set: Users with zero badges but recent high‑quality answers ---- */
+SELECT
+    NULL                                     AS elite_rank,
+    u.Id                                     AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    ra.last_post_date                        AS last_activity,
+    a_stats.total_answers                    AS answer_count,
+    a_stats.accept_rate_pct                  AS accept_rate,
+    0                                        AS badge_total,
+    0                                        AS gold_badges,
+    0                                        AS silver_badges,
+    0                                        AS bronze_badges,
+    ra.last_question_id                      AS recent_question_id,
+    ra.last_answer_id                        AS recent_answer_id,
+    COALESCE(ts.TagName,'<no‑tag>')          AS TopTag,
+    ts.tag_total_posts,
+    ts.tag_score_sum,
+    ts.distinct_contributors,
+    ts.tag_rank,
+    ROUND(
+        (u.Reputation / 1000.0) * 0.5 +
+        (a_stats.accept_rate_pct / 100.0) * 5.0 +
+        (ts.tag_score_sum / NULLIF(ts.tag_total_posts,0)) * 0.5,
+        2)                                 AS composite_score
+FROM Users u
+JOIN recent_activity ra          ON ra.user_id = u.Id
+JOIN answer_stats a_stats        ON a_stats.user_id = u.Id
+LEFT JOIN LATERAL (
+    SELECT
+        t.TagName,
+        t.tag_total_posts,
+        t.tag_score_sum,
+        t.distinct_contributors,
+        t.tag_rank
+    FROM tag_stats t
+    WHERE t.TagName ILIKE '%answer%'
+    ORDER BY t.tag_rank
+    LIMIT 1
+) ts ON true
+WHERE NOT EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id)
+  AND a_stats.total_answers >= 50
+  AND a_stats.accept_rate_pct >= 75
+  AND ra.last_post_date > (CURRENT_TIMESTAMP - INTERVAL '90 days')
+ORDER BY composite_score DESC
+LIMIT 50;

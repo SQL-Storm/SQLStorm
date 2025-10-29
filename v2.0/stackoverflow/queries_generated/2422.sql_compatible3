@@ -1,0 +1,145 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+    UNION ALL
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1 AS Level,
+        r.TagPath || t.TagName AS TagPath
+    FROM Tags t
+    INNER JOIN PostLinks pl ON pl.PostId = t.ExcerptPostId
+    INNER JOIN RecursiveTagHierarchy r ON r.Id = pl.RelatedPostId
+    WHERE r.Level < 3
+)
+, UserBadges AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        COALESCE(SUM(p.Score),0) AS TotalPostScore,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC) AS LastPostRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+)
+, PostMetrics AS (
+    SELECT 
+        p.Id, p.OwnerUserId, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+        COUNT(c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        MAX(ph.CreationDate) AS LastEditDate,
+        MAX(COALESCE(clt.Name, 'NoCloseReason')) AS CloseReasonName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)
+    LEFT JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    LEFT JOIN CloseReasonTypes clt ON clt.Id = CAST(ph.Comment AS INTEGER) AND ph.PostHistoryTypeId = 10
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY p.Id, p.OwnerUserId, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Tags
+)
+, TopActiveUsers AS (
+    SELECT 
+        ub.UserId,
+        ub.DisplayName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalPostScore,
+        COUNT(DISTINCT p.Id) AS QuestionsPosted,
+        COUNT(DISTINCT ans.Id) AS AnswersPosted,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(ans.Score) AS AvgAnswerScore
+    FROM UserBadges ub
+    LEFT JOIN Posts p ON p.OwnerUserId = ub.UserId AND p.PostTypeId = 1 AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    LEFT JOIN Posts ans ON ans.OwnerUserId = ub.UserId AND ans.PostTypeId = 2 AND ans.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    WHERE ub.TotalPostScore >= 1000
+    GROUP BY ub.UserId, ub.DisplayName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TotalPostScore
+    ORDER BY ub.TotalPostScore DESC
+    LIMIT 50
+)
+SELECT 
+    t.Level,
+    t.TagName,
+    array_to_string(t.TagPath, ' > ') AS FullTagPath,
+    pm.Id AS PostId,
+    pm.PostTypeId,
+    pm.CreationDate,
+    pm.Score,
+    pm.ViewCount,
+    pm.CommentCount,
+    pm.UpVotes,
+    pm.DownVotes,
+    COALESCE(pm.CloseReasonName, 'Open') AS CloseReason,
+    tu.DisplayName AS OwnerName,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.QuestionsPosted,
+    tu.AnswersPosted,
+    CAST(COALESCE(tu.AvgQuestionScore, 0) AS NUMERIC(10,2)) AS AvgQuestionScore,
+    CAST(COALESCE(tu.AvgAnswerScore, 0) AS NUMERIC(10,2)) AS AvgAnswerScore,
+    pm.ScoreRank,
+    DENSE_RANK() OVER (PARTITION BY pm.PostTypeId ORDER BY pm.ViewCount DESC) AS ViewRank,
+    CASE 
+        WHEN pm.ScoreRank <= 10 THEN 'Top10Score'
+        WHEN DENSE_RANK() OVER (PARTITION BY pm.PostTypeId ORDER BY pm.ViewCount DESC) <= 10 THEN 'Top10View'
+        ELSE 'Other'
+    END AS PopularityCategory,
+    LENGTH(pm.Tags) - LENGTH(REPLACE(pm.Tags, '<', '')) AS TagCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = pm.Id AND pl.LinkTypeId = 1) AS OutboundLinks,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = pm.Id AND pl.LinkTypeId = 1) AS InboundLinks
+FROM RecursiveTagHierarchy t
+INNER JOIN Posts pm ON pm.PostTypeId = 1 AND pm.Tags LIKE '%' || t.TagName || '%'
+LEFT JOIN TopActiveUsers tu ON pm.OwnerUserId = tu.UserId
+WHERE pm.Score > 
+(
+    SELECT AVG(p2.Score) + STDDEV_POP(p2.Score)
+    FROM Posts p2
+    WHERE p2.PostTypeId = pm.PostTypeId AND p2.Tags LIKE '%' || t.TagName || '%'
+)
+AND pm.ViewCount > 1000 
+AND pm.CreationDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 week'
+AND (pm.LastEditDate IS NULL OR pm.LastEditDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 day')
+GROUP BY
+    t.Level,
+    t.TagName,
+    t.TagPath,
+    pm.Id,
+    pm.PostTypeId,
+    pm.CreationDate,
+    pm.Score,
+    pm.ViewCount,
+    pm.CommentCount,
+    pm.UpVotes,
+    pm.DownVotes,
+    pm.CloseReasonName,
+    tu.DisplayName,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.QuestionsPosted,
+    tu.AnswersPosted,
+    tu.AvgQuestionScore,
+    tu.AvgAnswerScore,
+    pm.ScoreRank,
+    pm.Tags
+ORDER BY t.Level ASC, PopularityCategory DESC, pm.Score DESC, pm.ViewCount DESC
+LIMIT 100;

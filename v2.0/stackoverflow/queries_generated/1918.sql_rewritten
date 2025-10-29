@@ -1,0 +1,184 @@
+-- {"query": "1918.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2662} 
+WITH ActiveUsers AS (
+    -- CTE 1: Aggregates user activity metrics for those active within the last 2 years,
+    -- including posts, comments, votes, and badge information.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        -- Use COALESCE for NULL location data
+        COALESCE(u.Location, 'Unknown') AS UserLocation,
+        SUM(CASE WHEN p.Id IS NOT NULL THEN 1 ELSE 0 END) AS TotalPostsCreated,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsCreated,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersCreated,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesCast,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesCast,
+        MAX(b.Date) AS LatestBadgeDate,
+        COUNT(DISTINCT b.Id) AS UniqueBadgesCount
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Votes AS v ON u.Id = v.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    -- Filter for recent activity
+    WHERE u.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+),
+QuestionPerformance AS (
+    -- CTE 2: Gathers detailed performance metrics for questions (PostTypeId = 1),
+    -- including score, view count, answer/favorite counts, associated tags,
+    -- and the creation date of the very first answer (if any) via a correlated subquery.
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        -- Handle potential NULL AnswerCount by coalescing to 0
+        COALESCE(q.AnswerCount, 0) AS AnswerCount,
+        COALESCE(q.FavoriteCount, 0) AS FavoriteCount,
+        q.ClosedDate,
+        -- Extract and unnest tags, converting to lowercase and trimming whitespace
+        LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(q.Tags, 2, LENGTH(q.Tags) - 2), '><')))) AS TagName,
+        -- Correlated subquery to find the minimum (first) answer creation date
+        (
+            SELECT MIN(a.CreationDate)
+            FROM Posts AS a
+            WHERE a.ParentId = q.Id AND a.PostTypeId = 2
+        ) AS FirstAnswerCreationDate
+    FROM Posts AS q
+    WHERE q.PostTypeId = 1
+),
+PostHistoryAggregates AS (
+    -- CTE 3: Analyzes post history for questions, focusing on edit revisions and close reasons.
+    -- It also calculates the time difference between consecutive history entries.
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditRevisions,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        -- Window function: Calculate time since the previous history entry for the same post
+        EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) AS TimeSincePreviousHistoryEntrySeconds,
+        -- String aggregation of distinct history types
+        STRING_AGG(DISTINCT pht.Name, '; ') AS DistinctHistoryTypes,
+        -- Conditional string aggregation for close reasons, handling comment parsing for IDs
+        STRING_AGG(DISTINCT crt.Name, '; ') FILTER (
+            WHERE pht.Id = 10 AND ph.Comment IS NOT NULL AND ph.Comment SIMILAR TO '[0-9]+'
+        ) AS DistinctCloseReasons
+    FROM PostHistory AS ph
+    JOIN PostHistoryTypes AS pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN CloseReasonTypes AS crt ON
+        pht.Id = 10 AND ph.Comment SIMILAR TO '[0-9]+' AND ph.Comment::smallint = crt.Id
+    -- Focus on key history types for edits, closure, reopen, delete, undelete
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13)
+    GROUP BY ph.PostId, ph.CreationDate -- Grouping by CreationDate for LAG to work correctly on individual rows
+),
+TagPerformanceRank AS (
+    -- CTE 4: Ranks tags based on the average score and total views of associated questions.
+    SELECT
+        TagName,
+        COUNT(DISTINCT QuestionId) AS TaggedQuestionsCount,
+        AVG(QuestionScore) AS AverageQuestionScore,
+        SUM(ViewCount) AS TotalTagViews,
+        -- Window function: Rank tags by average score and total views
+        RANK() OVER (ORDER BY AVG(QuestionScore) DESC, SUM(ViewCount) DESC) AS TagPerformanceRank
+    FROM QuestionPerformance
+    GROUP BY TagName
+)
+-- Main query: Combines information from all CTEs to identify high-performing users and questions
+SELECT
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.UserLocation,
+    au.TotalPostsCreated,
+    au.TotalQuestionsCreated,
+    qp.QuestionId,
+    qp.QuestionScore,
+    qp.ViewCount,
+    qp.AnswerCount,
+    qp.FavoriteCount AS ActualFavoriteCount,
+    qp.TagName,
+    tpr.AverageQuestionScore AS TagAvgScore,
+    tpr.TagPerformanceRank,
+    pha.TotalEditRevisions,
+    pha.DistinctCloseReasons,
+    -- Calculate time to first answer in minutes, coalescing NULLs to -1
+    COALESCE(EXTRACT(EPOCH FROM (qp.FirstAnswerCreationDate - qp.QuestionCreationDate)) / 60.0, -1.0) AS TimeToFirstAnswerMinutes,
+    -- Complicated CASE expression for engagement categorization
+    CASE
+        WHEN qp.QuestionScore > 100 AND qp.ViewCount > 50000 AND qp.FavoriteCount > 50 THEN 'Superstar Engagement'
+        WHEN qp.QuestionScore > 50 AND qp.ViewCount > 10000 AND qp.FavoriteCount > 10 THEN 'High Engagement'
+        WHEN qp.QuestionScore > 10 AND qp.ViewCount > 1000 THEN 'Moderate Engagement'
+        ELSE 'Lower Engagement'
+    END AS EngagementCategory,
+    -- Window function: Calculate average question score for each user
+    AVG(qp.QuestionScore) OVER (PARTITION BY au.UserId) AS AvgUserQuestionScore,
+    -- Window function: Rank questions by score within each tag
+    ROW_NUMBER() OVER (PARTITION BY qp.TagName ORDER BY qp.QuestionScore DESC, qp.ViewCount DESC) AS QuestionRankInTag
+FROM ActiveUsers AS au
+INNER JOIN QuestionPerformance AS qp ON au.UserId = qp.OwnerUserId
+LEFT JOIN (SELECT PostId, TotalEditRevisions, STRING_AGG(DistinctHistoryTypes, '') AS DistinctHistoryTypes, STRING_AGG(DistinctCloseReasons, '') AS DistinctCloseReasons FROM PostHistoryAggregates GROUP BY PostId, TotalEditRevisions) AS pha ON qp.QuestionId = pha.PostId
+LEFT JOIN TagPerformanceRank AS tpr ON qp.TagName = tpr.TagName
+WHERE
+    au.Reputation > 5000
+    AND qp.QuestionScore > 15
+    AND qp.ViewCount > 500
+    -- Complicated string predicate using LIKE and IN
+    AND (
+        qp.TagName LIKE 'java%' OR qp.TagName LIKE '%script%' OR qp.TagName IN ('python', 'c#', 'c++', 'javascript')
+    )
+    AND qp.ClosedDate IS NULL -- Only open questions
+    AND pha.TotalEditRevisions >= 1 -- At least one edit to the post
+    AND au.UserLocation NOT ILIKE '%Europe%' -- Case-insensitive exclusion for location
+    -- Correlated subquery in WHERE clause: ensure user has at least one Gold badge
+    AND (
+        SELECT COUNT(b2.Id)
+        FROM Badges AS b2
+        WHERE b2.UserId = au.UserId AND b2.Class = 1
+    ) >= 1
+    AND au.LatestBadgeDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' -- Only users with a recent badge
+
+UNION ALL
+
+-- Second branch of UNION ALL: Focus on users with significant post history activity
+-- (e.g., many edits, closed questions), and high comment/upvote counts.
+SELECT
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.UserLocation,
+    au.TotalPostsCreated,
+    au.TotalQuestionsCreated,
+    qp.QuestionId,
+    qp.QuestionScore,
+    qp.ViewCount,
+    qp.AnswerCount,
+    qp.FavoriteCount AS ActualFavoriteCount,
+    qp.TagName,
+    tpr.AverageQuestionScore AS TagAvgScore,
+    tpr.TagPerformanceRank,
+    pha.TotalEditRevisions,
+    pha.DistinctCloseReasons,
+    COALESCE(EXTRACT(EPOCH FROM (qp.FirstAnswerCreationDate - qp.QuestionCreationDate)) / 60.0, -1.0) AS TimeToFirstAnswerMinutes,
+    'High History Activity & Contributions' AS EngagementCategory,
+    AVG(qp.QuestionScore) OVER (PARTITION BY au.UserId) AS AvgUserQuestionScore,
+    ROW_NUMBER() OVER (PARTITION BY qp.TagName ORDER BY qp.QuestionScore DESC, qp.ViewCount DESC) AS QuestionRankInTag
+FROM ActiveUsers AS au
+INNER JOIN QuestionPerformance AS qp ON au.UserId = qp.OwnerUserId
+INNER JOIN (SELECT PostId, TotalEditRevisions, STRING_AGG(DistinctHistoryTypes, '') AS DistinctHistoryTypes, STRING_AGG(DistinctCloseReasons, '') AS DistinctCloseReasons FROM PostHistoryAggregates GROUP BY PostId, TotalEditRevisions) AS pha ON qp.QuestionId = pha.PostId -- INNER JOIN to ensure history exists
+LEFT JOIN TagPerformanceRank AS tpr ON qp.TagName = tpr.TagName
+WHERE
+    pha.TotalEditRevisions >= 5 -- At least five edits to the post
+    AND (pha.DistinctCloseReasons IS NOT NULL OR qp.ClosedDate IS NOT NULL) -- Question was closed or had a close reason recorded
+    AND au.TotalCommentsMade > 150 -- Users with many comments
+    AND au.TotalUpvotesCast > 1000 -- Users who cast many upvotes
+    AND au.Reputation > 15000 -- Higher reputation threshold for this branch
+    AND qp.QuestionScore < 75 -- Different score criteria from the first branch
+    AND qp.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 years' -- More recent questions for this branch
+ORDER BY Reputation DESC, QuestionScore DESC
+LIMIT 5000;

@@ -1,0 +1,103 @@
+WITH UserPostStats AS (
+    SELECT u.Id                            AS UserId,
+           u.DisplayName,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+           COALESCE(SUM(p.Score),0)                     AS TotalScore,
+           COALESCE(AVG(p.Score),0)                     AS AvgScore,
+           MAX(p.CreationDate)                         AS LastPostDate
+    FROM   Users u
+    LEFT  JOIN Posts p
+           ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+UserBadgeStats AS (
+    SELECT b.UserId,
+           COUNT(*) FILTER (WHERE b.Class = 1)          AS GoldBadges,
+           COUNT(*) FILTER (WHERE b.Class = 2)          AS SilverBadges,
+           COUNT(*) FILTER (WHERE b.Class = 3)          AS BronzeBadges,
+           COUNT(*) FILTER (WHERE b.TagBased = TRUE)    AS TagBasedBadges
+    FROM   Badges b
+    GROUP BY b.UserId
+),
+UserTagActivity AS (
+    SELECT u.Id                                      AS UserId,
+           LOWER(TRIM(cleaned.tag_clean))            AS Tag,
+           COUNT(*)                                   AS TagPostCount,
+           COALESCE(SUM(p.Score),0)                   AS TagScore,
+           ROW_NUMBER() OVER (PARTITION BY u.Id
+                              ORDER BY COUNT(*) DESC) AS TagRank
+    FROM   Users u
+    JOIN   Posts p
+           ON p.OwnerUserId = u.Id
+          AND p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+    CROSS  JOIN LATERAL regexp_split_to_table(p.Tags, '> <') AS raw_tag(tag_raw)
+    CROSS  JOIN LATERAL (SELECT REPLACE(REPLACE(raw_tag.tag_raw, '<', ''), '>', '') AS tag_clean) AS cleaned
+    GROUP BY u.Id, cleaned.tag_clean
+),
+TopUserTags AS (
+    SELECT UserId, Tag, TagPostCount, TagScore
+    FROM   UserTagActivity
+    WHERE  TagRank = 1
+),
+UserVoteStats AS (
+    SELECT u.Id                                           AS UserId,
+           COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2)    AS UpVotesReceived,
+           COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3)    AS DownVotesReceived,
+           COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 5)    AS FavoritesReceived
+    FROM   Users u
+    LEFT   JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT   JOIN Votes v   ON v.PostId = p.Id
+    GROUP BY u.Id
+),
+CompositeScore AS (
+    SELECT ups.UserId,
+           COALESCE(u.Reputation,0) * 0.5
+         + COALESCE(ups.QuestionCount,0) * 2
+         + COALESCE(ups.AnswerCount,0) * 3
+         + COALESCE(ups.TotalScore,0) * 0.1
+         + COALESCE(b.GoldBadges,0)    * 10
+         + COALESCE(b.SilverBadges,0)  * 5
+         + COALESCE(b.BronzeBadges,0)  * 2
+         + COALESCE(v.UpVotesReceived,0)   * 0.05
+         - COALESCE(v.DownVotesReceived,0) * 0.1
+         + COALESCE(t.TagScore,0)          * 0.2
+           AS Score
+    FROM   UserPostStats ups
+    LEFT   JOIN Users u               ON u.Id = ups.UserId
+    LEFT   JOIN UserBadgeStats b      ON b.UserId = ups.UserId
+    LEFT   JOIN UserVoteStats v       ON v.UserId = ups.UserId
+    LEFT   JOIN TopUserTags t         ON t.UserId = ups.UserId
+),
+RankedUsers AS (
+    SELECT u.Id,
+           u.DisplayName,
+           cs.Score,
+           RANK() OVER (ORDER BY cs.Score DESC)                AS Rank,
+           CASE WHEN cs.Score > (SELECT AVG(Score) FROM CompositeScore)
+                THEN 'Above Avg' ELSE 'Below Avg' END          AS PerformanceTier,
+           COALESCE(u.LastAccessDate, u.CreationDate)          AS MostRecentActivity,
+           COALESCE(u.EmailHash, 'N/A')                        AS EmailHashOrNA,
+           ('User_' || CAST(u.Id AS VARCHAR))                  AS UserKey
+    FROM   Users u
+    JOIN   CompositeScore cs ON cs.UserId = u.Id
+    WHERE  u.Id IS NOT NULL
+)
+SELECT *
+FROM   RankedUsers
+WHERE  Rank <= 100
+
+UNION ALL
+
+SELECT CAST(NULL AS INTEGER) AS Id,
+       '---' AS DisplayName,
+       CAST(NULL AS NUMERIC) AS Score,
+       CAST(NULL AS INTEGER) AS Rank,
+       CAST(NULL AS VARCHAR) AS PerformanceTier,
+       CAST(NULL AS TIMESTAMP) AS MostRecentActivity,
+       CAST(NULL AS VARCHAR) AS EmailHashOrNA,
+       CAST(NULL AS VARCHAR) AS UserKey
+WHERE  EXISTS (SELECT 1 FROM RankedUsers WHERE Rank = 101)
+
+ORDER BY Rank ASC NULLS LAST;

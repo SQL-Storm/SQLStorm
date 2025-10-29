@@ -1,0 +1,260 @@
+WITH UserBaseMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.DisplayName,
+        U.WebsiteUrl,
+        U.Location,
+        U.AboutMe,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserTotalUpVotes,
+        U.DownVotes AS UserTotalDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        MAX(COALESCE(P.LastActivityDate, TIMESTAMP '1900-01-01')) AS LatestPostActivityFromOwned,
+        MAX(COALESCE(C.CreationDate, TIMESTAMP '1900-01-01')) AS LatestCommentActivityFromMade
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.Reputation, U.CreationDate, U.DisplayName, U.WebsiteUrl, U.Location, U.AboutMe, U.Views, U.UpVotes, U.DownVotes
+    HAVING U.Reputation > 750 AND COUNT(DISTINCT P.Id) > 10
+),
+PostHistoryAgg AS (
+    SELECT
+        PH.PostId,
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (1, 2, 3) THEN PH.CreationDate ELSE NULL END) AS InitialContentDate,
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS FirstEditDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS LastEditDate,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE NULL END) AS ContentEditCount,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditorsCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 AND PH.Comment LIKE '101' THEN 1 ELSE 0 END) AS WasClosedAsDuplicate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 AND PH.Comment LIKE '102' THEN 1 ELSE 0 END) AS WasClosedOffTopic,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+QuestionAnalysis AS (
+    SELECT
+        UBM.UserId,
+        UBM.DisplayName,
+        UBM.Reputation,
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Title AS PostTitle,
+        P.Body AS PostBody,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        COALESCE(P.AnswerCount, 0) AS AnswerCount,
+        P.CommentCount,
+        COALESCE(P.FavoriteCount, 0) AS FavoriteCount,
+        COALESCE(TRIM(SUBSTRING(P.Tags FROM POSITION('<' IN P.Tags) + 1 FOR POSITION('>' IN P.Tags) - POSITION('<' IN P.Tags) - 1)), 'untagged') AS PrimaryTag,
+        PHA.InitialContentDate,
+        PHA.FirstEditDate,
+        PHA.ContentEditCount,
+        PHA.UniqueEditorsCount,
+        PHA.WasClosedAsDuplicate,
+        PHA.WasReopened,
+        (P.AcceptedAnswerId IS NOT NULL) AS HasAcceptedAnswer,
+        EXISTS (
+            SELECT 1
+            FROM Posts A
+            WHERE A.ParentId = P.Id
+              AND A.OwnerUserId = UBM.UserId
+        ) AS HasSelfAnswer,
+        COALESCE((SELECT SUM(C_sub.Score) FROM Comments C_sub WHERE C_sub.PostId = P.Id), 0) AS TotalCommentScoreOnPost,
+        (
+            P.Score * 2.0 + P.ViewCount * 0.002 + COALESCE(P.AnswerCount, 0) * 3.0 + P.CommentCount * 0.5 + COALESCE(P.FavoriteCount, 0) * 2.5
+            + (CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 10.0 ELSE 0.0 END)
+            + (CASE WHEN COALESCE(PHA.WasReopened, 0) = 1 THEN 5.0 ELSE 0.0 END)
+        ) AS QuestionWeightedScore,
+        ROW_NUMBER() OVER (PARTITION BY UBM.UserId ORDER BY P.Score DESC, P.ViewCount DESC, P.CreationDate DESC) AS rn
+    FROM UserBaseMetrics UBM
+    JOIN Posts P ON UBM.UserId = P.OwnerUserId
+    LEFT JOIN PostHistoryAgg PHA ON P.Id = PHA.PostId
+    WHERE P.PostTypeId = 1
+      AND P.CreationDate BETWEEN (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '4 year') AND TIMESTAMP '2024-10-01 12:34:56'
+      AND P.Score > 5 AND P.ViewCount > 50
+      AND (P.Body ILIKE '%sql%' OR P.Title ILIKE '%database%')
+),
+AnswerAnalysis AS (
+    SELECT
+        UBM.UserId,
+        UBM.DisplayName,
+        UBM.Reputation,
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Body AS PostBody,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.CommentCount,
+        COALESCE(P.FavoriteCount, 0) AS FavoriteCount,
+        COALESCE(TRIM(SUBSTRING(QP.Tags FROM POSITION('<' IN QP.Tags) + 1 FOR POSITION('>' IN QP.Tags) - POSITION('<' IN QP.Tags) - 1)), 'untagged') AS PrimaryTag,
+        PHA.InitialContentDate,
+        PHA.FirstEditDate,
+        PHA.ContentEditCount,
+        PHA.UniqueEditorsCount,
+        (SELECT MAX(ph_q.WasClosedAsDuplicate) FROM PostHistoryAgg ph_q WHERE ph_q.PostId = P.ParentId) AS WasClosedAsDuplicate,
+        (SELECT MAX(ph_q.WasReopened) FROM PostHistoryAgg ph_q WHERE ph_q.PostId = P.ParentId) AS WasReopened,
+        (P.Id = QP.AcceptedAnswerId) AS IsAcceptedAnswer,
+        P.ParentId,
+        QP.Title AS ParentQuestionTitle,
+        QP.ViewCount AS ParentQuestionViewCount,
+        COALESCE((SELECT SUM(V_sub.BountyAmount) FROM Votes V_sub WHERE V_sub.PostId = P.ParentId AND V_sub.VoteTypeId = 8), 0) AS ParentBountyAmount,
+        (
+            P.Score * 3.0 + P.CommentCount * 0.7 + COALESCE(P.FavoriteCount, 0) * 3.0
+            + (CASE WHEN P.Id = QP.AcceptedAnswerId THEN 15.0 ELSE 0.0 END)
+            + (COALESCE(QP.Score, 0) * 0.1)
+            + (CASE WHEN P.Body ILIKE '%example%' THEN 2.0 ELSE 0.0 END)
+        ) AS AnswerWeightedScore,
+        ROW_NUMBER() OVER (PARTITION BY UBM.UserId ORDER BY P.Score DESC, (P.Id = QP.AcceptedAnswerId) DESC, P.CreationDate DESC) AS rn
+    FROM UserBaseMetrics UBM
+    JOIN Posts P ON UBM.UserId = P.OwnerUserId
+    JOIN Posts QP ON P.ParentId = QP.Id
+    LEFT JOIN PostHistoryAgg PHA ON P.Id = PHA.PostId
+    WHERE P.PostTypeId = 2
+      AND P.CreationDate BETWEEN (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 year') AND TIMESTAMP '2024-10-01 12:34:56'
+      AND P.Score > 3
+      AND P.Body NOT ILIKE '%check the documentation%'
+)
+SELECT
+    'Question' AS RecordType,
+    QA.UserId,
+    QA.DisplayName,
+    QA.Reputation,
+    UBM.UserProfileViews,
+    UBM.TotalPostsOwned,
+    UBM.GoldBadgesCount,
+    QA.PostId,
+    QA.PostTitle,
+    QA.PostBody,
+    QA.PostCreationDate,
+    QA.PostScore,
+    QA.ViewCount,
+    QA.AnswerCount AS RelatedAnswerCount,
+    QA.CommentCount AS RelatedCommentCount,
+    QA.FavoriteCount AS RelatedFavoriteCount,
+    QA.PrimaryTag,
+    QA.HasAcceptedAnswer,
+    QA.InitialContentDate,
+    QA.FirstEditDate,
+    QA.ContentEditCount,
+    QA.UniqueEditorsCount,
+    QA.WasClosedAsDuplicate,
+    QA.WasReopened,
+    QA.HasSelfAnswer,
+    QA.TotalCommentScoreOnPost,
+    NULL AS IsAcceptedAnswerForParent,
+    NULL AS ParentBountyReceived,
+    COALESCE(
+        NULLIF(SUBSTRING(UBM.WebsiteUrl FROM POSITION('//' IN UBM.WebsiteUrl) + 2 FOR
+            CASE WHEN POSITION('/' IN SUBSTRING(UBM.WebsiteUrl FROM POSITION('//' IN UBM.WebsiteUrl) + 2)) > 0
+                 THEN POSITION('/' IN SUBSTRING(UBM.WebsiteUrl FROM POSITION('//' IN UBM.WebsiteUrl) + 2)) - 1
+                 ELSE CHAR_LENGTH(SUBSTRING(UBM.WebsiteUrl FROM POSITION('//' IN UBM.WebsiteUrl) + 2))
+            END
+        ), ''), '[No Website Domain]') AS UserWebsiteDomain,
+    EXISTS (
+        SELECT 1
+        FROM Badges B_sub
+        WHERE B_sub.UserId = QA.UserId
+          AND B_sub.Class = 1
+          AND B_sub.TagBased = TRUE
+          AND LOWER(B_sub.Name) = LOWER(QA.PrimaryTag)
+    ) AS UserHasGoldBadgeForPostTag,
+    EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - UBM.LatestPostActivityFromOwned)) / (60 * 60 * 24) AS DaysSinceLastUserPostActivity,
+    (EXTRACT(YEAR FROM TIMESTAMP '2024-10-01 12:34:56') - EXTRACT(YEAR FROM UBM.UserCreationDate)) AS UserAgeInYears,
+    CASE
+        WHEN UBM.AboutMe ILIKE '%developer%' OR UBM.AboutMe ILIKE '%programmer%' THEN TRUE
+        ELSE FALSE
+    END AS IsDevInAboutMe,
+    (
+        SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sub_p.Score)
+        FROM Posts sub_p
+        WHERE sub_p.OwnerUserId = QA.UserId AND sub_p.PostTypeId = QA.PostTypeId
+          AND sub_p.CreationDate BETWEEN (QA.PostCreationDate - INTERVAL '1 year') AND (QA.PostCreationDate + INTERVAL '1 year')
+    ) AS MedianScoreForSimilarPostsByOwner,
+    DENSE_RANK() OVER (ORDER BY QA.QuestionWeightedScore DESC, QA.Reputation DESC) AS GlobalPostRank
+FROM QuestionAnalysis QA
+JOIN UserBaseMetrics UBM ON QA.UserId = UBM.UserId
+WHERE QA.rn = 1
+  AND UBM.Location IS NOT NULL AND UBM.Location NOT LIKE '%(null)%' AND UBM.Location <> ''
+  AND QA.ContentEditCount >= 1
+  AND (COALESCE(QA.WasClosedAsDuplicate, 0) = 0 OR COALESCE(QA.WasReopened, 0) = 1)
+  AND CHAR_LENGTH(QA.PostBody) > 200
+  AND AGE(TIMESTAMP '2024-10-01 12:34:56', QA.PostCreationDate) > INTERVAL '3 months'
+  AND QA.QuestionWeightedScore > 50
+
+UNION ALL
+
+SELECT
+    'Answer' AS RecordType,
+    AA.UserId,
+    AA.DisplayName,
+    AA.Reputation,
+    UBM.UserProfileViews,
+    UBM.TotalPostsOwned,
+    UBM.GoldBadgesCount,
+    AA.PostId,
+    COALESCE(AA.ParentQuestionTitle, '[No Parent Question Title]') AS PostTitle,
+    AA.PostBody,
+    AA.PostCreationDate,
+    AA.PostScore,
+    AA.ParentQuestionViewCount AS ViewCount,
+    NULL AS RelatedAnswerCount,
+    AA.CommentCount AS RelatedCommentCount,
+    AA.FavoriteCount AS RelatedFavoriteCount,
+    AA.PrimaryTag,
+    NULL AS HasAcceptedAnswer,
+    AA.InitialContentDate,
+    AA.FirstEditDate,
+    AA.ContentEditCount,
+    AA.UniqueEditorsCount,
+    AA.WasClosedAsDuplicate,
+    AA.WasReopened,
+    NULL AS HasSelfAnswer,
+    COALESCE((SELECT SUM(C_sub.Score) FROM Comments C_sub WHERE C_sub.PostId = AA.PostId), 0) AS TotalCommentScoreOnPost,
+    AA.IsAcceptedAnswer AS IsAcceptedAnswerForParent,
+    AA.ParentBountyAmount AS ParentBountyReceived,
+    COALESCE(
+        NULLIF(SUBSTRING(UBM.WebsiteUrl FROM POSITION('//' IN UBM.WebsiteUrl) + 2 FOR
+            CASE WHEN POSITION('/' IN UBM.WebsiteUrl) > POSITION('//' IN UBM.WebsiteUrl) + 2
+                 THEN POSITION('/' IN SUBSTRING(UBM.WebsiteUrl FROM POSITION('//' IN UBM.WebsiteUrl) + 2)) - 1
+                 ELSE CHAR_LENGTH(SUBSTRING(UBM.WebsiteUrl FROM POSITION('//' IN UBM.WebsiteUrl) + 2))
+            END
+        ), ''), '[No Website Domain]') AS UserWebsiteDomain,
+    EXISTS (
+        SELECT 1
+        FROM Badges B_sub
+        WHERE B_sub.UserId = AA.UserId
+          AND B_sub.Class = 1
+          AND B_sub.TagBased = TRUE
+          AND LOWER(B_sub.Name) = LOWER(AA.PrimaryTag)
+    ) AS UserHasGoldBadgeForPostTag,
+    EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - UBM.LatestPostActivityFromOwned)) / (60 * 60 * 24) AS DaysSinceLastUserPostActivity,
+    (EXTRACT(YEAR FROM TIMESTAMP '2024-10-01 12:34:56') - EXTRACT(YEAR FROM UBM.UserCreationDate)) AS UserAgeInYears,
+    CASE
+        WHEN UBM.AboutMe ILIKE '%engineer%' OR UBM.AboutMe ILIKE '%architect%' THEN TRUE
+        ELSE FALSE
+    END AS IsDevInAboutMe,
+    (
+        SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sub_p.Score)
+        FROM Posts sub_p
+        WHERE sub_p.OwnerUserId = AA.UserId AND sub_p.PostTypeId = AA.PostTypeId
+          AND sub_p.CreationDate BETWEEN (AA.PostCreationDate - INTERVAL '1 year') AND (AA.PostCreationDate + INTERVAL '1 year')
+    ) AS MedianScoreForSimilarPostsByOwner,
+    DENSE_RANK() OVER (ORDER BY AA.AnswerWeightedScore DESC, AA.Reputation DESC) AS GlobalPostRank
+FROM AnswerAnalysis AA
+JOIN UserBaseMetrics UBM ON AA.UserId = UBM.UserId
+JOIN Posts QP ON AA.ParentId = QP.Id
+WHERE AA.rn = 1
+  AND UBM.Location IS NOT NULL AND UBM.Location NOT LIKE '%(null)%' AND UBM.Location <> ''
+  AND AA.ContentEditCount >= 1
+  AND AA.PostScore >= 5
+  AND CHAR_LENGTH(AA.PostBody) > 150
+  AND AGE(TIMESTAMP '2024-10-01 12:34:56', AA.PostCreationDate) > INTERVAL '6 months'
+  AND AA.AnswerWeightedScore > 40
+ORDER BY GlobalPostRank ASC, Reputation DESC
+LIMIT 2000;

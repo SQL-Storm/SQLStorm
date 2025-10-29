@@ -1,0 +1,112 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, 1 AS Depth
+    FROM Tags t
+    WHERE t.Count > 1000 AND (t.IsModeratorOnly = FALSE OR t.IsModeratorOnly = 'f' OR t.IsModeratorOnly = 0 OR t.IsModeratorOnly IS NULL AND FALSE IS NOT NULL)
+
+    UNION ALL
+
+    SELECT t2.Id, t2.TagName, r.Depth + 1
+    FROM RecursiveTagHierarchy r
+    JOIN Posts post_for_tag ON post_for_tag.Id IN (
+        SELECT COALESCE(ExcerptPostId, -1) FROM Tags WHERE ExcerptPostId IS NOT NULL
+        UNION
+        SELECT COALESCE(WikiPostId, -1) FROM Tags WHERE WikiPostId IS NOT NULL
+    )
+    JOIN Tags t2 ON t2.ExcerptPostId = post_for_tag.Id OR t2.WikiPostId = post_for_tag.Id
+    WHERE r.Depth < 3 AND t2.Count > 500 AND (t2.IsModeratorOnly = FALSE OR t2.IsModeratorOnly = 'f' OR t2.IsModeratorOnly = 0 OR t2.IsModeratorOnly IS NULL AND FALSE IS NOT NULL)
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+        COUNT(DISTINCT p.Id) AS PostsCount,
+        COUNT(DISTINCT b.Id) AS BadgesCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 24 THEN ph.Id END) AS EditsMade
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+ClosingReasonsStats AS (
+    SELECT
+        crt.Name AS CloseReason,
+        COUNT(ph.Id) AS CloseVotesCount,
+        COUNT(DISTINCT ph.PostId) AS ClosedPostsCount,
+        AVG(EXTRACT(EPOCH FROM (p.ClosedDate - p.CreationDate))) AS AvgCloseDelaySeconds
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id AND ph.PostHistoryTypeId = 10
+    JOIN Posts p ON p.Id = ph.PostId AND p.ClosedDate IS NOT NULL
+    GROUP BY crt.Name
+),
+TopScoredAnswersPerQuestion AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        p.Id AS AnswerId,
+        p.Score,
+        u.DisplayName AS AnswerOwner,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 2
+),
+QuestionsWithBadges AS (
+    SELECT DISTINCT p.Id AS QuestionId, b.Name AS BadgeName, b.Class AS BadgeClass
+    FROM Posts p
+    JOIN Badges b ON b.UserId = p.OwnerUserId
+    WHERE p.PostTypeId = 1 AND b.Class = 1
+),
+AggregatedStats AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName AS UserName,
+        ua.Reputation,
+        ua.PostsCount,
+        ua.BadgesCount,
+        ua.UpVotes,
+        ua.DownVotes,
+        COALESCE(crs.CloseVotesCount, 0) AS TotalCloseVotes,
+        COALESCE(crs.ClosedPostsCount, 0) AS TotalClosedPosts,
+        COALESCE(crs.AvgCloseDelaySeconds, 0) AS AvgCloseDelaySeconds,
+        tq.BadgeName,
+        tq.BadgeClass,
+        tsa.AnswerId,
+        tsa.Score AS TopAnswerScore,
+        tsa.AnswerOwner,
+        ROW_NUMBER() OVER (PARTITION BY ua.UserId ORDER BY tsa.Score DESC NULLS LAST) AS AnswerRank
+    FROM UserActivity ua
+    LEFT JOIN ClosingReasonsStats crs ON 1 = 1
+    LEFT JOIN QuestionsWithBadges tq ON tq.QuestionId IN (
+        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ua.UserId AND p.PostTypeId = 1
+    )
+    LEFT JOIN TopScoredAnswersPerQuestion tsa ON tsa.QuestionId IN (
+        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ua.UserId AND p.PostTypeId = 1
+    )
+    GROUP BY
+        ua.UserId, ua.DisplayName, ua.Reputation, ua.PostsCount, ua.BadgesCount, ua.UpVotes, ua.DownVotes,
+        crs.CloseVotesCount, crs.ClosedPostsCount, crs.AvgCloseDelaySeconds,
+        tq.BadgeName, tq.BadgeClass, tsa.AnswerId, tsa.Score, tsa.AnswerOwner
+)
+SELECT DISTINCT
+    u.UserId,
+    u.UserName,
+    u.Reputation,
+    u.PostsCount,
+    u.BadgesCount,
+    u.UpVotes,
+    u.DownVotes,
+    u.TotalCloseVotes,
+    u.TotalClosedPosts,
+    ROUND(u.AvgCloseDelaySeconds / 3600.0, 2) AS AvgCloseDelayHours,
+    COALESCE(u.BadgeName, 'No Gold Badge') || CASE WHEN u.BadgeClass = 1 THEN ' (Gold)' ELSE '' END AS ProminentBadge,
+    CONCAT_WS(' / ', u.AnswerOwner, 'Top Answer Score:', COALESCE(CAST(u.TopAnswerScore AS VARCHAR), 'N/A')) AS TopAnswerInfo,
+    u.AnswerRank
+FROM AggregatedStats u
+WHERE u.AnswerRank = 1 OR u.AnswerRank IS NULL
+ORDER BY u.Reputation DESC, u.PostsCount DESC, u.TopAnswerScore DESC NULLS LAST
+LIMIT 100;

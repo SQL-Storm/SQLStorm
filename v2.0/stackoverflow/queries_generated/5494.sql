@@ -1,0 +1,98 @@
+-- {"query": "5494.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 848} 
+WITH TopPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.PostTypeId,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.AccountId,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.OwnerUserId) AS UpvotesByOwner
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  WHERE p.PostTypeId IN (1, 2) -- questions and answers
+    AND p.CreationDate >= NOW() - INTERVAL '1 year'
+  GROUP BY
+    p.Id, p.Title, p.Tags, p.Score, p.ViewCount, p.CreationDate,
+    p.OwnerUserId, p.LastActivityDate, p.PostTypeId, p.AnswerCount,
+    p.CommentCount, p.FavoriteCount, p.ContentLicense,
+    u.Reputation, u.DisplayName, u.AccountId
+),
+RecentClosed AS (
+  SELECT
+    p.Id AS PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate AS ChangeDate,
+    rt.Name AS CloseReason,
+    ph.Text
+  FROM PostHistory ph
+  JOIN Posts p ON ph.PostId = p.Id
+  LEFT JOIN CloseReasonTypes rt ON
+    CASE
+      WHEN ph.PostHistoryTypeId = 10 THEN CAST(JSON_VALUE(ph.Text, '$.CloseReasonId') AS SMALLINT)
+      ELSE NULL
+    END = rt.Id
+  WHERE ph.PostHistoryTypeId = 10
+    AND ph.CreationDate >= NOW() - INTERVAL '14 days'
+),
+TagStats AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS AvgPostScore,
+    (SELECT MAX(p.ViewCount) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS MaxViews
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+)
+SELECT
+  tp.PostId,
+  tp.Title,
+  tp.Tags,
+  tp.Score,
+  tp.ViewCount,
+  tp.CreationDate,
+  tp.OwnerDisplayName,
+  tp.Reputation,
+  tp.UpVotes,
+  tp.DownVotes,
+  tp.FavoriteCount,
+  tp.ContentLicense,
+  tp.LastActivityDate,
+  tp.PostTypeId,
+  tp.AnswerCount,
+  tp.CommentCount,
+  tp.AccountId,
+  tp.UpvotesByOwner,
+  rr.CloseReason AS LastCloseReason,
+  tr.Name AS TagGroupName,
+  ts.TagName,
+  ts.AvgPostScore,
+  ts.MaxViews
+FROM TopPosts tp
+LEFT JOIN (
+  SELECT p.Id AS PostId, ph.CreationDate, ph.Text, ph.PostHistoryTypeId
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId = 10
+) AS ph_last ON ph_last.PostId = tp.PostId
+LEFT JOIN RecentClosed rr ON rr.PostId = tp.PostId
+LEFT JOIN (
+  SELECT DISTINCT UNNEST(string_to_array(tp.Tags, '><>')) AS TagName
+  FROM Posts tp
+  WHERE tp.Id = tp.PostId
+) AS tgs ON TRUE
+LEFT JOIN TagStats ts ON ts.TagName = (SELECT TagName FROM Tags WHERE Tags.Id = (SELECT UNNEST(string_to_array(tp.Tags, '><>')))) 
+ORDER BY tp.ViewCount DESC
+LIMIT 100;

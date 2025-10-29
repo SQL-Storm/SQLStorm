@@ -1,0 +1,322 @@
+-- {"query": "329.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2962} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as region_hint,
+        dense_rank() over (order by u.creationdate desc) as recent_rank
+    from users u
+),
+activity_window as (
+    select
+        p.owneruserid as user_id,
+        p.posttypeid,
+        p.id as post_id,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        row_number() over (partition by p.owneruserid order by p.creationdate desc) as rn_user_post,
+        lag(p.score) over (partition by p.owneruserid order by p.creationdate) as prev_score,
+        sum(case when p.posttypeid = 1 then 1 else 0 end) over (partition by p.owneruserid) as total_questions,
+        sum(case when p.posttypeid = 2 then 1 else 0 end) over (partition by p.owneruserid) as total_answers
+    from posts p
+    where p.owneruserid is not null
+),
+user_vote_aggs as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+    from votes v
+    group by v.postid
+),
+comment_activity as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        max(c.creationdate) as last_comment_date,
+        sum(case when c.score > 0 then 1 else 0 end) as pos_comments
+    from comments c
+    group by c.postid
+),
+tag_expansion as (
+    select
+        p.id as post_id,
+        unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tag
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+),
+tag_quality as (
+    select
+        te.tag,
+        count(*) as q_count,
+        avg(nullif(p.score,0)) filter (where p.score is not null) as avg_q_score_nonzero,
+        avg(p.viewcount) as avg_views
+    from tag_expansion te
+    join posts p on p.id = te.post_id
+    group by te.tag
+),
+postlink_dupes as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+        count(*) filter (where pl.linktypeid = 1) as related_links
+    from postlinks pl
+    group by pl.postid
+),
+close_events as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid = 10) as closed_events,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopened_events,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_closed_at,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_at,
+        max(case when ph.posthistorytypeid = 10 then try_cast(nullif(ph.comment,'') as int) end) as last_close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+accepted_answers as (
+    select
+        q.id as question_id,
+        q.acceptedanswerid as answer_id,
+        a.owneruserid as answerer_id,
+        a.score as answer_score,
+        a.creationdate as answer_created
+    from posts q
+    left join posts a on a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+),
+badge_aggs as (
+    select
+        b.userid,
+        sum(case when b.class = 1 then 1 else 0 end) as gold,
+        sum(case when b.class = 2 then 1 else 0 end) as silver,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze,
+        count(*) as total_badges,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_core as (
+    select
+        q.id as question_id,
+        q.owneruserid as asker_id,
+        q.creationdate as q_created,
+        q.score as q_score,
+        q.viewcount as q_views,
+        q.title,
+        q.tags,
+        q.answercount,
+        q.closeddate
+    from posts q
+    where q.posttypeid = 1
+),
+answer_core as (
+    select
+        a.parentid as question_id,
+        count(*) as answers_total,
+        avg(a.score) as avg_answer_score,
+        max(a.score) as max_answer_score,
+        sum(case when a.score > 0 then 1 else 0 end) as pos_answer_count
+    from posts a
+    where a.posttypeid = 2
+    group by a.parentid
+),
+user_post_density as (
+    select
+        u.id as user_id,
+        count(p.id) as total_posts,
+        min(p.creationdate) as first_post_at,
+        max(p.creationdate) as last_post_at,
+        extract(epoch from (max(p.creationdate) - min(p.creationdate))) as span_seconds
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+question_enriched as (
+    select
+        qc.question_id,
+        qc.asker_id,
+        qc.q_created,
+        qc.q_score,
+        qc.q_views,
+        qc.title,
+        qc.tags,
+        qc.answercount,
+        qc.closeddate,
+        ua.upvotes,
+        ua.downvotes,
+        ua.favorites,
+        ua.bounty_total,
+        ca.comment_count,
+        ca.last_comment_date,
+        ca.pos_comments,
+        pl.duplicate_links,
+        pl.related_links,
+        ce.closed_events,
+        ce.reopened_events,
+        ce.last_closed_at,
+        ce.last_reopened_at,
+        ce.last_close_reason_id,
+        aa.answer_id as accepted_answer_id,
+        aa.answerer_id,
+        aa.answer_score,
+        aa.answer_created,
+        ac.answers_total,
+        ac.avg_answer_score,
+        ac.max_answer_score,
+        ac.pos_answer_count
+    from question_core qc
+    left join user_vote_aggs ua on ua.postid = qc.question_id
+    left join comment_activity ca on ca.postid = qc.question_id
+    left join postlink_dupes pl on pl.postid = qc.question_id
+    left join close_events ce on ce.postid = qc.question_id
+    left join accepted_answers aa on aa.question_id = qc.question_id
+    left join answer_core ac on ac.question_id = qc.question_id
+),
+heavy_calc as (
+    select
+        qe.*,
+        coalesce(ua_density.total_posts,0) as asker_total_posts,
+        ua_density.span_seconds as asker_span_seconds,
+        br.total_badges as asker_total_badges,
+        br.gold as asker_gold,
+        br.silver as asker_silver,
+        br.bronze as asker_bronze,
+        case
+            when qe.q_views is null or qe.q_views = 0 then null
+            else round((qe.q_score::numeric / nullif(qe.q_views,0)) * 100000, 4)
+        end as score_per_100k_views,
+        case
+            when qe.answers_total is null or qe.answers_total = 0 then null
+            else round(qe.pos_answer_count::numeric / nullif(qe.answers_total,0), 4)
+        end as positive_answer_ratio,
+        case
+            when qe.upvotes is null and qe.downvotes is null then null
+            else coalesce(qe.upvotes,0) - coalesce(qe.downvotes,0)
+        end as net_votes,
+        case
+            when qe.closed_events > coalesce(qe.reopened_events,0) then 'MoreClosed'
+            when qe.closed_events = coalesce(qe.reopened_events,0) then 'Balanced'
+            else 'MoreReopened'
+        end as close_reopen_balance,
+        greatest(
+            coalesce(qe.q_score, -2147483648),
+            coalesce(qe.max_answer_score, -2147483648),
+            coalesce(qe.answer_score, -2147483648)
+        ) as peak_thread_score,
+        coalesce(length(qe.title),0) as title_len,
+        position('[' in coalesce(qe.title,'')) as has_bracket_pos,
+        case when qe.tags ilike '%<sql>%' then 1 else 0 end as has_tag_sql,
+        case when qe.tags ilike '%<javascript>%' then 1 else 0 end as has_tag_js
+    from question_enriched qe
+    left join user_post_density ua_density on ua_density.user_id = qe.asker_id
+    left join badge_aggs br on br.userid = qe.asker_id
+),
+ranked as (
+    select
+        hc.*,
+        row_number() over (
+            partition by coalesce(hc.asker_id, -1)
+            order by hc.net_votes desc nulls last, hc.q_views desc nulls last
+        ) as rn_by_asker,
+        ntile(10) over (order by hc.q_views desc nulls last) as views_decile,
+        percent_rank() over (order by hc.peak_thread_score nulls first) as pct_peak_score,
+        sum(coalesce(hc.favorites,0)) over (order by hc.q_created rows between unbounded preceding and current row) as running_favorites
+    from heavy_calc hc
+),
+recent_focus as (
+    select
+        r.user_id,
+        r.recent_rank,
+        count(aw.post_id) filter (where aw.posttypeid = 1 and aw.creationdate >= now() - interval '365 days') as questions_last_year,
+        count(aw.post_id) filter (where aw.posttypeid = 2 and aw.creationdate >= now() - interval '365 days') as answers_last_year
+    from recent_users r
+    left join activity_window aw on aw.user_id = r.user_id
+    where r.recent_rank <= 1000
+    group by r.user_id, r.recent_rank
+),
+tag_signal as (
+    select
+        hc.question_id,
+        avg(tq.avg_q_score_nonzero) filter (where tq.avg_q_score_nonzero is not null) as tag_avg_of_avgs,
+        avg(tq.avg_views) as tag_avg_views
+    from heavy_calc hc
+    left join tag_expansion te on te.post_id = hc.question_id
+    left join tag_quality tq on tq.tag = te.tag
+    group by hc.question_id
+)
+select
+    r.question_id,
+    r.asker_id,
+    u.displayname as asker_name,
+    coalesce(u.location, 'N/A') as location,
+    r.q_created,
+    r.q_score,
+    r.q_views,
+    r.title,
+    r.answercount,
+    r.accepted_answer_id,
+    r.answerer_id,
+    r.net_votes,
+    r.peak_thread_score,
+    r.score_per_100k_views,
+    r.positive_answer_ratio,
+    r.views_decile,
+    r.pct_peak_score,
+    r.running_favorites,
+    r.close_reopen_balance,
+    r.closed_events,
+    r.reopened_events,
+    r.last_close_reason_id,
+    coalesce(ts.tag_avg_of_avgs, 0) as tag_avg_of_avgs,
+    coalesce(ts.tag_avg_views, 0) as tag_avg_views,
+    rf.questions_last_year,
+    rf.answers_last_year,
+    case
+        when r.has_tag_sql = 1 and r.has_tag_js = 1 then 'polyglot'
+        when r.has_tag_sql = 1 then 'sql'
+        when r.has_tag_js = 1 then 'js'
+        else 'other'
+    end as tech_bucket,
+    case when r.title_len > 80 then 'long' when r.title_len between 40 and 80 then 'medium' else 'short' end as title_size,
+    b.gold as asker_gold_badges,
+    b.silver as asker_silver_badges,
+    b.bronze as asker_bronze_badges
+from ranked r
+left join users u on u.id = r.asker_id
+left join badge_aggs b on b.userid = r.asker_id
+left join recent_focus rf on rf.user_id = r.asker_id
+left join tag_signal ts on ts.question_id = r.question_id
+where
+    coalesce(r.net_votes, -9999999) >= (
+        select percentile_disc(0.75) within group (order by coalesce(net_votes, -9999999))
+        from ranked
+    )
+    and (
+        r.q_created >= now() - interval '5 years'
+        or r.views_decile >= 8
+        or (r.asker_total_posts >= 50 and coalesce(r.asker_span_seconds,0) > 0)
+    )
+    and (
+        r.duplicate_links is null
+        or r.duplicate_links = 0
+        or r.reopened_events > r.closed_events
+    )
+    and (
+        r.answercount >= 1
+        or r.accepted_answer_id is not null
+        or r.avg_answer_score > 0
+    )
+order by
+    r.views_decile desc,
+    r.net_votes desc nulls last,
+    r.q_views desc nulls last,
+    r.q_created desc
+fetch first 500 rows only;

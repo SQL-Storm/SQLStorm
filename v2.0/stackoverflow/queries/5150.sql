@@ -1,0 +1,94 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_owner
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+),
+top_tags AS (
+  SELECT
+    unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag_text
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+),
+tag_alias AS (
+  SELECT tag_text AS TagName, COUNT(*) AS TagCount
+  FROM top_tags
+  GROUP BY tag_text
+),
+qualified_users AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate
+  FROM Users u
+  WHERE u.Reputation >= 1000
+),
+expanded AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    u.DisplayName AS OwnerName,
+    q.LastActivityDate,
+    ROW_NUMBER() OVER (ORDER BY q.LastActivityDate DESC, q.Score DESC) AS seq
+  FROM recent_questions q
+  LEFT JOIN Users u ON q.OwnerUserId = u.Id
+  WHERE q.rn_owner = 1
+)
+SELECT
+  e.PostId,
+  e.Title,
+  e.CreationDate,
+  e.LastActivityDate,
+  e.Score,
+  e.ViewCount,
+  e.OwnerName,
+  array_agg(DISTINCT ta.TagName) AS TopTags,
+  (
+    SELECT COUNT(*)
+    FROM Posts p2
+    JOIN Users u2 ON p2.OwnerUserId = u2.Id
+    WHERE p2.PostTypeId = 1
+      AND u2.DisplayName = e.OwnerName
+      AND p2.CreationDate > e.CreationDate
+  ) AS NewerPostsByOwner,
+  (
+    SELECT COUNT(*)
+    FROM Comments c
+    WHERE c.PostId = e.PostId
+  ) AS CommentCount,
+  (
+    SELECT AVG(v.BountyAmount)
+    FROM Votes v
+    WHERE v.PostId = e.PostId
+      AND v.VoteTypeId = 8
+  ) AS AvgBounty
+FROM expanded e
+LEFT JOIN LATERAL (
+  SELECT DISTINCT unnest(string_to_array(substring(e.Tags, 2, length(e.Tags) - 2), '><')) AS TagName
+) AS ta ON true
+GROUP BY
+  e.PostId,
+  e.Title,
+  e.CreationDate,
+  e.LastActivityDate,
+  e.Score,
+  e.ViewCount,
+  e.OwnerName
+ORDER BY e.LastActivityDate DESC, e.Score DESC
+LIMIT 50;

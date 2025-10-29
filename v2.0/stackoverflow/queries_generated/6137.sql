@@ -1,0 +1,46 @@
+-- {"query": "6137.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 607} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) AS TotalWikis,
+    SUM(p.Score) AS TotalScore,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) AS TotalAnswersToQuestions,
+    SUM(v.BountyAmount) AS TotalBountyAmount,
+    MAX(u.LastAccessDate) AS LastAccessDate,
+    MIN(p.CreationDate) AS EarliestPostDate,
+    MAX(p.LastActivityDate) AS LatestActivityDate,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+    AVG(p.ViewCount) AS AvgViewCount,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS LastClosedDate,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate ELSE NULL END) AS LastReopenedDate,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 1 THEN ph.Comment ELSE NULL END) AS InitialTitle,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 2 THEN ph.Comment ELSE NULL END) AS InitialBody,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 3 THEN ph.Comment ELSE NULL END) AS InitialTags,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN cl.Name ELSE NULL END) AS CloseReason,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 33 THEN pn.Name ELSE NULL END) AS PostNotice
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    CloseReasonTypes cl ON ph.Comment = CAST(cl.Id AS varchar)
+LEFT JOIN 
+    PostNotices pn ON ph.Comment = CAST(pn.Id AS varchar)
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+WHERE 
+    p.PostTypeId IN (1, 2, 3)
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    TotalScore DESC;

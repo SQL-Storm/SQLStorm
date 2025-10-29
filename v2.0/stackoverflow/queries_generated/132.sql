@@ -1,0 +1,339 @@
+-- {"query": "132.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3351} 
+with recent_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        coalesce(p.answercount, 0) as answercount,
+        p.closeddate,
+        p.acceptedanswerid
+    from posts p
+    where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+user_activity as (
+    select
+        u.id as userid,
+        u.displayname,
+        u.reputation,
+        u.creationdate as user_creationdate,
+        u.location,
+        u.upvotes,
+        u.downvotes,
+        u.views as profileviews,
+        count(distinct b.id) filter (where b.class = 1) as gold_badges,
+        count(distinct b.id) filter (where b.class = 2) as silver_badges,
+        count(distinct b.id) filter (where b.class = 3) as bronze_badges,
+        count(distinct p.id) as total_posts_last_year,
+        sum(case when p.posttypeid = 1 then 1 else 0 end) as questions_last_year,
+        sum(case when p.posttypeid = 2 then 1 else 0 end) as answers_last_year
+    from users u
+    left join badges b on b.userid = u.id and b.date >= now() - interval '365 days'
+    left join recent_posts p on p.owneruserid = u.id
+    group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.upvotes, u.downvotes, u.views
+),
+post_metrics as (
+    select
+        rp.id as postid,
+        rp.posttypeid,
+        rp.owneruserid,
+        rp.creationdate,
+        rp.score,
+        rp.viewcount,
+        rp.title,
+        rp.tags,
+        rp.answercount,
+        rp.closeddate,
+        rp.acceptedanswerid,
+        -- votes
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_count,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_count,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites_count,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+        -- comments
+        count(distinct c.id) as comment_count,
+        coalesce(avg(nullif(c.score,0)), 0) as avg_comment_score_nonzero
+    from recent_posts rp
+    left join votes v on v.postid = rp.id
+    left join comments c on c.postid = rp.id
+    group by rp.id, rp.posttypeid, rp.owneruserid, rp.creationdate, rp.score, rp.viewcount, rp.title, rp.tags, rp.answercount, rp.closeddate, rp.acceptedanswerid
+),
+post_linkage as (
+    select
+        rp.id as postid,
+        count(*) filter (where pl.linktypeid = 1) as linked_count,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_count,
+        max(case when pl.linktypeid = 3 then pl.relatedpostid end) as any_duplicate_of_postid
+    from recent_posts rp
+    left join postlinks pl on pl.postid = rp.id
+    group by rp.id
+),
+question_answer_latency as (
+    select
+        q.id as questionid,
+        q.owneruserid as askerid,
+        q.creationdate as question_created,
+        a.id as answerid,
+        a.owneruserid as answererid,
+        a.creationdate as answer_created,
+        extract(epoch from (a.creationdate - q.creationdate))/3600.0 as hours_to_first_answer,
+        row_number() over (partition by q.id order by a.creationdate asc) as rn_first,
+        min(a.creationdate) over (partition by q.id) as first_answer_time,
+        count(a.id) over (partition by q.id) as total_answers
+    from posts q
+    left join posts a on a.parentid = q.id and a.posttypeid = 2
+    where q.posttypeid = 1
+      and q.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+accepted_answer_info as (
+    select
+        q.id as questionid,
+        q.acceptedanswerid,
+        aa.owneruserid as accepted_answererid,
+        aa.creationdate as accepted_created,
+        extract(epoch from (aa.creationdate - q.creationdate))/3600.0 as hours_to_accepted
+    from recent_posts q
+    left join posts aa on aa.id = q.acceptedanswerid
+    where q.posttypeid = 1
+),
+tag_expansion as (
+    select
+        p.id as postid,
+        unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tagname
+    from recent_posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+      and length(p.tags) >= 2
+),
+tag_quality as (
+    select
+        te.tagname,
+        count(*) as tag_questions_last_year,
+        avg(pm.score) as avg_score,
+        percentile_cont(0.5) within group (order by pm.viewcount) as median_views,
+        sum(pm.upvotes_count) as total_upvotes,
+        sum(pm.downvotes_count) as total_downvotes,
+        sum(case when pm.acceptedanswerid is not null then 1 else 0 end) as questions_with_accepted
+    from tag_expansion te
+    join post_metrics pm on pm.postid = te.postid
+    group by te.tagname
+),
+edits_and_closures as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+        min(ph.creationdate) filter (where ph.posthistorytypeid in (10,35)) as first_close_or_migrate,
+        -- decode close reason codes from comment field where applicable
+        string_agg(distinct case
+            when ph.posthistorytypeid = 10 then
+                coalesce(
+                    (select crt.name from closereasontypes crt where crt.id::varchar = ph.comment),
+                    'Unknown'
+                )
+            else null
+        end, '; ') as close_reasons
+    from posthistory ph
+    join recent_posts rp on rp.id = ph.postid
+    group by ph.postid
+),
+user_quality as (
+    select
+        ua.userid,
+        ua.displayname,
+        ua.reputation,
+        ua.location,
+        ua.total_posts_last_year,
+        ua.questions_last_year,
+        ua.answers_last_year,
+        ua.gold_badges,
+        ua.silver_badges,
+        ua.bronze_badges,
+        -- compute a quality score with NULL-safe arithmetic
+        (
+            coalesce(ua.reputation,0) * 0.001
+          + coalesce(ua.gold_badges,0) * 3
+          + coalesce(ua.silver_badges,0) * 1.5
+          + coalesce(ua.bronze_badges,0) * 0.5
+          + coalesce(ua.answers_last_year,0) * 0.2
+          - greatest(coalesce(ua.downvotes,0) - coalesce(ua.upvotes,0), 0) * 0.05
+        ) as user_quality_score
+    from user_activity ua
+),
+question_rollup as (
+    select
+        pm.postid,
+        pm.owneruserid as askerid,
+        pm.creationdate,
+        pm.score,
+        pm.viewcount,
+        pm.title,
+        pm.answercount,
+        pm.closeddate,
+        pm.acceptedanswerid,
+        pm.upvotes_count,
+        pm.downvotes_count,
+        pm.favorites_count,
+        pm.bounty_total,
+        pm.comment_count,
+        pm.avg_comment_score_nonzero,
+        coalesce(pl.duplicate_count,0) as duplicate_count,
+        coalesce(pl.linked_count,0) as linked_count,
+        eac.edit_events,
+        eac.first_close_or_migrate,
+        eac.close_reasons,
+        qal.hours_to_first_answer,
+        aai.hours_to_accepted,
+        qal.total_answers
+    from post_metrics pm
+    left join post_linkage pl on pl.postid = pm.postid
+    left join edits_and_closures eac on eac.postid = pm.postid
+    left join lateral (
+        select q1.hours_to_first_answer, q1.total_answers
+        from question_answer_latency q1
+        where q1.questionid = pm.postid and q1.rn_first = 1
+    ) qal on true
+    left join accepted_answer_info aai on aai.questionid = pm.postid
+    where pm.posttypeid = 1
+),
+ranked_questions as (
+    select
+        qr.*,
+        uq.user_quality_score,
+        row_number() over (
+            partition by date_trunc('month', qr.creationdate)
+            order by
+                coalesce(qr.score, 0) * 2
+              + coalesce(qr.viewcount, 0) * 0.01
+              + coalesce(qr.upvotes_count - qr.downvotes_count, 0) * 1.5
+              + coalesce(qr.favorites_count, 0) * 0.5
+              + case when qr.acceptedanswerid is not null then 5 else 0 end
+              - coalesce(qr.duplicate_count, 0) * 3
+              - case when qr.closeddate is not null then 2 else 0 end
+              + coalesce(uq.user_quality_score, 0) * 0.2
+              - coalesce(qr.hours_to_first_answer, 0) * 0.05
+        desc, qr.postid asc
+        ) as month_rank
+    from question_rollup qr
+    left join user_quality uq on uq.userid = qr.askerid
+),
+tag_topN as (
+    select
+        te.tagname,
+        rq.postid,
+        rq.creationdate,
+        rq.month_rank,
+        row_number() over (partition by te.tagname, date_trunc('month', rq.creationdate) order by rq.month_rank) as tag_month_rank
+    from tag_expansion te
+    join ranked_questions rq on rq.postid = te.postid
+),
+dup_cluster as (
+    select
+        rq.postid,
+        case
+            when rq.duplicate_count > 0 then coalesce(pl.any_duplicate_of_postid, rq.postid)
+            else rq.postid
+        end as cluster_id
+    from ranked_questions rq
+    left join post_linkage pl on pl.postid = rq.postid
+),
+cluster_stats as (
+    select
+        dc.cluster_id,
+        count(*) as cluster_size,
+        avg(rq.score) as avg_cluster_score,
+        max(rq.viewcount) as max_cluster_views,
+        min(rq.creationdate) as first_seen
+    from dup_cluster dc
+    join ranked_questions rq on rq.postid = dc.postid
+    group by dc.cluster_id
+),
+final_scored as (
+    select
+        rq.postid,
+        rq.creationdate,
+        rq.title,
+        rq.score,
+        rq.viewcount,
+        rq.answercount,
+        rq.upvotes_count,
+        rq.downvotes_count,
+        rq.favorites_count,
+        rq.bounty_total,
+        rq.comment_count,
+        rq.avg_comment_score_nonzero,
+        rq.duplicate_count,
+        rq.linked_count,
+        rq.closeddate,
+        rq.first_close_or_migrate,
+        rq.close_reasons,
+        rq.hours_to_first_answer,
+        rq.hours_to_accepted,
+        rq.total_answers,
+        rq.user_quality_score,
+        rq.month_rank,
+        cs.cluster_id,
+        cs.cluster_size,
+        cs.avg_cluster_score,
+        cs.max_cluster_views,
+        -- composite final score
+        (
+            coalesce(rq.score,0) * 1.8
+          + coalesce(rq.viewcount,0) * 0.008
+          + coalesce(rq.upvotes_count - rq.downvotes_count,0) * 1.2
+          + coalesce(rq.favorites_count,0) * 0.4
+          + case when rq.acceptedanswerid is not null then 4 else 0 end
+          - coalesce(rq.duplicate_count,0) * 2.5
+          - case when rq.closeddate is not null then 1.5 else 0 end
+          - least(coalesce(rq.hours_to_first_answer, 72), 168) * 0.03
+          + least(coalesce(rq.hours_to_accepted, 168), 168) * 0.01
+          + coalesce(rq.bounty_total,0) * 0.02
+          + coalesce(rq.comment_count,0) * 0.05
+          + coalesce(rq.avg_comment_score_nonzero,0) * 0.3
+          + coalesce(rq.linked_count,0) * 0.1
+          + coalesce(rq.total_answers,0) * 0.25
+          + coalesce(rq.user_quality_score,0) * 0.15
+          + case when cs.cluster_size > 1 then -log(greatest(cs.cluster_size,1)) else 0 end
+        ) as final_score
+    from ranked_questions rq
+    left join dup_cluster dc on dc.postid = rq.postid
+    left join cluster_stats cs on cs.cluster_id = dc.cluster_id
+)
+select
+    fs.postid,
+    fs.creationdate,
+    left(coalesce(fs.title, ''), 200) as title_200,
+    fs.score,
+    fs.viewcount,
+    fs.answercount,
+    fs.upvotes_count,
+    fs.downvotes_count,
+    fs.favorites_count,
+    fs.bounty_total,
+    fs.comment_count,
+    round(fs.avg_comment_score_nonzero::numeric, 2) as avg_comment_score_nonzero,
+    fs.duplicate_count,
+    fs.linked_count,
+    coalesce(to_char(fs.closeddate, 'YYYY-MM-DD"T"HH24:MI:SS'), 'OPEN') as closed_at,
+    coalesce(to_char(fs.first_close_or_migrate, 'YYYY-MM-DD"T"HH24:MI:SS'), 'NEVER') as first_close_or_migrate_at,
+    coalesce(nullif(fs.close_reasons, ''), 'N/A') as close_reasons,
+    round(coalesce(fs.hours_to_first_answer, -1)::numeric, 2) as hours_to_first_answer,
+    round(coalesce(fs.hours_to_accepted, -1)::numeric, 2) as hours_to_accepted,
+    fs.total_answers,
+    fs.user_quality_score,
+    fs.month_rank,
+    fs.cluster_id,
+    fs.cluster_size,
+    round(fs.avg_cluster_score::numeric, 2) as avg_cluster_score,
+    fs.max_cluster_views,
+    round(fs.final_score::numeric, 3) as final_score,
+    -- string expressions and NULL logic
+    trim(both ' ' from regexp_replace(coalesce(fs.title, '[no title]'), '\s+', ' ', 'g')) ||
+        case when fs.duplicate_count > 0 then ' [DUP]' else '' end ||
+        case when fs.closeddate is not null then ' [CLOSED]' else '' end as normalized_title
+from final_scored fs
+qualify row_number() over (order by fs.final_score desc, fs.postid) <= 500
+order by fs.final_score desc, fs.postid;

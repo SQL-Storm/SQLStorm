@@ -1,0 +1,340 @@
+-- {"query": "249.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3252} 
+with recent_users as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl,
+    case when u.location ilike '%remote%' then 1 else 0 end as is_remote_flag
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+q_and_a as (
+  select
+    p.id as post_id,
+    p.posttypeid,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.title,
+    p.tags,
+    p.acceptedanswerid,
+    p.parentid
+  from posts p
+  where p.posttypeid in (1, 2)
+),
+question_core as (
+  select
+    q.post_id as question_id,
+    q.owneruserid as asker_id,
+    q.creationdate as question_date,
+    q.score as question_score,
+    q.viewcount,
+    q.title,
+    q.tags,
+    q.acceptedanswerid
+  from q_and_a q
+  where q.posttypeid = 1
+),
+answer_core as (
+  select
+    a.post_id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as answer_date,
+    a.score as answer_score
+  from q_and_a a
+  where a.posttypeid = 2
+),
+answer_stats as (
+  select
+    ac.question_id,
+    count(*) as answers_count,
+    count(*) filter (where ac.answer_score > 0) as positive_answers,
+    max(ac.answer_score) as max_answer_score,
+    min(ac.answer_score) as min_answer_score,
+    avg(ac.answer_score::numeric) as avg_answer_score,
+    percentile_cont(0.5) within group (order by ac.answer_score) as median_answer_score,
+    min(ac.answer_date) as first_answer_date
+  from answer_core ac
+  group by ac.question_id
+),
+accepted_answer as (
+  select
+    qc.question_id,
+    qc.acceptedanswerid,
+    ac.answer_id,
+    ac.answerer_id,
+    ac.answer_date,
+    ac.answer_score
+  from question_core qc
+  left join answer_core ac
+    on ac.answer_id = qc.acceptedanswerid
+),
+question_votes as (
+  select
+    v.postid as question_id,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+  from votes v
+  join question_core qc on qc.question_id = v.postid
+  group by v.postid
+),
+tag_expansion as (
+  select
+    qc.question_id,
+    unnest(string_to_array(substring(coalesce(qc.tags,''), 2, greatest(length(coalesce(qc.tags,'')) - 2, 0)), '><')) as tagname
+  from question_core qc
+),
+top_tags as (
+  select
+    te.question_id,
+    te.tagname,
+    t.count as tag_global_count,
+    row_number() over (partition by te.question_id order by coalesce(t.count,0) desc, te.tagname) as tag_rank
+  from tag_expansion te
+  left join tags t on lower(t.tagname) = lower(te.tagname)
+),
+primary_tag as (
+  select question_id,
+         tagname as primary_tag,
+         tag_global_count
+  from top_tags
+  where tag_rank = 1
+),
+comment_activity as (
+  select
+    c.postid as question_id,
+    count(*) as comment_count,
+    max(c.creationdate) as last_comment_at,
+    max(c.score) as max_comment_score
+  from comments c
+  join question_core qc on qc.question_id = c.postid
+  group by c.postid
+),
+post_history_flags as (
+  select
+    ph.postid as question_id,
+    max(case when ph.posthistorytypeid = 10 then 1 else 0 end) as was_closed,
+    max(case when ph.posthistorytypeid = 11 then 1 else 0 end) as was_reopened,
+    max(case when ph.posthistorytypeid = 50 then 1 else 0 end) as was_community_bumped,
+    max(case when ph.posthistorytypeid = 52 then 1 else 0 end) as was_hot,
+    max(case when ph.posthistorytypeid = 53 then 1 else 0 end) as was_unhot
+  from posthistory ph
+  join question_core qc on qc.question_id = ph.postid
+  group by ph.postid
+),
+dup_links as (
+  select
+    pl.postid as question_id,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_marks,
+    count(*) filter (where pl.linktypeid = 1) as linked_refs
+  from postlinks pl
+  join question_core qc on qc.question_id = pl.postid
+  group by pl.postid
+),
+user_badge_rollup as (
+  select
+    b.userid,
+    count(*) as badges_total,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges,
+    min(b.date) as first_badge_date,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+questioner as (
+  select
+    qc.question_id,
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    coalesce(ubr.badges_total,0) as badges_total,
+    coalesce(ubr.gold_badges,0) as gold_badges,
+    coalesce(ubr.silver_badges,0) as silver_badges,
+    coalesce(ubr.bronze_badges,0) as bronze_badges,
+    ru.is_remote_flag,
+    coalesce(ru.websiteurl, 'n/a') as websiteurl
+  from question_core qc
+  left join users u on u.id = qc.asker_id
+  left join user_badge_rollup ubr on ubr.userid = qc.asker_id
+  left join recent_users ru on ru.id = qc.asker_id
+),
+answerer as (
+  select
+    aa.question_id,
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    coalesce(ubr.badges_total,0) as badges_total,
+    coalesce(ubr.gold_badges,0) as gold_badges,
+    coalesce(ubr.silver_badges,0) as silver_badges,
+    coalesce(ubr.bronze_badges,0) as bronze_badges
+  from accepted_answer aa
+  left join users u on u.id = aa.answerer_id
+  left join user_badge_rollup ubr on ubr.userid = aa.answerer_id
+),
+age_buckets as (
+  select
+    qc.question_id,
+    case
+      when qc.question_date >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' then '7d'
+      when qc.question_date >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then '30d'
+      when qc.question_date >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' then '90d'
+      when qc.question_date >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year' then '1y'
+      else 'older'
+    end as age_bucket
+  from question_core qc
+),
+ranked_questions as (
+  select
+    qc.question_id,
+    qc.question_date,
+    qc.question_score,
+    qc.viewcount,
+    qa.answers_count,
+    qa.first_answer_date,
+    qa.max_answer_score,
+    qv.upvotes,
+    qv.downvotes,
+    qv.favorites,
+    coalesce(qv.upvotes,0) - coalesce(qv.downvotes,0) as net_votes,
+    extract(epoch from (qa.first_answer_date - qc.question_date)) as seconds_to_first_answer,
+    row_number() over (order by coalesce(qv.upvotes,0) - coalesce(qv.downvotes,0) desc, qc.viewcount desc, qc.question_date desc) as popularity_rank
+  from question_core qc
+  left join answer_stats qa on qa.question_id = qc.question_id
+  left join question_votes qv on qv.question_id = qc.question_id
+),
+influential_users as (
+  select
+    qu.user_id,
+    count(*) as questions_asked,
+    sum(coalesce(rq.net_votes,0)) as total_net_votes,
+    avg(coalesce(rq.viewcount,0)) as avg_views,
+    dense_rank() over (order by sum(coalesce(rq.net_votes,0)) desc nulls last) as influence_rank
+  from questioner qu
+  join ranked_questions rq on rq.question_id = qu.question_id
+  group by qu.user_id
+),
+cross_user_pairs as (
+  select
+    qu.question_id,
+    qu.user_id as asker_id,
+    an.user_id as answerer_id,
+    case when qu.user_id is not null and an.user_id is not null and qu.user_id = an.user_id then 1 else 0 end as self_answer
+  from questioner qu
+  left join answerer an on an.question_id = qu.question_id
+),
+string_metrics as (
+  select
+    qc.question_id,
+    length(coalesce(qc.title, '')) as title_len,
+    length(regexp_replace(coalesce(qc.title,''), '\s+', '', 'g')) as title_len_nospace,
+    case when qc.title ~* '(\bhow\b|\bwhy\b|\bwhat\b|\bwhen\b|\bwhere\b|\bwhich\b|\bcan\b|\bdoes\b|\bare\b|\bis\b|\bshould\b)' then 1 else 0 end as is_interrogative,
+    regexp_replace(lower(coalesce(qc.title,'')), '[^a-z0-9]+', '-', 'g') as slug
+  from question_core qc
+)
+select
+  qc.question_id,
+  qc.question_date,
+  qc.question_score,
+  qc.viewcount,
+  coalesce(qa.answers_count, 0) as answers_count,
+  qa.positive_answers,
+  qa.avg_answer_score,
+  qa.median_answer_score,
+  qa.first_answer_date,
+  aa.answer_id as accepted_answer_id,
+  aa.answer_score as accepted_answer_score,
+  aa.answer_date as accepted_answer_date,
+  qv.upvotes,
+  qv.downvotes,
+  qv.favorites,
+  qv.bounty_started,
+  qv.bounty_awarded,
+  coalesce(df.duplicate_marks,0) as duplicate_marks,
+  coalesce(df.linked_refs,0) as linked_links,
+  coalesce(ca.comment_count,0) as comment_count,
+  ca.last_comment_at,
+  ph.was_closed,
+  ph.was_reopened,
+  ph.was_community_bumped,
+  ph.was_hot,
+  ph.was_unhot,
+  pt.primary_tag,
+  pt.tag_global_count,
+  sm.title_len,
+  sm.title_len_nospace,
+  sm.is_interrogative,
+  sm.slug,
+  qu.user_id as asker_id,
+  qu.displayname as asker_displayname,
+  qu.reputation as asker_reputation,
+  qu.badges_total as asker_badges_total,
+  qu.gold_badges as asker_gold_badges,
+  qu.silver_badges as asker_silver_badges,
+  qu.bronze_badges as asker_bronze_badges,
+  qu.is_remote_flag as asker_is_remote_recent,
+  qu.websiteurl as asker_websiteurl,
+  an.user_id as answerer_id,
+  an.displayname as answerer_displayname,
+  an.reputation as answerer_reputation,
+  an.badges_total as answerer_badges_total,
+  case when cu.self_answer = 1 then 'self' else 'other' end as answerer_relation,
+  rq.popularity_rank,
+  rq.net_votes,
+  rq.seconds_to_first_answer,
+  ab.age_bucket,
+  iu.influence_rank,
+  -- complicated predicate-based classification
+  case
+    when ph.was_closed = 1 and coalesce(df.duplicate_marks,0) > 0 then 'closed-duplicate'
+    when ph.was_closed = 1 then 'closed-other'
+    when rq.net_votes >= 50 and coalesce(qa.answers_count,0) >= 3 and sm.is_interrogative = 1 then 'popular-qna'
+    when rq.net_votes <= -2 and coalesce(qa.answers_count,0) = 0 then 'unpopular-unanswered'
+    else 'normal'
+  end as classification,
+  -- NULL-sensitive computations
+  coalesce(rq.viewcount,0) / nullif(greatest(sm.title_len,1),0) as views_per_title_char,
+  coalesce(qa.answers_count,0)::numeric / nullif(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qc.question_date)) / 86400.0, 0) as answers_per_day_since_post
+from question_core qc
+left join answer_stats qa on qa.question_id = qc.question_id
+left join accepted_answer aa on aa.question_id = qc.question_id
+left join question_votes qv on qv.question_id = qc.question_id
+left join dup_links df on df.question_id = qc.question_id
+left join comment_activity ca on ca.question_id = qc.question_id
+left join post_history_flags ph on ph.question_id = qc.question_id
+left join primary_tag pt on pt.question_id = qc.question_id
+left join string_metrics sm on sm.question_id = qc.question_id
+left join questioner qu on qu.question_id = qc.question_id
+left join answerer an on an.question_id = qc.question_id
+left join ranked_questions rq on rq.question_id = qc.question_id
+left join age_buckets ab on ab.question_id = qc.question_id
+left join cross_user_pairs cu on cu.question_id = qc.question_id
+left join influential_users iu on iu.user_id = qu.user_id
+where
+  -- complex predicate including string and numeric logic
+  (qc.title is not null and sm.title_len >= 10)
+  and (coalesce(qv.upvotes,0) + coalesce(qv.downvotes,0) >= 0)
+  and (
+    pt.primary_tag is null
+    or pt.primary_tag ~* '^(java|python|javascript|c\+\+|c#|sql|postgres|mysql)$'
+    or (pt.tag_global_count is not null and pt.tag_global_count >= 1000)
+  )
+  and (
+    aa.answer_id is null
+    or aa.answer_score >= coalesce(qa.avg_answer_score, aa.answer_score)
+    or an.reputation >= coalesce(qu.reputation, 0)
+  )
+order by
+  rq.popularity_rank nulls last,
+  qc.question_date desc
+limit 500;

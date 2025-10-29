@@ -1,0 +1,232 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        COUNT(DISTINCT P_Owned.Id) AS TotalOwnedPosts,
+        SUM(CASE WHEN P_Owned.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P_Owned.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COALESCE(SUM(P_Owned.Score), 0) AS TotalScoreReceivedOnOwnedPosts,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotesCast,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotesCast,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END), 0) AS TotalFavoriteBookmarks,
+        AVG(CASE WHEN P_Owned.PostTypeId IN (1,2) THEN P_Owned.Score ELSE NULL END) AS AvgOwnedPostScore,
+        COUNT(DISTINCT P_Edited.Id) AS TotalPostsEdited,
+        COUNT(DISTINCT P_LastAccessed.Id) AS TotalLastAccessedPosts
+    FROM Users U
+    LEFT JOIN Posts P_Owned ON U.Id = P_Owned.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Posts P_Edited ON U.Id = P_Edited.LastEditorUserId
+    LEFT JOIN Posts P_LastAccessed ON U.LastAccessDate >= P_LastAccessed.CreationDate AND U.LastAccessDate < P_LastAccessed.LastActivityDate AND P_LastAccessed.OwnerUserId = U.Id
+    GROUP BY U.Id
+),
+PostEngagementMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        (SELECT COUNT(PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        (SELECT COUNT(PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId = 10) AS CloseVoteCount,
+        (SELECT COUNT(PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId = 11) AS ReopenVoteCount,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 3) AS ReceivedDownVotes,
+        CASE
+            WHEN P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2 THEN SUBSTRING(P.Tags FROM 2 FOR (LENGTH(P.Tags) - 2))
+            ELSE ''
+        END AS CleanTags
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2)
+      AND P.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5' YEAR)
+),
+UserBadgePerformance AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeDate
+    FROM Badges B
+    GROUP BY B.UserId
+),
+HighlyInteractedPosts AS (
+    SELECT
+        PEM.PostId,
+        PEM.OwnerUserId,
+        PEM.PostTypeId,
+        PEM.PostScore,
+        PEM.ViewCount,
+        PEM.AnswerCount,
+        PEM.CommentCount,
+        PEM.FavoriteCount,
+        PEM.EditCount,
+        PEM.CloseVoteCount,
+        PEM.ReopenVoteCount,
+        PEM.ReceivedDownVotes,
+        PEM.CleanTags,
+        (PEM.EditCount * 0.5) + (ABS(PEM.PostScore) * 0.1) + (PEM.ReceivedDownVotes * 0.8) + (PEM.CloseVoteCount * 2) - (PEM.ReopenVoteCount * 1.5) AS ControversyScore,
+        CASE
+            WHEN PEM.CloseVoteCount > 0 AND PEM.ReopenVoteCount > 0 THEN 'ClosedAndReopened'
+            WHEN PEM.ReceivedDownVotes > (SELECT AVG(PEM2.ReceivedDownVotes) * 2 FROM PostEngagementMetrics PEM2 WHERE PEM2.PostTypeId = PEM.PostTypeId) AND PEM.EditCount > 5 THEN 'HighlyNegativeAndEdited'
+            WHEN PEM.ViewCount > 100000 AND (PEM.FavoriteCount IS NULL OR PEM.FavoriteCount < 10) THEN 'HighViewsLowFavs'
+            ELSE 'Normal'
+        END AS ControversyType
+    FROM PostEngagementMetrics PEM
+    WHERE (PEM.PostScore < -5 AND PEM.ReceivedDownVotes > 10)
+       OR (PEM.EditCount > 10 AND PEM.CloseVoteCount > 0)
+       OR (EXISTS (SELECT 1 FROM Comments C WHERE C.PostId = PEM.PostId AND LENGTH(C.Text) > 200 AND C.Score > 5))
+       OR (PEM.ViewCount > 50000 AND PEM.CommentCount > 50)
+),
+RankedUsers AS (
+    SELECT
+        U.Id AS UserId,
+        COALESCE(U.DisplayName, 'Unknown User ' || U.Id) AS UserDisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        UAS.TotalOwnedPosts,
+        UAS.TotalScoreReceivedOnOwnedPosts,
+        UAS.TotalCommentsMade,
+        COALESCE(UBP.GoldBadges, 0) AS GoldBadges,
+        COALESCE(UBP.SilverBadges, 0) AS SilverBadges,
+        COALESCE(UBP.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(UBP.TotalBadges, 0) AS TotalBadges,
+        'ActiveOnControversial' AS UserCategory,
+        HIP.PostId,
+        HIP.ControversyScore,
+        HIP.ControversyType,
+        HIP.CleanTags,
+        RANK() OVER (PARTITION BY HIP.ControversyType ORDER BY U.Reputation DESC, HIP.ControversyScore DESC, UAS.TotalScoreReceivedOnOwnedPosts DESC) AS RankWithinControversyType,
+        NTILE(5) OVER (ORDER BY U.Reputation DESC, HIP.ControversyScore DESC) AS ReputationControversyQuintile
+    FROM Users U
+    INNER JOIN UserActivitySummary UAS ON U.Id = UAS.UserId
+    LEFT JOIN UserBadgePerformance UBP ON U.Id = UBP.UserId
+    INNER JOIN HighlyInteractedPosts HIP ON U.Id = HIP.OwnerUserId
+    WHERE U.Reputation > 10000
+      AND (U.Location LIKE '%developer%' OR U.Location LIKE '%engineer%' OR U.Location IS NULL)
+      AND U.AboutMe IS NOT NULL AND LENGTH(TRIM(U.AboutMe)) > 100
+      AND UAS.TotalOwnedPosts > 50
+      AND UAS.TotalCommentsMade > 20
+      AND COALESCE(UBP.GoldBadges, 0) >= 1
+      AND HIP.ControversyScore > (SELECT AVG(ControversyScore) FROM HighlyInteractedPosts) * 1.5
+      AND U.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+    GROUP BY
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        UAS.TotalOwnedPosts,
+        UAS.TotalScoreReceivedOnOwnedPosts,
+        UAS.TotalCommentsMade,
+        UBP.GoldBadges,
+        UBP.SilverBadges,
+        UBP.BronzeBadges,
+        UBP.TotalBadges,
+        HIP.PostId,
+        HIP.ControversyScore,
+        HIP.ControversyType,
+        HIP.CleanTags
+),
+HistoricalImpactUsers AS (
+    SELECT
+        U.Id AS UserId,
+        COALESCE(U.DisplayName, 'Anonymous Contributor ' || U.Id) AS UserDisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        UAS.TotalOwnedPosts,
+        UAS.TotalScoreReceivedOnOwnedPosts,
+        UAS.TotalCommentsMade,
+        COALESCE(UBP.GoldBadges, 0) AS GoldBadges,
+        COALESCE(UBP.SilverBadges, 0) AS SilverBadges,
+        COALESCE(UBP.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(UBP.TotalBadges, 0) AS TotalBadges,
+        'HistoricalImpact' AS UserCategory,
+        CAST(NULL AS BIGINT) AS PostId,
+        CAST(NULL AS NUMERIC) AS ControversyScore,
+        CAST(NULL AS VARCHAR) AS ControversyType,
+        CAST(NULL AS VARCHAR) AS CleanTags,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, UAS.TotalScoreReceivedOnOwnedPosts DESC, COALESCE(UBP.TotalBadges, 0) DESC) AS OverallRank,
+        (SELECT COUNT(DISTINCT P_Acc.Id)
+         FROM Posts P_Q
+         INNER JOIN Posts P_Acc ON P_Q.AcceptedAnswerId = P_Acc.Id
+         WHERE P_Q.OwnerUserId = U.Id AND P_Acc.OwnerUserId = U.Id AND P_Acc.PostTypeId = 2
+        ) AS AcceptedAnswersToOwnQuestionsCount
+    FROM Users U
+    INNER JOIN UserActivitySummary UAS ON U.Id = UAS.UserId
+    LEFT JOIN UserBadgePerformance UBP ON U.Id = UBP.UserId
+    WHERE U.CreationDate < (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7' YEAR)
+      AND UAS.TotalQuestionsOwned > 10
+      AND UAS.TotalAnswersOwned > 20
+      AND U.UpVotes > U.DownVotes * 5
+      AND U.Views > 1000
+      AND EXISTS (SELECT 1 FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId = 1)
+      AND NOT EXISTS (SELECT 1 FROM Badges B WHERE B.UserId = U.Id AND B.Name = 'Disciplined')
+    GROUP BY
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        UAS.TotalOwnedPosts,
+        UAS.TotalScoreReceivedOnOwnedPosts,
+        UAS.TotalCommentsMade,
+        UBP.GoldBadges,
+        UBP.SilverBadges,
+        UBP.BronzeBadges,
+        UBP.TotalBadges
+)
+SELECT
+    RU.UserId,
+    RU.UserDisplayName,
+    RU.Reputation,
+    RU.UserCreationDate,
+    RU.TotalOwnedPosts,
+    RU.TotalScoreReceivedOnOwnedPosts,
+    RU.TotalCommentsMade,
+    RU.GoldBadges,
+    RU.SilverBadges,
+    RU.BronzeBadges,
+    RU.TotalBadges,
+    RU.UserCategory,
+    RU.PostId,
+    RU.ControversyScore,
+    RU.ControversyType,
+    RU.CleanTags,
+    RU.RankWithinControversyType AS SpecificRank,
+    RU.ReputationControversyQuintile AS OverallRankComponent
+FROM RankedUsers RU
+WHERE RU.RankWithinControversyType <= 10
+  AND RU.ReputationControversyQuintile = 1
+  AND (RU.CleanTags LIKE '%<sql>%' OR RU.CleanTags LIKE '%<database>%' OR RU.CleanTags LIKE '%<performance>%')
+UNION ALL
+SELECT
+    HIU.UserId,
+    HIU.UserDisplayName,
+    HIU.Reputation,
+    HIU.UserCreationDate,
+    HIU.TotalOwnedPosts,
+    HIU.TotalScoreReceivedOnOwnedPosts,
+    HIU.TotalCommentsMade,
+    HIU.GoldBadges,
+    HIU.SilverBadges,
+    HIU.BronzeBadges,
+    HIU.TotalBadges,
+    HIU.UserCategory,
+    HIU.PostId,
+    HIU.ControversyScore,
+    HIU.ControversyType,
+    HIU.CleanTags,
+    HIU.OverallRank AS SpecificRank,
+    HIU.AcceptedAnswersToOwnQuestionsCount AS OverallRankComponent
+FROM HistoricalImpactUsers HIU
+WHERE HIU.OverallRank <= 50
+  AND HIU.AcceptedAnswersToOwnQuestionsCount >= 5
+ORDER BY Reputation DESC, SpecificRank ASC;

@@ -1,0 +1,138 @@
+WITH UserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        MAX(GREATEST(COALESCE(P.LastActivityDate, TIMESTAMP '1900-01-01'), COALESCE(C.CreationDate, TIMESTAMP '1900-01-01'))) AS LastInteractionDate,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswerCount,
+        U.Views AS UserProfileViews
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views
+),
+PostDetailMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        COALESCE(NULLIF(TRIM(REPLACE(REPLACE(P.Tags, '>', ''), '<', ' ')), ''), 'no-tag') AS CleanTags,
+        (SELECT COUNT(PL_dup.Id) FROM PostLinks AS PL_dup WHERE PL_dup.RelatedPostId = P.Id AND PL_dup.LinkTypeId = 3) AS DuplicateLinkedCount,
+        (SELECT CR.Name FROM PostHistory AS PH_close JOIN CloseReasonTypes AS CR ON CAST(PH_close.Comment AS INTEGER) = CR.Id WHERE PH_close.PostId = P.Id AND PH_close.PostHistoryTypeId = 10 ORDER BY PH_close.CreationDate DESC LIMIT 1) AS PrimaryCloseReason,
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS RankByScoreInType,
+        (SELECT MAX(PH.CreationDate) FROM PostHistory AS PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4,5,6)) AS LastEditHistoryDate
+    FROM Posts AS P
+    WHERE P.PostTypeId IN (1, 2)
+),
+AggregatedTagStats AS (
+    SELECT
+        TRIM(tag_val) AS TagName,
+        COUNT(DISTINCT PDM.PostId) AS TagPostCount,
+        SUM(PDM.PostScore) AS TagTotalScore,
+        AVG(PDM.PostScore) AS TagAvgScore,
+        SUM(PDM.ViewCount) AS TagTotalViews,
+        SUM(PDM.AnswerCount) AS TagTotalAnswers,
+        SUM(PDM.CommentCount) AS TagTotalComments
+    FROM PostDetailMetrics AS PDM,
+    LATERAL (SELECT UNNEST(STRING_TO_ARRAY(PDM.CleanTags, ' ')) AS tag_val) AS t
+    WHERE TRIM(tag_val) <> '' AND PDM.PostTypeId = 1
+    GROUP BY TRIM(tag_val)
+),
+UserBadgeOverview AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeDate,
+        (SELECT Name FROM Badges WHERE UserId = B.UserId AND Class = 1 ORDER BY Date DESC LIMIT 1) AS MostRecentGoldBadgeName
+    FROM Badges AS B
+    GROUP BY B.UserId
+),
+PostCommentSentiment AS (
+    SELECT
+        C.PostId,
+        AVG(C.Score) AS AvgCommentScore,
+        COUNT(CASE WHEN LOWER(C.Text) LIKE '%thank%' OR LOWER(C.Text) LIKE '%appreciate%' THEN 1 END) AS PositiveCommentCount,
+        COUNT(CASE WHEN LOWER(C.Text) LIKE '%bug%' OR LOWER(C.Text) LIKE '%error%' OR LOWER(C.Text) LIKE '%issue%' THEN 1 END) AS ProblematicCommentCount,
+        MAX(C.CreationDate) AS LastCommentDate
+    FROM Comments AS C
+    GROUP BY C.PostId
+)
+SELECT
+    UA.UserId,
+    UA.DisplayName,
+    UA.Reputation,
+    UA.UserCreationDate,
+    UA.TotalPosts,
+    UA.QuestionCount,
+    UA.AnswerCount,
+    UA.TotalPostScore,
+    UBO.GoldBadges,
+    UBO.SilverBadges,
+    UBO.BronzeBadges,
+    UBO.MostRecentGoldBadgeName,
+    UBO.LastBadgeDate,
+    PDM_Q.PostId AS TopQuestionId,
+    PDM_Q.PostScore AS TopQuestionScore,
+    PDM_Q.ViewCount AS TopQuestionViews,
+    PDM_Q.CleanTags AS TopQuestionTags,
+    PDM_Q.DuplicateLinkedCount AS TopQuestionDuplicateLinks,
+    PDM_Q.PrimaryCloseReason AS TopQuestionCloseReason,
+    PCS_Q.AvgCommentScore AS TopQuestionAvgCommentScore,
+    PCS_Q.ProblematicCommentCount AS TopQuestionProblematicComments,
+    (SELECT COUNT(P_child.Id) FROM Posts AS P_child WHERE P_child.ParentId = PDM_Q.PostId AND P_child.PostTypeId = 2) AS VerifiedTopQuestionAnswerCount,
+    (UA.TotalPostScore * 0.4 + UA.TotalCommentScore * 0.1 + UA.TotalPosts * 0.05 + UA.UserProfileViews * 0.005 + COALESCE(UBO.TotalBadges,0) * 1.0 + COALESCE(UBO.GoldBadges,0) * 5.0) AS UserEngagementScore,
+    NTILE(10) OVER (ORDER BY (UA.TotalPostScore * 0.4 + UA.TotalCommentScore * 0.1 + UA.TotalPosts * 0.05 + UA.UserProfileViews * 0.005 + COALESCE(UBO.TotalBadges,0) * 1.0 + COALESCE(UBO.GoldBadges,0) * 5.0) DESC) AS EngagementDecile,
+    COALESCE(UPPER(SUBSTRING(U.Location FROM 1 FOR 3)), 'UNKNOWN') AS LocationPrefix,
+    CASE
+        WHEN UA.LastInteractionDate IS NULL OR UA.LastInteractionDate < TIMESTAMP '1900-01-02' THEN 'Never Interacted'
+        WHEN UA.LastInteractionDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days') THEN 'Highly Active'
+        WHEN UA.LastInteractionDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90 days') THEN 'Active'
+        WHEN UA.LastInteractionDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year') THEN 'Moderately Active'
+        ELSE 'Lapsed'
+    END AS UserActivityStatus,
+    ATS.TagName AS TopContributingTagName,
+    ATS.TagTotalScore AS TopContributingTagTotalScore,
+    ATS.TagAvgScore AS TopContributingTagAvgScore,
+    EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - UA.UserLastAccessDate)) AS DaysSinceLastAccess,
+    EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - UA.LastInteractionDate)) AS DaysSinceLastInteraction
+FROM Users AS U
+INNER JOIN UserActivity AS UA ON U.Id = UA.UserId
+LEFT JOIN UserBadgeOverview AS UBO ON U.Id = UBO.UserId
+LEFT JOIN PostDetailMetrics AS PDM_Q ON U.Id = PDM_Q.OwnerUserId AND PDM_Q.PostTypeId = 1 AND PDM_Q.RankByScoreInType = 1
+LEFT JOIN PostCommentSentiment AS PCS_Q ON PDM_Q.PostId = PCS_Q.PostId
+LEFT JOIN AggregatedTagStats AS ATS ON ATS.TagName IN (
+        SELECT UNNEST(STRING_TO_ARRAY(CleanTags, ' ')) FROM PostDetailMetrics pdm_sub WHERE pdm_sub.PostId = PDM_Q.PostId
+    )
+    AND ATS.TagPostCount > 50 AND ATS.TagAvgScore > 10
+WHERE
+    UA.Reputation > 1000
+    AND UA.TotalPosts > 10
+    AND UBO.TotalBadges IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory AS PH_ce
+        WHERE PH_ce.UserId = U.Id
+          AND PH_ce.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '7 days')
+          AND PH_ce.PostId IN (SELECT P_comm.Id FROM Posts AS P_comm WHERE P_comm.OwnerUserId = -1)
+    )
+ORDER BY
+    UserEngagementScore DESC, UA.Reputation DESC, UA.LastInteractionDate DESC
+LIMIT 5000;

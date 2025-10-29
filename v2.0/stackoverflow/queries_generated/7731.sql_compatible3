@@ -1,0 +1,222 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        MAX(v.CreationDate) as LastVoteDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                (COUNT(DISTINCT p.Id) * 1.0 / NULLIF(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400.0, 0)) * 30
+            ELSE 0 
+        END as PostsPerDay,
+        CASE 
+            WHEN COUNT(DISTINCT v.Id) > 0 THEN 
+                (COUNT(DISTINCT v.Id) * 1.0 / NULLIF(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400.0, 0)) * 30
+            ELSE 0 
+        END as VotesPerDay,
+        RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY (COUNT(DISTINCT p.Id) + COUNT(DISTINCT c.Id) + COUNT(DISTINCT b.Id)) DESC) as ActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.CreationDate
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        RANK() OVER (ORDER BY t.Count DESC) as TagRank,
+        AVG(t.Count) OVER () as AvgTagCount,
+        STRING_AGG(p.Title, ', ' ORDER BY p.CreationDate DESC) as SampleQuestions
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= TIMESTAMP '2015-01-01'
+    GROUP BY t.TagName, t.Count
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400.0) as AgeDays,
+        COUNT(DISTINCT pl.Id) as LinkCount,
+        COUNT(DISTINCT ph.Id) as HistoryCount,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Yes' 
+            ELSE 'No' 
+        END as HasAcceptedAnswer,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.Score > 10 THEN 'Highly Voted'
+            ELSE 'Normal'
+        END as QuestionStatus,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ', ') as AllTags
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate >= TIMESTAMP '2018-01-01'
+        AND p.CreationDate < TIMESTAMP '2023-01-01'
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.CreationDate, p.AcceptedAnswerId, p.ClosedDate, p.CommunityOwnedDate
+),
+HighActivityUsers AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.VoteCount,
+        uas.ActivityRank,
+        uas.ReputationRank,
+        CASE 
+            WHEN uas.PostCount > 50 AND uas.VoteCount > 100 THEN 'Highly Active'
+            WHEN uas.PostCount > 20 AND uas.VoteCount > 50 THEN 'Active'
+            WHEN uas.PostCount > 5 THEN 'Regular'
+            ELSE 'Casual'
+        END as ActivityLevel,
+        CASE 
+            WHEN uas.Reputation > 10000 THEN 'Expert'
+            WHEN uas.Reputation > 5000 THEN 'Advanced'
+            WHEN uas.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationLevel
+    FROM UserActivityStats uas
+    WHERE uas.ReputationRank <= 1000 AND uas.ActivityRank <= 1000
+),
+QuestionAnalysis AS (
+    SELECT 
+        qs.QuestionId,
+        qs.Title,
+        qs.Score,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.CommentCount,
+        qs.FavoriteCount,
+        qs.AgeDays,
+        qs.LinkCount,
+        qs.HistoryCount,
+        qs.QuestionStatus,
+        qs.AllTags,
+        CASE 
+            WHEN qs.AnswerCount > 0 THEN 
+                (qs.Score * 1.0 / NULLIF(qs.AnswerCount, 0)) 
+            ELSE 0 
+        END as ScorePerAnswer,
+        CASE 
+            WHEN qs.ViewCount > 0 THEN 
+                (qs.AnswerCount * 1.0 / NULLIF(qs.ViewCount, 0)) 
+            ELSE 0 
+        END as AnswersPerView,
+        CASE 
+            WHEN qs.CommentCount > 0 THEN 
+                (qs.FavoriteCount * 1.0 / NULLIF(qs.CommentCount, 0)) 
+            ELSE 0 
+        END as FavoritesPerComment,
+        RANK() OVER (ORDER BY qs.Score DESC) as ScoreRank,
+        RANK() OVER (ORDER BY qs.ViewCount DESC) as ViewRank,
+        RANK() OVER (ORDER BY qs.AnswerCount DESC) as AnswerRank,
+        RANK() OVER (ORDER BY qs.FavoriteCount DESC) as FavoriteRank,
+        CASE 
+            WHEN qs.Score > 50 THEN 'Hot Question'
+            WHEN qs.Score > 20 THEN 'Popular Question'
+            WHEN qs.ViewCount > 1000 THEN 'Well Viewed'
+            ELSE 'Regular'
+        END as PopularityTier
+    FROM QuestionStats qs
+),
+CombinedAnalysis AS (
+    SELECT 
+        hau.UserId,
+        hau.DisplayName,
+        hau.Reputation,
+        hau.PostCount,
+        hau.CommentCount,
+        hau.BadgeCount,
+        hau.VoteCount,
+        hau.ActivityLevel,
+        hau.ReputationLevel,
+        qa.QuestionId,
+        qa.Title,
+        qa.Score,
+        qa.ViewCount,
+        qa.AnswerCount,
+        qa.CommentCount,
+        qa.FavoriteCount,
+        qa.AgeDays,
+        qa.QuestionStatus,
+        qa.PopularityTier,
+        qa.AnswersPerView,
+        qa.FavoritesPerComment,
+        ta.TagName,
+        ta.TagCount,
+        ta.TagRank,
+        ta.AvgTagCount
+    FROM HighActivityUsers hau
+    JOIN QuestionAnalysis qa ON hau.UserId IN (
+        SELECT OwnerUserId 
+        FROM Posts 
+        WHERE Id = qa.QuestionId AND PostTypeId = 1
+    )
+    JOIN TopTags ta ON ta.TagRank <= 20
+    WHERE hau.Reputation > 5000
+)
+SELECT 
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT UserId) as DistinctUsers,
+    COUNT(DISTINCT QuestionId) as DistinctQuestions,
+    COUNT(DISTINCT TagName) as DistinctTags,
+    AVG(Reputation) as AvgReputation,
+    AVG(Score) as AvgQuestionScore,
+    AVG(ViewCount) as AvgViewCount,
+    AVG(AnswerCount) as AvgAnswerCount,
+    AVG(CommentCount) as AvgCommentCount,
+    AVG(FavoriteCount) as AvgFavoriteCount,
+    AVG(AgeDays) as AvgQuestionAge,
+    STRING_AGG(DISTINCT ActivityLevel, ', ' ORDER BY ActivityLevel) as ActivityLevels,
+    STRING_AGG(DISTINCT ReputationLevel, ', ' ORDER BY ReputationLevel) as ReputationLevels,
+    STRING_AGG(DISTINCT QuestionStatus, ', ' ORDER BY QuestionStatus) as QuestionStatuses,
+    STRING_AGG(DISTINCT PopularityTier, ', ' ORDER BY PopularityTier) as PopularityTiers,
+    ('Users: ' || COUNT(DISTINCT UserId) || ', Questions: ' || COUNT(DISTINCT QuestionId) || ', Tags: ' || COUNT(DISTINCT TagName)) as SummaryStats,
+    CASE 
+        WHEN SUM(PostCount) > 0 THEN 
+            (SUM(VoteCount) * 1.0 / NULLIF(SUM(PostCount), 0)) 
+        ELSE 0 
+    END as VotesPerPost,
+    CASE 
+        WHEN SUM(ViewCount) > 0 THEN 
+            (SUM(AnswerCount) * 1.0 / NULLIF(SUM(ViewCount), 0)) 
+        ELSE 0 
+    END as AnswersPerView,
+    CASE 
+        WHEN SUM(CommentCount) > 0 THEN 
+            (SUM(FavoriteCount) * 1.0 / NULLIF(SUM(CommentCount), 0)) 
+        ELSE 0 
+    END as FavoritesPerComment
+FROM CombinedAnalysis
+GROUP BY 
+    ActivityLevels, ReputationLevels, QuestionStatuses, PopularityTiers, SummaryStats
+HAVING COUNT(*) > 0
+   AND COUNT(DISTINCT UserId) > 50
+   AND COUNT(DISTINCT QuestionId) > 100
+   AND COUNT(DISTINCT TagName) > 10
+ORDER BY AvgReputation DESC, AvgQuestionScore DESC, AVG(ViewCount) DESC
+LIMIT 100;

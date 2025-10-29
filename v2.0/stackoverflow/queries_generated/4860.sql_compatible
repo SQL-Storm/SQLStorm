@@ -1,0 +1,155 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.RevisionGUID,
+      ph.UserId,
+      ph.UserDisplayName,
+      ph.CreationDate AS EditDate,
+      ph.PostHistoryTypeId,
+      ph.Comment,
+      ph.Text AS EditContent,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.RevisionGUID ORDER BY ph.CreationDate DESC) AS rn_revision_order
+    FROM
+      PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  PostEditSummary AS (
+    SELECT
+      PostId,
+      MAX(CASE WHEN PostHistoryTypeId = 4 THEN 1 ELSE 0 END) AS TitleEdited,
+      MAX(CASE WHEN PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS BodyEdited,
+      MAX(CASE WHEN PostHistoryTypeId = 6 THEN 1 ELSE 0 END) AS TagsEdited,
+      COUNT(DISTINCT RevisionGUID) AS DistinctEditsPerPost,
+      SUM(CASE WHEN Comment IS NOT NULL AND Comment <> '' THEN 1 ELSE 0 END) AS EditsWithComments
+    FROM
+      RankedPostEdits
+    GROUP BY
+      PostId
+  ),
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS QuestionsPosted,
+      COUNT(DISTINCT a.Id) AS AnswersPosted,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceived,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceived,
+      COUNT(DISTINCT b.Id) AS BadgesEarned
+    FROM
+      Users u
+      LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+      LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+      LEFT JOIN Votes v ON u.Id = v.UserId
+      LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  AvgPostScore AS (
+    SELECT
+      p.OwnerUserId,
+      AVG(CAST(p.Score AS DECIMAL(10, 2))) AS AverageScore,
+      COUNT(p.Id) AS PostsCount
+    FROM
+      Posts p
+    WHERE
+      p.Score IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  CorrelatedAnswerCount AS (
+    SELECT
+      p.Id AS QuestionId,
+      (
+        SELECT
+          COUNT(a.Id)
+        FROM
+          Posts a
+        WHERE
+          a.ParentId = p.Id AND a.PostTypeId = 2
+      ) AS DirectAnswerCount
+    FROM
+      Posts p
+    WHERE
+      p.PostTypeId = 1
+  ),
+  PostActivityRank AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.CreationDate,
+      p.LastActivityDate,
+      p.OwnerUserId,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      u.DisplayName AS OwnerDisplayName,
+      ph.UserDisplayName AS LastEditorDisplayName,
+      ph.CreationDate AS LastEditDate,
+      DENSE_RANK() OVER (ORDER BY p.LastActivityDate DESC) AS ActivityRank
+    FROM
+      Posts p
+      LEFT JOIN Users u ON p.OwnerUserId = u.Id
+      LEFT JOIN PostHistory ph ON p.LastEditorUserId = ph.UserId AND p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    WHERE
+      p.PostTypeId = 1
+  )
+SELECT
+  par.PostId,
+  par.Title,
+  par.OwnerDisplayName,
+  par.OwnerUserId,
+  par.LastEditorDisplayName,
+  par.LastEditDate,
+  par.CreationDate,
+  par.LastActivityDate,
+  par.Score,
+  par.AnswerCount,
+  par.CommentCount,
+  par.FavoriteCount,
+  par.ActivityRank,
+  COALESCE(pes.TitleEdited, 0) AS TitleEditedFlag,
+  COALESCE(pes.BodyEdited, 0) AS BodyEditedFlag,
+  COALESCE(pes.TagsEdited, 0) AS TagsEditedFlag,
+  COALESCE(pes.DistinctEditsPerPost, 0) AS DistinctEditCount,
+  COALESCE(pes.EditsWithComments, 0) AS EditsWithCommentsCount,
+  CASE
+    WHEN cac.DirectAnswerCount IS NULL THEN 'No Answers'
+    WHEN cac.DirectAnswerCount = 0 THEN 'No Answers'
+    WHEN cac.DirectAnswerCount BETWEEN 1 AND 5 THEN 'Few Answers'
+    WHEN cac.DirectAnswerCount > 5 THEN 'Many Answers'
+    ELSE 'Unknown'
+  END AS AnswerQuantityCategory,
+  COALESCE(aps.AverageScore, 0) AS UserAvgPostScore,
+  COALESCE(aps.PostsCount, 0) AS UserTotalPosts,
+  ue.QuestionsPosted AS UserTotalQuestions,
+  ue.AnswersPosted AS UserTotalAnswers,
+  ue.TotalUpVotesReceived AS UserTotalUpVotes,
+  ue.TotalDownVotesReceived AS UserTotalDownVotes,
+  ue.BadgesEarned AS UserTotalBadges,
+  CASE
+    WHEN par.Score > 100 THEN 'High Score'
+    WHEN par.Score <= 0 THEN 'Zero or Negative Score'
+    ELSE 'Moderate Score'
+  END AS ScoreCategory,
+  SUBSTRING(par.Title FROM '\\<([a-zA-Z0-9\\-\\+]+)\\>') AS FirstTag,
+  CASE
+    WHEN par.OwnerUserId = -1 THEN 'Community Owned'
+    ELSE 'User Owned'
+  END AS OwnershipType,
+  ROW_NUMBER() OVER (PARTITION BY par.OwnerUserId ORDER BY par.Score DESC, par.LastActivityDate DESC) AS OwnerScoreRank
+FROM
+  PostActivityRank par
+  LEFT JOIN PostEditSummary pes ON par.PostId = pes.PostId
+  LEFT JOIN AvgPostScore aps ON par.OwnerUserId = aps.OwnerUserId
+  LEFT JOIN UserEngagement ue ON par.OwnerUserId = ue.UserId
+  LEFT JOIN CorrelatedAnswerCount cac ON par.PostId = cac.QuestionId
+WHERE
+  par.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+  AND par.Score >= 0
+ORDER BY
+  par.ActivityRank
+LIMIT 1000;

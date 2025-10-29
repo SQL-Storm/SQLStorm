@@ -1,0 +1,119 @@
+WITH TopUsers AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rn,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges
+    FROM   Users u
+    WHERE  u.Reputation IS NOT NULL
+),
+RecentPosts AS (
+    SELECT p.Id,
+           p.OwnerUserId,
+           p.PostTypeId,
+           p.CreationDate,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_recent
+    FROM   Posts p
+    WHERE  p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+),
+TagStats AS (
+    SELECT t.TagName,
+           COUNT(p.Id)                                                  AS TotalPosts,
+           SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END)            AS Questions,
+           SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END)            AS Answers,
+           MAX(p.Score)                                                AS MaxScore,
+           MIN(p.Score)                                                AS MinScore,
+           AVG(p.Score)                                                AS AvgScore
+    FROM   Tags t
+    LEFT JOIN Posts p
+           ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 0
+),
+VotesAgg AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)          AS UpVotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)          AS DownVotes,
+           SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END)          AS Favorites,
+           MAX(v.CreationDate)                                        AS LastVoteDate
+    FROM   Votes v
+    GROUP BY v.PostId
+),
+ClosedDuplicate AS (
+    SELECT ph.PostId,
+           MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS CloseReason,
+           MAX(CASE WHEN ph.PostHistoryTypeId = 3  THEN ph.Comment END) AS DuplicateInfo
+    FROM   PostHistory ph
+    WHERE  ph.PostHistoryTypeId IN (10, 3)
+    GROUP BY ph.PostId
+)
+
+SELECT *
+FROM (
+    SELECT
+        tu.Id                                      AS UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        rp.Id                                      AS RecentPostId,
+        rp.PostTypeId,
+        rp.CreationDate                            AS PostCreated,
+        ts.TagName,
+        ts.TotalPosts,
+        ts.Questions,
+        ts.Answers,
+        ts.AvgScore,
+        va.UpVotes,
+        va.DownVotes,
+        va.Favorites,
+        cd.CloseReason,
+        cd.DuplicateInfo,
+        ROW_NUMBER() OVER (PARTITION BY tu.Id ORDER BY rp.CreationDate DESC) AS UserPostRank,
+        CASE
+            WHEN (COALESCE(va.UpVotes,0) - COALESCE(va.DownVotes,0)) > 0 THEN 'Positive'
+            WHEN (COALESCE(va.UpVotes,0) - COALESCE(va.DownVotes,0)) = 0 THEN 'Neutral'
+            ELSE 'Negative'
+        END                                        AS VoteSentiment,
+        COALESCE(NULLIF(p.Title, ''), p.Body)      AS TitleOrBodySnippet,
+        LEFT(p.Tags, 50)                           AS TagSnippet
+    FROM   TopUsers tu
+    LEFT   JOIN RecentPosts rp
+           ON rp.OwnerUserId = tu.Id AND rp.rn_recent = 1
+    LEFT   JOIN Posts p
+           ON p.Id = rp.Id
+    LEFT   JOIN LATERAL (
+               SELECT TRIM(BOTH '<>' FROM unnest(string_to_array(COALESCE(p.Tags,''), '><'))) AS tag_raw
+           ) AS tags_split ON TRUE
+    LEFT   JOIN TagStats ts
+           ON ts.TagName = tags_split.tag_raw
+    LEFT   JOIN VotesAgg va
+           ON va.PostId = p.Id
+    LEFT   JOIN ClosedDuplicate cd
+           ON cd.PostId = p.Id
+    WHERE  tu.rn <= 100
+
+    UNION ALL
+
+    SELECT
+        NULL::bigint, NULL::text, NULL::bigint, NULL::bigint, NULL::bigint, NULL::bigint,
+        NULL::bigint, NULL::int, NULL::timestamp,
+        t.TagName,
+        t.TotalPosts,
+        t.Questions,
+        t.Answers,
+        t.AvgScore,
+        NULL::int, NULL::int, NULL::int,
+        NULL::text, NULL::text,
+        NULL::int,
+        NULL::text,
+        NULL::text
+    FROM   TagStats t
+    WHERE  t.AvgScore > 5
+) AS combined
+ORDER  BY COALESCE(combined.Reputation, 0) DESC, COALESCE(combined.UserPostRank, 999999) ASC, COALESCE(combined.TotalPosts,0) DESC
+LIMIT  200
+OFFSET 0;

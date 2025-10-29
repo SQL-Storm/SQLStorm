@@ -1,0 +1,168 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COUNT(DISTINCT c.Id) AS Comments,
+        MAX(p.CreationDate) AS LastPostDate,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS DOUBLE PRECISION) / 
+                CAST(COUNT(DISTINCT p.Id) AS DOUBLE PRECISION)
+            ELSE 0 
+        END AS AnswerRatio,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes
+),
+AnswerQuality AS (
+    SELECT 
+        p.ParentId,
+        AVG(p.Score) AS AvgAnswerScore,
+        COUNT(*) AS AnswerCount,
+        STRING_AGG(p.OwnerDisplayName, ', ' ORDER BY p.Score DESC) AS TopAnswerers,
+        MAX(p.Score) AS BestAnswerScore,
+        MIN(p.Score) AS WorstAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        COALESCE(STRING_AGG(p.Title, '; ' ORDER BY p.CreationDate DESC), '') AS RecentQuestions,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        MAX(p.Score) AS MaxQuestionScore,
+        MIN(p.Score) AS MinQuestionScore
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.TotalPosts,
+        us.Questions,
+        us.Answers,
+        us.AnswerRatio,
+        us.ScoreRank,
+        us.RepRank,
+        us.TotalScore,
+        CASE 
+            WHEN us.Questions > 0 AND us.Answers > 0 THEN 
+                (us.Answers * 100.0) / us.Questions
+            ELSE 0 
+        END AS AnswerPercentage,
+        CASE 
+            WHEN us.Answers > us.Questions THEN 'More Answers Than Questions'
+            WHEN us.Answers = us.Questions THEN 'Equal Answers and Questions'
+            ELSE 'More Questions Than Answers'
+        END AS PostRatioStatus,
+        CASE 
+            WHEN us.Reputation >= 10000 THEN 'Elite'
+            WHEN us.Reputation >= 1000 THEN 'Expert'
+            WHEN us.Reputation >= 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS RepTier,
+        COALESCE(STRING_AGG(p.Title, '; '), '') AS RecentTitles,
+        COALESCE(MAX(p.CreationDate), TIMESTAMP '1900-01-01') AS LatestPostTime,
+        CASE 
+            WHEN us.ScoreRank <= 10 THEN 'Top 10 Scorer'
+            WHEN us.ScoreRank <= 50 THEN 'Top 50 Scorer'
+            WHEN us.ScoreRank <= 100 THEN 'Top 100 Scorer'
+            ELSE 'Regular User'
+        END AS ScoringTier
+    FROM UserStats us
+    LEFT JOIN Posts p ON us.UserId = p.OwnerUserId
+    GROUP BY 
+        us.UserId, us.DisplayName, us.Reputation, us.TotalPosts,
+        us.Questions, us.Answers, us.AnswerRatio, us.ScoreRank,
+        us.RepRank, us.TotalScore
+)
+SELECT 
+    cua.UserId,
+    cua.DisplayName,
+    cua.Reputation,
+    cua.TotalPosts,
+    cua.Questions,
+    cua.Answers,
+    ROUND(CAST(cua.AnswerRatio AS NUMERIC), 3) AS AnswerRatio,
+    cua.ScoreRank,
+    cua.RepRank,
+    cua.TotalScore,
+    ROUND(CAST(cua.AnswerPercentage AS NUMERIC), 2) AS AnswerPercentage,
+    cua.PostRatioStatus,
+    cua.RepTier,
+    SUBSTRING(cua.RecentTitles FROM 1 FOR 200) AS RecentTitlesPreview,
+    cua.LatestPostTime,
+    cua.ScoringTier,
+    CASE 
+        WHEN cua.Reputation >= 10000 AND cua.Answers > 100 THEN 'Veteran Answerer'
+        WHEN cua.Reputation >= 1000 AND cua.Questions > 50 THEN 'Veteran Questioner'
+        WHEN cua.Reputation >= 100 AND cua.Answers >= 10 THEN 'Regular Contributor'
+        ELSE 'New Participant'
+    END AS ContributionStatus,
+    CASE 
+        WHEN cua.TotalScore > 1000 THEN 'Highly Active'
+        WHEN cua.TotalScore > 100 THEN 'Moderately Active'
+        WHEN cua.TotalScore > 0 THEN 'Active'
+        ELSE 'Inactive'
+    END AS ActivityLevel,
+    COUNT(DISTINCT b.Id) AS BadgeCount,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    MAX(p.CreationDate) AS MostRecentPostDate,
+    MIN(p.CreationDate) AS FirstPostDate,
+    CAST(EXTRACT(EPOCH FROM (MAX(p.CreationDate) - MIN(p.CreationDate))) / 86400 AS INTEGER) AS DaysActive,
+    COALESCE(STRING_AGG(DISTINCT ut.TagName, ', '), 'No Tags') AS UserTagsInPosts
+FROM ComplexUserAnalysis cua
+LEFT JOIN Badges b ON cua.UserId = b.UserId
+LEFT JOIN Votes v ON cua.UserId = v.UserId
+LEFT JOIN Posts p ON cua.UserId = p.OwnerUserId
+LEFT JOIN Comments c ON cua.UserId = c.UserId
+LEFT JOIN (
+    SELECT DISTINCT p.OwnerUserId, SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)) AS TagList
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+) user_tags ON cua.UserId = user_tags.OwnerUserId
+LEFT JOIN (
+    SELECT unnest(string_to_array(tag_list, '><')) AS TagName
+    FROM (
+        SELECT DISTINCT p.Tags AS tag_list
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+    ) tags_list
+) ut ON TRUE
+GROUP BY 
+    cua.UserId, cua.DisplayName, cua.Reputation, cua.TotalPosts,
+    cua.Questions, cua.Answers, cua.AnswerRatio, cua.ScoreRank,
+    cua.RepRank, cua.TotalScore, cua.AnswerPercentage,
+    cua.PostRatioStatus, cua.RepTier, cua.RecentTitles,
+    cua.LatestPostTime, cua.ScoringTier
+HAVING 
+    COUNT(DISTINCT p.Id) > 0
+    AND SUM(COALESCE(p.Score, 0)) > -1000
+ORDER BY 
+    cua.TotalScore DESC,
+    cua.Reputation DESC,
+    cua.ScoreRank ASC
+LIMIT 1000;

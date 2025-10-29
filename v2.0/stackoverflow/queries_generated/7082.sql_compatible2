@@ -1,0 +1,91 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT b.Id) AS Badges,
+    COUNT(DISTINCT v.Id) AS Votes,
+    COUNT(DISTINCT c.Id) AS Comments,
+    COALESCE(SUM(p.Score), 0) AS TotalScore,
+    COALESCE(AVG(p.Score), 0) AS AverageScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    MIN(p.CreationDate) AS FirstPostDate,
+    CAST('2024-10-01 12:34:56' AS timestamp) - MAX(p.CreationDate) AS DaysSinceLastPost,
+    CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate AS AccountAgeDays,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Elite'
+        WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Veteran'
+        WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Regular'
+        ELSE 'Newbie'
+    END AS UserLevel,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1 AND Score > 100) AS HighScoringQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 2 AND Score > 100) AS HighScoringAnswers,
+    (SELECT Title FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1 ORDER BY Score DESC LIMIT 1) AS HighestScoredQuestion,
+    (SELECT Body FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 2 ORDER BY Score DESC LIMIT 1) AS HighestScoredAnswer,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND ParentId IS NOT NULL AND Score > 0) AS AnsweredQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND ParentId IS NOT NULL AND Score <= 0) AS UnansweredQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND Score > 0 AND ParentId IS NULL) AS QuestionWithPositiveScore,
+    COALESCE(
+        (SELECT AVG(AnswerScore) 
+         FROM (SELECT p2.Score AS AnswerScore 
+               FROM Posts p1 
+               JOIN Posts p2 ON p1.Id = p2.ParentId 
+               WHERE p1.OwnerUserId = u.Id 
+                 AND p2.Score IS NOT NULL 
+                 AND p2.Score > 0) AS AnswersScores), 0) AS AvgAnswerScore,
+    (SELECT STRING_AGG(Tag, ', ') 
+     FROM (
+           SELECT DISTINCT TRIM(SUBSTRING(tagtext FROM 2 FOR CHAR_LENGTH(tagtext) - 2)) AS Tag
+           FROM (
+                 SELECT REGEXP_MATCHES(t.tags, '<[^>]+>', 'g') AS tagarray
+                 FROM (SELECT (SELECT COALESCE(STRING_AGG(p2.Tags, ' '), '') FROM Posts p2 WHERE p2.OwnerUserId = u.Id) AS tags) t
+                ) x,
+                LATERAL (
+                  SELECT unnest(tagarray) AS tagtext
+                ) s
+          ) AS TagsParsed) AS AllUserTags,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) * 100.0 / NULLIF(COUNT(DISTINCT p.Id), 0) AS QuestionPercentage,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph 
+     JOIN Posts pph ON ph.PostId = pph.Id 
+     WHERE pph.OwnerUserId = u.Id AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) AS EditHistoryCount,
+    (SELECT COUNT(DISTINCT CommentId) 
+     FROM (SELECT DISTINCT c2.Id AS CommentId 
+           FROM Comments c2 
+           JOIN Posts p2 ON c2.PostId = p2.Id 
+           WHERE p2.OwnerUserId = u.Id) AS UniqueComments) AS UniqueCommentsReceived,
+    (SELECT COUNT(DISTINCT p2.Id) 
+     FROM Posts p1 
+     JOIN Posts p2 ON p1.Id = p2.ParentId 
+     WHERE p1.OwnerUserId = u.Id 
+       AND p2.AcceptedAnswerId IS NOT NULL) AS QuestionsWithAcceptedAnswers,
+    (SELECT COUNT(*) 
+     FROM Badges b2 
+     WHERE b2.UserId = u.Id 
+       AND b2.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) 
+     FROM Badges b2 
+     WHERE b2.UserId = u.Id 
+       AND b2.Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) 
+     FROM Badges b2 
+     WHERE b2.UserId = u.Id 
+       AND b2.Class = 3) AS BronzeBadges,
+    AVG(ABS(p.Score)) AS AvgAbsoluteScore,
+    MAX(p.Score) AS MaxScore,
+    MIN(p.Score) AS MinScore,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore,
+    STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, '; ') AS QuestionTitles
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+WHERE u.Reputation > 0
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+HAVING COUNT(DISTINCT p.Id) > 0
+ORDER BY u.Reputation DESC
+OFFSET 10
+FETCH NEXT 20 ROWS ONLY;

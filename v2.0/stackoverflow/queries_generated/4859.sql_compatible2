@@ -1,0 +1,163 @@
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        u.DisplayName AS EditorDisplayName,
+        ph.CreationDate AS EditDate,
+        ph.Comment,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+LatestPostEdits AS (
+    SELECT
+        PostId,
+        STRING_AGG(DISTINCT CASE WHEN rn = 1 THEN EditorDisplayName ELSE NULL END, ', ') AS LastEditorDisplayName,
+        MAX(EditDate) AS LastEditDate
+    FROM RankedPostEdits
+    GROUP BY PostId
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount,
+        MAX(p.CreationDate) AS LastPostCreationDate,
+        MAX(u.LastAccessDate) AS LastAccessDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        pt.Name AS PostType,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.DisplayName AS OwnerDisplayName,
+        p.OwnerUserId,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN CAST((julianday(p.ClosedDate) - julianday(p.CreationDate)) AS INTEGER) ELSE NULL END AS DaysToClose,
+        p.Tags,
+        lpe.LastEditDate,
+        lpe.LastEditorDisplayName,
+        crc.Name AS CloseReason,
+        CASE
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Accepted Answer Exists'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL THEN 'No Accepted Answer'
+            ELSE 'N/A'
+        END AS AcceptanceStatus
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN LatestPostEdits lpe ON p.Id = lpe.PostId
+    LEFT JOIN CloseReasonTypes crc ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT
+            ph.Comment AS CloseComment
+        FROM PostHistory ph
+        WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+        ORDER BY ph.CreationDate DESC
+        LIMIT 1
+    ) phc ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT
+            NULLIF(
+                NULLIF(
+                    REPLACE(REPLACE(SUBSTR(COALESCE(phc.CloseComment, ''), 
+                        CASE WHEN INSTR(COALESCE(phc.CloseComment, ''), ':') > 0 THEN INSTR(COALESCE(phc.CloseComment, ''), ':') + 1 ELSE 1 END,
+                        100
+                    ), '"', ''), '[', ''), ']', ''
+                ), ''
+            ) AS CloseReasonIdText
+    ) extracted ON TRUE
+    LEFT JOIN CloseReasonTypes crt ON (CASE WHEN extracted.CloseReasonIdText REGEXP '^[0-9]+$' THEN CAST(extracted.CloseReasonIdText AS INTEGER) ELSE NULL END) = crt.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserEngagement AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.AnswerCount,
+        ua.CommentCount,
+        ua.GoldBadgeCount,
+        ua.SilverBadgeCount,
+        ua.BronzeBadgeCount,
+        CASE
+            WHEN ua.TotalPosts = 0 THEN 'No Posts'
+            WHEN ua.TotalPosts > 0 AND ua.AnswerCount * 1.0 / ua.TotalPosts > 0.5 THEN 'Answer Heavy'
+            ELSE 'Question Heavy or Balanced'
+        END AS PostingProfile,
+        CASE
+            WHEN ua.LastAccessDate < (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days') THEN 'Inactive (>1 Year)'
+            WHEN ua.LastAccessDate < (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days') THEN 'Moderately Active (6-12 Months)'
+            ELSE 'Active (<6 Months)'
+        END AS ActivityLevel,
+        pd.PostType,
+        pd.PostStatus,
+        pd.AcceptanceStatus,
+        pd.DaysToClose,
+        pd.Score,
+        pd.ViewCount,
+        pd.FavoriteCount,
+        CASE
+            WHEN pd.Tags LIKE '%<sql>%' THEN 'SQL Related'
+            ELSE 'Other'
+        END AS TagCategory,
+        pd.PostId,
+        pd.OwnerDisplayName,
+        pd.PostCreationDate
+    FROM UserActivity ua
+    LEFT JOIN PostDetails pd ON ua.UserId = pd.OwnerUserId
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.PostingProfile,
+    ue.ActivityLevel,
+    ue.TagCategory,
+    COUNT(DISTINCT pd.PostId) AS PostsInvolvingUser,
+    SUM(CASE WHEN pd.PostType = 'Question' THEN 1 ELSE 0 END) AS Questions,
+    SUM(CASE WHEN pd.PostType = 'Answer' THEN 1 ELSE 0 END) AS Answers,
+    AVG(CAST(pd.Score AS DECIMAL(10, 2))) AS AverageScore,
+    SUM(COALESCE(pd.FavoriteCount, 0)) AS TotalFavorites,
+    COUNT(DISTINCT CASE WHEN pd.PostStatus = 'Closed' THEN pd.PostId ELSE NULL END) AS ClosedPosts,
+    AVG(CASE WHEN pd.PostStatus = 'Closed' THEN CAST(pd.DaysToClose AS DECIMAL(10, 2)) ELSE NULL END) AS AverageDaysToCloseForClosed,
+    MAX(CASE WHEN pd.AcceptanceStatus = 'Accepted Answer Exists' THEN 1 ELSE 0 END) AS HasAcceptedAnswer,
+    SUM(pd.Score) AS SumScore
+FROM UserEngagement ue
+LEFT JOIN PostDetails pd ON ue.UserId = pd.OwnerUserId
+WHERE ue.Reputation > 1000
+GROUP BY
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.PostingProfile,
+    ue.ActivityLevel,
+    ue.TagCategory
+HAVING COUNT(DISTINCT pd.PostId) > 5
+ORDER BY
+    ue.Reputation DESC,
+    ue.ActivityLevel,
+    ue.PostingProfile,
+    SumScore DESC;

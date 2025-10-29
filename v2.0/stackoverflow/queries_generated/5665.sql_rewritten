@@ -1,0 +1,136 @@
+-- {"query": "5665.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 990} 
+WITH ranked_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastEditorUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.PostTypeId,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.AccountId,
+    -- Window function: rolling average of score over last 100 posts by CreationDate
+    AVG(p.Score) OVER (
+      ORDER BY p.CreationDate
+      ROWS BETWEEN 99 PRECEDING AND CURRENT ROW
+    ) AS rolling_avg_score,
+    -- Window function: rank by Score within PostTypeId = 1 (Questions)
+    RANK() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY p.Score DESC
+    ) AS score_rank
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+),
+correlated_sub AS (
+  SELECT
+    rp.*,
+    -- correlated subquery: count of comments on same post
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.PostId) AS CommentCountFromComments,
+    -- correlated subquery: latest tag count interaction from Votes by UpMod on this post
+    (SELECT COUNT(*) FROM Votes v
+     WHERE v.PostId = rp.PostId AND v.VoteTypeId = 2) AS UpModCount
+  FROM ranked_posts rp
+),
+pivot AS (
+  SELECT
+    cs.PostId,
+    cs.Title,
+    cs.Body,
+    cs.CreationDate,
+    cs.Score,
+    cs.ViewCount,
+    cs.Tags,
+    cs.OwnerUserId,
+    cs.LastEditorUserId,
+    cs.LastActivityDate,
+    cs.CommentCount,
+    cs.FavoriteCount,
+    cs.PostTypeId,
+    cs.Reputation,
+    cs.OwnerDisplayName,
+    cs.Location,
+    cs.Views,
+    cs.UpVotes,
+    cs.DownVotes,
+    cs.ProfileImageUrl,
+    cs.AccountId,
+    cs.rolling_avg_score,
+    cs.score_rank,
+    cs.CommentCountFromComments,
+    cs.UpModCount,
+    -- compute a complex string expression
+    CONCAT_WS(' | ',
+      CASE WHEN cs.Score > 0 THEN 'Positive'
+           WHEN cs.Score = 0 THEN 'Neutral'
+           ELSE 'Negative' END,
+      CONCAT('Owner=', COALESCE(cs.OwnerDisplayName, 'Unknown')),
+      CONCAT('Tags=', COALESCE(cs.Tags, ''))
+    ) AS MetaDescriptor
+  FROM correlated_sub cs
+),
+with_links AS (
+  SELECT
+    pvt.*,
+    -- Outer join: find related posts via PostLinks (if any)
+    pl.RelatedPostId,
+    rl.PostId AS RelatedPostIdFromLink,
+    t2.TagName
+  FROM pivot pvt
+  LEFT JOIN PostLinks pl ON pl.PostId = pvt.PostId
+  LEFT JOIN Posts rl ON rl.Id = pl.RelatedPostId
+  LEFT JOIN Tags t2 ON t2.Id = (
+    SELECT TOP 1 t.Id
+    FROM Tags t
+    WHERE t.WikiPostId = rl.Id OR t.ExcerptPostId = rl.Id
+    ORDER BY t.Count DESC
+    LIMIT 1
+  )
+),
+final_select AS (
+  SELECT
+    wl.*,
+    -- complicated predicate: include only posts that have either high score or many views or contain certain keywords
+    CASE
+      WHEN wl.Score >= 10 OR wl.ViewCount >= 1000 THEN TRUE
+      WHEN wl.Title ILIKE '%performance%' OR wl.Body ILIKE '%benchmark%' THEN TRUE
+      ELSE FALSE
+    END AS IncludeFlag
+  FROM with_links wl
+)
+SELECT
+  DISTINCT
+  fs.PostId,
+  fs.Title,
+  fs.CreationDate,
+  fs.Score,
+  fs.ViewCount,
+  fs.OwnerDisplayName,
+  fs.Location,
+  fs.rolling_avg_score AS rolling_avg_score_overall,
+  fs.score_rank,
+  fs.CommentCountFromComments,
+  fs.UpModCount,
+  fs.MetaDescriptor,
+  fs.RelatedPostId,
+  fs.TagName
+FROM final_select fs
+WHERE fs.IncludeFlag = TRUE
+ORDER BY fs.Score DESC, fs.ViewCount DESC, fs.CreationDate DESC
+LIMIT 100;

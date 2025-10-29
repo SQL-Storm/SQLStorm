@@ -1,0 +1,129 @@
+-- {"query": "4016.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1205} 
+
+WITH
+  QuestionEditHistory AS (
+    SELECT
+      ph.PostId,
+      COUNT(ph.Id) AS edit_count,
+      MAX(ph.CreationDate) AS last_edit_date,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 ELSE 0 END) AS title_edits,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS body_edits
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5) AND ph.PostId IN (
+        SELECT
+          p.Id
+        FROM Posts AS p
+        WHERE
+          p.PostTypeId = 1
+      )
+    GROUP BY
+      ph.PostId
+  ),
+  AnswerQuality AS (
+    SELECT
+      a.Id AS answer_id,
+      a.ParentId AS question_id,
+      a.Score AS answer_score,
+      ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS rank_by_score,
+      CASE
+        WHEN LAG(a.Score, 1, 0) OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) = a.Score
+        THEN TRUE
+        ELSE FALSE
+      END AS has_tied_score
+    FROM Posts AS a
+    WHERE
+      a.PostTypeId = 2
+  ),
+  UserEngagement AS (
+    SELECT
+      u.Id AS user_id,
+      u.DisplayName,
+      u.Reputation,
+      (
+        SELECT
+          COUNT(*)
+        FROM Votes AS v
+        WHERE
+          v.UserId = u.Id AND v.VoteTypeId = 2
+      ) AS upvotes_given,
+      (
+        SELECT
+          COUNT(*)
+        FROM Votes AS v
+        WHERE
+          v.UserId = u.Id AND v.VoteTypeId = 3
+      ) AS downvotes_given,
+      (
+        SELECT
+          COUNT(*)
+        FROM Comments AS c
+        WHERE
+          c.UserId = u.Id
+      ) AS comments_made,
+      COUNT(b.Id) AS badges_earned
+    FROM Users AS u
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  )
+SELECT
+  q.Id AS question_id,
+  q.Title AS question_title,
+  q.CreationDate AS question_creation_date,
+  q.Score AS question_score,
+  q.ViewCount AS question_view_count,
+  COALESCE(qe.edit_count, 0) AS total_edits,
+  COALESCE(qe.title_edits, 0) AS title_edit_count,
+  COALESCE(qe.body_edits, 0) AS body_edit_count,
+  COALESCE(aq.answer_score, 0) AS top_answer_score,
+  CASE
+    WHEN aq.has_tied_score IS TRUE THEN 'Tied'
+    WHEN aq.answer_id IS NOT NULL THEN 'Unique Top'
+    ELSE 'No Answers'
+  END AS top_answer_status,
+  ue.DisplayName AS owner_display_name,
+  ue.Reputation AS owner_reputation,
+  ue.upvotes_given AS owner_upvotes_given,
+  ue.downvotes_given AS owner_downvotes_given,
+  ue.comments_made AS owner_comments_made,
+  ue.badges_earned AS owner_badges_earned,
+  CASE
+    WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+    ELSE 'Open'
+  END AS question_status,
+  REPLACE(REPLACE(q.Tags, '<', ''), '>', '') AS formatted_tags,
+  CASE
+    WHEN q.FavoriteCount > 1000 THEN 'Very Popular'
+    WHEN q.FavoriteCount > 100 THEN 'Popular'
+    ELSE 'Normal'
+  END AS popularity_tier,
+  DATEDIFF(
+    day,
+    q.CreationDate,
+    COALESCE(q.ClosedDate, q.LastActivityDate)
+  ) AS days_open_or_closed,
+  SQRT(POWER(q.Score, 2) + POWER(q.ViewCount, 1.5)) AS engagement_metric
+FROM Posts AS q
+LEFT JOIN QuestionEditHistory AS qe
+  ON q.Id = qe.PostId
+LEFT JOIN AnswerQuality AS aq
+  ON q.Id = aq.question_id AND aq.rank_by_score = 1
+LEFT JOIN UserEngagement AS ue
+  ON q.OwnerUserId = ue.user_id
+WHERE
+  q.PostTypeId = 1
+  AND q.Score > 10
+  AND q.ViewCount > 100
+  AND q.OwnerUserId IS NOT NULL
+  AND q.OwnerUserId <> -1
+  AND ue.badges_earned > 5
+  AND (
+    qe.edit_count IS NULL OR qe.edit_count > 2
+  )
+ORDER BY
+  engagement_metric DESC
+LIMIT 100;

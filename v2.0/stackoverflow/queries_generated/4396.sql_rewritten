@@ -1,0 +1,135 @@
+-- {"query": "4396.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1218} 
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate AS EditDate,
+      pht.Name AS EditType,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    JOIN PostHistoryTypes AS pht
+      ON ph.PostHistoryTypeId = pht.Id
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) AND ph.UserId IS NOT NULL
+  ),
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+      AVG(p.Score) AS AvgPostScore,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY
+      p.OwnerUserId
+  ),
+  HighReputationUsers AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      upa.TotalPosts,
+      upa.Questions,
+      upa.Answers,
+      upa.AvgPostScore,
+      upa.LastPostDate,
+      (
+        SELECT
+          COUNT(*)
+        FROM Badges AS b
+        WHERE
+          b.UserId = u.Id AND b.Class = 1 /* Gold Badge */
+      ) AS GoldBadges,
+      (
+        SELECT
+          COUNT(*)
+        FROM Badges AS b
+        WHERE
+          b.UserId = u.Id AND b.Class = 2 /* Silver Badge */
+      ) AS SilverBadges,
+      (
+        SELECT
+          COUNT(*)
+        FROM Badges AS b
+        WHERE
+          b.UserId = u.Id AND b.Class = 3 /* Bronze Badge */
+      ) AS BronzeBadges,
+      LEFT_JOIN (
+        SELECT
+          Id,
+          DisplayName
+        FROM Users
+        WHERE
+          Id = u.Id - 1
+      ) AS PreviousUser
+    FROM Users AS u
+    JOIN UserPostActivity AS upa
+      ON u.Id = upa.OwnerUserId
+    WHERE
+      u.Reputation > 100000
+  )
+SELECT
+  hru.DisplayName AS UserDisplayName,
+  hru.Reputation,
+  hru.TotalPosts,
+  hru.Questions,
+  hru.Answers,
+  hru.AvgPostScore,
+  hru.LastPostDate,
+  hru.GoldBadges,
+  hru.SilverBadges,
+  hru.BronzeBadges,
+  CASE
+    WHEN hru.DisplayName IS NULL THEN 'Unknown'
+    WHEN LENGTH(hru.DisplayName) > 10 THEN SUBSTRING(hru.DisplayName FROM 1 FOR 10) || '...'
+    ELSE hru.DisplayName
+  END AS TruncatedDisplayName,
+  CASE
+    WHEN hru.LastPostDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days' THEN 'Inactive'
+    ELSE 'Active'
+  END AS UserActivityStatus,
+  (
+    SELECT
+      COUNT(*)
+    FROM RankedPostEdits AS rpe
+    WHERE
+      rpe.UserId = hru.UserId AND rpe.rn = 1
+  ) AS MostRecentEdits,
+  COALESCE(hru.PreviousUser.DisplayName, 'No Previous User') AS PreviousUserDisplayName,
+  (
+    SELECT
+      COUNT(DISTINCT ph.PostId)
+    FROM PostHistory AS ph
+    WHERE
+      ph.UserId = hru.UserId AND ph.PostHistoryTypeId = 16 /* Community Owned */
+  ) AS PostsPutToCommunityWiki
+FROM HighReputationUsers AS hru
+WHERE
+  hru.Reputation BETWEEN 100000 AND 500000
+  AND hru.LastPostDate >= DATE('now', '-1 year')
+UNION ALL
+SELECT
+  'Total' AS UserDisplayName,
+  SUM(Reputation) AS Reputation,
+  SUM(TotalPosts) AS TotalPosts,
+  SUM(Questions) AS Questions,
+  SUM(Answers) AS Answers,
+  AVG(AvgPostScore) AS AvgPostScore,
+  MAX(LastPostDate) AS LastPostDate,
+  SUM(GoldBadges) AS GoldBadges,
+  SUM(SilverBadges) AS SilverBadges,
+  SUM(BronzeBadges) AS BronzeBadges,
+  'N/A' AS TruncatedDisplayName,
+  'N/A' AS UserActivityStatus,
+  COUNT(DISTINCT rpe.PostId) AS MostRecentEdits,
+  'N/A' AS PreviousUserDisplayName,
+  COUNT(DISTINCT ph.PostId) AS PostsPutToCommunityWiki
+FROM HighReputationUsers AS hru
+LEFT JOIN RankedPostEdits AS rpe
+  ON hru.UserId = rpe.UserId AND rpe.rn = 1
+LEFT JOIN PostHistory AS ph
+  ON hru.UserId = ph.UserId AND ph.PostHistoryTypeId = 16;

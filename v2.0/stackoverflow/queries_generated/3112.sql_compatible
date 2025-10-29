@@ -1,0 +1,166 @@
+WITH RECURSIVE
+user_stats AS (
+    SELECT
+        u.id                                   AS user_id,
+        u.displayname                          AS display_name,
+        u.reputation,
+        COUNT(DISTINCT CASE WHEN p.posttypeid = 1 THEN p.id END)  AS questions_asked,
+        COUNT(DISTINCT CASE WHEN p.posttypeid = 2 THEN p.id END)  AS answers_given,
+        COALESCE(SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END),0) AS upvotes_given,
+        COALESCE(SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END),0) AS downvotes_given,
+        COALESCE(SUM(b.class),0)               AS badge_points
+    FROM users u
+    LEFT JOIN posts      p ON p.owneruserid = u.id
+    LEFT JOIN votes      v ON v.userid = u.id
+    LEFT JOIN badges     b ON b.userid = u.id
+    GROUP BY u.id, u.displayname, u.reputation
+),
+
+recent_activity AS (
+    SELECT
+        u.id                                                  AS user_id,
+        GREATEST(
+            MAX(CASE WHEN p.posttypeid = 1 THEN p.creationdate END),
+            MAX(CASE WHEN a.posttypeid = 2 THEN a.creationdate END),
+            MAX(c.creationdate)
+        )                                                     AS most_recent_ts
+    FROM users u
+    LEFT JOIN posts   p ON p.owneruserid = u.id AND p.posttypeid = 1
+    LEFT JOIN posts   a ON a.owneruserid = u.id AND a.posttypeid = 2
+    LEFT JOIN comments c ON c.userid = u.id
+    GROUP BY u.id
+),
+
+tag_usage AS (
+    SELECT
+        u.id                                          AS user_id,
+        COUNT(DISTINCT t.tagname)                     AS distinct_tags,
+        LISTAGG(DISTINCT t.tagname, ',') WITHIN GROUP (ORDER BY t.tagname) 
+            AS tag_list
+    FROM users u
+    JOIN posts p ON p.owneruserid = u.id AND p.posttypeid = 1
+    LEFT JOIN (
+        -- split tags by stripping angle brackets and splitting on '><'
+        -- portable split: use a simple approach assuming tags like '<tag1><tag2>'
+        -- many dialects don't have regexp_split_to_table; use a recursive split
+        SELECT p.id AS post_id, TRIM(BOTH '<>' FROM p.tags) AS tags_str
+        FROM posts p
+    ) pst ON pst.post_id = p.id
+    LEFT JOIN (
+        -- split tags_str on '><' by using a recursive CTE per post
+        SELECT post_id, tag
+        FROM (
+            WITH RECURSIVE split(post_id, rest, tag) AS (
+                SELECT post_id,
+                       tags_str || '>' AS rest,
+                       NULL::VARCHAR AS tag
+                FROM (SELECT post_id, tags_str FROM (SELECT p.id AS post_id, TRIM(BOTH '<>' FROM p.tags) AS tags_str FROM posts p) x WHERE x.post_id = p.id) sub
+                WHERE 1=0
+                UNION ALL
+                SELECT s.post_id,
+                       CASE WHEN POSITION('><' IN s.rest) > 0 THEN SUBSTR(s.rest, POSITION('><' IN s.rest)+2) ELSE '' END,
+                       CASE WHEN POSITION('><' IN s.rest) > 0 THEN SUBSTR(s.rest,1,POSITION('><' IN s.rest)-1)
+                            ELSE CASE WHEN LENGTH(s.rest)>0 THEN REPLACE(REPLACE(s.rest,'<',''),'>','') ELSE NULL END END
+                FROM split s
+                WHERE s.rest IS NOT NULL AND s.rest <> ''
+            )
+            SELECT post_id, tag FROM split WHERE tag IS NOT NULL
+        ) tsplit
+    ) split_tags ON split_tags.post_id = p.id
+    LEFT JOIN tags t ON t.tagname = split_tags.tag
+    GROUP BY u.id
+),
+
+combined AS (
+    SELECT
+        us.user_id,
+        us.display_name,
+        us.reputation,
+        us.questions_asked,
+        us.answers_given,
+        us.upvotes_given,
+        us.downvotes_given,
+        us.badge_points,
+        ra.most_recent_ts,
+        tu.distinct_tags,
+        tu.tag_list,
+        ROW_NUMBER() OVER (
+            ORDER BY us.reputation DESC, us.badge_points DESC
+        ) AS rep_rank
+    FROM user_stats      us
+    LEFT JOIN recent_activity ra ON ra.user_id = us.user_id
+    LEFT JOIN tag_usage       tu ON tu.user_id = us.user_id
+    WHERE us.questions_asked > 0
+      AND us.answers_given   > 0
+      AND us.reputation IS NOT NULL
+),
+
+top_users AS (
+    SELECT *
+    FROM combined
+    WHERE rep_rank <= 100
+),
+
+user_best_answer AS (
+    SELECT
+        a.owneruserid                     AS user_id,
+        a.id                               AS answer_id,
+        a.score                            AS answer_score,
+        ROW_NUMBER() OVER (PARTITION BY a.owneruserid 
+                           ORDER BY a.score DESC, a.creationdate) AS rn
+    FROM posts a
+    WHERE a.posttypeid = 2
+),
+
+detailed AS (
+    SELECT
+        tu.user_id,
+        tu.display_name,
+        tu.reputation,
+        tu.rep_rank,
+        tu.questions_asked,
+        tu.answers_given,
+        tu.upvotes_given,
+        tu.downvotes_given,
+        tu.badge_points,
+        tu.most_recent_ts,
+        tu.distinct_tags,
+        CASE
+            WHEN tu.distinct_tags >= 10 THEN 'Power User'
+            WHEN tu.distinct_tags >= 5  THEN 'Active Tagger'
+            ELSE 'Niche Contributor'
+        END                             AS tagger_level,
+        COALESCE(NULLIF(COALESCE(tu.tag_list, ''), ''), 'No Tags') AS tags_used,
+        uba.answer_id,
+        uba.answer_score
+    FROM top_users tu
+    LEFT JOIN user_best_answer uba 
+        ON uba.user_id = tu.user_id AND uba.rn = 1
+),
+
+summary AS (
+    SELECT
+        -1                                       AS user_id,
+        'Aggregated Summary'                     AS display_name,
+        CAST(NULL AS INTEGER)                    AS reputation,
+        CAST(NULL AS INTEGER)                    AS rep_rank,
+        SUM(questions_asked)                     AS questions_asked,
+        SUM(answers_given)                       AS answers_given,
+        SUM(upvotes_given)                       AS upvotes_given,
+        SUM(downvotes_given)                     AS downvotes_given,
+        SUM(badge_points)                        AS badge_points,
+        MAX(most_recent_ts)                      AS most_recent_ts,
+        COUNT(DISTINCT tags_used)                AS distinct_tags,
+        CAST(NULL AS VARCHAR(64))                AS tagger_level,
+        CAST(NULL AS VARCHAR(1024))              AS tags_used,
+        CAST(NULL AS INTEGER)                    AS answer_id,
+        CAST(NULL AS INTEGER)                    AS answer_score
+    FROM detailed
+)
+
+SELECT *
+FROM detailed
+UNION ALL
+SELECT *
+FROM summary
+ORDER BY rep_rank NULLS LAST, user_id;

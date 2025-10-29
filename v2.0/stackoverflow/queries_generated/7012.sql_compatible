@@ -1,0 +1,334 @@
+WITH RECURSIVE PostHierarchy AS (
+    SELECT 
+        p.Id as PostId,
+        p.ParentId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        0 as Depth,
+        CAST(p.Id AS VARCHAR(1000)) as Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ParentId IS NULL
+
+    UNION ALL
+
+    SELECT 
+        p.Id as PostId,
+        p.ParentId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        ph.Depth + 1 as Depth,
+        ph.Path || '->' || CAST(p.Id AS VARCHAR(1000)) as Path
+    FROM Posts p
+    INNER JOIN PostHierarchy ph ON p.ParentId = ph.PostId
+    WHERE ph.Depth < 5
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+        MAX(p.CreationDate) as LastPostDate,
+        DATEDIFF(DAY, u.CreationDate, CAST('2024-10-01 12:34:56' AS timestamp)) as AccountAgeDays,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 1000 THEN 'Veteran'
+            WHEN COUNT(DISTINCT p.Id) > 500 THEN 'Experienced'
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Active'
+            ELSE 'Newbie'
+        END as UserCategory,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC) as PostRank,
+        LAG(MAX(p.CreationDate), 1) OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate)) as PrevPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        COALESCE(p.Tags, '') as CleanTags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags)-2)), '><'), 1)
+            ELSE 0 
+        END as TagCount,
+        CASE 
+            WHEN p.PostTypeId = 1 AND COALESCE(p.AnswerCount,0) > 0 THEN p.AnswerCount
+            ELSE 0 
+        END as HasAnswers,
+        CASE 
+            WHEN p.PostTypeId = 1 AND COALESCE(p.CommentCount,0) > 0 THEN 1
+            ELSE 0 
+        END as HasComments,
+        CASE 
+            WHEN p.PostTypeId = 1 AND COALESCE(p.FavoriteCount,0) > 0 THEN 1
+            ELSE 0 
+        END as HasFavorites,
+        CASE 
+            WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN 
+                (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = p.ParentId AND p2.PostTypeId = 2 AND p2.Score > 0) 
+            ELSE 0 
+        END as ParentAnswerCount,
+        p.Score * COALESCE(p.ViewCount, 0) as ScoreViewProduct,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'LowVoted'
+            ELSE 'Unrated'
+        END as VoteCategory,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) as PrevScore,
+        LAG(p.ViewCount, 1) OVER (ORDER BY p.CreationDate) as PrevViews
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagBasedBadges AS (
+    SELECT 
+        b.Id as BadgeId,
+        b.Name as BadgeName,
+        b.UserId,
+        b.Date as BadgeDate,
+        b.Class,
+        b.TagBased,
+        CASE 
+            WHEN b.TagBased = 1 AND b.Name IN ('Popular Question', 'Notable Question', 'Famous Question') THEN 'QuestionBadge'
+            WHEN b.TagBased = 1 AND b.Name IN ('Good Answer', 'Great Answer') THEN 'AnswerBadge'
+            WHEN b.TagBased = 1 AND b.Name IN ('Nice Answer', 'Nice Question') THEN 'QualityBadge'
+            ELSE 'OtherBadge'
+        END as BadgeType
+    FROM Badges b
+    WHERE b.TagBased = 1
+),
+ComplexStats AS (
+    SELECT 
+        pa.UserId,
+        pa.DisplayName,
+        pa.Reputation,
+        pa.TotalPosts,
+        pa.Questions,
+        pa.Answers,
+        pa.Comments,
+        pa.Badges,
+        pa.TotalQuestionScore,
+        pa.TotalAnswerScore,
+        pa.AvgQuestionScore,
+        pa.AvgAnswerScore,
+        pa.LastPostDate,
+        pa.AccountAgeDays,
+        pa.UserCategory,
+        SUM(COALESCE(p.Score,0)) OVER (PARTITION BY pa.UserId ORDER BY pa.LastPostDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as RunningScore,
+        AVG(COALESCE(p.Score,0)) OVER (PARTITION BY pa.UserId ORDER BY pa.LastPostDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as MovingAvgScore,
+        RANK() OVER (ORDER BY pa.TotalQuestionScore DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY pa.Reputation DESC) as RankByReputation,
+        PERCENT_RANK() OVER (ORDER BY pa.AccountAgeDays DESC) as AgePercentile,
+        CASE 
+            WHEN pa.TotalPosts > 0 AND pa.Answers > 0 THEN 
+                CAST(pa.Answers AS DOUBLE PRECISION) / pa.TotalPosts * 100
+            ELSE 0 
+        END as AnswerPercentage,
+        CASE 
+            WHEN pa.TotalPosts = 0 THEN 0
+            ELSE (pa.UpVotes - pa.DownVotes) / NULLIF(pa.TotalPosts,0)
+        END as NetVotePerPost
+    FROM UserActivityStats pa
+    LEFT JOIN Posts p ON pa.UserId = p.OwnerUserId
+),
+PostTrendAnalysis AS (
+    SELECT 
+        pm.PostId,
+        pm.Title,
+        pm.Score,
+        pm.ViewCount,
+        pm.CreationDate,
+        pm.OwnerUserId,
+        pm.PostTypeId,
+        pm.ScoreViewProduct,
+        pm.VoteCategory,
+        pm.TagCount,
+        pm.HasAnswers,
+        pm.HasComments,
+        pm.HasFavorites,
+        CASE 
+            WHEN pm.Score > 0 AND pm.ViewCount > 0 THEN 
+                CAST(pm.Score AS DOUBLE PRECISION) / pm.ViewCount 
+            ELSE 0 
+        END as ScoreToViewRatio,
+        CASE 
+            WHEN pm.Score > 0 AND pm.TagCount > 0 THEN 
+                CAST(pm.Score AS DOUBLE PRECISION) / pm.TagCount
+            ELSE 0 
+        END as ScorePerTag,
+        CASE 
+            WHEN pm.Score > 100 AND pm.ScoreViewProduct > 1000 THEN 'ViralPost'
+            WHEN pm.Score > 50 AND pm.ScoreViewProduct > 500 THEN 'PopularPost'
+            WHEN pm.Score > 0 AND pm.ScoreViewProduct > 100 THEN 'EngagingPost'
+            ELSE 'AveragePost'
+        END as PostCategory,
+        LAG(pm.Score, 1) OVER (ORDER BY pm.CreationDate) - pm.Score as ScoreChange,
+        LAG(pm.ViewCount, 1) OVER (ORDER BY pm.CreationDate) - pm.ViewCount as ViewChange,
+        ROW_NUMBER() OVER (ORDER BY pm.CreationDate DESC) as TimeRank,
+        NTILE(10) OVER (ORDER BY pm.Score DESC) as QualityDecile,
+        CUME_DIST() OVER (ORDER BY pm.Score ASC) as CumulativeScoreDistribution,
+        PERCENT_RANK() OVER (ORDER BY pm.ViewCount DESC) as ViewPercentile
+    FROM PostMetrics pm
+)
+SELECT 
+    cs.UserId,
+    cs.DisplayName,
+    cs.Reputation,
+    cs.TotalPosts,
+    cs.Questions,
+    cs.Answers,
+    cs.Comments,
+    cs.Badges,
+    cs.TotalQuestionScore,
+    cs.TotalAnswerScore,
+    cs.AvgQuestionScore,
+    cs.AvgAnswerScore,
+    cs.LastPostDate,
+    cs.AccountAgeDays,
+    cs.UserCategory,
+    cs.RunningScore,
+    cs.MovingAvgScore,
+    cs.ScoreRank,
+    cs.RankByReputation,
+    cs.AgePercentile,
+    cs.AnswerPercentage,
+    cs.NetVotePerPost,
+    CASE 
+        WHEN cs.NetVotePerPost > 1 THEN 'HighlyActive'
+        WHEN cs.NetVotePerPost > 0.5 THEN 'ModeratelyActive'
+        WHEN cs.NetVotePerPost > 0 THEN 'LowActivity'
+        ELSE 'Inactive'
+    END as ActivityLevel,
+    pt.PostId,
+    pt.Title,
+    pt.Score,
+    pt.ViewCount,
+    pt.CreationDate,
+    pt.PostTypeId,
+    pt.ScoreViewProduct,
+    pt.VoteCategory,
+    pt.TagCount,
+    pt.HasAnswers,
+    pt.HasComments,
+    pt.HasFavorites,
+    pt.ScoreToViewRatio,
+    pt.ScorePerTag,
+    pt.PostCategory,
+    pt.ScoreChange,
+    pt.ViewChange,
+    pt.TimeRank,
+    pt.QualityDecile,
+    pt.CumulativeScoreDistribution,
+    pt.ViewPercentile,
+    CASE 
+        WHEN pt.PostCategory IN ('ViralPost', 'PopularPost') AND cs.NetVotePerPost > 0.5 THEN 
+            'HighImpactUser'
+        WHEN cs.TotalQuestionScore > 1000 OR cs.TotalAnswerScore > 500 THEN 
+            'HighScoringUser'
+        ELSE 
+            'RegularUser'
+    END as UserClassification,
+    CASE 
+        WHEN pt.Score > 100 THEN 
+            (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = pt.PostId AND ph.PostHistoryTypeId IN (1,2,3,4,5,6)) 
+        ELSE 0 
+    END as EditCount,
+    CASE 
+        WHEN cs.TotalPosts > 10 AND cs.Answers > 5 AND cs.Comments > 5 THEN 
+            'EngagedContributor'
+        WHEN cs.TotalPosts > 5 AND cs.Reputation > 500 THEN 
+            'ActiveContributor'
+        ELSE 
+            'RegularContributor'
+    END as ContributionLevel,
+    COALESCE(ROW_NUMBER() OVER (ORDER BY pt.Score DESC), 0) as TopScorePosition,
+    CASE 
+        WHEN pt.PostId IS NOT NULL THEN 'HasRecentPosts'
+        ELSE 'NoRecentPosts'
+    END as PostStatus,
+    CAST(ABS(COS(RADIANS(CAST(pt.Score AS DOUBLE PRECISION)))) AS DECIMAL(10,4)) as CosineScore,
+    CASE 
+        WHEN cs.ScoreRank <= 10 THEN 'Top10Scorer'
+        WHEN cs.ScoreRank <= 50 THEN 'Top50Scorer'
+        ELSE 'RegularScorer'
+    END as RankCategory,
+    CASE 
+        WHEN cs.UserCategory = 'Veteran' AND cs.Reputation > 10000 THEN 
+            (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = cs.UserId AND ph.PostHistoryTypeId = 10)
+        ELSE 0
+    END as ClosedPostCount,
+    CASE 
+        WHEN cs.Answers > 0 THEN 
+            (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = cs.UserId AND p2.PostTypeId = 2)
+        ELSE 0 
+    END as AvgAnswerScore,
+    CASE 
+        WHEN cs.Questions > 0 THEN 
+            (SELECT AVG(p3.Score) FROM Posts p3 WHERE p3.OwnerUserId = cs.UserId AND p3.PostTypeId = 1)
+        ELSE 0 
+    END as AvgQuestionScore,
+    CASE 
+        WHEN cs.Badges > 0 THEN 
+            (SELECT COUNT(DISTINCT tb.BadgeType) FROM TagBasedBadges tb WHERE tb.UserId = cs.UserId)
+        ELSE 0 
+    END as DistinctBadgeTypes,
+    ('User:' || cs.UserId || '|Post:' || COALESCE(CAST(pt.PostId AS VARCHAR(100)), 'NULL') || '|Category:' || COALESCE(pt.PostCategory, 'NULL')) as UserPostIdentifier,
+    CASE 
+        WHEN cs.NetVotePerPost > 1 AND cs.Reputation > 5000 THEN 
+            (SELECT COUNT(*) FROM Votes v WHERE v.UserId = cs.UserId AND v.VoteTypeId IN (2,3))
+        ELSE 0 
+    END as VoteActivityCount,
+    CASE 
+        WHEN cs.AccountAgeDays > 365 THEN 
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cs.UserId AND p.CreationDate >= DATEADD(DAY, -30, CAST('2024-10-01 12:34:56' AS timestamp)))
+        ELSE 0 
+    END as RecentPostCount
+FROM ComplexStats cs
+LEFT JOIN PostTrendAnalysis pt ON cs.UserId = pt.OwnerUserId
+WHERE cs.UserId IN (
+    SELECT DISTINCT UserId 
+    FROM Badges 
+    WHERE Name IN ('Gold', 'Silver', 'Bronze')
+    INTERSECT
+    SELECT DISTINCT OwnerUserId 
+    FROM Posts 
+    WHERE Score > 100 AND ViewCount > 1000
+    EXCEPT
+    SELECT DISTINCT UserId 
+    FROM Votes 
+    WHERE VoteTypeId IN (10, 11)
+)
+AND (cs.UserCategory = 'Veteran' OR cs.UserCategory = 'Experienced')
+AND pt.PostCategory IN ('ViralPost', 'PopularPost', 'EngagingPost')
+ORDER BY cs.ScoreRank ASC, pt.Score DESC
+LIMIT 5000;

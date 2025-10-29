@@ -1,0 +1,310 @@
+-- {"query": "7782.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3113} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevViewCount,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as ScoreMovingAvg,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreCategory,
+        COALESCE(p.Tags, '') as SanitizedTags,
+        CASE 
+            WHEN p.Tags IS NULL OR p.Tags = '' THEN 'No Tags'
+            ELSE 'Has Tags'
+        END as TagStatus,
+        DATEDIFF(day, p.CreationDate, CURRENT_TIMESTAMP) as DaysSinceCreation,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+UserEngagementStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT rp.Id) as TotalPosts,
+        SUM(CASE WHEN rp.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN rp.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        AVG(rp.Score) as AvgScore,
+        MAX(rp.Score) as MaxScore,
+        SUM(rp.ViewCount) as TotalViews,
+        SUM(rp.FavoriteCount) as TotalFavorites,
+        COUNT(DISTINCT CASE WHEN rp.Score > 0 THEN rp.Id END) as PositiveScorePosts,
+        COUNT(DISTINCT CASE WHEN rp.Score < 0 THEN rp.Id END) as NegativeScorePosts,
+        COUNT(DISTINCT CASE WHEN rp.Score = 0 THEN rp.Id END) as ZeroScorePosts,
+        AVG(CASE WHEN rp.Score IS NOT NULL THEN rp.Score END) as AvgScoreWithNulls,
+        AVG(rp.Score) as AvgScoreExcludingNulls,
+        ROW_NUMBER() OVER (ORDER BY AVG(rp.Score) DESC) as RankByAvgScore
+    FROM Users u
+    LEFT JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+    HAVING COUNT(rp.Id) > 0 -- Only users with posts
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Very Popular'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderately Popular'
+            ELSE 'Niche'
+        END as PopularityLevel,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        ROW_NUMBER() OVER (PARTITION BY CASE WHEN t.Count > 1000 THEN 'High' ELSE 'Low' END ORDER BY t.Count DESC) as WithinCategoryRank,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) as PrevTagCount
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        rp.Id as PostId,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.UserPostRank,
+        rp.PrevScore,
+        rp.PrevViewCount,
+        rp.ScoreMovingAvg,
+        rp.ScoreCategory,
+        rp.TagStatus,
+        rp.DaysSinceCreation,
+        rp.EngagementCount,
+        CASE 
+            WHEN rp.Score >= 0 AND rp.AnswerCount >= 1 AND rp.CommentCount >= 5 THEN 'Engaging'
+            WHEN rp.Score < 0 AND rp.AnswerCount = 0 THEN 'Disengaging'
+            WHEN rp.Score > 100 THEN 'High Engagement'
+            ELSE 'Standard'
+        END as EngagementClassification,
+        CASE 
+            WHEN rp.Tags IS NOT NULL AND rp.Tags != '' 
+                 AND rp.Tags LIKE '%<%><%<%' 
+                 AND rp.Tags NOT LIKE '%<>%' THEN 'Multiple Tags'
+            WHEN rp.Tags IS NOT NULL AND rp.Tags != '' THEN 'Single Tag'
+            ELSE 'No Tags'
+        END as TagStructure,
+        NULLIF(rp.Score - rp.PrevScore, 0) as ScoreChange,
+        NULLIF(rp.ViewCount - rp.PrevViewCount, 0) as ViewChange,
+        NULLIF(rp.ViewCount, 0) * NULLIF(rp.Score, 0) as ViewScoreProduct,
+        CASE 
+            WHEN rp.EngagementCount >= 10 THEN 'Highly Engaging'
+            WHEN rp.EngagementCount >= 5 THEN 'Moderately Engaging'
+            ELSE 'Low Engagement'
+        END as EngagementLevel,
+        ABS(rp.Score - ISNULL(rp.PrevScore, 0)) as ScoreDeviation,
+        NULLIF(rn.PostLinkCount, 0) as RelatedPostCount,
+        NULLIF(bp.PostHistoryCount, 0) as HistoryEventsCount,
+        NULLIF(vs.VoteCount, 0) as VoteCount,
+        COALESCE(u.DisplayName, 'Anonymous') as OwnerDisplayName,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'High Rep'
+            WHEN u.Reputation > 1000 THEN 'Medium Rep'
+            ELSE 'Low Rep'
+        END as UserRepLevel,
+        CASE 
+            WHEN rp.DaysSinceCreation <= 30 THEN 'Recent'
+            WHEN rp.DaysSinceCreation <= 180 THEN 'Mid-term'
+            ELSE 'Long-term'
+        END as PostAgeCategory
+    FROM RankedPosts rp
+    LEFT JOIN (
+        SELECT 
+            PostId, 
+            COUNT(*) as PostLinkCount
+        FROM PostLinks 
+        GROUP BY PostId
+    ) rn ON rp.Id = rn.PostId
+    LEFT JOIN (
+        SELECT 
+            PostId, 
+            COUNT(*) as PostHistoryCount
+        FROM PostHistory 
+        GROUP BY PostId
+    ) bp ON rp.Id = bp.PostId
+    LEFT JOIN (
+        SELECT 
+            PostId, 
+            COUNT(*) as VoteCount
+        FROM Votes 
+        GROUP BY PostId
+    ) vs ON rp.Id = vs.PostId
+    LEFT JOIN Users u ON rp.OwnerUserId = u.Id
+)
+SELECT 
+    cpa.PostId,
+    cpa.OwnerUserId,
+    cpa.Score,
+    cpa.ViewCount,
+    cpa.Title,
+    cpa.Tags,
+    cpa.AnswerCount,
+    cpa.CommentCount,
+    cpa.FavoriteCount,
+    cpa.UserPostRank,
+    cpa.PrevScore,
+    cpa.PrevViewCount,
+    cpa.ScoreMovingAvg,
+    cpa.ScoreCategory,
+    cpa.TagStatus,
+    cpa.DaysSinceCreation,
+    cpa.EngagementCount,
+    cpa.EngagementClassification,
+    cpa.TagStructure,
+    cpa.ScoreChange,
+    cpa.ViewChange,
+    cpa.ViewScoreProduct,
+    cpa.EngagementLevel,
+    cpa.ScoreDeviation,
+    cpa.RelatedPostCount,
+    cpa.HistoryEventsCount,
+    cpa.VoteCount,
+    cpa.OwnerDisplayName,
+    cpa.UserRepLevel,
+    cpa.PostAgeCategory,
+    CASE 
+        WHEN ues.RankByAvgScore <= 10 THEN 'Top 10'
+        WHEN ues.RankByAvgScore <= 50 THEN 'Top 50'
+        WHEN ues.RankByAvgScore <= 100 THEN 'Top 100'
+        ELSE 'Below Top 100'
+    END as UserRankInfluence,
+    CASE 
+        WHEN ta.PopularityLevel LIKE '%Popular%' THEN 'Trending'
+        WHEN ta.PopularityLevel LIKE '%Niche%' THEN 'Specialized'
+        ELSE 'General'
+    END as TagTrendCategory,
+    CASE 
+        WHEN cpa.Score > 100 AND cpa.ViewCount > 1000 THEN 'High Visibility'
+        WHEN cpa.Score > 50 AND cpa.ViewCount > 500 THEN 'Medium Visibility'
+        ELSE 'Low Visibility'
+    END as VisibilityLevel,
+    -- Complex calculated fields
+    CASE 
+        WHEN cpa.Score > (SELECT AVG(Score) FROM RankedPosts WHERE PostTypeId = 1) 
+             AND cpa.ViewCount > (SELECT AVG(ViewCount) FROM RankedPosts WHERE PostTypeId = 1) 
+             THEN 'Above Average'
+        ELSE 'Below Average'
+    END as PerformanceCategory,
+    -- Correlated subquery for ranking within tags
+    (SELECT COUNT(*) + 1 
+     FROM ComplexPostAnalysis cpa2 
+     WHERE cpa2.Tags LIKE '%' || SUBSTRING(cpa.Tags, 2, LENGTH(cpa.Tags)-2) || '%' 
+       AND cpa2.Score >= cpa.Score 
+       AND cpa2.Score > 0) as TagSpecificRank,
+    -- Set operator and multiple join logic
+    (SELECT COUNT(*) 
+     FROM Badges b 
+     WHERE b.UserId = cpa.OwnerUserId 
+       AND b.Name IN ('Great Answer', 'Good Answer', 'Popular Question') 
+       AND b.Date > DATEADD(month, -6, CURRENT_TIMESTAMP)) as RecentHighValueBadges,
+    -- String manipulation and case expressions
+    CASE 
+        WHEN cpa.Title IS NOT NULL AND LENGTH(cpa.Title) > 0 THEN UPPER(SUBSTRING(cpa.Title, 1, 1)) || LOWER(SUBSTRING(cpa.Title, 2))
+        ELSE 'Untitled'
+    END as FormattedTitle,
+    -- Null handling and complex window function
+    COALESCE(
+        (MAX(cpa.Score) OVER (PARTITION BY cpa.OwnerUserId ORDER BY cpa.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)),
+        0
+    ) as LifetimeMaxScore,
+    -- Outer join logic
+    NULLIF(
+        (SELECT MAX(u2.Reputation) 
+         FROM Users u2 
+         WHERE u2.Id = cpa.OwnerUserId 
+           AND u2.Reputation IS NOT NULL), 
+        0
+    ) as OwnerReputation,
+    -- Conditional logic for performance categories
+    CASE 
+        WHEN cpa.Score > 100 AND cpa.AnswerCount >= 2 AND cpa.CommentCount >= 5 
+             AND cpa.DaysSinceCreation <= 30 THEN 'Recent Success'
+        WHEN cpa.Score > 50 AND cpa.AnswerCount >= 1 AND cpa.ViewCount > 1000 THEN 'Established Success'
+        WHEN cpa.Score < 0 AND cpa.CommentCount >= 10 THEN 'Controversial'
+        ELSE 'Neutral'
+    END as PostPerformanceIndicator
+FROM ComplexPostAnalysis cpa
+INNER JOIN UserEngagementStats ues ON cpa.OwnerUserId = ues.UserId
+LEFT JOIN TagAnalysis ta ON ta.TagName = (
+    SELECT DISTINCT TRIM(BOTH '<>' FROM unnest(string_to_array(SUBSTRING(cpa.Tags, 2, LENGTH(cpa.Tags)-2), '><'))) 
+    FROM dual 
+    WHERE cpa.Tags IS NOT NULL AND cpa.Tags != ''
+    LIMIT 1
+)
+WHERE cpa.Score IS NOT NULL 
+  AND cpa.ViewCount IS NOT NULL
+  AND cpa.DaysSinceCreation BETWEEN 0 AND 3650 -- Within 10 years
+  AND cpa.EngagementCount > 0
+  AND NOT EXISTS (
+    SELECT 1 
+    FROM Votes v 
+    WHERE v.PostId = cpa.PostId 
+      AND v.VoteTypeId = 12 -- Spam votes
+  )
+-- Set operations to combine different post categories
+UNION ALL
+SELECT 
+    999999 as PostId,
+    999999 as OwnerUserId,
+    999999 as Score,
+    999999 as ViewCount,
+    'Summary Row' as Title,
+    'Summary' as Tags,
+    999999 as AnswerCount,
+    999999 as CommentCount,
+    999999 as FavoriteCount,
+    999999 as UserPostRank,
+    999999 as PrevScore,
+    999999 as PrevViewCount,
+    999999 as ScoreMovingAvg,
+    'Summary' as ScoreCategory,
+    'Summary' as TagStatus,
+    999999 as DaysSinceCreation,
+    999999 as EngagementCount,
+    'Summary' as EngagementClassification,
+    'Summary' as TagStructure,
+    999999 as ScoreChange,
+    999999 as ViewChange,
+    999999 as ViewScoreProduct,
+    'Summary' as EngagementLevel,
+    999999 as ScoreDeviation,
+    999999 as RelatedPostCount,
+    999999 as HistoryEventsCount,
+    999999 as VoteCount,
+    'Summary' as OwnerDisplayName,
+    'Summary' as UserRepLevel,
+    'Summary' as PostAgeCategory,
+    'Summary' as UserRankInfluence,
+    'Summary' as TagTrendCategory,
+    'Summary' as VisibilityLevel,
+    'Summary' as PerformanceCategory,
+    999999 as TagSpecificRank,
+    999999 as RecentHighValueBadges,
+    'Summary' as FormattedTitle,
+    999999 as LifetimeMaxScore,
+    999999 as OwnerReputation,
+    'Summary' as PostPerformanceIndicator
+ORDER BY PostId, Score DESC, ViewCount DESC

@@ -1,0 +1,284 @@
+-- {"query": "1716.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4250} 
+
+WITH PostUnifiedView AS (
+    -- Combines Questions and Answers into a single view using UNION ALL
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.AcceptedAnswerId,
+        P.ClosedDate,
+        P.LastActivityDate,
+        P.Title,
+        P.Tags,
+        'Question' AS PostCategory,
+        NULL::int AS ParentId, -- Questions do not have a parent
+        NULL::varchar(300) AS ParentQuestionTitle,
+        NULL::varchar(4000) AS ParentQuestionTags,
+        P.Body
+    FROM Posts AS P
+    JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+    WHERE P.PostTypeId = 1 -- Only Questions
+    UNION ALL
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        NULL AS AnswerCount, -- Answers do not have an AnswerCount
+        P.CommentCount,
+        P.FavoriteCount,
+        NULL AS AcceptedAnswerId, -- Answers do not have an AcceptedAnswerId
+        NULL AS ClosedDate, -- Answers do not have a ClosedDate
+        P.LastActivityDate,
+        SUBSTRING(P.Body, 1, 100) AS Title, -- Use a snippet of the answer body as its 'title'
+        NULL AS Tags, -- Answers do not have tags; tags are on the parent question
+        'Answer' AS PostCategory,
+        P.ParentId, -- The parent for an answer
+        QP.Title AS ParentQuestionTitle,
+        QP.Tags AS ParentQuestionTags,
+        P.Body
+    FROM Posts AS P
+    JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+    LEFT JOIN Posts AS QP ON P.ParentId = QP.Id -- Join to get parent question details
+    WHERE P.PostTypeId = 2 -- Only Answers
+),
+UserEngagementSummary AS (
+    -- Aggregates user activity and calculates an engagement factor
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.UpVotes,
+        U.DownVotes,
+        SUM(CASE WHEN PUV.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN PUV.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT PUV.PostId) AS TotalPosts,
+        SUM(COALESCE(PUV.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(PUV.ViewCount, 0)) AS TotalPostViews,
+        SUM(COALESCE(PUV.FavoriteCount, 0)) AS TotalPostFavorites,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        COUNT(DISTINCT PH.Id) AS TotalPostHistoryEntries,
+        -- Complex calculation for an 'Engagement Factor'
+        (COALESCE(U.Reputation, 0) * 0.5 + COALESCE(U.UpVotes, 0) * 0.2 + COALESCE(SUM(PUV.Score), 0) * 0.3) AS EngagementFactor,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        COUNT(B.Id) AS TotalBadges
+    FROM Users AS U
+    LEFT JOIN PostUnifiedView AS PUV ON U.Id = PUV.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN PostHistory AS PH ON U.Id = PH.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.UpVotes, U.DownVotes
+),
+PostActivityMetrics AS (
+    -- Gathers detailed activity metrics for posts, including correlated subqueries and complex CASE logic
+    SELECT
+        PUV.PostId,
+        PUV.PostTypeId,
+        PUV.PostTypeName,
+        PUV.OwnerUserId,
+        PUV.CreationDate AS PostCreationDate,
+        PUV.Score AS PostScore,
+        PUV.ViewCount,
+        PUV.AnswerCount,
+        PUV.CommentCount,
+        PUV.FavoriteCount,
+        PUV.AcceptedAnswerId,
+        PUV.ClosedDate,
+        PUV.LastActivityDate,
+        PUV.ParentId,
+        PUV.Body,
+        -- Correlated subquery to find the latest comment by a known user
+        (SELECT MAX(C.CreationDate) FROM Comments AS C WHERE C.PostId = PUV.PostId AND C.UserId IS NOT NULL) AS LatestCommentDateByKnownUser,
+        (SELECT AVG(C.Score) FROM Comments AS C WHERE C.PostId = PUV.PostId) AS AvgCommentScore,
+        COUNT(DISTINCT PL_Linked.RelatedPostId) AS LinkedPostsCount,
+        COUNT(DISTINCT PL_Duplicate.RelatedPostId) AS DuplicatePostsCount,
+        MAX(PH.CreationDate) AS LatestPostHistoryDate,
+        -- Complex CASE statement to determine post status with NULL logic
+        CASE
+            WHEN PUV.PostTypeId = 1 AND PUV.ClosedDate IS NOT NULL AND PUV.AcceptedAnswerId IS NULL
+            THEN 'ClosedUnansweredQuestion'
+            WHEN PUV.PostTypeId = 1 AND PUV.AcceptedAnswerId IS NOT NULL AND P_CommunityOwned.CommunityOwnedDate IS NULL
+            THEN 'AcceptedAnsweredQuestion'
+            WHEN PUV.PostTypeId = 2 AND PUV.ParentId IS NOT NULL AND EXISTS (SELECT 1 FROM Posts AS Q WHERE Q.Id = PUV.ParentId AND Q.AcceptedAnswerId = PUV.PostId)
+            THEN 'AcceptedAnswer'
+            WHEN P_CommunityOwned.CommunityOwnedDate IS NOT NULL
+            THEN 'CommunityOwned'
+            ELSE 'OtherActive'
+        END AS PostStatusFlag,
+        PUV.Title,
+        PUV.Tags,
+        PUV.ParentQuestionTitle,
+        PUV.ParentQuestionTags
+    FROM PostUnifiedView AS PUV
+    -- Join to original Posts table to access CommunityOwnedDate not available in PostUnifiedView for answers
+    LEFT JOIN Posts AS P_CommunityOwned ON PUV.PostId = P_CommunityOwned.Id
+    LEFT JOIN PostLinks AS PL_Linked ON PUV.PostId = PL_Linked.PostId AND PL_Linked.LinkTypeId = 1
+    LEFT JOIN PostLinks AS PL_Duplicate ON PUV.PostId = PL_Duplicate.PostId AND PL_Duplicate.LinkTypeId = 3
+    LEFT JOIN PostHistory AS PH ON PUV.PostId = PH.PostId
+    GROUP BY PUV.PostId, PUV.PostTypeId, PUV.PostTypeName, PUV.OwnerUserId, PUV.CreationDate, PUV.Score, PUV.ViewCount, PUV.AnswerCount, PUV.CommentCount, PUV.FavoriteCount, PUV.AcceptedAnswerId, PUV.ClosedDate, PUV.LastActivityDate, PUV.Title, PUV.Tags, PUV.ParentQuestionTitle, PUV.ParentQuestionTags, P_CommunityOwned.CommunityOwnedDate, PUV.ParentId, PUV.Body
+),
+TagAnalysis AS (
+    -- Analyzes tag popularity, using string manipulation and window functions
+    SELECT
+        TagName,
+        SUM(TotalViewsForTag) AS GlobalTotalViewsForTag,
+        SUM(TotalScoreForTag) AS GlobalTotalScoreForTag,
+        COUNT(DISTINCT PostId) AS GlobalPostsCountForTag,
+        AVG(LENGTH(Post_Body)) AS OverallAvgPostBodyLength,
+        RANK() OVER (ORDER BY SUM(TotalViewsForTag) DESC, COUNT(DISTINCT PostId) DESC) AS GlobalTagViewRank
+    FROM (
+        SELECT
+            TRIM(UNNEST(string_to_array(SUBSTRING(PUV.Tags, 2, LENGTH(PUV.Tags)-2), '><'))) AS TagName, -- String array parsing and manipulation
+            PUV.PostId,
+            COALESCE(PUV.ViewCount, 0) AS TotalViewsForTag,
+            COALESCE(PUV.Score, 0) AS TotalScoreForTag,
+            PUV.Body AS Post_Body -- Use Body directly from PostUnifiedView
+        FROM PostUnifiedView AS PUV
+        WHERE PUV.PostTypeId = 1 AND PUV.Tags IS NOT NULL AND LENGTH(PUV.Tags) > 2 -- Only analyze tags from questions
+    ) AS TagPostData
+    GROUP BY TagName
+    HAVING COUNT(DISTINCT PostId) > 100 -- Filter for tags used on more than 100 posts
+),
+HistoricalPostChangeSummary AS (
+    -- Summarizes post history, including various edit types and time differences using LAG and date arithmetic
+    SELECT
+        PH.PostId,
+        PH.UserId AS EditorUserId,
+        COUNT(PH.Id) AS TotalEdits,
+        COUNT(DISTINCT PH.PostHistoryTypeId) AS DistinctChangeTypes,
+        MAX(PH.CreationDate) AS LastEditDate,
+        MIN(PH.CreationDate) AS FirstEditDate,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS ContentEdits, -- Title, Body, Tags edits
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 11) THEN 1 ELSE 0 END) AS CloseReopenEvents, -- Post closed/reopened
+        -- Calculate average hours between consecutive edits by the same user on the same post
+        AVG(EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId, PH.UserId ORDER BY PH.CreationDate))) / 3600.0) AS AvgHoursBetweenEdits
+    FROM PostHistory AS PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13) -- Focus on content edits, close/reopen, delete/undelete
+    GROUP BY PH.PostId, PH.UserId
+),
+TopQuestionContributors AS (
+    -- Ranks users based on their question scores and counts
+    SELECT
+        UES.UserId,
+        UES.DisplayName,
+        UES.Reputation,
+        SUM(PAM.PostScore) AS TotalQuestionScore,
+        COUNT(PAM.PostId) AS NumberOfQuestions,
+        ROW_NUMBER() OVER (ORDER BY SUM(PAM.PostScore) DESC, COUNT(PAM.PostId) DESC) AS RankByQuestionScore
+    FROM UserEngagementSummary AS UES
+    JOIN PostActivityMetrics AS PAM ON UES.UserId = PAM.OwnerUserId
+    WHERE PAM.PostTypeId = 1 AND UES.TotalQuestions > 0
+    GROUP BY UES.UserId, UES.DisplayName, UES.Reputation
+    HAVING SUM(PAM.PostScore) > 100 -- Only consider users with high scoring questions
+),
+TopAnswerers AS (
+    -- Ranks users based on their answer scores and counts
+    SELECT
+        UES.UserId,
+        UES.DisplayName,
+        UES.Reputation,
+        SUM(PAM.PostScore) AS TotalAnswerScore,
+        COUNT(PAM.PostId) AS NumberOfAnswers,
+        DENSE_RANK() OVER (ORDER BY SUM(PAM.PostScore) DESC, COUNT(PAM.PostId) DESC) AS RankByAnswerScore
+    FROM UserEngagementSummary AS UES
+    JOIN PostActivityMetrics AS PAM ON UES.UserId = PAM.OwnerUserId
+    WHERE PAM.PostTypeId = 2 AND UES.TotalAnswers > 0
+    GROUP BY UES.UserId, UES.DisplayName, UES.Reputation
+    HAVING SUM(PAM.PostScore) > 50 -- Only consider users with good scoring answers
+)
+-- Main Query: Joins various CTEs with outer joins and applies complex filtering and calculations
+SELECT
+    COALESCE(TQC.UserId, TA.UserId) AS UserID, -- NULL logic for user ID
+    COALESCE(TQC.DisplayName, TA.DisplayName) AS UserDisplayName,
+    COALESCE(TQC.Reputation, TA.Reputation) AS UserReputation,
+    TQC.TotalQuestionScore,
+    TQC.NumberOfQuestions,
+    TQC.RankByQuestionScore,
+    TA.TotalAnswerScore,
+    TA.NumberOfAnswers,
+    TA.RankByAnswerScore,
+    UES.EngagementFactor,
+    UES.TotalPosts,
+    UES.TotalCommentsMade,
+    UES.TotalBadges,
+    UES.HasGoldBadge,
+    PAM.PostId AS ActivePostId,
+    PAM.PostTypeName AS ActivePostTypeName,
+    PAM.PostStatusFlag AS ActivePostStatus,
+    PAM.PostScore AS ActivePostScore,
+    PAM.ViewCount AS ActivePostViewCount,
+    PAM.LatestCommentDateByKnownUser,
+    PAM.AvgCommentScore,
+    PAM.LinkedPostsCount,
+    PAM.DuplicatePostsCount,
+    TP.TagName AS MostPopularRelatedTag,
+    TP.GlobalTagViewRank,
+    TP.GlobalTotalViewsForTag,
+    HPC.TotalEdits AS PostEditsCount,
+    HPC.AvgHoursBetweenEdits AS AvgHoursBetweenEditsOnPost,
+    PV.VoteCount AS RecentUpvoteCountForPost,
+    PV.AvgVoteScore AS AvgVoteScoreForPost,
+    PAM.ParentQuestionTitle,
+    PAM.ParentQuestionTags,
+    -- Complicated calculation for a 'post virality score'
+    (COALESCE(PAM.Score, 0) * 0.4 + COALESCE(PAM.ViewCount, 0) * 0.01 + COALESCE(PAM.CommentCount, 0) * 0.2 + COALESCE(PAM.FavoriteCount, 0) * 0.3) AS PostViralityScore,
+    -- String expression for post title summary, handles NULLs
+    LEFT(COALESCE(PAM.Title, PAM.ParentQuestionTitle, 'No Title Available'), 75) || CASE WHEN LENGTH(COALESCE(PAM.Title, PAM.ParentQuestionTitle, '')) > 75 THEN '...' ELSE '' END AS PostTitleSummary
+FROM TopQuestionContributors AS TQC
+FULL OUTER JOIN TopAnswerers AS TA ON TQC.UserId = TA.UserId -- Full outer join to combine top questioners and top answerers
+JOIN UserEngagementSummary AS UES ON COALESCE(TQC.UserId, TA.UserId) = UES.UserId
+LEFT JOIN PostActivityMetrics AS PAM ON UES.UserId = PAM.OwnerUserId
+                                      AND PAM.PostTypeId IN (1, 2) -- Focus on questions and answers
+                                      AND PAM.PostScore > 5
+                                      AND PAM.ViewCount > 100
+                                      AND PAM.PostCreationDate > (UES.UserCreationDate + INTERVAL '1 year') -- Post created at least 1 year after user registration
+LEFT JOIN (
+    -- Subquery to find the most popular (by rank) tag associated with a user's questions
+    SELECT DISTINCT ON (P.OwnerUserId) -- Ensures only one tag per user (the highest ranked)
+           P.OwnerUserId,
+           TA.TagName,
+           TA.GlobalTagViewRank,
+           TA.GlobalTotalViewsForTag
+    FROM PostUnifiedView AS P
+    JOIN (
+        SELECT TagName, GlobalTagViewRank, GlobalTotalViewsForTag
+        FROM TagAnalysis
+        WHERE GlobalTagViewRank <= 20 -- Consider only the top 20 overall tags
+    ) AS TA ON P.Tags LIKE '%<' || TA.TagName || '>%' -- String pattern matching
+    WHERE P.PostTypeId = 1 AND P.OwnerUserId IS NOT NULL
+    ORDER BY P.OwnerUserId, TA.GlobalTagViewRank ASC
+) AS TP ON UES.UserId = TP.OwnerUserId
+LEFT JOIN HistoricalPostChangeSummary AS HPC ON PAM.PostId = HPC.PostId AND PAM.OwnerUserId = HPC.EditorUserId -- Link post history to specific user's edits
+LEFT JOIN (
+    -- Non-correlated subquery for recent vote activity on posts
+    SELECT
+        V.PostId,
+        COUNT(V.Id) AS VoteCount,
+        -- Calculate an average vote score where UpMod = 1 and DownMod = -1
+        AVG(CASE WHEN V.VoteTypeId = 2 THEN 1.0 ELSE -1.0 END) AS AvgVoteScore
+    FROM Votes AS V
+    WHERE V.VoteTypeId IN (2, 3) -- UpMod, DownMod
+      AND V.CreationDate BETWEEN (CURRENT_DATE - INTERVAL '6 months') AND CURRENT_DATE -- Recent votes within the last 6 months
+    GROUP BY V.PostId
+    HAVING COUNT(V.Id) > 10 AND AVG(CASE WHEN V.VoteTypeId = 2 THEN 1.0 ELSE -1.0 END) > 0.5 -- Only posts with significant positive recent vote activity
+) AS PV ON PAM.PostId = PV.PostId
+WHERE (TQC.UserId IS NOT NULL OR TA.UserId IS NOT NULL) -- Ensure we're selecting from either top Q or top A users
+  AND UES.Reputation > 10000 -- Filter for highly reputed users
+  AND (PAM.PostId IS NULL OR PAM.PostStatusFlag NOT IN ('CommunityOwned', 'ClosedUnansweredQuestion')) -- Exclude certain post statuses with NULL logic
+  AND UES.EngagementFactor > 5000 -- Filter by a high engagement factor
+  AND (PAM.Title LIKE '%SQL%' OR PAM.ParentQuestionTitle LIKE '%database%' OR PAM.Tags LIKE '%<performance>%' OR PAM.Tags LIKE '%<indexing>%' OR (PAM.Title IS NULL AND PAM.ParentQuestionTitle IS NULL AND PAM.Tags IS NULL)) -- Complex string search across multiple text fields, including NULL logic
+ORDER BY UES.EngagementFactor DESC, UES.Reputation DESC, COALESCE(TQC.TotalQuestionScore, 0) DESC, COALESCE(TA.TotalAnswerScore, 0) DESC, PostViralityScore DESC
+LIMIT 500;

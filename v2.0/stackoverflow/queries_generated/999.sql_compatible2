@@ -1,0 +1,265 @@
+with recent_posts as (
+  select
+    p.id,
+    p.posttypeid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.owneruserid as owneruserid,
+    p.title,
+    p.tags,
+    p.acceptedanswerid,
+    p.parentid,
+    p.lastactivitydate,
+    coalesce(nullif(trim(p.ownerdisplayname), ''), 'Anonymous') as ownerdisplayname_norm
+  from posts p
+  where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+user_activity as (
+  select
+    u.id as userid,
+    u.displayname,
+    u.reputation,
+    u.creationdate as user_created,
+    u.lastaccessdate,
+    u.location,
+    u.upvotes,
+    u.downvotes,
+    u.views as profile_views,
+    count(distinct b.id) filter (where b.class = 1) as gold_badges,
+    count(distinct b.id) filter (where b.class = 2) as silver_badges,
+    count(distinct b.id) filter (where b.class = 3) as bronze_badges,
+    count(distinct c.id) as total_comments_made
+  from users u
+  left join badges b on b.userid = u.id
+  left join comments c on c.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.location, u.upvotes, u.downvotes, u.views
+),
+post_engagement as (
+  select
+    p.id as postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+    count(distinct c.id) as comments,
+    max(c.creationdate) as last_comment_date
+  from posts p
+  left join votes v on v.postid = p.id
+  left join comments c on c.postid = p.id
+  group by p.id
+),
+question_answer_cte as (
+  select
+    q.id as question_id,
+    q.creationdate as q_created,
+    q.score as q_score,
+    q.viewcount as q_views,
+    q.title,
+    q.tags,
+    q.owneruserid as q_ownerid,
+    q.acceptedanswerid,
+    count(a.id) as answers_count,
+    max(a.score) as best_answer_score,
+    avg(a.score) as avg_answer_score,
+    max(a.creationdate) filter (where a.creationdate is not null) as last_answer_date
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+    and q.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+  group by q.id, q.creationdate, q.score, q.viewcount, q.title, q.tags, q.owneruserid, q.acceptedanswerid
+),
+tag_expansion as (
+  select
+    q.question_id,
+    unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tag
+  from question_answer_cte q
+  where q.tags is not null
+),
+tag_stats as (
+  select
+    t.tag as tagname,
+    count(distinct t.question_id) as questions_with_tag,
+    sum(q.answers_count) as answers_for_tag,
+    avg(q.q_views) as avg_views_for_tag,
+    max(q.q_score) as max_q_score_for_tag
+  from tag_expansion t
+  join question_answer_cte q on q.question_id = t.question_id
+  group by t.tag
+),
+dup_clusters as (
+  select
+    pl.relatedpostid as canonical_id,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_incoming,
+    count(*) filter (where pl.linktypeid = 1) as linked_incoming
+  from postlinks pl
+  group by pl.relatedpostid
+),
+edit_events as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_count,
+    max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as last_edit_date,
+    count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35,36)) as mod_event_count,
+    sum(case
+      when ph.posthistorytypeid = 10 then 1
+      when ph.posthistorytypeid = 11 then 1
+      when ph.posthistorytypeid = 12 then 1
+      when ph.posthistorytypeid = 13 then 1
+      else 0 end) as close_reopen_delete_events
+  from posthistory ph
+  group by ph.postid
+),
+recent_hot_candidates as (
+  select
+    q.question_id,
+    q.q_created,
+    q.q_score,
+    q.q_views,
+    q.answers_count,
+    pe.upvotes,
+    pe.downvotes,
+    pe.favorites,
+    coalesce(pe.comments,0) as comments,
+    coalesce(pe.bounty_total,0) as bounty_total,
+    coalesce(dc.duplicate_incoming,0) as duplicate_incoming,
+    coalesce(ee.edit_count,0) as edit_count,
+    coalesce(ee.mod_event_count,0) as mod_event_count,
+    q.last_answer_date,
+    q.title,
+    q.tags
+  from question_answer_cte q
+  left join post_engagement pe on pe.postid = q.question_id
+  left join dup_clusters dc on dc.canonical_id = q.question_id
+  left join edit_events ee on ee.postid = q.question_id
+),
+owner_rollup as (
+  select
+    u.id as userid,
+    count(*) filter (where p.posttypeid = 1) as questions_authored,
+    count(*) filter (where p.posttypeid = 2) as answers_authored,
+    max(p.creationdate) as last_post_date
+  from posts p
+  join users u on u.id = p.owneruserid
+  where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+  group by u.id
+),
+question_owner as (
+  select
+    q.question_id,
+    q.q_ownerid,
+    oa.questions_authored,
+    oa.answers_authored,
+    ua.reputation,
+    ua.gold_badges,
+    ua.silver_badges,
+    ua.bronze_badges,
+    ua.total_comments_made
+  from question_answer_cte q
+  left join owner_rollup oa on oa.userid = q.q_ownerid
+  left join user_activity ua on ua.userid = q.q_ownerid
+),
+ranked_questions as (
+  select
+    rhc.*,
+    qo.reputation as owner_reputation,
+    qo.gold_badges,
+    qo.silver_badges,
+    qo.bronze_badges,
+    qo.questions_authored,
+    qo.answers_authored,
+    qo.total_comments_made as owner_comments,
+    coalesce(nullif(rhc.title, ''), '(no title)') as title_norm,
+    coalesce(nullif(rhc.tags, ''), '<none>') as tags_norm,
+    case when rhc.q_views > 0 then (rhc.q_score * 1.0 / rhc.q_views) else null end as score_view_ratio,
+    case when rhc.answers_count > 0 then (rhc.q_score * 1.0 / rhc.answers_count) else null end as score_answer_ratio,
+    (coalesce(rhc.upvotes,0) - coalesce(rhc.downvotes,0)) as net_votes,
+    (coalesce(rhc.favorites,0) + greatest(coalesce(rhc.upvotes,0) - coalesce(rhc.downvotes,0),0)) as interest_index,
+    coalesce(rhc.bounty_total,0) + (coalesce(rhc.upvotes,0) * 10) - (coalesce(rhc.downvotes,0) * 5) + (coalesce(rhc.comments,0) * 2) - (coalesce(rhc.duplicate_incoming,0) * 15) + (case when rhc.last_answer_date is null then -20 else 0 end) as composite_score
+  from recent_hot_candidates rhc
+  left join question_owner qo on qo.question_id = rhc.question_id
+),
+tag_leaders as (
+  select
+    te.tag,
+    qac.q_ownerid as user_id,
+    count(*) as q_count,
+    row_number() over (partition by te.tag order by count(*) desc, min(qac.q_created)) as rn
+  from tag_expansion te
+  join question_answer_cte qac on qac.question_id = te.question_id
+  group by te.tag, qac.q_ownerid
+),
+final as (
+  select
+    rq.question_id,
+    rq.q_created,
+    rq.title_norm as title,
+    rq.tags_norm as tags,
+    rq.q_score,
+    rq.q_views,
+    rq.answers_count,
+    rq.last_answer_date,
+    rq.upvotes,
+    rq.downvotes,
+    rq.net_votes,
+    rq.favorites,
+    rq.comments,
+    rq.bounty_total,
+    rq.edit_count,
+    rq.mod_event_count,
+    rq.duplicate_incoming,
+    rq.score_view_ratio,
+    rq.score_answer_ratio,
+    rq.interest_index,
+    rq.composite_score,
+    rq.owner_reputation,
+    rq.gold_badges,
+    rq.silver_badges,
+    rq.bronze_badges,
+    rq.questions_authored,
+    rq.answers_authored,
+    rq.owner_comments,
+    ts.tagname,
+    ts.questions_with_tag,
+    ts.answers_for_tag,
+    ts.avg_views_for_tag,
+    ts.max_q_score_for_tag,
+    case
+      when upper(rq.title_norm) like any (array['%HOW TO%','%WHY%','%WHAT IS%']) then 'How/Why/What'
+      when rq.title_norm ~* '\\b(?:help|error|exception)\\b' then 'Help/Error'
+      else 'Other'
+    end as title_class,
+    coalesce((tl.user_id = qo.q_ownerid), false) as owner_is_tag_leader
+  from ranked_questions rq
+  left join tag_expansion te on te.question_id = rq.question_id
+  left join tag_stats ts on ts.tagname = te.tag
+  left join question_owner qo on qo.question_id = rq.question_id
+  left join tag_leaders tl on tl.tag = te.tag and tl.rn = 1
+)
+select *
+from (
+  select
+    f.*,
+    row_number() over (
+      partition by f.tagname
+      order by f.composite_score desc nulls last, f.net_votes desc nulls last, f.q_created desc
+    ) as tag_rank,
+    dense_rank() over (
+      order by f.composite_score desc nulls last
+    ) as global_rank,
+    coalesce(
+      lag(f.composite_score) over (partition by f.tagname order by f.composite_score desc nulls last) - f.composite_score,
+      0
+    ) as tag_score_gap
+  from final f
+) ranked
+where (global_rank <= 200 or tag_rank <= 5)
+  and coalesce(q_views,0) > 0
+  and (answers_count > 0 or favorites > 0 or comments > 0)
+  and not exists (
+    select 1
+    from posthistory ph
+    where ph.postid = ranked.question_id
+      and ph.posthistorytypeid in (12)
+  )
+order by global_rank, tag_rank, question_id;

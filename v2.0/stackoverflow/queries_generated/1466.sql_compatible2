@@ -1,0 +1,187 @@
+WITH InitialUserActivities AS (
+    SELECT
+        OwnerUserId AS UserId,
+        CreationDate AS ActivityDate,
+        'Post' AS ActivityType
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    UNION ALL
+    SELECT
+        UserId AS UserId,
+        CreationDate AS ActivityDate,
+        'Comment' AS ActivityType
+    FROM Comments
+    WHERE UserId IS NOT NULL
+),
+UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(COALESCE(P.Score,0)), 0) AS TotalPostScore,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN COALESCE(P.ViewCount,0) ELSE 0 END), 0) AS TotalQuestionViews,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COALESCE(SUM(COALESCE(C.Score,0)), 0) AS TotalCommentScore,
+        MIN(IA.ActivityDate) AS FirstActivityDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN InitialUserActivities IA ON U.Id = IA.UserId
+    GROUP BY U.Id
+),
+PostEditTimeDiffs AS (
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS CurrentEditDate,
+        LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousEditDate
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6)
+),
+QuestionPerformance AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.Title AS QuestionTitle,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.ClosedDate,
+        Q.CommunityOwnedDate,
+        LENGTH(COALESCE(Q.Body, '')) AS QuestionBodyLength,
+        COUNT(DISTINCT PH_Edit.Id) AS PostEditCount,
+        SUM(CASE WHEN PH_Close.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEvents,
+        SUM(CASE WHEN PH_Reopen.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEvents,
+        COALESCE(AVG(
+            CASE
+                WHEN PETD.PreviousEditDate IS NOT NULL
+                THEN (EXTRACT(EPOCH FROM (PETD.CurrentEditDate - PETD.PreviousEditDate)) / (60 * 60 * 24))
+            END
+        ), 0.0) AS AvgDaysBetweenEdits,
+        MAX(CASE WHEN PH_Close.PostHistoryTypeId = 10 THEN PH_Close.CreationDate END) AS LastClosedDate,
+        MAX(CASE WHEN PH_Reopen.PostHistoryTypeId = 11 THEN PH_Reopen.CreationDate END) AS LastReopenedDate,
+        STRING_AGG(DISTINCT SUBSTRING(TRIM(T.TagName) FROM 1 FOR 30), ';') AS QuestionTagsList
+    FROM Posts Q
+    LEFT JOIN PostHistory PH_Edit ON Q.Id = PH_Edit.PostId AND PH_Edit.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN PostHistory PH_Close ON Q.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory PH_Reopen ON Q.Id = PH_Reopen.PostId AND PH_Reopen.PostHistoryTypeId = 11
+    LEFT JOIN PostEditTimeDiffs PETD ON Q.Id = PETD.PostId AND PETD.PreviousEditDate IS NOT NULL
+    LEFT JOIN Tags T ON POSITION('<' || T.TagName || '>' IN COALESCE(Q.Tags, '')) > 0
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id, Q.OwnerUserId, Q.Title, Q.CreationDate, Q.Score, Q.ViewCount, Q.AnswerCount, Q.FavoriteCount, Q.ClosedDate, Q.CommunityOwnedDate, Q.Body
+),
+UserAnswerStats AS (
+    SELECT
+        A.OwnerUserId AS UserId,
+        COUNT(A.Id) AS TotalAnswersProvided,
+        COALESCE(SUM(CASE WHEN Q.AcceptedAnswerId = A.Id THEN 1 ELSE 0 END), 0) AS AcceptedAnswersCount,
+        COALESCE(AVG(COALESCE(A.Score,0)), 0.0) AS AvgAnswerScore,
+        COUNT(DISTINCT A.ParentId) AS AnsweredQuestionCount
+    FROM Posts A
+    INNER JOIN Posts Q ON A.ParentId = Q.Id AND Q.PostTypeId = 1
+    WHERE A.PostTypeId = 2
+    GROUP BY A.OwnerUserId
+),
+UserBadgeSummary AS (
+    SELECT
+        B.UserId,
+        B.Name AS LatestBadgeName,
+        B.Class AS LatestBadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY B.UserId ORDER BY B.Date DESC, B.Id DESC) as rn
+    FROM Badges B
+)
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    U.LastAccessDate,
+    UPA.FirstActivityDate,
+    U.WebsiteUrl,
+    U.Location,
+    SUBSTRING(COALESCE(U.AboutMe, 'No "About Me" provided.') FROM 1 FOR 500) AS AboutMeExcerpt,
+    U.Views AS ProfileViews,
+    U.UpVotes,
+    U.DownVotes,
+    UPA.TotalPosts,
+    UPA.TotalQuestions,
+    UPA.TotalAnswers,
+    UPA.TotalPostScore,
+    UPA.TotalQuestionViews,
+    UPA.TotalCommentsMade,
+    UAS.TotalAnswersProvided,
+    UAS.AcceptedAnswersCount,
+    UAS.AvgAnswerScore,
+    UBS.LatestBadgeName,
+    UBS.LatestBadgeClass,
+    COUNT(QP.QuestionId) AS PopularQuestionsAsked,
+    COALESCE(SUM(CASE WHEN QP.QuestionScore > 100 AND QP.QuestionViewCount > 5000 AND QP.AnswerCount > 5 THEN 1 ELSE 0 END), 0) AS HighlyEngagedQuestionsCount,
+    (SELECT COALESCE(C2.Text, 'No recent comment') FROM Comments C2 WHERE C2.UserId = U.Id ORDER BY C2.CreationDate DESC LIMIT 1) AS LatestCommentText,
+    RANK() OVER (ORDER BY U.Reputation DESC, UAS.AcceptedAnswersCount DESC, UPA.TotalPostScore DESC) AS UserOverallRank,
+    AVG(U.Reputation) OVER (PARTITION BY COALESCE(U.Location, 'Unspecified')) AS AvgReputationInLocation,
+    CASE
+        WHEN COALESCE(UAS.TotalAnswersProvided,0) > 0 THEN CAST(COALESCE(UAS.AcceptedAnswersCount,0) AS DECIMAL) / COALESCE(UAS.TotalAnswersProvided,0)
+        ELSE 0.0
+    END AS AcceptedAnswerRatio,
+    CASE
+        WHEN U.Location IS NULL OR TRIM(U.Location) = '' THEN 'Location Unknown'
+        WHEN LOWER(U.Location) LIKE '%london%' THEN 'Based in London'
+        WHEN LOWER(U.Location) LIKE '%usa%' OR LOWER(U.Location) LIKE '%united states%' OR LOWER(U.Location) LIKE '%america%' THEN 'Based in USA'
+        ELSE 'Other Location'
+    END AS UserLocationStatus,
+    CASE
+        WHEN U.Reputation >= 10000 AND UPA.TotalPosts >= 50 AND COALESCE(UAS.AcceptedAnswersCount,0) >= 10 AND UPA.TotalQuestions >= 5 THEN 'Highly Engaged Veteran'
+        WHEN U.Reputation >= 1000 AND UPA.TotalPosts >= 10 AND COALESCE(UAS.AcceptedAnswersCount,0) >= 3 THEN 'Active Contributor'
+        WHEN U.Reputation >= 100 AND UPA.TotalPosts >= 1 THEN 'New Contributor'
+        ELSE 'Passive User'
+    END AS UserEngagementLevel,
+    COALESCE(SUM(CASE WHEN QP.CloseEvents > 0 AND QP.ReopenEvents > 0 THEN QP.PostEditCount ELSE 0 END), 0) AS TotalEditsOnClosedReopenedQuestions,
+    COALESCE(AVG(CASE WHEN QP.QuestionScore > 100 AND QP.QuestionViewCount > 5000 THEN QP.QuestionBodyLength END), 0) AS AvgPopularQuestionBodyLength,
+    COALESCE(AVG(CASE WHEN QP.PostEditCount > 1 THEN QP.AvgDaysBetweenEdits END), 0.0) AS UserAvgDaysBetweenQuestionEdits,
+    STRING_AGG(DISTINCT HotQTags.TagName, ', ') AS HotQuestionTagList
+FROM Users U
+LEFT JOIN UserActivitySummary UPA ON U.Id = UPA.UserId
+LEFT JOIN UserAnswerStats UAS ON U.Id = UAS.UserId
+LEFT JOIN UserBadgeSummary UBS ON U.Id = UBS.UserId AND UBS.rn = 1
+LEFT JOIN QuestionPerformance QP ON U.Id = QP.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT DISTINCT TRIM(value) AS TagName
+    FROM (
+        SELECT UNNEST(string_to_array(SUBSTRING(Posts.Tags FROM 2 FOR (CHAR_LENGTH(Posts.Tags)-2)), '><')) AS value, Posts.OwnerUserId AS owner_user_id, Posts.Tags AS tags
+        FROM Posts
+    ) t
+    WHERE t.owner_user_id = U.Id AND t.tags IS NOT NULL
+) AS HotQTags ON TRUE
+WHERE
+    U.Reputation >= 100
+    AND U.LastAccessDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '2' YEAR)
+    AND UPA.TotalPosts > 0
+    AND (
+        EXISTS (
+            SELECT 1
+            FROM QuestionPerformance InnerQP
+            WHERE InnerQP.OwnerUserId = U.Id
+              AND InnerQP.QuestionScore > 75
+              AND InnerQP.QuestionViewCount > 3000
+              AND InnerQP.AnswerCount > 3
+              AND InnerQP.PostEditCount > 2
+              AND InnerQP.CloseEvents > 0
+              AND InnerQP.ReopenEvents > 0
+        )
+        OR
+        (COALESCE(UAS.AcceptedAnswersCount,0) >= 5 AND COALESCE(UAS.AvgAnswerScore,0) >= 10.0 AND COALESCE(UAS.TotalAnswersProvided,0) > 0)
+    )
+GROUP BY
+    U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.WebsiteUrl, U.Location, U.AboutMe, U.Views, U.UpVotes, U.DownVotes,
+    UPA.TotalPosts, UPA.TotalQuestions, UPA.TotalAnswers, UPA.TotalPostScore, UPA.TotalQuestionViews, UPA.TotalCommentsMade, UPA.FirstActivityDate,
+    UAS.TotalAnswersProvided, UAS.AcceptedAnswersCount, UAS.AvgAnswerScore,
+    UBS.LatestBadgeName, UBS.LatestBadgeClass, UPA.LastPostActivityDate
+HAVING
+    COUNT(QP.QuestionId) > 0
+    OR (COALESCE(UAS.AcceptedAnswersCount,0) >= 5 AND COALESCE(UAS.AvgAnswerScore,0) >= 10.0 AND COALESCE(UAS.TotalAnswersProvided,0) > 0)
+ORDER BY
+    UserOverallRank ASC, U.Reputation DESC
+LIMIT 200;

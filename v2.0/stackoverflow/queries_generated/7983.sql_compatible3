@@ -1,0 +1,398 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, '; ') AS QuestionTitles,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Body END, ' | ') AS AnswerBodies,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Score > 0 THEN p.Id END) AS PositiveQuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Id END) AS PositiveAnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) AS HighViewQuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.ViewCount > 1000 THEN p.Id END) AS HighViewAnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS AcceptedQuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN p.Id END) AS AnsweredAnswerCount,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS MaxQuestionScore,
+        MAX(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS MaxAnswerScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL THEN p.Id END) AS TaggedQuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN p.Id END) AS AnsweredCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) AS ClosedQuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.ParentId IS NULL THEN p.Id END) AS OrphanedAnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.CommentCount > 0 THEN p.Id END) AS CommentedQuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.CommentCount > 0 THEN p.Id END) AS CommentedAnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.FavoriteCount > 0 THEN p.Id END) AS FavoritedQuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.FavoriteCount > 0 THEN p.Id END) AS FavoritedAnswerCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationDenseRank,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRankWithTies,
+        COUNT(*) OVER () AS TotalUsers,
+        AVG(u.Reputation) OVER () AS AvgReputation,
+        PERCENT_RANK() OVER (ORDER BY u.Reputation) AS ReputationPercentile,
+        NTILE(10) OVER (ORDER BY u.Reputation) AS ReputationDecile,
+        LAG(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC) AS PrevUserReputation,
+        LEAD(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC) AS NextUserReputation,
+        FIRST_VALUE(u.Reputation) OVER (ORDER BY u.Reputation ASC) AS LowestReputation,
+        LAST_VALUE(u.Reputation) OVER (ORDER BY u.Reputation ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS HighestReputation,
+        NTH_VALUE(u.Reputation, 5) OVER (ORDER BY u.Reputation DESC) AS FifthHighestReputation,
+        u.Reputation - LAG(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC) AS ReputationDifference,
+        CASE 
+            WHEN u.Reputation > 100000 THEN 'Elite'
+            WHEN u.Reputation > 10000 THEN 'Expert'
+            WHEN u.Reputation > 1000 THEN 'Advanced'
+            WHEN u.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS ReputationLevel,
+        CASE 
+            WHEN u.Views > 10000 THEN 'Popular'
+            WHEN u.Views > 1000 THEN 'Notable'
+            WHEN u.Views > 100 THEN 'Recognized'
+            ELSE 'Regular'
+        END AS ViewLevel,
+        CASE 
+            WHEN u.UpVotes > u.DownVotes AND u.UpVotes > 1000 THEN 'Positive'
+            WHEN u.DownVotes > u.UpVotes AND u.DownVotes > 1000 THEN 'Negative'
+            ELSE 'Neutral'
+        END AS VotingTrend,
+        CASE 
+            WHEN u.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 'Above Average'
+            ELSE 'At or Below Average'
+        END AS ReputationStatus,
+        u.CreationDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        CASE 
+            WHEN p.PostTypeId IN (1, 4, 5) THEN 
+                CASE 
+                    WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                        (SELECT COUNT(*) FROM (SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS tag) t WHERE tag <> '')
+                    ELSE 0
+                END
+            ELSE 0
+        END AS TagCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN p.AnswerCount
+            ELSE 0
+        END AS AnswerCount,
+        CASE 
+            WHEN p.PostTypeId = 2 THEN p.ParentId
+            ELSE NULL
+        END AS ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND EXISTS (SELECT 1 FROM Posts WHERE Id = p.AcceptedAnswerId) THEN TRUE
+            ELSE FALSE
+        END AS HasAcceptedAnswer,
+        CASE 
+            WHEN p.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Posts WHERE Id = p.ParentId AND PostTypeId = 1) THEN TRUE
+            ELSE FALSE
+        END AS IsAnswerToQuestion,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN TRUE
+            ELSE FALSE
+        END AS IsClosed,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.CommunityOwnedDate IS NOT NULL THEN TRUE
+            ELSE FALSE
+        END AS IsCommunityOwned,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                CASE 
+                    WHEN p.Score > 0 THEN 
+                        CASE 
+                            WHEN p.Score > 10 THEN 'Highly Positive'
+                            ELSE 'Positive'
+                        END
+                    WHEN p.Score < 0 THEN 
+                        CASE 
+                            WHEN p.Score < -10 THEN 'Highly Negative'
+                            ELSE 'Negative'
+                        END
+                    ELSE 'Neutral'
+                END
+            ELSE 'N/A'
+        END AS ScoreCategory,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN 'High View'
+            WHEN p.PostTypeId = 1 AND p.ViewCount > 100 THEN 'Medium View'
+            ELSE 'Low View'
+        END AS ViewCategory,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 AND p.Score > 0 THEN 'Popular Positive'
+            WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 AND p.Score < 0 THEN 'Popular Negative'
+            ELSE 'Regular'
+        END AS PopularityScoreCategory
+    FROM Posts p
+),
+UserPostAnalysis AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.PositiveQuestionCount,
+        us.PositiveAnswerCount,
+        us.HighViewQuestionCount,
+        us.HighViewAnswerCount,
+        us.AcceptedQuestionCount,
+        us.AnsweredAnswerCount,
+        us.MaxQuestionScore,
+        us.MaxAnswerScore,
+        us.TaggedQuestionCount,
+        us.AnsweredCount,
+        us.ClosedQuestionCount,
+        us.OrphanedAnswerCount,
+        us.CommentedQuestionCount,
+        us.CommentedAnswerCount,
+        us.FavoritedQuestionCount,
+        us.FavoritedAnswerCount,
+        us.ReputationRank,
+        us.ReputationDenseRank,
+        us.ReputationRankWithTies,
+        us.ReputationLevel,
+        us.ViewLevel,
+        us.VotingTrend,
+        us.ReputationStatus,
+        CASE 
+            WHEN us.PostCount > 0 THEN CAST(us.PositiveQuestionCount * 100.0 / NULLIF(us.QuestionCount,0) AS NUMERIC(5,2))
+            ELSE 0
+        END AS PositiveQuestionPercentage,
+        CASE 
+            WHEN us.PostCount > 0 THEN CAST(us.HighViewQuestionCount * 100.0 / NULLIF(us.QuestionCount,0) AS NUMERIC(5,2))
+            ELSE 0
+        END AS HighViewQuestionPercentage,
+        CASE 
+            WHEN us.AnswerCount > 0 THEN CAST(us.QuestionCount * 100.0 / NULLIF(us.AnswerCount,0) AS NUMERIC(5,2))
+            ELSE 0
+        END AS QuestionToAnswerRatio,
+        CASE 
+            WHEN us.QuestionCount > 0 THEN CAST(us.AcceptedQuestionCount * 100.0 / NULLIF(us.QuestionCount,0) AS NUMERIC(5,2))
+            ELSE 0
+        END AS AcceptanceRate,
+        CASE 
+            WHEN us.QuestionCount > 0 THEN 
+                CAST(SUM(CASE WHEN pa.PostTypeId = 1 THEN pa.Score ELSE 0 END) OVER (PARTITION BY us.UserId) * 1.0 / NULLIF(us.QuestionCount,0) AS NUMERIC(10,2))
+            ELSE 0
+        END AS AvgQuestionScore,
+        CASE 
+            WHEN us.AnswerCount > 0 THEN 
+                CAST(SUM(CASE WHEN pa.PostTypeId = 2 THEN pa.Score ELSE 0 END) OVER (PARTITION BY us.UserId) * 1.0 / NULLIF(us.AnswerCount,0) AS NUMERIC(10,2))
+            ELSE 0
+        END AS AvgAnswerScore,
+        CASE 
+            WHEN us.AnswerCount > 0 THEN 
+                CAST(SUM(CASE WHEN pa.PostTypeId = 2 THEN pa.Score ELSE 0 END) OVER (PARTITION BY us.UserId) * 1.0 / NULLIF(us.AnswerCount,0) AS NUMERIC(10,2)) - 
+                CAST(SUM(CASE WHEN pa.PostTypeId = 1 THEN pa.Score ELSE 0 END) OVER (PARTITION BY us.UserId) * 1.0 / NULLIF(us.QuestionCount,0) AS NUMERIC(10,2))
+            ELSE 0
+        END AS ScoreDifferenceBetweenQuestionsAndAnswers,
+        us.PrevUserReputation,
+        us.NextUserReputation,
+        us.LastPostDate,
+        us.CreationDate
+    FROM UserStats us
+    LEFT JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId AND pa.PostTypeId IN (1, 2)
+    WHERE us.PostCount > 0
+    GROUP BY
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.PositiveQuestionCount,
+        us.PositiveAnswerCount,
+        us.HighViewQuestionCount,
+        us.HighViewAnswerCount,
+        us.AcceptedQuestionCount,
+        us.AnsweredAnswerCount,
+        us.MaxQuestionScore,
+        us.MaxAnswerScore,
+        us.TaggedQuestionCount,
+        us.AnsweredCount,
+        us.ClosedQuestionCount,
+        us.OrphanedAnswerCount,
+        us.CommentedQuestionCount,
+        us.CommentedAnswerCount,
+        us.FavoritedQuestionCount,
+        us.FavoritedAnswerCount,
+        us.ReputationRank,
+        us.ReputationDenseRank,
+        us.ReputationRankWithTies,
+        us.ReputationLevel,
+        us.ViewLevel,
+        us.VotingTrend,
+        us.ReputationStatus,
+        us.PrevUserReputation,
+        us.NextUserReputation,
+        us.LastPostDate,
+        us.CreationDate
+),
+ComplexRankings AS (
+    SELECT 
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.PostCount,
+        upa.QuestionCount,
+        upa.AnswerCount,
+        upa.PositiveQuestionPercentage,
+        upa.HighViewQuestionPercentage,
+        upa.QuestionToAnswerRatio,
+        upa.AcceptanceRate,
+        upa.AvgQuestionScore,
+        upa.AvgAnswerScore,
+        upa.ScoreDifferenceBetweenQuestionsAndAnswers,
+        upa.ReputationRank,
+        upa.ReputationDenseRank,
+        upa.ReputationRankWithTies,
+        upa.ReputationLevel,
+        upa.ViewLevel,
+        upa.VotingTrend,
+        upa.ReputationStatus,
+        CASE 
+            WHEN upa.PostCount > 10 AND upa.Reputation > 5000 AND upa.PositiveQuestionPercentage > 75 THEN 'Active Contributor'
+            WHEN upa.PostCount > 5 AND upa.Reputation > 2000 AND upa.PositiveQuestionPercentage > 60 THEN 'Regular Contributor'
+            WHEN upa.PostCount > 1 AND upa.Reputation > 500 THEN 'New Contributor'
+            ELSE 'Passive User'
+        END AS ContributorType,
+        CASE 
+            WHEN upa.AvgQuestionScore > 5 AND upa.AvgAnswerScore > 3 THEN 'High Quality Contributor'
+            WHEN upa.AvgQuestionScore > 2 AND upa.AvgAnswerScore > 1 THEN 'Moderate Quality Contributor'
+            ELSE 'Low Quality Contributor'
+        END AS QualityScoreCategory,
+        CASE 
+            WHEN upa.Reputation > 10000 AND upa.PostCount > 20 THEN 'Top Performer'
+            WHEN upa.Reputation > 5000 AND upa.PostCount > 10 THEN 'Mid Level Performer'
+            WHEN upa.Reputation > 1000 AND upa.PostCount > 5 THEN 'Beginner Performer'
+            ELSE 'Regular Performer'
+        END AS PerformanceRating,
+        CASE 
+            WHEN upa.Reputation > 100000 AND upa.ReputationLevel = 'Elite' THEN 'Hall of Fame'
+            WHEN upa.Reputation > 50000 AND upa.ReputationLevel = 'Expert' THEN 'Expert Rank'
+            WHEN upa.Reputation > 10000 THEN 'Reputation Rank'
+            ELSE 'Standard User'
+        END AS RecognitionLevel,
+        CAST(DATE_PART('day', MAX(upa.LastPostDate) OVER () - MIN(upa.CreationDate) OVER ()) AS INTEGER) AS UserLifespanDays,
+        CASE WHEN upa.CreationDate IS NOT NULL THEN DATE_PART('day', MAX(upa.LastPostDate) OVER () - upa.CreationDate) ELSE NULL END AS ActiveDays,
+        (upa.Reputation - upa.PrevUserReputation) AS ReputationChange,
+        (upa.Reputation - upa.NextUserReputation) AS ReputationChangeToNext,
+        CASE 
+            WHEN upa.PostCount > 0 THEN 
+                (upa.ScoreDifferenceBetweenQuestionsAndAnswers * 1.0) / upa.PostCount
+            ELSE 0
+        END AS ScorePerPost,
+        CASE 
+            WHEN (upa.Reputation - upa.PrevUserReputation) > 0 THEN 'Gaining'
+            WHEN (upa.Reputation - upa.PrevUserReputation) < 0 THEN 'Losing'
+            ELSE 'Stable'
+        END AS ReputationTrend,
+        CASE 
+            WHEN upa.Reputation > (SELECT AVG(Reputation) FROM Users) AND upa.QuestionCount > 5 THEN 'Above Average High Performer'
+            WHEN upa.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 'Above Average Performer'
+            WHEN upa.QuestionCount > 5 THEN 'Regular High Performer'
+            ELSE 'Below Average Performer'
+        END AS OverallRanking,
+        RANK() OVER(ORDER BY upa.Reputation DESC, upa.PostCount DESC) AS ComprehensiveRank,
+        ROW_NUMBER() OVER(PARTITION BY upa.ReputationLevel ORDER BY upa.PostCount DESC) AS LevelRank,
+        NTILE(5) OVER(ORDER BY upa.ScoreDifferenceBetweenQuestionsAndAnswers DESC) AS ScoreTier,
+        PERCENT_RANK() OVER(ORDER BY upa.ScoreDifferenceBetweenQuestionsAndAnswers DESC) AS ScorePercentile,
+        CASE 
+            WHEN upa.PostCount = 0 THEN 'Inactive Member'
+            WHEN upa.Reputation > 10000 THEN 'Elite Member'
+            WHEN upa.Reputation > 5000 THEN 'Senior Member'
+            WHEN upa.Reputation > 1000 THEN 'Member'
+            ELSE 'New Member'
+        END AS MembershipLevel,
+        upa.CreationDate,
+        upa.LastPostDate,
+        upa.PrevUserReputation,
+        upa.NextUserReputation
+    FROM UserPostAnalysis upa
+)
+SELECT * FROM (
+    SELECT 
+        'TOP USERS' AS QueryName,
+        cr.*,
+        (SELECT COUNT(*) FROM Users u WHERE u.Reputation > 10000) AS EliteUsersCount,
+        (SELECT COUNT(*) FROM Users u WHERE u.Reputation > 5000) AS SeniorUsersCount,
+        (SELECT COUNT(*) FROM Users u WHERE u.Reputation > 1000) AS RegularUsersCount,
+        (SELECT COUNT(*) FROM Users) AS TotalUsers,
+        (SELECT AVG(Reputation) FROM Users) AS AvgReputation,
+        (SELECT AVG(PostCount) FROM UserStats) AS AvgPostCount,
+        (SELECT MAX(Reputation) FROM Users) AS HighestReputation,
+        (SELECT MIN(Reputation) FROM Users) AS LowestReputation
+    FROM ComplexRankings cr
+    WHERE cr.Reputation > (SELECT AVG(Reputation) FROM Users) AND cr.PostCount > 2
+    ORDER BY cr.Reputation DESC, cr.PostCount DESC
+    FETCH FIRST 500 ROWS ONLY
+) t1
+
+UNION ALL
+
+SELECT * FROM (
+    SELECT 
+        'STATISTICAL ANALYSIS' AS QueryName,
+        cr.*,
+        (SELECT COUNT(*) FROM Users u WHERE u.Reputation > 10000) AS EliteUsersCount,
+        (SELECT COUNT(*) FROM Users u WHERE u.Reputation > 5000) AS SeniorUsersCount,
+        (SELECT COUNT(*) FROM Users u WHERE u.Reputation > 1000) AS RegularUsersCount,
+        (SELECT COUNT(*) FROM Users) AS TotalUsers,
+        (SELECT AVG(Reputation) FROM Users) AS AvgReputation,
+        (SELECT AVG(PostCount) FROM UserStats) AS AvgPostCount,
+        (SELECT MAX(Reputation) FROM Users) AS HighestReputation,
+        (SELECT MIN(Reputation) FROM Users) AS LowestReputation
+    FROM ComplexRankings cr
+    WHERE cr.ContributorType IN ('Active Contributor', 'Regular Contributor') 
+        AND cr.QualityScoreCategory = 'High Quality Contributor'
+    ORDER BY cr.ComprehensiveRank ASC
+    FETCH FIRST 500 ROWS ONLY
+) t2
+
+UNION ALL
+
+SELECT * FROM (
+    SELECT 
+        'PERFORMANCE PROFILE' AS QueryName,
+        cr.*,
+        (SELECT COUNT(*) FROM Users u WHERE u.Reputation > 10000) AS EliteUsersCount,
+        (SELECT COUNT(*) FROM Users u WHERE u.Reputation > 5000) AS SeniorUsersCount,
+        (SELECT COUNT(*) FROM Users u WHERE u.Reputation > 1000) AS RegularUsersCount,
+        (SELECT COUNT(*) FROM Users) AS TotalUsers,
+        (SELECT AVG(Reputation) FROM Users) AS AvgReputation,
+        (SELECT AVG(PostCount) FROM UserStats) AS AvgPostCount,
+        (SELECT MAX(Reputation) FROM Users) AS HighestReputation,
+        (SELECT MIN(Reputation) FROM Users) AS LowestReputation
+    FROM ComplexRankings cr
+    WHERE cr.PerformanceRating IN ('Top Performer', 'Mid Level Performer')
+        AND cr.ReputationStatus = 'Above Average'
+    ORDER BY cr.Reputation DESC
+    OFFSET 100 ROWS
+    FETCH FIRST 500 ROWS ONLY
+) t3;

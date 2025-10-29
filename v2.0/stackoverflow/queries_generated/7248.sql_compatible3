@@ -1,0 +1,260 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        MAX(v.CreationDate) as LastVoteDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - MAX(p.CreationDate)))/86400
+            ELSE NULL 
+        END as DaysSinceLastPost,
+        CASE 
+            WHEN COUNT(DISTINCT c.Id) > 0 THEN 
+                EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - MAX(c.CreationDate)))/86400
+            ELSE NULL 
+        END as DaysSinceLastComment
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        p.OwnerDisplayName,
+        p.ParentId,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                COALESCE(p.Tags, '')
+            WHEN p.PostTypeId = 2 THEN 
+                'Answer to question ' || CAST(p.ParentId as VARCHAR)
+            ELSE 
+                'Other type'
+        END as PostCategory,
+        CASE 
+            WHEN p.Score > 0 THEN 
+                'Positive'
+            WHEN p.Score < 0 THEN 
+                'Negative'
+            ELSE 
+                'Neutral'
+        END as ScoreCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 
+                'High'
+            WHEN p.ViewCount > 100 THEN 
+                'Medium'
+            ELSE 
+                'Low'
+        END as ViewCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as PostRank,
+        RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+        NTILE(4) OVER (ORDER BY p.ViewCount) as ViewQuartile
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.CreationDate >= CAST('2022-01-01' AS date)
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE 
+            WHEN t.Count > 100 THEN 
+                'Popular'
+            WHEN t.Count > 10 THEN 
+                'Moderate'
+            ELSE 
+                'Rare'
+        END as PopularityLevel,
+        CASE 
+            WHEN (t.IsModeratorOnly IS NOT NULL AND t.IsModeratorOnly = TRUE) OR (t.IsModeratorOnly IS NOT NULL AND t.IsModeratorOnly = 1) THEN 
+                'Moderator Only'
+            WHEN (t.IsRequired IS NOT NULL AND t.IsRequired = TRUE) OR (t.IsRequired IS NOT NULL AND t.IsRequired = 1) THEN 
+                'Required'
+            ELSE 
+                'Regular'
+        END as TagType,
+        STRING_AGG(
+            CASE 
+                WHEN p.PostTypeId = 1 THEN p.Title
+                ELSE 'No title'
+            END, 
+            '; ' 
+        ) as SampleQuestions
+    FROM Tags t
+    LEFT JOIN Posts p ON t.Id = p.Id AND p.PostTypeId = 1
+    WHERE t.TagName IS NOT NULL
+    GROUP BY t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired
+),
+ComplexActivity AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.PostTypeName,
+        pa.PostTypeId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        ROW_NUMBER() OVER (ORDER BY pa.Score DESC, pa.ViewCount DESC) as ActivityRank,
+        CASE 
+            WHEN (pa.Score > 100 AND pa.ViewCount > 1000) OR pa.PostTypeId = 1 THEN 
+                1
+            ELSE 
+                0
+        END as HighImpactFlag,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - pa.CreationDate))/86400 as DaysOld,
+        CASE 
+            WHEN pa.PostTypeId = 1 AND pa.AnswerCount > 0 THEN 
+                (pa.AnswerCount * 100.0 / (pa.AnswerCount + 1))
+            ELSE 
+                0.0
+        END as AnswerRate,
+        'Score: ' || CAST(pa.Score as VARCHAR) || ' Views: ' || CAST(pa.ViewCount as VARCHAR) || ' Answers: ' || CAST(pa.AnswerCount as VARCHAR) AS MetricSummary
+    FROM PostAnalysis pa
+    JOIN UserActivityStats uas ON pa.OwnerUserId = uas.UserId
+    WHERE pa.Score IS NOT NULL
+),
+UserContribution AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.VoteCount,
+        uas.DaysSinceLastPost,
+        uas.DaysSinceLastComment,
+        ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC) as UserRank,
+        ROW_NUMBER() OVER (ORDER BY uas.PostCount DESC) as PostRanking,
+        ROW_NUMBER() OVER (ORDER BY uas.VoteCount DESC) as VoteRanking,
+        CASE 
+            WHEN uas.Reputation > 100000 THEN 
+                'Legendary'
+            WHEN uas.Reputation > 10000 THEN 
+                'Epic'
+            WHEN uas.Reputation > 1000 THEN 
+                'Master'
+            ELSE 
+                'Regular'
+        END as ReputationTier,
+        CASE 
+            WHEN uas.PostCount > 500 AND uas.Reputation > 1000 THEN 
+                'Highly Active'
+            WHEN uas.PostCount > 100 AND uas.Reputation > 500 THEN 
+                'Active'
+            ELSE 
+                'Moderate'
+        END as ActivityLevel,
+        CASE 
+            WHEN uas.BadgeCount > 50 THEN 
+                'Award Winner'
+            WHEN uas.BadgeCount > 20 THEN 
+                'Badge Enthusiast'
+            ELSE 
+                'Badge Beginner'
+        END as BadgeLevel
+    FROM UserActivityStats uas
+    WHERE uas.PostCount > 0 OR uas.CommentCount > 0 OR uas.BadgeCount > 0
+)
+SELECT 
+    'Post Analysis Results' as Category,
+    COUNT(*) as TotalPosts,
+    SUM(CASE WHEN HighImpactFlag = 1 THEN 1 ELSE 0 END) as HighImpactPosts,
+    AVG(Score) as AvgScore,
+    AVG(ViewCount) as AvgViews,
+    COUNT(DISTINCT OwnerUserId) as UniqueAuthors,
+    MAX(ActivityRank) as MaxActivityRank,
+    MIN(CreationDate) as EarliestPost,
+    MAX(CreationDate) as LatestPost,
+    '---' as Separator
+FROM ComplexActivity
+UNION ALL
+SELECT 
+    'User Statistics' as Category,
+    COUNT(*) as TotalUsers,
+    COUNT(DISTINCT CASE WHEN PostCount > 0 THEN UserId END) as ActiveUsers,
+    AVG(Reputation) as AvgReputation,
+    AVG(PostCount) as AvgPostsPerUser,
+    AVG(CommentCount) as AvgCommentsPerUser,
+    COUNT(DISTINCT CASE WHEN BadgeCount > 0 THEN UserId END) as UsersWithBadges,
+    MAX(UserRank) as MaxUserRank,
+    MIN(UserRank) as MinUserRank,
+    '---' as Separator
+FROM UserContribution
+UNION ALL
+SELECT 
+    'Tag Analysis' as Category,
+    COUNT(*) as TotalTags,
+    COUNT(DISTINCT CASE WHEN PopularityLevel = 'Popular' THEN Id END) as PopularTags,
+    COUNT(DISTINCT CASE WHEN TagType = 'Required' THEN Id END) as RequiredTags,
+    COUNT(DISTINCT CASE WHEN TagType = 'Moderator Only' THEN Id END) as ModeratorOnlyTags,
+    AVG(Count) as AvgTagCount,
+    MAX(Count) as MaxTagCount,
+    MIN(Count) as MinTagCount,
+    STRING_AGG(TagName, ', ') as AllTagNames,
+    '---' as Separator
+FROM TagAnalysis
+UNION ALL
+SELECT 
+    'Performance Metrics' as Category,
+    COUNT(*) as TotalRecordsScanned,
+    COUNT(DISTINCT OwnerUserId) as DistinctAuthors,
+    SUM(CASE WHEN Score > 0 THEN 1 ELSE 0 END) as PositivePosts,
+    SUM(CASE WHEN Score < 0 THEN 1 ELSE 0 END) as NegativePosts,
+    SUM(CASE WHEN Score = 0 THEN 1 ELSE 0 END) as NeutralPosts,
+    AVG(ViewCount) as AvgViewCount,
+    AVG(AnswerCount) as AvgAnswerCount,
+    AVG(CommentCount) as AvgCommentCount,
+    STRING_AGG(CAST(DaysOld AS VARCHAR), ', ') as SampleAges,
+    '---' as Separator
+FROM ComplexActivity
+WHERE HighImpactFlag = 1
+ORDER BY CASE Category 
+    WHEN 'Post Analysis Results' THEN 1
+    WHEN 'User Statistics' THEN 2
+    WHEN 'Tag Analysis' THEN 3
+    WHEN 'Performance Metrics' THEN 4
+    ELSE 5
+END;

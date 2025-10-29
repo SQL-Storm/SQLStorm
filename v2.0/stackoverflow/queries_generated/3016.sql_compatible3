@@ -1,0 +1,117 @@
+WITH
+    tag_extraction AS (
+        SELECT
+            p.Id AS PostId,
+            UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS Tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+    ),
+
+    user_tag_counts AS (
+        SELECT
+            p.OwnerUserId AS UserId,
+            te.Tag,
+            COUNT(*) AS TagUseCount
+        FROM Posts p
+        JOIN tag_extraction te ON te.PostId = p.Id
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId, te.Tag
+    ),
+
+    ranked_user_tags AS (
+        SELECT
+            utc.UserId,
+            utc.Tag,
+            utc.TagUseCount,
+            ROW_NUMBER() OVER (PARTITION BY utc.UserId ORDER BY utc.TagUseCount DESC) AS rn
+        FROM user_tag_counts utc
+    ),
+
+    user_badges AS (
+        SELECT
+            u.Id AS UserId,
+            MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+            COUNT(b.Id) AS TotalBadges
+        FROM Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        GROUP BY u.Id
+    ),
+
+    recent_activity AS (
+        SELECT
+            p.OwnerUserId AS UserId,
+            MAX(p.LastActivityDate) AS LastActivity
+        FROM Posts p
+        WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)
+        GROUP BY p.OwnerUserId
+    ),
+
+    vote_aggregates AS (
+        SELECT
+            p.OwnerUserId AS UserId,
+            COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVoteCount,
+            COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVoteCount
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        GROUP BY p.OwnerUserId
+    ),
+
+    post_stats AS (
+        SELECT
+            p.OwnerUserId AS UserId,
+            COUNT(*) AS TotalPosts,
+            AVG(p.Score) AS AvgScore,
+            SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalViews,
+            MAX(p.CreationDate) AS FirstPostDate,
+            MIN(p.CreationDate) AS LastPostDate
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+
+    user_summary AS (
+        SELECT
+            u.Id AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(ps.TotalPosts, 0) AS TotalPosts,
+            COALESCE(ps.AvgScore, 0) AS AvgScore,
+            COALESCE(ps.TotalViews, 0) AS TotalViews,
+            ub.HasGoldBadge,
+            ub.TotalBadges,
+            ra.LastActivity,
+            va.UpVoteCount,
+            va.DownVoteCount,
+            STRING_AGG(rt.Tag, ', ' ORDER BY rt.rn) FILTER (WHERE rt.rn <= 3) AS Top3Tags
+        FROM Users u
+        LEFT JOIN post_stats ps ON ps.UserId = u.Id
+        LEFT JOIN user_badges ub ON ub.UserId = u.Id
+        LEFT JOIN recent_activity ra ON ra.UserId = u.Id
+        LEFT JOIN vote_aggregates va ON va.UserId = u.Id
+        LEFT JOIN ranked_user_tags rt ON rt.UserId = u.Id
+        GROUP BY
+            u.Id, u.DisplayName, u.Reputation,
+            ps.TotalPosts, ps.AvgScore, ps.TotalViews,
+            ub.HasGoldBadge, ub.TotalBadges,
+            ra.LastActivity, va.UpVoteCount, va.DownVoteCount
+    )
+
+SELECT *
+FROM (
+    SELECT *
+    FROM user_summary us
+    WHERE (us.TotalPosts > 100 AND us.Reputation > 10000)
+       OR (us.LastActivity IS NOT NULL AND us.LastActivity > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR))
+    ORDER BY us.Reputation DESC
+    LIMIT 100
+
+    UNION ALL
+
+    SELECT *
+    FROM user_summary us
+    WHERE us.Reputation BETWEEN 5000 AND 10000
+      AND us.AvgScore IS NOT NULL
+    ORDER BY us.AvgScore DESC
+    LIMIT 50 OFFSET 50
+) t;

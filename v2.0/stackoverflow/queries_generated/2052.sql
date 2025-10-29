@@ -1,0 +1,127 @@
+-- {"query": "2052.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1401} 
+
+WITH RecursiveUserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopTagsPerUser AS (
+    SELECT
+        ph.UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) AS Tag,
+        COUNT(*) AS TagCount,
+        RANK() OVER (PARTITION BY ph.UserId ORDER BY COUNT(*) DESC) AS TagRank
+    FROM PostHistory ph
+    JOIN Posts p ON p.Id = ph.PostId
+    WHERE p.Tags IS NOT NULL AND ph.PostHistoryTypeId IN (3,6) -- Initial Tags or Edit Tags
+    GROUP BY ph.UserId, Tag
+),
+UserBadgeCounts AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+),
+UserVoteAggregates AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived
+    FROM Votes v
+    JOIN Posts p ON p.Id = v.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserEngagementWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT pl.Id) AS LinkedPostsCount,
+        COALESCE(SUM(COALESCE(v.BountyAmount,0)),0) AS TotalBountyAwarded,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT c.Id) DESC) AS EngagementRank
+    FROM Users u
+    LEFT JOIN Comments c ON c.UserId = u.Id AND c.CreationDate > u.CreationDate + INTERVAL '1 year'
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId IN (8,9) -- BountyStart or BountyClose
+    GROUP BY u.Id, u.DisplayName
+),
+DuplicateQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = p.Id) AS AnswersCount
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.CreationDate
+),
+UserCorrelatedClosed AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT ph.PostId) AS ClosedQuestionsByUser
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id AND ph.PostHistoryTypeId = 10 -- Post Closed
+    LEFT JOIN Posts p ON p.Id = ph.PostId AND p.PostTypeId = 1
+    GROUP BY u.Id
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.TotalPostScore,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    uv.UpVotesReceived,
+    uv.DownVotesReceived,
+    eu.CommentCount,
+    eu.LinkedPostsCount,
+    eu.TotalBountyAwarded,
+    uc.ClosedQuestionsByUser,
+    MAX(dt.DuplicateCount) AS MaxDuplicateCount,
+    STRING_AGG(DISTINCT tt.Tag, ', ') FILTER (WHERE tt.TagRank <= 3) AS Top3Tags,
+    ROW_NUMBER() OVER (ORDER BY us.TotalPostScore DESC, us.AnswerCount DESC) AS UserRanking,
+    CASE WHEN us.LastPostDate IS NULL THEN 'No Posts' ELSE TO_CHAR(us.LastPostDate, 'YYYY-MM-DD') END AS LastPostDate,
+    CASE 
+        WHEN ub.GoldBadges >= 5 THEN 'Expert'
+        WHEN ub.SilverBadges >= 10 THEN 'Intermediate'
+        ELSE 'Novice'
+    END AS ExpertiseLevel,
+    COALESCE(u.AboutMe, '') AS AboutExcerpt,
+    CASE WHEN u.Location IS NULL THEN 'Unknown' ELSE u.Location END AS UserLocation
+FROM Users u
+LEFT JOIN RecursiveUserPostStats us ON us.UserId = u.Id
+LEFT JOIN UserBadgeCounts ub ON ub.UserId = u.Id
+LEFT JOIN UserVoteAggregates uv ON uv.UserId = u.Id
+LEFT JOIN UserEngagementWindow eu ON eu.UserId = u.Id
+LEFT JOIN UserCorrelatedClosed uc ON uc.UserId = u.Id
+LEFT JOIN TopTagsPerUser tt ON tt.UserId = u.Id AND tt.TagRank <= 3
+LEFT JOIN DuplicateQuestions dt ON dt.QuestionId IN (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1
+)
+WHERE u.Reputation > (
+    SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Reputation) FROM Users
+)
+GROUP BY 
+    u.Id, u.DisplayName, us.QuestionCount, us.AnswerCount, us.TotalPostScore, 
+    ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, uv.UpVotesReceived, uv.DownVotesReceived, 
+    eu.CommentCount, eu.LinkedPostsCount, eu.TotalBountyAwarded, uc.ClosedQuestionsByUser, 
+    us.LastPostDate, u.AboutMe, u.Location
+ORDER BY UserRanking
+LIMIT 50;

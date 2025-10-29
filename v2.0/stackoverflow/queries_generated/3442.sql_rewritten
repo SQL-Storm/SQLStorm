@@ -1,0 +1,180 @@
+-- {"query": "3442.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2394} 
+WITH
+/* ------------------------------------------------------------------
+   1. Aggregate per‑user post statistics (answers, questions, avg scores)
+   ------------------------------------------------------------------ */
+user_stats AS (
+    SELECT
+        u.id                                     AS user_id,
+        u.displayname,
+        u.reputation,
+        COUNT(p.id)               FILTER (WHERE p.posttypeid = 2) AS answer_cnt,
+        COUNT(p.id)               FILTER (WHERE p.posttypeid = 1) AS question_cnt,
+        AVG(p.score)              FILTER (WHERE p.posttypeid = 2) AS avg_answer_score,
+        MAX(p.creationdate)                              AS last_post_dt
+    FROM users u
+    LEFT JOIN posts p
+           ON p.owneruserid = u.id
+    GROUP BY u.id, u.displayname, u.reputation
+),
+
+/* ------------------------------------------------------------------
+   2. Badge aggregates per user, including gold count and first badge date
+   ------------------------------------------------------------------ */
+badge_stats AS (
+    SELECT
+        b.userid           AS user_id,
+        COUNT(*)           AS total_badges,
+        COUNT(*) FILTER (WHERE b.class = 1) AS gold_badges,
+        MIN(b.date)        AS first_badge_dt
+    FROM badges b
+    GROUP BY b.userid
+),
+
+/* ------------------------------------------------------------------
+   3. Recent vote activity (last 30 days) per user
+   ------------------------------------------------------------------ */
+recent_votes AS (
+    SELECT
+        v.userid           AS user_id,
+        COUNT(*)           AS recent_vote_cnt
+    FROM votes v
+    WHERE v.creationdate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+    GROUP BY v.userid
+),
+
+/* ------------------------------------------------------------------
+   4. Latest close event per post (if any)
+   ------------------------------------------------------------------ */
+latest_closed AS (
+    SELECT
+        ph.postid          AS post_id,
+        MAX(ph.creationdate) AS closed_dt
+    FROM posthistory ph
+    WHERE ph.posthistorytypeid = 10                -- Post Closed
+    GROUP BY ph.postid
+),
+
+/* ------------------------------------------------------------------
+   5. Duplicate links (PostId -> RelatedPostId) – only type 3 (Duplicate)
+   ------------------------------------------------------------------ */
+duplicate_links AS (
+    SELECT
+        pl.postid           AS post_id,
+        pl.relatedpostid    AS dup_of_post_id
+    FROM postlinks pl
+    WHERE pl.linktypeid = 3
+),
+
+/* ------------------------------------------------------------------
+   6. Top‑scoring post per tag (using window function + string split)
+   ------------------------------------------------------------------ */
+top_tag_posts AS (
+    SELECT
+        p.id,
+        p.title,
+        unnest(string_to_array(substring(p.tags FROM 2 FOR length(p.tags)-2), '><')) AS tag,
+        p.score,
+        ROW_NUMBER() OVER (PARTITION BY unnest(string_to_array(substring(p.tags FROM 2 FOR length(p.tags)-2), '><'))
+                           ORDER BY p.score DESC) AS rn
+    FROM posts p
+    WHERE p.posttypeid = 1               -- questions only
+      AND p.tags IS NOT NULL
+),
+tag_rankings AS (
+    SELECT
+        tag,
+        id    AS top_post_id,
+        title AS top_post_title,
+        score AS top_score
+    FROM top_tag_posts
+    WHERE rn = 1
+),
+
+/* ------------------------------------------------------------------
+   7. Users enriched with all the above pieces (outer joins keep nulls)
+   ------------------------------------------------------------------ */
+enriched_users AS (
+    SELECT
+        us.user_id,
+        us.displayname,
+        us.reputation,
+        us.answer_cnt,
+        us.question_cnt,
+        us.avg_answer_score,
+        us.last_post_dt,
+        COALESCE(bs.total_badges,0)      AS total_badges,
+        COALESCE(bs.gold_badges,0)       AS gold_badges,
+        bs.first_badge_dt,
+        COALESCE(rv.recent_vote_cnt,0)   AS recent_votes,
+        lc.closed_dt,
+        dl.dup_of_post_id
+    FROM user_stats us
+    LEFT JOIN badge_stats bs      ON bs.user_id = us.user_id
+    LEFT JOIN recent_votes rv    ON rv.user_id = us.user_id
+    LEFT JOIN latest_closed lc   ON lc.post_id = us.user_id      -- demo of mismatched join (may be null)
+    LEFT JOIN duplicate_links dl ON dl.post_id = us.user_id
+),
+
+/* ------------------------------------------------------------------
+   8. Correlated subquery: compute days since last post per user
+   ------------------------------------------------------------------ */
+user_activity_lag AS (
+    SELECT
+        eu.*,
+        COALESCE(DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - eu.last_post_dt), NULL) AS days_since_last_post
+    FROM enriched_users eu
+),
+
+/* ------------------------------------------------------------------
+   9. Final ranking – users with high reputation or gold badges
+   ------------------------------------------------------------------ */
+ranked_users AS (
+    SELECT
+        ual.*,
+        ROW_NUMBER() OVER (ORDER BY ual.reputation DESC, ual.gold_badges DESC) AS rank_by_rep
+    FROM user_activity_lag ual
+    WHERE ual.reputation > 15000
+       OR ual.gold_badges >= 1
+)
+
+-- ==================================================================
+--  Main result set: top users + a UNION ALL of tag summary rows
+-- ==================================================================
+SELECT
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.answer_cnt,
+    ru.question_cnt,
+    ROUND(ru.avg_answer_score,2)      AS avg_answer_score,
+    ru.total_badges,
+    ru.gold_badges,
+    ru.recent_votes,
+    CASE WHEN ru.closed_dt IS NOT NULL THEN 'Closed' ELSE 'Active' END AS status,
+    CASE WHEN ru.dup_of_post_id IS NOT NULL THEN 'HasDuplicate' ELSE 'Unique' END AS dup_flag,
+    ru.days_since_last_post,
+    ru.rank_by_rep
+FROM ranked_users ru
+ORDER BY ru.rank_by_rep
+/* ------------------------------------------------------------------
+   UNION ALL: tag summary rows (dummy user rows) for benchmarking string ops
+   ------------------------------------------------------------------ */
+UNION ALL
+SELECT
+    NULL                      AS user_id,
+    '-- Tag Summary --'       AS displayname,
+    NULL                      AS reputation,
+    NULL                      AS answer_cnt,
+    NULL                      AS question_cnt,
+    NULL                      AS avg_answer_score,
+    NULL                      AS total_badges,
+    NULL                      AS gold_badges,
+    NULL                      AS recent_votes,
+    CONCAT('Tag: ', tr.tag)   AS status,
+    CONCAT('Score:', tr.top_score) AS dup_flag,
+    NULL                      AS days_since_last_post,
+    NULL                      AS rank_by_rep
+FROM tag_rankings tr
+ORDER BY status DESC, dup_flag DESC
+LIMIT 10;

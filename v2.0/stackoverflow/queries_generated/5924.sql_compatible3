@@ -1,0 +1,104 @@
+WITH
+recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    ut.Reputation AS UserReputation,
+    u.DisplayName AS OwnerName,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT Id, Reputation, DisplayName
+    FROM Users
+  ) ut ON ut.Id = p.OwnerUserId
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+popular_tags AS (
+  SELECT
+    TRIM(tag) AS tag,
+    COUNT(*) AS tag_count
+  FROM Posts p,
+    (SELECT
+       -- split tags like '<tag1><tag2>' into rows by simple string operations
+       REGEXP_SPLIT_TO_TABLE(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><') AS tag
+    ) AS unnested
+  WHERE p.PostTypeId = 1
+  GROUP BY TRIM(tag)
+),
+tag_metrics AS (
+  SELECT
+    t.tag,
+    t.tag_count,
+    (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1 AND p2.Tags LIKE '%' || t.tag || '%') AS avg_question_score,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.PostTypeId IN (1,2) AND p3.Tags LIKE '%' || t.tag || '%') AS related_posts
+  FROM popular_tags t
+  GROUP BY t.tag, t.tag_count
+),
+activity AS (
+  SELECT
+    p.OwnerUserId,
+    MAX(p.LastActivityDate) AS last_activity
+  FROM Posts p
+  GROUP BY p.OwnerUserId
+),
+combined AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.OwnerUserId,
+    q.OwnerName,
+    q.UserReputation,
+    q.LastActivityDate,
+    q.CommentCount,
+    q.AnswerCount,
+    a.last_activity,
+    m.tag,
+    m.tag_count,
+    m.avg_question_score,
+    m.related_posts
+  FROM recent_questions q
+  LEFT JOIN activity a ON q.OwnerUserId = a.OwnerUserId
+  LEFT JOIN tag_metrics m ON EXISTS (
+      SELECT 1
+      FROM (
+        SELECT REGEXP_SPLIT_TO_TABLE(SUBSTRING(q.Tags FROM 2 FOR CHAR_LENGTH(q.Tags)-2), '><') AS tag
+      ) t2
+      WHERE m.tag = TRIM(t2.tag)
+  )
+  WHERE q.rn = 1
+)
+SELECT
+  c.PostId,
+  c.Title,
+  c.Tags,
+  c.CreationDate,
+  c.Score,
+  c.ViewCount,
+  c.OwnerUserId,
+  c.OwnerName,
+  c.UserReputation,
+  c.LastActivityDate,
+  c.CommentCount,
+  c.AnswerCount,
+  c.last_activity,
+  c.tag,
+  c.tag_count,
+  c.avg_question_score,
+  c.related_posts
+FROM combined c
+ORDER BY c.LastActivityDate DESC
+LIMIT 100;

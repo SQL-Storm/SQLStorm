@@ -1,0 +1,109 @@
+-- {"query": "4121.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1159} 
+
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS PostsCreated,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        MAX(p.CreationDate) AS LastPostCreationDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostPerformance AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Active'
+        END AS PostStatus,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS RankByScore,
+        LAG(p.Score, 1, 0) OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score, 1, 0) OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+        COALESCE(p.AnswerCount, 0) AS NonNullAnswerCount,
+        CASE WHEN p.Tags LIKE '%<sql>%' THEN 'SQL Related' ELSE 'Other' END AS TagCategory
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers only
+),
+CommentSentiment AS (
+    SELECT
+        c.PostId,
+        AVG(CASE
+                WHEN LOWER(c.Text) LIKE '%great%' THEN 1.0
+                WHEN LOWER(c.Text) LIKE '%helpful%' THEN 1.0
+                WHEN LOWER(c.Text) LIKE '%thanks%' THEN 0.5
+                WHEN LOWER(c.Text) LIKE '%bad%' THEN -1.0
+                WHEN LOWER(c.Text) LIKE '%wrong%' THEN -1.0
+                ELSE 0.0
+            END) AS AvgSentimentScore,
+        COUNT(*) AS TotalComments
+    FROM Comments c
+    GROUP BY c.PostId
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.CreationDate AS UserCreationDate,
+    ua.PostsCreated,
+    ua.CommentsMade,
+    ua.UpvotesGiven,
+    ua.DownvotesGiven,
+    ua.BadgesEarned,
+    pp.PostId,
+    pp.Title,
+    pp.PostTypeName,
+    pp.Score,
+    pp.ViewCount,
+    pp.AnswerCount,
+    pp.CommentCount,
+    pp.FavoriteCount,
+    pp.CreationDate AS PostCreationDate,
+    pp.LastActivityDate,
+    pp.PostStatus,
+    pp.TagCategory,
+    cs.AvgSentimentScore,
+    cs.TotalComments,
+    CASE
+        WHEN pp.RankByScore <= 5 THEN 'Top 5 Post'
+        ELSE 'Other Post'
+    END AS PostRankCategory,
+    (pp.Score * 1.0 / NULLIF(pp.ViewCount, 0)) AS ScorePerView,
+    (pp.NextScore - pp.PreviousScore) AS ScoreDelta,
+    COALESCE(ua.DisplayName, 'Deleted User') AS SafeDisplayName,
+    CASE
+        WHEN ua.LastPostCreationDate > ua.CreationDate + INTERVAL '1 year' THEN 'Long-Term User'
+        ELSE 'Short-Term User'
+    END AS UserTenureCategory
+FROM UserActivity ua
+INNER JOIN PostPerformance pp ON ua.UserId = pp.OwnerUserId
+LEFT JOIN CommentSentiment cs ON pp.PostId = cs.PostId
+WHERE ua.Reputation > 1000 -- Consider users with some reputation
+  AND pp.PostStatus <> 'Closed' -- Exclude closed posts
+  AND pp.Score > 5 -- Posts with a decent score
+ORDER BY ua.Reputation DESC, pp.Score DESC
+LIMIT 1000;

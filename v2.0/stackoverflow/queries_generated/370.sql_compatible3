@@ -1,0 +1,373 @@
+with params as (
+    select 
+        date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '24 months' as start_month,
+        cast('2024-10-01 12:34:56' as timestamp) as asof
+),
+recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.lastaccessdate,
+        coalesce(u.location, 'Unknown') as location,
+        u.upvotes - u.downvotes as net_votes,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_cnt,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_cnt,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_cnt,
+        count(b.id) as badges_total,
+        max(b.date) as last_badge_date
+    from users u
+    left join badges b 
+      on b.userid = u.id
+     and b.date >= (select start_month from params)
+    where u.lastaccessdate >= (select start_month from params)
+    group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.location, u.upvotes, u.downvotes
+),
+recent_posts as (
+    select 
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.commentcount,
+        p.favoritecount,
+        p.closeddate,
+        p.acceptedanswerid,
+        p.parentid,
+        p.title,
+        p.tags,
+        case when p.tags is not null then array_length(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><'), 1) else 0 end as tag_count
+    from posts p
+    where p.creationdate >= (select start_month from params)
+      and p.posttypeid in (1,2)
+),
+qa_links as (
+    select
+        q.id as question_id,
+        q.owneruserid as asker_id,
+        q.creationdate as q_created,
+        q.score as q_score,
+        q.viewcount as q_views,
+        q.answercount as q_answercount,
+        q.commentcount as q_commentcount,
+        q.favoritecount as q_favcount,
+        q.title as q_title,
+        q.tags as q_tags,
+        q.tag_count as q_tagcount,
+        q.acceptedanswerid,
+        a.id as answer_id,
+        a.owneruserid as answerer_id,
+        a.score as a_score,
+        a.creationdate as a_created,
+        a.commentcount as a_commentcount,
+        a.parentid as a_parent
+    from recent_posts q
+    left join recent_posts a
+      on a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+),
+user_activity as (
+    select
+        rp.owneruserid as user_id,
+        rp.posttypeid,
+        cast(rp.creationdate as date) as d,
+        count(*) as posts_day,
+        sum(case when rp.posttypeid = 1 then 1 else 0 end) as q_day,
+        sum(case when rp.posttypeid = 2 then 1 else 0 end) as a_day
+    from recent_posts rp
+    group by rp.owneruserid, rp.posttypeid, cast(rp.creationdate as date)
+),
+user_activity_rollup as (
+    select
+        ua.user_id,
+        sum(ua.posts_day) as posts_total,
+        sum(ua.q_day) as q_total,
+        sum(ua.a_day) as a_total,
+        avg(ua.posts_day) as avg_posts_per_active_day,
+        count(*) filter (where ua.posts_day > 0) as active_days,
+        min(ua.d) as first_post_day,
+        max(ua.d) as last_post_day
+    from user_activity ua
+    group by ua.user_id
+),
+vote_agg as (
+    select 
+        p.id as post_id,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+        max(case when v.votetypeid in (10,11,12) then 1 else 0 end) = 1 as had_mod_action
+    from recent_posts p
+    left join votes v 
+      on v.postid = p.id
+     and v.creationdate >= (select start_month from params)
+    group by p.id
+),
+comment_density as (
+    select
+        p.id as post_id,
+        count(c.id) as comment_count,
+        cast(coalesce(avg(nullif(length(c.text),0)), 0) as numeric(18,2)) as avg_comment_len,
+        percentile_disc(0.5) within group (order by nullif(length(c.text),0)) as median_comment_len
+    from recent_posts p
+    left join comments c 
+      on c.postid = p.id
+     and c.creationdate >= (select start_month from params)
+    group by p.id
+),
+link_flags as (
+    select
+        q.id as question_id,
+        max(case when pl.linktypeid = 3 then 1 else 0 end) as is_duplicate,
+        count(*) filter (where pl.linktypeid = 1) as linked_count,
+        max(case when pl.linktypeid = 3 then pl.relatedpostid end) as dup_target_id
+    from recent_posts q
+    left join postlinks pl
+      on pl.postid = q.id
+     and pl.creationdate >= (select start_month from params)
+    where q.posttypeid = 1
+    group by q.id
+),
+close_info as (
+    select
+        ph.postid as question_id,
+        min(ph.creationdate) as first_closed_at,
+        max(case 
+              when ph.posthistorytypeid = 10 then 
+                nullif(trim(regexp_replace(ph.comment, '[^0-9]', '', 'g')), '') 
+            end) as last_close_reason_code
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+      and ph.creationdate >= (select start_month from params)
+    group by ph.postid
+),
+question_tags as (
+    select
+        q.id as question_id,
+        unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag_name
+    from recent_posts q
+    where q.posttypeid = 1
+      and q.tags is not null
+),
+-- compute global max tag count once, then use it in join to avoid window inside aggregate
+tag_global_max as (
+    select max(coalesce(t.count,0)) as max_tag_count
+    from tags t
+),
+tag_weights as (
+    select 
+        qt.question_id,
+        avg(least(1.0, ln(1+coalesce(t.count,0)) / nullif(ln(1+tg.max_tag_count),0))) as tag_popularity_weight
+    from question_tags qt
+    left join tags t
+      on lower(t.tagname) = lower(qt.tag_name)
+    cross join tag_global_max tg
+    group by qt.question_id, tg.max_tag_count
+),
+question_fact as (
+    select
+        ql.question_id,
+        ql.asker_id,
+        ru.displayname as asker_name,
+        coalesce(ru.reputation, 1) as asker_rep,
+        ru.location as asker_location,
+        ql.q_created,
+        ql.q_score,
+        ql.q_views,
+        ql.q_answercount,
+        ql.q_commentcount,
+        ql.q_favcount,
+        ql.q_title,
+        coalesce(ql.q_tagcount,0) as q_tagcount,
+        lf.is_duplicate,
+        lf.linked_count,
+        ci.first_closed_at,
+        ci.last_close_reason_code,
+        tw.tag_popularity_weight,
+        case when ci.first_closed_at is not null then 1 else 0 end as was_closed,
+        case when ru.user_id is null then 1 else 0 end as asker_unknown_user
+    from qa_links ql
+    left join recent_users ru on ru.user_id = ql.asker_id
+    left join link_flags lf on lf.question_id = ql.question_id
+    left join close_info ci on ci.question_id = ql.question_id
+    left join tag_weights tw on tw.question_id = ql.question_id
+),
+answer_fact as (
+    select
+        ql.question_id,
+        ql.answer_id,
+        ql.answerer_id,
+        ru.displayname as answerer_name,
+        coalesce(ru.reputation, 1) as answerer_rep,
+        ql.a_score,
+        ql.a_created,
+        ql.a_commentcount
+    from qa_links ql
+    left join recent_users ru on ru.user_id = ql.answerer_id
+    where ql.answer_id is not null
+),
+other_answers as (
+    select 
+        p.parentid as question_id,
+        count(*) filter (where p.id <> q.acceptedanswerid) as other_ans_count,
+        max(p.score) filter (where p.id <> q.acceptedanswerid) as max_other_ans_score
+    from posts p
+    join posts q on q.id = p.parentid and q.posttypeid = 1
+    where p.posttypeid = 2
+      and p.creationdate >= (select start_month from params)
+    group by p.parentid, q.acceptedanswerid
+),
+engagement as (
+    select
+        rp.id as post_id,
+        coalesce(va.upvotes,0) - coalesce(va.downvotes,0) as net_votes,
+        coalesce(va.bounty_awarded,0) as bounty_awarded,
+        cd.comment_count,
+        cd.avg_comment_len,
+        cd.median_comment_len,
+        va.had_mod_action
+    from recent_posts rp
+    left join vote_agg va on va.post_id = rp.id
+    left join comment_density cd on cd.post_id = rp.id
+),
+question_metrics as (
+    select
+        qf.*,
+        e.net_votes as q_net_votes,
+        e.bounty_awarded as q_bounty,
+        e.comment_count as q_comments,
+        e.avg_comment_len as q_avg_comment_len,
+        e.median_comment_len as q_median_comment_len,
+        e.had_mod_action as q_had_mod_action,
+        rank() over (order by qf.q_views desc nulls last) as r_views,
+        dense_rank() over (order by qf.q_score desc nulls last) as r_score,
+        percent_rank() over (order by coalesce(qf.tag_popularity_weight,0)) as pr_tag_popularity,
+        ntile(10) over (order by coalesce(qf.q_answercount,0) desc) as decile_answercount
+    from question_fact qf
+    left join engagement e on e.post_id = qf.question_id
+),
+answer_metrics as (
+    select
+        af.*,
+        e.net_votes as a_net_votes,
+        e.comment_count as a_comments,
+        e.avg_comment_len as a_avg_comment_len,
+        e.median_comment_len as a_median_comment_len,
+        e.had_mod_action as a_had_mod_action,
+        row_number() over (partition by af.question_id order by coalesce(af.a_score, -1) desc, af.a_created asc) as rn_answer_quality
+    from answer_fact af
+    left join engagement e on e.post_id = af.answer_id
+),
+qna as (
+    select
+        qm.*,
+        coalesce(am.answer_id, 0) as answer_id,
+        am.answerer_id,
+        am.answerer_name,
+        am.answerer_rep,
+        am.a_score,
+        am.a_created,
+        am.a_commentcount,
+        am.a_net_votes,
+        am.a_comments,
+        am.a_avg_comment_len,
+        am.a_median_comment_len,
+        am.a_had_mod_action,
+        uar.posts_total as asker_posts_total,
+        uar.q_total as asker_q_total,
+        uar.a_total as asker_a_total,
+        uar.avg_posts_per_active_day as asker_avg_posts_per_active_day,
+        uar.active_days as asker_active_days,
+        uar.first_post_day as asker_first_post_day,
+        uar.last_post_day as asker_last_post_day,
+        uar2.posts_total as answerer_posts_total,
+        uar2.q_total as answerer_q_total,
+        uar2.a_total as answerer_a_total,
+        coalesce(oa.other_ans_count,0) as other_ans_count,
+        oa.max_other_ans_score
+    from question_metrics qm
+    left join answer_metrics am on am.question_id = qm.question_id and am.rn_answer_quality = 1
+    left join user_activity_rollup uar on uar.user_id = qm.asker_id
+    left join user_activity_rollup uar2 on uar2.user_id = am.answerer_id
+    left join other_answers oa on oa.question_id = qm.question_id
+),
+scored as (
+    select
+        qna.*,
+        cast(
+        (
+            0.35 * coalesce(ln(nullif(q_views,0)), 0) +
+            0.25 * coalesce(q_net_votes, 0) +
+            0.15 * coalesce(q_score, 0) +
+            0.10 * coalesce(a_net_votes, 0) +
+            0.05 * coalesce(a_score, 0) +
+            0.05 * coalesce(tag_popularity_weight, 0) +
+            0.05 * case when was_closed = 1 then -1 else 0 end
+        ) as numeric(18,4)) as composite_score,
+        extract(epoch from (coalesce(a_created, q_created) - q_created))/3600.0 as hours_to_answer_or_accept,
+        case 
+            when is_duplicate = 1 then 'DUPLICATE'
+            when was_closed = 1 then 'CLOSED'
+            when coalesce(q_answercount,0) = 0 then 'UNANSWERED'
+            else 'ANSWERED'
+        end as status_label,
+        ('Q#' || question_id || ' by ' || coalesce(asker_name, 'Anonymous') || ' [' || coalesce(asker_location,'Unknown') || '] - ' || coalesce(left(q_title,80),'(no title)')) as summary
+    from qna
+),
+ranked as (
+    select
+        s.*,
+        rank() over (order by composite_score desc nulls last) as r_comp,
+        cume_dist() over (order by composite_score desc nulls last) as cd_comp,
+        ntile(20) over (order by composite_score desc nulls last) as tile20
+    from scored s
+),
+extremes as (
+    (select * from ranked where r_comp <= 50)
+    union all
+    (select * from ranked where r_comp > (select count(*) from ranked) - 50)
+)
+select
+    e.question_id,
+    e.answer_id,
+    e.summary,
+    e.status_label,
+    e.composite_score,
+    e.r_comp,
+    e.cd_comp,
+    e.tile20,
+    e.q_created,
+    e.q_score,
+    e.q_views,
+    e.q_answercount,
+    e.q_comments,
+    e.q_favcount,
+    e.is_duplicate,
+    e.linked_count,
+    e.first_closed_at,
+    e.last_close_reason_code,
+    cast(coalesce(e.tag_popularity_weight,0) as numeric(6,4)) as tag_popularity_weight,
+    e.asker_id,
+    e.asker_name,
+    e.asker_rep,
+    e.asker_location,
+    e.asker_posts_total,
+    e.asker_q_total,
+    e.asker_a_total,
+    e.asker_avg_posts_per_active_day,
+    e.asker_active_days,
+    e.answerer_id,
+    e.answerer_name,
+    e.answerer_rep,
+    e.a_score,
+    e.a_net_votes,
+    e.a_comments,
+    e.hours_to_answer_or_accept,
+    e.other_ans_count,
+    e.max_other_ans_score
+from extremes e
+order by e.r_comp, e.question_id;

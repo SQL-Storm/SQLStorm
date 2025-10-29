@@ -1,0 +1,190 @@
+WITH top_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    ASQ.Cnt AS UndeletedAnswers
+  FROM Posts p
+  LEFT JOIN (
+    SELECT ParentId, COUNT(*) AS Cnt
+    FROM Posts
+    WHERE PostTypeId = 2
+      AND ClosedDate IS NULL
+    GROUP BY ParentId
+  ) AS ASQ ON ASQ.ParentId = p.Id
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+recent_comments AS (
+  SELECT
+    c.PostId,
+    c.Id AS CommentId,
+    c.Text,
+    c.CreationDate,
+    c.UserDisplayName,
+    c.UserId,
+    c.Score
+  FROM Comments c
+  WHERE c.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+),
+tag_expansion AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+),
+activity_per_post AS (
+  SELECT
+    tq.PostId,
+    tq.Title,
+    tq.Tags,
+    tq.Score,
+    tq.ViewCount,
+    tq.CreationDate,
+    tq.OwnerUserId,
+    tq.LastActivityDate,
+    tq.AnswerCount,
+    tq.CommentCount,
+    tq.FavoriteCount,
+    COALESCE(ch.CommentId, 0) AS DraftCommentId,
+    COALESCE(ch.Text, '') AS DraftCommentText,
+    ARRAY_AGG(DISTINCT vl.VoteTypeId) FILTER (WHERE vl.PostId = tq.PostId) AS VoteTypes
+  FROM (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.Tags,
+      p.Score,
+      p.ViewCount,
+      p.CreationDate,
+      p.OwnerUserId,
+      p.LastActivityDate,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND p.ClosedDate IS NULL
+  ) AS tq
+  LEFT JOIN recent_comments ch ON ch.PostId = tq.PostId
+  LEFT JOIN Votes vl ON vl.PostId = tq.PostId
+  GROUP BY
+    tq.PostId, tq.Title, tq.Tags, tq.Score, tq.ViewCount, tq.CreationDate,
+    tq.OwnerUserId, tq.LastActivityDate, tq.AnswerCount, tq.CommentCount, tq.FavoriteCount, ch.CommentId, ch.Text
+),
+complex_benchmark AS (
+  SELECT
+    a.PostId,
+    a.Title,
+    a.Tags,
+    a.Score,
+    a.ViewCount,
+    a.CreationDate,
+    a.OwnerUserId,
+    a.LastActivityDate,
+    a.AnswerCount,
+    a.CommentCount,
+    a.FavoriteCount,
+    a.DraftCommentId,
+    a.DraftCommentText,
+    a.VoteTypes,
+    SUM(COALESCE(vl.BountyAmount, 0)) OVER (
+      PARTITION BY a.OwnerUserId
+      ORDER BY a.CreationDate
+      ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+    ) AS CumulativeBounty
+  FROM activity_per_post a
+  LEFT JOIN Votes vl ON vl.PostId = a.PostId
+  GROUP BY
+    a.PostId, a.Title, a.Tags, a.Score, a.ViewCount, a.CreationDate,
+    a.OwnerUserId, a.LastActivityDate, a.AnswerCount, a.CommentCount, a.FavoriteCount, a.DraftCommentId, a.DraftCommentText, a.VoteTypes
+),
+final_output AS (
+  SELECT
+    cb.PostId,
+    cb.Title,
+    CASE
+      WHEN cb.Tags IS NULL OR cb.Tags = '' THEN NULL
+      ELSE
+        (
+          SELECT
+            CASE WHEN COUNT(1) = 0 THEN NULL ELSE STRING_AGG(elem, ',') END
+          FROM (
+            SELECT TRIM(BOTH '<>' FROM cb.Tags) AS cleaned_tags
+          ) single,
+          (
+            SELECT elem FROM (
+              SELECT
+                CASE
+                  WHEN POSITION('><' IN single.cleaned_tags) = 0 THEN single.cleaned_tags
+                  ELSE REPLACE(single.cleaned_tags, '><', ',')
+                END AS comma_tags
+            ) s,
+            (
+              SELECT
+                CASE WHEN n = 1 THEN
+                  CASE WHEN POSITION(',' IN s.comma_tags) = 0 THEN s.comma_tags ELSE SUBSTRING(s.comma_tags FROM 1 FOR (CASE WHEN POSITION(',' IN s.comma_tags) = 0 THEN CHAR_LENGTH(s.comma_tags) ELSE POSITION(',' IN s.comma_tags)-1 END)) END
+                WHEN n = 2 THEN
+                  CASE
+                    WHEN POSITION(',' IN s.comma_tags) = 0 THEN NULL
+                    ELSE
+                      CASE
+                        WHEN POSITION(',' IN s.comma_tags, POSITION(',' IN s.comma_tags)+1) = 0 THEN SUBSTRING(s.comma_tags FROM POSITION(',' IN s.comma_tags) + 1)
+                        ELSE SUBSTRING(s.comma_tags FROM POSITION(',' IN s.comma_tags) + 1 FOR (POSITION(',' IN s.comma_tags, POSITION(',' IN s.comma_tags)+1) - POSITION(',' IN s.comma_tags) - 1))
+                      END
+                  END
+                WHEN n = 3 THEN
+                  NULL
+                WHEN n = 4 THEN NULL
+                WHEN n = 5 THEN NULL
+                WHEN n = 6 THEN NULL
+                ELSE NULL
+                END AS elem,
+                n
+              FROM (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6) nums, (SELECT s.comma_tags) s
+            ) parts
+            WHERE elem IS NOT NULL AND elem <> ''
+            ORDER BY n
+            LIMIT 6
+          ) derived_elems
+        )
+    END AS TopTags,
+    cb.Score,
+    cb.ViewCount,
+    cb.CreationDate,
+    cb.OwnerUserId,
+    (SELECT DisplayName FROM Users u WHERE u.Id = cb.OwnerUserId) AS OwnerDisplayName,
+    cb.LastActivityDate,
+    cb.AnswerCount,
+    cb.CommentCount,
+    cb.FavoriteCount,
+    cb.DraftCommentId,
+    cb.DraftCommentText,
+    cb.VoteTypes,
+    cb.CumulativeBounty
+  FROM complex_benchmark cb
+  LEFT JOIN Posts p ON p.Id = cb.PostId
+  LEFT JOIN Tags t ON t.ExcerptPostId = p.Id OR t.WikiPostId = p.Id
+  GROUP BY
+    cb.PostId, cb.Title, cb.Tags, cb.Score, cb.ViewCount, cb.CreationDate,
+    cb.OwnerUserId, cb.LastActivityDate, cb.AnswerCount, cb.CommentCount, cb.FavoriteCount,
+    cb.DraftCommentId, cb.DraftCommentText, cb.VoteTypes, cb.CumulativeBounty, p.Id
+)
+SELECT *
+FROM final_output
+ORDER BY CreationDate DESC
+LIMIT 100;

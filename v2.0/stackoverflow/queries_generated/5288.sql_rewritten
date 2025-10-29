@@ -1,0 +1,95 @@
+-- {"query": "5288.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 879} 
+WITH
+-- a) recent activity per user (most recent PostHistory in last 90 days)
+RecentActivity AS (
+  SELECT
+    ph.UserId,
+    MAX(ph.CreationDate) AS LastActivityDate,
+    COUNT(*) AS HistoryCount
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= cast('2024-10-01' as date) - INTERVAL '90 days'
+  GROUP BY ph.UserId
+),
+-- b) top users by reputation with derived score from badges
+UserBadgeScore AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    COALESCE(SUM(CASE WHEN b.Class = 1 THEN 100 ELSE 0 END),0) AS GoldScore,
+    COALESCE(SUM(CASE WHEN b.Class = 2 THEN 50 ELSE 0 END),0) AS SilverScore,
+    COALESCE(SUM(CASE WHEN b.Class = 3 THEN 25 ELSE 0 END),0) AS BronzeScore,
+    COALESCE(SUM(CASE WHEN b.TagBased = 1 THEN 10 ELSE 0 END),0) AS TagBadgeScore
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.Reputation
+),
+-- c) posts with complex predicates and windowing
+PostMetrics AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.ViewCount,
+    p.Score,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC, p.Score DESC, p.CreationDate DESC) AS RN
+  FROM Posts p
+  WHERE p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '365 days'
+    AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+),
+-- d) cross-join some tag relationships to inflate workload
+TagRelations AS (
+  SELECT
+    t.TagName,
+    t.ExcerptPostId,
+    t.WikiPostId
+  FROM Tags t
+  WHERE t.Count > 100
+),
+-- e) correlated subquery usage: for each post, compute number of related posts linked as duplicates
+DuplicateLinks AS (
+  SELECT
+    pl.PostId,
+    COUNT(*) AS DuplicateCount
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  WHERE lt.Name IN ('Duplicate')
+  GROUP BY pl.PostId
+)
+SELECT
+  -- select a mix of computed fields to stress the optimizer
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  ua.LastActivityDate,
+  ra.HistoryCount,
+  u.Reputation,
+  ub.GoldScore + ub.SilverScore + ub.BronzeScore + ub.TagBadgeScore AS BadgeImpact,
+  pm.PostId,
+  pm.Title,
+  pm.ViewCount,
+  pm.Score,
+  pm.CreationDate,
+  pm.LastActivityDate AS PostLastActivityDate,
+  pm.RN,
+  COALESCE(dl.DuplicateCount, 0) AS DuplicateCount,
+  tg.TagName
+FROM Users u
+LEFT JOIN RecentActivity ra ON ra.UserId = u.Id
+LEFT JOIN UserBadgeScore ub ON ub.UserId = u.Id
+LEFT JOIN PostMetrics pm ON pm.OwnerUserId = u.Id AND pm.RN = 1
+LEFT JOIN DuplicateLinks dl ON dl.PostId = pm.PostId
+LEFT JOIN LATERAL (
+  SELECT tg.TagName
+  FROM TagRelations tr
+  CROSS JOIN LATERAL (SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName) AS tg
+  WHERE tr.ExcerptPostId = pm.PostId OR tr.WikiPostId = pm.PostId
+  ORDER BY tg.TagName
+  LIMIT 1
+) AS tg ON TRUE
+WHERE u.AccountId IS NOT NULL
+  AND (u.Reputation > 1000 OR ra.HistoryCount > 20)
+ORDER BY BadgeImpact DESC, pm.Score DESC, pm.ViewCount DESC
+LIMIT 100;

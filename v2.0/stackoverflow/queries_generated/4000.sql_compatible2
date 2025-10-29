@@ -1,0 +1,126 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 2 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswersGiven,
+        AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score ELSE NULL END) AS AvgPostScore,
+        MAX(p.LastActivityDate) AS LastActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+),
+BadgeStats AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        STRING_AGG(b.Name, ', ') FILTER (WHERE b.Class = 1) AS GoldBadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TagUsage AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        t.TagName,
+        COUNT(*) AS TagCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC) AS rn
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT TRIM(BOTH '<>' FROM tag) AS Tag
+        FROM UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag
+    ) taglist
+    JOIN Tags t ON t.TagName = taglist.Tag
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, t.TagName
+),
+TopTags AS (
+    SELECT
+        UserId,
+        STRING_AGG(TagName, ', ') AS TopThreeTags
+    FROM TagUsage
+    WHERE rn <= 3
+    GROUP BY UserId
+),
+RecentVotes AS (
+    SELECT
+        v.UserId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END)   AS UpVotesGiven,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVotesGiven,
+        MAX(v.CreationDate)                             AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+Combined AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.Location,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.AcceptedAnswersGiven,
+        us.AvgPostScore,
+        us.LastActivityDate,
+        COALESCE(bs.GoldBadges,   0) AS GoldBadges,
+        COALESCE(bs.SilverBadges, 0) AS SilverBadges,
+        COALESCE(bs.BronzeBadges, 0) AS BronzeBadges,
+        bs.GoldBadgeNames,
+        COALESCE(tt.TopThreeTags, '') AS TopThreeTags,
+        COALESCE(rv.UpVotesGiven,   0) AS UpVotesGiven,
+        COALESCE(rv.DownVotesGiven, 0) AS DownVotesGiven,
+        rv.LastVoteDate,
+        RANK() OVER (ORDER BY us.Reputation DESC, COALESCE(bs.GoldBadges,0) DESC, us.AnswerCount DESC) AS ReputationRank,
+        CASE
+            WHEN us.Reputation > 10000 THEN 'Elite'
+            WHEN us.Reputation > 5000  THEN 'Power'
+            WHEN us.Reputation > 1000  THEN 'Contributor'
+            ELSE 'Newbie'
+        END AS ReputationTier
+    FROM UserStats us
+    LEFT JOIN BadgeStats   bs ON bs.UserId = us.Id
+    LEFT JOIN TopTags      tt ON tt.UserId = us.Id
+    LEFT JOIN RecentVotes  rv ON rv.UserId = us.Id
+)
+SELECT *
+FROM (
+    SELECT *
+    FROM Combined
+    WHERE (GoldBadges > 0 OR SilverBadges > 0)
+      AND (TopThreeTags <> '' OR ReputationTier = 'Elite')
+      AND (LastActivityDate IS NOT NULL
+           AND LastActivityDate > (DATE '2024-10-01' - INTERVAL '180' DAY))
+    ORDER BY ReputationRank ASC
+    LIMIT 100
+
+    UNION ALL
+
+    SELECT
+        NULL::integer AS Id,
+        'Summary' AS DisplayName,
+        NULL::integer AS Reputation,
+        NULL::text AS Location,
+        SUM(QuestionCount)          AS QuestionCount,
+        SUM(AnswerCount)            AS AnswerCount,
+        SUM(AcceptedAnswersGiven)   AS AcceptedAnswersGiven,
+        AVG(AvgPostScore)           AS AvgPostScore,
+        MAX(LastActivityDate)       AS LastActivityDate,
+        SUM(GoldBadges)             AS GoldBadges,
+        SUM(SilverBadges)           AS SilverBadges,
+        SUM(BronzeBadges)           AS BronzeBadges,
+        NULL::text AS GoldBadgeNames,
+        NULL::text AS TopThreeTags,
+        SUM(UpVotesGiven)           AS UpVotesGiven,
+        SUM(DownVotesGiven)         AS DownVotesGiven,
+        MAX(LastVoteDate)           AS LastVoteDate,
+        NULL::integer AS ReputationRank,
+        NULL::text AS ReputationTier
+    FROM Combined
+    WHERE ReputationTier IS NOT NULL
+) AS final;

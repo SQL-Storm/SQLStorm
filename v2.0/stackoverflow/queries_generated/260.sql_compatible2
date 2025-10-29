@@ -1,0 +1,343 @@
+with
+recent_active_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.location,
+         u.websiteurl,
+         u.creationdate,
+         u.lastaccessdate,
+         coalesce(nullif(trim(split_part(u.websiteurl, '/', 3)), ''), 'unknown.host') as website_host
+  from users u
+  where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '3 years' from users)
+),
+question_core as (
+  select p.id as question_id,
+         p.owneruserid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.title,
+         p.tags,
+         p.acceptedanswerid,
+         p.closeddate,
+         p.commentcount,
+         p.favoritecount
+  from posts p
+  where p.posttypeid = 1
+),
+answer_core as (
+  select a.id as answer_id,
+         a.parentid as question_id,
+         a.owneruserid,
+         a.creationdate,
+         a.score as answer_score
+  from posts a
+  where a.posttypeid = 2
+),
+q_activity as (
+  select q.question_id,
+         count(distinct c.id) filter (where c.id is not null) as comment_cnt,
+         count(distinct v.id) filter (where v.votetypeid = 2) as up_cnt,
+         count(distinct v.id) filter (where v.votetypeid = 3) as down_cnt,
+         count(distinct v.id) filter (where v.votetypeid in (8,9)) as bounty_events,
+         sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as total_bounty,
+         max(coalesce(c.creationdate, v.creationdate)) as last_engagement_at
+  from question_core q
+  left join comments c on c.postid = q.question_id
+  left join votes v on v.postid = q.question_id
+  group by q.question_id
+),
+a_activity as (
+  select a.question_id,
+         count(*) as answer_cnt,
+         count(*) filter (where a.answer_score > 0) as pos_ans_cnt,
+         max(a.answer_score) as best_answer_score,
+         max(a.creationdate) as last_answer_at
+  from answer_core a
+  group by a.question_id
+),
+dup_links as (
+  select pl.postid as duplicate_of,
+         count(*) filter (where pl.linktypeid = 3) as duplicate_marks,
+         count(*) filter (where pl.linktypeid = 1) as linked_refs
+  from postlinks pl
+  group by pl.postid
+),
+close_reasons as (
+  select ph.postid as question_id,
+         max(case when ph.posthistorytypeid = 10 then (case when ph.comment ~ '^[0-9]+$' then cast(ph.comment as integer) else null end) end) as last_close_reason_id,
+         max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_closed_at,
+         bool_or(ph.posthistorytypeid = 11) as ever_reopened
+  from posthistory ph
+  group by ph.postid
+),
+tag_explode as (
+  select q.question_id,
+         unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tagname
+  from question_core q
+),
+tag_metrics as (
+  select t.tagname,
+         count(*) as tag_q_count,
+         avg(qc.score) as avg_q_score,
+         avg(qc.viewcount) as avg_views
+  from tag_explode te
+  join question_core qc on qc.question_id = te.question_id
+  join tags t on t.tagname = te.tagname
+  group by t.tagname
+),
+user_badges as (
+  select b.userid,
+         count(*) as badge_cnt,
+         count(*) filter (where b.class = 1) as gold_cnt,
+         count(*) filter (where b.class = 2) as silver_cnt,
+         count(*) filter (where b.class = 3) as bronze_cnt,
+         max(b.date) as last_badge_at
+  from badges b
+  group by b.userid
+),
+question_owner as (
+  select q.question_id,
+         u.id as owner_id,
+         u.displayname as owner_name,
+         u.reputation as owner_rep,
+         ub.badge_cnt,
+         ub.gold_cnt,
+         ub.silver_cnt,
+         ub.bronze_cnt,
+         rank() over (order by u.reputation desc nulls last) as owner_rep_rank_global
+  from question_core q
+  left join users u on u.id = q.owneruserid
+  left join user_badges ub on ub.userid = u.id
+),
+quality_signals as (
+  select q.question_id,
+         q.score,
+         q.viewcount,
+         qa.answer_cnt,
+         qa.pos_ans_cnt,
+         qa.best_answer_score,
+         qa.last_answer_at,
+         qa.answer_cnt > 0 as has_answers,
+         (qa.answer_cnt = 0 and q.closeddate is null) as unanswered_open,
+         greatest(coalesce(qa.best_answer_score, 0), 0) as top_ans_score_nonneg,
+         coalesce(qa.answer_cnt, 0) + coalesce(qa.pos_ans_cnt, 0) as ans_activity
+  from question_core q
+  left join a_activity qa on qa.question_id = q.question_id
+),
+accepted_answer_latency as (
+  select q.question_id,
+         case
+           when q.acceptedanswerid is null then null
+           else (select a.creationdate - q.creationdate
+                 from answer_core a
+                 where a.answer_id = q.acceptedanswerid)
+         end as time_to_accepted
+  from question_core q
+),
+engagement_score as (
+  select q.question_id,
+         qa.comment_cnt,
+         qa.up_cnt,
+         qa.down_cnt,
+         qa.bounty_events,
+         qa.total_bounty,
+         qa.last_engagement_at,
+         (coalesce(qa.up_cnt,0)*2 - coalesce(qa.down_cnt,0)
+          + coalesce(qa.comment_cnt,0)*0.25
+          + coalesce(qa.bounty_events,0)*3
+          + least(coalesce(qa.total_bounty,0)/50.0, 20)) as engagement_score
+  from q_activity qa
+  join question_core q on q.question_id = qa.question_id
+),
+owner_activity_window as (
+  select q.question_id,
+         u.id as owner_id,
+         count(*) over (partition by u.id rows between unbounded preceding and unbounded following) as total_posts_by_owner,
+         sum(case when p.posttypeid = 1 then 1 else 0 end) over (partition by u.id) as total_questions_by_owner,
+         sum(case when p.posttypeid = 2 then 1 else 0 end) over (partition by u.id) as total_answers_by_owner,
+         avg(p.score) over (partition by u.id) as avg_owner_post_score
+  from question_core q
+  left join users u on u.id = q.owneruserid
+  left join posts p on p.owneruserid = u.id
+),
+recent_high_impact_questions as (
+  select q.question_id,
+         q.title,
+         q.tags,
+         q.creationdate,
+         coalesce(es.engagement_score, 0) as engagement_score,
+         qs.score,
+         qs.viewcount,
+         qs.ans_activity,
+         row_number() over (order by coalesce(es.engagement_score,0) desc, qs.viewcount desc, qs.score desc, q.creationdate desc) as rn
+  from question_core q
+  left join engagement_score es on es.question_id = q.question_id
+  left join quality_signals qs on qs.question_id = q.question_id
+  where q.creationdate >= (select date_trunc('year', max(creationdate)) - interval '2 years' from posts where posttypeid = 1)
+),
+domain_quality as (
+  select rau.website_host,
+         count(distinct q.question_id) as q_count,
+         avg(rhq.engagement_score) as avg_engagement,
+         percentile_cont(0.9) within group (order by rhq.engagement_score) as p90_engagement
+  from recent_active_users rau
+  join question_core q on q.owneruserid = rau.user_id
+  join recent_high_impact_questions rhq on rhq.question_id = q.question_id
+  group by rau.website_host
+),
+closed_stats as (
+  select q.question_id,
+         cr.last_close_reason_id,
+         crt.name as close_reason_name,
+         cr.last_closed_at,
+         cr.ever_reopened,
+         dl.duplicate_marks,
+         dl.linked_refs
+  from question_core q
+  left join close_reasons cr on cr.question_id = q.question_id
+  left join close_reason_types crt on crt.id = cr.last_close_reason_id
+  left join dup_links dl on dl.duplicate_of = q.question_id
+),
+tag_ranked as (
+  select te.question_id,
+         te.tagname,
+         tm.tag_q_count,
+         tm.avg_q_score,
+         dense_rank() over (partition by te.question_id order by tm.tag_q_count desc, tm.avg_q_score desc, te.tagname) as tag_rank
+  from tag_explode te
+  left join tag_metrics tm on tm.tagname = te.tagname
+),
+question_flags as (
+  select q.question_id,
+         case when q.viewcount is null or q.viewcount = 0 then 1 else 0 end as is_zero_view,
+         case when q.score < 0 then 1 else 0 end as is_neg_scored,
+         case when cs.last_close_reason_id in (101,1) then 1 else 0 end as is_duplicate_like,
+         case when cs.last_close_reason_id is not null then 1 else 0 end as is_closed,
+         case when qa.answer_cnt is null or qa.answer_cnt = 0 then 1 else 0 end as has_no_answers
+  from question_core q
+  left join a_activity qa on qa.question_id = q.question_id
+  left join closed_stats cs on cs.question_id = q.question_id
+),
+owner_rep_bucket as (
+  select qo.question_id,
+         case
+           when qo.owner_rep >= 100000 then 'legend'
+           when qo.owner_rep >= 50000 then 'elite'
+           when qo.owner_rep >= 10000 then 'expert'
+           when qo.owner_rep >= 1000 then 'intermediate'
+           when qo.owner_rep is null then 'unknown'
+           else 'novice'
+         end as owner_rep_bucket
+  from question_owner qo
+),
+final_scored as (
+  select q.question_id,
+         q.title,
+         q.tags,
+         q.creationdate,
+         qc.owner_name,
+         qc.owner_rep,
+         orb.owner_rep_bucket,
+         es.engagement_score,
+         qs.score as q_score,
+         qs.viewcount,
+         qs.has_answers,
+         aal.time_to_accepted,
+         cs.close_reason_name,
+         cs.duplicate_marks,
+         cs.linked_refs,
+         (coalesce(es.engagement_score,0)
+          + coalesce(qs.viewcount,0)/100.0
+          + coalesce(qs.score,0)*5
+          - coalesce(cs.duplicate_marks,0)*2
+          - case when cs.close_reason_name is not null then 10 else 0 end
+          + case when qs.has_answers then 3 else -1 end
+          + case when aal.time_to_accepted is not null then 5 / greatest(extract(epoch from aal.time_to_accepted)/3600.0, 1) else 0 end
+         ) as composite_score
+  from question_core q
+  left join question_owner qc on qc.question_id = q.question_id
+  left join owner_rep_bucket orb on orb.question_id = q.question_id
+  left join engagement_score es on es.question_id = q.question_id
+  left join quality_signals qs on qs.question_id = q.question_id
+  left join accepted_answer_latency aal on aal.question_id = q.question_id
+  left join closed_stats cs on cs.question_id = q.question_id
+),
+top_tag_context as (
+  select tr.question_id,
+         tr.tagname as top_tag,
+         tr.tag_q_count as top_tag_q_count,
+         tr.avg_q_score as top_tag_avg_score
+  from tag_ranked tr
+  where tr.tag_rank = 1
+),
+owner_rollup as (
+  select qc.owner_id,
+         count(*) as q_count,
+         avg(fs.composite_score) as avg_composite,
+         max(fs.composite_score) as max_composite,
+         min(fs.composite_score) as min_composite
+  from question_owner qc
+  join final_scored fs on fs.question_id = qc.question_id
+  group by qc.owner_id
+),
+owner_percentiles as (
+  select qc.owner_id,
+         percentile_cont(0.5) within group (order by fs.composite_score) as p50_composite,
+         percentile_cont(0.9) within group (order by fs.composite_score) as p90_composite
+  from question_owner qc
+  join final_scored fs on fs.question_id = qc.question_id
+  group by qc.owner_id
+),
+owner_enriched as (
+  select qc.owner_id,
+         qc.owner_name,
+         qc.owner_rep,
+         oru.q_count,
+         oru.avg_composite,
+         oru.max_composite,
+         oru.min_composite,
+         op.p50_composite,
+         op.p90_composite
+  from question_owner qc
+  left join owner_rollup oru on oru.owner_id = qc.owner_id
+  left join owner_percentiles op on op.owner_id = qc.owner_id
+),
+final as (
+  select fs.question_id,
+         fs.title,
+         fs.tags,
+         fs.creationdate,
+         fs.owner_name,
+         fs.owner_rep,
+         fs.owner_rep_bucket,
+         fs.engagement_score,
+         fs.q_score,
+         fs.viewcount,
+         fs.has_answers,
+         fs.time_to_accepted,
+         fs.close_reason_name,
+         fs.duplicate_marks,
+         fs.linked_refs,
+         fs.composite_score,
+         coalesce(ttc.top_tag, '(none)') as top_tag,
+         ttc.top_tag_q_count,
+         ttc.top_tag_avg_score,
+         oe.q_count as owner_total_questions,
+         oe.avg_composite as owner_avg_composite,
+         oe.p90_composite as owner_p90_composite
+  from final_scored fs
+  left join top_tag_context ttc on ttc.question_id = fs.question_id
+  left join owner_enriched oe on oe.owner_id = (select owneruserid from posts where id = fs.question_id)
+)
+select *
+from final
+where composite_score is not null
+  and (close_reason_name is null or close_reason_name not ilike '%off-topic%')
+  and (tags is null or position('java' in coalesce(tags,'')) = 0 or viewcount > 1000)
+  and case when has_answers then 1 else 0 end = 1
+  and (extract(month from creationdate) in (1,4,7,10) or q_score > 0)
+order by composite_score desc nulls last, engagement_score desc nulls last, viewcount desc, question_id
+limit 500;

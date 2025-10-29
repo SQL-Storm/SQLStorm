@@ -1,0 +1,167 @@
+-- {"query": "1043.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2468} 
+
+WITH UserEngagement AS (
+    -- CTE 1: Summarize user engagement and badge counts for active users
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        MAX(P.CreationDate) AS LatestPostCreationDate,
+        AVG(P.Score) FILTER (WHERE P.Score IS NOT NULL AND P.OwnerUserId IS NOT NULL) AS AvgOwnPostScore,
+        COUNT(B.Id) AS TotalBadgesAwarded,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesCount,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesCount
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN
+        Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.Views
+    HAVING
+        COUNT(DISTINCT P.Id) > 5 AND U.Reputation > 1000 AND U.Views > 50
+),
+PostHistoricalMetrics AS (
+    -- CTE 2: Analyze post history for edit frequency, close/reopen activity, and migration status
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        COUNT(PH.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) AND PH.UserId = P.OwnerUserId THEN 1 ELSE 0 END) AS OwnerEditCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS CloseEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (35, 36) THEN 1 ELSE 0 END) AS MigrationEvents,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)) AS LastContentEditDate,
+        MIN(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105)) AS FirstClosedDate
+    FROM
+        Posts P
+    LEFT JOIN
+        PostHistory PH ON P.Id = PH.PostId
+    WHERE
+        P.PostTypeId IN (1, 2) -- Only questions or answers
+    GROUP BY
+        P.Id, P.OwnerUserId, P.PostTypeId, P.CreationDate, P.LastEditDate, P.LastActivityDate, P.ClosedDate, P.CommunityOwnedDate
+    HAVING
+        COUNT(PH.Id) > 0 -- Ensure there's some history
+),
+PostLinkagesAndVotes AS (
+    -- CTE 3: Analyze post linkages, vote counts, favorite counts, and related answer scores for questions
+    SELECT
+        PQ.Id AS PostId,
+        PQ.OwnerUserId, -- Required for joining back to UserEngagement
+        PQ.PostTypeId,
+        PQ.Score AS PostScore,
+        PQ.ViewCount,
+        PQ.FavoriteCount,
+        PQ.AnswerCount,
+        PQ.Title,
+        PQ.Tags,
+        SUM(CASE WHEN PV.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN PV.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        COUNT(PL.Id) AS TotalLinks,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedFromThisPost,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatedThisPost,
+        COALESCE(AVG(PA.Score) FILTER (WHERE PA.Score IS NOT NULL AND PA.PostTypeId = 2), 0) AS AvgAnswerScoreForQuestion, -- Avg score of answers to this post
+        COUNT(DISTINCT PA.Id) AS NumberOfAnswersForQuestion
+    FROM
+        Posts PQ
+    LEFT JOIN
+        Votes PV ON PQ.Id = PV.PostId
+    LEFT JOIN
+        PostLinks PL ON PQ.Id = PL.PostId
+    LEFT JOIN
+        Posts PA ON PQ.Id = PA.ParentId AND PA.PostTypeId = 2 -- Answers to this post
+    WHERE
+        PQ.PostTypeId IN (1, 2) -- Questions or Answers
+    GROUP BY
+        PQ.Id, PQ.OwnerUserId, PQ.PostTypeId, PQ.Score, PQ.ViewCount, PQ.FavoriteCount, PQ.AnswerCount, PQ.Title, PQ.Tags
+)
+-- Main Query: Identify highly influential users and their impactful posts with detailed analytics
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.TotalQuestionsOwned,
+    UE.TotalAnswersOwned,
+    UE.GoldBadgesCount,
+    UE.SilverBadgesCount,
+    PHM.PostId,
+    PHM.PostTypeId,
+    PLV.Title,
+    PLV.PostScore,
+    PLV.ViewCount,
+    PLV.UpVotesReceived,
+    PLV.DownVotesReceived,
+    PLV.TotalLinks,
+    PLV.LinkedFromThisPost,
+    PLV.DuplicatedThisPost,
+    PHM.OwnerEditCount,
+    PHM.CloseEvents,
+    PHM.ReopenEvents,
+    PHM.MigrationEvents,
+    PLV.AvgAnswerScoreForQuestion,
+    PLV.NumberOfAnswersForQuestion,
+    (PLV.UpVotesReceived - PLV.DownVotesReceived) AS NetVotes,
+    (EXTRACT(EPOCH FROM (COALESCE(PHM.LastContentEditDate, PHM.PostCreationDate) - PHM.PostCreationDate)) / (3600 * 24)) AS DaysSinceCreationToLastEdit,
+    COALESCE(NULLIF(PLV.FavoriteCount, 0), 0) AS NonZeroFavoriteCount,
+    CASE
+        WHEN PHM.ClosedDate IS NOT NULL AND PHM.ReopenEvents > 0 THEN 'Closed and Reopened'
+        WHEN PHM.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN PHM.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN PHM.MigrationEvents > 0 THEN 'Migrated'
+        ELSE 'Active'
+    END AS PostLifecycleStatus,
+    LENGTH(PLV.Title) AS TitleLength,
+    TRIM(BOTH '<>' FROM PLV.Tags) AS CleanedTagsString, -- Remove leading/trailing < and > from tags string
+    -- Window functions for ranking and temporal analysis
+    RANK() OVER (PARTITION BY UE.UserId ORDER BY PLV.PostScore DESC, PLV.ViewCount DESC) AS RankByUserPostScore,
+    NTILE(100) OVER (ORDER BY UE.Reputation DESC, UE.TotalPostsOwned DESC, UE.GoldBadgesCount DESC) AS UserInfluencePercentile,
+    LAG(PHM.PostCreationDate, 1, '1970-01-01 00:00:00'::timestamp) OVER (PARTITION BY UE.UserId ORDER BY PHM.PostCreationDate) AS PreviousPostCreationDateOfUser,
+    -- Correlated subquery to find the average comment score for *this specific post*
+    (SELECT COALESCE(AVG(C.Score), 0) FROM Comments C WHERE C.PostId = PHM.PostId AND C.CreationDate BETWEEN PHM.PostCreationDate AND PHM.LastActivityDate) AS AvgRelevantCommentScore,
+    -- Subquery for overall average post score of users within a similar reputation range
+    (SELECT COALESCE(AVG(SubQ.PostScore), 0)
+     FROM PostLinkagesAndVotes SubQ
+     JOIN UserEngagement SubUE ON SubQ.OwnerUserId = SubUE.UserId
+     WHERE SubUE.Reputation BETWEEN UE.Reputation - 2500 AND UE.Reputation + 2500
+       AND SubQ.PostTypeId = PHM.PostTypeId
+       AND SubUE.UserId <> UE.UserId -- Exclude the current user from their own rep range avg
+    ) AS AvgPostScoreInSimilarRepRange
+FROM
+    UserEngagement UE
+JOIN
+    PostHistoricalMetrics PHM ON UE.UserId = PHM.OwnerUserId
+JOIN
+    PostLinkagesAndVotes PLV ON PHM.PostId = PLV.PostId AND PHM.OwnerUserId = PLV.OwnerUserId
+WHERE
+    (
+        (PLV.PostTypeId = 1 AND PLV.AnswerCount > 0 AND PLV.AvgAnswerScoreForQuestion > 10 AND PLV.ViewCount > 5000) -- Popular questions with good answers
+        OR
+        (PLV.PostTypeId = 2 AND PLV.UpVotesReceived > (PLV.DownVotesReceived * 2) AND PLV.PostScore > 20) -- Highly acclaimed answers
+    )
+    AND
+    PHM.OwnerEditCount > 1 -- User has edited their own post more than once
+    AND
+    (PLV.Tags LIKE '%<sql>%' OR PLV.Tags LIKE '%<database>%' OR PLV.Tags LIKE '%<performance>%') -- Filter by relevant tags
+    AND
+    PHM.CloseEvents = 0 -- Exclude posts that were closed
+    AND
+    NOT EXISTS (SELECT 1 FROM Badges B WHERE B.UserId = UE.UserId AND B.Name IN ('Copy Editor', 'Reviewer')) -- Exclude users known for editing/reviewing others' posts (for distinct focus)
+ORDER BY
+    UE.Reputation DESC, NetVotes DESC, PHM.OwnerEditCount DESC, PLV.ViewCount DESC
+LIMIT 7500;

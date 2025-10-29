@@ -1,0 +1,145 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate as PostCreationDate,
+        lead(p.CreationDate) over (partition by u.Id order by p.CreationDate) as NextPostDate,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+), UserPostIntervals as (
+    select
+        UserId,
+        DisplayName,
+        Reputation,
+        PostId,
+        PostTypeId,
+        Score,
+        ViewCount,
+        PostCreationDate,
+        NextPostDate,
+        coalesce(julianday(NextPostDate) - julianday(PostCreationDate), 0) as DaysToNextPost,
+        RecentPostRank
+    from RecursiveUserActivity
+), Top10UsersByActivity as (
+    select distinct UserId, DisplayName, Reputation
+    from UserPostIntervals
+    order by (select count(*) from Posts p2 where p2.OwnerUserId = UserId) desc
+    limit 10
+), UserBadgesWithWindow as (
+    select
+        b.UserId,
+        ub.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        row_number() over (partition by b.UserId order by b.Date desc) as BadgeRank
+    from Badges b
+    join Users ub on ub.Id = b.UserId
+    where b.Class in (1,2) and b.Date > '2018-01-01'
+), DistinguishedUsers as (
+    select distinct u.UserId, u.DisplayName, u.Reputation
+    from Top10UsersByActivity u
+    join UserBadgesWithWindow bw on bw.UserId = u.UserId and bw.BadgeRank <= 3
+), QuestionAnswerStats as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        p.CreationDate as QuestionDate,
+        count(a.Id) as AnswerCount,
+        avg(coalesce(a.Score,0)) as AvgAnswerScore,
+        sum(case when a.Score >= 10 then 1 else 0 end) as HighScoreAnswerCount,
+        max(a.Score) as MaxAnswerScore
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1 and p.CreationDate >= '2020-01-01'
+    group by p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate
+), UserQuestionAnswers as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        qa.QuestionId,
+        qa.AnswerCount,
+        qa.AvgAnswerScore,
+        qa.HighScoreAnswerCount,
+        qa.MaxAnswerScore,
+        qa.QuestionScore,
+        qa.ViewCount,
+        qa.QuestionDate
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 2
+    join QuestionAnswerStats qa on qa.QuestionId = p.ParentId
+    where u.Reputation > 5000
+), UserScoreWindows as (
+    select
+        UserId,
+        DisplayName,
+        sum(AnswerCount) over (partition by UserId) as TotalAnswers,
+        avg(AvgAnswerScore) over (partition by UserId) as AverageAnswerScore,
+        sum(HighScoreAnswerCount) over (partition by UserId) as TotalHighScoreAnswers,
+        max(MaxAnswerScore) over (partition by UserId) as MaxAnswerScoreOverall
+    from UserQuestionAnswers
+), CloseReasonCounts as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseVotesCount
+    from PostHistory ph
+    left join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+), PostsWithCloseInfo as (
+    select
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        crc.CloseReasonName,
+        crc.CloseVotesCount
+    from Posts p
+    left join CloseReasonCounts crc on crc.PostId = p.Id
+), FinalOutput as (
+    select distinct
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        case when u.WebsiteUrl is not null and length(u.WebsiteUrl) > 0 then
+            lower(substring(u.WebsiteUrl from 'https?://([^/]+)')) else 'no_website' end as WebsiteDomain,
+        ub.BadgeName,
+        ub.Class as BadgeClass,
+        pq.AnswerCount,
+        pq.AvgAnswerScore,
+        pq.HighScoreAnswerCount,
+        pq.MaxAnswerScore,
+        pwc.CloseReasonName,
+        pwc.CloseVotesCount,
+        rank() over (partition by u.Id order by pq.AnswerCount desc, pq.AvgAnswerScore desc) as RankByAnswers,
+        coalesce(l.PropensityToUpVote, 0) as UserUpvotePropensity
+    from Users u
+    left join UserBadgesWithWindow ub on ub.UserId = u.Id and ub.BadgeRank = 1
+    left join UserQuestionAnswers pq on pq.UserId = u.Id
+    left join PostsWithCloseInfo pwc on pwc.Id = pq.QuestionId
+    left join (
+        select
+            v.UserId,
+            cast(count(case when vt.Name = 'UpMod' then 1 end) as float) /
+            nullif(count(v.Id),0) as PropensityToUpVote
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        where v.UserId is not null
+        group by v.UserId
+    ) l on l.UserId = u.Id
+    where u.Reputation > 1000
+)
+select *
+from FinalOutput
+where AnswerCount is not null
+order by Reputation desc, AnswerCount desc
+limit 100;

@@ -1,0 +1,188 @@
+with recursive RecursiveTags as (
+    select 
+        p.Id as PostId,
+        trim(tag.value) as Tag,
+        1 as Level
+    from 
+        Posts p
+        cross join lateral unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) as tag(value)
+    where p.PostTypeId = 1 and p.Tags is not null
+    union all
+    select
+        rt.PostId,
+        trim(rt.Tag) || '_ext' as Tag,
+        rt.Level + 1
+    from RecursiveTags rt
+    where rt.Level < 2
+),
+UserBadgeCounts as (
+    select 
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationStats as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(ubc_g.GoldCount, 0) as GoldBadges,
+        coalesce(ubc_s.SilverCount, 0) as SilverBadges,
+        coalesce(ubc_b.BronzeCount, 0) as BronzeBadges,
+        rank() over (order by u.Reputation desc) as RepRank,
+        dense_rank() over (partition by coalesce(u.Location, 'Unknown') order by u.Reputation desc) as LocationRepRank,
+        u.Location
+    from Users u
+    left join (
+        select UserId, BadgeCount as GoldCount from UserBadgeCounts where Class = 1
+    ) ubc_g on ubc_g.UserId = u.Id
+    left join (
+        select UserId, BadgeCount as SilverCount from UserBadgeCounts where Class = 2
+    ) ubc_s on ubc_s.UserId = u.Id
+    left join (
+        select UserId, BadgeCount as BronzeCount from UserBadgeCounts where Class = 3
+    ) ubc_b on ubc_b.UserId = u.Id
+),
+PostAnswerDetails as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        q.OwnerUserId,
+        q.Score as QuestionScore,
+        count(a.Id) filter (where a.Id is not null) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        min(a.CreationDate) as FirstAnswerDate,
+        max(a.CreationDate) as LastAnswerDate,
+        string_agg(distinct rt.Tag, ',' order by rt.Tag) as Tags,
+        case when q.ClosedDate is not null then 1 else 0 end as IsClosed
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join RecursiveTags rt on rt.PostId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.OwnerUserId, q.Score, q.ClosedDate
+),
+UserActivityWindow as (
+    select 
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        lag(ph.CreationDate) over (partition by ph.UserId order by ph.CreationDate) as PreviousEditDate,
+        lead(ph.CreationDate) over (partition by ph.UserId order by ph.CreationDate) as NextEditDate,
+        case 
+            when ph.PostHistoryTypeId in (10,12) then 1 else 0 
+        end as IsClosedOrDeleted
+    from PostHistory ph
+    where ph.UserId is not null
+),
+FilteredPostLinks as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where lt.Name in ('Duplicate', 'Linked')
+),
+HighImpactPosts as (
+    select 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.CreationDate,
+        case 
+            when p.Score > 100 then 'High'
+            when p.Score between 50 and 100 then 'Medium'
+            else 'Low'
+        end as ImpactLevel
+    from Posts p
+    where p.PostTypeId = 1 and p.Score is not null
+),
+AllUserQuestionsAnswers as (
+    select u.Id as UserId, p.Id as PostId, p.PostTypeId, p.Score, p.CreationDate
+    from Users u 
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1, 2)
+)
+select 
+    hq.QuestionId,
+    hq.Title,
+    hq.Tags,
+    hq.AnswerCount,
+    hq.MaxAnswerScore,
+    cast(hq.AvgAnswerScore as numeric(10,2)) as AvgAnswerScore,
+    hq.QuestionScore,
+    hq.IsClosed,
+    urs.DisplayName as OwnerName,
+    urs.Reputation as OwnerReputation,
+    urs_gold.GoldBadges,
+    urs_silver.SilverBadges,
+    urs_bronze.BronzeBadges,
+    urs.LocationRepRank,
+    hl.ViewCount,
+    hl.ImpactLevel,
+    coalesce(lkdups.DuplicateCount,0) as DuplicateLinks,
+    coalesce(lklinks.LinkedCount,0) as LinkedCount,
+    lastActivity.LastEditDate,
+    pg.CommentCount,
+    case 
+        when hq.AnswerCount > 0 and pg.FavoriteCount is null then 'Popular Question Without Favorites' 
+        when pg.FavoriteCount is not null then 'Favorited Question' 
+        else 'Unfavored and Unanswered'
+    end as PopularityStatus,
+    case when urs.Location is null then 'Unknown' else urs.Location end as OwnerLocation
+from PostAnswerDetails hq
+join Users urs on urs.Id = hq.OwnerUserId
+left join (
+    select u.Id, u.DisplayName, u.Reputation, coalesce(ubc_g.GoldCount,0) as GoldBadges, coalesce(ubc_s.SilverCount,0) as SilverBadges, coalesce(ubc_b.BronzeCount,0) as BronzeBadges, dense_rank() over (partition by coalesce(u.Location,'Unknown') order by u.Reputation desc) as LocationRepRank, u.Location
+    from Users u
+    left join (select UserId, BadgeCount as GoldCount from UserBadgeCounts where Class = 1) ubc_g on ubc_g.UserId = u.Id
+    left join (select UserId, BadgeCount as SilverCount from UserBadgeCounts where Class = 2) ubc_s on ubc_s.UserId = u.Id
+    left join (select UserId, BadgeCount as BronzeCount from UserBadgeCounts where Class = 3) ubc_b on ubc_b.UserId = u.Id
+) urs_combined on urs_combined.Id = urs.Id
+left join Posts pg on pg.Id = hq.QuestionId
+left join HighImpactPosts hl on hl.Id = hq.QuestionId
+left join (
+    select PostId, count(*) as DuplicateCount
+    from FilteredPostLinks
+    where LinkTypeName = 'Duplicate'
+    group by PostId
+) lkdups on lkdups.PostId = hq.QuestionId
+left join (
+    select PostId, count(*) as LinkedCount
+    from FilteredPostLinks
+    where LinkTypeName = 'Linked'
+    group by PostId
+) lklinks on lklinks.PostId = hq.QuestionId
+left join (
+    select p_inner.Id as PostId, max(p_inner.LastEditDate) as LastEditDate
+    from Posts p_inner
+    group by p_inner.Id
+) lastActivity on lastActivity.PostId = hq.QuestionId
+left join (
+    select Id, coalesce(GoldBadges,0) as GoldBadges, coalesce(SilverBadges,0) as SilverBadges, coalesce(BronzeBadges,0) as BronzeBadges, LocationRepRank
+    from UserReputationStats
+) urs_gold on urs_gold.Id = urs.Id
+left join (
+    select Id, SilverBadges
+    from UserReputationStats
+) urs_silver on urs_silver.Id = urs.Id
+left join (
+    select Id, BronzeBadges
+    from UserReputationStats
+) urs_bronze on urs_bronze.Id = urs.Id
+where 
+    (
+        (hq.QuestionScore > 10 and hq.AnswerCount >= 3 and (hq.MaxAnswerScore > hq.QuestionScore or hq.MaxAnswerScore is null))
+        or (hq.IsClosed = 0 and hq.QuestionCreationDate > (timestamp '2024-10-01 12:34:56' - interval '180 days'))
+    )
+    and (
+        urs.Reputation >= 1000 or coalesce(urs_gold.GoldBadges,0) >= 1 or coalesce(urs_silver.SilverBadges,0) >= 3
+    )
+order by hq.QuestionScore desc, hq.AnswerCount desc, urs.Reputation desc
+limit 100;

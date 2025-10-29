@@ -1,0 +1,115 @@
+WITH
+RecentPosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.LastActivityDate,
+    p.LastEditDate,
+    p.CommentCount,
+    p.FavoriteCount
+  FROM Posts p
+  WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days')
+),
+TopTagRelated AS (
+  SELECT
+    p.Id AS PostId,
+    t.TagName AS Tag,
+    (SELECT COUNT(*) FROM Posts q WHERE q.Tags LIKE '%' || t.TagName || '%' ) AS TagPostCount
+  FROM RecentPosts p
+  CROSS JOIN LATERAL (
+    SELECT UNNEST(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS TagName
+  ) t
+),
+RankedRelated AS (
+  SELECT
+    r.PostId,
+    r.Tag,
+    r.TagPostCount,
+    ROW_NUMBER() OVER (
+      PARTITION BY r.PostId
+      ORDER BY r.TagPostCount DESC,
+               COALESCE((
+                 SELECT MAX(v.CreationDate)
+                 FROM Posts v
+                 WHERE v.Id = r.PostId
+               ), (SELECT rp.CreationDate FROM RecentPosts rp WHERE rp.Id = r.PostId)) DESC
+    ) AS rn
+  FROM TopTagRelated r
+),
+UserStats AS (
+  SELECT
+    up.Id AS UserId,
+    up.DisplayName,
+    up.Reputation,
+    up.CreationDate AS UserCreationDate,
+    up.LastAccessDate,
+    up.Views,
+    up.UpVotes,
+    up.DownVotes,
+    up.AccountId,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    MAX(v.CreationDate) AS LastVoteDate
+  FROM Users up
+  LEFT JOIN Posts p ON p.OwnerUserId = up.Id
+  LEFT JOIN Comments c ON c.UserId = up.Id
+  LEFT JOIN Votes v ON v.UserId = up.Id
+  GROUP BY up.Id, up.DisplayName, up.Reputation, up.CreationDate, up.LastAccessDate, up.Views, up.UpVotes, up.DownVotes, up.AccountId
+),
+Metrics AS (
+  SELECT
+    r.PostId,
+    r.Tag,
+    r.TagPostCount,
+    ROUND(COALESCE(p.Score, 0) * 1.0 / NULLIF(p.ViewCount, 0), 6) AS ScorePerView,
+    CASE
+      WHEN p.ViewCount IS NULL THEN NULL
+      WHEN p.ViewCount < 100 THEN 'low-traffic'
+      WHEN p.ViewCount < 1000 THEN 'mid-traffic'
+      ELSE 'high-traffic'
+    END AS TrafficBucket,
+    LENGTH(p.Title) AS TitleLength,
+    (CASE WHEN p.Body IS NOT NULL THEN LENGTH(p.Body) ELSE 0 END) AS BodyLength
+  FROM RankedRelated r
+  JOIN RecentPosts p ON p.Id = r.PostId
+  WHERE r.rn = 1
+)
+SELECT
+  m.PostId,
+  m.Tag,
+  m.TagPostCount,
+  m.ScorePerView,
+  m.TrafficBucket,
+  m.TitleLength,
+  m.BodyLength,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation,
+  u.LastAccessDate AS OwnerLastAccess,
+  us.CommentCount,
+  us.LastVoteDate
+FROM Metrics m
+LEFT JOIN Posts p ON p.Id = m.PostId
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN UserStats us ON us.UserId = u.Id
+GROUP BY
+  m.PostId,
+  m.Tag,
+  m.TagPostCount,
+  m.ScorePerView,
+  m.TrafficBucket,
+  m.TitleLength,
+  m.BodyLength,
+  u.DisplayName,
+  u.Reputation,
+  u.LastAccessDate,
+  us.CommentCount,
+  us.LastVoteDate
+ORDER BY m.TagPostCount DESC, m.ScorePerView DESC
+LIMIT 100;

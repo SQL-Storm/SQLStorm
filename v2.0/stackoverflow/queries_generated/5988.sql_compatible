@@ -1,0 +1,145 @@
+WITH TopPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.PostTypeId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.ViewCount > 0
+),
+RecentActivity AS (
+  SELECT
+    t.PostId,
+    t.Title,
+    t.CreationDate,
+    t.LastActivityDate,
+    t.ViewCount,
+    t.Score,
+    t.OwnerUserId,
+    t.CommentCount,
+    t.FavoriteCount,
+    t.Tags,
+    t.ContentLicense,
+    ROW_NUMBER() OVER (PARTITION BY t.OwnerUserId ORDER BY t.LastActivityDate DESC, t.Score DESC) AS user_rank
+  FROM TopPosts t
+),
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.Location,
+    u.AccountId,
+    (COALESCE(u.Views,0) * 1.0
+     + COALESCE(u.UpVotes,0) * 2.0
+     - COALESCE(u.DownVotes,0) * 1.5) AS ActivityScore
+  FROM Users u
+),
+Combined AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.CreationDate,
+    r.LastActivityDate,
+    r.ViewCount,
+    r.Score,
+    r.OwnerUserId,
+    r.CommentCount,
+    r.FavoriteCount,
+    r.Tags,
+    r.ContentLicense,
+    u.UserId,
+    u.DisplayName AS UserDisplayName,
+    u.Reputation,
+    u.UserCreationDate,
+    u.LastAccessDate,
+    u.ActivityScore,
+    r.user_rank
+  FROM RecentActivity r
+  LEFT JOIN UserStats u
+    ON r.OwnerUserId = u.UserId
+),
+TagPairs AS (
+  SELECT
+    c.*,
+    t.Tag
+  FROM Combined c,
+  LATERAL (
+    SELECT regexp_split_to_table(
+      -- remove outer angle brackets if present, then split on '><'
+      REGEXP_REPLACE(c.Tags, '^<|>$', '', 'g'),
+      '><'
+    ) AS Tag
+  ) t
+)
+SELECT
+  c.PostId,
+  c.Title,
+  c.CreationDate,
+  c.LastActivityDate,
+  c.ViewCount,
+  c.Score,
+  c.OwnerUserId,
+  c.CommentCount,
+  c.FavoriteCount,
+  c.Tags,
+  c.ContentLicense,
+  c.UserId,
+  c.UserDisplayName,
+  c.Reputation,
+  c.UserCreationDate,
+  c.LastAccessDate,
+  c.ActivityScore,
+  c.user_rank,
+  tp.Tag,
+  CASE
+    WHEN c.Reputation IS NULL THEN 0
+    ELSE c.Reputation * 0.75
+  END AS AdjustedReputation,
+  (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = c.PostId AND v.VoteTypeId = 9) AS AvgBountyOnPost,
+  (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = c.OwnerUserId AND p2.PostTypeId = 1) AS OtherQuestionsByUser,
+  (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.PostId = c.PostId) AS LastVoteDate
+FROM Combined c
+LEFT JOIN TagPairs tp ON tp.PostId = c.PostId
+LEFT JOIN (SELECT 1 AS dummy) d ON true
+GROUP BY
+  c.PostId,
+  c.Title,
+  c.CreationDate,
+  c.LastActivityDate,
+  c.ViewCount,
+  c.Score,
+  c.OwnerUserId,
+  c.CommentCount,
+  c.FavoriteCount,
+  c.Tags,
+  c.ContentLicense,
+  c.UserId,
+  c.UserDisplayName,
+  c.Reputation,
+  c.UserCreationDate,
+  c.LastAccessDate,
+  c.ActivityScore,
+  c.user_rank,
+  tp.Tag,
+  d.dummy
+ORDER BY c.user_rank ASC, c.LastActivityDate DESC, c.ViewCount DESC
+LIMIT 100;

@@ -1,0 +1,274 @@
+-- {"query": "1731.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3529} 
+WITH UserBaseStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        DATE_PART('day', COALESCE(cast('2024-10-01 12:34:56' as timestamp), U.LastAccessDate) - U.CreationDate) AS DaysSinceCreation,
+        CASE
+            WHEN U.Reputation >= 100000 THEN 'Legend'
+            WHEN U.Reputation >= 20000 THEN 'Expert'
+            WHEN U.Reputation >= 5000 THEN 'Advanced'
+            WHEN U.Reputation >= 1000 THEN 'Intermediate'
+            ELSE 'Novice'
+        END AS ReputationTier
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        U.Views, U.UpVotes, U.DownVotes
+),
+PostQualityMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.AcceptedAnswerId,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.Title,
+        P.Tags,
+        (SELECT AVG(C_sub.Score) FROM Comments C_sub WHERE C_sub.PostId = P.Id) AS AvgCommentScore,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceived,
+        COALESCE(P.Score * 1.0 / NULLIF(P.ViewCount, 0), 0) AS ScoreToViewRatio,
+        COALESCE(P.AnswerCount * 1.0 / NULLIF(P.ViewCount, 0), 0) AS AnswerToViewRatio,
+        CASE
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN TRUE
+            ELSE FALSE
+        END AS HasAcceptedAnswer,
+        DATE_PART('day', COALESCE(P.LastEditDate, P.CreationDate) - P.CreationDate) AS DaysUntilLastEdit,
+        DATE_PART('day', COALESCE(P.LastActivityDate, P.CreationDate) - P.CreationDate) AS DaysUntilLastActivity,
+        LENGTH(P.Body) - LENGTH(REPLACE(P.Body, ' ', '')) + 1 AS BodyWordCount,
+        COUNT(DISTINCT PL_OUT.RelatedPostId) AS OutgoingLinks,
+        COUNT(DISTINCT PL_IN.PostId) AS IncomingLinks
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN PostLinks PL_OUT ON P.Id = PL_OUT.PostId
+    LEFT JOIN PostLinks PL_IN ON P.Id = PL_IN.RelatedPostId
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount,
+        P.AnswerCount, P.CommentCount, P.FavoriteCount, P.AcceptedAnswerId,
+        P.LastEditDate, P.LastActivityDate, P.ClosedDate, P.CommunityOwnedDate,
+        P.Title, P.Tags, P.Body
+),
+TagTrendAnalysis AS (
+    SELECT
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS TaggedPostsCount,
+        AVG(P.Score) AS AvgTagScore,
+        SUM(CASE WHEN P.ClosedDate IS NOT NULL AND P.PostTypeId = 1 THEN 1 ELSE 0 END) AS ClosedQuestionsInTag,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsInTag,
+        COALESCE(SUM(CASE WHEN P.ClosedDate IS NOT NULL AND P.PostTypeId = 1 THEN 1 ELSE 0 END) * 1.0 / NULLIF(SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END), 0), 0) AS TagClosureRate,
+        RANK() OVER (ORDER BY COUNT(DISTINCT P.Id) DESC, T.TagName) AS TagPopularityRank
+    FROM Tags T
+    JOIN Posts P ON P.Tags LIKE CONCAT('%<', T.TagName, '>%' )
+    WHERE P.PostTypeId = 1
+    GROUP BY T.TagName
+),
+PostHistoryInsights AS (
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PHT.Name LIKE 'Edit %' THEN 1 ELSE NULL END) AS EditCount,
+        COUNT(CASE WHEN PHT.Name = 'Post Reopened' THEN 1 ELSE NULL END) AS ReopenCount,
+        COUNT(CASE WHEN PHT.Name = 'Post Deleted' THEN 1 ELSE NULL END) AS DeleteCount,
+        MIN(CASE WHEN PHT.Name LIKE 'Edit %' THEN PH.CreationDate ELSE NULL END) AS FirstEditDate,
+        MAX(PH.CreationDate) AS LastHistoryEventDate,
+        MAX(CASE WHEN PHT.Name LIKE 'Edit %' THEN PH.UserId ELSE NULL END) AS LastEditorUserIdFromHistory,
+        MAX(CASE WHEN PHT.Name = 'Post Closed' AND PH.Comment ~ '^[0-9]+$' THEN CRT.Name ELSE NULL END) AS MostRecentCloseReason,
+        COUNT(DISTINCT PH.RevisionGUID) AS UniqueRevisions
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    LEFT JOIN CloseReasonTypes CRT ON PHT.Name = 'Post Closed' AND PH.Comment ~ '^[0-9]+$' AND PH.Comment::smallint = CRT.Id
+    GROUP BY PH.PostId
+),
+CombinedPostAnalysis AS (
+    SELECT
+        PQ.PostId,
+        PQ.PostTypeId,
+        PQ.OwnerUserId,
+        PQ.PostCreationDate,
+        PQ.PostScore,
+        PQ.ViewCount,
+        PQ.AnswerCount,
+        PQ.PostCommentCount,
+        PQ.FavoriteCount,
+        PQ.HasAcceptedAnswer,
+        PQ.DaysUntilLastEdit,
+        PQ.DaysUntilLastActivity,
+        PQ.BodyWordCount,
+        PQ.AvgCommentScore,
+        PQ.TotalUpVotesReceived,
+        PQ.TotalDownVotesReceived,
+        COALESCE(PQ.ScoreToViewRatio, 0) AS ScoreToViewRatio,
+        COALESCE(PQ.AnswerToViewRatio, 0) AS AnswerToViewRatio,
+        COALESCE(PHI.EditCount, 0) AS PostEditCount,
+        COALESCE(PHI.ReopenCount, 0) AS PostReopenCount,
+        COALESCE(PHI.DeleteCount, 0) AS PostDeleteCount,
+        PHI.MostRecentCloseReason,
+        PHI.FirstEditDate,
+        DATE_PART('day', COALESCE(PHI.FirstEditDate, PQ.PostCreationDate) - PQ.PostCreationDate) AS DaysToFirstEdit,
+        PQ.OutgoingLinks,
+        PQ.IncomingLinks,
+        RANK() OVER (PARTITION BY PQ.OwnerUserId ORDER BY PQ.PostScore DESC, PQ.PostCreationDate ASC) AS OwnerPostScoreRank,
+        AVG(PQ.PostScore) OVER (PARTITION BY PQ.PostTypeId ORDER BY PQ.PostCreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS AvgScoreLast30DaysOfType,
+        (PQ.TotalUpVotesReceived * 1.0) / NULLIF((PQ.TotalUpVotesReceived + PQ.TotalDownVotesReceived), 0) AS UpvoteRatio
+    FROM PostQualityMetrics PQ
+    LEFT JOIN PostHistoryInsights PHI ON PQ.PostId = PHI.PostId
+),
+FinalAggregatedData AS (
+    SELECT
+        U.UserId,
+        U.DisplayName AS UserName,
+        U.Reputation,
+        U.ReputationTier,
+        U.TotalQuestions AS UserTotalQuestions,
+        U.TotalAnswers AS UserTotalAnswers,
+        C.PostId,
+        C.PostTypeId,
+        C.PostCreationDate,
+        C.PostScore,
+        C.ViewCount,
+        C.AnswerCount,
+        C.PostCommentCount,
+        C.FavoriteCount,
+        C.HasAcceptedAnswer,
+        C.BodyWordCount,
+        COALESCE(C.AvgCommentScore, 0) AS AvgCommentScore,
+        C.TotalUpVotesReceived,
+        C.TotalDownVotesReceived,
+        C.ScoreToViewRatio,
+        C.AnswerToViewRatio,
+        C.PostEditCount,
+        COALESCE(C.DaysToFirstEdit, 0) AS DaysToFirstEdit,
+        C.MostRecentCloseReason,
+        C.OwnerPostScoreRank,
+        C.AvgScoreLast30DaysOfType,
+        C.UpvoteRatio,
+        C.OutgoingLinks,
+        C.IncomingLinks,
+        SPLIT_PART(SUBSTRING(C.Tags, 2, LENGTH(C.Tags) - 2), '><', 1) AS FirstTagFromPost,
+        TTA.TagName AS PrimaryTag,
+        TTA.TagClosureRate,
+        TTA.TagPopularityRank,
+        (C.ScoreToViewRatio > 0.08 AND C.UpvoteRatio > 0.75 AND C.BodyWordCount > 250 AND C.PostEditCount < 3 AND C.HasAcceptedAnswer = TRUE) AS IsHighQualityLowMaintenancePost,
+        COALESCE(U.DisplayName, 'Community User') AS EffectiveDisplayName
+    FROM UserBaseStats U
+    JOIN CombinedPostAnalysis C ON U.UserId = C.OwnerUserId
+    LEFT JOIN TagTrendAnalysis TTA ON TTA.TagName = SPLIT_PART(SUBSTRING(C.Tags, 2, LENGTH(C.Tags) - 2), '><', 1)
+    WHERE
+        C.PostScore > 5
+        AND C.ViewCount > 50
+        AND C.PostCreationDate >= '2019-01-01'
+        AND C.PostTypeId = 1
+        AND C.Tags IS NOT NULL AND LENGTH(C.Tags) > 2
+)
+SELECT
+    FAD.UserId,
+    FAD.UserName,
+    FAD.Reputation,
+    FAD.ReputationTier,
+    FAD.PostId,
+    FAD.PostCreationDate,
+    FAD.PostScore,
+    FAD.ViewCount,
+    FAD.AnswerCount,
+    FAD.PostCommentCount,
+    FAD.FavoriteCount,
+    FAD.HasAcceptedAnswer,
+    FAD.BodyWordCount,
+    FAD.AvgCommentScore,
+    FAD.TotalUpVotesReceived,
+    FAD.TotalDownVotesReceived,
+    FAD.ScoreToViewRatio,
+    FAD.AnswerToViewRatio,
+    FAD.PostEditCount,
+    FAD.DaysToFirstEdit,
+    FAD.MostRecentCloseReason,
+    FAD.OwnerPostScoreRank,
+    FAD.AvgScoreLast30DaysOfType,
+    FAD.UpvoteRatio,
+    FAD.PrimaryTag,
+    FAD.TagClosureRate,
+    FAD.TagPopularityRank,
+    FAD.IsHighQualityLowMaintenancePost,
+    FAD.FirstTagFromPost,
+    'High Engagement Question' AS Category,
+    COALESCE( (FAD.Reputation * (FAD.TotalUpVotesReceived + COALESCE(FAD.FavoriteCount,0))) / NULLIF((FAD.ViewCount + FAD.PostEditCount), 0), 0) AS UserPostEngagementIndex
+FROM FinalAggregatedData FAD
+WHERE FAD.ScoreToViewRatio > 0.05
+  AND FAD.PostEditCount <= 2
+  AND FAD.HasAcceptedAnswer = TRUE
+  AND FAD.PostScore > 10
+  AND FAD.AvgCommentScore >= 1
+  AND FAD.BodyWordCount BETWEEN 100 AND 1000
+  AND FAD.IncomingLinks > 0
+  AND FAD.OutgoingLinks > 0
+  AND FAD.PrimaryTag IS NOT NULL
+
+UNION ALL
+
+SELECT
+    FAD.UserId,
+    FAD.UserName,
+    FAD.Reputation,
+    FAD.ReputationTier,
+    FAD.PostId,
+    FAD.PostCreationDate,
+    FAD.PostScore,
+    FAD.ViewCount,
+    FAD.AnswerCount,
+    FAD.PostCommentCount,
+    FAD.FavoriteCount,
+    FAD.HasAcceptedAnswer,
+    FAD.BodyWordCount,
+    FAD.AvgCommentScore,
+    FAD.TotalUpVotesReceived,
+    FAD.TotalDownVotesReceived,
+    FAD.ScoreToViewRatio,
+    FAD.AnswerToViewRatio,
+    FAD.PostEditCount,
+    FAD.DaysToFirstEdit,
+    FAD.MostRecentCloseReason,
+    FAD.OwnerPostScoreRank,
+    FAD.AvgScoreLast30DaysOfType,
+    FAD.UpvoteRatio,
+    FAD.PrimaryTag,
+    FAD.TagClosureRate,
+    FAD.TagPopularityRank,
+    FAD.IsHighQualityLowMaintenancePost,
+    FAD.FirstTagFromPost,
+    'Low Engagement High Edit Question' AS Category,
+    COALESCE( (FAD.Reputation * (FAD.TotalUpVotesReceived + COALESCE(FAD.FavoriteCount,0))) / NULLIF((FAD.ViewCount + FAD.PostEditCount), 0), 0) AS UserPostEngagementIndex
+FROM FinalAggregatedData FAD
+WHERE FAD.ScoreToViewRatio <= 0.05
+  AND FAD.PostEditCount > 2
+  AND FAD.PostScore <= 10
+  AND FAD.MostRecentCloseReason IS NOT NULL
+  AND FAD.BodyWordCount > 50
+  AND FAD.IncomingLinks = 0
+  AND FAD.PrimaryTag IS NOT NULL
+ORDER BY PostCreationDate DESC, Reputation DESC
+LIMIT 10000;

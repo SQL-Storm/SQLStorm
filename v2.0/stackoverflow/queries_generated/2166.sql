@@ -1,0 +1,175 @@
+-- {"query": "2166.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1562} 
+with RecursiveBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        row_number() over (partition by u.Id order by b.Date) as BadgeSeq
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where b.TagBased = 0
+),
+UserBadgeRanks as (
+    select
+        UserId,
+        DisplayName,
+        BadgeName,
+        BadgeClass,
+        BadgeSeq,
+        case 
+            when BadgeClass = 1 then 'Gold'
+            when BadgeClass = 2 then 'Silver'
+            when BadgeClass = 3 then 'Bronze'
+            else 'Unknown'
+        end as BadgeClassName
+    from RecursiveBadges
+),
+QuestionWithAcceptedAnswer as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreation,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerUserId,
+        a.OwnerDisplayName as AnswerUserName,
+        q.AcceptedAnswerId
+    from Posts q
+    left join Posts a on q.AcceptedAnswerId = a.Id
+    where q.PostTypeId = 1
+),
+AnswerCountsPerUser as (
+    select OwnerUserId, count(*) as AnswersCount
+    from Posts
+    where PostTypeId = 2
+    group by OwnerUserId
+),
+TopUsersByAnswerCount as (
+    select u.Id, u.DisplayName, coalesce(ac.AnswersCount, 0) as AnswersCount
+    from Users u
+    left join AnswerCountsPerUser ac on ac.OwnerUserId = u.Id
+    order by AnswersCount desc
+    limit 10
+),
+PostTagsExploded as (
+    select 
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as TagName
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TagUsageStats as (
+    select 
+        t.TagName,
+        count(distinct p.PostId) as QuestionCount,
+        max(p.Score) as MaxScore,
+        avg(p.Score) as AvgScore
+    from PostTagsExploded t
+    join Posts p on p.Id = t.PostId
+    group by t.TagName
+    having count(distinct p.PostId) > 10
+),
+PostHistoryCloseInfo as (
+    select ph.PostId, ph.CreationDate as CloseDate, crt.Name as CloseReason
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+),
+RecentClosedQuestions as (
+    select 
+        q.Id, q.Title, q.CreationDate, q.Score, pci.CloseDate, pci.CloseReason
+    from Posts q
+    left join PostHistoryCloseInfo pci on pci.PostId = q.Id
+    where q.PostTypeId = 1 and pci.CloseDate > now() - interval '30 days'
+),
+RankedCommentsPerPost as (
+    select
+        c.PostId,
+        c.Id as CommentId,
+        c.Text,
+        c.CreationDate,
+        c.Score,
+        rank() over (partition by c.PostId order by c.Score desc nulls last, c.CreationDate asc) as CommentRank
+    from Comments c
+),
+TopCommentsPerPost as (
+    select * from RankedCommentsPerPost where CommentRank <= 3
+),
+CombinedSet as (
+    select UserId, 'QuestionAuthor' as Role, count(*) as CountPosts from Posts where PostTypeId = 1 group by UserId
+    union all
+    select OwnerUserId as UserId, 'AnswerAuthor' as Role, count(*) from Posts where PostTypeId = 2 group by OwnerUserId
+),
+UserActivitySummary as (
+    select UserId,
+        max(case when Role = 'QuestionAuthor' then CountPosts else 0 end) as Questions,
+        max(case when Role = 'AnswerAuthor' then CountPosts else 0 end) as Answers
+    from CombinedSet
+    group by UserId
+),
+AnswersWithDuplicates as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        case when pl.LinkTypeId = 3 then 1 else 0 end as IsDuplicateLink
+    from Posts a
+    left join PostLinks pl on pl.PostId = a.Id and pl.LinkTypeId = 3
+    where a.PostTypeId = 2
+),
+DuplicateAnswerStats as (
+    select
+        QuestionId,
+        count(*) as TotalAnswers,
+        sum(IsDuplicateLink) as DuplicateAnswerCount,
+        avg(AnswerScore) as AvgAnswerScore
+    from AnswersWithDuplicates
+    group by QuestionId
+)
+select 
+    q.QuestionId,
+    q.Title,
+    q.QuestionCreation,
+    q.QuestionScore,
+    q.AcceptedAnswerId,
+    q.AnswerId as AcceptedAnswerId,
+    q.AnswerCreation,
+    q.AnswerScore,
+    u.DisplayName as AcceptedAnswerUser,
+    u.Reputation,
+    tb.BadgeName as AcceptedAnswerUserTopBadge,
+    t.TagName,
+    t.QuestionCount as TagQuestions,
+    t.MaxScore as TagMaxScore,
+    t.AvgScore as TagAvgScore,
+    rc.CloseDate,
+    rc.CloseReason,
+    coalesce(asum.Questions,0) as TotalQuestionsByAuthor,
+    coalesce(asum.Answers,0) as TotalAnswersByAuthor,
+    das.TotalAnswers,
+    das.DuplicateAnswerCount,
+    das.AvgAnswerScore,
+    array_to_string(array_agg(distinct tc.Text), ' | ') as TopCommentsOnQuestion
+from QuestionWithAcceptedAnswer q
+left join Users u on u.Id = q.AnswerUserId
+left join UserBadgeRanks tb on tb.UserId = u.Id and tb.BadgeSeq = 1
+left join PostTagsExploded pte on pte.PostId = q.QuestionId
+left join TagUsageStats t on t.TagName = pte.TagName
+left join RecentClosedQuestions rc on rc.Id = q.QuestionId
+left join UserActivitySummary asum on asum.UserId = q.AcceptedAnswerId
+left join DuplicateAnswerStats das on das.QuestionId = q.QuestionId
+left join TopCommentsPerPost tc on tc.PostId = q.QuestionId and tc.CommentRank <= 3
+where q.QuestionScore >= (
+    select percentile_cont(0.75) within group (order by Score) 
+    from Posts where PostTypeId = 1
+)
+group by 
+    q.QuestionId, q.Title, q.QuestionCreation, q.QuestionScore, q.AcceptedAnswerId, 
+    q.AnswerId, q.AnswerCreation, q.AnswerScore,
+    u.DisplayName, u.Reputation, tb.BadgeName, t.TagName, t.QuestionCount, t.MaxScore, t.AvgScore,
+    rc.CloseDate, rc.CloseReason, asum.Questions, asum.Answers, das.TotalAnswers, das.DuplicateAnswerCount, das.AvgAnswerScore
+order by q.QuestionScore desc, q.QuestionCreation desc
+limit 50;

@@ -1,0 +1,113 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        COUNT(DISTINCT b.Id)                                AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)         AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)         AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)         AS BronzeBadges,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        MAX(p.CreationDate)                                 AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY 
+        u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+UserTagAffinities AS (
+    SELECT 
+        us.Id                AS UserId,
+        tt.TagName,
+        COUNT(*)             AS TagUsage
+    FROM UserStats us
+    JOIN Posts p
+        ON p.OwnerUserId = us.Id
+       AND p.PostTypeId = 1
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag
+    ) AS pt
+    JOIN Tags tt
+        ON tt.TagName = pt.Tag
+    GROUP BY us.Id, tt.TagName
+),
+RankedAffinities AS (
+    SELECT 
+        uta.UserId,
+        uta.TagName,
+        uta.TagUsage,
+        RANK() OVER (PARTITION BY uta.UserId ORDER BY uta.TagUsage DESC) AS TagRank
+    FROM UserTagAffinities uta
+),
+MainResults AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.NetVotes,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.QuestionsAsked,
+        us.AnswersGiven,
+        COALESCE(ra.TagName, 'N/A')   AS TopTag,
+        COALESCE(ra.TagUsage, 0)      AS TopTagUsage,
+        CASE
+            WHEN us.Reputation > 20000 THEN 'Legendary'
+            WHEN us.Reputation > 10000 THEN 'Expert'
+            WHEN us.Reputation > 5000  THEN 'Advanced'
+            WHEN us.Reputation > 1000  THEN 'Intermediate'
+            ELSE 'Novice'
+        END                           AS ReputationLevel,
+        CASE
+            WHEN us.LastPostDate IS NULL THEN NULL
+            WHEN us.LastPostDate < (DATE '2024-10-01' - INTERVAL '365' DAY) THEN 'Inactive'
+            ELSE 'Active'
+        END                           AS ActivityStatus
+    FROM UserStats us
+    LEFT JOIN (
+        SELECT UserId, TagName, TagUsage
+        FROM RankedAffinities
+        WHERE TagRank = 1
+    ) ra ON ra.UserId = us.Id
+    WHERE us.TotalBadges > 0
+      AND (us.GoldBadges > 0 OR us.SilverBadges > 0)
+      AND (us.AnswersGiven > us.QuestionsAsked OR us.NetVotes > 0)
+)
+SELECT *
+FROM (
+    SELECT *
+    FROM MainResults
+    ORDER BY Reputation DESC
+    OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+
+    UNION ALL
+
+    SELECT 
+        CAST(NULL AS BIGINT)  AS Id,
+        '---'                 AS DisplayName,
+        CAST(NULL AS INTEGER) AS Reputation,
+        CAST(NULL AS INTEGER) AS NetVotes,
+        CAST(NULL AS INTEGER) AS TotalBadges,
+        CAST(NULL AS INTEGER) AS GoldBadges,
+        CAST(NULL AS INTEGER) AS SilverBadges,
+        CAST(NULL AS INTEGER) AS BronzeBadges,
+        CAST(NULL AS INTEGER) AS QuestionsAsked,
+        CAST(NULL AS INTEGER) AS AnswersGiven,
+        CAST(NULL AS VARCHAR) AS TopTag,
+        CAST(NULL AS INTEGER) AS TopTagUsage,
+        CAST(NULL AS VARCHAR) AS ReputationLevel,
+        CAST(NULL AS VARCHAR) AS ActivityStatus
+    FROM (SELECT 1) AS dummy
+    WHERE NOT EXISTS (SELECT 1 FROM UserStats WHERE TotalBadges > 0)
+) AS final_results;

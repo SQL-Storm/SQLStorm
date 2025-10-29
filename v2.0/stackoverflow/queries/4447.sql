@@ -1,0 +1,120 @@
+WITH
+  AvgQuestionAnswerScore AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.Title,
+      q.CreationDate AS QuestionCreationDate,
+      q.OwnerUserId AS QuestionOwnerUserId,
+      AVG(COALESCE(a.Score, 0)) AS AvgAnswerScore,
+      q.Score AS QuestionScore,
+      COUNT(a.Id) AS AnswerCount,
+      q.FavoriteCount,
+      EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - q.CreationDate)) / 86400.0 AS DaysSinceCreation
+    FROM Posts q
+    LEFT JOIN Posts a
+      ON q.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE
+      q.PostTypeId = 1
+      AND q.CreationDate < TIMESTAMP '2023-01-01'
+      AND q.OwnerUserId BETWEEN 1000 AND 5000
+      AND q.Score > 0
+    GROUP BY
+      q.Id,
+      q.Title,
+      q.CreationDate,
+      q.OwnerUserId,
+      q.Score,
+      q.FavoriteCount
+  ),
+  RankedUsers AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.Views AS UserViews,
+      COUNT(b.Id) AS BadgeCount,
+      RANK() OVER (ORDER BY u.UpVotes DESC) AS UpVoteRank,
+      ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS LastAccessRank
+    FROM Users u
+    LEFT JOIN Badges b
+      ON u.Id = b.UserId
+    WHERE
+      u.UpVotes > 100
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes,
+      u.LastAccessDate
+    HAVING
+      COUNT(b.Id) > 5
+  ),
+  ActivePosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.CreationDate AS PostCreationDate,
+      p.LastActivityDate,
+      COUNT(c.Id) AS CommentCount,
+      EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400.0 AS ActivityDurationDays
+    FROM Posts p
+    JOIN Comments c
+      ON p.Id = c.PostId
+    WHERE
+      p.CreationDate > TIMESTAMP '2022-01-01'
+      AND p.ViewCount > 1000
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.CreationDate,
+      p.LastActivityDate
+    HAVING
+      COUNT(c.Id) > 10
+  )
+SELECT
+  aqas.Title AS QuestionTitle,
+  aqas.QuestionScore,
+  aqas.AvgAnswerScore,
+  aqas.FavoriteCount,
+  aqas.DaysSinceCreation,
+  ru.DisplayName AS TopUserDisplayName,
+  ru.Reputation AS TopUserReputation,
+  ru.UpVoteRank,
+  ru.LastAccessRank,
+  ap.Title AS ActivePostTitle,
+  ap.CommentCount,
+  ap.ActivityDurationDays,
+  CASE
+    WHEN p.Tags IS NULL OR p.Tags = '' OR p.Tags = '""' THEN 'No Tags'
+    ELSE SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2))
+  END AS FormattedTags,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL AND EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.ClosedDate)) < (EXTRACT(EPOCH FROM INTERVAL '6 months')) THEN 'Recently Closed'
+    WHEN p.CommunityOwnedDate IS NOT NULL AND EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CommunityOwnedDate)) < (EXTRACT(EPOCH FROM INTERVAL '1 year')) THEN 'Community Owned (Recent)'
+    WHEN p.LastEditDate IS NULL THEN 'No Edits'
+    ELSE 'Edited'
+  END AS PostStatus,
+  SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeUserScore,
+  CASE WHEN p.PostTypeId = 1 THEN 'Question' WHEN p.PostTypeId = 2 THEN 'Answer' ELSE 'Other' END AS PostTypeDescription
+FROM Posts p
+LEFT JOIN AvgQuestionAnswerScore aqas
+  ON p.Id = aqas.QuestionId AND p.PostTypeId = 1
+INNER JOIN RankedUsers ru
+  ON p.OwnerUserId = ru.UserId
+LEFT JOIN ActivePosts ap
+  ON p.Id = ap.PostId
+WHERE
+  p.Score > 5
+  AND ru.LastAccessRank = 1
+  AND (
+    aqas.QuestionId IS NOT NULL
+    OR ap.PostId IS NOT NULL
+    OR p.PostTypeId <> 1
+  )
+  AND p.ContentLicense = 'CC BY-SA 4.0'
+ORDER BY
+  p.LastActivityDate DESC,
+  ru.Reputation DESC;

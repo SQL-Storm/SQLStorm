@@ -1,0 +1,122 @@
+WITH RecursiveUserBadgeInfo AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Class AS BadgeClass,
+        COUNT(b.Id) AS BadgeCount,
+        dense_rank() OVER (PARTITION BY u.Id ORDER BY b.Class) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, b.Class
+),
+RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostRank,
+        p.Tags
+    FROM Posts p
+    INNER JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2) AND p.Score IS NOT NULL
+),
+PostAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        COUNT(a.Id) FILTER (WHERE a.PostTypeId = 2) AS TotalAnswers,
+        AVG(a.Score) FILTER (WHERE a.PostTypeId = 2) AS AvgAnswerScore,
+        SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAcceptedAnswer
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+),
+UserLastActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        MAX(p.LastActivityDate) AS LastActivity,
+        MAX(ph.CreationDate) AS LastPostHistoryEdit
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostHistoryCloseEvents AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS CloseDate,
+        row_number() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS CloseEventRank
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    JOIN CloseReasonTypes crt ON CAST(crt.Id AS VARCHAR) = ph.Comment
+    WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL
+),
+TopTagsByQuestionCount AS (
+    SELECT
+        tag AS TagName,
+        COUNT(*) AS QuestionCount
+    FROM (
+        SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    ) t
+    GROUP BY tag
+    ORDER BY QuestionCount DESC
+    LIMIT 10
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.BadgeClass,
+    u.BadgeCount,
+    p.Id AS PostId,
+    p.PostTypeName,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    pas.TotalAnswers,
+    pas.AvgAnswerScore,
+    pas.HasAcceptedAnswer,
+    la.LastActivity,
+    la.LastPostHistoryEdit,
+    phce.CloseReason,
+    phce.CloseDate,
+    tg.TagName,
+    CASE
+        WHEN p.PostTypeName = 'Question' THEN
+            substring(coalesce(p.OwnerDisplayName, 'anonymous') FROM 1 FOR 3) || '-' ||
+            coalesce(NULLIF(tg.TagName, ''), 'no-tag') || '-' ||
+            CASE WHEN pas.HasAcceptedAnswer > 0 THEN 'ACC' ELSE 'NACC' END
+        ELSE
+            'NA'
+    END AS CustomLabel,
+    rank() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS ScoreRankForUser
+FROM RecursiveUserBadgeInfo u
+INNER JOIN RankedPosts p ON p.OwnerUserId = u.UserId AND p.PostRank <= 3
+LEFT JOIN PostAnswerStats pas ON pas.QuestionId = p.Id AND p.PostTypeId = 1
+LEFT JOIN UserLastActivity la ON la.UserId = u.UserId
+LEFT JOIN PostHistoryCloseEvents phce ON phce.PostId = p.Id AND phce.CloseEventRank = 1
+LEFT JOIN TopTagsByQuestionCount tg
+    ON tg.TagName = ANY(
+        string_to_array(
+            substring(coalesce(p.Tags, '') FROM 2 FOR char_length(coalesce(p.Tags, '')) - 2),
+            '><'
+        )
+    )
+WHERE coalesce(p.Score, 0) > 0
+  AND (phce.CloseDate IS NULL OR phce.CloseDate > p.CreationDate)
+ORDER BY u.Reputation DESC, p.Score DESC, p.CreationDate DESC
+LIMIT 100;

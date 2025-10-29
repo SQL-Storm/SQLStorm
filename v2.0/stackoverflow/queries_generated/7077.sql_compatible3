@@ -1,0 +1,217 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.AnswerCount,
+        p.CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) as avg_score_5posts,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Answer'
+            WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN 'Answer'
+            ELSE 'Other'
+        END as post_category
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2020-01-01'
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+        SUM(p.Score) as total_score,
+        MAX(p.CreationDate) as last_post_date,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(p.Id), 0), 0) as q_percent,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as rep_rank,
+        CASE 
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            WHEN u.Reputation >= 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as skill_level
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.CreationDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 50 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as tag_popularity,
+        AVG(p.Score) as avg_related_score,
+        COUNT(DISTINCT p.Id) as related_posts_count
+    FROM Tags t
+    LEFT JOIN Posts p ON POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    WHERE t.Count > 0 
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+ComplexQuery AS (
+    SELECT 
+        rp.Id,
+        rp.Title,
+        rp.Tags,
+        rp.Score,
+        rp.ViewCount,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        rs.Reputation,
+        rs.DisplayName,
+        rs.total_score,
+        rs.skill_level,
+        ta.TagName,
+        ta.Count as tag_count,
+        ta.tag_popularity,
+        CASE 
+            WHEN rp.Score > 0 AND rp.prev_score IS NOT NULL AND rp.prev_score > 0 
+            THEN (rp.Score - rp.prev_score) * 100.0 / rp.prev_score 
+            ELSE NULL 
+        END as score_change_percent,
+        CASE 
+            WHEN rp.avg_score_5posts > 0 AND rp.Score > 0 
+            THEN rp.Score / rp.avg_score_5posts 
+            ELSE NULL 
+        END as score_vs_avg,
+        CASE 
+            WHEN rp.post_category = 'Question with Answer' 
+            THEN COALESCE(
+                (SELECT AVG(v.Score) 
+                 FROM Votes v 
+                 WHERE v.PostId = rp.Id AND v.VoteTypeId IN (2,3)
+                 ), 0)
+            ELSE 0 
+        END as avg_vote_score,
+        rp.CreationDate,
+        rp.LastActivityDate,
+        CASE 
+            WHEN rp.CreationDate < TIMESTAMP '2021-01-01' 
+            THEN 'Old'
+            WHEN rp.CreationDate < TIMESTAMP '2022-01-01' 
+            THEN 'Mid'
+            ELSE 'New'
+        END as post_age,
+        CASE 
+            WHEN rp.Tags IS NOT NULL AND LENGTH(rp.Tags) > 120 
+            THEN 'Long'
+            ELSE 'Short'
+        END as tag_length,
+        CASE 
+            WHEN rp.AnswerCount > 0 AND rp.AnswerCount >= (rp.CommentCount * 1.5) 
+            THEN 'Active'
+            ELSE 'Passive'
+        END as engagement_level,
+        COALESCE(rp.AnswerCount, 0) - COALESCE(
+            (SELECT COUNT(*) FROM Posts p2 
+             WHERE p2.ParentId = rp.Id AND p2.PostTypeId = 2), 0
+        ) as potential_answers
+    FROM RankedPosts rp
+    JOIN UserStats rs ON rp.OwnerUserId = rs.UserId
+    JOIN TagAnalysis ta ON POSITION('<' || ta.TagName || '>' IN rp.Tags) > 0
+    WHERE rp.rn = 1
+      AND rs.total_posts >= 5
+      AND rs.Reputation > 1000
+)
+SELECT 
+    cq.Id,
+    cq.Title,
+    cq.Tags,
+    cq.Score,
+    cq.ViewCount,
+    cq.OwnerUserId,
+    cq.Reputation,
+    cq.DisplayName,
+    cq.total_score,
+    cq.skill_level,
+    cq.TagName,
+    cq.tag_count,
+    cq.tag_popularity,
+    cq.score_change_percent,
+    cq.score_vs_avg,
+    cq.avg_vote_score,
+    cq.CreationDate,
+    cq.LastActivityDate,
+    cq.post_age,
+    cq.tag_length,
+    cq.engagement_level,
+    cq.potential_answers,
+    CASE 
+        WHEN cq.score_change_percent > 10 AND cq.score_vs_avg > 1.5 
+        THEN 'Highly Active'
+        WHEN cq.score_change_percent > 5 AND cq.score_vs_avg > 1.2 
+        THEN 'Moderately Active'
+        WHEN cq.score_vs_avg > 1.0 
+        THEN 'Stable'
+        ELSE 'Inactive'
+    END as performance_trend,
+    CASE 
+        WHEN cq.ViewCount > 1000 AND cq.Score > 50 
+        THEN 'High Impact'
+        WHEN cq.ViewCount > 500 AND cq.Score > 25 
+        THEN 'Medium Impact'
+        WHEN cq.ViewCount > 100 AND cq.Score > 10 
+        THEN 'Low Impact'
+        ELSE 'Minimal Impact'
+    END as impact_level
+FROM ComplexQuery cq
+WHERE cq.TagName IS NOT NULL
+  AND cq.score_change_percent IS NOT NULL
+  AND cq.score_vs_avg IS NOT NULL
+  AND cq.avg_vote_score IS NOT NULL
+  AND cq.Score > 0
+  AND cq.ViewCount >= 10
+  AND cq.Reputation >= 1000
+  AND cq.total_score >= 100
+  AND cq.tag_count >= 10
+
+UNION ALL
+
+SELECT 
+    NULL as Id,
+    'SUMMARY_STATS' as Title,
+    NULL as Tags,
+    CAST(SUM(cq.Score) AS INTEGER) as Score,
+    CAST(SUM(cq.ViewCount) AS INTEGER) as ViewCount,
+    NULL as OwnerUserId,
+    NULL as Reputation,
+    NULL as DisplayName,
+    CAST(SUM(cq.total_score) AS INTEGER) as total_score,
+    NULL as skill_level,
+    NULL as TagName,
+    CAST(0 AS INTEGER) as tag_count,
+    'Overall' as tag_popularity,
+    NULL as score_change_percent,
+    NULL as score_vs_avg,
+    NULL as avg_vote_score,
+    NULL as CreationDate,
+    NULL as LastActivityDate,
+    NULL as post_age,
+    NULL as tag_length,
+    'Summary' as engagement_level,
+    NULL as potential_answers,
+    'Overall Performance' as performance_trend,
+    'All Users' as impact_level
+FROM ComplexQuery cq
+WHERE cq.Score IS NOT NULL
+
+ORDER BY 
+    CASE WHEN Title = 'SUMMARY_STATS' THEN 1 ELSE 2 END,
+    Score DESC,
+    ViewCount DESC;

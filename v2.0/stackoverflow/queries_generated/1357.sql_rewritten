@@ -1,0 +1,189 @@
+-- {"query": "1357.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3400} 
+WITH UserOverallActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserDisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question') THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer') THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN p_accepted.Id IS NOT NULL THEN 1 ELSE 0 END) AS TotalAnswersAcceptedByOthers, -- User's answers accepted by others
+        SUM(v.BountyAmount) AS TotalBountyGiven,
+        SUM(CASE WHEN vt_up.Name = 'UpMod' THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN vt_down.Name = 'DownMod' THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.LastActivityDate) AS LatestPostActivityDate,
+        ARRAY_AGG(DISTINCT t.TagName) FILTER (WHERE t.TagName IS NOT NULL) AS AssociatedTags -- Aggregating tags for user
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN VoteTypes vt_up ON v.VoteTypeId = vt_up.Id AND vt_up.Name = 'UpMod'
+    LEFT JOIN VoteTypes vt_down ON v.VoteTypeId = vt_down.Id AND vt_down.Name = 'DownMod'
+    -- Join to identify answers by this user that were accepted
+    LEFT JOIN Posts p_accepted ON u.Id = p_accepted.OwnerUserId AND p_accepted.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer')
+    LEFT JOIN Posts q_with_accepted ON p_accepted.Id = q_with_accepted.AcceptedAnswerId AND q_with_accepted.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question')
+    -- Lateral join for tags
+    LEFT JOIN (
+        SELECT DISTINCT p_tags.Id, SUBSTRING(p_tags.Tags, 2, LENGTH(p_tags.Tags) - 2) AS RawTags
+        FROM Posts p_tags
+        WHERE p_tags.Tags IS NOT NULL
+    ) AS tagged_posts ON p.Id = tagged_posts.Id
+    LEFT JOIN LATERAL UNNEST(STRING_TO_ARRAY(tagged_posts.RawTags, '><')) AS t(TagName) ON TRUE
+    WHERE u.Reputation > 500
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING COUNT(p.Id) + COUNT(c.Id) > 5 -- Minimal activity threshold
+),
+PostMetricsExtended AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate)) / (24 * 3600) AS PostAgeDays, -- in days
+        (p.Score * 0.7 + COALESCE(p.FavoriteCount, 0) * 0.5 + COALESCE(p.AnswerCount, 0) * 1.0 + COALESCE(p.ViewCount, 0) * 0.005) AS ContentQualityScore,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><') AS TagArray,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL AND p.CommunityOwnedDate IS NOT NULL THEN 'Closed & Community'
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            ELSE 'Open'
+        END AS PostStatusDetail,
+        (SELECT MAX(ph_sub.CreationDate) FROM PostHistory ph_sub WHERE ph_sub.PostId = p.Id AND ph_sub.PostHistoryTypeId IN (4,5,6)) AS LatestEditHistoryDate, -- Correlated Subquery 1
+        RANK() OVER(PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByUserScoreAndViews, -- Window Function 1
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RollingAvgUserPostScore, -- Window Function 2 (Rolling Average)
+        COALESCE(p.LastEditorUserId, p.OwnerUserId) AS ActualLastEditorUserId -- NULL Logic with COALESCE
+    FROM Posts p
+    WHERE p.PostTypeId IN ((SELECT Id FROM PostTypes WHERE Name = 'Question'), (SELECT Id FROM PostTypes WHERE Name = 'Answer'))
+      AND p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 year') AND p.ViewCount IS NOT NULL
+),
+PostEditHistoryDetails AS (
+    SELECT
+        ph.PostId,
+        ph.UserId AS EditorUserId,
+        ph.CreationDate AS EditDate,
+        ph.PostHistoryTypeId,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate) AS EditNumberForUser,
+        LAG(ph.CreationDate, 1, ph.CreationDate) OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate) AS PreviousEditDate, -- Window Function 3 (LAG)
+        EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate, 1, ph.CreationDate) OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate))) / 3600 AS HoursSincePreviousEdit
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) -- Edit/Rollback Title, Body, Tags
+),
+CommentSentimentAnalysis AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        SUM(CASE WHEN LOWER(c.Text) LIKE '%excellent%' OR LOWER(c.Text) LIKE '%helpful%' OR LOWER(c.Text) LIKE '%thanks%' THEN 1 ELSE 0 END) AS PositiveCommentCount,
+        SUM(CASE WHEN LOWER(c.Text) LIKE '%bug%' OR LOWER(c.Text) LIKE '%fix%' OR LOWER(c.Text) LIKE '%error%' THEN 1 ELSE 0 END) AS NegativeCommentCount,
+        MAX(c.CreationDate) AS LatestCommentDate
+    FROM Comments c
+    GROUP BY c.PostId
+    HAVING COUNT(c.Id) > 1
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostsWithoutDuplicateLinks AS (
+    SELECT p.Id AS PostId
+    FROM Posts p
+    WHERE p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question')
+    EXCEPT
+    SELECT pl.PostId
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate')
+)
+SELECT
+    uoa.UserId,
+    uoa.UserDisplayName,
+    uoa.Reputation,
+    uoa.UserCreationDate,
+    uoa.TotalPostsOwned,
+    uoa.TotalQuestionsOwned,
+    uoa.TotalAnswersOwned,
+    uoa.TotalCommentsMade,
+    uoa.TotalAnswersAcceptedByOthers,
+    uoa.TotalBountyGiven,
+    uoa.TotalUpVotesGiven,
+    uoa.TotalDownVotesGiven,
+    STRING_AGG(DISTINCT uoa.AssociatedTags, ', ') AS ConsolidatedUserTags, -- String aggregation
+    COUNT(DISTINCT pme.PostId) AS RelevantPostsCount,
+    AVG(pme.Score) AS AverageRelevantPostScore,
+    AVG(pme.ContentQualityScore) AS AverageContentQuality,
+    MAX(pme.PostAgeDays) AS MaxPostAgeInDays,
+    MAX(pme.LatestEditHistoryDate) AS LatestPostEditDateFromHistory,
+    SUM(cs.CommentCount) AS TotalCommentsOnRelevantPosts,
+    AVG(cs.AvgCommentScore) FILTER (WHERE cs.AvgCommentScore IS NOT NULL) AS AvgCommentScoreOnRelevantPosts,
+    SUM(cs.PositiveCommentCount) AS SumPositiveComments,
+    COALESCE(ubs.TotalBadges, 0) AS UserTotalBadges,
+    COALESCE(ubs.GoldBadges, 0) AS UserGoldBadges,
+    (SELECT COUNT(DISTINCT v_fav.PostId) FROM Votes v_fav WHERE v_fav.UserId = uoa.UserId AND v_fav.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'Favorite')) AS UserFavoritedUniquePostsCount, -- Correlated Subquery 2
+    (SELECT SUM(p_link.Score)
+     FROM Posts p_link
+     JOIN PostLinks pl ON p_link.Id = pl.RelatedPostId
+     WHERE pl.PostId IN (SELECT PostId FROM PostMetricsExtended WHERE OwnerUserId = uoa.UserId AND PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question') AND PostAgeDays < 365)
+       AND pl.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Linked')
+       AND p_link.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question')
+    ) AS SumScoreOfLinkedQuestionsToUsersRecentQuestions, -- Correlated Subquery 3
+    COUNT(DISTINCT pehd.PostId) AS PostsWithEditHistory,
+    AVG(pehd.HoursSincePreviousEdit) FILTER (WHERE pehd.HoursSincePreviousEdit > 0 AND pehd.HoursSincePreviousEdit < 1000) AS AvgHoursBetweenUserEdits, -- Filtered aggregation
+    (SELECT COUNT(DISTINCT pl_dup.RelatedPostId) FROM PostLinks pl_dup JOIN PostMetricsExtended pme_sub ON pl_dup.PostId = pme_sub.PostId WHERE pme_sub.OwnerUserId = uoa.UserId AND pl_dup.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate')) AS TotalUniqueDuplicateLinkedPostsByOwner, -- Correlated Subquery 4
+    CASE
+        WHEN uoa.TotalQuestionsOwned > 0 THEN CAST(uoa.TotalAnswersAcceptedByOthers AS DECIMAL) / uoa.TotalQuestionsOwned
+        ELSE 0
+    END AS AcceptedAnswerPerQuestionRatio,
+    (SELECT MAX(ph_init.CreationDate)
+     FROM PostHistory ph_init
+     WHERE ph_init.PostId = (SELECT MIN(p_early.Id) FROM Posts p_early WHERE p_early.OwnerUserId = uoa.UserId ORDER BY p_early.CreationDate LIMIT 1)
+       AND ph_init.PostHistoryTypeId IN (1, 2, 3) -- Initial Post History Types
+    ) AS EarliestPostInitialHistoryDate, -- Correlated Subquery 5
+    MAX(pme.RollingAvgUserPostScore) AS MaxRollingAvgPostScore,
+    AVG(pme.RankByUserScoreAndViews) AS AvgRankOfUserPosts,
+    SUM(CASE WHEN pme.PostStatusDetail = 'Closed' THEN 1 ELSE 0 END) AS ClosedPostsCount,
+    STRING_AGG(DISTINCT pme.PostStatusDetail, '; ') AS CombinedPostStatuses
+FROM UserOverallActivity uoa
+LEFT JOIN PostMetricsExtended pme ON uoa.UserId = pme.OwnerUserId
+LEFT JOIN CommentSentimentAnalysis cs ON pme.PostId = cs.PostId
+LEFT JOIN UserBadgeSummary ubs ON uoa.UserId = ubs.UserId
+LEFT JOIN PostEditHistoryDetails pehd ON pme.PostId = pehd.PostId AND uoa.UserId = pehd.EditorUserId
+LEFT JOIN PostsWithoutDuplicateLinks pndl ON pme.PostId = pndl.PostId -- Using the CTE with EXCEPT
+WHERE
+    uoa.Reputation >= 5000
+    AND uoa.LastAccessDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months')
+    AND uoa.TotalQuestionsOwned > 0
+    AND uoa.TotalAnswersOwned > 0
+    AND (pme.ContentQualityScore > 20 OR pme.ContentQualityScore IS NULL) -- NULL logic for posts with no quality score
+    AND uoa.UserDisplayName IS NOT NULL
+    AND pndl.PostId IS NOT NULL -- Ensure only posts without duplicate links are included from the pndl CTE
+    AND POSITION('sql' IN LOWER(STRING_AGG(DISTINCT uoa.AssociatedTags, ''))) > 0 -- String expression with POSITION and LOWER
+GROUP BY
+    uoa.UserId, uoa.UserDisplayName, uoa.Reputation, uoa.UserCreationDate, uoa.LastAccessDate,
+    uoa.TotalPostsOwned, uoa.TotalQuestionsOwned, uoa.TotalAnswersOwned, uoa.TotalCommentsMade,
+    uoa.TotalAnswersAcceptedByOthers, uoa.TotalBountyGiven, uoa.TotalUpVotesGiven, uoa.TotalDownVotesGiven,
+    ubs.TotalBadges, ubs.GoldBadges
+HAVING
+    COUNT(DISTINCT pme.PostId) >= 5
+    AND AVG(COALESCE(pme.ContentQualityScore, 0)) > 30
+    AND (SUM(cs.NegativeCommentCount) IS NULL OR SUM(cs.NegativeCommentCount) < SUM(cs.PositiveCommentCount))
+    AND EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = uoa.UserId AND b.Class = 1 AND b.Name = 'Fanatic') -- Correlated Subquery 6 (EXISTS)
+ORDER BY
+    uoa.Reputation DESC, AverageContentQuality DESC
+LIMIT 500;

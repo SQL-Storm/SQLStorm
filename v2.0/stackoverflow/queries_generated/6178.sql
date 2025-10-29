@@ -1,0 +1,44 @@
+-- {"query": "6178.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 401} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    SUM(v.BountyAmount) AS TotalBounty,
+    MAX(u.LastAccessDate) AS LastAccess,
+    AVG(p.Score) AS AvgScore,
+    (
+        SELECT STRING_AGG(TagName, ', ')
+        FROM Tags t
+        WHERE t.ExcerptPostId = p.Id
+    ) AS TagNames,
+    (
+        SELECT COUNT(*)
+        FROM Votes v
+        WHERE v.PostId = p.Id
+        AND v.VoteTypeId = 15
+    ) AS ModeratorReviews,
+    (
+        SELECT COUNT(*)
+        FROM PostLinks pl
+        WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ) AS DuplicatesCount
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+WHERE 
+    (u.Reputation > 1000 OR u.Location IS NOT NULL) 
+    AND (p.CreationDate >= DATEADD(year, -1, GETDATE()) OR p.LastActivityDate >= DATEADD(year, -1, GETDATE()))
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.Location
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    AvgScore DESC, 
+    TotalBounty DESC;

@@ -1,0 +1,79 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName,
+        U.Reputation,
+        U.LastAccessDate,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0 AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    WHERE 
+        B.Class = 1 AND (B.TagBased = false OR B.TagBased = 0)
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+CommentStats AS (
+    SELECT 
+        P.Id AS PostId,
+        COUNT(C.Id) AS CommentCount,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    GROUP BY 
+        P.Id
+)
+SELECT 
+    RP.Id AS PostId,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.Rank,
+    U.DisplayName AS OwnerName,
+    U.Reputation,
+    U.LastAccessDate,
+    BC.BadgeCount,
+    CS.CommentCount,
+    CS.TotalCommentScore,
+    MAX(CASE WHEN PH.PostHistoryTypeId = 1 THEN PH.CreationDate END) AS InitialTitleDate,
+    MAX(CASE WHEN PH.PostHistoryTypeId = 2 THEN PH.CreationDate END) AS InitialBodyDate,
+    MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Comment END) AS CloseReason,
+    MAX(CASE WHEN PH.PostHistoryTypeId = 4 THEN PH.Comment END) AS LastEditTitle,
+    MAX(CASE WHEN PH.PostHistoryTypeId = 5 THEN PH.Comment END) AS LastEditBody,
+    MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS ReopenDate
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    Users U ON RP.OwnerUserId = U.Id
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerUserId = BC.UserId
+LEFT JOIN 
+    CommentStats CS ON RP.Id = CS.PostId
+LEFT JOIN 
+    PostHistory PH ON RP.Id = PH.PostId
+GROUP BY 
+    RP.Id, RP.Title, RP.Score, RP.ViewCount, RP.CreationDate, RP.Rank, RP.OwnerUserId,
+    U.DisplayName, U.Reputation, U.LastAccessDate, BC.BadgeCount, CS.CommentCount, CS.TotalCommentScore
+ORDER BY 
+    RP.Rank;

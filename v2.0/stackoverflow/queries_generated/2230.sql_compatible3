@@ -1,0 +1,64 @@
+SELECT
+            UserId,
+            SUM(CASE WHEN Class = 1 THEN BadgeCount ELSE 0 END) AS GoldCount,
+            SUM(CASE WHEN Class = 2 THEN BadgeCount ELSE 0 END) AS SilverCount,
+            SUM(CASE WHEN Class = 3 THEN BadgeCount ELSE 0 END) AS BronzeCount
+        FROM UserBadgeRanks
+        GROUP BY UserId
+    ) ub ON ub.UserId = u.Id
+),
+UserAnswerRanks AS (
+    SELECT
+        a.OwnerUserId,
+        COUNT(*) AS AnswersCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        MIN(a.Score) AS MinAnswerScore
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.OwnerUserId
+)
+SELECT 
+    tq.QuestionId,
+    tq.Title,
+    COALESCE(tq.Tags, '') AS Tags,
+    tq.CreationDate,
+    tq.Score,
+    tq.ViewCount,
+    tq.AnswerCount,
+    tq.CommentTotal,
+    REGEXP_REPLACE(tq.Tags, '[<>]', '', 'g') AS CleanedTags,
+    dq.OriginalQuestionId,
+    qc.CloseReason,
+    qc.ClosedAt,
+    qc.ClosedByUserName,
+    tq.Answerers,
+    ua.AnswersCount,
+    ua.AvgAnswerScore,
+    ua.MaxAnswerScore,
+    ua.MinAnswerScore,
+    us.DisplayName AS QuestionOwner,
+    us.Reputation AS OwnerReputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.ProfileViews,
+    us.ReputationRank,
+    LAG(tq.Score) OVER (ORDER BY tq.CreationDate) AS PrevQuestionScore,
+    LEAD(tq.Score) OVER (ORDER BY tq.CreationDate) AS NextQuestionScore,
+    LENGTH(tq.Title) AS TitleLength,
+    CASE 
+        WHEN tq.ViewCount > 1000 THEN 'Popular'
+        WHEN tq.ViewCount BETWEEN 100 AND 1000 THEN 'Average'
+        ELSE 'Niche'
+    END AS PopularityCategory,
+    CARDINALITY(STRING_TO_ARRAY(tq.Tags, '><')) AS TagsCount
+FROM TopQuestionsWithAnswers tq
+LEFT JOIN DuplicateQuestionRelations dq ON dq.DuplicateQuestionId = tq.QuestionId
+LEFT JOIN QuestionClosureDetails qc ON qc.PostId = tq.QuestionId
+LEFT JOIN UserAnswerRanks ua ON ua.OwnerUserId = tq.OwnerUserId
+LEFT JOIN UserScoreStats us ON us.Id = tq.OwnerUserId
+WHERE (qc.ClosedAt IS NULL OR qc.ClosedAt > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'))
+  AND ua.AnswersCount IS NOT NULL
+ORDER BY tq.CreationDate DESC, tq.Score DESC
+LIMIT 100;

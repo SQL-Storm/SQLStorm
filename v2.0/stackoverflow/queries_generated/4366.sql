@@ -1,0 +1,139 @@
+-- {"query": "4366.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1262} 
+
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ph.PostHistoryTypeId,
+      ph.Comment,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+  ),
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      AVG(p.Score) AS AverageScore,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserBadgeSummary AS (
+    SELECT
+      b.UserId,
+      COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+      COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+      COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY
+      b.UserId
+  ),
+  RecentTopQuestions AS (
+    SELECT
+      Id,
+      Title,
+      OwnerUserId,
+      Score,
+      AnswerCount,
+      FavoriteCount,
+      CreationDate
+    FROM Posts
+    WHERE
+      PostTypeId = 1
+      AND CreationDate >= DATE('now', '-30 day')
+      AND Score > 100
+      AND AnswerCount > 5
+  ),
+  HighReputationUsersWithEdits AS (
+    SELECT
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      rpe.CreationDate AS LastEditDate,
+      rpe.Comment AS LastEditComment
+    FROM Users u
+    JOIN RankedPostEdits rpe
+      ON u.Id = rpe.UserId
+    WHERE
+      rpe.rn = 1 AND u.Reputation > 10000
+  )
+SELECT
+  u.DisplayName,
+  u.Reputation,
+  upa.TotalPosts,
+  upa.QuestionCount,
+  upa.AnswerCount,
+  CASE
+    WHEN upa.AverageScore IS NULL THEN 0
+    ELSE ROUND(upa.AverageScore, 2)
+  END AS FormattedAverageScore,
+  ubs.GoldBadges,
+  ubs.SilverBadges,
+  ubs.BronzeBadges,
+  rtq.Title AS RecentTopQuestionTitle,
+  rtq.Score AS RecentTopQuestionScore,
+  hrue.LastEditDate,
+  hrue.LastEditComment,
+  CASE
+    WHEN u.EmailHash IS NOT NULL THEN 'Has Email Hash'
+    ELSE 'No Email Hash'
+  END AS EmailStatus,
+  CASE
+    WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website'
+    ELSE 'Has Website'
+  END AS WebsiteStatus,
+  COALESCE(pht.Name, 'Unknown') AS LastPostHistoryTypeName,
+  COUNT(c.Id) AS CommentCountOnOwnedPosts
+FROM Users u
+LEFT JOIN UserPostActivity upa
+  ON u.Id = upa.OwnerUserId
+LEFT JOIN UserBadgeSummary ubs
+  ON u.Id = ubs.UserId
+LEFT JOIN (
+  SELECT
+    rtq_inner.*,
+    ROW_NUMBER() OVER (PARTITION BY rtq_inner.OwnerUserId ORDER BY rtq_inner.CreationDate DESC) as rn_rtq
+  FROM RecentTopQuestions rtq_inner
+) rtq
+  ON u.Id = rtq.OwnerUserId AND rtq.rn_rtq = 1
+LEFT JOIN HighReputationUsersWithEdits hrue
+  ON u.Id = hrue.Id
+LEFT JOIN PostHistory ph_last
+  ON u.Id = ph_last.UserId AND ph_last.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Edit Body') AND ph_last.Id = (SELECT MAX(Id) FROM PostHistory WHERE UserId = u.Id AND PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Edit Body'))
+LEFT JOIN PostHistoryTypes pht
+  ON ph_last.PostHistoryTypeId = pht.Id
+LEFT JOIN Comments c
+  ON u.Id = c.UserId AND c.CreationDate >= DATE('now', '-7 day')
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  upa.TotalPosts,
+  upa.QuestionCount,
+  upa.AnswerCount,
+  upa.AverageScore,
+  ubs.GoldBadges,
+  ubs.SilverBadges,
+  ubs.BronzeBadges,
+  rtq.Title,
+  rtq.Score,
+  hrue.LastEditDate,
+  hrue.LastEditComment,
+  EmailStatus,
+  WebsiteStatus,
+  LastPostHistoryTypeName
+HAVING
+  COUNT(c.Id) > 5 OR u.Reputation > 50000
+ORDER BY
+  u.Reputation DESC,
+  COUNT(c.Id) DESC
+LIMIT 100;

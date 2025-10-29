@@ -1,0 +1,117 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn_score,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS previous_day_score,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS next_day_score,
+        SUM(p.CommentCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_comment_total
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.PostTypeId IN (1, 2) AND p.OwnerUserId IS NOT NULL
+),
+UserEngagement AS (
+    SELECT
+        rp.OwnerUserId,
+        COUNT(rp.PostId) AS TotalPosts,
+        AVG(rp.Score) AS AvgScore,
+        SUM(rp.ViewCount) AS TotalViews,
+        MAX(rp.CreationDate) AS LastPostDate,
+        SUM(CASE WHEN rp.rn_score = 1 THEN 1 ELSE 0 END) AS HasTopScoringPost,
+        COUNT(CASE WHEN rp.previous_day_score < rp.Score AND rp.Score > rp.next_day_score THEN 1 ELSE NULL END) AS ScoreIncreasesThenDecreases,
+        SUM(rp.running_comment_total) AS TotalRunningComments
+    FROM RankedPosts rp
+    WHERE rp.OwnerUserId > 0
+    GROUP BY rp.OwnerUserId
+),
+TopUsers AS (
+    SELECT
+        ue.OwnerUserId,
+        ue.TotalPosts,
+        ue.AvgScore,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        ROW_NUMBER() OVER (ORDER BY ue.TotalPosts DESC, ue.AvgScore DESC) AS user_rank_posts,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS reputation_rank,
+        ue.LastPostDate
+    FROM UserEngagement ue
+    JOIN Users u ON ue.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000
+)
+SELECT
+    tu.OwnerUserId,
+    u.DisplayName,
+    tu.TotalPosts,
+    tu.AvgScore,
+    tu.Reputation,
+    tu.UserCreationDate,
+    tu.user_rank_posts,
+    tu.reputation_rank,
+    rp_top.Title AS TopPostTitle,
+    rp_top.Score AS TopPostScore,
+    rp_top.PostTypeName,
+    CASE
+        WHEN rp_top.Score > 1000 THEN 'High Value'
+        WHEN rp_top.Score BETWEEN 100 AND 999 THEN 'Medium Value'
+        ELSE 'Low Value'
+    END AS PostValueCategory,
+    COALESCE(LENGTH(u.AboutMe), 0) AS AboutMeLength,
+    CASE WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '' THEN 'Has Website' ELSE 'No Website' END AS WebsiteStatus,
+    EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Name LIKE '%Gold%') AS HasGoldBadge,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND c.Score > 5) AS HighScoringCommentCount,
+    CASE
+        WHEN TIMESTAMP '2024-10-01 12:34:56' - tu.LastPostDate > INTERVAL '365 days' THEN 'Inactive'
+        WHEN TIMESTAMP '2024-10-01 12:34:56' - tu.LastPostDate BETWEEN INTERVAL '90 days' AND INTERVAL '365 days' THEN 'Moderately Active'
+        ELSE 'Active'
+    END AS UserActivityStatus,
+    rp_later.Title AS LaterPostTitle,
+    rp_later.Score AS LaterPostScore,
+    rp_earlier.Title AS EarlierPostTitle,
+    rp_earlier.Score AS EarlierPostScore,
+    (SELECT COUNT(DISTINCT ph.UserId) FROM PostHistory ph WHERE ph.PostId = rp_top.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)) AS EditCountForTopPost,
+    (SELECT COUNT(DISTINCT LinkTypeId) FROM PostLinks pl WHERE pl.PostId = rp_top.PostId AND pl.LinkTypeId = 3) AS DuplicateLinkCount
+FROM TopUsers tu
+JOIN Users u ON tu.OwnerUserId = u.Id
+LEFT JOIN RankedPosts rp_top ON tu.OwnerUserId = rp_top.OwnerUserId AND rp_top.rn_score = 1
+LEFT JOIN RankedPosts rp_later ON tu.OwnerUserId = rp_later.OwnerUserId AND rp_later.CreationDate > rp_top.CreationDate
+LEFT JOIN RankedPosts rp_earlier ON tu.OwnerUserId = rp_earlier.OwnerUserId AND rp_earlier.CreationDate < rp_top.CreationDate
+WHERE tu.user_rank_posts <= 50
+GROUP BY
+    tu.OwnerUserId,
+    u.DisplayName,
+    tu.TotalPosts,
+    tu.AvgScore,
+    tu.Reputation,
+    tu.UserCreationDate,
+    tu.user_rank_posts,
+    tu.reputation_rank,
+    rp_top.Title,
+    rp_top.Score,
+    rp_top.PostTypeName,
+    CASE
+        WHEN rp_top.Score > 1000 THEN 'High Value'
+        WHEN rp_top.Score BETWEEN 100 AND 999 THEN 'Medium Value'
+        ELSE 'Low Value'
+    END,
+    COALESCE(LENGTH(u.AboutMe), 0),
+    CASE WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '' THEN 'Has Website' ELSE 'No Website' END,
+    EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Name LIKE '%Gold%'),
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND c.Score > 5),
+    CASE
+        WHEN TIMESTAMP '2024-10-01 12:34:56' - tu.LastPostDate > INTERVAL '365 days' THEN 'Inactive'
+        WHEN TIMESTAMP '2024-10-01 12:34:56' - tu.LastPostDate BETWEEN INTERVAL '90 days' AND INTERVAL '365 days' THEN 'Moderately Active'
+        ELSE 'Active'
+    END,
+    rp_later.Title,
+    rp_later.Score,
+    rp_earlier.Title,
+    rp_earlier.Score
+HAVING
+    SUM(CASE WHEN rp_top.PostTypeName = 'Question' THEN 1 ELSE 0 END) > 0
+    OR SUM(CASE WHEN rp_top.PostTypeName = 'Answer' THEN 1 ELSE 0 END) > 0;

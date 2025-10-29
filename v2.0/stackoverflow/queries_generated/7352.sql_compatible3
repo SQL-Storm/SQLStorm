@@ -1,0 +1,221 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_score,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS UNBOUNDED PRECEDING) AS cum_score,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS user_post_count,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS avg_user_score
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(p.Tags, '; ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.Count > (SELECT AVG(t2.Count) FROM Tags t2) THEN 'High' ELSE 'Low' END AS TagPopularity,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS PostsWithTag
+    FROM Tags t
+    WHERE t.Count > 0
+),
+ComplexVotes AS (
+    SELECT 
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        v.CreationDate,
+        v.BountyAmount,
+        CASE 
+            WHEN v.VoteTypeId IN (2, 3) THEN 'Moderation'
+            WHEN v.VoteTypeId IN (8, 9) THEN 'Bounty'
+            WHEN v.VoteTypeId IN (6, 7) THEN 'Close/Open'
+            ELSE 'Other'
+        END AS VoteCategory,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate) AS vote_sequence,
+        LAG(v.CreationDate) OVER (PARTITION BY v.PostId ORDER BY v.CreationDate) AS prev_vote_date,
+        EXTRACT(EPOCH FROM (v.CreationDate - LAG(v.CreationDate) OVER (PARTITION BY v.PostId ORDER BY v.CreationDate))) AS seconds_since_last_vote
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 6, 7, 8, 9)
+),
+PostMetrics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.Score <= 0 THEN 'Negative'
+            WHEN p.Score BETWEEN 1 AND 5 THEN 'Low'
+            WHEN p.Score BETWEEN 6 AND 15 THEN 'Medium'
+            WHEN p.Score BETWEEN 16 AND 50 THEN 'High'
+            ELSE 'Very High'
+        END AS ScoreCategory,
+        CASE 
+            WHEN p.CommentCount > 0 THEN 'Has Comments'
+            ELSE 'No Comments'
+        END AS CommentStatus,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id),
+            0
+        ) AS ActualCommentCount,
+        CASE 
+            WHEN p.ViewCount IS NOT NULL AND p.ViewCount > 0 THEN 
+                (p.Score * 100.0) / p.ViewCount 
+            ELSE 0 
+        END AS ScoreToViewRatio,
+        CASE 
+            WHEN p.AnswerCount IS NOT NULL AND p.AnswerCount > 0 THEN 
+                (p.Score * 100.0) / p.AnswerCount 
+            ELSE 0 
+        END AS ScoreToAnswerRatio,
+        p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+-- replace correlated IN-subqueries in JOINs with joins to derived tables to avoid non-inner join on subquery issues
+UserTagValues AS (
+    SELECT us.UserId,
+           TRIM(value) AS tag_value
+    FROM UserStats us,
+    LATERAL (
+        SELECT value
+        FROM ( SELECT UNNEST(STRING_TO_ARRAY(us.AllTags, '; ')) AS value ) t
+    ) lt
+    WHERE us.AllTags IS NOT NULL
+),
+UserTagValues2 AS (
+    SELECT us.UserId,
+           TRIM(value) AS tag_value
+    FROM UserStats us,
+    LATERAL (
+        SELECT value
+        FROM ( SELECT UNNEST(STRING_TO_ARRAY(us.AllTags, '; ')) AS value ) t
+    ) lt2
+    WHERE us.AllTags IS NOT NULL
+)
+SELECT 
+    ps.UserId,
+    ps.Reputation,
+    ps.Views,
+    ps.UpVotes,
+    ps.DownVotes,
+    ps.TotalPosts,
+    ps.QuestionCount,
+    ps.AnswerCount,
+    ps.TotalQuestionScore,
+    ps.TotalAnswerScore,
+    ps.LastPostDate,
+    ps.AllTags,
+    COUNT(DISTINCT CASE WHEN rp.PostTypeId = 1 THEN rp.Id END) AS RankedQuestions,
+    COUNT(DISTINCT CASE WHEN rp.PostTypeId = 2 THEN rp.Id END) AS RankedAnswers,
+    STRING_AGG(DISTINCT ta.TagName, ', ') AS PopularTags,
+    AVG(CASE WHEN rp.Score > 0 THEN rp.Score ELSE NULL END) AS AvgPositiveScore,
+    MAX(rp.Score) AS MaxScore,
+    MIN(rp.Score) AS MinScore,
+    MAX(CASE WHEN rp.Score > 0 THEN rp.Score ELSE NULL END) AS MaxPositiveScore,
+    MIN(CASE WHEN rp.Score <= 0 THEN rp.Score ELSE NULL END) AS MinNegativeScore,
+    AVG(rp.Score) AS OverallAvgScore,
+    COUNT(rp.Id) AS TotalRankedPosts,
+    STRING_AGG(
+        CASE 
+            WHEN rp.prev_score IS NOT NULL THEN 
+                CONCAT('Post ', rp.Id, ' Score Diff: ', (rp.Score - rp.prev_score))
+            ELSE 'No Previous Score'
+        END, 
+        '; '
+    ) AS ScoreDifferences,
+    AVG(rp.cum_score) AS AvgCumScore,
+    MAX(rp.user_post_count) AS MaxUserPostCount,
+    AVG(rp.avg_user_score) AS AvgUserScore,
+    COUNT(DISTINCT CASE WHEN cp.VoteTypeId IN (2, 3) THEN cp.PostId END) AS UpDownVotes,
+    COUNT(DISTINCT CASE WHEN cp.VoteTypeId IN (8, 9) THEN cp.PostId END) AS BountyVotes,
+    STRING_AGG(DISTINCT pm.Title, '; ') AS PostTitles,
+    STRING_AGG(DISTINCT pm.ScoreCategory, ', ') AS ScoreCategories,
+    STRING_AGG(
+        CASE 
+            WHEN pm.ScoreToViewRatio > 0.5 THEN CONCAT('High Ratio: ', pm.ScoreToViewRatio)
+            ELSE 'Low Ratio'
+        END, 
+        '; '
+    ) AS ViewScoreRatios,
+    CASE 
+        WHEN AVG(pm.ScoreToAnswerRatio) > 20 THEN 'High Answer Engagement'
+        ELSE 'Normal Answer Engagement'
+    END AS AnswerEngagementLevel,
+    AVG(pm.ScoreToViewRatio) AS AvgScoreToViewRatio,
+    AVG(pm.ScoreToAnswerRatio) AS AvgScoreToAnswerRatio,
+    COUNT(DISTINCT pm.PostId) AS AnalysisPostCount,
+    ROW_NUMBER() OVER (ORDER BY ps.TotalQuestionScore DESC, ps.Reputation DESC) AS Ranking,
+    'Performance Test Query Result' AS QueryDescription
+FROM UserStats ps
+LEFT JOIN RankedPosts rp ON ps.UserId = rp.OwnerUserId
+LEFT JOIN PostMetrics pm ON pm.OwnerUserId = ps.UserId
+LEFT JOIN ComplexVotes cp ON cp.PostId IN (
+    SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = ps.UserId
+)
+LEFT JOIN UserTagValues utv ON utv.UserId = ps.UserId
+LEFT JOIN Tags t ON t.TagName = utv.tag_value
+LEFT JOIN UserTagValues2 utv2 ON utv2.UserId = ps.UserId
+LEFT JOIN TagAnalysis ta ON ta.TagName = utv2.tag_value
+WHERE ps.UserId IS NOT NULL
+GROUP BY 
+    ps.UserId,
+    ps.Reputation,
+    ps.Views,
+    ps.UpVotes,
+    ps.DownVotes,
+    ps.TotalPosts,
+    ps.QuestionCount,
+    ps.AnswerCount,
+    ps.TotalQuestionScore,
+    ps.TotalAnswerScore,
+    ps.LastPostDate,
+    ps.AllTags
+HAVING 
+    COUNT(DISTINCT CASE WHEN rp.PostTypeId = 1 THEN rp.Id END) > 0
+    OR COUNT(DISTINCT CASE WHEN rp.PostTypeId = 2 THEN rp.Id END) > 0
+    OR COUNT(DISTINCT pm.PostId) > 0
+    OR COUNT(DISTINCT CASE WHEN cp.VoteTypeId IS NOT NULL THEN cp.PostId END) > 0
+ORDER BY 
+    ps.Reputation DESC,
+    ps.TotalQuestionScore DESC,
+    ps.TotalAnswerScore DESC,
+    ps.TotalPosts DESC
+LIMIT 100;

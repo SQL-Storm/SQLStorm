@@ -1,0 +1,264 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(b.Id) AS TotalBadges,
+        MAX(p.CreationDate) AS LastPostDate,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / (60 * 60 * 24) AS AccountAgeDays
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostEditAnalysis AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalRevisions,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS ContentEdits,
+        MAX(ph.CreationDate) AS LastEditDate,
+        MIN(ph.CreationDate) AS FirstEditDate,
+        (SELECT COUNT(DISTINCT UserId) FROM PostHistory WHERE PostId = ph.PostId AND UserId IS NOT NULL) AS DistinctEditors,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS ClosureEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEvents
+    FROM
+        PostHistory ph
+    GROUP BY
+        ph.PostId
+),
+PostTaggingContext AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Tags,
+        CASE
+            WHEN p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 2
+            THEN (string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))[1]
+            ELSE NULL
+        END AS PrimaryTag,
+        (SELECT COUNT(pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateLinkCount,
+        (SELECT COUNT(pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS LinkedPostCount
+    FROM
+        Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+-- Precompute per-user window aggregates to allow filtering without window functions in HAVING
+PerPostWithUserWindows AS (
+    SELECT
+        p.*,
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.AccountAgeDays,
+        uas.TotalBadges,
+        pe.TotalRevisions,
+        pe.ContentEdits,
+        pe.DistinctEditors,
+        pe.ClosureEvents,
+        pe.ReopenEvents,
+        ptc.PrimaryTag,
+        ptc.DuplicateLinkCount,
+        ptc.LinkedPostCount,
+        b_tag.Id AS BadgeId,
+        t_wiki.Id AS TagWikiId,
+        COUNT(cmt.Id) AS PostCommentCount, -- aggregate per post
+        -- Window-like aggregates computed using subqueries to be SQL-dialect neutral
+        (SELECT AVG(pp.Score)
+         FROM Posts pp
+         WHERE pp.OwnerUserId = p.OwnerUserId
+           AND pp.PostTypeId = p.PostTypeId
+           AND pp.CreationDate BETWEEN (p.CreationDate - INTERVAL '90 days') AND p.CreationDate
+        ) AS UserAvgScore90DaysRange,
+        (SELECT SUM(COALESCE(pp.FavoriteCount,0))
+         FROM Posts pp
+         WHERE pp.OwnerUserId = p.OwnerUserId
+        ) AS TotalFavoritesByUser
+    FROM
+        Posts p
+    INNER JOIN UserActivitySummary uas ON uas.UserId = p.OwnerUserId
+    LEFT JOIN PostEditAnalysis pe ON p.Id = pe.PostId
+    LEFT JOIN PostTaggingContext ptc ON p.Id = ptc.PostId
+    LEFT JOIN Badges b_tag ON uas.UserId = b_tag.UserId
+        AND ptc.PrimaryTag IS NOT NULL
+        AND b_tag.Name = ptc.PrimaryTag
+        AND b_tag.Class = 1
+    LEFT JOIN Comments cmt ON p.Id = cmt.PostId
+    LEFT JOIN Tags t_wiki ON ptc.PrimaryTag = t_wiki.TagName AND t_wiki.WikiPostId IS NOT NULL
+    GROUP BY
+        p.Id, p.PostTypeId, p.Title, p.CreationDate, p.Score, p.ViewCount,
+        p.AnswerCount, p.CommentCount, p.FavoriteCount, p.AcceptedAnswerId, p.Body,
+        p.ClosedDate, p.CommunityOwnedDate, p.LastEditorUserId, p.OwnerUserId, p.Tags,
+        uas.UserId, uas.DisplayName, uas.Reputation, uas.AccountAgeDays, uas.TotalBadges,
+        pe.TotalRevisions, pe.ContentEdits, pe.DistinctEditors, pe.ClosureEvents, pe.ReopenEvents,
+        ptc.PrimaryTag, ptc.DuplicateLinkCount, ptc.LinkedPostCount, b_tag.Id, t_wiki.Id
+)
+
+SELECT
+    'HighImpactQuestion' AS RecordType,
+    ppw.UserId,
+    ppw.DisplayName,
+    ppw.Reputation,
+    ppw.Id AS PostId,
+    ppw.Title,
+    ppw.CreationDate AS PostCreationDate,
+    ppw.Score AS PostScore,
+    ppw.ViewCount AS PostViewCount,
+    ppw.TotalRevisions,
+    ppw.ContentEdits,
+    ppw.DistinctEditors,
+    ppw.ClosureEvents,
+    ppw.ReopenEvents,
+    ppw.PrimaryTag,
+    ppw.DuplicateLinkCount,
+    ppw.LinkedPostCount,
+    COALESCE(ppw.AcceptedAnswerId IS NOT NULL, FALSE) AS HasAcceptedAnswer,
+    ppw.BadgeId IS NOT NULL AS HasPrimaryTagGoldBadge,
+    (
+        SELECT AVG(pp.Score)
+        FROM Posts pp
+        WHERE pp.OwnerUserId = ppw.OwnerUserId
+          AND pp.PostTypeId = ppw.PostTypeId
+          AND pp.CreationDate BETWEEN (ppw.CreationDate - INTERVAL '60 days') AND ppw.CreationDate
+          AND pp.Id != ppw.Id
+    ) AS AvgUserScoreLast60DaysBeforePost,
+    CASE
+        WHEN ppw.ViewCount > 50000 AND ppw.Score > 200 THEN 'Mega Impact'
+        WHEN ppw.ViewCount > 10000 AND ppw.Score > 50 THEN 'High Impact'
+        WHEN ppw.ViewCount > 1000 AND ppw.Score > 10 THEN 'Medium Impact'
+        ELSE 'Low Impact'
+    END AS PostImpactCategory,
+    CASE
+        WHEN ppw.ClosedDate IS NOT NULL AND ppw.ClosureEvents > 0 AND ppw.ReopenEvents = 0 THEN 'Permanently Closed'
+        WHEN ppw.ClosedDate IS NOT NULL AND ppw.ReopenEvents > 0 THEN 'Closed & Reopened'
+        WHEN ppw.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+    END AS PostStatusFlag,
+    ppw.UserAvgScore90DaysRange AS UserRollingAvgScore90Days,
+    ppw.TotalFavoritesByUser AS TotalFavoritesByUser,
+    LAG(ppw.CreationDate) OVER (PARTITION BY ppw.OwnerUserId ORDER BY ppw.CreationDate) AS PreviousPostCreationDate,
+    EXTRACT(EPOCH FROM (ppw.CreationDate - LAG(ppw.CreationDate) OVER (PARTITION BY ppw.OwnerUserId ORDER BY ppw.CreationDate))) / (60 * 60 * 24) AS DaysSincePreviousPost,
+    ppw.PostCommentCount AS PostCommentCountWindow,
+    CASE WHEN ppw.Body LIKE '%<pre><code>%' OR ppw.Body LIKE '%`%`%' THEN TRUE ELSE FALSE END AS HasCodeBlock,
+    NULLIF(ppw.LastEditorUserId, ppw.OwnerUserId) IS NOT NULL AS EditedByOtherUser,
+    ppw.TagWikiId IS NOT NULL AS PrimaryTagHasWikiPost,
+    COALESCE((
+        SELECT COUNT(*) FROM unnest(string_to_array(SUBSTRING(ppw.Tags FROM 2 FOR LENGTH(ppw.Tags) - 2), '><')) AS t(tag)
+        WHERE t.tag ILIKE '%sql%'
+    ), 0) AS SQLRelatedTagCount,
+    (
+        SELECT SUM(c_inner.Score)
+        FROM Comments c_inner
+        WHERE c_inner.PostId = ppw.Id
+          AND c_inner.UserId IS NOT NULL
+          AND c_inner.CreationDate > ppw.CreationDate + INTERVAL '1 hour'
+          AND c_inner.Score > 0
+    ) AS PostCommentUpvoteSum
+FROM
+    PerPostWithUserWindows ppw
+WHERE
+    ppw.PostTypeId = 1
+    AND ppw.Reputation > 5000
+    AND ppw.CreationDate >= '2021-01-01'
+    AND ppw.ViewCount > 1000
+    AND ppw.Score > 10
+    AND EXISTS (
+        SELECT 1 FROM PostLinks pl_duplicate WHERE pl_duplicate.PostId = ppw.Id AND pl_duplicate.LinkTypeId = 3
+    )
+    AND (ppw.Title ILIKE '%performance%' OR ppw.Tags ILIKE '%<optimization>%')
+    AND ppw.ContentEdits > 2
+    AND ppw.DistinctEditors > 1
+    AND COALESCE(ppw.FavoriteCount, 0) > 5
+    AND EXISTS (
+        SELECT 1
+        FROM Users u_answerer
+        INNER JOIN Posts a ON u_answerer.Id = a.OwnerUserId
+        WHERE a.ParentId = ppw.Id AND a.PostTypeId = 2 AND u_answerer.Reputation > 10000 AND a.Score > 20
+    )
+    AND ppw.PostCommentCount > 3
+    AND COALESCE(ppw.UserAvgScore90DaysRange, 0) > 15
+    AND COALESCE(ppw.TotalFavoritesByUser, 0) > 20
+
+UNION ALL
+
+SELECT
+    'TopAnswererInsights' AS RecordType,
+    ppw.UserId,
+    ppw.DisplayName,
+    ppw.Reputation,
+    ppw.Id AS PostId,
+    ppw.Title,
+    ppw.CreationDate AS PostCreationDate,
+    ppw.Score AS PostScore,
+    ppw.ViewCount AS PostViewCount,
+    ppw.TotalRevisions,
+    ppw.ContentEdits,
+    ppw.DistinctEditors,
+    ppw.ClosureEvents,
+    ppw.ReopenEvents,
+    ppw.PrimaryTag,
+    ppw.DuplicateLinkCount,
+    ppw.LinkedPostCount,
+    COALESCE(ppw.AcceptedAnswerId IS NOT NULL, FALSE) AS HasAcceptedAnswer,
+    ppw.BadgeId IS NOT NULL AS HasPrimaryTagGoldBadge,
+    (
+        SELECT AVG(pp.Score)
+        FROM Posts pp
+        WHERE pp.OwnerUserId = ppw.OwnerUserId
+          AND pp.PostTypeId = ppw.PostTypeId
+          AND pp.CreationDate BETWEEN (ppw.CreationDate - INTERVAL '60 days') AND ppw.CreationDate
+          AND pp.Id != ppw.Id
+    ) AS AvgUserScoreLast60DaysBeforePost,
+    CASE
+        WHEN ppw.Score > 50 THEN 'Highly Valued Answer'
+        WHEN ppw.Score > 10 THEN 'Well-Received Answer'
+        ELSE 'Standard Answer'
+    END AS PostImpactCategory,
+    'Active' AS PostStatusFlag,
+    ppw.UserAvgScore90DaysRange AS UserRollingAvgScore90Days,
+    ppw.TotalFavoritesByUser AS TotalFavoritesByUser,
+    LAG(ppw.CreationDate) OVER (PARTITION BY ppw.OwnerUserId ORDER BY ppw.CreationDate) AS PreviousPostCreationDate,
+    EXTRACT(EPOCH FROM (ppw.CreationDate - LAG(ppw.CreationDate) OVER (PARTITION BY ppw.OwnerUserId ORDER BY ppw.CreationDate))) / (60 * 60 * 24) AS DaysSincePreviousPost,
+    ppw.PostCommentCount AS PostCommentCountWindow,
+    CASE WHEN ppw.Body LIKE '%<pre><code>%' OR ppw.Body LIKE '%`%`%' THEN TRUE ELSE FALSE END AS HasCodeBlock,
+    NULLIF(ppw.LastEditorUserId, ppw.OwnerUserId) IS NOT NULL AS EditedByOtherUser,
+    ppw.TagWikiId IS NOT NULL AS PrimaryTagHasWikiPost,
+    COALESCE((
+        SELECT COUNT(*) FROM unnest(string_to_array(COALESCE(SUBSTRING(ppw.Tags FROM 2 FOR LENGTH(ppw.Tags) - 2), ''), '><')) AS t(tag)
+        WHERE t.tag ILIKE '%sql%'
+    ), 0) AS SQLRelatedTagCount,
+    (
+        SELECT SUM(c_inner.Score)
+        FROM Comments c_inner
+        WHERE c_inner.PostId = ppw.Id
+          AND c_inner.UserId IS NOT NULL
+          AND c_inner.CreationDate > ppw.CreationDate + INTERVAL '1 hour'
+          AND c_inner.Score > 0
+    ) AS PostCommentUpvoteSum
+FROM
+    PerPostWithUserWindows ppw
+WHERE
+    ppw.PostTypeId = 2
+    AND ppw.TotalBadges > 10
+    AND ppw.CreationDate >= '2022-01-01'
+    AND ppw.Score > 20
+    AND ppw.OwnerUserId IS NOT NULL
+    AND EXISTS (
+        SELECT 1 FROM Votes v_accepted WHERE v_accepted.PostId = ppw.Id AND v_accepted.VoteTypeId = 1
+    )
+    AND ppw.Body IS NOT NULL AND LENGTH(ppw.Body) > 300
+    AND (SELECT q.Title FROM Posts q WHERE q.Id = ppw.ParentId) ILIKE '%query%'
+    AND ppw.PostCommentCount > 1
+    AND COALESCE(ppw.UserAvgScore90DaysRange, 0) > 10
+    AND COALESCE(ppw.TotalFavoritesByUser, 0) > 5
+ORDER BY
+    Reputation DESC, PostScore DESC
+LIMIT 2000;

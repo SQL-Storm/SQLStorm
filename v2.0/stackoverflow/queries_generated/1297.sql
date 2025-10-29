@@ -1,0 +1,284 @@
+-- {"query": "1297.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3942} 
+
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate AS UserLastAccessDate,
+        COALESCE(u.Views, 0) AS UserProfileViews,
+        COALESCE(u.UpVotes, 0) AS TotalUpVotesGiven,
+        COALESCE(u.DownVotes, 0) AS TotalDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score ELSE 0 END) AS TotalPostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalPostViews,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(CASE WHEN va.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostsUpVoted,
+        SUM(CASE WHEN vd.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostsDownVoted,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        SUM(CASE WHEN EXISTS (SELECT 1 FROM Posts pa WHERE pa.Id = p.AcceptedAnswerId AND pa.OwnerUserId = u.Id) THEN 1 ELSE 0 END) AS AnswersAcceptedByOthers,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes va ON u.Id = va.UserId AND va.VoteTypeId = 2 -- Upvotes given by user
+    LEFT JOIN Votes vd ON u.Id = vd.UserId AND vd.VoteTypeId = 3 -- Downvotes given by user
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostHistoryStats AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalEdits,
+        MAX(ph.CreationDate) AS LastEditDateHistory,
+        MIN(ph.CreationDate) AS FirstEditDateHistory,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS CloseEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (11) THEN 1 ELSE 0 END) AS ReopenEvents,
+        STRING_AGG(DISTINCT crt.Name, '; ') FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL) AS CloseReasons,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IN ('1', '101') THEN 1 ELSE 0 END) AS IsDuplicateClosed -- Check for close reason (Exact Duplicate or Duplicate)
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND ph.Comment = crt.Id::text
+    GROUP BY ph.PostId
+),
+TagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.Tags,
+        ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'), 1) AS TagCount,
+        (SELECT COUNT(DISTINCT t.Id) FROM Tags t WHERE t.TagName = ANY(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AND t.IsModeratorOnly = TRUE) AS ModeratorOnlyTagCount
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+InfluentialUserCandidate AS (
+    SELECT
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.UserCreationDate,
+        ue.TotalPosts,
+        ue.TotalQuestions,
+        ue.TotalAnswers,
+        ue.TotalPostScore,
+        ue.TotalPostViews,
+        ue.TotalComments,
+        ue.AnswersAcceptedByOthers,
+        (SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = ue.UserId AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = ue.UserId AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = ue.UserId AND b.Class = 3) AS BronzeBadges,
+        (SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = ue.UserId AND b.TagBased = TRUE) AS TagBasedBadges,
+        ue.AvgQuestionScore,
+        ue.AvgAnswerScore,
+        SUM(phs.TotalEdits) AS SumPostEdits,
+        MAX(phs.IsDuplicateClosed) AS HasDuplicateClosedPost,
+        STRING_AGG(DISTINCT phs.CloseReasons, ' | ') FILTER (WHERE phs.CloseReasons IS NOT NULL) AS CombinedCloseReasons,
+        SUM(CASE WHEN p.ParentId IS NULL AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswers, -- Questions posted by user that have an accepted answer
+        SUM(CASE WHEN p.Body LIKE '%<a href%' AND p.Body NOT LIKE '%stackoverflow.com%' THEN 1 ELSE 0 END) AS PostsWithExternalLinks,
+        SUM(ta.TagCount) AS TotalTagsUsedAcrossPosts,
+        SUM(ta.ModeratorOnlyTagCount) AS TotalModeratorOnlyTagsUsed,
+        SUM(p.FavoriteCount) AS TotalFavoriteCounts,
+        MAX(p.ViewCount) AS MaxPostViewCount,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM UserEngagement ue
+    JOIN Posts p ON ue.UserId = p.OwnerUserId
+    LEFT JOIN PostHistoryStats phs ON p.Id = phs.PostId
+    LEFT JOIN TagAnalysis ta ON p.Id = ta.PostId
+    GROUP BY
+        ue.UserId, ue.DisplayName, ue.Reputation, ue.UserCreationDate, ue.TotalPosts,
+        ue.TotalQuestions, ue.TotalAnswers, ue.TotalPostScore, ue.TotalPostViews, ue.TotalComments,
+        ue.AnswersAcceptedByOthers, ue.AvgQuestionScore, ue.AvgAnswerScore
+    HAVING ue.Reputation > 500
+    AND ue.TotalPosts > 10
+    AND (SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = ue.UserId AND b.Class = 1) > 0 -- Has at least one Gold badge
+),
+CalculatedMetrics AS (
+    SELECT
+        iu.UserId,
+        iu.DisplayName,
+        iu.Reputation,
+        iu.UserCreationDate,
+        iu.TotalPosts,
+        iu.TotalQuestions,
+        iu.TotalAnswers,
+        iu.TotalPostScore,
+        iu.TotalPostViews,
+        iu.TotalComments,
+        iu.AnswersAcceptedByOthers,
+        iu.GoldBadges,
+        iu.SilverBadges,
+        iu.BronzeBadges,
+        iu.TagBasedBadges,
+        iu.SumPostEdits,
+        iu.HasDuplicateClosedPost,
+        iu.CombinedCloseReasons,
+        iu.QuestionsWithAcceptedAnswers,
+        iu.PostsWithExternalLinks,
+        iu.TotalTagsUsedAcrossPosts,
+        iu.TotalModeratorOnlyTagsUsed,
+        iu.TotalFavoriteCounts,
+        iu.MaxPostViewCount,
+        -- Complex calculation for engagement score, heavily weighted by gold badges, reputation, and accepted answers
+        (iu.Reputation * 0.5)
+        + (iu.GoldBadges * 100)
+        + (iu.SilverBadges * 50)
+        + (iu.BronzeBadges * 10)
+        + (iu.AnswersAcceptedByOthers * 20)
+        + (iu.TotalPostScore * 0.1)
+        + (iu.TotalPostViews * 0.001)
+        + (iu.TotalComments * 0.5)
+        + (iu.SumPostEdits * 2)
+        - (CASE WHEN iu.HasDuplicateClosedPost = 1 THEN 50 ELSE 0 END) AS WeightedEngagementScore,
+
+        -- Days since user creation
+        EXTRACT(EPOCH FROM (NOW() - iu.UserCreationDate)) / 86400.0 AS DaysActive,
+
+        -- Ratio of accepted answers to total answers, handling division by zero
+        COALESCE(CAST(iu.AnswersAcceptedByOthers AS NUMERIC) / NULLIF(iu.TotalAnswers, 0), 0) AS AcceptedAnswerRatio,
+
+        -- Ratio of questions with accepted answers to total questions, handling division by zero
+        COALESCE(CAST(iu.QuestionsWithAcceptedAnswers AS NUMERIC) / NULLIF(iu.TotalQuestions, 0), 0) AS QuestionAcceptedRatio,
+
+        -- Average edits per post, handling division by zero
+        COALESCE(CAST(iu.SumPostEdits AS NUMERIC) / NULLIF(iu.TotalPosts, 0), 0) AS AvgEditsPerPost,
+
+        -- Is a "Top Contributor" based on reputation and accepted answers
+        CASE
+            WHEN iu.Reputation > 5000 AND iu.AnswersAcceptedByOthers >= 10 THEN 'Elite'
+            WHEN iu.Reputation > 1000 AND iu.AnswersAcceptedByOthers >= 3 THEN 'Senior'
+            ELSE 'Regular'
+        END AS ContributorTier,
+
+        -- Does the user frequently use moderator-only tags?
+        COALESCE(CAST(iu.TotalModeratorOnlyTagsUsed AS NUMERIC) / NULLIF(iu.TotalTagsUsedAcrossPosts, 0), 0) AS ModeratorTagUsageRatio
+
+    FROM InfluentialUserCandidate iu
+    WHERE iu.DisplayName IS NOT NULL
+      AND iu.DisplayName NOT ILIKE '%test%'
+      AND iu.DisplayName NOT ILIKE '%admin%'
+      AND iu.UserCreationDate >= '2010-01-01'
+),
+RankedUsers AS (
+    SELECT
+        cm.UserId,
+        cm.DisplayName,
+        cm.Reputation,
+        cm.UserCreationDate,
+        cm.TotalPosts,
+        cm.WeightedEngagementScore,
+        cm.AcceptedAnswerRatio,
+        cm.QuestionAcceptedRatio,
+        cm.AvgEditsPerPost,
+        cm.ContributorTier,
+        cm.ModeratorTagUsageRatio,
+        cm.CombinedCloseReasons,
+        cm.MaxPostViewCount,
+        RANK() OVER (ORDER BY cm.WeightedEngagementScore DESC, cm.Reputation DESC) AS OverallEngagementRank,
+        DENSE_RANK() OVER (PARTITION BY cm.ContributorTier ORDER BY cm.AcceptedAnswerRatio DESC) AS TierAcceptedAnswerRank,
+        NTILE(10) OVER (ORDER BY cm.MaxPostViewCount DESC) AS TopPostViewPercentile,
+        LAG(cm.WeightedEngagementScore, 1, 0) OVER (ORDER BY cm.WeightedEngagementScore DESC) AS PrevUserEngagementScore,
+        (SELECT COUNT(DISTINCT l.RelatedPostId)
+         FROM Posts p_inner
+         JOIN PostLinks l ON p_inner.Id = l.PostId
+         WHERE p_inner.OwnerUserId = cm.UserId
+           AND l.LinkTypeId = 3
+           AND p_inner.PostTypeId = 1
+         ) AS TotalLinkedDuplicates, -- Correlated subquery in SELECT
+        COUNT(cm.UserId) OVER (PARTITION BY cm.ContributorTier) AS UsersInTierCount
+    FROM CalculatedMetrics cm
+),
+UserPostLanguageAnalysis AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.Body ILIKE '%javascript%' OR p.Tags ILIKE '%<javascript>%' THEN 1 ELSE 0 END) AS JavascriptPosts,
+        SUM(CASE WHEN p.Body ILIKE '%python%' OR p.Tags ILIKE '%<python>%' THEN 1 ELSE 0 END) AS PythonPosts,
+        SUM(CASE WHEN p.Body ILIKE '%sql%' OR p.Tags ILIKE '%<sql>%' THEN 1 ELSE 0 END) AS SQLPosts
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+TopUsersWithLanguagePreference AS (
+    SELECT
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.WeightedEngagementScore,
+        ru.OverallEngagementRank,
+        upla.JavascriptPosts,
+        upla.PythonPosts,
+        upla.SQLPosts,
+        ru.TotalLinkedDuplicates,
+        CASE
+            WHEN upla.JavascriptPosts > upla.PythonPosts AND upla.JavascriptPosts > upla.SQLPosts THEN 'JavaScript Focused'
+            WHEN upla.PythonPosts > upla.JavascriptPosts AND upla.PythonPosts > upla.SQLPosts THEN 'Python Focused'
+            WHEN upla.SQLPosts > upla.JavascriptPosts AND upla.SQLPosts > upla.PythonPosts THEN 'SQL Focused'
+            ELSE 'Mixed Focus'
+        END AS PrimaryLanguageFocus,
+        COALESCE(ru.CombinedCloseReasons, 'No Closed Posts') AS UserClosedPostSummary
+    FROM RankedUsers ru
+    INNER JOIN UserPostLanguageAnalysis upla ON ru.UserId = upla.UserId
+    WHERE ru.OverallEngagementRank <= 1000 -- Top N users
+    AND (upla.JavascriptPosts + upla.PythonPosts + upla.SQLPosts) > 0 -- At least one post in these languages
+),
+HighlyEngagedActiveUsers AS (
+    SELECT
+        tulp.UserId,
+        tulp.DisplayName,
+        tulp.Reputation,
+        tulp.WeightedEngagementScore,
+        tulp.OverallEngagementRank,
+        tulp.PrimaryLanguageFocus,
+        tulp.UserClosedPostSummary,
+        tulp.TotalLinkedDuplicates
+    FROM TopUsersWithLanguagePreference tulp
+    WHERE tulp.WeightedEngagementScore > 1000
+      AND tulp.Reputation > 2000
+),
+ModeratorEngagedUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT ph.PostId) AS PostsAffectedByModeration,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (14, 19) THEN 1 ELSE 0 END) AS ModeratedEventsCount, -- Locked/Protected posts
+        MAX(ph.CreationDate) AS LastModerationActionDate,
+        'Moderator Engagement' AS Category
+    FROM Users u
+    JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) -- Post closed, reopened, deleted, undeleted, locked, unlocked, protected, unprotected
+      AND ph.CreationDate >= (NOW() - INTERVAL '1 year')
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT ph.PostId) > 5
+)
+SELECT
+    heu.UserId,
+    heu.DisplayName,
+    heu.Reputation,
+    heu.WeightedEngagementScore,
+    heu.OverallEngagementRank,
+    heu.PrimaryLanguageFocus,
+    heu.UserClosedPostSummary,
+    heu.TotalLinkedDuplicates,
+    'Highly Engaged' AS UserClassification
+FROM HighlyEngagedActiveUsers heu
+
+UNION ALL
+
+SELECT
+    meu.UserId,
+    meu.DisplayName,
+    meu.Reputation,
+    NULL AS WeightedEngagementScore, -- Not directly applicable for this branch
+    NULL AS OverallEngagementRank,
+    'N/A' AS PrimaryLanguageFocus,
+    'Moderator-Affected Posts: ' || meu.PostsAffectedByModeration::TEXT AS UserClosedPostSummary,
+    meu.ModeratedEventsCount AS TotalLinkedDuplicates, -- Reusing column name for a different metric
+    meu.Category AS UserClassification
+FROM ModeratorEngagedUsers meu
+WHERE NOT EXISTS (SELECT 1 FROM HighlyEngagedActiveUsers heu WHERE heu.UserId = meu.UserId) -- Exclude users already in the highly engaged group
+ORDER BY Reputation DESC, WeightedEngagementScore DESC NULLS LAST, UserId ASC
+LIMIT 5000;

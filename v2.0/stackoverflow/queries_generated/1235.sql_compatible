@@ -1,0 +1,224 @@
+WITH UserPostActivitySummary AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(P.Id) AS TotalPostsCreated,
+        SUM(P.Score) AS TotalPostScore,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCreated,
+        SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        MAX(P.CreationDate) AS LatestPostDate,
+        AVG(P.ViewCount) AS AvgPostViewCount,
+        MIN(P.CreationDate) AS FirstPostDate
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL
+    GROUP BY P.OwnerUserId
+),
+UserVoteHistorySummary AS (
+    SELECT
+        V.UserId AS UserId,
+        COUNT(V.Id) AS TotalVotesMade,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesMade,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesMade,
+        MAX(V.CreationDate) AS LatestVoteDate,
+        -- correlated count rewritten to aggregate with join to avoid referencing outer V.PostId in subquery
+        SUM(CASE WHEN U_target.Reputation > 10000 THEN 1 ELSE 0 END) AS VotesOnPowerUserPosts
+    FROM Votes V
+    LEFT JOIN Posts P_target ON P_target.Id = V.PostId
+    LEFT JOIN Users U_target ON P_target.OwnerUserId = U_target.Id
+    WHERE V.UserId IS NOT NULL
+    GROUP BY V.UserId
+),
+UserCommentActivitySummary AS (
+    SELECT
+        C.UserId AS UserId,
+        COUNT(C.Id) AS TotalCommentsWritten,
+        SUM(C.Score) AS TotalCommentScoreReceived,
+        MAX(C.CreationDate) AS LatestCommentDate
+    FROM Comments C
+    WHERE C.UserId IS NOT NULL
+    GROUP BY C.UserId
+),
+UserCombinedActivity AS (
+    SELECT
+        COALESCE(UPS.UserId, UVS.UserId, UCS.UserId) AS UserId,
+        COALESCE(UPS.TotalPostsCreated, 0) AS TotalPostsCreated,
+        COALESCE(UPS.TotalPostScore, 0) AS TotalPostScore,
+        COALESCE(UPS.QuestionsCreated, 0) AS QuestionsCreated,
+        COALESCE(UPS.AcceptedAnswersCount, 0) AS AcceptedAnswersCount,
+        UPS.LatestPostDate,
+        UPS.AvgPostViewCount,
+        UPS.FirstPostDate,
+        COALESCE(UVS.TotalVotesMade, 0) AS TotalVotesMade,
+        COALESCE(UVS.UpVotesMade, 0) AS UpVotesMade,
+        COALESCE(UVS.DownVotesMade, 0) AS DownVotesMade,
+        UVS.LatestVoteDate,
+        COALESCE(UVS.VotesOnPowerUserPosts, 0) AS VotesOnPowerUserPosts,
+        COALESCE(UCS.TotalCommentsWritten, 0) AS TotalCommentsWritten,
+        COALESCE(UCS.TotalCommentScoreReceived, 0) AS TotalCommentScoreReceived,
+        UCS.LatestCommentDate
+    FROM UserPostActivitySummary UPS
+    FULL OUTER JOIN UserVoteHistorySummary UVS ON UPS.UserId = UVS.UserId
+    FULL OUTER JOIN UserCommentActivitySummary UCS ON COALESCE(UPS.UserId, UVS.UserId) = UCS.UserId
+),
+UserHistoricalEdits AS (
+    SELECT
+        PH.UserId AS EditorUserId,
+        PH.PostId,
+        PH.CreationDate AS EditDate,
+        PH.PostHistoryTypeId,
+        P.OwnerUserId AS OriginalOwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS EditRankInPost,
+        LAG(PH.CreationDate, 1) OVER (PARTITION BY PH.UserId ORDER BY PH.CreationDate) AS PreviousEditByUserDate
+    FROM PostHistory PH
+    JOIN Posts P ON PH.PostId = P.Id
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6)
+      AND PH.UserId IS NOT NULL
+),
+AggregatedUserEditMetrics AS (
+    SELECT
+        UHE.EditorUserId AS UserId,
+        COUNT(UHE.PostId) AS TotalEditsMade,
+        SUM(CASE WHEN UHE.EditorUserId = UHE.OriginalOwnerUserId THEN 1 ELSE 0 END) AS SelfEditsMade,
+        SUM(CASE WHEN UHE.EditorUserId <> UHE.OriginalOwnerUserId THEN 1 ELSE 0 END) AS OtherUserEditsMade,
+        AVG(EXTRACT(EPOCH FROM (UHE.EditDate - UHE.PreviousEditByUserDate))) / 3600 AS AvgHoursBetweenEdits
+    FROM UserHistoricalEdits UHE
+    GROUP BY UHE.EditorUserId
+),
+UserBadgeTimeline AS (
+    SELECT
+        B.UserId,
+        B.Name AS BadgeName,
+        B.Class AS BadgeClass,
+        B.Date AS BadgeDate,
+        LAG(B.Date) OVER (PARTITION BY B.UserId ORDER BY B.Date) AS PreviousBadgeDate,
+        COALESCE(DATE_PART('day', B.Date - LAG(B.Date) OVER (PARTITION BY B.UserId ORDER BY B.Date)), 0) AS DaysSinceLastBadge
+    FROM Badges B
+    WHERE B.Class IN (1, 2)
+),
+PostDetailsWithTags AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><') AS PostTagsArray,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate DESC) AS rn_latest_post_by_user
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+),
+TagPerformance AS (
+    SELECT
+        T.TagName,
+        AVG(P.Score) AS AveragePostScoreInTag,
+        COUNT(P.Id) AS TotalPostsInTag,
+        SUM(P.ViewCount) AS TotalViewsInTag
+    FROM Tags T
+    JOIN Posts P ON P.Tags LIKE ('%' || '<' || T.TagName || '>' || '%')
+    WHERE P.PostTypeId = 1
+    GROUP BY T.TagName
+    HAVING COUNT(P.Id) > 50
+)
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate,
+    U.LastAccessDate,
+    UA.TotalPostsCreated,
+    UA.TotalPostScore,
+    UA.QuestionsCreated,
+    UA.AcceptedAnswersCount,
+    UA.TotalVotesMade,
+    UA.UpVotesMade,
+    UA.DownVotesMade,
+    UA.TotalCommentsWritten,
+    UA.TotalCommentScoreReceived,
+    UA.VotesOnPowerUserPosts,
+    AUE.TotalEditsMade,
+    AUE.SelfEditsMade,
+    AUE.OtherUserEditsMade,
+    COALESCE(AUE.AvgHoursBetweenEdits, 0.0) AS AvgHoursBetweenEdits,
+    RANK() OVER (PARTITION BY EXTRACT(YEAR FROM U.CreationDate) ORDER BY U.Reputation DESC) AS RankByReputationInYear,
+    NTILE(10) OVER (ORDER BY UA.TotalPostScore DESC NULLS LAST) AS PostScoreDecile,
+    AVG(UBT.DaysSinceLastBadge) FILTER (WHERE UBT.BadgeClass = 1) AS AvgDaysBetweenGoldBadges,
+    (SELECT COUNT(DISTINCT P_closed.Id)
+     FROM Posts P_closed
+     JOIN PostHistory PH_closed ON P_closed.Id = PH_closed.PostId
+     WHERE P_closed.OwnerUserId = U.Id
+       AND PH_closed.PostHistoryTypeId = 10
+       AND PH_closed.Comment = '101'
+       AND P_closed.ClosedDate IS NOT NULL
+    ) AS DuplicateQuestionsCount,
+    (U.Reputation * 0.45)
+    + (COALESCE(UA.TotalPostScore, 0) * 0.25)
+    + (COALESCE(UA.TotalCommentScoreReceived, 0) * 0.1)
+    + (COALESCE(UA.UpVotesMade, 0) * 0.05)
+    - (COALESCE(UA.DownVotesMade, 0) * 0.03)
+    + (COALESCE(AUE.OtherUserEditsMade, 0) * 0.04)
+    + (COUNT(DISTINCT B.Id) * 0.01)
+    + (CASE WHEN U.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days' THEN 10 ELSE 0 END)
+    + (CASE WHEN UA.AvgPostViewCount > 1000 THEN 5 ELSE 0 END)
+    AS CommunityContributionIndex,
+    CASE
+        WHEN U.DisplayName ILIKE '%dev%' THEN 'Developer'
+        WHEN U.DisplayName ILIKE '%engineer%' THEN 'Engineer'
+        WHEN U.DisplayName ILIKE '%architect%' THEN 'Architect'
+        WHEN U.DisplayName ILIKE '%data%' THEN 'Data Specialist'
+        ELSE NULL
+    END AS DisplayNameRoleGuess,
+    COALESCE(U.AboutMe, 'No "About Me" provided') AS AboutMeTextSummary,
+    (
+        SELECT COUNT(*) FROM (
+            SELECT U_inner.Id
+            FROM Users U_inner
+            WHERE U_inner.Id = U.Id
+            INTERSECT
+            SELECT P_high_score.OwnerUserId
+            FROM Posts P_high_score
+            WHERE P_high_score.PostTypeId = 1 AND P_high_score.Score > 50 AND P_high_score.OwnerUserId IS NOT NULL
+            EXCEPT
+            SELECT B_gold.UserId
+            FROM Badges B_gold
+            WHERE B_gold.Class = 1
+        ) t_sub
+    ) > 0 AS HighScoreNoGoldBadge,
+    (SELECT
+        EXISTS (SELECT 1
+                FROM PostDetailsWithTags PD_latest
+                JOIN TagPerformance TP_compare ON TP_compare.TagName = ANY(PD_latest.PostTagsArray)
+                WHERE PD_latest.OwnerUserId = U.Id
+                  AND PD_latest.rn_latest_post_by_user = 1
+                  AND PD_latest.PostTypeId = 1
+                  AND PD_latest.PostScore > TP_compare.AveragePostScoreInTag
+               )
+    ) AS LatestQuestionAboveAvgTagScore,
+    SUM(U.Reputation) OVER (PARTITION BY DATE_TRUNC('month', U.CreationDate) ORDER BY U.CreationDate) AS MonthlyCumulativeReputation
+FROM Users U
+LEFT JOIN UserCombinedActivity UA ON U.Id = UA.UserId
+LEFT JOIN AggregatedUserEditMetrics AUE ON U.Id = AUE.UserId
+LEFT JOIN Badges B ON U.Id = B.UserId
+LEFT JOIN UserBadgeTimeline UBT ON U.Id = UBT.UserId
+WHERE U.Reputation > 200
+  AND (COALESCE(UA.TotalPostsCreated, 0) > 3 OR COALESCE(UA.TotalVotesMade, 0) > 20 OR COALESCE(UA.TotalCommentsWritten, 0) > 10)
+  AND U.DisplayName IS NOT NULL AND LENGTH(U.DisplayName) > 0
+  AND U.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+  AND COALESCE(UA.FirstPostDate, U.CreationDate + INTERVAL '1 year') <= U.CreationDate + INTERVAL '30 days'
+GROUP BY
+    U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.WebsiteUrl, U.AboutMe, U.Views, U.UpVotes, U.DownVotes,
+    UA.TotalPostsCreated, UA.TotalPostScore, UA.QuestionsCreated, UA.AcceptedAnswersCount,
+    UA.TotalVotesMade, UA.UpVotesMade, UA.DownVotesMade, UA.TotalCommentsWritten,
+    UA.TotalCommentScoreReceived, UA.LatestPostDate, UA.VotesOnPowerUserPosts, UA.AvgPostViewCount, UA.FirstPostDate,
+    AUE.TotalEditsMade, AUE.SelfEditsMade, AUE.OtherUserEditsMade, AUE.AvgHoursBetweenEdits,
+    UBT.DaysSinceLastBadge, UBT.BadgeClass, UBT.BadgeDate, B.Id
+HAVING
+    COUNT(DISTINCT B.Id) >= 1
+    AND (
+        (SUM(CASE WHEN UBT.BadgeClass = 1 THEN 1 ELSE 0 END) >= 1 AND AVG(CASE WHEN UBT.BadgeClass = 1 THEN UBT.DaysSinceLastBadge ELSE NULL END) < 300)
+        OR
+        (SUM(CASE WHEN UBT.BadgeClass = 2 THEN 1 ELSE 0 END) >= 3 AND SUM(CASE WHEN UBT.BadgeClass = 1 THEN 1 ELSE 0 END) = 0)
+    )
+    AND COALESCE(UA.TotalPostScore, 0) + COALESCE(UA.TotalCommentScoreReceived, 0) > 50
+ORDER BY
+    CommunityContributionIndex DESC, U.Reputation DESC, U.LastAccessDate DESC
+LIMIT 100;

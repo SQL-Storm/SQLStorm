@@ -1,0 +1,285 @@
+-- {"query": "29.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2631} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm,
+        date_trunc('month', u.creationdate) as cohort_month,
+        row_number() over (order by u.creationdate desc, u.id desc) as rn_global
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_activity as (
+    select
+        u.user_id,
+        count(distinct p.id) filter (where p.posttypeid in (1,2)) as posts_authored,
+        count(distinct c.id) as comments_authored,
+        sum(v.vote_delta) as net_votes_received
+    from recent_users u
+    left join posts p
+        on p.owneruserid = u.user_id
+    left join lateral (
+        select
+            v.postid,
+            sum(case when vt.name = 'UpMod' then 1 when vt.name = 'DownMod' then -1 else 0 end) as vote_delta
+        from votes v
+        join votetypes vt on vt.id = v.votetypeid
+        where exists (select 1 from posts p2 where p2.id = v.postid and p2.owneruserid = u.user_id)
+        group by v.postid
+    ) v on true
+    left join comments c
+        on c.userid = u.user_id
+    group by u.user_id
+),
+accepted_stats as (
+    select
+        u.user_id,
+        count(*) as accepted_answers,
+        sum(case when p.score >= 10 then 1 else 0 end) as accepted_score_ge_10
+    from recent_users u
+    join posts a on a.posttypeid = 2 and a.owneruserid = u.user_id
+    join posts q on q.id = a.parentid
+    where q.acceptedanswerid = a.id
+    group by u.user_id
+),
+tag_prefs as (
+    select
+        u.user_id,
+        string_agg(distinct t.tagname, ',' order by t.tagname) as top_tags_csv,
+        max(t.count) as max_tag_popularity
+    from recent_users u
+    join posts p on p.owneruserid = u.user_id and p.posttypeid = 1
+    left join lateral (
+        select unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tagname
+    ) ut on p.tags is not null and length(p.tags) > 2
+    left join tags t on t.tagname = ut.tagname
+    group by u.user_id
+),
+badge_rollup as (
+    select
+        b.userid as user_id,
+        count(*) as badges_total,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where b.tagbased = 1) as tag_badges
+    from badges b
+    group by b.userid
+),
+post_edits as (
+    select
+        ph.userid as user_id,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edits_made,
+        count(*) filter (where ph.posthistorytypeid in (24)) as suggested_edits_applied,
+        count(*) filter (where ph.posthistorytypeid in (10)) as close_votes_logged
+    from posthistory ph
+    group by ph.userid
+),
+question_metrics as (
+    select
+        u.user_id,
+        count(*) as questions_asked,
+        avg(nullif(p.viewcount,0)) as avg_views,
+        percentile_cont(0.5) within group (order by coalesce(p.score,0)) as median_score,
+        sum(case when p.closeddate is not null then 1 else 0 end) as closed_questions
+    from recent_users u
+    left join posts p on p.owneruserid = u.user_id and p.posttypeid = 1
+    group by u.user_id
+),
+dup_network as (
+    select
+        q.owneruserid as asker_id,
+        count(distinct pl.relatedpostid) as duplicates_marked,
+        min(pl.creationdate) as first_dup_date
+    from postlinks pl
+    join posts q on q.id = pl.postid and pl.linktypeid = 3
+    group by q.owneruserid
+),
+suspicious_nulls as (
+    select
+        u.user_id,
+        count(*) as nullish_titles_or_bodies
+    from recent_users u
+    join posts p on p.owneruserid = u.user_id and p.posttypeid in (1,2)
+    where coalesce(nullif(btrim(p.title), ''), nullif(btrim(regexp_replace(coalesce(p.body,''), '<[^>]*>', '', 'g')), '')) is null
+    group by u.user_id
+),
+activity_rank as (
+    select
+        u.user_id,
+        dense_rank() over (order by coalesce(ua.posts_authored,0) + coalesce(ua.comments_authored,0) desc, u.reputation desc) as activity_rank_desc
+    from recent_users u
+    left join user_activity ua on ua.user_id = u.user_id
+),
+cohort_stats as (
+    select
+        cohort_month,
+        count(*) as users_in_cohort,
+        avg(reputation) as avg_rep_cohort
+    from recent_users
+    group by cohort_month
+),
+joined as (
+    select
+        u.user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        u.websiteurl_norm,
+        u.cohort_month,
+        ua.posts_authored,
+        ua.comments_authored,
+        ua.net_votes_received,
+        asf.accepted_answers,
+        asf.accepted_score_ge_10,
+        tm.questions_asked,
+        tm.avg_views,
+        tm.median_score,
+        tm.closed_questions,
+        coalesce(dp.duplicates_marked, 0) as duplicates_marked,
+        dp.first_dup_date,
+        br.badges_total,
+        br.gold_badges,
+        br.silver_badges,
+        br.bronze_badges,
+        br.tag_badges,
+        pe.edits_made,
+        pe.suggested_edits_applied,
+        pe.close_votes_logged,
+        tp.top_tags_csv,
+        tp.max_tag_popularity,
+        sn.nullish_titles_or_bodies,
+        ar.activity_rank_desc
+    from recent_users u
+    left join user_activity ua on ua.user_id = u.user_id
+    left join accepted_stats asf on asf.user_id = u.user_id
+    left join question_metrics tm on tm.user_id = u.user_id
+    left join dup_network dp on dp.asker_id = u.user_id
+    left join badge_rollup br on br.user_id = u.user_id
+    left join post_edits pe on pe.user_id = u.user_id
+    left join tag_prefs tp on tp.user_id = u.user_id
+    left join suspicious_nulls sn on sn.user_id = u.user_id
+    left join activity_rank ar on ar.user_id = u.user_id
+),
+anomalies as (
+    select
+        j.user_id,
+        case
+            when coalesce(j.posts_authored,0) = 0 and coalesce(j.comments_authored,0) > 50 then 'commenter_only'
+            when coalesce(j.questions_asked,0) > 0 and coalesce(j.accepted_answers,0) = 0 and coalesce(j.median_score,0) < 0 then 'low_quality_asker'
+            when coalesce(j.badges_total,0) > 50 and coalesce(j.net_votes_received,0) <= 0 then 'decorated_but_unvoted'
+            when coalesce(j.nullish_titles_or_bodies,0) > 5 then 'content_null_suspect'
+            when coalesce(j.edits_made,0) > 100 and coalesce(j.posts_authored,0) < 5 then 'heavy_editor_light_author'
+            else null
+        end as anomaly_flag
+    from joined j
+),
+limits as (
+    select
+        percentile_cont(0.9) within group (order by coalesce(posts_authored,0)) as p90_posts,
+        percentile_cont(0.9) within group (order by coalesce(comments_authored,0)) as p90_comments,
+        percentile_cont(0.9) within group (order by coalesce(net_votes_received,0)) as p90_netvotes
+    from joined
+),
+top_users as (
+    select
+        j.*,
+        l.p90_posts,
+        l.p90_comments,
+        l.p90_netvotes,
+        (coalesce(j.posts_authored,0) >= l.p90_posts)::int
+            + (coalesce(j.comments_authored,0) >= l.p90_comments)::int
+            + (coalesce(j.net_votes_received,0) >= l.p90_netvotes)::int as top_signals
+    from joined j
+    cross join limits l
+),
+qualified as (
+    select *
+    from top_users
+    where top_signals >= 2
+       or anomaly_flag is not null
+),
+dupe_pairs as (
+    select
+        q.owneruserid as u1,
+        a.owneruserid as u2,
+        count(*) as cross_interactions
+    from posts a
+    join posts q on q.id = a.parentid
+    where a.posttypeid = 2 and q.posttypeid = 1
+    group by q.owneruserid, a.owneruserid
+),
+peer_context as (
+    select
+        q.user_id,
+        avg(dp.cross_interactions) as avg_peer_cross_interactions,
+        max(dp.cross_interactions) as max_peer_cross_interactions
+    from qualified q
+    left join dupe_pairs dp
+      on dp.u1 = q.user_id or dp.u2 = q.user_id
+    group by q.user_id
+)
+select
+    q.user_id,
+    q.displayname,
+    q.reputation,
+    q.cohort_month,
+    q.location,
+    q.websiteurl_norm,
+    q.activity_rank_desc,
+    q.posts_authored,
+    q.comments_authored,
+    q.net_votes_received,
+    q.questions_asked,
+    q.accepted_answers,
+    q.accepted_score_ge_10,
+    q.avg_views,
+    q.median_score,
+    q.closed_questions,
+    q.badges_total,
+    q.gold_badges,
+    q.silver_badges,
+    q.bronze_badges,
+    q.tag_badges,
+    q.top_tags_csv,
+    q.max_tag_popularity,
+    q.duplicates_marked,
+    q.first_dup_date,
+    q.edits_made,
+    q.suggested_edits_applied,
+    q.close_votes_logged,
+    q.nullish_titles_or_bodies,
+    q.top_signals,
+    a.anomaly_flag,
+    pc.avg_peer_cross_interactions,
+    pc.max_peer_cross_interactions,
+    case
+        when q.top_signals >= 2 and coalesce(a.anomaly_flag,'') = '' then 'top_performer'
+        when q.top_signals >= 2 and coalesce(a.anomaly_flag,'') <> '' then 'top_but_anomalous'
+        when q.top_signals < 2 and coalesce(a.anomaly_flag,'') <> '' then 'anomalous'
+        else 'other'
+    end as classification
+from qualified q
+left join anomalies a on a.user_id = q.user_id
+left join peer_context pc on pc.user_id = q.user_id
+where
+    (
+        -- complex predicate mixing NULLs, strings, arithmetic
+        regexp_replace(coalesce(q.displayname, ''), '\s+', '', 'g') <> ''
+        or coalesce(q.badges_total,0) + coalesce(q.posts_authored,0) + coalesce(q.comments_authored,0) > 10
+    )
+    and (
+        q.cohort_month >= (select min(cohort_month) from recent_users) -- correlated subquery
+        or q.net_votes_received is null
+    )
+order by
+    classification asc,
+    q.top_signals desc,
+    q.activity_rank_desc asc,
+    q.reputation desc,
+    q.user_id
+limit 500;

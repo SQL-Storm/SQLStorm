@@ -1,0 +1,120 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT b.Id) AS Badges,
+    COALESCE(SUM(p.Score), 0) AS TotalScore,
+    COALESCE(AVG(p.Score), 0) AS AverageScore,
+    MAX(p.CreationDate) AS LatestPostDate,
+    STRING_AGG(DISTINCT tag_summary.Tags, ', ') AS TagsUsed,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+        THEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) * 100.0 / COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)
+        ELSE 0 
+    END AS AnswerRate,
+    (SELECT COUNT(*) 
+     FROM Posts p2_sub
+     WHERE p2_sub.OwnerUserId = u.Id 
+       AND p2_sub.PostTypeId = 1 
+       AND p2_sub.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')) AS QuestionsLastYear,
+    (SELECT COUNT(*) 
+     FROM Posts p3_sub
+     WHERE p3_sub.OwnerUserId = u.Id 
+       AND p3_sub.PostTypeId = 2 
+       AND p3_sub.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')) AS AnswersLastYear,
+    (SELECT p4.Title 
+     FROM Posts p4
+     WHERE p4.OwnerUserId = u.Id 
+       AND p4.PostTypeId = 1 
+       AND p4.Score > 100 
+     ORDER BY p4.Score DESC
+     LIMIT 1) AS HighestScoringQuestion,
+    (SELECT COUNT(*) 
+     FROM Votes v_sub
+     WHERE v_sub.UserId = u.Id 
+       AND v_sub.VoteTypeId = 2) AS UpvotesReceived,
+    (SELECT COUNT(*) 
+     FROM Votes v_sub2
+     WHERE v_sub2.UserId = u.Id 
+       AND v_sub2.VoteTypeId = 3) AS DownvotesReceived,
+    (SELECT COUNT(*) 
+     FROM Comments c_sub
+     WHERE c_sub.UserId = u.Id) AS CommentsMade,
+    (SELECT COUNT(*) 
+     FROM Posts p5_sub
+     WHERE p5_sub.OwnerUserId = u.Id 
+       AND p5_sub.ViewCount > 1000) AS PopularPosts,
+    CASE 
+        WHEN MAX(p.CreationDate) >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 day') THEN 'Active'
+        WHEN MAX(p.CreationDate) >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 day') THEN 'Inactive'
+        ELSE 'Very Inactive' 
+    END AS ActivityLevel,
+    PERCENT_RANK() OVER (ORDER BY COALESCE(SUM(p.Score), 0)) AS ScorePercentile,
+    LAG(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation) AS PreviousReputation,
+    LEAD(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation) AS NextReputation,
+    ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) AS RankByScore,
+    RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS RankByPostCount,
+    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT b.Id) DESC) AS RankByBadgeCount,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Class = 1) THEN 'Gold'
+        WHEN EXISTS (SELECT 1 FROM Badges b3 WHERE b3.UserId = u.Id AND b3.Class = 2) THEN 'Silver'
+        WHEN EXISTS (SELECT 1 FROM Badges b4 WHERE b4.UserId = u.Id AND b4.Class = 3) THEN 'Bronze'
+        ELSE 'No Badges'
+    END AS BadgeTier,
+    COALESCE(u.WebsiteUrl, 'No Website') AS Website,
+    COALESCE(u.Location, 'Unknown Location') AS Location,
+    CASE 
+        WHEN u.AccountId IS NOT NULL THEN 'Account Linked' 
+        ELSE 'Account Unlinked' 
+    END AS AccountStatus
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 3
+LEFT JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+LEFT JOIN (
+    SELECT 
+        p3.Id,
+        STRING_AGG(t2.TagName, ', ') AS Tags
+    FROM Posts p3
+    INNER JOIN (
+        SELECT 
+            Id,
+            unnest(string_to_array(substring(Tags, 2, length(Tags)-2), '><')) AS TagId
+        FROM Posts 
+        WHERE Tags IS NOT NULL AND Tags <> ''
+    ) t1 ON p3.Id = t1.Id
+    INNER JOIN Tags t2 ON t2.Id::text = t1.TagId -- ensure comparable types; if TagId is text this compares as text
+    WHERE p3.PostTypeId = 1
+    GROUP BY p3.Id
+) tag_summary ON p.Id = tag_summary.Id
+LEFT JOIN Tags t ON p.Id = t.ExcerptPostId OR p.Id = t.WikiPostId
+WHERE u.Id IN (
+    SELECT Id FROM Users 
+    WHERE Reputation > (
+        SELECT AVG(Reputation) FROM Users
+    )
+    AND LastAccessDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 month')
+    AND DisplayName IS NOT NULL
+    AND (AccountId IS NOT NULL OR EmailHash IS NOT NULL)
+)
+GROUP BY 
+    u.Id, 
+    u.DisplayName, 
+    u.Reputation, 
+    u.WebsiteUrl, 
+    u.Location, 
+    u.AccountId
+HAVING 
+    COUNT(DISTINCT p.Id) > 0
+    AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) >= 1
+    AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) >= 0
+ORDER BY 
+    TotalScore DESC,
+    TotalPosts DESC,
+    Reputation DESC
+OFFSET 10 ROWS
+FETCH NEXT 50 ROWS ONLY;

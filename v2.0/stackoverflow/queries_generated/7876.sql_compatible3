@@ -1,0 +1,327 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_score,
+        LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_views,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS score_rank,
+        NTILE(10) OVER (ORDER BY p.ViewCount DESC) AS view_decile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(DISTINCT p.Tags, ', ') AS AllTags,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes, u.AccountId
+),
+PostsWithComments AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        c.Text AS CommentText,
+        c.Score AS CommentScore,
+        CASE 
+            WHEN c.Score < 0 THEN 'Negative'
+            WHEN c.Score > 0 THEN 'Positive'
+            ELSE 'Neutral'
+        END AS CommentRating,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 'HasAnswers'
+            ELSE 'NoAnswers'
+        END AS AnswerStatus,
+        COALESCE(p.Tags, '') AS Tags,
+        REGEXP_REPLACE(p.Tags, '<[^>]*>', '', 'g') AS CleanTags,
+        LENGTH(p.Body) AS BodyLength,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = p.Id AND p2.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Comments c2 WHERE c2.PostId = p.Id) AS CommentCount,
+        (SELECT AVG(v.Score) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3)) AS AvgVoteScore
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2018-01-01' AS TIMESTAMP)
+      AND p.Score > 50
+),
+TopQuestions AS (
+    SELECT 
+        q.Id,
+        q.Title,
+        q.Body,
+        q.Score,
+        q.ViewCount,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.Tags,
+        q.AnswerCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        CAST(q.Score AS DOUBLE PRECISION) / (1 + q.ViewCount) AS ScoreToViewRatio,
+        CASE 
+            WHEN q.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END AS QuestionStatus,
+        CASE 
+            WHEN q.Tags LIKE '%python%' THEN 'PythonRelated'
+            WHEN q.Tags LIKE '%javascript%' THEN 'JavaScriptRelated'
+            WHEN q.Tags LIKE '%java%' THEN 'JavaRelated'
+            ELSE 'Other'
+        END AS LanguageTag
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+      AND q.ViewCount > 1000
+      AND q.CreationDate >= CAST('2017-01-01' AS TIMESTAMP)
+      AND q.AnswerCount > 0
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreation,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS Favorites,
+        COUNT(DISTINCT p.Id) AS PostsCreated,
+        MAX(v.CreationDate) AS LastVoteDate,
+        MAX(p.CreationDate) AS LastPostDate,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.CreationDate)) AS DaysSinceJoin,
+        CASE 
+            WHEN COUNT(DISTINCT v.Id) > 1000 THEN 'High'
+            WHEN COUNT(DISTINCT v.Id) > 100 THEN 'Medium'
+            ELSE 'Low'
+        END AS ActivityLevel
+    FROM Users u
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+DetailedPostAnalysis AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation,
+        CASE 
+            WHEN (p.ViewCount > 0) THEN (p.Score * 1.0 / p.ViewCount)
+            ELSE 0
+        END AS ScorePerView,
+        CASE 
+            WHEN (p.AnswerCount > 0) THEN (p.ViewCount * 1.0 / p.AnswerCount)
+            ELSE 0
+        END AS ViewsPerAnswer,
+        CASE 
+            WHEN (p.Score > 0 AND p.ViewCount > 0) THEN (p.Score * 1.0 / (p.ViewCount + 1))
+            ELSE 0
+        END AS NormalizedScore,
+        CASE 
+            WHEN p.CreationDate >= CAST('2020-01-01' AS TIMESTAMP) AND p.CreationDate < CAST('2021-01-01' AS TIMESTAMP) THEN '2020'
+            WHEN p.CreationDate >= CAST('2021-01-01' AS TIMESTAMP) AND p.CreationDate < CAST('2022-01-01' AS TIMESTAMP) THEN '2021'
+            WHEN p.CreationDate >= CAST('2022-01-01' AS TIMESTAMP) THEN '2022'
+            ELSE 'Older'
+        END AS YearGroup,
+        CASE WHEN p.AnswerCount > 10 THEN 'HighAnswerCount' ELSE 'LowAnswerCount' END AS AnswerGroup,
+        STRING_AGG(DISTINCT COALESCE(b.Name, 'NoBadge'), ', ') AS UserBadges
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE p.PostTypeId = 1 
+      AND p.ViewCount > 100
+      AND p.CreationDate >= CAST('2018-01-01' AS TIMESTAMP)
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.CreationDate, p.OwnerUserId, p.Tags, u.DisplayName, u.Reputation
+),
+CombinedAnalysis AS (
+    SELECT 
+        qa.Id,
+        qa.Title,
+        qa.Score,
+        qa.ViewCount,
+        qa.AnswerCount,
+        qa.CommentCount,
+        qa.FavoriteCount,
+        qa.CreationDate,
+        qa.OwnerUserId,
+        qa.OwnerName,
+        qa.OwnerReputation,
+        qa.ScorePerView,
+        qa.ViewsPerAnswer,
+        qa.NormalizedScore,
+        qa.YearGroup,
+        qa.AnswerGroup,
+        qa.UserBadges,
+        us.Reputation AS UserMaxReputation,
+        us.TotalPosts AS UserTotalPosts,
+        us.QuestionCount AS UserQuestionCount,
+        us.AnswerCount AS UserAnswerCount,
+        us.AvgScore AS UserAvgScore,
+        us.BadgeCount AS UserBadgeCount,
+        us.GoldBadges AS UserGoldBadges,
+        us.SilverBadges AS UserSilverBadges,
+        us.BronzeBadges AS UserBronzeBadges
+    FROM DetailedPostAnalysis qa
+    JOIN UserStats us ON qa.OwnerUserId = us.UserId
+    WHERE qa.Score > 100
+      AND qa.ViewCount > 500
+)
+SELECT
+    ca.Id,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.AnswerCount,
+    ca.CommentCount,
+    ca.FavoriteCount,
+    ca.CreationDate,
+    ca.OwnerUserId,
+    ca.OwnerName,
+    ca.OwnerReputation,
+    ca.ScorePerView,
+    ca.ViewsPerAnswer,
+    ca.NormalizedScore,
+    ca.YearGroup,
+    ca.AnswerGroup,
+    ca.UserBadges,
+    ca.UserMaxReputation,
+    ca.UserTotalPosts,
+    ca.UserQuestionCount,
+    ca.UserAnswerCount,
+    ca.UserAvgScore,
+    ca.UserBadgeCount,
+    ca.UserGoldBadges,
+    ca.UserSilverBadges,
+    ca.UserBronzeBadges,
+    (ca.ScorePerView * ca.ViewsPerAnswer) AS ProductOfRatios,
+    (ca.UserAvgScore * ca.NormalizedScore) AS UserScoreNormalization,
+    CASE 
+        WHEN (ca.UserMaxReputation > 10000) THEN 'Elite'
+        WHEN (ca.UserMaxReputation > 5000) THEN 'Veteran'
+        ELSE 'Regular'
+    END AS UserTier,
+    CASE 
+        WHEN ca.AnswerCount > 10 THEN 'HighEngagement'
+        WHEN ca.AnswerCount > 5 THEN 'MediumEngagement'
+        ELSE 'LowEngagement'
+    END AS EngagementLevel,
+    CASE 
+        WHEN ca.ViewCount > 5000 THEN 'Viral'
+        WHEN ca.ViewCount > 1000 THEN 'Popular'
+        WHEN ca.ViewCount > 100 THEN 'Noticeable'
+        ELSE 'Unknown'
+    END AS PopularityLevel,
+    COALESCE(
+        (SELECT STRING_AGG((p2.Title || ':' || CAST(p2.ViewCount AS text)), ' | ') 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = ca.OwnerUserId 
+           AND p2.Id != ca.Id 
+           AND p2.ViewCount > 100 
+         ORDER BY p2.ViewCount DESC 
+         LIMIT 5), 
+        'NoOtherPosts'
+    ) AS SimilarPosts,
+    (SELECT COUNT(*) 
+     FROM Posts p3 
+     WHERE p3.OwnerUserId = ca.OwnerUserId 
+       AND p3.PostTypeId = 1 
+       AND p3.CreationDate > CAST('2020-01-01' AS TIMESTAMP)) AS RecentQuestions,
+    (SELECT COUNT(*) 
+     FROM Posts p4 
+     WHERE p4.OwnerUserId = ca.OwnerUserId 
+       AND p4.PostTypeId = 2 
+       AND p4.CreationDate > CAST('2020-01-01' AS TIMESTAMP)) AS RecentAnswers,
+    (SELECT AVG(v2.Score) 
+     FROM Votes v2 
+     WHERE v2.UserId = ca.OwnerUserId) AS AvgUserVoteScore,
+    EXISTS (
+        SELECT 1 
+        FROM Posts p5 
+        WHERE p5.OwnerUserId = ca.OwnerUserId 
+          AND p5.PostTypeId = 1 
+          AND p5.Score > 500
+    ) AS HasHighScoreQuestion,
+    (SELECT COUNT(DISTINCT c2.Id) 
+     FROM Comments c2 
+     WHERE c2.UserId = ca.OwnerUserId) AS TotalCommentsByUser,
+    (SELECT MAX(c3.CreationDate) 
+     FROM Comments c3 
+     WHERE c3.UserId = ca.OwnerUserId) AS LastCommentDate,
+    (SELECT COUNT(DISTINCT b2.Id) 
+     FROM Badges b2 
+     WHERE b2.UserId = ca.OwnerUserId 
+       AND b2.Class = 1) AS GoldBadgeCount,
+    (SELECT COUNT(DISTINCT b3.Id) 
+     FROM Badges b3 
+     WHERE b3.UserId = ca.OwnerUserId 
+       AND b3.Class = 2) AS SilverBadgeCount,
+    (SELECT COUNT(DISTINCT b4.Id) 
+     FROM Badges b4 
+     WHERE b4.UserId = ca.OwnerUserId 
+       AND b4.Class = 3) AS BronzeBadgeCount,
+    (SELECT STRING_AGG(DISTINCT t.TagName, ', ') 
+     FROM Posts p6 
+     CROSS JOIN LATERAL (
+         SELECT regexp_split_to_table(substring(p6.Tags from 2 for char_length(p6.Tags) - 2), '><') AS value
+     ) tag
+     JOIN Tags t ON t.TagName = tag.value
+     WHERE p6.OwnerUserId = ca.OwnerUserId
+       AND p6.PostTypeId = 1) AS UserTagPreferences,
+    (SELECT COUNT(*) 
+     FROM Votes v4 
+     WHERE v4.UserId = ca.OwnerUserId 
+       AND v4.VoteTypeId = 2) AS UpvoteCount,
+    (SELECT COUNT(*) 
+     FROM Votes v5 
+     WHERE v5.UserId = ca.OwnerUserId 
+       AND v5.VoteTypeId = 3) AS DownvoteCount
+FROM CombinedAnalysis ca
+WHERE ca.UserMaxReputation > 5000
+  AND (ca.ViewsPerAnswer > 0 OR ca.ScorePerView > 0)
+ORDER BY 
+    ca.Score DESC,
+    ca.ViewCount DESC,
+    ca.UserAvgScore DESC,
+    ca.UserBadgeCount DESC,
+    ca.NormalizedScore DESC,
+    ProductOfRatios DESC
+OFFSET 0
+FETCH NEXT 1000 ROWS ONLY;

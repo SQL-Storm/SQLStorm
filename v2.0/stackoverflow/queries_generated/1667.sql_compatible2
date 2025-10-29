@@ -1,0 +1,186 @@
+WITH UserQuestionStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount END) AS AvgQuestionViews,
+        MAX(p.CreationDate) AS LastPostActivityDate,
+        MIN(p.CreationDate) AS FirstPostActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+QuestionEngagementDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Title AS QuestionTitle,
+        q.Body AS QuestionBody,
+        q.Tags,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.AcceptedAnswerId,
+        a.CreationDate AS AcceptedAnswerCreationDate,
+        a.OwnerUserId AS AcceptedAnswerOwnerUserId,
+        (EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0) AS TimeToAcceptHours,
+        COALESCE(ph_reopened.ReopenCount, 0) AS ReopenCount,
+        (CASE WHEN q.Tags IS NULL THEN NULL ELSE regexp_split_to_array(substring(q.Tags from 2 for char_length(q.Tags) - 2), '><') END) AS TagArray
+    FROM Posts q
+    JOIN PostTypes pt ON q.PostTypeId = pt.Id AND pt.Name = 'Question'
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS ReopenCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 11
+        GROUP BY PostId
+    ) ph_reopened ON q.Id = ph_reopened.PostId
+    WHERE q.CreationDate >= TIMESTAMP '2021-01-01'
+),
+RelevantBadgeAchievements AS (
+    SELECT
+        b.UserId AS BadgeRecipientId,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        b.Date AS BadgeAwardDate,
+        b.TagBased,
+        LOWER(b.Name) AS LowerBadgeName
+    FROM Badges b
+    WHERE b.Class IN (1, 2)
+      AND (
+          LOWER(b.Name) LIKE '%sql%' OR LOWER(b.Name) LIKE '%database%' OR
+          LOWER(b.Name) LIKE '%performance%' OR LOWER(b.Name) LIKE '%expert%'
+      )
+),
+UserMonthlyPerformanceRank AS (
+    SELECT
+        ugs.UserId,
+        ugs.UserCreationDate,
+        EXTRACT(YEAR FROM ugs.UserCreationDate) AS CreationYear,
+        EXTRACT(MONTH FROM ugs.UserCreationDate) AS CreationMonth,
+        ugs.Reputation,
+        AVG(ugs.Reputation) OVER (PARTITION BY EXTRACT(YEAR FROM ugs.UserCreationDate), EXTRACT(MONTH FROM ugs.UserCreationDate)) AS AvgReputationInMonthCohort,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM ugs.UserCreationDate), EXTRACT(MONTH FROM ugs.UserCreationDate) ORDER BY ugs.Reputation DESC, ugs.UserId) AS RankInMonthByReputation
+    FROM UserQuestionStats ugs
+),
+QualifiedQuestionsSummary AS (
+    SELECT
+        qed.OwnerUserId AS ContributorId,
+        qed.QuestionId,
+        qed.QuestionTitle,
+        qed.QuestionCreationDate,
+        qed.TimeToAcceptHours,
+        qed.ReopenCount,
+        qed.QuestionScore,
+        qed.ViewCount,
+        qed.AnswerCount,
+        qed.AcceptedAnswerOwnerUserId,
+        (
+         SELECT AVG(sub_p.Score)
+         FROM Posts sub_p
+         WHERE sub_p.OwnerUserId = qed.OwnerUserId
+           AND sub_p.PostTypeId = 1
+           AND sub_p.Id != qed.QuestionId
+           AND EXTRACT(YEAR FROM sub_p.CreationDate) = EXTRACT(YEAR FROM qed.QuestionCreationDate)
+           AND sub_p.Score IS NOT NULL
+        ) AS AvgOtherQuestionScoreByOwner,
+        COALESCE(qed.Tags, '[untagged]') AS FormattedTags,
+        qed.TagArray
+    FROM QuestionEngagementDetails qed
+    WHERE qed.AnswerCount >= 2
+      AND qed.TimeToAcceptHours IS NOT NULL AND qed.TimeToAcceptHours BETWEEN 0.0 AND 48.0
+      AND (
+          'sql' = ANY(qed.TagArray) OR 'postgresql' = ANY(qed.TagArray) OR
+          'performance' = ANY(qed.TagArray) OR 'optimization' = ANY(qed.TagArray)
+      )
+      AND (
+          LOWER(qed.QuestionTitle) LIKE '%index%' OR
+          LOWER(qed.QuestionBody) LIKE '%explain analyze%' OR
+          LOWER(qed.QuestionTitle) LIKE '%query plan%'
+      )
+),
+UserBadgeContexts AS (
+    SELECT
+        qss.ContributorId AS UserId,
+        qss.QuestionId,
+        qss.QuestionTitle,
+        'Question_Owner_Badge' AS BadgeContext,
+        rba.BadgeName
+    FROM QualifiedQuestionsSummary qss
+    JOIN RelevantBadgeAchievements rba ON qss.ContributorId = rba.BadgeRecipientId
+    WHERE rba.TagBased = FALSE
+    UNION ALL
+    SELECT
+        qss.AcceptedAnswerOwnerUserId AS UserId,
+        qss.QuestionId,
+        qss.QuestionTitle,
+        'Accepted_Answer_Owner_Badge' AS BadgeContext,
+        rba.BadgeName
+    FROM QualifiedQuestionsSummary qss
+    JOIN RelevantBadgeAchievements rba ON qss.AcceptedAnswerOwnerUserId = rba.BadgeRecipientId
+    WHERE qss.AcceptedAnswerOwnerUserId IS NOT NULL
+      AND rba.TagBased = TRUE
+      AND rba.LowerBadgeName = ANY(regexp_split_to_array(substring(qss.FormattedTags from 2 for char_length(qss.FormattedTags) - 2), '><'))
+)
+SELECT
+    ump.UserId,
+    ugs.UserName,
+    ugs.Reputation,
+    ump.UserCreationDate,
+    ump.CreationYear,
+    ump.CreationMonth,
+    ump.AvgReputationInMonthCohort,
+    ump.RankInMonthByReputation,
+    COUNT(DISTINCT qqs.QuestionId) AS TotalQualifiedQuestions,
+    AVG(qqs.TimeToAcceptHours) AS AvgTimeToAcceptQualified,
+    SUM(qqs.ReopenCount) AS SumReopensOnQualifiedQuestions,
+    SUM(qqs.QuestionScore) AS SumQualifiedQuestionScore,
+    AVG(qqs.AvgOtherQuestionScoreByOwner) AS AvgOtherQScoreByOwner,
+    STRING_AGG(DISTINCT (ubc.BadgeName || ' (' || ubc.BadgeContext || ')'), '; ') AS AssociatedBadges,
+    CASE
+        WHEN ugs.Reputation > 75000 AND ump.RankInMonthByReputation = 1 AND COUNT(DISTINCT qqs.QuestionId) >= 5 THEN 'Elite_Top_Monthly_Contributor'
+        WHEN ugs.Reputation > 20000 AND AVG(qqs.TimeToAcceptHours) IS NOT NULL AND AVG(qqs.TimeToAcceptHours) < 12 AND SUM(qqs.ReopenCount) = 0 THEN 'High_Impact_Fast_Acceptor_Zero_Reopens'
+        WHEN ugs.TotalQuestionsAsked IS NULL OR ugs.TotalQuestionsAsked = 0 THEN 'No_Relevant_Questions_Found'
+        ELSE 'Active_Qualified_Contributor'
+    END AS UserContributionCategory,
+    CAST(SUM(qqs.QuestionScore) AS NUMERIC) / NULLIF(ugs.TotalQuestionScore, 0) AS QualifiedToTotalQuestionScoreRatio,
+    AVG(qqs.QuestionScore) OVER (PARTITION BY umps.CreationYear, umps.CreationMonth, ump.UserId ORDER BY qqs.QuestionCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS MovingAvgQualifiedQuestionScore
+FROM UserMonthlyPerformanceRank ump
+JOIN UserQuestionStats ugs ON ump.UserId = ugs.UserId
+LEFT JOIN QualifiedQuestionsSummary qqs ON ugs.UserId = qqs.ContributorId
+LEFT JOIN UserBadgeContexts ubc ON ugs.UserId = ubc.UserId AND qqs.QuestionId = ubc.QuestionId
+LEFT JOIN UserMonthlyPerformanceRank umps ON ump.UserId = umps.UserId
+WHERE ugs.TotalQuestionsAsked IS NOT NULL AND ugs.TotalQuestionsAsked > 0
+  AND ugs.AvgQuestionViews IS NOT NULL AND ugs.AvgQuestionViews > 500
+  AND ump.Reputation IS NOT NULL AND ump.Reputation > 5000
+GROUP BY
+    ump.UserId,
+    ugs.UserName,
+    ugs.Reputation,
+    ump.UserCreationDate,
+    ump.CreationYear,
+    ump.CreationMonth,
+    ump.AvgReputationInMonthCohort,
+    ump.RankInMonthByReputation,
+    ugs.TotalQuestionsAsked,
+    ugs.TotalQuestionScore,
+    qqs.QuestionCreationDate,
+    umps.CreationYear,
+    umps.CreationMonth,
+    qqs.TimeToAcceptHours,
+    qqs.ReopenCount,
+    qqs.QuestionScore,
+    qqs.AvgOtherQuestionScoreByOwner,
+    ubc.BadgeName,
+    ubc.BadgeContext
+HAVING
+    COUNT(DISTINCT qqs.QuestionId) > 0
+    OR COUNT(DISTINCT ubc.BadgeName) > 0
+ORDER BY
+    ugs.Reputation DESC, TotalQualifiedQuestions DESC, AvgTimeToAcceptQualified ASC
+LIMIT 100;

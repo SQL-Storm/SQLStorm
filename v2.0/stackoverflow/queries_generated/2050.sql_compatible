@@ -1,0 +1,179 @@
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) as QuestionsAsked,
+        count(distinct a.Id) as AnswersGiven,
+        coalesce(sum(vt1.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(vt2.DownVotes),0) as TotalDownVotes,
+        row_number() over (partition by u.Id order by u.LastAccessDate desc) as rn
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join (
+        select PostId, count(*) as UpVotes from Votes 
+        where VoteTypeId = 2
+        group by PostId
+    ) vt1 on vt1.PostId in (
+        select Id from Posts where OwnerUserId = u.Id
+    )
+    left join (
+        select PostId, count(*) as DownVotes from Votes 
+        where VoteTypeId = 3
+        group by PostId
+    ) vt2 on vt2.PostId in (
+        select Id from Posts where OwnerUserId = u.Id
+    )
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TaggedQuestions as (
+    select 
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        array_agg(distinct t.TagName) filter (where t.TagName is not null) as TagsArray,
+        p.AnswerCount,
+        dense_rank() over (order by p.Score desc) as ScoreRank,
+        dense_rank() over (order by p.ViewCount desc) as ViewRank
+    from Posts p
+    left join Tags t on t.ExcerptPostId = p.Id or t.WikiPostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount
+),
+BadgeSummary as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges,
+        count(distinct b.TagBased) filter (where b.TagBased = true) as TagBasedBadges
+    from Badges b
+    group by b.UserId
+),
+AcceptedAnswers as (
+    select 
+        q.Id as QuestionId,
+        q.OwnerUserId as QuestionOwner,
+        q.Title,
+        a.Id as AcceptedAnswerId,
+        a.OwnerUserId as AnswerOwner,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        (a.Score * 1.0 / nullif(extract(epoch from (a.CreationDate - q.CreationDate)) / 86400.0,0)) as ScorePerDay,
+        count(distinct c1.Id) as CommentsOnAcceptedAnswer
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId and a.PostTypeId = 2
+    left join Comments c1 on c1.PostId = a.Id
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+    group by q.Id, q.OwnerUserId, q.Title, a.Id, a.OwnerUserId, a.Score, a.CreationDate
+),
+RecentEditsCounts as (
+    select 
+        ph.UserId,
+        count(*) filter (where ph.PostHistoryTypeId in (4,5,6)) as TitleBodyTagEdits,
+        count(*) filter (where ph.PostHistoryTypeId in (10,11)) as CloseReopenEvents,
+        count(*) as TotalEdits
+    from PostHistory ph
+    where ph.UserId is not null
+    group by ph.UserId
+),
+DuplicateLinks as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+),
+UserQuestionAnswerHeatmap as (
+    select
+        u.Id as UserId,
+        count(distinct pq.Id) as QuestionCount,
+        count(distinct pa.Id) as AnswerCount,
+        count(distinct pq.AcceptedAnswerId) filter (where pq.AcceptedAnswerId is not null) as AcceptedAnswersCount
+    from Users u
+    left join Posts pq on pq.OwnerUserId = u.Id and pq.PostTypeId = 1
+    left join Posts pa on pa.OwnerUserId = u.Id and pa.PostTypeId = 2
+    group by u.Id
+),
+CombinedUserStats as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.CreationDate,
+        ua.LastAccessDate,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        bs.GoldBadges,
+        bs.SilverBadges,
+        bs.BronzeBadges,
+        r.TotalEdits,
+        r.TitleBodyTagEdits,
+        r.CloseReopenEvents,
+        coalesce(usq.QuestionCount,0) as TotalQuestions,
+        coalesce(usq.AnswerCount,0) as TotalAnswers,
+        coalesce(usq.AcceptedAnswersCount,0) as AcceptedAnswers,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes
+    from RecursiveUserActivity ua
+    left join BadgeSummary bs on bs.UserId = ua.UserId
+    left join RecentEditsCounts r on r.UserId = ua.UserId
+    left join UserQuestionAnswerHeatmap usq on usq.UserId = ua.UserId
+)
+select 
+    c.UserId,
+    c.DisplayName,
+    c.Reputation,
+    c.CreationDate,
+    c.LastAccessDate,
+    c.QuestionsAsked,
+    c.AnswersGiven,
+    c.GoldBadges,
+    c.SilverBadges,
+    c.BronzeBadges,
+    c.TotalEdits,
+    c.TitleBodyTagEdits,
+    c.CloseReopenEvents,
+    c.TotalQuestions,
+    c.TotalAnswers,
+    c.AcceptedAnswers,
+    c.TotalUpVotes,
+    c.TotalDownVotes,
+    pq.QuestionId,
+    pq.Score,
+    pq.ViewCount,
+    array_to_string(pq.TagsArray, ', ') as Tags,
+    aa.AcceptedAnswerId,
+    aa.AnswerScore,
+    aa.ScorePerDay,
+    aa.CommentsOnAcceptedAnswer,
+    coalesce(dl.PostId, -1) as DuplicatePostId,
+    coalesce(dl.RelatedPostId, -1) as DuplicateRelatedPostId,
+    coalesce(dl.PostTitle, '') as DuplicatePostTitle,
+    coalesce(dl.RelatedPostTitle, '') as DuplicateRelatedPostTitle
+from CombinedUserStats c
+left join LATERAL (
+    select * from TaggedQuestions tq
+    where tq.OwnerUserId = c.UserId
+    order by tq.Score desc nulls last
+    limit 1
+) pq on true
+left join AcceptedAnswers aa on aa.QuestionOwner = c.UserId and aa.QuestionId = pq.QuestionId
+left join LATERAL (
+    select * from DuplicateLinks dl
+    where dl.PostId = pq.QuestionId
+    limit 1
+) dl on true
+where c.Reputation > 1000
+order by c.Reputation desc, pq.Score desc
+limit 100;

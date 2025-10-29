@@ -1,0 +1,91 @@
+SELECT 
+    u.Id,
+    u.DisplayName, 
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.LastActivityDate) AS LastActivityDate,
+    b.Name AS LatestBadge,
+    vt.Name AS MostVotedType,
+    t.TagName AS MostUsedTag
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    (
+      SELECT 
+         UserId, 
+         Name, 
+         Date 
+      FROM 
+         Badges 
+      WHERE 
+         Class = 1
+      -- For portability, do not use LIMIT in a correlated subquery here; keep as a derived table for join
+    ) b1 ON u.Id = b1.UserId
+LEFT JOIN 
+    (
+      SELECT 
+         PostId, 
+         MAX(Score) AS MaxScore
+      FROM 
+         Votes 
+      GROUP BY 
+         PostId
+    ) v ON p.Id = v.PostId
+LEFT JOIN 
+    (
+      SELECT 
+         vt_inner.UserId,
+         vt_inner.Name
+      FROM 
+         VoteTypes vt_inner
+      JOIN (
+         SELECT UserId, MAX(Id) AS MaxVoteId
+         FROM Votes
+         GROUP BY UserId
+      ) mv ON vt_inner.Id = mv.MaxVoteId
+    ) vt ON vt.UserId = u.Id
+LEFT JOIN 
+    (
+      SELECT 
+         TagName, 
+         COUNT(*) AS Count
+      FROM 
+         Tags 
+      GROUP BY 
+         TagName
+    ) t ON EXISTS (
+         SELECT 1
+         FROM Posts p2
+         WHERE p2.Id = p.Id
+           AND EXISTS (
+             SELECT 1
+             FROM (
+               -- split tags by common delimiters; use standard SQL string split emulation where supported.
+               SELECT TRIM(value) AS tag
+               FROM (
+                 -- fallback: treat Tags as a string of format "<tag1><tag2>" or delimited; try to replace angle brackets
+                 SELECT regexp_split_to_table(
+                          replace(replace(COALESCE(p2.Tags, ''), '><', ','), '<', '' ), ',' ) AS value
+               ) s
+             ) ss
+             WHERE ss.tag = t.TagName
+           )
+       )
+WHERE 
+    u.Reputation > 1000 
+    AND (u.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 month') OR u.LastAccessDate IS NULL)
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, b.Name, vt.Name, t.TagName
+HAVING 
+    COUNT(DISTINCT p.Id) > 10 
+ORDER BY 
+    TotalPosts DESC, 
+    HighestScoredPost DESC;

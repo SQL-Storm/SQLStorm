@@ -1,0 +1,191 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.Id] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.Count > 1000
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.TagPath || t2.Id
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON r.TagPath[array_length(r.TagPath, 1)] <> t2.Id
+    WHERE t2.IsRequired = TRUE
+      AND t2.Count > 500
+      AND NOT t2.Id = ANY(r.TagPath)
+      AND t2.Count < r.Count
+),
+TopActiveUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.WebsiteUrl, 'N/A') AS Website,
+        COALESCE(u.Location,'Unknown') AS Location,
+        COUNT(DISTINCT p.Id) AS PostsCount,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.WebsiteUrl, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 50
+),
+QuestionAnswerStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AcceptedAnswerId,
+        COALESCE(a.AnswersCount,0) AS AnswersCount,
+        COALESCE(a.Score,0) AS AvgAnswerScore,
+        (
+            SELECT MAX(pv.CreationDate)
+            FROM PostHistory pv
+            WHERE pv.PostId = q.Id AND pv.PostHistoryTypeId IN (10,11)
+        ) AS LastCloseReopenDate,
+        (
+            SELECT CASE WHEN COUNT(pl.Id) > 0 THEN 'Yes' ELSE 'No' END
+            FROM PostLinks pl
+            WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3
+        ) AS HasDuplicates
+    FROM Posts q
+    LEFT JOIN (
+        SELECT ParentId, COUNT(*) AS AnswersCount, AVG(Score) AS Score
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON a.ParentId = q.Id
+    WHERE q.PostTypeId = 1
+),
+RankedAnswers AS (
+    SELECT 
+        a.Id,
+        a.ParentId AS QuestionId,
+        a.CreationDate,
+        a.Score,
+        a.OwnerUserId,
+        u.DisplayName,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS IsAccepted
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE a.PostTypeId = 2
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsPosted,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesReceived,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesReceived,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate,
+        u.Location,
+        u.WebsiteUrl AS Website
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Location, u.WebsiteUrl
+),
+FinalResults AS (
+    SELECT
+        qas.QuestionId,
+        qas.Title,
+        qas.CreationDate AS QuestionCreatedOn,
+        qas.QuestionScore,
+        qas.ViewCount,
+        qas.AnswersCount,
+        qas.AvgAnswerScore,
+        qas.HasDuplicates,
+        r1.Id AS TopAnswerId,
+        r1.DisplayName AS TopAnswerer,
+        r1.Score AS TopAnswerScore,
+        r1.IsAccepted,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.CommentsMade,
+        ua.UpVotesReceived,
+        ua.GoldBadges,
+        rt.TagName,
+        concat_ws(' | ', COALESCE(ua.DisplayName, 'Anonymous'), COALESCE(ua.Location, 'No Location'), COALESCE(ua.Website, 'No Website')) AS UserSummary,
+        CASE 
+            WHEN qas.LastCloseReopenDate IS NULL THEN 'Never Closed' 
+            ELSE TO_CHAR(qas.LastCloseReopenDate, 'YYYY-MM-DD') 
+        END AS CloseReopenInfo,
+        LENGTH(COALESCE(qas.Title, '')) AS TitleLength,
+        COALESCE(NULLIF(TRIM(qas.Title),''), 'NO TITLE') AS NormalizedTitle,
+        string_agg(DISTINCT pt.Name, ', ') OVER (PARTITION BY qas.QuestionId) AS PostTypeNames
+    FROM QuestionAnswerStats qas
+    LEFT JOIN RankedAnswers r1 ON r1.QuestionId = qas.QuestionId AND r1.AnswerRank = 1
+    LEFT JOIN UserEngagement ua ON ua.UserId = r1.OwnerUserId
+    LEFT JOIN RecursiveTagHierarchy rt ON rt.Id = ANY (
+        SELECT CAST(unnest(regexp_split_to_table(substr(t.Tags, 2, char_length(t.Tags)-2), '><')) AS INTEGER)
+        FROM Posts t WHERE t.Id = qas.QuestionId
+        LIMIT 1
+    )
+    LEFT JOIN PostTypes pt ON pt.Id = (SELECT PostTypeId FROM Posts WHERE Id = qas.QuestionId)
+    WHERE qas.AnswersCount > 3
+      AND qas.QuestionScore > 5
+),
+UnionedSet AS (
+    SELECT DisplayName, Reputation, Location, 'TopActiveUser' AS Category FROM TopActiveUsers
+    UNION
+    SELECT DisplayName, NULL AS Reputation, Location, 'Answerer' FROM UserEngagement WHERE AnswersPosted > 100
+    UNION
+    SELECT NULL AS DisplayName, NULL AS Reputation, Location, 'TagModeratorArea' FROM Tags WHERE IsModeratorOnly = TRUE
+)
+SELECT 
+    f.QuestionId,
+    f.NormalizedTitle,
+    f.QuestionCreatedOn,
+    f.QuestionScore,
+    f.ViewCount,
+    f.AnswersCount,
+    f.AvgAnswerScore,
+    f.HasDuplicates,
+    f.TopAnswerId,
+    f.TopAnswerer,
+    f.TopAnswerScore,
+    f.IsAccepted,
+    f.QuestionsPosted,
+    f.AnswersPosted,
+    f.CommentsMade,
+    f.UpVotesReceived,
+    f.GoldBadges,
+    f.TagName,
+    f.UserSummary,
+    f.CloseReopenInfo,
+    f.TitleLength,
+    f.PostTypeNames,
+    u.Category,
+    dense_rank() OVER (PARTITION BY u.Category ORDER BY f.QuestionScore DESC) AS ScoreRankInCategory,
+    CASE 
+        WHEN f.AvgAnswerScore > 10 AND f.QuestionScore > 50 THEN 'Hot Question'
+        WHEN f.AnswersCount > 10 AND f.ViewCount > 1000 THEN 'Highly Active'
+        ELSE 'Normal'
+    END AS QuestionStatus
+FROM FinalResults f
+LEFT JOIN UnionedSet u ON u.DisplayName = f.TopAnswerer
+WHERE f.TitleLength > 20
+ORDER BY f.QuestionScore DESC, f.ViewCount DESC
+LIMIT 100;

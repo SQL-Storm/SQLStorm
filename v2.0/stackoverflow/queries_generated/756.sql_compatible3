@@ -1,0 +1,412 @@
+with
+recent_activity as (
+  select
+    p.id as post_id,
+    p.posttypeid,
+    p.owneruserid,
+    coalesce(p.score, 0) as score,
+    coalesce(p.viewcount, 0) as views,
+    p.creationdate,
+    p.lastactivitydate,
+    p.title,
+    p.tags,
+    case
+      when p.posttypeid = 1 and p.tags is not null and length(p.tags) >= 2
+        then string_to_array(substring(p.tags from 2 for length(p.tags)-2), '><')
+      else null
+    end as tag_array
+  from posts p
+  where p.creationdate >= (
+    select date_trunc('year', max(creationdate)) from posts
+  )
+),
+engagement as (
+  select
+    ra.post_id,
+    count(c.id) filter (where c.id is not null) as comment_count,
+    sum(coalesce(c.score, 0)) as comment_score,
+    count(v.id) filter (where v.votetypeid = 2) as upvotes,
+    count(v.id) filter (where v.votetypeid = 3) as downvotes,
+    count(v.id) filter (where v.votetypeid = 5) as favorites,
+    count(v.id) filter (where v.votetypeid = 8) as bounties_started,
+    sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_amount_total
+  from recent_activity ra
+  left join comments c on c.postid = ra.post_id
+  left join votes v on v.postid = ra.post_id
+  group by ra.post_id
+),
+link_stats as (
+  select
+    ra.post_id,
+    count(pl.id) filter (where pl.linktypeid = 1) as links_out,
+    count(pl.id) filter (where pl.linktypeid = 3 and pl.postid = ra.post_id) as duplicates_of,
+    count(pl2.id) filter (where pl2.linktypeid = 3 and pl2.relatedpostid = ra.post_id) as has_duplicates
+  from recent_activity ra
+  left join postlinks pl on pl.postid = ra.post_id
+  left join postlinks pl2 on pl2.relatedpostid = ra.post_id
+  group by ra.post_id
+),
+qa as (
+  select
+    q.id as question_id,
+    q.acceptedanswerid,
+    a.id as answer_id,
+    a.score as answer_score,
+    a.owneruserid as answer_user_id,
+    case when q.acceptedanswerid is not null then 1 else 0 end as has_accepted
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+),
+qa_condensed as (
+  select
+    question_id,
+    max(has_accepted) as has_accepted,
+    max(answer_score) filter (where answer_id = acceptedanswerid) as accepted_answer_score,
+    count(answer_id) as answer_count,
+    coalesce(max(answer_score), 0) as top_answer_score
+  from qa
+  group by question_id
+),
+user_slices as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    date_trunc('month', u.creationdate) as cohort_month,
+    sum(u.upvotes - u.downvotes) over (partition by u.id) as net_votes_lifetime,
+    row_number() over (order by u.reputation desc, u.id) as rep_rank_global
+  from users u
+),
+user_recent_intensity as (
+  select
+    u.id as user_id,
+    count(distinct p.id) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as posts_90d,
+    count(c.id) filter (where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as comments_90d,
+    sum(case when p.posttypeid = 1 then 1 else 0 end) as total_questions_alltime,
+    sum(case when p.posttypeid = 2 then 1 else 0 end) as total_answers_alltime
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  group by u.id
+),
+recent_question_tags as (
+  select
+    ra.post_id as question_id,
+    unnest(ra.tag_array) as tag_name
+  from recent_activity ra
+  where ra.posttypeid = 1
+),
+tag_popularity as (
+  select
+    rqt.tag_name,
+    count(*) as tag_recent_count,
+    count(distinct rqt.question_id) as tag_recent_questions
+  from recent_question_tags rqt
+  group by rqt.tag_name
+),
+latest_badges as (
+  select distinct on (b.userid)
+    b.userid,
+    b.name as latest_badge_name,
+    b.class as latest_badge_class,
+    b.date as latest_badge_date
+  from badges b
+  order by b.userid, b.date desc, b.id desc
+),
+post_windows as (
+  select
+    ra.post_id,
+    ra.posttypeid,
+    ra.creationdate,
+    ra.score,
+    avg(ra.score) over (partition by ra.posttypeid order by ra.creationdate rows between 30 preceding and current row) as avg_score_win30,
+    sum(ra.views) over (partition by ra.posttypeid order by ra.creationdate rows between unbounded preceding and current row) as cum_views_by_type,
+    rank() over (partition by ra.posttypeid order by ra.score desc nulls last) as score_rank_in_type
+  from recent_activity ra
+),
+moderation_signals as (
+  select
+    p.id as post_id,
+    max(case when ph.posthistorytypeid = 10 then 1 else 0 end) as was_closed,
+    max(case when ph.posthistorytypeid = 11 then 1 else 0 end) as was_reopened,
+    max(case when ph.posthistorytypeid = 14 then 1 else 0 end) as was_locked,
+    max(case when ph.posthistorytypeid in (35,36) then 1 else 0 end) as was_migrated
+  from posts p
+  left join posthistory ph on ph.postid = p.id
+  group by p.id
+),
+user_norm as (
+  select
+    u.id as user_id,
+    lower(trim(regexp_replace(coalesce(u.location, 'unknown'), '\s+', ' ', 'g'))) as location_norm,
+    nullif(lower(regexp_replace(coalesce(u.websiteurl, ''), '^https?://(www\.)?', '')), '') as website_host_norm
+  from users u
+),
+high_value_users as (
+  select u.id as user_id
+  from users u
+  where u.reputation >= (
+    select percentile_cont(0.95) within group (order by reputation) from users
+  )
+  and exists (
+    select 1 from posts p
+    where p.owneruserid = u.id and p.score >= 5
+  )
+),
+post_facts as (
+  select
+    ra.post_id,
+    ra.posttypeid,
+    ra.owneruserid,
+    ra.creationdate,
+    ra.lastactivitydate,
+    ra.title,
+    ra.score,
+    ra.views,
+    e.comment_count,
+    e.comment_score,
+    e.upvotes,
+    e.downvotes,
+    e.favorites,
+    e.bounties_started,
+    e.bounty_amount_total,
+    ls.links_out,
+    ls.duplicates_of,
+    ls.has_duplicates,
+    qac.has_accepted,
+    qac.accepted_answer_score,
+    qac.answer_count,
+    pw.avg_score_win30,
+    pw.cum_views_by_type,
+    pw.score_rank_in_type,
+    ms.was_closed,
+    ms.was_reopened,
+    ms.was_locked,
+    ms.was_migrated
+  from recent_activity ra
+  left join engagement e on e.post_id = ra.post_id
+  left join link_stats ls on ls.post_id = ra.post_id
+  left join qa_condensed qac on qac.question_id = ra.post_id
+  left join post_windows pw on pw.post_id = ra.post_id
+  left join moderation_signals ms on ms.post_id = ra.post_id
+),
+owner_enriched as (
+  select
+    pf.post_id,
+    pf.posttypeid,
+    pf.owneruserid,
+    pf.creationdate,
+    pf.lastactivitydate,
+    pf.title,
+    pf.score,
+    pf.views,
+    pf.comment_count,
+    pf.comment_score,
+    pf.upvotes,
+    pf.downvotes,
+    pf.favorites,
+    pf.bounties_started,
+    pf.bounty_amount_total,
+    pf.links_out,
+    pf.duplicates_of,
+    pf.has_duplicates,
+    pf.has_accepted,
+    pf.accepted_answer_score,
+    pf.answer_count,
+    pf.avg_score_win30,
+    pf.cum_views_by_type,
+    pf.score_rank_in_type,
+    pf.was_closed,
+    pf.was_reopened,
+    pf.was_locked,
+    pf.was_migrated,
+    u.displayname as owner_displayname,
+    u.reputation as owner_reputation,
+    us.net_votes_lifetime,
+    uri.posts_90d,
+    uri.comments_90d,
+    uri.total_questions_alltime,
+    uri.total_answers_alltime,
+    lb.latest_badge_name,
+    lb.latest_badge_class,
+    lb.latest_badge_date,
+    (hvu.user_id is not null) as is_high_value_user
+  from post_facts pf
+  left join users u on u.id = pf.owneruserid
+  left join user_slices us on us.user_id = pf.owneruserid
+  left join user_recent_intensity uri on uri.user_id = pf.owneruserid
+  left join latest_badges lb on lb.userid = pf.owneruserid
+  left join high_value_users hvu on hvu.user_id = pf.owneruserid
+),
+post_tag_rollup as (
+  select
+    p.post_id,
+    count(distinct rqt.tag_name) as tag_count,
+    sum(tp.tag_recent_count) as sum_tag_recent_count,
+    max(tp.tag_recent_questions) as max_tag_recent_questions
+  from owner_enriched p
+  left join recent_question_tags rqt on rqt.question_id = p.post_id
+  left join tag_popularity tp on tp.tag_name = rqt.tag_name
+  group by p.post_id
+),
+scored as (
+  select
+    oe.post_id,
+    oe.posttypeid,
+    oe.owneruserid,
+    oe.creationdate,
+    oe.lastactivitydate,
+    oe.title,
+    oe.score,
+    oe.views,
+    oe.upvotes,
+    oe.downvotes,
+    oe.favorites,
+    oe.comment_count,
+    oe.comment_score,
+    oe.answer_count,
+    oe.has_accepted,
+    oe.accepted_answer_score,
+    oe.links_out,
+    oe.duplicates_of,
+    oe.has_duplicates,
+    oe.was_closed,
+    oe.was_reopened,
+    oe.was_locked,
+    oe.was_migrated,
+    oe.avg_score_win30,
+    oe.cum_views_by_type,
+    oe.score_rank_in_type,
+    oe.owner_displayname,
+    oe.owner_reputation,
+    oe.net_votes_lifetime,
+    oe.posts_90d,
+    oe.comments_90d,
+    oe.total_questions_alltime,
+    oe.total_answers_alltime,
+    oe.latest_badge_name,
+    oe.latest_badge_class,
+    oe.latest_badge_date,
+    oe.is_high_value_user,
+    ptr.tag_count,
+    ptr.sum_tag_recent_count,
+    ptr.max_tag_recent_questions,
+    greatest(0,
+      coalesce(oe.score,0) * 3
+      + coalesce(oe.upvotes,0) * 2
+      - coalesce(oe.downvotes,0) * 2
+      + coalesce(oe.views,0) * 0.01
+      + coalesce(oe.comment_score,0) * 1.5
+      + coalesce(oe.bounty_amount_total,0) * 0.2
+      + coalesce(oe.has_accepted,0) * 10
+      + case when oe.was_closed = 1 then -25 else 0 end
+      + case when oe.was_locked = 1 then -10 else 0 end
+      + case when oe.is_high_value_user then 5 else 0 end
+      + coalesce(oe.avg_score_win30,0) * 1.2
+    ) as popularity_score,
+    case
+      when oe.posttypeid = 1 and coalesce(oe.answer_count,0) = 0 and oe.views > 1000 then 'unanswered-high-view'
+      when oe.posttypeid = 1 and coalesce(oe.answer_count,0) >= 3 and coalesce(oe.has_accepted,0) = 1 then 'answered-accepted'
+      when oe.posttypeid = 2 and oe.score >= 5 then 'strong-answer'
+      when oe.was_closed = 1 and oe.was_reopened = 1 then 'reopened'
+      when oe.was_closed = 1 then 'closed'
+      else 'other'
+    end as quality_bucket,
+    trim(both ' ' from coalesce(oe.owner_displayname, '(anonymous)')) as owner_name_sanitized
+  from owner_enriched oe
+  left join post_tag_rollup ptr on ptr.post_id = oe.post_id
+),
+ranked as (
+  select
+    s.*,
+    ntile(100) over (order by s.popularity_score) as percentile_bucket,
+    dense_rank() over (partition by s.posttypeid order by s.popularity_score desc) as dense_rank_in_type
+  from scored s
+),
+best_per_user as (
+  select r.*
+  from ranked r
+  where r.popularity_score = (
+    select max(r2.popularity_score) from ranked r2 where r2.owneruserid = r.owneruserid
+  )
+  union all
+  select r.*
+  from ranked r
+  where r.owneruserid is null
+),
+zscored as (
+  select
+    b.*,
+    (b.popularity_score - avg(b.popularity_score) over (partition by b.posttypeid))
+      / nullif(stddev_pop(b.popularity_score) over (partition by b.posttypeid), 0) as z_popularity
+  from best_per_user b
+)
+select
+  z.post_id,
+  z.posttypeid,
+  z.title,
+  z.owneruserid,
+  z.owner_name_sanitized,
+  z.owner_reputation,
+  z.reputation as owner_reputation_dup_guard,
+  z.creationdate,
+  z.lastactivitydate,
+  z.score,
+  z.views,
+  z.upvotes,
+  z.downvotes,
+  z.favorites,
+  z.comment_count,
+  z.comment_score,
+  z.answer_count,
+  z.has_accepted,
+  z.accepted_answer_score,
+  z.links_out,
+  z.duplicates_of,
+  z.has_duplicates,
+  z.was_closed,
+  z.was_reopened,
+  z.was_locked,
+  z.was_migrated,
+  z.avg_score_win30,
+  z.cum_views_by_type,
+  z.score_rank_in_type,
+  z.tag_count,
+  z.sum_tag_recent_count,
+  z.max_tag_recent_questions,
+  z.latest_badge_name,
+  z.latest_badge_class,
+  z.latest_badge_date,
+  z.posts_90d,
+  z.comments_90d,
+  z.total_questions_alltime,
+  z.total_answers_alltime,
+  z.net_votes_lifetime,
+  z.is_high_value_user,
+  z.quality_bucket,
+  z.popularity_score,
+  z.percentile_bucket,
+  z.dense_rank_in_type,
+  z.z_popularity,
+  (z.posttypeid = 1 and coalesce(z.answer_count,0) >= 1 and z.was_closed = 0) as is_active_question,
+  (z.posttypeid = 2 and z.score >= 1 and not (z.was_locked = 1)) as is_decents_answer,
+  (
+    select p2.title
+    from postlinks pl
+    join posts p2 on p2.id = pl.relatedpostid
+    where pl.postid = z.post_id
+    order by pl.creationdate desc
+    limit 1
+  ) as sample_related_title
+from zscored z
+where (
+  coalesce(z.popularity_score, 0) > 0
+  or (z.was_closed = 1 and z.was_reopened = 1)
+  or (z.posttypeid = 1 and coalesce(z.answer_count,0) = 0 and z.views > 500)
+)
+order by
+  z.z_popularity desc nulls last,
+  z.popularity_score desc,
+  z.creationdate desc
+limit 500;

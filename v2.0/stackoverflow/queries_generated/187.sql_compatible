@@ -1,0 +1,322 @@
+with recent_q as (
+  select
+    p.Id as QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    coalesce(nullif(btrim(p.OwnerDisplayName), ''), u.DisplayName) as OwnerName,
+    u.Reputation,
+    u.Location,
+    date_trunc('month', p.CreationDate) as month_bucket
+  from Posts p
+  left join Users u on u.Id = p.OwnerUserId
+  where p.PostTypeId = 1
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+answers as (
+  select
+    a.ParentId as QuestionId,
+    count(*) filter (where a.CreationDate <= rq.CreationDate + interval '30 days') as answers_30d,
+    count(*) as total_answers,
+    max(a.Score) as max_answer_score,
+    sum(case when a.Id = rq.AcceptedAnswerId then 1 else 0 end) as accepted_present
+  from Posts a
+  join Posts rq on rq.Id = a.ParentId and rq.PostTypeId = 1
+  where a.PostTypeId = 2
+  group by a.ParentId, rq.CreationDate, rq.AcceptedAnswerId
+),
+votes as (
+  select
+    v.PostId,
+    count(*) filter (where v.VoteTypeId = 2) as upvotes,
+    count(*) filter (where v.VoteTypeId = 3) as downvotes,
+    count(*) filter (where v.VoteTypeId = 5) as favorites,
+    count(*) filter (where v.VoteTypeId = 8) as bounties_started,
+    sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as bounty_amount
+  from Votes v
+  group by v.PostId
+),
+close_info as (
+  select
+    ph.PostId,
+    min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as first_closed,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as last_reopened,
+    max(case when ph.PostHistoryTypeId = 10 then nullif(ph.Comment,'') end) as last_close_reason_raw
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10,11)
+  group by ph.PostId
+),
+close_reason as (
+  select
+    ci.PostId,
+    cr.Name as CloseReasonName
+  from close_info ci
+  left join lateral (
+    select crt.Name
+    from CloseReasonTypes crt
+    where cast(ci.last_close_reason_raw as int) = crt.Id
+  ) cr on true
+),
+links as (
+  select
+    pl.PostId,
+    count(*) filter (where pl.LinkTypeId = 1) as linked_count,
+    count(*) filter (where pl.LinkTypeId = 3) as duplicate_count,
+    max(pl.CreationDate) as last_link_date
+  from PostLinks pl
+  group by pl.PostId
+),
+tag_split as (
+  select
+    rq.QuestionId,
+    unnest(string_to_array(substring(rq.Tags, 2, greatest(length(rq.Tags)-2,0)), '><')) as tag
+  from recent_q rq
+),
+tag_stats as (
+  select
+    ts.QuestionId,
+    count(*) as tag_count,
+    min(t.Count) as min_tag_popularity,
+    max(t.Count) as max_tag_popularity,
+    avg(cast(t.Count as numeric)) as avg_tag_popularity
+  from tag_split ts
+  left join Tags t on lower(t.TagName) = lower(ts.tag)
+  group by ts.QuestionId
+),
+comment_activity as (
+  select
+    c.PostId,
+    count(*) as comment_count,
+    max(c.CreationDate) as last_comment_date,
+    count(*) filter (where c.Score > 0) as positive_comment_count,
+    sum(length(c.Text)) as total_comment_text_len
+  from Comments c
+  group by c.PostId
+),
+user_badge_summary as (
+  select
+    b.UserId,
+    count(*) as total_badges,
+    count(*) filter (where b.Class = 1) as gold_badges,
+    count(*) filter (where b.Class = 2) as silver_badges,
+    count(*) filter (where b.Class = 3) as bronze_badges,
+    count(*) filter (where b.TagBased = true) as tag_badges
+  from Badges b
+  group by b.UserId
+),
+question_activity as (
+  select
+    rq.QuestionId,
+    rq.Title,
+    rq.OwnerUserId,
+    rq.OwnerName,
+    rq.Reputation,
+    rq.Location,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.month_bucket,
+    a.answers_30d,
+    a.total_answers,
+    a.max_answer_score,
+    a.accepted_present,
+    v.upvotes,
+    v.downvotes,
+    v.favorites,
+    v.bounties_started,
+    v.bounty_amount,
+    ci.first_closed,
+    ci.last_reopened,
+    cr.CloseReasonName,
+    l.linked_count,
+    l.duplicate_count,
+    l.last_link_date,
+    ts.tag_count,
+    ts.min_tag_popularity,
+    ts.max_tag_popularity,
+    ts.avg_tag_popularity,
+    ca.comment_count,
+    ca.last_comment_date,
+    ca.positive_comment_count,
+    ca.total_comment_text_len
+  from recent_q rq
+  left join answers a on a.QuestionId = rq.QuestionId
+  left join votes v on v.PostId = rq.QuestionId
+  left join close_info ci on ci.PostId = rq.QuestionId
+  left join close_reason cr on cr.PostId = rq.QuestionId
+  left join links l on l.PostId = rq.QuestionId
+  left join tag_stats ts on ts.QuestionId = rq.QuestionId
+  left join comment_activity ca on ca.PostId = rq.QuestionId
+),
+percentiles as (
+  select
+    qa.*,
+    ntile(100) over (order by coalesce(qa.ViewCount,0)) as view_pctl,
+    ntile(100) over (order by coalesce(qa.Score,0)) as score_pctl,
+    ntile(100) over (order by coalesce(qa.total_answers,0)) as answer_pctl,
+    row_number() over (partition by date_trunc('month', qa.CreationDate) order by qa.ViewCount desc nulls last, qa.Score desc nulls last, qa.QuestionId) as rn_month_views
+  from question_activity qa
+),
+quality_flags as (
+  select
+    p.*,
+    case
+      when p.duplicate_count > 0 or p.CloseReasonName ilike '%duplicate%' then 1
+      when p.CloseReasonName in ('Off-topic','Needs details or clarity','Needs more focus','Opinion-based') then 1
+      else 0
+    end as is_low_quality_flag,
+    case when coalesce(p.upvotes,0) - coalesce(p.downvotes,0) >= 10 then 1 else 0 end as is_well_received,
+    case when p.accepted_present > 0 then 1 else 0 end as has_accept,
+    case when p.first_closed is not null and (p.last_reopened is null or p.first_closed > p.last_reopened) then 1 else 0 end as currently_closed
+  from percentiles p
+),
+user_enrichment as (
+  select
+    ues.QuestionId,
+    ues.OwnerUserId,
+    ues.OwnerName,
+    ues.Reputation,
+    ues.Location,
+    coalesce(ubs.total_badges,0) as total_badges,
+    coalesce(ubs.gold_badges,0) as gold_badges,
+    coalesce(ubs.silver_badges,0) as silver_badges,
+    coalesce(ubs.bronze_badges,0) as bronze_badges,
+    coalesce(ubs.tag_badges,0) as tag_badges
+  from (
+    select distinct qa.QuestionId, qa.OwnerUserId, qa.OwnerName, qa.Reputation, qa.Location
+    from quality_flags qa
+  ) ues
+  left join user_badge_summary ubs on ubs.UserId = ues.OwnerUserId
+),
+monthly_rollup as (
+  select
+    date_trunc('month', qf.CreationDate) as month_bucket,
+    count(*) as questions,
+    avg(cast(qf.ViewCount as numeric)) as avg_views,
+    avg(cast(qf.Score as numeric)) as avg_score,
+    avg(cast(coalesce(qf.total_answers,0) as numeric)) as avg_answers,
+    sum(case when qf.currently_closed = 1 then 1 else 0 end) as closed_count,
+    sum(case when qf.is_well_received = 1 then 1 else 0 end) as well_received_count
+  from quality_flags qf
+  group by date_trunc('month', qf.CreationDate)
+),
+scored as (
+  select
+    qf.*,
+    ue.total_badges,
+    ue.gold_badges,
+    ue.silver_badges,
+    ue.bronze_badges,
+    ue.tag_badges,
+    mr.questions as month_questions,
+    mr.avg_views as month_avg_views,
+    mr.avg_score as month_avg_score,
+    mr.avg_answers as month_avg_answers,
+    mr.closed_count as month_closed_count,
+    mr.well_received_count as month_well_received_count,
+    (
+      coalesce(qf.view_pctl,0) * 0.25 +
+      coalesce(qf.score_pctl,0) * 0.35 +
+      coalesce(qf.answer_pctl,0) * 0.20 +
+      case when qf.is_low_quality_flag = 1 then -20 else 0 end +
+      case when qf.has_accept = 1 then 10 else 0 end +
+      least(coalesce(ue.gold_badges,0),5) * 1.5
+    ) as composite_score
+  from quality_flags qf
+  left join user_enrichment ue on ue.QuestionId = qf.QuestionId
+  left join monthly_rollup mr on mr.month_bucket = qf.month_bucket
+),
+ranked as (
+  select
+    s.*,
+    rank() over (order by s.composite_score desc, s.ViewCount desc nulls last, s.Score desc nulls last) as rank_overall,
+    dense_rank() over (partition by s.month_bucket order by s.composite_score desc) as rank_in_month
+  from scored s
+),
+stringified as (
+  select
+    r.QuestionId,
+    coalesce(nullif(btrim(r.Title),''),'(no title)') as Title,
+    r.OwnerUserId,
+    coalesce(r.OwnerName, '(deleted user)') as OwnerName,
+    r.Reputation,
+    coalesce(nullif(btrim(r.Location),''),'Unknown') as Location,
+    r.CreationDate,
+    r.Score,
+    r.ViewCount,
+    r.total_answers,
+    r.upvotes,
+    r.downvotes,
+    r.favorites,
+    r.bounties_started,
+    r.bounty_amount,
+    r.first_closed,
+    r.last_reopened,
+    r.CloseReasonName,
+    r.linked_count,
+    r.duplicate_count,
+    r.tag_count,
+    r.min_tag_popularity,
+    r.max_tag_popularity,
+    r.avg_tag_popularity,
+    r.comment_count,
+    r.last_comment_date,
+    r.positive_comment_count,
+    r.total_comment_text_len,
+    r.view_pctl,
+    r.score_pctl,
+    r.answer_pctl,
+    r.rn_month_views,
+    r.is_low_quality_flag,
+    r.is_well_received,
+    r.has_accept,
+    r.currently_closed,
+    r.total_badges,
+    r.gold_badges,
+    r.silver_badges,
+    r.bronze_badges,
+    r.tag_badges,
+    r.month_bucket,
+    r.month_questions,
+    r.month_avg_views,
+    r.month_avg_score,
+    r.month_avg_answers,
+    r.month_closed_count,
+    r.month_well_received_count,
+    r.composite_score,
+    r.rank_overall,
+    r.rank_in_month,
+    (
+      'Score='||coalesce(r.Score,0)||', Views='||coalesce(r.ViewCount,0)||
+      ', Ans='||coalesce(r.total_answers,0)||
+      case when r.currently_closed=1 then ', CLOSED' else '' end||
+      case when r.duplicate_count>0 then ', DUP' else '' end||
+      case when r.has_accept=1 then ', ACCEPTED' else '' end
+    ) as metrics_summary
+  from ranked r
+)
+select *
+from stringified s
+where
+  (
+    (coalesce(s.ViewCount,0) > 1000 and coalesce(s.Score,0) > 5)
+    or (s.duplicate_count = 0 and s.is_low_quality_flag = 0 and s.tag_count >= 3)
+    or (s.currently_closed = 1 and s.last_reopened is null)
+  )
+  and (
+    s.month_bucket >= date_trunc('month', cast('2024-10-01 12:34:56' as timestamp) - interval '2 years')
+    or s.rank_overall <= 500
+  )
+  and not (
+    s.OwnerName ilike '%bot%' or s.OwnerName ilike '%community%'
+  )
+  and (
+    s.Location is null
+    or s.Location ~* 'us|canada|uk|germany|india'
+    or length(s.Location) > 10
+  )
+order by s.composite_score desc, s.rank_overall asc
+limit 250;

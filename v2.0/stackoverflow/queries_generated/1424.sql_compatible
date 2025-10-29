@@ -1,0 +1,210 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        U.WebsiteUrl,
+        U.Location,
+        U.AboutMe,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P_Owned.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P_Owned.PostTypeId = 1 THEN P_Owned.Id END) AS TotalQuestionsCreated,
+        COUNT(DISTINCT CASE WHEN P_Owned.PostTypeId = 2 THEN P_Owned.Id END) AS TotalAnswersCreated,
+        COUNT(DISTINCT C_Made.Id) AS TotalCommentsMade,
+        SUM(COALESCE(P_Owned.ViewCount, 0)) AS TotalPostViewsOwned,
+        SUM(COALESCE(P_Owned.Score, 0)) AS TotalPostScoreOwned,
+        COUNT(DISTINCT PH_Edited.PostId) AS TotalPostsEditedByAuthor,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        (U.Reputation * 0.5) + (COUNT(DISTINCT P_Owned.Id) * 2) + (COUNT(DISTINCT C_Made.Id) * 0.5) + (U.UpVotes * 0.1) AS UserActivityScore
+    FROM Users U
+    LEFT JOIN Posts P_Owned ON U.Id = P_Owned.OwnerUserId
+    LEFT JOIN Comments C_Made ON U.Id = C_Made.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN PostHistory PH_Edited ON U.Id = PH_Edited.UserId AND PH_Edited.PostHistoryTypeId IN (4, 5, 6, 8)
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.WebsiteUrl, U.Location, U.AboutMe, U.Views, U.UpVotes, U.DownVotes
+),
+PostActivitySummary AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.CreationDate AS PostCreationDate,
+        P.OwnerUserId,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.Title,
+        P.Tags,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        COALESCE(P.CommunityOwnedDate, TIMESTAMP '1900-01-01 00:00:00') AS CommunityOwnedDate,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 3) AS DownVoteCount,
+        (SELECT COUNT(PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS EditHistoryCount,
+        (SELECT COUNT(PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId = 10) AS CloseHistoryCount,
+        (SELECT COUNT(PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId = 11) AS ReopenHistoryCount,
+        (SELECT MAX(C.CreationDate) FROM Comments C WHERE C.PostId = P.Id) AS LatestCommentDate,
+        (SELECT SUM(C.Score) FROM Comments C WHERE C.PostId = P.Id) AS TotalCommentScore,
+        (
+            SELECT AVG(P_Dup.Score)
+            FROM PostLinks PL_Dup
+            JOIN Posts P_Dup ON PL_Dup.RelatedPostId = P_Dup.Id
+            WHERE PL_Dup.PostId = P.Id AND PL_Dup.LinkTypeId = 3
+        ) AS AvgDuplicateLinkScore
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+),
+PostTagging AS (
+    SELECT
+        PS.PostId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(PS.Tags, 2, LENGTH(PS.Tags) - 2), '><'))) AS TagName
+    FROM PostActivitySummary PS
+    WHERE PS.Tags IS NOT NULL AND LENGTH(PS.Tags) > 2
+),
+RankedActivity AS (
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        UE.Reputation,
+        UE.TotalPostsCreated,
+        UE.UserActivityScore,
+        UE.GoldBadges,
+        UE.SilverBadges,
+        UE.BronzeBadges,
+        PAS.PostId,
+        PAS.PostTypeId,
+        PAS.PostTypeName,
+        PAS.Title,
+        PAS.PostCreationDate,
+        PAS.PostScore,
+        PAS.PostViewCount,
+        PAS.AnswerCount,
+        PAS.PostCommentCount,
+        PAS.UpVoteCount,
+        PAS.DownVoteCount,
+        PAS.EditHistoryCount,
+        PAS.CloseHistoryCount,
+        PAS.ReopenHistoryCount,
+        PAS.LatestCommentDate,
+        PAS.TotalCommentScore,
+        PAS.AvgDuplicateLinkScore,
+        ROW_NUMBER() OVER (PARTITION BY PAS.PostTypeId ORDER BY PAS.PostScore DESC, PAS.PostViewCount DESC, PAS.PostCreationDate DESC) AS PostScoreRankByType,
+        DENSE_RANK() OVER (ORDER BY UE.Reputation DESC, UE.TotalPostsCreated DESC) AS GlobalUserReputationRank,
+        AVG(PAS.PostScore) OVER (PARTITION BY UE.UserId ORDER BY PAS.PostCreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS RollingAvgPostScoreByUser,
+        (CAST(PAS.UpVoteCount AS DECIMAL) / NULLIF(PAS.DownVoteCount, 0)) AS UpDownVoteRatio,
+        (CAST(PAS.EditHistoryCount AS DECIMAL) / NULLIF(EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - PAS.PostCreationDate)), 0)) AS EditsPerDaySinceCreation,
+        (CAST(PAS.PostScore AS DECIMAL) / NULLIF(PAS.PostViewCount, 0)) AS ScorePerViewRatio,
+        (
+            SELECT AVG(P_Other.Score)
+            FROM Posts P_Other
+            WHERE P_Other.OwnerUserId = UE.UserId
+              AND P_Other.Id != PAS.PostId
+              AND P_Other.PostTypeId = 1
+              AND P_Other.CreationDate < PAS.PostCreationDate
+        ) AS AvgEarlierQuestionsScoreByAuthor,
+        CASE
+            WHEN PAS.CommunityOwnedDate IS NOT NULL
+             AND PAS.CommunityOwnedDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+             AND PAS.EditHistoryCount > 5
+             AND PAS.PostScore > 0
+             THEN 'Highly_Edited_Community_Wiki'
+            ELSE NULL
+        END AS SpecialPostFlag,
+        LOWER(SUBSTRING(UE.WebsiteUrl FROM '^(?:https?://)?(?:[^@\n]+@)?(?:www\.)?([^:/\n?]+)')) AS WebsiteDomain,
+        COALESCE(UE.Location, 'Unknown Location') AS UserLocation
+    FROM UserEngagement UE
+    JOIN PostActivitySummary PAS ON UE.UserId = PAS.OwnerUserId
+    WHERE PAS.PostCreationDate IS NOT NULL AND PAS.PostTypeId IN (1, 2)
+),
+ControversialPosts AS (
+    SELECT
+        RA.PostId,
+        RA.Title,
+        RA.UpDownVoteRatio,
+        RA.EditHistoryCount,
+        RA.CloseHistoryCount,
+        RA.ReopenHistoryCount,
+        RA.DownVoteCount,
+        RA.PostScore,
+        RA.AvgDuplicateLinkScore
+    FROM RankedActivity RA
+    WHERE
+        (RA.UpDownVoteRatio IS NOT NULL AND RA.UpDownVoteRatio < 0.5 AND RA.DownVoteCount > 10)
+        OR RA.CloseHistoryCount > 1
+        OR (RA.ReopenHistoryCount > 0 AND RA.CloseHistoryCount > 0)
+        OR (RA.EditHistoryCount > 20 AND RA.PostScore < 0)
+        OR (RA.AvgDuplicateLinkScore IS NOT NULL AND RA.AvgDuplicateLinkScore < RA.PostScore * 0.7)
+)
+SELECT
+    RA.PostId,
+    RA.PostTypeName,
+    RA.Title,
+    RA.PostCreationDate,
+    RA.PostScore,
+    RA.PostViewCount,
+    RA.UpVoteCount,
+    RA.DownVoteCount,
+    RA.UpDownVoteRatio,
+    RA.EditHistoryCount,
+    RA.CloseHistoryCount,
+    RA.ReopenHistoryCount,
+    RA.DisplayName AS AuthorDisplayName,
+    RA.Reputation AS AuthorReputation,
+    RA.GlobalUserReputationRank,
+    RA.PostScoreRankByType,
+    RA.ScorePerViewRatio,
+    RA.AvgEarlierQuestionsScoreByAuthor,
+    RA.SpecialPostFlag,
+    RA.WebsiteDomain,
+    RA.UserLocation,
+    RA.UserActivityScore,
+    RA.RollingAvgPostScoreByUser,
+    CASE WHEN CP.PostId IS NOT NULL THEN 'Controversial' ELSE 'Standard' END AS ControversyStatus,
+    STRING_AGG(PTG.TagName, ', ' ORDER BY PTG.TagName) AS AssociatedTags,
+    (SELECT COUNT(DISTINCT C.Id) FROM Comments C WHERE C.PostId = RA.PostId AND C.Score > 0) AS PositiveCommentsCount,
+    (
+        SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY A.Score)
+        FROM Posts A
+        WHERE A.ParentId = RA.PostId AND A.PostTypeId = 1
+    ) AS MedianAnswerScoreForQuestion
+FROM RankedActivity RA
+LEFT JOIN ControversialPosts CP ON RA.PostId = CP.PostId
+LEFT JOIN PostTagging PTG ON RA.PostId = PTG.PostId
+WHERE
+    RA.Reputation > 5000
+    AND RA.PostCreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')
+    AND RA.PostViewCount > 1000
+    AND (
+        (RA.PostTypeName = 'Question' AND RA.PostScore > 20 AND RA.AnswerCount >= 2)
+        OR (RA.PostTypeName = 'Answer' AND RA.PostScore > 10 AND RA.EditHistoryCount <= 5)
+    )
+    AND (LOWER(RA.Title) LIKE '%performance%' OR LOWER(RA.Title) LIKE '%optimization%' OR LOWER(RA.Title) LIKE '%scalable%' OR LOWER(RA.Title) LIKE '%benchmark%')
+    AND RA.PostScoreRankByType <= 50
+    AND RA.EditsPerDaySinceCreation IS NOT NULL
+    AND RA.AvgEarlierQuestionsScoreByAuthor IS NOT NULL
+GROUP BY
+    RA.PostId, RA.PostTypeId, RA.PostTypeName, RA.Title, RA.PostCreationDate, RA.PostScore, RA.PostViewCount,
+    RA.UpVoteCount, RA.DownVoteCount, RA.UpDownVoteRatio, RA.EditHistoryCount, RA.CloseHistoryCount,
+    RA.ReopenHistoryCount, RA.DisplayName, RA.Reputation, RA.GlobalUserReputationRank,
+    RA.PostScoreRankByType, RA.ScorePerViewRatio, RA.AvgEarlierQuestionsScoreByAuthor,
+    RA.SpecialPostFlag, RA.WebsiteDomain, RA.UserLocation, RA.UserActivityScore,
+    RA.RollingAvgPostScoreByUser, CP.PostId
+HAVING
+    COUNT(PTG.TagName) >= 2
+    AND SUM(CASE WHEN PTG.TagName IN ('sql', 'database-performance', 'query-optimization', 'benchmarking', 'big-data') THEN 1 ELSE 0 END) >= 1
+    AND (AVG(RA.PostScore) > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = RA.PostTypeId AND CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')))
+ORDER BY
+    RA.GlobalUserReputationRank ASC, RA.PostScore DESC, RA.PostCreationDate DESC
+LIMIT 200;

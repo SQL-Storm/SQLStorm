@@ -1,0 +1,141 @@
+WITH
+ActiveUsers AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS rk
+  FROM Users u
+  WHERE u.AccountId IS NOT NULL
+),
+TopQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    p.CommentCount,
+    p.LastActivityDate,
+    p.FavoriteCount,
+    p.Body,
+    p.AcceptedAnswerId,
+    p.PostTypeId,
+    COUNT(*) OVER () AS TotalPosts
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '180' DAY)
+),
+QuestionActivity AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.OwnerUserId,
+    q.Tags,
+    q.CommentCount,
+    q.LastActivityDate,
+    q.FavoriteCount,
+    q.Body,
+    q.AcceptedAnswerId,
+    q.PostTypeId,
+    COALESCE(b.CountBadges, 0) AS BadgeCount,
+    COALESCE(v.UpMod, 0) AS UpVotes,
+    COALESCE(v.DownMod, 0) AS DownVotes
+  FROM TopQuestions q
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS CountBadges
+    FROM Badges
+    GROUP BY OwnerUserId
+  ) b ON b.OwnerUserId = q.OwnerUserId
+  LEFT JOIN (
+    SELECT p.OwnerUserId,
+           SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpMod,
+           SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownMod
+    FROM Posts p
+    LEFT JOIN Votes vt ON vt.PostId = p.Id
+    GROUP BY p.OwnerUserId
+  ) v ON v.OwnerUserId = q.OwnerUserId
+),
+RecentActivity AS (
+  SELECT
+    pa.PostId,
+    pa.Title,
+    pa.CreationDate AS ActivityDate,
+    pa.LastActivityDate,
+    pa.Score,
+    pa.ViewCount,
+    pa.CommentCount,
+    pa.Tags,
+    pa.Body,
+    pa.OwnerUserId,
+    ROW_NUMBER() OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.LastActivityDate DESC) AS rn
+  FROM QuestionActivity pa
+),
+CorrelatedPosts AS (
+  SELECT
+    ra.PostId,
+    ra.Title,
+    ra.ActivityDate,
+    ra.Score,
+    ra.ViewCount,
+    ra.CommentCount,
+    ra.Tags,
+    ra.Body,
+    ra.OwnerUserId,
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.Reputation AS UserReputation,
+    u.Location AS UserLocation,
+    u.LastAccessDate AS UserLastAccess
+  FROM RecentActivity ra
+  JOIN ActiveUsers u ON u.Id = ra.OwnerUserId
+  WHERE ra.rn = 1
+),
+ComplexQuery AS (
+  SELECT
+    cp.PostId,
+    cp.Title,
+    cp.ActivityDate,
+    cp.Score,
+    cp.ViewCount,
+    cp.CommentCount,
+    cp.Tags,
+    cp.Body,
+    cp.UserId,
+    cp.UserName,
+    cp.UserReputation,
+    cp.UserLocation,
+    cp.UserLastAccess,
+    CASE
+      WHEN cp.Score > 50 THEN 'Hot'
+      WHEN cp.Score > 20 THEN 'Trending'
+      ELSE 'Normal'
+    END AS StatusTag,
+    CONCAT_WS(' | ', cp.Title, cp.Tags) AS TitleAndTags,
+    COALESCE(cp.ViewCount, 0) * 1.0 / NULLIF(COALESCE(cp.CommentCount, 1), 0) AS EngagementRatio,
+    AVG(cp.Score) OVER (PARTITION BY cp.UserId ORDER BY cp.ActivityDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS UserRunningAvg,
+    b.UserId AS BadgeUserId,
+    b.Name AS BadgeName,
+    v.PostId AS VotePostId,
+    v.Id AS VoteId
+  FROM CorrelatedPosts cp
+  LEFT JOIN Badges b ON b.UserId = cp.UserId
+  LEFT JOIN Votes v ON v.PostId = cp.PostId
+)
+SELECT
+  *
+FROM ComplexQuery
+ORDER BY UserReputation DESC, ActivityDate DESC
+LIMIT 100;

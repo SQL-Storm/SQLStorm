@@ -1,0 +1,219 @@
+-- {"query": "1533.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3029} 
+WITH GlobalPostTypeAvgViews AS (
+    SELECT
+        PostTypeId,
+        AVG(ViewCount) AS AverageViewCount
+    FROM Posts
+    WHERE PostTypeId IN (1, 2) -- Questions and Answers
+    GROUP BY PostTypeId
+),
+EliteUsersA AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        'HighReputationContributor' AS UserCategory
+    FROM Users U
+    WHERE U.Reputation > 50000
+    AND EXISTS (
+        SELECT 1
+        FROM Posts P
+        WHERE P.OwnerUserId = U.Id
+          AND P.PostTypeId = 1
+          AND P.Score > 50
+    )
+),
+EliteUsersB AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        'FrequentAcceptedAnswerer' AS UserCategory
+    FROM Users U
+    WHERE EXISTS (
+        SELECT 1
+        FROM Posts P
+        WHERE P.OwnerUserId = U.Id
+          AND P.PostTypeId = 2
+          AND P.ParentId IS NOT NULL
+          AND (
+              SELECT Q.AcceptedAnswerId FROM Posts Q WHERE Q.Id = P.ParentId AND Q.PostTypeId = 1
+          ) = P.Id
+        GROUP BY P.OwnerUserId
+        HAVING COUNT(P.Id) > 20
+    )
+),
+CombinedEliteUsers AS (
+    SELECT UserId, DisplayName, UserCategory FROM EliteUsersA
+    UNION ALL
+    SELECT UserId, DisplayName, UserCategory FROM EliteUsersB
+),
+UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsCount,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersCount,
+        SUM(P.Score) AS TotalPostScore,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE NULL END) AS AvgQuestionScore,
+        SUM(C.Score) AS TotalCommentScore,
+        COUNT(DISTINCT CO.Id) AS TotalComments,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        MAX(CO.CreationDate) AS LastCommentActivity,
+        NTILE(5) OVER (ORDER BY U.Reputation DESC) AS ReputationQuintile,
+        SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswersGiven,
+        SUM(CASE WHEN P.PostTypeId = 1 AND EXISTS (SELECT 1 FROM Posts A WHERE A.Id = P.AcceptedAnswerId AND A.OwnerUserId = U.Id) THEN 1 ELSE 0 END) AS OwnAcceptedAnswersCount
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments CO ON U.Id = CO.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostEditActivity AS (
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.Id) AS TotalEdits,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS ContentEdits,
+        MAX(PH.CreationDate) AS LastEditDate,
+        MIN(PH.CreationDate) AS FirstEditDate,
+        AVG(EXTRACT(EPOCH FROM (PH.CreationDate - P.CreationDate)) / (60*60*24)) AS AvgEditTimeDeltaDays,
+        SUM(CASE WHEN PH.UserId IS NOT NULL AND PH.UserId != P.OwnerUserId THEN 1 ELSE 0 END) AS EditsByOtherUsers,
+        LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PrevEditDate
+    FROM PostHistory PH
+    JOIN Posts P ON PH.PostId = P.Id
+    WHERE PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9)
+    GROUP BY PH.PostId, P.CreationDate, P.OwnerUserId
+),
+PostTagAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.ViewCount,
+        P.Score,
+        P.OwnerUserId,
+        STRING_AGG(T.TagName, ',') AS TagNames,
+        COUNT(T.Id) AS TagCount,
+        SUM(T.Count) AS TotalTagUsageCount,
+        MAX(CASE WHEN T.TagName LIKE '%sql%' OR T.TagName LIKE '%database%' OR T.TagName LIKE '%performance%' THEN 1 ELSE 0 END) AS IsTechOrPerformanceRelated,
+        CASE
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS PostStatusCategory,
+        P.CreationDate,
+        P.LastActivityDate
+    FROM Posts P
+    LEFT JOIN LATERAL (
+        SELECT REPLACE(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')), '-', ' ') AS Tag
+    ) AS SplitTags ON TRUE
+    LEFT JOIN Tags T ON SplitTags.Tag = T.TagName
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY P.Id, P.PostTypeId, P.ViewCount, P.Score, P.AcceptedAnswerId, P.ClosedDate, P.OwnerUserId, P.CreationDate, P.LastActivityDate
+),
+ModerationActivity AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (10, 12, 14, 19) THEN PH.Id END) AS ModerationActionCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (11, 13, 15, 20) THEN PH.Id END) AS ReversalActionCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS LastClosedDate,
+        (
+            SELECT CR.Name
+            FROM PostHistory PH_INNER
+            JOIN CloseReasonTypes CR ON PH_INNER.Comment = CR.Id::varchar(50)
+            WHERE PH_INNER.PostId = P.Id AND PH_INNER.PostHistoryTypeId = 10 AND PH_INNER.Comment IS NOT NULL
+            ORDER BY PH_INNER.CreationDate DESC
+            LIMIT 1
+        ) AS LastCloseReason,
+        SUM(CASE WHEN V.VoteTypeId IN (4, 12) THEN 1 ELSE 0 END) AS OffensiveSpamVotes
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    GROUP BY P.Id, P.OwnerUserId
+),
+BountyDetails AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        SUM(CASE WHEN V.VoteTypeId = 8 THEN V.BountyAmount ELSE 0 END) AS TotalBountyOffered,
+        SUM(CASE WHEN V.VoteTypeId = 9 THEN V.BountyAmount ELSE 0 END) AS TotalBountyAwarded,
+        COUNT(DISTINCT CASE WHEN V.VoteTypeId = 8 THEN V.UserId END) AS UniqueBountyGivers
+    FROM Posts P
+    JOIN Votes V ON P.Id = V.PostId
+    WHERE V.VoteTypeId IN (8, 9) AND P.PostTypeId = 1
+    GROUP BY P.Id, P.OwnerUserId
+),
+UserBadgePerformance AS (
+    SELECT
+        U.Id AS UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeAwardDate
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.ReputationQuintile,
+    COALESCE(CEU.UserCategory, 'RegularContributor') AS UserCategory,
+    UE.TotalPosts,
+    UE.QuestionsCount,
+    UE.AnswersCount,
+    UE.TotalPostScore,
+    COALESCE(UE.AvgQuestionScore, 0) AS AvgQuestionScore,
+    UBP.TotalBadges,
+    UBP.GoldBadges,
+    UBP.SilverBadges,
+    UBP.BronzeBadges,
+    MAX(CASE WHEN PTA.IsTechOrPerformanceRelated = 1 THEN 1 ELSE 0 END) AS HasTechOrPerformanceRelatedPosts,
+    COUNT(DISTINCT CASE WHEN PTA.PostStatusCategory = 'Accepted' THEN PTA.PostId END) AS AcceptedPostsCount,
+    AVG(PTA.ViewCount) AS AvgUserPostViewCount,
+    SUM(PEA.TotalEdits) AS TotalPostEdits,
+    SUM(MA.ModerationActionCount) AS TotalModerationActionsOnPosts,
+    SUM(MA.OffensiveSpamVotes) AS TotalOffensiveSpamVotesOnPosts,
+    COALESCE(SUM(BD.TotalBountyOffered), 0) AS UserTotalBountyOffered,
+    COALESCE(SUM(BD.TotalBountyAwarded), 0) AS UserTotalBountyAwarded,
+    (
+        SELECT COUNT(DISTINCT OtherPosts.Id)
+        FROM Posts AS OtherPosts
+        JOIN GlobalPostTypeAvgViews GPTAV ON OtherPosts.PostTypeId = GPTAV.PostTypeId
+        WHERE OtherPosts.OwnerUserId = UE.UserId
+          AND OtherPosts.PostTypeId = 1
+          AND OtherPosts.CreationDate >= (UE.UserCreationDate + INTERVAL '6 month')
+          AND OtherPosts.ViewCount > GPTAV.AverageViewCount
+          AND NOT EXISTS (
+              SELECT 1 FROM Comments C_inner WHERE C_inner.PostId = OtherPosts.Id AND C_inner.Score < 0
+          )
+    ) AS HighPerformingQuestionsWithoutNegativeComments,
+    RANK() OVER (ORDER BY UE.Reputation DESC, UE.TotalPostScore DESC) AS GlobalReputationRank,
+    DENSE_RANK() OVER (PARTITION BY COALESCE(CEU.UserCategory, 'RegularContributor') ORDER BY UE.Reputation DESC) AS RankWithinCategory,
+    SUM(CASE WHEN PTA.PostId IS NOT NULL THEN EXTRACT(EPOCH FROM (PTA.LastActivityDate - PTA.CreationDate)) / (60*60*24) END) AS SumDaysPostActivitySpan,
+    SUM(CASE WHEN PTA.PostId IS NOT NULL AND PTA.PostStatusCategory = 'Closed' AND PTA.CreationDate > (CURRENT_TIMESTAMP - INTERVAL '2 year') THEN 1 ELSE 0 END) AS RecentClosedPosts,
+    AVG(COALESCE(PEA.AvgEditTimeDeltaDays, 0)) AS AvgTimeBetweenPostAndFirstEdit
+FROM UserEngagement UE
+LEFT JOIN CombinedEliteUsers CEU ON UE.UserId = CEU.UserId
+LEFT JOIN UserBadgePerformance UBP ON UE.UserId = UBP.UserId
+LEFT JOIN PostTagAnalysis PTA ON UE.UserId = PTA.OwnerUserId
+LEFT JOIN PostEditActivity PEA ON PTA.PostId = PEA.PostId
+LEFT JOIN ModerationActivity MA ON PTA.PostId = MA.PostId
+LEFT JOIN BountyDetails BD ON PTA.PostId = BD.PostId
+WHERE UE.Reputation > 500
+  AND UE.TotalPosts >= 5
+  AND UE.QuestionsCount >= 1
+  AND UE.LastPostActivity IS NOT NULL
+  AND UE.UserCreationDate < (CURRENT_TIMESTAMP - INTERVAL '1 year')
+  AND (UE.TotalCommentScore IS NULL OR UE.TotalCommentScore >= 0)
+  AND (CEU.UserId IS NOT NULL OR UBP.GoldBadges > 0 OR UBP.SilverBadges > 2)
+  AND UE.DisplayName IS NOT NULL AND LENGTH(UE.DisplayName) BETWEEN 4 AND 30
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.ReputationQuintile, COALESCE(CEU.UserCategory, 'RegularContributor'),
+    UE.TotalPosts, UE.QuestionsCount, UE.AnswersCount, UE.TotalPostScore, UE.AvgQuestionScore,
+    UBP.TotalBadges, UBP.GoldBadges, UBP.SilverBadges, UBP.BronzeBadges
+HAVING COUNT(DISTINCT PTA.PostId) > 0 OR SUM(PEA.TotalEdits) > 0
+ORDER BY GlobalReputationRank ASC, RankWithinCategory NULLS LAST, UE.Reputation DESC
+LIMIT 200;

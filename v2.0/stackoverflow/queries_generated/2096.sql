@@ -1,0 +1,107 @@
+-- {"query": "2096.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1259} 
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.Count, 1 as Level, array[t.Id] as Path
+    from Tags t
+    where not t.IsModeratorOnly = 1
+  union all
+    select t.Id, t.TagName, t.Count, h.Level + 1, h.Path || t.Id
+    from Tags t
+    join RecursiveTagHierarchy h on t.Id <> all(h.Path)
+    where t.Count > 100 and h.Level < 3
+),
+UserReputationStats as (
+    select u.Id as UserId,
+           u.DisplayName,
+           u.Reputation,
+           u.CreationDate,
+           count(b.Id) filter (where b.Class = 1) as GoldBadges,
+           count(b.Id) filter (where b.Class = 2) as SilverBadges,
+           count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+           avg(vt_count.VotesCount) as AvgVotesPerPost
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join (
+        select p.OwnerUserId, count(v.Id) as VotesCount
+        from Posts p
+        left join Votes v on v.PostId = p.Id
+        where p.OwnerUserId is not null
+        group by p.OwnerUserId, p.Id
+    ) vt_count on vt_count.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostActivityRanked as (
+    select p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Title,
+           row_number() over (partition by p.OwnerUserId order by p.LastActivityDate desc nulls last) as UserPostRank,
+           dense_rank() over (order by p.Score desc nulls last) as ScoreRank,
+           case when p.Tags is null then '{}'::text[] else string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><') end as TagArray
+    from Posts p
+    where p.PostTypeId in (1, 2) -- Questions and Answers
+),
+CloseReasonCounts as (
+    select cht.Name as CloseReasonName, count(ph.Id) as CloseCount
+    from PostHistory ph
+    join PostHistoryTypes cht on ph.PostHistoryTypeId = cht.Id and ph.PostHistoryTypeId = 10
+    group by cht.Name
+),
+DuplicationLinkCounts as (
+    select pl.RelatedPostId as MasterQuestionId, count(pl.PostId) as DuplicateCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3 -- Duplicate link type
+    group by pl.RelatedPostId
+),
+UserTopPosts as (
+    select p.OwnerUserId, p.Id as PostId, p.Score,
+           rank() over (partition by p.OwnerUserId order by p.Score desc nulls last) as ScoreRank
+    from Posts p
+    where p.PostTypeId = 1 and p.OwnerUserId is not null
+),
+UserBadgeString as (
+    select u.Id as UserId,
+           concat_ws(', ',
+                    'Gold: ' || coalesce(g.GoldBadges, 0),
+                    'Silver: ' || coalesce(g.SilverBadges, 0),
+                    'Bronze: ' || coalesce(g.BronzeBadges, 0)) as BadgeSummary
+    from Users u
+    left join (
+       select UserId,
+              count(case when Class = 1 then 1 end) as GoldBadges,
+              count(case when Class = 2 then 1 end) as SilverBadges,
+              count(case when Class = 3 then 1 end) as BronzeBadges
+       from Badges
+       group by UserId
+    ) g on g.UserId = u.Id
+)
+select u.Id as UserId,
+       u.DisplayName,
+       u.Reputation,
+       urs.BadgeSummary,
+       par.PostId,
+       par.Title,
+       par.Score,
+       par.ViewCount,
+       par.TagArray,
+       crc.CloseReasonName,
+       coalesce(dlc.DuplicateCount,0) as DuplicateCount,
+       case when par.UserPostRank = 1 then 'Latest' 
+            when par.UserPostRank <= 5 then 'RecentTop5' 
+            else 'Other' end as UserPostRecency,
+       round(avg(coalesce(v.Score,0)) over (partition by v.PostId),2) as AvgVoteScore,
+       row_number() over (partition by par.TagArray[1] order by par.Score desc nulls last) as TagTopPostRank
+from Users u
+left join UserBadgeString urs on urs.UserId = u.Id
+left join PostActivityRanked par on par.OwnerUserId = u.Id and par.UserPostRank <= 5
+left join PostHistory ph on ph.PostId = par.Id and ph.PostHistoryTypeId = 10 -- Post Closed
+left join CloseReasonCounts crc on crc.CloseReasonName = (select Name from CloseReasonTypes where Id = cast(ph.Comment as int)) -- correlated subquery
+left join DuplicationLinkCounts dlc on dlc.MasterQuestionId = par.Id
+left join Votes v on v.PostId = par.Id and v.VoteTypeId = 2 -- UpMod votes only
+where u.Reputation > 1000
+  and (par.Score is null or par.Score > 0)
+union
+select distinct u.Id, u.DisplayName, u.Reputation, urs.BadgeSummary, null, null, null, null, null, null, 0, null
+from Users u
+left join UserBadgeString urs on urs.UserId = u.Id
+where not exists (
+  select 1 from Posts p where p.OwnerUserId = u.Id and p.Score > 0
+)
+order by Reputation desc nulls last, Score desc nulls last, UserId, PostId
+limit 100;

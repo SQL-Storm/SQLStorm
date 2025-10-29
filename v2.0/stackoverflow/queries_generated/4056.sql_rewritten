@@ -1,0 +1,209 @@
+-- {"query": "4056.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1951} 
+WITH
+  QuestionStats AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate AS QuestionCreationDate,
+      p.AnswerCount,
+      p.Score AS QuestionScore,
+      p.ViewCount AS QuestionViewCount,
+      p.FavoriteCount AS QuestionFavoriteCount,
+      (
+        SELECT
+          COUNT(ph.Id)
+        FROM
+          PostHistory AS ph
+        WHERE
+          ph.PostId = p.Id
+          AND ph.PostHistoryTypeId IN (4, 5, 6)
+      ) AS EditCount,
+      p.ClosedDate,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserQuestionRank,
+      AVG(CAST(ph.CommentCount AS DECIMAL(10, 2))) OVER (PARTITION BY p.OwnerUserId) AS AvgUserQuestionComments,
+      SUM(p.AnswerCount) OVER (PARTITION BY p.OwnerUserId) AS TotalAnswersByOwner,
+      LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PreviousQuestionScore
+    FROM
+      Posts AS p
+    WHERE
+      p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+  ),
+  AnswerStats AS (
+    SELECT
+      p.ParentId AS QuestionId,
+      COUNT(p.Id) AS AnswerCount,
+      SUM(p.Score) AS TotalAnswerScore,
+      AVG(CAST(p.Score AS DECIMAL(10, 2))) AS AvgAnswerScore,
+      MAX(p.CreationDate) AS LastAnswerDate
+    FROM
+      Posts AS p
+    WHERE
+      p.PostTypeId = 2
+      AND p.ParentId IS NOT NULL
+    GROUP BY
+      p.ParentId
+  ),
+  UserReputation AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.Views AS UserViews,
+      u.UpVotes AS UserUpVotes,
+      u.DownVotes AS UserDownVotes,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      MAX(b.Date) AS LastBadgeDate
+    FROM
+      Users AS u
+    LEFT JOIN
+      Badges AS b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes
+  ),
+  TopUsersWithBadges AS (
+    SELECT
+      UserId,
+      DisplayName,
+      Reputation,
+      UserCreationDate,
+      BadgeCount,
+      ROW_NUMBER() OVER (ORDER BY Reputation DESC, BadgeCount DESC) AS UserRank
+    FROM
+      UserReputation
+    WHERE
+      BadgeCount > 0
+  ),
+  HighScoringQuestions AS (
+    SELECT
+      qs.QuestionId,
+      qs.Title,
+      qs.OwnerUserId,
+      qs.QuestionCreationDate,
+      qs.QuestionScore,
+      qs.QuestionViewCount,
+      qs.QuestionFavoriteCount,
+      qs.EditCount,
+      qs.IsClosed,
+      COALESCE(ast.AnswerCount, 0) AS AnswerCount,
+      COALESCE(ast.TotalAnswerScore, 0) AS TotalAnswerScore,
+      COALESCE(ast.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+      COALESCE(ast.LastAnswerDate, qs.QuestionCreationDate) AS LastActivityOnQuestion,
+      ur.Reputation AS OwnerReputation,
+      ur.DisplayName AS OwnerDisplayName,
+      t.TagName,
+      CASE WHEN qs.QuestionScore > 1000 THEN 'Very High' WHEN qs.QuestionScore > 500 THEN 'High' WHEN qs.QuestionScore > 100 THEN 'Medium' ELSE 'Low' END AS ScoreCategory,
+      DATEDIFF(day, qs.QuestionCreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceCreation,
+      CASE WHEN qs.ClosedDate IS NULL THEN DATEDIFF(day, qs.QuestionCreationDate, cast('2024-10-01 12:34:56' as timestamp)) ELSE DATEDIFF(day, qs.QuestionCreationDate, qs.ClosedDate) END AS LifeSpanDays,
+      IIF(qs.OwnerUserId = 1, 'Community', ur.DisplayName) AS EffectiveOwnerName
+    FROM
+      QuestionStats AS qs
+    LEFT JOIN
+      AnswerStats AS ast
+      ON qs.QuestionId = ast.QuestionId
+    LEFT JOIN
+      UserReputation AS ur
+      ON qs.OwnerUserId = ur.UserId
+    CROSS JOIN
+      (SELECT TOP 1 TagName FROM Tags ORDER BY NEWID()) AS t
+    WHERE
+      qs.QuestionScore > 50
+      AND qs.AnswerCount > 5
+      AND DATEDIFF(day, qs.QuestionCreationDate, cast('2024-10-01 12:34:56' as timestamp)) > 30
+      AND qs.OwnerReputation > 10000
+      AND qs.EditCount < 10
+      AND qs.IsClosed = 0
+  )
+SELECT
+  hsq.QuestionId,
+  hsq.Title,
+  hsq.OwnerUserId,
+  hsq.OwnerDisplayName,
+  hsq.OwnerReputation,
+  hsq.QuestionCreationDate,
+  hsq.QuestionScore,
+  hsq.QuestionViewCount,
+  hsq.QuestionFavoriteCount,
+  hsq.AnswerCount,
+  hsq.TotalAnswerScore,
+  hsq.AvgAnswerScore,
+  hsq.TagName,
+  hsq.ScoreCategory,
+  hsq.DaysSinceCreation,
+  hsq.LifeSpanDays,
+  hsq.EffectiveOwnerName,
+  (
+    SELECT
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) -- Upvotes
+    FROM
+      Votes AS v
+    WHERE
+      v.PostId = hsq.QuestionId
+      AND v.VoteTypeId IN (2, 3)
+  ) AS TotalVotesOnQuestion,
+  (
+    SELECT
+      AVG(CAST(c.Score AS DECIMAL(10, 2)))
+    FROM
+      Comments AS c
+    WHERE
+      c.PostId = hsq.QuestionId
+      AND c.Score IS NOT NULL
+  ) AS AvgCommentScoreOnQuestion,
+  (
+    SELECT TOP 1
+      ur_a.DisplayName
+    FROM
+      Posts AS p_a
+    JOIN
+      UserReputation AS ur_a
+      ON p_a.OwnerUserId = ur_a.UserId
+    WHERE
+      p_a.ParentId = hsq.QuestionId
+      AND p_a.PostTypeId = 2
+      AND p_a.Score = (
+        SELECT
+          MAX(Score)
+        FROM
+          Posts
+        WHERE
+          ParentId = hsq.QuestionId
+          AND PostTypeId = 2
+      )
+    ORDER BY
+      p_a.CreationDate ASC
+  ) AS BestAnswererDisplayName,
+  CASE
+    WHEN hsq.OwnerReputation > 100000
+    AND hsq.TotalAnswerScore > 5000 THEN 'Highly Engaged Expert'
+    WHEN hsq.OwnerReputation > 50000
+    AND hsq.AnswerCount > 20 THEN 'Experienced Contributor'
+    ELSE 'Standard User'
+  END AS UserEngagementLevel,
+  CASE
+    WHEN LEFT(hsq.Title, 3) = 'Why' THEN 'Why Question'
+    WHEN LEFT(hsq.Title, 4) = 'How ' THEN 'How Question'
+    WHEN LEFT(hsq.Title, 7) = 'What is' THEN 'What Question'
+    ELSE 'Other Question Type'
+  END AS QuestionType,
+  CONCAT(hsq.OwnerDisplayName, ' - ', hsq.TagName) AS OwnerAndTag,
+  IIF(hsq.LastActivityOnQuestion > DATEADD(day, -7, cast('2024-10-01 12:34:56' as timestamp)), 'Recent Activity', 'Dormant') AS ActivityStatus
+FROM
+  HighScoringQuestions AS hsq
+WHERE
+  hsq.OwnerReputation BETWEEN 1000 AND 50000
+  OR hsq.QuestionScore > 200
+ORDER BY
+  hsq.QuestionScore DESC,
+  hsq.QuestionViewCount DESC
+LIMIT 100;

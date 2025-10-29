@@ -1,0 +1,203 @@
+-- {"query": "1296.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3216} 
+
+WITH UserActivitySummary AS (
+    -- Summarize user activity and reputation metrics for all users, including those with no posts/comments/badges
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViews,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoriteCount,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(b.Class) AS MaxBadgeClass, -- 1=Gold, 2=Silver, 3=Bronze
+        AVG(CASE WHEN p.PostTypeId = 2 AND p.AcceptedAnswerId IS NOT NULL THEN 1.0 ELSE 0.0 END) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerAcceptanceRate,
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6) AND ph.UserId IS NOT NULL) AS TotalEditsMade
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostDetailsExtended AS (
+    -- Enrich Post data with aggregated history, linked post info, and correlated subqueries
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.OwnerUserId,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEntries,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS TotalPostEdits,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS LastEditHistoryDate,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedPostsCount,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicatePostsCount,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVoteCount,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><') AS ParsedTagsArray,
+        -- Correlated subquery: Get the most recent comment score for posts by their owner
+        (SELECT COALESCE(MAX(co.Score), 0)
+         FROM Comments co
+         WHERE co.PostId = p.Id AND co.UserId = p.OwnerUserId
+         AND co.CreationDate = (SELECT MAX(co2.CreationDate) FROM Comments co2 WHERE co2.PostId = p.Id AND co2.UserId = p.OwnerUserId)
+        ) AS LatestOwnerCommentScore,
+        -- Correlated subquery: Check if post has any "Off-topic" close reason
+        EXISTS (SELECT 1 FROM PostHistory ph_close WHERE ph_close.PostId = p.Id AND ph_close.PostHistoryTypeId = 10 AND ph_close.Comment LIKE '102%') AS HasOffTopicCloseReason
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY p.Id, p.PostTypeId, p.Title, p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.OwnerUserId, p.Tags, p.AcceptedAnswerId, p.ClosedDate, p.CommunityOwnedDate
+),
+RankedPosts AS (
+    -- Apply window functions for ranking and categorization, and bring in owner summary details
+    SELECT
+        pde.*,
+        uas.DisplayName AS OwnerDisplayName,
+        uas.Reputation AS OwnerReputation,
+        uas.TotalPosts AS OwnerTotalPosts,
+        uas.MaxBadgeClass AS OwnerMaxBadgeClass,
+        uas.TotalEditsMade AS OwnerTotalEditsMade,
+        uas.TotalCommentScore AS OwnerTotalCommentScore,
+        uas.AvgAnswerAcceptanceRate AS OwnerAvgAnswerAcceptanceRate,
+        -- Calculate post "freshness" based on last activity vs. creation date in hours
+        EXTRACT(EPOCH FROM (pde.LastActivityDate - pde.PostCreationDate)) / 3600 AS HoursSinceCreationToLastActivity,
+        -- Calculate a composite post engagement score
+        (pde.PostScore * 1.5 + pde.ViewCount / 100.0 + pde.CommentCount * 5 + COALESCE(pde.FavoriteCount, 0) * 10) AS CompositeEngagementScore,
+        -- Rank posts by engagement score within their type using ROW_NUMBER
+        ROW_NUMBER() OVER (PARTITION BY pde.PostTypeId ORDER BY (pde.PostScore * 1.5 + pde.ViewCount / 100.0 + pde.CommentCount * 5 + COALESCE(pde.FavoriteCount, 0) * 10) DESC, pde.PostId) AS RankByEngagement,
+        -- Calculate average score of answers for a question using a window function
+        AVG(ans.Score) FILTER (WHERE pde.PostTypeId = 1) OVER (PARTITION BY pde.PostId) AS AvgAnswerScore,
+        -- Calculate total reputation of distinct users who edited the post (excluding owner) using a window function
+        SUM(u_editor.Reputation) OVER (PARTITION BY pde.PostId) FILTER (WHERE ph_editor.UserId IS NOT NULL AND ph_editor.UserId <> pde.OwnerUserId) AS SumEditorReputation
+    FROM PostDetailsExtended pde
+    LEFT JOIN UserActivitySummary uas ON pde.OwnerUserId = uas.UserId
+    LEFT JOIN Posts ans ON pde.PostTypeId = 1 AND pde.Id = ans.ParentId AND ans.PostTypeId = 2 -- For calculating average answer score
+    LEFT JOIN PostHistory ph_editor ON pde.PostId = ph_editor.PostId AND ph_editor.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN Users u_editor ON ph_editor.UserId = u_editor.Id
+),
+HighlyEngagedPosts AS (
+    -- Filter for top engaged questions and answers, combining with UNION ALL set operator
+    SELECT
+        rp.PostId,
+        rp.Title,
+        rp.PostTypeId,
+        rp.PostCreationDate,
+        rp.LastActivityDate,
+        rp.PostScore,
+        rp.ViewCount,
+        rp.OwnerUserId,
+        rp.OwnerDisplayName,
+        rp.OwnerReputation,
+        rp.CompositeEngagementScore,
+        'Highly Engaged Question' AS EngagementCategory,
+        rp.ParsedTagsArray
+    FROM RankedPosts rp
+    WHERE rp.PostTypeId = 1 -- Questions
+      AND rp.RankByEngagement <= 100 -- Top 100 questions by engagement
+      AND rp.PostScore >= 50
+      AND rp.ViewCount >= 5000
+      AND rp.AnswerCount IS NOT NULL AND rp.AnswerCount > 0 -- Must have at least one answer
+    UNION ALL
+    SELECT
+        rp.PostId,
+        rp.Title,
+        rp.PostTypeId,
+        rp.PostCreationDate,
+        rp.LastActivityDate,
+        rp.PostScore,
+        rp.ViewCount,
+        rp.OwnerUserId,
+        rp.OwnerDisplayName,
+        rp.OwnerReputation,
+        rp.CompositeEngagementScore,
+        'Highly Engaged Answer' AS EngagementCategory,
+        rp.ParsedTagsArray
+    FROM RankedPosts rp
+    WHERE rp.PostTypeId = 2 -- Answers
+      AND rp.RankByEngagement <= 200 -- Top 200 answers by engagement
+      AND rp.PostScore >= 25
+      AND rp.OwnerReputation >= 10000 -- Answers from reputable users
+      AND rp.AcceptedAnswerId IS NOT NULL -- This answer must be an accepted one
+)
+-- Final selection and presentation of results
+SELECT
+    hep.PostId,
+    hep.Title,
+    pt.Name AS PostTypeName,
+    hep.OwnerDisplayName,
+    hep.OwnerReputation,
+    hep.PostScore,
+    hep.ViewCount,
+    hep.LastActivityDate,
+    hep.EngagementCategory,
+    hep.CompositeEngagementScore,
+    STRING_AGG(t.TagName, ', ') FILTER (WHERE t.TagName IS NOT NULL) AS RelatedTags,
+    rp_full.OwnerTotalPosts AS OwnerOverallPosts,
+    rp_full.OwnerTotalEditsMade AS OwnerTotalEdits,
+    rp_full.OwnerTotalCommentScore AS OwnerCommentKarma,
+    COALESCE(rp_full.OwnerAvgAnswerAcceptanceRate, 0.0) AS OwnerAvgAnswerAcceptanceRate,
+    -- NULL logic and complex expressions: Score-to-View Ratio, Owner Tier classification
+    COALESCE(hep.PostScore * 1.0 / NULLIF(hep.ViewCount, 0), 0.0) AS ScoreToViewRatio,
+    CASE
+        WHEN rp_full.OwnerReputation >= 100000 AND rp_full.OwnerMaxBadgeClass = 1 THEN 'Veteran Platinum Contributor'
+        WHEN rp_full.OwnerReputation >= 50000 AND rp_full.OwnerMaxBadgeClass <= 2 THEN 'Experienced Gold/Silver Contributor'
+        WHEN rp_full.OwnerReputation >= 10000 THEN 'Established Contributor'
+        ELSE 'Active Contributor'
+    END AS OwnerTier,
+    -- Post Lifecycle Status with complicated predicates
+    CASE
+        WHEN rp_full.HoursSinceCreationToLastActivity IS NOT NULL
+             AND rp_full.HoursSinceCreationToLastActivity < 72 -- Active within 3 days
+             AND rp_full.TotalPostEdits >= 5
+             AND rp_full.PostScore >= 20 THEN 'Rapidly Evolving Hot Post'
+        WHEN rp_full.ClosedDate IS NOT NULL AND rp_full.HasOffTopicCloseReason THEN 'Moderated Off-Topic Post'
+        WHEN rp_full.CommunityOwnedDate IS NOT NULL THEN 'Community Curated Post'
+        ELSE 'Standard Engaged Post'
+    END AS PostLifecycleStatus,
+    rp_full.LatestOwnerCommentScore AS MaxCommentScoreByOwner,
+    rp_full.DuplicatePostsCount,
+    rp_full.SumEditorReputation AS TotalNonOwnerEditorReputation
+FROM HighlyEngagedPosts hep
+JOIN PostTypes pt ON hep.PostTypeId = pt.Id
+-- Re-join to RankedPosts to retrieve all pre-calculated detailed information
+LEFT JOIN RankedPosts rp_full ON hep.PostId = rp_full.PostId
+-- String expressions: LATERAL UNNEST for parsing tags and joining to Tags table
+LEFT JOIN LATERAL UNNEST(hep.ParsedTagsArray) AS tag_name ON TRUE
+LEFT JOIN Tags t ON LOWER(tag_name) = LOWER(t.TagName)
+WHERE
+    hep.PostCreationDate >= '2020-01-01' -- Filter for posts created after a certain date
+    AND hep.OwnerReputation >= 5000 -- Filter for posts by users with significant reputation
+    -- Complicated predicate combining tag filtering and tag count
+    AND (EXISTS (SELECT 1 FROM Tags t_filter WHERE LOWER(t_filter.TagName) IN ('sql', 'postgresql', 'mysql', 'database', 'performance') AND LOWER(tag_name) = LOWER(t_filter.TagName))
+         OR ARRAY_LENGTH(hep.ParsedTagsArray, 1) > 2)
+    -- NULL logic: Ensure critical calculated fields are present
+    AND rp_full.HoursSinceCreationToLastActivity IS NOT NULL
+    AND rp_full.LatestOwnerCommentScore IS NOT NULL
+GROUP BY
+    hep.PostId, hep.Title, pt.Name, hep.OwnerDisplayName, hep.OwnerReputation, hep.PostScore, hep.ViewCount, hep.LastActivityDate,
+    hep.EngagementCategory, hep.CompositeEngagementScore,
+    rp_full.OwnerTotalPosts, rp_full.OwnerTotalEditsMade, rp_full.OwnerTotalCommentScore, rp_full.OwnerAvgAnswerAcceptanceRate,
+    rp_full.OwnerMaxBadgeClass, rp_full.HoursSinceCreationToLastActivity, rp_full.TotalPostEdits, rp_full.ClosedDate, rp_full.HasOffTopicCloseReason,
+    rp_full.CommunityOwnedDate, rp_full.LatestOwnerCommentScore, rp_full.DuplicatePostsCount, rp_full.SumEditorReputation
+ORDER BY
+    hep.CompositeEngagementScore DESC,
+    hep.LastActivityDate DESC
+LIMIT 500;

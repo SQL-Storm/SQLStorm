@@ -1,0 +1,136 @@
+-- {"query": "5872.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 986} 
+WITH
+-- recent high-velocity posts with many edits and long text bodies
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.LastEditorUserId,
+    p.LastEditorDisplayName,
+    p.LastEditDate,
+    p.CommentCount,
+    p.AnswerCount
+  FROM Posts p
+  WHERE p.LastActivityDate >= dateadd(day, -30, cast('2024-10-01 12:34:56' as timestamp))
+),
+-- compute a per-user engagement score using window functions
+UserEngagement AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    -- weighted engagement: 2*reputation + 0.5*views + upvotes - downvotes + recent activity
+    CAST(2.0 * NULLIF(u.Reputation,0) + 0.5 * NULLIF(u.Views,0)
+         + 1.0 * (u.UpVotes - u.DownVotes) AS float) AS BaseEngagement
+  FROM Users u
+),
+-- track cross-post relations via PostLinks: links and duplicates for top 100 by activity
+TopLinked AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    p.Title AS RelatedTitle,
+    p.CreationDate AS RelatedCreationDate
+  FROM PostLinks pl
+  JOIN Posts p ON p.Id = pl.RelatedPostId
+  WHERE pl.LinkTypeId IN (1, 3) -- Linked or Duplicate
+  ORDER BY RelatedCreationDate DESC
+  OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+),
+-- aggregate tag information for popular tags among recent posts
+PopularTags AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagCount,
+    AVG(p.Score) AS AvgPostScore
+  FROM RecentActivePosts rap
+  JOIN Tags t ON t.Id = (
+    SELECT TOP 1 Id FROM Tags t2
+    WHERE t2.TagName IN (SELECT UNNEST(string_to_array(rap.Tags, '><')) AS tname)
+    LIMIT 1
+  )
+  CROSS APPLY string_split(rap.Tags, '><') AS tname
+  GROUP BY t.TagName
+),
+-- correlated subquery: select for each post a close reason if closed
+ClosedReasons AS (
+  SELECT
+    rh.PostId,
+    rh.Comment AS CloseComment,
+    rh.Text AS ExtraInfo,
+    rh.CreationDate
+  FROM PostHistory rh
+  WHERE rh.PostHistoryTypeId = 10
+),
+-- final blend: join recent posts with their owners, last editor, and top linked info
+FinalQuery AS (
+  SELECT
+    rap.PostId,
+    rap.Title,
+    rap.Body,
+    rap.Tags,
+    rap.CreationDate,
+    rap.LastActivityDate,
+    rap.Score,
+    rap.ViewCount,
+    rap.CommentCount,
+    rap.AnswerCount,
+    ue.UserId,
+    ue.DisplayName AS OwnerDisplayName,
+    ue.Reputation,
+    ue.BaseEngagement,
+    ui.DisplayName AS LastEditorDisplayName,
+    rap.OwnerUserId,
+    rap.LastEditDate,
+    bl.RelatedPostId,
+    bl.RelatedTitle,
+    bl.RelatedCreationDate,
+    clr.CloseComment
+  FROM RecentActivePosts rap
+  LEFT JOIN UserEngagement ue ON rap.OwnerUserId = ue.UserId
+  LEFT JOIN Users ui ON rap.LastEditorUserId = ui.Id
+  LEFT JOIN TopLinked bl ON rap.PostId = bl.PostId
+  LEFT JOIN ClosedReasons clr ON rap.PostId = clr.PostId
+  ORDER BY rap.LastActivityDate DESC, rap.Score DESC
+  OFFSET 0 ROWS FETCH NEXT 200 ROWS ONLY
+)
+SELECT
+  PostId,
+  Title,
+  SUBSTRING(Body FROM 1 FOR 200) || '...' AS PreviewBody,
+  Tags,
+  CreationDate,
+  LastActivityDate,
+  Score,
+  ViewCount,
+  CommentCount,
+  AnswerCount,
+  OwnerUserId,
+  OwnerDisplayName,
+  Reputation,
+  BaseEngagement,
+  LastEditorDisplayName,
+  RelatedPostId,
+  RelatedTitle,
+  RelatedCreationDate,
+  CloseComment
+FROM FinalQuery
+WHERE LastActivityDate >= dateadd(day, -14, cast('2024-10-01 12:34:56' as timestamp))
+ORDER BY LastActivityDate DESC, Score DESC;

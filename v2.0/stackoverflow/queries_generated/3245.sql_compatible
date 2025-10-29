@@ -1,0 +1,126 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Views, 0) + COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS ActivityScore,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MIN(u.CreationDate) AS FirstSeen
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVoteCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND (p.Tags IS NOT NULL OR LOWER(p.Title) LIKE '%performance%')
+),
+
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagUseCount,
+        COALESCE(e.ExcerptLength, 0) AS ExcerptLength,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN LATERAL (
+        SELECT LENGTH(p.Body) AS ExcerptLength, p.Id AS pid
+        FROM Posts p
+        WHERE p.Id = t.ExcerptPostId
+        LIMIT 1
+    ) e ON true
+    WHERE t.TagName IS NOT NULL
+),
+
+RecentClosedPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        ph.CreationDate AS ClosedDate,
+        ph.Comment AS CloseReasonJson,
+        CASE
+            WHEN ph.Comment LIKE '%"CloseReasonId":%101%' THEN 'Duplicate'
+            WHEN ph.Comment LIKE '%"CloseReasonId":%102%' THEN 'Off-topic'
+            ELSE 'Other'
+        END AS CloseReason
+    FROM Posts p
+    JOIN PostHistory ph
+      ON ph.PostId = p.Id
+     AND ph.PostHistoryTypeId = 10
+    WHERE p.ClosedDate >= CAST('2024-10-01' AS date) - INTERVAL '30' DAY
+)
+
+SELECT
+    us.Id                                    AS UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.ActivityScore,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    tq.Id                                    AS TopQuestionId,
+    tq.Title                                 AS TopQuestionTitle,
+    tq.Score                                 AS TopQuestionScore,
+    tq.UpVoteCount,
+    tq.DownVoteCount,
+    tp.TagName,
+    tp.TagUseCount,
+    tp.TagRank,
+    rc.Id                                    AS RecentlyClosedPostId,
+    rc.Title                                 AS RecentlyClosedPostTitle,
+    rc.CloseReason,
+    COALESCE(NULLIF(tq.Tags, ''), '(no tags)') AS TopQuestionTags,
+    CASE
+        WHEN us.Reputation > 20000 THEN 'Elite'
+        WHEN us.Reputation BETWEEN 5000 AND 20000 THEN 'Pro'
+        ELSE 'Rising'
+    END                                      AS ReputationTier,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = us.Id AND c.Score > 0) AS PositiveCommentCount,
+    (SELECT STRING_AGG(DISTINCT SUBSTRING(t2.TagName FROM 1 FOR 10), ', ')
+       FROM Tags t2
+       JOIN Posts p2 ON p2.Tags LIKE '%' || t2.TagName || '%'
+      WHERE p2.OwnerUserId = us.Id)          AS TagCloudSample
+FROM UserStats us
+LEFT JOIN TopQuestions tq
+       ON tq.OwnerUserId = us.Id AND tq.rn = 1
+LEFT JOIN TagPopularity tp
+       ON tp.TagRank <= 5
+LEFT JOIN RecentClosedPosts rc
+       ON rc.OwnerUserId = us.Id
+WHERE us.ActivityScore > 0
+ORDER BY us.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL
+WHERE FALSE;

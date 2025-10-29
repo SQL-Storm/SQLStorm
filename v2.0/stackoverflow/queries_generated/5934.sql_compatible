@@ -1,0 +1,98 @@
+WITH
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(p.Id) AS PostCount,
+    SUM(p.ViewCount) AS TotalViews,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.LastActivityDate) AS LastActive,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId END) AS Upvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId END) AS Downvotes
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RecentEdits AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.LastEditDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    MAX(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,8,9,24) THEN ph.CreationDate END) AS LastEditDateCandidate,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  GROUP BY p.Id, p.Title, p.CreationDate, p.LastEditDate, p.LastActivityDate, p.OwnerUserId
+),
+TagStats AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.IsModeratorOnly,
+    t.IsRequired,
+    t.ExcerptPostId,
+    t.WikiPostId
+  FROM Tags t
+  WHERE t.Count > 0
+),
+BenchmarkBoard AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(rr.LastActive, u.LastAccessDate) AS RecencyAnchor,
+    ro.PostId AS RelatedPostId,
+    ro.Title AS RelatedPostTitle,
+    rb.LastEditDateCandidate,
+    ws.TotalViews,
+    ws.Upvotes,
+    ws.Downvotes,
+    bb.Count AS TagCount,
+    ro.CreationDate
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN RecentEdits ro ON ro.PostId = p.Id
+  LEFT JOIN RecentEdits rb ON rb.PostId = p.Id
+  LEFT JOIN UserStats ws ON ws.UserId = u.Id
+  LEFT JOIN (
+    SELECT DISTINCT TagName, Count
+    FROM TagStats
+  ) bb ON bb.TagName LIKE ('%' || COALESCE(ro.Title, '') || '%')
+  LEFT JOIN (
+    SELECT OwnerUserId, MAX(LastActivityDate) AS LastActive
+    FROM Posts
+    GROUP BY OwnerUserId
+  ) rr ON rr.OwnerUserId = u.Id
+  WHERE u.Reputation > 0
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, rr.LastActive, u.LastAccessDate,
+    ro.PostId, ro.Title, rb.LastEditDateCandidate, ws.TotalViews, ws.Upvotes, ws.Downvotes, bb.Count, ro.CreationDate
+)
+SELECT
+  UserId,
+  DisplayName,
+  Reputation,
+  RecencyAnchor,
+  RelatedPostId,
+  RelatedPostTitle,
+  LastEditDateCandidate,
+  TotalViews,
+  Upvotes,
+  Downvotes,
+  TagCount,
+  CASE WHEN LastEditDateCandidate IS NULL THEN CreationDate ELSE LastEditDateCandidate END AS BenchmarkPoint,
+  COALESCE(TagCount, 0) AS TagMetric,
+  (Upvotes - Downvotes) AS NetVotes,
+  (TotalViews * 1.0) / NULLIF(
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = BenchmarkBoard.UserId), 0
+  ) AS ViewsPerPost
+FROM BenchmarkBoard
+ORDER BY Reputation DESC, TotalViews DESC
+LIMIT 100;

@@ -1,0 +1,222 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        coalesce(u.UpVotes,0) as UpVotes,
+        coalesce(u.DownVotes,0) as DownVotes,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    where u.Reputation > 100
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.Views, u.UpVotes, u.DownVotes
+),
+UserPostStats as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        coalesce(vt.Name, 'Unknown') as VoteTypeName,
+        coalesce(v.CountVotes,0) as VoteCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        case when p.PostTypeId = 1 then coalesce(p.AnswerCount,0) else null end as AnswerCount,
+        row_number() over(partition by p.OwnerUserId order by p.CreationDate desc) as rn
+    from Posts p
+    left join (
+        select PostId, VoteTypeId, count(*) as CountVotes
+        from Votes
+        group by PostId, VoteTypeId
+    ) v on v.PostId = p.Id and v.VoteTypeId = 2
+    left join VoteTypes vt on vt.Id = 2
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+),
+TopPostsPerUser as (
+    select
+        ups.OwnerUserId as UserId,
+        ups.PostId,
+        ups.Score,
+        ups.Title,
+        ups.Tags,
+        ups.AnswerCount,
+        ru.DisplayName as UserName,
+        ru.Reputation,
+        ups.CreationDate
+    from UserPostStats ups
+    inner join RecursiveUserActivity ru on ru.UserId = ups.OwnerUserId
+    where ups.rn <= 3
+),
+PostLinkDetails as (
+    select
+        pl.Id as LinkId,
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.Score as PostScore,
+        p2.Score as RelatedPostScore,
+        p1.PostTypeId as PostType,
+        p2.PostTypeId as RelatedPostType
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId
+    inner join Posts p1 on p1.Id = pl.PostId
+    inner join Posts p2 on p2.Id = pl.RelatedPostId
+),
+DuplicateQuestionsWithAnswers as (
+    select distinct
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score as QuestionScore,
+        p.AcceptedAnswerId,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.Score as AnswerScore
+    from Posts p
+    inner join PostLinks pl on pl.PostId = p.Id and pl.LinkTypeId = 3
+    inner join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1
+),
+TopAnswerers as (
+    select
+        a.OwnerUserId,
+        count(a.Id) as AnswersCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        row_number() over (order by count(a.Id) desc, avg(a.Score) desc) as Rank
+    from Posts a
+    where a.PostTypeId = 2 and a.OwnerUserId is not null
+    group by a.OwnerUserId
+    having count(a.Id) > 10
+),
+UserEngagement as (
+    select
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.Views,
+        rua.UpVotes,
+        rua.DownVotes,
+        coalesce(ta.AnswersCount,0) as answers_posted,
+        coalesce(ta.AvgAnswerScore,0) as avg_answer_score,
+        coalesce(ta.MaxAnswerScore,0) as max_answer_score,
+        coalesce(tb.GoldBadges, 0) as gold_badges,
+        coalesce(tb.SilverBadges, 0) as silver_badges,
+        coalesce(tb.BronzeBadges, 0) as bronze_badges,
+        case
+            when r.Reputation < 1000 then 'Novice'
+            when r.Reputation between 1000 and 10000 then 'Experienced'
+            else 'Expert'
+        end as UserLevel
+    from RecursiveUserActivity rua
+    left join TopAnswerers ta on ta.OwnerUserId = rua.UserId
+    left join (
+        select
+            UserId,
+            count(case when Class = 1 then 1 end) as GoldBadges,
+            count(case when Class = 2 then 1 end) as SilverBadges,
+            count(case when Class = 3 then 1 end) as BronzeBadges
+        from Badges
+        group by UserId
+    ) tb on tb.UserId = rua.UserId
+    left join Users r on r.Id = rua.UserId
+),
+UserRanking as (
+    select
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.Views,
+        ue.UpVotes,
+        ue.DownVotes,
+        ue.answers_posted,
+        ue.avg_answer_score,
+        ue.max_answer_score,
+        ue.gold_badges,
+        ue.silver_badges,
+        ue.bronze_badges,
+        ue.UserLevel,
+        ntile(10) over (order by ue.Reputation desc) as ReputationDecile,
+        ntile(5) over (order by ue.Views desc) as ViewsQuintile,
+        ntile(4) over (order by ue.answers_posted desc) as AnswerActivityQuartile
+    from UserEngagement ue
+),
+FinalResults as (
+    select
+        ur.UserId,
+        ur.DisplayName,
+        ur.Reputation,
+        ur.UserLevel,
+        ur.Views,
+        ur.UpVotes,
+        ur.DownVotes,
+        ur.answers_posted,
+        ur.avg_answer_score,
+        ur.max_answer_score,
+        ur.gold_badges,
+        ur.silver_badges,
+        ur.bronze_badges,
+        ur.ReputationDecile,
+        ur.ViewsQuintile,
+        ur.AnswerActivityQuartile,
+        topPosts.PostId,
+        topPosts.Title as PostTitle,
+        topPosts.Score as PostScore,
+        topPosts.AnswerCount as PostAnswerCount,
+        pl.LinkId,
+        pl.LinkTypeName,
+        pl.RelatedPostId,
+        pl.RelatedPostType,
+        pl.RelatedPostScore
+    from UserRanking ur
+    left join TopPostsPerUser topPosts on topPosts.UserId = ur.UserId
+    left join PostLinkDetails pl on pl.PostId = topPosts.PostId
+    where ur.Reputation > 500 and (coalesce(topPosts.Score,0) > 10 or coalesce(ur.answers_posted,0) > 50)
+)
+select distinct
+    fr.UserId,
+    fr.DisplayName,
+    fr.Reputation,
+    fr.UserLevel,
+    fr.Views,
+    fr.UpVotes,
+    fr.DownVotes,
+    fr.answers_posted,
+    round(cast(coalesce(fr.avg_answer_score,0) as numeric),2) as AvgAnswerScore,
+    fr.max_answer_score,
+    fr.gold_badges,
+    fr.silver_badges,
+    fr.bronze_badges,
+    fr.ReputationDecile,
+    fr.ViewsQuintile,
+    fr.AnswerActivityQuartile,
+    fr.PostId,
+    fr.PostTitle,
+    fr.PostScore,
+    fr.PostAnswerCount,
+    fr.LinkId,
+    fr.LinkTypeName,
+    fr.RelatedPostId,
+    fr.RelatedPostType,
+    fr.RelatedPostScore,
+    case 
+        when fr.PostScore is null then 0
+        else (fr.PostScore * 1.5 + coalesce(fr.answers_posted,0)*2 + coalesce(fr.gold_badges,0)*5)
+             / nullif(fr.Reputation / 1000.0, 0)
+    end as CompositeScore,
+    substring(coalesce(fr.DisplayName,'[Unknown]') from 1 for 20) || ' (' || fr.UserLevel || ')' as DisplayNameLabel
+from FinalResults fr
+order by CompositeScore desc NULLS LAST, fr.Reputation desc
+limit 50;

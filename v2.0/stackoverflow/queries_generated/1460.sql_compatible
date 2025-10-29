@@ -1,0 +1,199 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Reputation,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(p.Score) AS TotalPostScoreReceived,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScoreMade,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        (
+            SELECT MAX(ph_inner.CreationDate)
+            FROM PostHistory ph_inner
+            WHERE ph_inner.UserId = u.Id
+        ) AS LastPostHistoryActivityDate,
+        (
+            SELECT AVG(p_inner.Score)
+            FROM Posts p_inner
+            WHERE p_inner.OwnerUserId = u.Id AND p_inner.PostTypeId = 1
+        ) AS AvgQuestionScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.CreationDate, u.LastAccessDate, u.Reputation,
+        u.Views, u.UpVotes, u.DownVotes
+),
+PostEngagementDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        -- replace postgres-specific CARDINALITY/ string_to_array with standard split approach where available
+        (CASE
+            WHEN p.Tags IS NULL OR LENGTH(TRIM(p.Tags)) <= 2 THEN 0
+            ELSE (LENGTH(p.Tags) - 2 - LENGTH(REPLACE(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><', '')) ) / NULLIF(LENGTH('><'),0) + 1
+        END) AS TagCount,
+        (CASE
+            WHEN LOWER(COALESCE(p.Title, '')) LIKE '%performance%' OR LOWER(COALESCE(p.Body, '')) LIKE '%benchmark%' OR LOWER(COALESCE(p.Body, '')) LIKE '%optimization%' THEN TRUE
+            ELSE FALSE
+        END) AS IsPerformanceRelated,
+        (
+            SELECT crt.Name
+            FROM PostHistory ph_close
+            LEFT JOIN CloseReasonTypes crt ON CAST(ph_close.Comment AS SMALLINT) = crt.Id
+            WHERE ph_close.PostId = p.Id
+              AND ph_close.PostHistoryTypeId = 10
+            ORDER BY ph_close.CreationDate DESC
+            LIMIT 1
+        ) AS LatestCloseReason,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        CAST(COALESCE(p.FavoriteCount, 0) + COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS DOUBLE PRECISION) /
+        NULLIF(COALESCE(p.ViewCount, 1), 0) AS EngagementRatio
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TopCommentsForPosts AS (
+    SELECT
+        c.PostId,
+        c.Text AS TopCommentText,
+        c.Score AS TopCommentScore,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY COALESCE(c.Score, 0) DESC, c.CreationDate DESC) AS rn
+    FROM Comments c
+),
+TagFrequency AS (
+    SELECT
+        tag AS TagName,
+        p.OwnerUserId AS UserId,
+        COUNT(p.Id) AS PostsWithTag,
+        SUM(p.Score) AS TagScore
+    FROM (
+        SELECT p.Id, p.OwnerUserId, p.Score,
+               TRIM(value) AS tag
+        FROM Posts p,
+             -- split tags string like '<tag1><tag2>' into rows using a generic split method
+             (SELECT value FROM UNNEST(STRING_SPLIT(REPLACE(REPLACE(SUBSTRING(p.Tags,2,LENGTH(p.Tags)-2), '><', '|'), '||','|'), '|')) AS value) s
+        WHERE p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 2
+    ) sub
+    GROUP BY tag, p.OwnerUserId
+),
+UserTopTag AS (
+    SELECT
+        tf.UserId,
+        tf.TagName AS MostFrequentTagName,
+        tf.PostsWithTag AS PostsWithMostFrequentTag,
+        ROW_NUMBER() OVER (PARTITION BY tf.UserId ORDER BY tf.PostsWithTag DESC, tf.TagScore DESC, tf.TagName) AS rn
+    FROM TagFrequency tf
+),
+PotentialDuplicateQuestions AS (
+    SELECT DISTINCT p.Id AS QuestionId
+    FROM Posts p
+    JOIN PostLinks pl ON p.Id = pl.RelatedPostId AND pl.LinkTypeId = 3
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.UserCreationDate,
+    uas.LastAccessDate,
+    uas.TotalPosts,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    uas.TotalPostScoreReceived,
+    uas.TotalCommentsMade,
+    uas.TotalBadges,
+    utt.MostFrequentTagName,
+    utt.PostsWithMostFrequentTag,
+    DENSE_RANK() OVER (ORDER BY uas.TotalPostScoreReceived DESC) AS UserScoreRank,
+    (
+        uas.Reputation * 0.1 +
+        uas.TotalPosts * 0.5 +
+        uas.TotalCommentsMade * 0.2 +
+        uas.TotalBadges * 1 +
+        (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - uas.LastAccessDate)) / 3600.0 / 24.0) * -0.01
+    ) AS OverallUserActivityScore,
+    SUM(ped.EngagementRatio) AS SumPostEngagementRatio,
+    AVG(ped.PostScore) AS AvgPostScoreByUser,
+    SUM(CASE WHEN ped.IsPerformanceRelated THEN 1 ELSE 0 END) AS PerformanceRelatedPostsCount,
+    MAX(ped.PostCreationDate) AS LatestPostDate,
+    COALESCE(
+        MAX(CASE WHEN ped.AcceptedAnswerId IS NOT NULL THEN ped.PostCreationDate ELSE NULL END),
+        MAX(ped.PostCreationDate)
+    ) AS LastAcceptedAnswerDateOrPostDate,
+    (SELECT COUNT(*) FROM PostLinks pl_outer JOIN Posts p_outer ON pl_outer.RelatedPostId = p_outer.Id WHERE p_outer.OwnerUserId = uas.UserId AND pl_outer.LinkTypeId = 1) AS TotalIncomingLinksToUsersPosts,
+    (CASE
+        WHEN EXISTS (SELECT 1 FROM Posts p_q WHERE p_q.OwnerUserId = uas.UserId AND p_q.PostTypeId = 1 AND p_q.AcceptedAnswerId IS NOT NULL)
+         AND NOT EXISTS (SELECT 1 FROM Posts p_a WHERE p_a.OwnerUserId = uas.UserId AND p_a.PostTypeId = 2)
+        THEN 'QuestionsWithAccepted_NoAnswers'
+        WHEN EXISTS (SELECT 1 FROM Posts p_a WHERE p_a.OwnerUserId = uas.UserId AND p_a.PostTypeId = 2)
+         AND NOT EXISTS (SELECT 1 FROM Posts p_q WHERE p_q.OwnerUserId = uas.UserId AND p_q.PostTypeId = 1 AND p_q.AcceptedAnswerId IS NOT NULL)
+        THEN 'AnswersOnly_NoAcceptedQuestions'
+        ELSE 'Mixed_Or_NoRelevantActivity'
+    END) AS UserActivityPattern,
+    NTILE(5) OVER (ORDER BY uas.Reputation DESC) AS ReputationTier,
+    SUM(CASE WHEN ped.ClosedDate IS NOT NULL AND ped.LatestCloseReason IS NOT NULL AND LOWER(ped.LatestCloseReason) NOT LIKE '%duplicate%' THEN 1 ELSE 0 END) AS NonDuplicateClosedPostsWithReason,
+    CONCAT(
+        UPPER(SUBSTRING(COALESCE(uas.DisplayName, 'Unknown User'), 1, 1)),
+        LOWER(SUBSTRING(COALESCE(uas.DisplayName, 'Unknown User'), 2, LENGTH(COALESCE(uas.DisplayName, 'Unknown User')) - 1)),
+        ' (Rep: ',
+        CAST(ROUND(uas.Reputation / 1000.0, 1) AS VARCHAR), 'k)'
+    ) AS FormattedDisplayNameAndReputation,
+    (
+        SELECT AVG(EXTRACT(EPOCH FROM (pa.CreationDate - pq.CreationDate)) / 3600.0 / 24.0)
+        FROM Posts pq
+        JOIN Posts pa ON pq.AcceptedAnswerId = pa.Id
+        WHERE pq.OwnerUserId = uas.UserId AND pq.PostTypeId = 1 AND pa.PostTypeId = 2
+    ) AS AvgTimeToAcceptedAnswerDays,
+    MAX(tcf.TopCommentText) AS TopCommentOnAnyPostByUser,
+    MAX(tcf.TopCommentScore) AS TopCommentScoreOnAnyPostByUser
+FROM UserActivitySummary uas
+LEFT JOIN PostEngagementDetails ped ON uas.UserId = ped.OwnerUserId
+LEFT JOIN TopCommentsForPosts tcf ON ped.PostId = tcf.PostId AND tcf.rn = 1
+LEFT JOIN UserTopTag utt ON uas.UserId = utt.UserId AND utt.rn = 1
+WHERE
+    uas.TotalPosts > 5
+    AND uas.Reputation >= 1000
+    AND uas.LastAccessDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR
+    AND (ped.PostId IS NULL OR ped.ViewCount > 100 OR ped.PostScore > 5)
+    AND NOT EXISTS (
+        SELECT 1 FROM Posts p_wiki WHERE p_wiki.OwnerUserId = uas.UserId AND p_wiki.PostTypeId IN (3,4,5,7,8) AND uas.TotalPosts = (
+            SELECT COUNT(*) FROM Posts p_all_wiki WHERE p_all_wiki.OwnerUserId = uas.UserId AND p_all_wiki.PostTypeId IN (3,4,5,7,8)
+        )
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM PotentialDuplicateQuestions pdq
+        WHERE pdq.QuestionId = ped.PostId
+          AND ped.PostCreationDate = (SELECT MAX(p_max.CreationDate) FROM Posts p_max WHERE p_max.OwnerUserId = uas.UserId)
+    )
+GROUP BY
+    uas.UserId, uas.DisplayName, uas.Reputation, uas.UserCreationDate, uas.LastAccessDate,
+    uas.TotalPosts, uas.TotalQuestions, uas.TotalAnswers, uas.TotalPostScoreReceived,
+    uas.TotalCommentsMade, uas.TotalBadges,
+    utt.MostFrequentTagName, utt.PostsWithMostFrequentTag
+HAVING
+    COUNT(DISTINCT ped.PostId) > 0
+    AND AVG(ped.EngagementRatio) IS NOT NULL
+    AND SUM(CASE WHEN ped.IsPerformanceRelated THEN 1 ELSE 0 END) >= 0
+ORDER BY
+    OverallUserActivityScore DESC,
+    UserScoreRank ASC,
+    uas.DisplayName NULLS LAST;

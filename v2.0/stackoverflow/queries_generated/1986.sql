@@ -1,0 +1,270 @@
+-- {"query": "1986.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4345} 
+
+WITH UserPostSequence AS (
+    -- CTE to establish a sequence of posts for each user, allowing calculation of time between posts using window functions.
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId AS UserId,
+        P.CreationDate,
+        LAG(P.CreationDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostDate
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL
+),
+UserEngagement AS (
+    -- CTE to summarize user-level engagement metrics, including post counts, comment counts, badge counts, and average time between posts.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.Location,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalPostViews,
+        MAX(P.CreationDate) AS LastPostDate,
+        MAX(C.CreationDate) AS LastCommentDate,
+        DATE_PART('day', MAX(U.LastAccessDate) - MIN(U.CreationDate)) AS DaysActiveSpan,
+        COUNT(CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges,
+        -- Calculate average days between a user's consecutive posts, filtering out the first post for each user where PreviousPostDate equals CreationDate.
+        AVG(DATE_PART('day', UPS.CreationDate - UPS.PreviousPostDate)) FILTER (WHERE UPS.CreationDate != UPS.PreviousPostDate) AS AvgDaysBetweenPosts
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN UserPostSequence UPS ON U.Id = UPS.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location,
+        U.Views, U.UpVotes, U.DownVotes
+),
+PostDetails AS (
+    -- CTE to augment post details with information derived from the post body, tags, and associated users.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        COALESCE(P.OwnerDisplayName, U_Owner.DisplayName) AS PostOwnerDisplayName,
+        U_Owner.Reputation AS OwnerReputation,
+        P.LastEditorUserId,
+        COALESCE(P.LastEditorDisplayName, U_Editor.DisplayName) AS PostLastEditorDisplayName,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        LOWER(P.Title) AS LowercasedTitle,
+        P.Tags,
+        -- Extract the first tag from the tags string, assuming a '<tag1><tag2>' format.
+        TRIM(BOTH '>' FROM SUBSTRING(P.Tags FROM 2 FOR POSITION('>' IN P.Tags) - 2)) AS FirstTag,
+        DATE_PART('day', P.LastActivityDate - P.CreationDate) AS PostActivityAgeDays,
+        -- Correlated subquery to count unique users who favorited a post (VoteTypeId = 5).
+        (SELECT COUNT(DISTINCT V.UserId) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 5) AS TotalBookmarks,
+        -- Categorize post content based on the presence of specific HTML elements in the Body.
+        CASE
+            WHEN P.Body LIKE '%<code>%</code>%' THEN 'HasCodeBlock'
+            WHEN P.Body LIKE '%<a href=%>%' THEN 'HasLink'
+            WHEN P.Body ILIKE '%stack overflow%' THEN 'MentionsStackOverflow'
+            ELSE 'OtherContent'
+        END AS ContentCategory
+    FROM Posts P
+    LEFT JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN Users U_Owner ON P.OwnerUserId = U_Owner.Id
+    LEFT JOIN Users U_Editor ON P.LastEditorUserId = U_Editor.Id
+    WHERE P.OwnerUserId IS NOT NULL AND P.OwnerUserId != -1 -- Filter out community posts and posts with deleted owners.
+),
+TagPerformance AS (
+    -- CTE to analyze user-specific tag performance and categorize tags.
+    SELECT
+        PD.OwnerUserId AS UserId,
+        PD.FirstTag,
+        COUNT(PD.PostId) AS PostsInTag,
+        SUM(PD.PostScore) AS ScoreInTag,
+        AVG(PD.PostScore) AS AvgScoreInTag,
+        -- Correlated subquery to compare user's average post score in a tag against the overall average for that tag and post type, considering recent posts.
+        (SELECT AVG(P_Inner.Score)
+         FROM Posts P_Inner
+         WHERE P_Inner.Tags LIKE CONCAT('%<', PD.FirstTag, '>%', COALESCE(NULLIF(PD.FirstTag, ''), '%'))
+         AND P_Inner.PostTypeId = PD.PostTypeId
+         AND P_Inner.CreationDate >= '2023-01-01' -- Focus on recent tag performance
+        ) AS OverallAvgScoreForTagAndType,
+        -- Categorize tags into broader technical domains.
+        CASE
+            WHEN PD.Tags LIKE '%<sql>%' OR PD.Tags LIKE '%<database>%' OR PD.Tags LIKE '%<postgres>%' THEN 'SQL_DB_Related'
+            WHEN PD.Tags LIKE '%<javascript>%' OR PD.Tags LIKE '%<frontend>%' OR PD.Tags LIKE '%<react>%' THEN 'Frontend_Related'
+            WHEN PD.Tags LIKE '%<python>%' OR PD.Tags LIKE '%<machine-learning>%' THEN 'DataScience_AI'
+            ELSE 'Other_Tech'
+        END AS TagCategory
+    FROM PostDetails PD
+    WHERE PD.FirstTag IS NOT NULL AND LENGTH(PD.FirstTag) > 0
+    GROUP BY PD.OwnerUserId, PD.FirstTag, PD.PostTypeId, PD.Tags
+),
+PostHistoryAgg AS (
+    -- CTE to aggregate post history data, focusing on edits, close/delete events, and time intervals between edits.
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.Id END) AS EditCount, -- Count edits to Title, Body, or Tags
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS LastClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 12 THEN PH.CreationDate END) AS LastDeletedDate,
+        -- Retrieve the name of the close reason, handling cases where the reason might be unknown or the comment is empty.
+        NULLIF(MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN COALESCE(CR.Name, 'UnknownCloseReason') ELSE NULL END), '') AS CloseReason,
+        -- Calculate the average time (in minutes) between consecutive edits by the same user on the same post using a window function.
+        AVG(DATE_PART('minute', PH.CreationDate - LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId, PH.UserId ORDER BY PH.CreationDate)))
+            FILTER (WHERE PH.PostHistoryTypeId IN (4,5,6) AND PH.CreationDate != LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId, PH.UserId ORDER BY PH.CreationDate)) AS AvgEditIntervalMinutes
+    FROM PostHistory PH
+    LEFT JOIN CloseReasonTypes CR ON PH.PostHistoryTypeId = 10 AND PH.Comment = CR.Id::varchar(50) -- Cast to match types for join
+    GROUP BY PH.PostId
+),
+QuestionAnswerContext AS (
+    -- CTE to analyze the relationship and performance between questions and their answers.
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.Score AS QuestionScore,
+        Q.CreationDate AS QuestionCreationDate,
+        A.Id AS AnswerId,
+        A.OwnerUserId AS AnswerOwnerId,
+        A.Score AS AnswerScore,
+        A.CreationDate AS AnswerCreationDate,
+        (A.AcceptedAnswerId IS NOT NULL) AS IsAcceptedAnswer,
+        -- Calculate the ratio of an answer's score to its parent question's score, handling division by zero.
+        (CAST(A.Score AS NUMERIC) / NULLIF(Q.Score, 0)) AS AnswerToQuestionScoreRatio,
+        -- Rank answers for each question by score (descending) then creation date (ascending) using a window function.
+        ROW_NUMBER() OVER (PARTITION BY Q.Id ORDER BY A.Score DESC, A.CreationDate ASC) AS AnswerRankByScore
+    FROM Posts Q
+    JOIN Posts A ON Q.Id = A.ParentId
+    WHERE Q.PostTypeId = 1 AND A.PostTypeId = 2
+),
+RankedUsers AS (
+    -- CTE to rank users based on various aggregated metrics and derive complex user attributes.
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        UE.Reputation,
+        UE.TotalPosts,
+        UE.TotalQuestions,
+        UE.TotalAnswers,
+        UE.TotalComments,
+        UE.TotalPostScore,
+        UE.GoldBadges,
+        UE.SilverBadges,
+        UE.BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY UE.Reputation DESC, UE.TotalPostScore DESC) AS UserReputationRank,
+        RANK() OVER (ORDER BY UE.TotalPosts DESC, UE.TotalComments DESC) AS UserActivityRank,
+        -- Calculate the average reputation of users in the same geographical location, handling NULL locations.
+        AVG(UE.Reputation) OVER (PARTITION BY COALESCE(UE.Location, 'Unknown')) AS AvgReputationInLocation,
+        -- Correlated subquery to check if a user has at least two of a predefined set of 'key' badges.
+        EXISTS (
+            SELECT 1
+            FROM Badges B_Inner
+            WHERE B_Inner.UserId = UE.UserId
+            AND B_Inner.Name IN ('Generalist', 'Populist', 'Great Answer', 'Unsung Hero', 'Enthusiast')
+            GROUP BY B_Inner.UserId
+            HAVING COUNT(DISTINCT B_Inner.Name) >= 2
+        ) AS HasKeyBadgesCombo,
+        -- Correlated subquery to count the number of distinct tags a user has posted in, using string_to_array and UNNEST for tag parsing.
+        (
+            SELECT COUNT(DISTINCT Tag.value)
+            FROM Posts P_Sub
+            CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(P_Sub.Tags, 2, LENGTH(P_Sub.Tags)-2), '><')) AS Tag(value)
+            WHERE P_Sub.OwnerUserId = UE.UserId AND P_Sub.Tags IS NOT NULL AND LENGTH(TRIM(Tag.value)) > 0
+        ) AS DistinctTagsPostedIn,
+        UE.AvgDaysBetweenPosts
+    FROM UserEngagement UE
+    WHERE UE.Reputation > 500 -- Filter for more established users for a more meaningful analysis.
+)
+-- Main query: Combines all the pre-calculated metrics and attributes into a single comprehensive result set.
+SELECT
+    RU.UserId,
+    RU.DisplayName,
+    RU.Reputation,
+    RU.UserReputationRank,
+    RU.UserActivityRank,
+    RU.TotalPosts,
+    RU.TotalQuestions,
+    RU.TotalAnswers,
+    RU.TotalComments,
+    RU.TotalPostScore,
+    RU.GoldBadges,
+    RU.SilverBadges,
+    RU.BronzeBadges,
+    RU.HasKeyBadgesCombo,
+    RU.AvgDaysBetweenPosts,
+    UE.UserProfileViews,
+    UE.DaysActiveSpan,
+    -- Recalculate post counts and scores for detailed posts, ensuring data consistency across CTEs.
+    COUNT(PD.PostId) AS TotalPostsDetailed,
+    COUNT(CASE WHEN PD.PostTypeId = 1 THEN PD.PostId END) AS QuestionsCount,
+    COUNT(CASE WHEN PD.PostTypeId = 2 THEN PD.PostId END) AS AnswersCount,
+    SUM(PD.PostViewCount) AS TotalPostViewsDetailed,
+    AVG(PD.PostScore) AS AvgPostScoreDetailed,
+    -- Calculate average answers per question, only for questions (PostTypeId = 1).
+    AVG(PD.AnswerCount) FILTER (WHERE PD.PostTypeId = 1) AS AvgAnswersPerQuestion,
+    COUNT(CASE WHEN PD.FavoriteCount > 0 THEN 1 ELSE NULL END) AS PostsWithFavorites,
+    COUNT(CASE WHEN PD.ClosedDate IS NOT NULL THEN 1 ELSE NULL END) AS ClosedPostsCount,
+    COUNT(CASE WHEN PD.CommunityOwnedDate IS NOT NULL THEN 1 ELSE NULL END) AS CommunityOwnedPostsCount,
+    -- Calculate the percentage of a user's total posts that are answers, handling division by zero.
+    CAST(SUM(CASE WHEN PD.PostTypeId = 2 THEN 1 ELSE 0 END) AS NUMERIC) / NULLIF(COUNT(PD.PostId), 0) AS PercentageOfAnswers,
+    AVG(PHA.EditCount) AS AvgEditCountPerPost,
+    COUNT(CASE WHEN PHA.LastDeletedDate IS NOT NULL THEN 1 ELSE NULL END) AS DeletedPostsCount,
+    COALESCE(UE.Location, 'Unknown Location') AS UserLocation,
+    -- Correlated subquery to find the most frequent content category for posts owned by the user.
+    (SELECT PD_Sub.ContentCategory
+     FROM PostDetails PD_Sub
+     WHERE PD_Sub.OwnerUserId = RU.UserId
+     GROUP BY PD_Sub.ContentCategory
+     ORDER BY COUNT(*) DESC, PD_Sub.ContentCategory ASC
+     LIMIT 1
+    ) AS MostFrequentContentCategory,
+    -- Correlated subquery to count duplicate post links for the user's questions, filtering for high-score and high-view duplicates.
+    (SELECT COUNT(DISTINCT PL.RelatedPostId)
+     FROM PostLinks PL
+     WHERE PL.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = RU.UserId AND PostTypeId = 1)
+     AND PL.LinkTypeId = 3 -- LinkType 3 represents duplicate posts
+     AND EXISTS (SELECT 1 FROM Posts P_Dup WHERE P_Dup.Id = PL.RelatedPostId AND P_Dup.Score > 100 AND P_Dup.ViewCount > 5000)
+    ) AS LinkedHighScoreDuplicatesCount,
+    -- Check if the user has asked any "How To" questions based on title pattern.
+    MAX(CASE WHEN PD.LowercasedTitle LIKE '%how to%' AND PD.PostTypeId = 1 THEN 1 ELSE 0 END) AS HasHowToQuestions,
+    MIN(PD.PostCreationDate) AS FirstPostDate,
+    MAX(PD.LastActivityDate) AS LatestPostActivityDate,
+    -- Count how many times a user has provided the top-ranked answer to a question.
+    SUM(CASE WHEN QAC.AnswerOwnerId = RU.UserId AND QAC.AnswerRankByScore = 1 THEN 1 ELSE 0 END) AS TopRankedAnswersCount,
+    -- Calculate the average time (in minutes) for a user to post their first answer to a question.
+    AVG(DATE_PART('minute', QAC.AnswerCreationDate - QAC.QuestionCreationDate)) FILTER (WHERE QAC.AnswerOwnerId = RU.UserId AND QAC.AnswerRankByScore = 1) AS AvgTimeForFirstAnswerMinutes,
+    -- Correlated subquery to count comments on the user's posts that contain positive keywords.
+    (SELECT COUNT(C_Sub.Id)
+     FROM Comments C_Sub
+     WHERE C_Sub.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = RU.UserId)
+     AND (C_Sub.Text ILIKE '%helpful%' OR C_Sub.Text ILIKE '%thanks%' OR C_Sub.Text ILIKE '%great answer%')
+     AND C_Sub.UserId IS NOT NULL -- Exclude comments by deleted users or system.
+    ) AS PositiveKeywordCommentsCount,
+    -- Determine if a user has engaged in 'SQL_DB_Related' or 'Frontend_Related' tags based on aggregated TagPerformance.
+    MAX(CASE WHEN TP.TagCategory = 'SQL_DB_Related' THEN 'SQL_DB_Enthusiast' ELSE NULL END) AS UserTagInterestSQL,
+    MAX(CASE WHEN TP.TagCategory = 'Frontend_Related' THEN 'Frontend_Enthusiast' ELSE NULL END) AS UserTagInterestFrontend,
+    -- Correlated subquery to find the latest badge received by the user
+    (SELECT B_Latest.Name FROM Badges B_Latest WHERE B_Latest.UserId = RU.UserId ORDER BY B_Latest.Date DESC LIMIT 1) AS LatestBadge
+FROM RankedUsers RU
+LEFT JOIN UserEngagement UE ON RU.UserId = UE.UserId -- Re-join UserEngagement to access metrics not propagated to RankedUsers
+LEFT JOIN PostDetails PD ON RU.UserId = PD.OwnerUserId
+LEFT JOIN PostHistoryAgg PHA ON PD.PostId = PHA.PostId
+LEFT JOIN QuestionAnswerContext QAC ON RU.UserId = QAC.AnswerOwnerId OR RU.UserId = QAC.QuestionOwnerId
+LEFT JOIN TagPerformance TP ON RU.UserId = TP.UserId -- Join to bring in tag category information
+GROUP BY
+    RU.UserId, RU.DisplayName, RU.Reputation, RU.UserReputationRank, RU.UserActivityRank,
+    RU.TotalPosts, RU.TotalQuestions, RU.TotalAnswers, RU.TotalComments, RU.TotalPostScore,
+    RU.GoldBadges, RU.SilverBadges, RU.BronzeBadges, RU.HasKeyBadgesCombo, RU.AvgDaysBetweenPosts,
+    UE.UserProfileViews, UE.DaysActiveSpan, UE.Location
+ORDER BY
+    RU.UserReputationRank ASC, RU.UserActivityRank ASC
+LIMIT 1000;

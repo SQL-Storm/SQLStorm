@@ -1,0 +1,42 @@
+-- {"query": "6032.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 331} 
+
+SELECT 
+    u.DisplayName, 
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.Reputation) AS MaxReputation,
+    MIN(u.CreationDate) AS EarliestJoinDate,
+    STRING_AGG(DISTINCT b.Name, ', ') WITHIN GROUP AS (ORDER BY b.Date DESC) AS RecentBadges,
+    MAX(ph.RevisionGUID) AS LastRevisionGUID
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+WHERE 
+    u.Id IN (
+        SELECT 
+            UserId 
+        FROM 
+            Votes 
+        WHERE 
+            VoteTypeId = 1 AND 
+            CreationDate > DATEADD(month, -12, CURRENT_TIMESTAMP)
+        GROUP BY 
+            UserId 
+        HAVING 
+            COUNT(Id) > 100
+    )
+AND 
+    p.PostTypeId IN (1, 2)
+GROUP BY 
+    u.DisplayName
+HAVING 
+    AVG(p.Score) > 10
+ORDER BY 
+    TotalPosts DESC, 
+    MaxReputation DESC;

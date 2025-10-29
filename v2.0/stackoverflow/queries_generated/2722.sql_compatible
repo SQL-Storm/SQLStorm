@@ -1,0 +1,229 @@
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        row_number() over (partition by u.Id order by b.Date desc nulls last) as BadgeRank
+    from 
+        Users u
+    left join 
+        Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+UserTopBadges as (
+    select UserId, DisplayName, GoldBadges, SilverBadges, BronzeBadges
+    from RecursiveUserBadges
+    where BadgeRank = 1
+),
+QuestionStats as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        count(distinct c.Id) as CommentCount,
+        avg(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesCount,
+        avg(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesCount,
+        jsonb_agg(distinct pht.Name order by pht.Id) filter (where pht.Name is not null) as HistoryTypesTouched,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as UserTopQuestionRank
+    from 
+        Posts p
+    left join 
+        Comments c on c.PostId = p.Id
+    left join 
+        Votes v on v.PostId = p.Id
+    left join 
+        PostHistory ph on ph.PostId = p.Id
+    left join 
+        PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    where 
+        p.PostTypeId = 1
+    group by 
+        p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount
+),
+AnswerStats as (
+    select 
+        a.Id,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.Score,
+        a.CreationDate,
+        count(distinct c.Id) as AnswerCommentCount,
+        rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+    from 
+        Posts a
+    left join 
+        Comments c on c.PostId = a.Id
+    left join 
+        Votes v on v.PostId = a.Id
+    where 
+        a.PostTypeId = 2
+    group by 
+        a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate
+),
+QuestionAnswerSummary as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.CommentCount,
+        q.HistoryTypesTouched,
+        a.AnswerRank,
+        a.Id as AnswerId,
+        a.AnswerOwnerUserId,
+        a.Score as AnswerScore,
+        a.AnswerCommentCount,
+        a.UpVotes,
+        a.DownVotes,
+        case when q.AcceptedAnswerId = a.Id then 1 else 0 end as IsAcceptedAnswer
+    from 
+        QuestionStats q
+    left join 
+        AnswerStats a on q.Id = a.QuestionId
+    where 
+        a.AnswerRank is not null
+),
+DuplicateLinks as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from 
+        PostLinks pl 
+    inner join 
+        LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    inner join 
+        Posts p1 on p1.Id = pl.PostId
+    inner join 
+        Posts p2 on p2.Id = pl.RelatedPostId
+    where 
+        p1.PostTypeId = 1 and p2.PostTypeId = 1
+),
+TagAggregates as (
+    select 
+        t.Id as TagId,
+        t.TagName,
+        t.Count as TagCount,
+        coalesce(p.ViewCount, 0) as PostViewCount,
+        coalesce(p.Score, 0) as PostScore
+    from 
+        Tags t
+    left join 
+        Posts p on p.Id = t.ExcerptPostId
+),
+UserActivityWindows as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        count(distinct p.Id) over (partition by u.Id) as TotalPosts,
+        count(distinct b.Id) over (partition by u.Id) as TotalBadges,
+        rank() over (order by u.Reputation desc) as ReputationRank,
+        dense_rank() over (partition by u.Location order by u.Reputation desc) as LocationReputationRank
+    from 
+        Users u
+    left join 
+        Posts p on p.OwnerUserId = u.Id
+    left join 
+        Badges b on b.UserId = u.Id
+)
+select 
+    qs.QuestionId,
+    qs.Title,
+    u.DisplayName as QuestionOwner,
+    qs.QuestionScore,
+    qs.ViewCount as QuestionViews,
+    qs.AnswerCount,
+    qs.FavoriteCount,
+    qs.CommentCount as QuestionComments,
+    array_to_string(qs.HistoryTypesTouched, ', ') as HistoryTypesTouched,
+    qs.AnswerId,
+    auser.DisplayName as AnswerOwner,
+    qs.AnswerScore,
+    qs.AnswerCommentCount,
+    qs.UpVotes as AnswerUpVotes,
+    qs.DownVotes as AnswerDownVotes,
+    case when qs.IsAcceptedAnswer = 1 then 'Accepted' else 'Not Accepted' end as AnswerStatus,
+    ul.RelatedPostId as DuplicateOfQuestionId,
+    ul.RelatedPostTitle as DuplicateOfQuestionTitle,
+    tutb.GoldBadges,
+    tutb.SilverBadges,
+    tutb.BronzeBadges,
+    taw.TotalPosts as UserTotalPosts,
+    taw.TotalBadges as UserTotalBadges,
+    taw.ReputationRank,
+    taw.LocationReputationRank,
+    tagagg.TagName,
+    tagagg.TagCount,
+    tagagg.PostViewCount,
+    tagagg.PostScore
+from
+    QuestionAnswerSummary qs
+left join 
+    Users u on u.Id = qs.OwnerUserId
+left join 
+    Users auser on auser.Id = qs.AnswerOwnerUserId
+left join 
+    DuplicateLinks ul on ul.PostId = qs.QuestionId
+left join 
+    UserTopBadges tutb on tutb.UserId = qs.OwnerUserId
+left join 
+    UserActivityWindows taw on taw.UserId = qs.OwnerUserId
+left join 
+    LATERAL (
+        select unnest(string_to_array(substring(t.Tags from 2 for char_length(t.Tags) - 2), '><')) as single_tag, t.Id as tid
+        from Posts t where t.Id = qs.QuestionId
+    ) qtags on true
+left join 
+    TagAggregates tagagg on tagagg.TagName = qtags.single_tag
+where
+    qs.QuestionScore > 5
+    and (qs.AnswerScore > 0 or qs.AnswerId is null)
+group by
+    qs.QuestionId,
+    qs.Title,
+    u.DisplayName,
+    qs.QuestionScore,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.FavoriteCount,
+    qs.CommentCount,
+    qs.HistoryTypesTouched,
+    qs.AnswerId,
+    auser.DisplayName,
+    qs.AnswerScore,
+    qs.AnswerCommentCount,
+    qs.UpVotes,
+    qs.DownVotes,
+    qs.IsAcceptedAnswer,
+    ul.RelatedPostId,
+    ul.RelatedPostTitle,
+    tutb.GoldBadges,
+    tutb.SilverBadges,
+    tutb.BronzeBadges,
+    taw.TotalPosts,
+    taw.TotalBadges,
+    taw.ReputationRank,
+    taw.LocationReputationRank,
+    tagagg.TagName,
+    tagagg.TagCount,
+    tagagg.PostViewCount,
+    tagagg.PostScore
+order by 
+    qs.QuestionScore desc, qs.AnswerScore desc nulls last
+limit 100;

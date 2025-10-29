@@ -1,0 +1,124 @@
+-- {"query": "3296.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2267} 
+WITH
+    -- 1️⃣ Gather per‑user statistics, including badge counts and vote activity
+    UserStats AS (
+        SELECT
+            u.Id                                     AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS UpVotesGiven,
+            COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS DownVotesGiven,
+            COUNT(CASE WHEN b.Class = 1 THEN 1 END)  AS GoldBadges,
+            COUNT(CASE WHEN b.Class = 2 THEN 1 END)  AS SilverBadges,
+            COUNT(CASE WHEN b.Class = 3 THEN 1 END)  AS BronzeBadges,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+        FROM Users u
+        LEFT JOIN Votes   v ON v.UserId   = u.Id
+        LEFT JOIN Badges  b ON b.UserId   = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    -- 2️⃣ Highest‑scoring answer per user (only answers with score ≥10)
+    TopAnswers AS (
+        SELECT
+            p.OwnerUserId               AS UserId,
+            p.Id                        AS AnswerId,
+            p.ParentId                  AS QuestionId,
+            p.Score                     AS AnswerScore,
+            p.CreationDate,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                               ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+        FROM Posts p
+        WHERE p.PostTypeId = 2               -- Answer
+          AND p.Score >= 10
+    ),
+
+    -- 3️⃣ Tag usage aggregation; keep only tags used >100 times
+    TagAgg AS (
+        SELECT
+            t.TagName,
+            COUNT(*)                                       AS TagUseCount,
+            STRING_AGG(DISTINCT CAST(p.OwnerUserId AS VARCHAR), ',') AS OwnerIds
+        FROM Posts p
+        JOIN LATERAL regexp_split_to_table(p.Tags, '><') AS t_raw(tag) ON true
+        JOIN Tags t ON t.TagName = trim(both '<>' FROM t_raw.tag)
+        WHERE p.PostTypeId = 1                         -- Question
+        GROUP BY t.TagName
+        HAVING COUNT(*) > 100
+    ),
+
+    -- 4️⃣ Most recent close reason (if any) for each post
+    RecentCloseReasons AS (
+        SELECT
+            ph.PostId,
+            MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS CloseReasonId,
+            MAX(ph.CreationDate)                                          AS CloseDate
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10
+        GROUP BY ph.PostId
+    )
+
+-- 5️⃣ Final result set combining everything, plus a UNION ALL for global totals
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.UpVotesGiven,
+    us.DownVotesGiven,
+    COALESCE(ta.AnswerScore, 0)                         AS TopAnswerScore,
+    COALESCE(rc.CloseReasonId, '0')::INT                AS LastCloseReasonId,
+    CASE
+        WHEN us.RepRank <= 10   THEN 'Elite'
+        WHEN us.RepRank <= 100  THEN 'Pro'
+        ELSE                         'Member'
+    END                                                AS Tier,
+    STRING_AGG(DISTINCT tg.TagName, ', ') FILTER (WHERE tg.TagUseCount > 500) AS PopularTags
+FROM UserStats us
+LEFT JOIN (SELECT UserId, AnswerScore FROM TopAnswers WHERE rn = 1) ta
+       ON ta.UserId = us.UserId
+LEFT JOIN LATERAL (
+        SELECT rc.CloseReasonId
+        FROM RecentCloseReasons rc
+        WHERE rc.PostId = (
+            SELECT p.Id
+            FROM Posts p
+            WHERE p.OwnerUserId = us.UserId
+              AND p.PostTypeId = 1            -- Question
+            ORDER BY p.CreationDate DESC
+            LIMIT 1
+        )
+        LIMIT 1
+) rc ON TRUE
+LEFT JOIN TagAgg tg
+       ON tg.OwnerIds LIKE CONCAT('%', us.UserId, '%')
+WHERE us.Reputation > 1000
+GROUP BY
+    us.UserId, us.DisplayName, us.Reputation,
+    us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+    us.UpVotesGiven, us.DownVotesGiven,
+    ta.AnswerScore, rc.CloseReasonId, us.RepRank
+HAVING COUNT(tg.TagName) FILTER (WHERE tg.TagName IS NOT NULL) > 0
+ORDER BY us.Reputation DESC
+LIMIT 50
+
+UNION ALL
+
+SELECT
+    NULL                                          AS UserId,
+    'Aggregated Totals'                           AS DisplayName,
+    SUM(us.Reputation)                            AS Reputation,
+    SUM(us.GoldBadges)                            AS GoldBadges,
+    SUM(us.SilverBadges)                          AS SilverBadges,
+    SUM(us.BronzeBadges)                          AS BronzeBadges,
+    SUM(us.UpVotesGiven)                          AS UpVotesGiven,
+    SUM(us.DownVotesGiven)                        AS DownVotesGiven,
+    MAX(ta.AnswerScore)                           AS TopAnswerScore,
+    NULL                                          AS LastCloseReasonId,
+    NULL                                          AS Tier,
+    NULL                                          AS PopularTags
+FROM UserStats us
+LEFT JOIN TopAnswers ta ON ta.UserId = us.UserId
+WHERE us.Reputation > 1000;

@@ -1,0 +1,97 @@
+-- {"query": "5393.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 781} 
+WITH
+RecentPopularQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC, p.Score DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.ClosedDate IS NULL
+),
+TagActivity AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagCount,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.ViewCount) AS PeakViews
+  FROM Posts p
+  CROSS APPLY (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+  ) AS t
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+TopBadgeCorrelated AS (
+  SELECT
+    b.Name AS BadgeName,
+    COUNT(*) AS BadgeCount,
+    AVG(u.Reputation) AS AvgUserRep
+  FROM Badges b
+  JOIN Users u ON b.UserId = u.Id
+  WHERE b.Date >= date_trunc('month', CURRENT_DATE) -- badges earned this month
+  GROUP BY b.Name
+),
+CrossPostLinks AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkTypeName,
+    p1.Title AS PostTitle,
+    p2.Title AS RelatedTitle
+  FROM PostLinks pl
+  JOIN Posts p1 ON pl.PostId = p1.Id
+  JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE lt.Name IN ('Linked', 'Duplicate')
+),
+ActiveVotes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    COUNT(*) AS VoteCount
+  FROM Votes v
+  WHERE v.CreationDate >= date_trunc('month', CURRENT_DATE)
+  GROUP BY v.PostId, v.VoteTypeId
+),
+ScoreDelta AS (
+  SELECT
+    p.Id AS PostId,
+    p.Score,
+    p.ViewCount,
+    (p.Score * 1.0 + p.ViewCount * 0.001) AS CompositeScore
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+)
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.Tags,
+  rp.CreationDate AS PostCreationDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.OwnerName,
+  COALESCE(tb.BadgeCount, 0) AS BadgesEarnedThisMonth,
+  COALESCE(tb.AvgUserRep, 0) AS AvgBadgeUserRep,
+  ca.PostId AS CommentPostId, ca.CommentCount,
+  ca_Last.Comment AS LastCommentText,
+  s.ScoreDelta
+FROM RecentPopularQuestions rp
+LEFT JOIN TopBadgeCorrelated tb ON 1 = 1
+LEFT JOIN Comments ca ON ca.PostId = rp.PostId
+LEFT JOIN (
+  SELECT PostId, MAX(CreationDate) AS LastCommentDate
+  FROM Comments
+  GROUP BY PostId
+) ca_ld ON ca_ld.PostId = rp.PostId
+LEFT JOIN Comments ca_Last ON ca_Last.PostId = rp.PostId AND ca_Last.CreationDate = ca_ld.LastCommentDate
+LEFT JOIN ScoreDelta s ON s.PostId = rp.PostId
+ORDER BY rp.ViewCount DESC, rp.Score DESC
+LIMIT 100;

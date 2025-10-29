@@ -1,0 +1,105 @@
+-- {"query": "5534.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 789} 
+WITH ranked_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    p.PostTypeId,
+    p.ParentId,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    COALESCE(u.Reputation, 0) AS OwnerReputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.CreationDate AS OwnerCreationDate,
+    u.LastAccessDate AS OwnerLastAccessDate,
+    -- Window function: rank posts within each day by score then views
+    ROW_NUMBER() OVER (
+      PARTITION BY DATE(p.CreationDate)
+      ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST
+    ) AS daily_rank
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.Tags IS NOT NULL
+),
+correlated_tags AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerUserId,
+    rp.Tags,
+    rp.OwnerDisplayName,
+    rp.OwnerReputation,
+    rp.Daily_rank,
+    -- number of related questions via PostLinks (Linked or Duplicate)
+    COALESCE(pl.CountRelated, 0) AS RelatedCount
+  FROM ranked_posts rp
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CountRelated
+    FROM PostLinks
+    WHERE RelatedPostId IS NOT NULL
+    GROUP BY PostId
+  ) pl ON pl.PostId = rp.PostId
+),
+extended AS (
+  SELECT
+    ct.PostId,
+    ct.Title,
+    ct.CreationDate,
+    ct.Score,
+    ct.ViewCount,
+    ct.OwnerUserId,
+    ct.OwnerDisplayName,
+    ct.OwnerReputation,
+    ct.Tags,
+    ct.Daily_rank,
+    ct.RelatedCount,
+    -- computed fields: activity delta and tag-derived metrics
+    EXTRACT(EPOCH FROM (NOW() - ct.CreationDate)) / 3600 AS hours_since_creation,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = ct.PostId AND v.BountyAmount IS NOT NULL) AS avg_bounty,
+    CASE
+      WHEN ct.Tags ~ '\\b(community|sql|performance|index)\\b' THEN 1
+      ELSE 0
+    END AS is_tag_related_pop,
+    -- null-safe string manipulation: count of tags in the string
+    (LENGTH(ct.Tags) - LENGTH(REPLACE(ct.Tags, '><', ''))) / 3 AS tag_count_derived
+  FROM correlated_tags ct
+)
+SELECT
+  e.PostId,
+  e.Title,
+  e.OwnerDisplayName,
+  e.OwnerReputation,
+  e.OwnerCreationDate,
+  e.OwnerLastAccessDate,
+  e.CreationDate,
+  e.ViewCount,
+  e.Score,
+  e.RelatedCount,
+  e.daily_rank,
+  e.hours_since_creation,
+  e.avg_bounty,
+  e.is_tag_related_pop,
+  e.tag_count_derived,
+  -- example nested subquery with a correlated reference
+  (SELECT COUNT(*) FROM Comments c
+   WHERE c.PostId = e.PostId
+     AND c.Score > 0) AS positive_comment_count,
+  -- set operation example: union with a synthetic top-N of similar posts
+  NULL AS extra_placeholder
+FROM extended e
+ORDER BY
+  e.daily_rank ASC,
+  e.Score DESC NULLS LAST,
+  e.ViewCount DESC NULLS LAST
+LIMIT 100;

@@ -1,0 +1,189 @@
+-- {"query": "4725.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1814} 
+
+WITH
+  QuestionStats AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount AS QuestionViewCount,
+      COUNT(DISTINCT c.Id) AS CommentCountOnQuestion,
+      CASE
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+        ELSE 0
+      END AS HasAcceptedAnswer,
+      AVG(a.Score) AS AverageAnswerScore,
+      MAX(a.Score) AS MaxAnswerScore,
+      COUNT(DISTINCT CASE WHEN a.OwnerUserId = p.OwnerUserId THEN a.Id END) AS AnswersByQuestionOwner,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS QuestionNumberForUser
+    FROM
+      Posts AS p
+    LEFT JOIN
+      Posts AS a
+      ON p.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN
+      Comments AS c
+      ON p.Id = c.PostId AND c.PostTypeId = 1
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount,
+      p.AcceptedAnswerId
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.Views AS UserViews,
+      u.UpVotes AS UserUpVotes,
+      u.DownVotes AS UserDownVotes,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceived,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceived,
+      MAX(qs.QuestionNumberForUser) AS MaxQuestionNumberForUser,
+      SUM(qs.AnswerCount) AS TotalAnswersGiven,
+      SUM(qs.QuestionScore) AS TotalQuestionScore,
+      AVG(qs.AverageAnswerScore) AS AvgAnswerScoreOnUserQuestions
+    FROM
+      Users AS u
+    LEFT JOIN
+      Badges AS b
+      ON u.Id = b.UserId
+    LEFT JOIN
+      PostHistory AS ph
+      ON u.Id = ph.UserId
+    LEFT JOIN
+      Votes AS v
+      ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN
+      QuestionStats AS qs
+      ON u.Id = qs.OwnerUserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes
+  )
+SELECT
+  qs.QuestionId,
+  qs.Title AS QuestionTitle,
+  qs.QuestionCreationDate,
+  qs.QuestionScore,
+  qs.QuestionViewCount,
+  qs.FavoriteCount AS QuestionFavoriteCount,
+  qs.CommentCountOnQuestion,
+  qs.HasAcceptedAnswer,
+  qs.AverageAnswerScore,
+  qs.MaxAnswerScore,
+  qs.AnswersByQuestionOwner,
+  ua.UserId,
+  ua.DisplayName AS OwnerDisplayName,
+  ua.Reputation AS OwnerReputation,
+  ua.UserCreationDate AS OwnerCreationDate,
+  ua.BadgeCount AS OwnerBadgeCount,
+  ua.PostHistoryCount AS OwnerPostHistoryCount,
+  ua.TotalUpvotesReceived AS OwnerTotalUpvotesReceived,
+  ua.TotalDownvotesReceived AS OwnerTotalDownvotesReceived,
+  ua.TotalAnswersGiven AS OwnerTotalAnswersGiven,
+  ua.TotalQuestionScore AS OwnerTotalQuestionScore,
+  ua.AvgAnswerScoreOnUserQuestions AS OwnerAvgAnswerScoreOnUserQuestions,
+  COALESCE(ua.DisplayName, 'Unknown User') AS DisplayNameOrDefault,
+  CASE
+    WHEN ua.Reputation > 100000 THEN 'Legendary'
+    WHEN ua.Reputation > 50000 THEN 'Expert'
+    WHEN ua.Reputation > 10000 THEN 'Experienced'
+    WHEN ua.Reputation > 1000 THEN 'Intermediate'
+    ELSE 'Novice'
+  END AS ReputationTier,
+  CASE
+    WHEN qs.QuestionScore > 0 AND qs.AnswerCount > 0 THEN CAST(qs.QuestionScore AS REAL) / qs.AnswerCount
+    ELSE NULL
+  END AS ScorePerAnswerRatio,
+  SUBSTRING(qs.Title, 1, 50) AS First50CharsOfTitle,
+  CASE
+    WHEN DATEDIFF(day, qs.QuestionCreationDate, GETDATE()) > 365 THEN 'Old'
+    WHEN DATEDIFF(day, qs.QuestionCreationDate, GETDATE()) > 30 THEN 'Medium'
+    ELSE 'New'
+  END AS QuestionAgeGroup,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      PostLinks AS pl
+    WHERE
+      pl.PostId = qs.QuestionId AND pl.LinkTypeId = 3
+  ) AS DuplicateLinkCount,
+  CASE
+    WHEN qs.QuestionFavoriteCount IS NULL THEN 0
+    ELSE qs.QuestionFavoriteCount
+  END AS NonNullFavoriteCount,
+  qs.QuestionNumberForUser
+FROM
+  QuestionStats AS qs
+LEFT OUTER JOIN
+  UserActivity AS ua
+  ON qs.OwnerUserId = ua.UserId
+WHERE
+  qs.QuestionScore > 10
+  AND ua.Reputation > 500
+  AND qs.QuestionCreationDate < DATEADD(year, -1, GETDATE())
+  OR qs.QuestionId % 10 = 0
+UNION
+SELECT
+  NULL AS QuestionId,
+  NULL AS QuestionTitle,
+  NULL AS QuestionCreationDate,
+  NULL AS QuestionScore,
+  NULL AS QuestionViewCount,
+  NULL AS QuestionFavoriteCount,
+  NULL AS CommentCountOnQuestion,
+  NULL AS HasAcceptedAnswer,
+  NULL AS AverageAnswerScore,
+  NULL AS MaxAnswerScore,
+  NULL AS AnswersByQuestionOwner,
+  ua.UserId,
+  ua.DisplayName AS OwnerDisplayName,
+  ua.Reputation AS OwnerReputation,
+  ua.UserCreationDate AS OwnerCreationDate,
+  ua.BadgeCount AS OwnerBadgeCount,
+  ua.PostHistoryCount AS OwnerPostHistoryCount,
+  ua.TotalUpvotesReceived AS OwnerTotalUpvotesReceived,
+  ua.TotalDownvotesReceived AS OwnerTotalDownvotesReceived,
+  ua.TotalAnswersGiven AS OwnerTotalAnswersGiven,
+  ua.TotalQuestionScore AS OwnerTotalQuestionScore,
+  ua.AvgAnswerScoreOnUserQuestions AS OwnerAvgAnswerScoreOnUserQuestions,
+  COALESCE(ua.DisplayName, 'Unknown User') AS DisplayNameOrDefault,
+  CASE
+    WHEN ua.Reputation > 100000 THEN 'Legendary'
+    WHEN ua.Reputation > 50000 THEN 'Expert'
+    WHEN ua.Reputation > 10000 THEN 'Experienced'
+    WHEN ua.Reputation > 1000 THEN 'Intermediate'
+    ELSE 'Novice'
+  END AS ReputationTier,
+  NULL AS ScorePerAnswerRatio,
+  NULL AS First50CharsOfTitle,
+  NULL AS QuestionAgeGroup,
+  NULL AS DuplicateLinkCount,
+  0 AS NonNullFavoriteCount,
+  ua.MaxQuestionNumberForUser
+FROM
+  UserActivity AS ua
+WHERE
+  ua.Reputation < 100 AND ua.UserCreationDate > DATEADD(month, -6, GETDATE());

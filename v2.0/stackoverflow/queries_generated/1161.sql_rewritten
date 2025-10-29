@@ -1,0 +1,282 @@
+-- {"query": "1161.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3883} 
+WITH UserActivitySummary AS (
+    -- Aggregates user-specific metrics including post counts, comment counts, average scores, and badge statistics.
+    -- Uses COALESCE and GREATEST for robust last activity tracking across multiple tables.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate AS UserLastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        -- Calculates average positive score for posts owned by the user, ignoring zero/negative scores.
+        AVG(CASE WHEN p.Score > 0 THEN p.Score ELSE NULL END) AS AvgPositivePostScore,
+        -- Determines the latest activity date for the user from various sources.
+        MAX(
+            GREATEST(
+                u.LastAccessDate,
+                COALESCE(p.LastActivityDate, '1900-01-01'::timestamp),
+                COALESCE(c.CreationDate, '1900-01-01'::timestamp),
+                COALESCE(ph.CreationDate, '1900-01-01'::timestamp)
+            )
+        ) AS LastKnownActivity,
+        COUNT(DISTINCT b_gold.Id) AS GoldBadgesCount,
+        COUNT(DISTINCT b_silver_tag.Id) AS SilverTagBadgesCount,
+        u.WebsiteUrl,
+        u.Location,
+        LENGTH(u.AboutMe) AS AboutMeLength
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId -- Actions performed by the user
+    LEFT JOIN Badges b_gold ON u.Id = b_gold.UserId AND b_gold.Class = 1
+    LEFT JOIN Badges b_silver_tag ON u.Id = b_silver_tag.UserId AND b_silver_tag.Class = 2 AND b_silver_tag.TagBased = TRUE
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.WebsiteUrl, u.Location, u.AboutMe
+),
+QuestionDetails AS (
+    -- Gathers detailed information and aggregates for questions and their associated answers and comments.
+    -- Includes counts for linked/duplicate posts using conditional aggregation.
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount AS InitialAnswerCount_FromQuestionTable, -- Pre-calculated count from Posts table
+        COUNT(a.Id) AS ActualAnswerCount, -- Real-time count of answers
+        SUM(a.Score) AS TotalAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        COUNT(DISTINCT ca.Id) AS TotalCommentsOnAnswers,
+        SUM(ca.Score) AS TotalCommentScoreOnAnswers,
+        COALESCE(SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END), 0) AS LinkedPostCount,
+        COALESCE(SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END), 0) AS DuplicatePostCount,
+        q.Tags,
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate)) / (60 * 60 * 24) AS DaysSinceQuestionCreation,
+        q.AcceptedAnswerId
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2 -- Answers to the question
+    LEFT JOIN Comments ca ON a.Id = ca.PostId -- Comments on answers
+    LEFT JOIN PostLinks pl ON q.Id = pl.PostId -- Links where the question is the source
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.Tags, q.AcceptedAnswerId
+),
+PostClosureDetails AS (
+    -- Extracts closure reasons and history for closed posts.
+    -- Uses a regular expression to safely cast the 'Comment' field to an integer for matching `CloseReasonTypes`.
+    SELECT
+        ph.PostId,
+        STRING_AGG(DISTINCT crt.Name, ' | ' ORDER BY crt.Name) AS AllCloseReasons,
+        MAX(ph.CreationDate) AS LastClosureDate,
+        COUNT(ph.Id) AS ClosureEventsCount
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON
+        CASE
+            WHEN ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS SMALLINT)
+            ELSE NULL
+        END = crt.Id
+    WHERE ph.PostHistoryTypeId = 10 -- Post Closed event
+    GROUP BY ph.PostId
+),
+UserEngagementRank AS (
+    -- Ranks users by reputation and last known activity, and assigns deciles for badge richness.
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.TotalQuestions,
+        uas.TotalAnswers,
+        uas.AvgPositivePostScore,
+        RANK() OVER (ORDER BY uas.Reputation DESC, uas.LastKnownActivity DESC) AS UserReputationRank,
+        NTILE(10) OVER (ORDER BY uas.GoldBadgesCount DESC, uas.SilverTagBadgesCount DESC, uas.TotalPosts DESC) AS BadgeRichnessDecile
+    FROM UserActivitySummary uas
+)
+-- Main query combines user and post information, applying complex filtering, calculations, and string manipulations.
+-- The query uses a UNION ALL to combine two distinct sets of questions:
+-- 1. Highly scored, answered questions from top-ranked users.
+-- 2. Low-scored, unanswered questions from moderately active users.
+SELECT
+    uer.UserId,
+    uer.DisplayName,
+    uer.UserReputationRank,
+    uer.BadgeRichnessDecile,
+    uas.Reputation,
+    uas.UserCreationDate,
+    uas.UserLastAccessDate,
+    uas.TotalPosts,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    uas.TotalComments,
+    uas.AvgPositivePostScore,
+    uas.LastKnownActivity,
+    qd.QuestionId,
+    qd.QuestionTitle,
+    qd.QuestionCreationDate,
+    qd.QuestionScore,
+    qd.ViewCount,
+    qd.InitialAnswerCount_FromQuestionTable,
+    qd.ActualAnswerCount,
+    qd.TotalAnswerScore,
+    qd.AvgAnswerScore,
+    qd.TotalCommentsOnAnswers,
+    qd.TotalCommentScoreOnAnswers,
+    qd.LinkedPostCount,
+    qd.DuplicatePostCount,
+    pct.AllCloseReasons,
+    pct.LastClosureDate,
+    pct.ClosureEventsCount,
+    -- String expression: Formats tags, handling cases of empty or missing tags.
+    COALESCE(
+        NULLIF(TRIM(SUBSTRING(qd.Tags FROM 2 FOR LENGTH(qd.Tags) - 2)), ''),
+        'Untagged'
+    ) AS FormattedTags,
+    -- Complicated predicate/expression/calculation: Categorizes question age.
+    CASE
+        WHEN qd.DaysSinceQuestionCreation IS NULL THEN 'N/A'
+        WHEN qd.DaysSinceQuestionCreation > 730 THEN 'Very Old (>2Y)'
+        WHEN qd.DaysSinceQuestionCreation > 365 THEN 'Old (1-2Y)'
+        WHEN qd.DaysSinceQuestionCreation > 180 THEN 'Mature (6M-1Y)'
+        WHEN qd.DaysSinceQuestionCreation > 30 THEN 'Active (1M-6M)'
+        WHEN qd.DaysSinceQuestionCreation > 7 THEN 'Recent (1W-1M)'
+        ELSE 'Fresh (<1W)'
+    END AS QuestionAgeCategory,
+    -- Correlated subquery: Retrieves the maximum bounty amount for a question.
+    (
+        SELECT COALESCE(MAX(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8), 0)
+        FROM Votes v
+        WHERE v.PostId = qd.QuestionId
+    ) AS LatestBountyAmount,
+    -- Correlated subquery: Counts the number of distinct tags associated with a question.
+    (
+        SELECT COUNT(DISTINCT t.Id)
+        FROM Tags t
+        WHERE qd.Tags LIKE '%' || t.TagName || '%' AND t.TagName IS NOT NULL
+    ) AS MatchedTagCount,
+    -- Window function: Calculates the total content score for each user across their questions, answers, and comments.
+    SUM(COALESCE(qd.QuestionScore, 0) + COALESCE(qd.TotalAnswerScore, 0) + COALESCE(qd.TotalCommentScoreOnAnswers, 0))
+        OVER (PARTITION BY uer.UserId) AS UserTotalContentScore,
+    -- Calculation involving dates and NULLIF: Calculates years on platform, returning NULL if zero.
+    NULLIF(EXTRACT(YEAR FROM cast('2024-10-01 12:34:56' as timestamp)) - EXTRACT(YEAR FROM uas.UserCreationDate), 0) AS YearsOnPlatform,
+    -- NULL logic and string expressions: Provides user website and about me length, with defaults.
+    COALESCE(uas.WebsiteUrl, 'Not Provided') AS UserWebsite,
+    COALESCE(uas.AboutMeLength, 0) AS AboutMeTextLength,
+    -- Conditional logic and string matching (case-insensitive) for user location classification.
+    CASE
+        WHEN uas.Location IS NULL THEN 'Location Unknown'
+        WHEN uas.Location ILIKE '%London%' THEN 'Major City: London'
+        WHEN uas.Location ILIKE '%New York%' OR uas.Location ILIKE '%NYC%' THEN 'Major City: New York'
+        WHEN uas.Location ILIKE '%San Francisco%' OR uas.Location ILIKE '%SF Bay Area%' THEN 'Major City: San Francisco'
+        WHEN uas.Location ILIKE '%Mumbai%' THEN 'Major City: Mumbai'
+        WHEN uas.Location ILIKE '%Berlin%' THEN 'Major City: Berlin'
+        ELSE 'Other/Uncategorized Location'
+    END AS UserLocationClassification,
+    'Top Scored Answered Questions' AS QuerySegment
+FROM UserEngagementRank uer
+JOIN UserActivitySummary uas ON uer.UserId = uas.UserId
+JOIN QuestionDetails qd ON uer.UserId = qd.OwnerUserId -- Only users who own questions
+LEFT JOIN PostClosureDetails pct ON qd.QuestionId = pct.PostId
+WHERE
+    uer.UserReputationRank <= 1000 -- Focus on top 1000 users
+    AND qd.QuestionScore >= 50 -- Only highly scored questions
+    AND qd.ActualAnswerCount >= 1 -- Questions with at least one answer
+    AND qd.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 years' -- Questions created in the last 3 years
+    AND NOT EXISTS ( -- Correlated subquery: Excludes questions with answers containing "deleted by moderator" in body
+        SELECT 1 FROM Posts del_a WHERE del_a.ParentId = qd.QuestionId AND del_a.Body ILIKE '%deleted by moderator%'
+    )
+
+UNION ALL
+
+SELECT
+    uer.UserId,
+    uer.DisplayName,
+    uer.UserReputationRank,
+    uer.BadgeRichnessDecile,
+    uas.Reputation,
+    uas.UserCreationDate,
+    uas.UserLastAccessDate,
+    uas.TotalPosts,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    uas.TotalComments,
+    uas.AvgPositivePostScore,
+    uas.LastKnownActivity,
+    qd.QuestionId,
+    qd.QuestionTitle,
+    qd.QuestionCreationDate,
+    qd.QuestionScore,
+    qd.ViewCount,
+    qd.InitialAnswerCount_FromQuestionTable,
+    qd.ActualAnswerCount,
+    qd.TotalAnswerScore,
+    qd.AvgAnswerScore,
+    qd.TotalCommentsOnAnswers,
+    qd.TotalCommentScoreOnAnswers,
+    qd.LinkedPostCount,
+    qd.DuplicatePostCount,
+    pct.AllCloseReasons,
+    pct.LastClosureDate,
+    pct.ClosureEventsCount,
+    COALESCE(
+        NULLIF(TRIM(SUBSTRING(qd.Tags FROM 2 FOR LENGTH(qd.Tags) - 2)), ''),
+        'Untagged'
+    ) AS FormattedTags,
+    CASE
+        WHEN qd.DaysSinceQuestionCreation IS NULL THEN 'N/A'
+        WHEN qd.DaysSinceQuestionCreation > 730 THEN 'Very Old (>2Y)'
+        WHEN qd.DaysSinceQuestionCreation > 365 THEN 'Old (1-2Y)'
+        WHEN qd.DaysSinceQuestionCreation > 180 THEN 'Mature (6M-1Y)'
+        WHEN qd.DaysSinceQuestionCreation > 30 THEN 'Active (1M-6M)'
+        WHEN qd.DaysSinceQuestionCreation > 7 THEN 'Recent (1W-1M)'
+        ELSE 'Fresh (<1W)'
+    END AS QuestionAgeCategory,
+    (
+        SELECT COALESCE(MAX(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8), 0)
+        FROM Votes v
+        WHERE v.PostId = qd.QuestionId
+    ) AS LatestBountyAmount,
+    (
+        SELECT COUNT(DISTINCT t.Id)
+        FROM Tags t
+        WHERE qd.Tags LIKE '%' || t.TagName || '%' AND t.TagName IS NOT NULL
+    ) AS MatchedTagCount,
+    SUM(COALESCE(qd.QuestionScore, 0) + COALESCE(qd.TotalAnswerScore, 0) + COALESCE(qd.TotalCommentScoreOnAnswers, 0))
+        OVER (PARTITION BY uer.UserId) AS UserTotalContentScore,
+    NULLIF(EXTRACT(YEAR FROM cast('2024-10-01 12:34:56' as timestamp)) - EXTRACT(YEAR FROM uas.UserCreationDate), 0) AS YearsOnPlatform,
+    COALESCE(uas.WebsiteUrl, 'Not Provided') AS UserWebsite,
+    COALESCE(uas.AboutMeLength, 0) AS AboutMeTextLength,
+    CASE
+        WHEN uas.Location IS NULL THEN 'Location Unknown'
+        WHEN uas.Location ILIKE '%London%' THEN 'Major City: London'
+        WHEN uas.Location ILIKE '%New York%' OR uas.Location ILIKE '%NYC%' THEN 'Major City: New York'
+        WHEN uas.Location ILIKE '%San Francisco%' OR uas.Location ILIKE '%SF Bay Area%' THEN 'Major City: San Francisco'
+        WHEN uas.Location ILIKE '%Mumbai%' THEN 'Major City: Mumbai'
+        WHEN uas.Location ILIKE '%Berlin%' THEN 'Major City: Berlin'
+        ELSE 'Other/Uncategorized Location'
+    END AS UserLocationClassification,
+    'Unanswered/Low Scored Recent Questions' AS QuerySegment
+FROM UserEngagementRank uer
+JOIN UserActivitySummary uas ON uer.UserId = uas.UserId
+JOIN QuestionDetails qd ON uer.UserId = qd.OwnerUserId
+LEFT JOIN PostClosureDetails pct ON qd.QuestionId = pct.PostId
+WHERE
+    uer.UserReputationRank > 1000 AND uer.UserReputationRank <= 10000 -- Focus on moderately ranked users
+    AND qd.QuestionScore BETWEEN -10 AND 10 -- Questions with low scores
+    AND qd.ActualAnswerCount = 0 -- Unanswered questions
+    AND qd.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' -- Questions created in the last year
+    AND uas.TotalPosts > 5 -- Users with some minimal activity
+    AND uas.LastKnownActivity >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months' -- Users active in the last 6 months
+    AND EXISTS ( -- Correlated subquery: Checks if user has performed an edit action on any post recently
+        SELECT 1
+        FROM PostHistory ph_edit
+        WHERE ph_edit.UserId = uer.UserId AND ph_edit.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, or Tags
+          AND ph_edit.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
+    )
+ORDER BY
+    UserReputationRank ASC,
+    QuestionScore DESC NULLS LAST,
+    QuestionCreationDate DESC
+LIMIT 20000;

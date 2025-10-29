@@ -1,0 +1,102 @@
+WITH
+recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.OwnerDisplayName
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Question
+    AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY)
+),
+tag_cluster AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS tag_count
+  FROM Tags t
+  GROUP BY t.TagName
+),
+complex_agg AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.ViewCount,
+    q.Score,
+    q.AnswerCount,
+    q.CommentCount,
+    q.FavoriteCount,
+    COALESCE(u.DisplayName, q.OwnerDisplayName) AS OwnerName,
+    u.Reputation,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = q.PostId AND v.BountyAmount > 0) AS AvgBounty
+  FROM recent_questions q
+  LEFT JOIN Users u ON q.OwnerUserId = u.Id
+),
+window_calc AS (
+  SELECT
+    ca.PostId,
+    ca.Title,
+    ca.Tags,
+    ca.CreationDate,
+    ca.ViewCount,
+    ca.Score,
+    ca.AnswerCount,
+    ca.CommentCount,
+    ca.FavoriteCount,
+    ca.OwnerName,
+    ca.Reputation,
+    ca.AvgBounty,
+    ROW_NUMBER() OVER (PARTITION BY ca.OwnerName ORDER BY ca.CreationDate DESC) AS rn_owner,
+    DENSE_RANK() OVER (ORDER BY ca.ViewCount DESC, ca.Score DESC) AS view_score_rank
+  FROM complex_agg ca
+),
+filtered AS (
+  SELECT
+    w.PostId,
+    w.Title,
+    w.Tags,
+    w.CreationDate,
+    w.ViewCount,
+    w.Score,
+    w.AnswerCount,
+    w.CommentCount,
+    w.FavoriteCount,
+    w.OwnerName,
+    w.Reputation,
+    w.AvgBounty
+  FROM window_calc w
+  WHERE w.rn_owner = 1
+    AND w.view_score_rank <= 100
+)
+SELECT
+  f.PostId,
+  f.Title,
+  f.Tags,
+  f.CreationDate,
+  f.ViewCount,
+  f.Score,
+  f.AnswerCount,
+  f.CommentCount,
+  f.FavoriteCount,
+  f.OwnerName,
+  f.Reputation,
+  f.AvgBounty,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = f.PostId AND pl.LinkTypeId = 3) AS DuplicateLinks,
+  (
+    SELECT STRING_AGG(tl.TagName, ', ')
+    FROM PostLinks pl2
+    JOIN Tags tl ON tl.TagName = pl2.TagName
+    WHERE pl2.PostId = f.PostId AND pl2.LinkTypeId = 1
+  ) AS LinkedTags
+FROM filtered f
+ORDER BY f.CreationDate DESC
+LIMIT 100;

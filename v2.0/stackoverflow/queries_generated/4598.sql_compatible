@@ -1,0 +1,205 @@
+WITH
+  QuestionStats AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.FavoriteCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.ClosedDate,
+      p.Tags,
+      COUNT(a.Id) AS AnswerCountActual,
+      AVG(a.Score) AS AvgAnswerScore,
+      MAX(a.Score) AS MaxAnswerScore,
+      MIN(a.Score) AS MinAnswerScore,
+      SUM(a.Score) AS TotalAnswerScore,
+      CASE
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+        ELSE 0
+      END AS HasAcceptedAnswer,
+      COALESCE(
+        (
+          SELECT
+            COUNT(*)
+          FROM
+            PostLinks pl
+          WHERE
+            pl.PostId = p.Id
+            AND pl.LinkTypeId = 3
+        ),
+        0
+      ) AS DuplicateLinkCount,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN
+          EXTRACT(EPOCH FROM (p.ClosedDate - p.CreationDate)) / 86400
+        ELSE NULL
+      END AS DaysToClose,
+      ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+      ROW_NUMBER() OVER (ORDER BY p.FavoriteCount DESC, p.LastActivityDate DESC) AS FavoriteRank,
+      SUM(p.ViewCount) OVER (ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningTotalViews,
+      LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PreviousQuestionScore,
+      LEAD(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS NextQuestionScore
+    FROM
+      Posts p
+    LEFT JOIN
+      Posts a
+      ON p.Id = a.ParentId
+    WHERE
+      p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+      AND p.DeletionDate IS NULL
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.FavoriteCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.ClosedDate,
+      p.Tags,
+      p.AcceptedAnswerId,
+      p.DeletionDate,
+      p.LastActivityDate
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.Views AS UserViews,
+      u.UpVotes AS UserUpVotes,
+      u.DownVotes AS UserDownVotes,
+      COUNT(DISTINCT ph.PostId) AS PostHistoryCount,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVoteCount,
+      COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVoteCount,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS BodyEditCount,
+      MAX(ph.CreationDate) AS LastPostHistoryDate
+    FROM
+      Users u
+    LEFT JOIN
+      PostHistory ph
+      ON u.Id = ph.UserId
+    LEFT JOIN
+      Comments c
+      ON u.Id = c.UserId
+    LEFT JOIN
+      Votes v
+      ON u.Id = v.UserId
+    WHERE
+      u.Id IS NOT NULL
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes
+  ),
+  TagEngagement AS (
+    SELECT
+      t.TagName,
+      COUNT(DISTINCT p.Id) AS PostCount,
+      AVG(p.Score) AS AvgPostScore,
+      SUM(p.ViewCount) AS TotalViewCount,
+      SUM(p.FavoriteCount) AS TotalFavoriteCount,
+      COUNT(DISTINCT b.UserId) AS UsersWithBadge,
+      CASE WHEN MAX(CASE WHEN t.IsRequired IS NOT NULL THEN t.IsRequired ELSE 0 END) = 1 THEN 'Required' ELSE 'Optional' END AS TagType
+    FROM
+      Tags t
+    LEFT JOIN
+      Posts p
+      ON POSITION(t.TagName IN COALESCE(REPLACE(REPLACE(p.Tags, '<', ''), '>', ' '), '')) > 0
+      AND p.PostTypeId = 1
+    LEFT JOIN
+      Badges b
+      ON t.TagName = b.Name
+      AND b.Class = 1
+    GROUP BY
+      t.TagName,
+      t.IsRequired
+  )
+SELECT
+  qs.QuestionId,
+  u.DisplayName AS OwnerDisplayName,
+  qs.Title,
+  qs.CreationDate AS QuestionCreationDate,
+  qs.Score AS QuestionScore,
+  qs.ViewCount AS QuestionViewCount,
+  qs.FavoriteCount AS QuestionFavoriteCount,
+  qs.AnswerCountActual AS ActualAnswerCount,
+  qs.AvgAnswerScore,
+  qs.MaxAnswerScore,
+  qs.MinAnswerScore,
+  qs.TotalAnswerScore,
+  qs.HasAcceptedAnswer,
+  qs.DuplicateLinkCount,
+  qs.DaysToClose,
+  qs.ScoreRank,
+  qs.FavoriteRank,
+  qs.RunningTotalViews,
+  qs.PreviousQuestionScore,
+  qs.NextQuestionScore,
+  ua.Reputation AS OwnerReputation,
+  ua.UserCreationDate,
+  ua.PostHistoryCount,
+  ua.CommentCount AS OwnerCommentCount,
+  ua.UpVoteCount AS OwnerUpVoteCount,
+  ua.DownVoteCount AS OwnerDownVoteCount,
+  ua.BodyEditCount AS OwnerBodyEditCount,
+  te.PostCount AS TagPosts,
+  te.AvgPostScore AS TagAvgScore,
+  te.TotalViewCount AS TagTotalViews,
+  te.UsersWithBadge AS TagGoldBadgeUsers,
+  te.TagType,
+  COALESCE(u.Location, 'Unknown Location') AS UserLocation,
+  CASE
+    WHEN qs.ClosedDate IS NOT NULL AND qs.ClosedDate > qs.CreationDate THEN 'Closed'
+    WHEN qs.AnswerCountActual = 0 AND qs.CreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN 'Unanswered Stale'
+    WHEN qs.Score > 100 THEN 'High Score'
+    ELSE 'Standard'
+  END AS QuestionStatusCategory,
+  CASE
+    WHEN ua.UserCreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days' AND ua.Reputation > 10000 THEN 'Experienced User'
+    WHEN ua.UserCreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days' AND ua.Reputation < 1000 THEN 'New User'
+    ELSE 'Regular User'
+  END AS UserExperienceLevel,
+  (qs.Title || ' (Tags: ' || qs.Tags || ')') AS QuestionTitleWithTags,
+  SUBSTRING(qs.Title FROM 1 FOR 50) AS First50CharsOfTitle,
+  CASE
+    WHEN qs.Score < 0 THEN 'Negative Score'
+    WHEN qs.Score BETWEEN 0 AND 10 THEN 'Low Score'
+    WHEN qs.Score BETWEEN 11 AND 100 THEN 'Medium Score'
+    ELSE 'High Score'
+  END AS ScoreBand,
+  ROW_NUMBER() OVER (PARTITION BY qs.OwnerUserId ORDER BY qs.CreationDate DESC) AS OwnerMostRecentQuestionRank
+FROM
+  QuestionStats qs
+LEFT JOIN
+  Users u
+  ON qs.OwnerUserId = u.Id
+LEFT JOIN
+  UserActivity ua
+  ON qs.OwnerUserId = ua.UserId
+LEFT JOIN
+  TagEngagement te
+  ON POSITION(te.TagName IN COALESCE(REPLACE(REPLACE(qs.Tags, '<', ''), '>', ' '), '')) > 0
+WHERE
+  (qs.Score > 0
+  OR qs.AnswerCountActual > 0
+  OR qs.FavoriteCount > 0)
+  AND u.DisplayName IS NOT NULL
+  AND ua.UserId IS NOT NULL
+ORDER BY
+  qs.ScoreRank,
+  qs.FavoriteRank,
+  qs.CreationDate;

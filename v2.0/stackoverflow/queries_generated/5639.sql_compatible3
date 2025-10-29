@@ -1,0 +1,95 @@
+WITH RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.PostTypeId,
+    COALESCE(a.TotalComments, 0) AS CommentCount,
+    COALESCE(v.UpVotes, 0) AS UpVotes,
+    COALESCE(v.DownVotes, 0) AS DownVotes,
+    COALESCE(b.BadgeCount, 0) AS BadgeCount
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS TotalComments
+    FROM Comments
+    GROUP BY PostId
+  ) a ON a.PostId = p.Id
+  LEFT JOIN (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Name IN ('Up Mod','UpMod') THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN vt.Name IN ('Down Mod','DownMod') THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE vt.Name IN ('Up Mod','Down Mod','UpMod','DownMod')
+    GROUP BY v.PostId
+  ) v ON v.PostId = p.Id
+  LEFT JOIN (
+    SELECT OwnerUserId AS badge_owneruserid, COUNT(*) AS BadgeCount
+    FROM Badges
+    GROUP BY OwnerUserId
+  ) b ON b.badge_owneruserid = p.OwnerUserId
+  WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180' DAY)
+), Tagged AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.OwnerUserId,
+    r.CreationDate,
+    r.LastActivityDate,
+    r.CommentCount,
+    r.ViewCount,
+    r.TagList,
+    r.Score,
+    ROW_NUMBER() OVER (PARTITION BY r.OwnerUserId ORDER BY r.Score DESC, r.LastActivityDate DESC) AS rn
+  FROM (
+    SELECT
+      ra.PostId,
+      ra.Title,
+      ra.OwnerUserId,
+      ra.CreationDate,
+      ra.LastActivityDate,
+      ra.CommentCount,
+      ra.ViewCount,
+      ra.Score,
+      STRING_AGG(DISTINCT t.TagName, ',') OVER (PARTITION BY ra.OwnerUserId) AS TagList
+    FROM RecentActivity ra
+    LEFT JOIN (
+      SELECT ra_ref.PostId, TRIM(u.x) AS TagName
+      FROM (SELECT NULL) dummy CROSS JOIN LATERAL (VALUES (1)) v_dummy -- placeholder to allow referencing below
+      -- the unnest of tags per row is done via a lateral below in the main query
+    ) dummy_tags ON dummy_tags.PostId = ra.PostId
+    LEFT JOIN LATERAL (
+      SELECT TRIM(x) AS TagName
+      FROM UNNEST(STRING_TO_ARRAY(ra.Tags, '>_<')) AS u(x)
+    ) t ON true
+  ) r
+)
+SELECT
+  t.PostId,
+  t.Title,
+  t.OwnerUserId AS UserId,
+  u.DisplayName AS OwnerDisplayName,
+  t.CreationDate,
+  t.LastActivityDate,
+  t.CommentCount,
+  t.ViewCount,
+  t.TagList AS Tags,
+  COALESCE(ra_up.UpVotes, t.UpVotes) AS UpVotes,
+  COALESCE(ra_down.DownVotes, t.DownVotes) AS DownVotes,
+  COALESCE(t.BadgeCount, 0) AS BadgeCount,
+  COALESCE(u.Reputation, 0) AS ReputationScore,
+  (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = t.OwnerUserId) AS AvgUserPostScore,
+  (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = t.OwnerUserId AND p2.PostTypeId = 1) AS QuestionCount
+FROM Tagged t
+JOIN Users u ON u.Id = t.OwnerUserId
+LEFT JOIN RecentActivity ra_up ON ra_up.PostId = t.PostId
+LEFT JOIN RecentActivity ra_down ON ra_down.PostId = t.PostId
+WHERE t.rn = 1
+  AND (t.TagList IS NULL OR LENGTH(t.TagList) > 0)
+ORDER BY t.LastActivityDate DESC
+LIMIT 100;

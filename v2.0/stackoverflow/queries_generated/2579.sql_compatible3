@@ -1,0 +1,140 @@
+with RecursiveTagCounts as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id as PostId,
+        p.Score,
+        u.Id as OwnerUserId,
+        u.DisplayName,
+        array_length(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), 1) as TagCount,
+        row_number() over (partition by t.Id order by p.Score desc) as rn
+    from 
+        Tags t
+        left join Posts p on p.PostTypeId = 1 and p.Tags like '%' || '<' || t.TagName || '>' || '%'
+        left join Users u on p.OwnerUserId = u.Id
+    where 
+        coalesce(t.IsModeratorOnly, false) = false
+),
+TopPostsPerTag as (
+    select * from RecursiveTagCounts where rn <= 3
+),
+UserBadgeRanks as (
+    select 
+        b.UserId,
+        b.Name,
+        b.Class,
+        count(*) over (partition by b.UserId, b.Class) as BadgeCount,
+        rank() over (partition by b.UserId order by b.Class) as BadgeRank
+    from Badges b
+),
+UserReputationBands as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        case 
+            when u.Reputation < 100 then 'Novice'
+            when u.Reputation between 100 and 999 then 'Intermediate'
+            when u.Reputation >= 1000 then 'Expert'
+            else 'Unknown'
+        end as ReputationBand,
+        coalesce((select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1), 0) as QuestionCount,
+        coalesce((select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2), 0) as AnswerCount,
+        coalesce((select count(*) from Comments c where c.UserId = u.Id), 0) as CommentCount
+    from Users u
+),
+RecentPostActivity as (
+    select 
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryDate,
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        row_number() over (partition by p.Id order by ph.CreationDate desc) as rn
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on cast(crt.Id as varchar) = cast(ph.Comment as varchar)
+),
+FilteredPostActivity as (
+    select * from RecentPostActivity where rn = 1
+),
+UserVoteSummary as (
+    select 
+        v.UserId,
+        vt.Name as VoteType,
+        count(*) as VoteCount,
+        sum(coalesce(v.BountyAmount, 0)) as TotalBounty
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    where v.UserId is not null
+    group by v.UserId, vt.Name
+),
+AcceptedAnswerRates as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(a.Id) filter (where q.AcceptedAnswerId = a.Id) as AcceptedAnswers,
+        count(a.Id) as TotalAnswers,
+        case when count(a.Id) = 0 then 0 else round(100.0 * count(q.AcceptedAnswerId) filter (where q.AcceptedAnswerId = a.Id)/count(a.Id),2) end as AcceptanceRate
+    from Users u
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join Posts q on q.AcceptedAnswerId = a.Id
+    group by u.Id, u.DisplayName
+)
+select 
+    t.TagName,
+    t.Count as TotalTagCount,
+    array_agg(distinct (p.Title || ' (Score: ' || coalesce(cast(p.Score as varchar), '0') || ')') order by p.Score desc) as TopQuestions,
+    u.DisplayName as TopUserForTag,
+    ub.Class as BadgeClass,
+    ub.BadgeCount,
+    ur.ReputationBand,
+    ur.QuestionCount,
+    ur.AnswerCount,
+    ur.CommentCount,
+    uv.VoteType,
+    uv.VoteCount,
+    uv.TotalBounty,
+    a.AcceptanceRate,
+    fpa.CloseReasonName,
+    length(coalesce(t.TagName, '')) as TagNameLength,
+    case when t.IsModeratorOnly then 'Moderator Only' else 'Public' end as TagVisibility
+from Tags t
+left join TopPostsPerTag p on p.TagName = t.TagName
+left join Users u on u.Id = p.OwnerUserId
+left join UserBadgeRanks ub on ub.UserId = u.Id and ub.BadgeRank = 1
+left join UserReputationBands ur on ur.Id = u.Id
+left join UserVoteSummary uv on uv.UserId = u.Id
+left join AcceptedAnswerRates a on a.UserId = u.Id
+left join FilteredPostActivity fpa on fpa.PostId = p.PostId
+where t.Count > (select avg(Count) from Tags)
+group by 
+    t.TagName, t.Count, u.DisplayName, ub.Class, ub.BadgeCount, ur.ReputationBand, ur.QuestionCount, ur.AnswerCount, ur.CommentCount,
+    uv.VoteType, uv.VoteCount, uv.TotalBounty, a.AcceptanceRate, fpa.CloseReasonName, t.IsModeratorOnly
+having bool_or(p.Score > 5) or bool_or(p.Score is null)
+union
+select 
+    'Summary' as TagName,
+    count(*) as TotalTagCount,
+    cast(null as text[]) as TopQuestions,
+    cast(null as varchar) as TopUserForTag,
+    cast(null as varchar) as BadgeClass,
+    cast(null as integer) as BadgeCount,
+    cast(null as varchar) as ReputationBand,
+    cast(null as integer) as QuestionCount,
+    cast(null as integer) as AnswerCount,
+    cast(null as integer) as CommentCount,
+    cast(null as varchar) as VoteType,
+    cast(null as integer) as VoteCount,
+    cast(null as numeric) as TotalBounty,
+    cast(null as numeric) as AcceptanceRate,
+    cast(null as varchar) as CloseReasonName,
+    cast(null as integer) as TagNameLength,
+    cast(null as varchar) as TagVisibility
+from Tags
+order by TagName nulls last, TotalTagCount desc;

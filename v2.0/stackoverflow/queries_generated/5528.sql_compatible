@@ -1,0 +1,77 @@
+WITH TopQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.AccountId,
+    ROW_NUMBER() OVER (
+      PARTITION BY DATE(p.CreationDate)
+      ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate ASC
+    ) AS DayRank
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+    AND p.Tags IS NOT NULL
+),
+TagAggregates AS (
+  SELECT
+    tg.TagName,
+    COUNT(*) AS QuestionCount,
+    AVG(t.count) AS AvgTagUsage
+  FROM Tags t,
+       LATERAL (
+         SELECT unnest(string_to_array(substr(t.TagName, 2, length(t.TagName)-2), '><')) AS TagName
+       ) tg
+  GROUP BY tg.TagName
+),
+CommentStats AS (
+  SELECT
+    p.Id AS PostId,
+    COUNT(c.Id) AS CommentCount
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  GROUP BY p.Id
+),
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    MAX(v.CreationDate) AS LastVoteDate
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2,3,16)
+  GROUP BY p.Id
+)
+SELECT
+  tq.PostId,
+  tq.Title,
+  tq.Tags,
+  tq.CreationDate,
+  tq.Score,
+  tq.ViewCount,
+  tq.OwnerDisplayName,
+  tq.Reputation,
+  tc.CommentCount,
+  ra.LastVoteDate,
+  ta.QuestionCount,
+  ta.AvgTagUsage,
+  (CASE WHEN tq.Score > 100 THEN 'Hot' ELSE 'Normal' END) AS Bucketing,
+  (CASE WHEN tq.ViewCount > 10000 THEN TRUE ELSE FALSE END) AS HighView
+FROM TopQuestions tq
+LEFT JOIN CommentStats tc ON tc.PostId = tq.PostId
+LEFT JOIN RecentActivity ra ON ra.PostId = tq.PostId
+LEFT JOIN TagAggregates ta ON ta.TagName = ANY (regexp_split_to_array(tq.Tags, '<|>'))
+WHERE
+  tq.DayRank <= 5
+ORDER BY tq.CreationDate DESC
+LIMIT 200;

@@ -1,0 +1,202 @@
+WITH UserEngagementStats AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(u.DisplayName, 'Anonymous') AS UserDisplayName,
+        u.Reputation,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        u.Views AS UserProfileViews,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / (60 * 60 * 24) AS UserAgeDays,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate)) / (60 * 60 * 24) AS DaysSinceLastAccess,
+        COUNT(DISTINCT p_q.Id) AS QuestionsAsked,
+        COUNT(DISTINCT p_a.Id) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        SUM(COALESCE(p_q.Score, 0) + COALESCE(p_a.Score, 0)) AS TotalPostScoreReceived,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        CASE
+            WHEN u.Location IS NOT NULL AND LENGTH(TRIM(u.Location)) > 0 THEN 'Located'
+            ELSE 'Location Undefined'
+        END AS HasLocationInfo,
+        AVG(CASE WHEN p_a.AcceptedAnswerId IS NOT NULL THEN 1.0 ELSE 0.0 END) AS AvgAcceptedAnswerRate
+    FROM Users u
+    LEFT JOIN Posts p_q ON u.Id = p_q.OwnerUserId AND p_q.PostTypeId = 1
+    LEFT JOIN Posts p_a ON u.Id = p_a.OwnerUserId AND p_a.PostTypeId = 2
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.Views, u.CreationDate, u.LastAccessDate, u.Location
+),
+PostActivityMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        COALESCE(p.OwnerUserId, -1) AS OwnerUserId,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / (60 * 60 * 24) AS PostAgeDays,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.LastActivityDate)) / (60 * 60 * 24) AS DaysSincePostActivity,
+        LENGTH(p.Body) AS BodyLength,
+        COUNT(ph.Id) AS EditCount,
+        SUM(CASE WHEN vt.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN vt.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        SUM(CASE WHEN vt.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoritesCountActual,
+        COALESCE(p.FavoriteCount, 0) AS FavoritesCountCached,
+        CASE
+            WHEN p.Title IS NOT NULL AND POSITION('sql' IN LOWER(p.Title)) > 0 THEN 'SQL_Related'
+            WHEN p.Tags IS NOT NULL AND POSITION('<sql>' IN LOWER(p.Tags)) > 0 THEN 'SQL_Related'
+            ELSE 'Non_SQL_Related'
+        END AS IsSQLRelated,
+        CASE
+            WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL THEN SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags) - 2))
+            ELSE NULL
+        END AS RawTags,
+        (p.ClosedDate IS NOT NULL) AS IsClosed,
+        MAX(CASE WHEN ph_close.PostHistoryTypeId = 10 THEN 'Closed'
+                 WHEN ph_reopen.PostHistoryTypeId = 11 THEN 'Reopened'
+                 ELSE 'N/A' END) AS CloseReopenStatusIndicator,
+        'Regular' AS PostSegment
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN Votes vt ON p.Id = vt.PostId AND vt.VoteTypeId IN (2, 3, 5)
+    LEFT JOIN PostHistory ph_close ON p.Id = ph_close.PostId AND ph_close.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory ph_reopen ON p.Id = ph_reopen.PostId AND ph_reopen.PostHistoryTypeId = 11
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate, p.LastActivityDate, p.Body, p.Title, p.Tags, p.ClosedDate
+
+    UNION ALL
+
+    SELECT
+        p_wiki.Id AS PostId,
+        p_wiki.PostTypeId,
+        COALESCE(p_wiki.OwnerUserId, -1) AS OwnerUserId,
+        p_wiki.Score AS PostScore,
+        p_wiki.ViewCount,
+        p_wiki.CreationDate AS PostCreationDate,
+        p_wiki.LastActivityDate,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p_wiki.CreationDate)) / (60 * 60 * 24) AS PostAgeDays,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p_wiki.LastActivityDate)) / (60 * 60 * 24) AS DaysSincePostActivity,
+        LENGTH(p_wiki.Body) AS BodyLength,
+        COUNT(ph_wiki.Id) AS EditCount,
+        SUM(CASE WHEN vt_wiki.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN vt_wiki.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        0 AS FavoritesCountActual,
+        COALESCE(p_wiki.FavoriteCount, 0) AS FavoritesCountCached,
+        'Wiki_Content' AS IsSQLRelated,
+        p_wiki.Tags AS RawTags,
+        (p_wiki.ClosedDate IS NOT NULL) AS IsClosed,
+        'N/A' AS CloseReopenStatusIndicator,
+        'Wiki' AS PostSegment
+    FROM Posts p_wiki
+    LEFT JOIN PostHistory ph_wiki ON p_wiki.Id = ph_wiki.PostId AND ph_wiki.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN Votes vt_wiki ON p_wiki.Id = vt_wiki.PostId AND vt_wiki.VoteTypeId IN (2, 3)
+    WHERE p_wiki.PostTypeId IN (3, 4, 5)
+    GROUP BY p_wiki.Id, p_wiki.PostTypeId, p_wiki.OwnerUserId, p_wiki.Score, p_wiki.ViewCount, p_wiki.CreationDate, p_wiki.LastActivityDate, p_wiki.Body, p_wiki.Title, p_wiki.Tags, p_wiki.ClosedDate
+),
+DetailedBadgeInfo AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(CASE WHEN b.TagBased = TRUE THEN 1 END) AS TagBasedBadges,
+        COUNT(DISTINCT b.Name) AS UniqueBadgeTypes
+    FROM Badges b
+    GROUP BY b.UserId
+),
+CorrelatedPostClosureInfo AS (
+    SELECT
+        p.Id AS PostId,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS FirstCloseDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LastReopenDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 12 THEN ph.CreationDate END) AS DeletionDate,
+        COUNT(DISTINCT ph.UserId) AS UniqueModeratorActionsUsers,
+        CASE
+            WHEN EXISTS (SELECT 1 FROM PostHistory ph_dup WHERE ph_dup.PostId = p.Id AND ph_dup.PostHistoryTypeId = 10 AND ph_dup.Comment = '101') THEN 'Duplicate_Closed'
+            WHEN EXISTS (SELECT 1 FROM PostHistory ph_ot WHERE ph_ot.PostId = p.Id AND ph_ot.PostHistoryTypeId = 10 AND ph_ot.Comment = '102') THEN 'OffTopic_Closed'
+            WHEN EXISTS (SELECT 1 FROM PostHistory ph_hist_gen WHERE ph_hist_gen.PostId = p.Id AND ph_hist_gen.PostHistoryTypeId = 10 AND ph_hist_gen.Comment IS NOT NULL AND ph_hist_gen.Comment NOT IN ('101', '102')) THEN 'Other_Closure_Type'
+            ELSE 'No_Explicit_Closure_Reason_Logged'
+        END AS PrimaryClosureReasonType
+    FROM Posts p
+    JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12)
+    GROUP BY p.Id
+    HAVING COUNT(DISTINCT ph.Id) >= 1
+)
+SELECT
+    ues.UserId,
+    ues.UserDisplayName,
+    ues.Reputation,
+    ues.QuestionsAsked,
+    ues.AnswersPosted,
+    ues.CommentsMade,
+    ues.TotalPostScoreReceived,
+    dbi.GoldBadges,
+    dbi.SilverBadges,
+    dbi.TagBasedBadges,
+    SUM(pam.ViewCount) AS TotalViewCountOnOwnedPosts,
+    AVG(pam.PostScore) AS AvgScoreOnOwnedPosts,
+    MAX(pam.EditCount) AS MaxEditsOnSinglePost,
+    SUM(CASE WHEN pam.IsSQLRelated = 'SQL_Related' THEN 1 ELSE 0 END) AS SQLRelatedPostsCount,
+    SUM(CASE WHEN pam.PostSegment = 'Wiki' THEN 1 ELSE 0 END) AS WikiContentContributions,
+    COUNT(DISTINCT pl.RelatedPostId) AS PostsLinkedByOthersCount,
+    COUNT(DISTINCT cpi.PostId) FILTER (WHERE cpi.FirstCloseDate IS NOT NULL AND cpi.DeletionDate IS NULL) AS ClosedButNotDeletedPosts,
+    COALESCE(AVG(NULLIF(pam.UpVotesReceived, 0) * 1.0 / NULLIF(pam.DownVotesReceived, 0)), 0.0) AS AvgUpToDownVoteRatio,
+    RANK() OVER (ORDER BY ues.Reputation DESC, ues.QuestionsAsked + ues.AnswersPosted DESC, dbi.GoldBadges DESC) AS OverallUserRank,
+    NTILE(10) OVER (ORDER BY ues.UserAgeDays DESC) AS UserAgeDecile,
+    CASE
+        WHEN ues.DaysSinceLastAccess > 365 THEN 'Inactive'
+        WHEN ues.DaysSinceLastAccess > 90 THEN 'Sporadic'
+        ELSE 'Active'
+    END AS UserActivityStatus,
+    STRING_AGG(DISTINCT SUBSTRING(t.TagName FROM 1 FOR 10), ', ') FILTER (WHERE t.TagName IS NOT NULL) AS TopTagsInOwnedPosts,
+    (SELECT AVG(LENGTH(c2.Text)) FROM Comments c2 WHERE c2.UserId = ues.UserId) AS AvgCommentLengthByThisUser,
+    FIRST_VALUE(cpi.PrimaryClosureReasonType) OVER (PARTITION BY ues.UserId ORDER BY cpi.FirstCloseDate) AS FirstClosureTypeForAnyOwnedPost
+FROM UserEngagementStats ues
+LEFT JOIN DetailedBadgeInfo dbi ON ues.UserId = dbi.UserId
+LEFT JOIN PostActivityMetrics pam ON ues.UserId = pam.OwnerUserId
+LEFT JOIN PostLinks pl ON pl.RelatedPostId IS NOT NULL
+    AND EXISTS (SELECT 1 FROM Posts p_link WHERE p_link.Id = pl.RelatedPostId AND p_link.OwnerUserId = ues.UserId)
+LEFT JOIN CorrelatedPostClosureInfo cpi ON pam.PostId = cpi.PostId
+LEFT JOIN LATERAL (
+    SELECT UNNEST(string_to_array(CASE WHEN pam.RawTags IS NULL THEN '' ELSE pam.RawTags END, '><')) AS TagName
+) AS t ON pam.RawTags IS NOT NULL
+WHERE
+    ues.Reputation > 1000
+    AND ues.QuestionsAsked + ues.AnswersPosted > 10
+    AND ues.DaysSinceLastAccess < 730
+    AND (
+        (pam.PostTypeId = 1 AND pam.ViewCount > 500 AND pam.PostScore > 10 AND pam.PostSegment = 'Regular')
+        OR (pam.PostTypeId = 2 AND pam.PostScore > 5 AND pam.OwnerUserId IS NOT NULL AND pam.PostSegment = 'Regular')
+        OR (pam.PostSegment = 'Wiki' AND pam.BodyLength > 1000 AND pam.EditCount > 2)
+    )
+GROUP BY
+    ues.UserId,
+    ues.UserDisplayName,
+    ues.Reputation,
+    ues.QuestionsAsked,
+    ues.AnswersPosted,
+    ues.CommentsMade,
+    ues.TotalPostScoreReceived,
+    dbi.GoldBadges,
+    dbi.SilverBadges,
+    dbi.TagBasedBadges,
+    ues.UserAgeDays,
+    ues.DaysSinceLastAccess,
+    ues.UserProfileViews,
+    ues.TotalUpVotesGiven,
+    ues.TotalDownVotesGiven,
+    ues.UserActivityStatus,
+    TopTagsInOwnedPosts,
+    AvgCommentLengthByThisUser,
+    OverallUserRank,
+    UserAgeDecile,
+    cpi.PrimaryClosureReasonType,
+    cpi.FirstCloseDate,
+    cpi.DeletionDate
+HAVING
+    COUNT(pam.PostId) > 5
+    AND SUM(CASE WHEN pam.IsClosed AND cpi.DeletionDate IS NULL THEN 1 ELSE 0 END) < COUNT(pam.PostId) * 0.5
+ORDER BY
+    OverallUserRank ASC, TotalViewCountOnOwnedPosts DESC
+LIMIT 100;

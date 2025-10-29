@@ -1,0 +1,304 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Contributor'
+            ELSE 'Member'
+        END AS UserTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        COALESCE(p.ParentId, 0) AS ParentId,
+        CASE 
+            WHEN p.Score >= 100 THEN 'High Score'
+            WHEN p.Score >= 50 THEN 'Medium Score'
+            WHEN p.Score >= 10 THEN 'Low Score'
+            ELSE 'Very Low Score'
+        END AS ScoreCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreDenseRank,
+        NTILE(4) OVER (ORDER BY p.Score DESC) AS ScoreQuartile,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) AS PrevScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.Score DESC) AS NextScore,
+        AVG(p.Score) OVER (ORDER BY p.CreationDate) AS MovingAvgScore,
+        COUNT(*) OVER () AS TotalPosts,
+        (p.Score * p.ViewCount) / NULLIF(p.AnswerCount + 1, 0) AS ScoreViewRatio,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 10 THEN 
+                (LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '>', ''))) / 2
+            ELSE 0 
+        END AS TagCount,
+        EXTRACT(YEAR FROM p.CreationDate) AS CreationYear,
+        EXTRACT(MONTH FROM p.CreationDate) AS CreationMonth,
+        EXTRACT(DAY FROM p.CreationDate) AS CreationDay,
+        p.LastActivityDate
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Only questions and answers
+),
+UserPostStats AS (
+    SELECT 
+        ps.UserId,
+        ps.DisplayName,
+        ps.Reputation,
+        ps.PostCount,
+        ps.CommentCount,
+        ps.BadgeCount,
+        CASE 
+            WHEN ps.PostCount > 100 THEN 'Highly Active'
+            WHEN ps.PostCount > 50 THEN 'Active'
+            WHEN ps.PostCount > 10 THEN 'Moderately Active'
+            ELSE 'Low Activity'
+        END AS ActivityLevel,
+        ROUND(
+            (COALESCE(ps.PostCount, 0) * 1.0 / NULLIF(ps.Reputation, 0)) * 100, 2
+        ) AS PostReputationRatio,
+        ps.ReputationRank,
+        ps.UserTier,
+        ps.LastPostDate,
+        ps.LastCommentDate,
+        ps.Views,
+        ps.UpVotes,
+        ps.DownVotes
+    FROM UserStats ps
+),
+FinalAnalysis AS (
+    SELECT 
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.PostCount,
+        ups.CommentCount,
+        ups.BadgeCount,
+        ups.ActivityLevel,
+        ups.PostReputationRatio,
+        ups.ReputationRank,
+        ups.UserTier,
+        ups.LastPostDate,
+        ups.LastCommentDate,
+        ups.Views,
+        ups.UpVotes,
+        ups.DownVotes,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.CreationDate,
+        pa.PostTypeId,
+        pa.PostType,
+        pa.ScoreCategory,
+        pa.ScoreRank,
+        pa.ScoreDenseRank,
+        pa.ScoreQuartile,
+        pa.PrevScore,
+        pa.NextScore,
+        pa.MovingAvgScore,
+        pa.TotalPosts,
+        pa.ScoreViewRatio,
+        pa.TagCount,
+        pa.CreationYear,
+        pa.CreationMonth,
+        pa.CreationDay,
+        -- Replace non-standard DATEDIFF with standard timestamp difference in days
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - pa.CreationDate)) / 86400 AS INTEGER) AS DaysOld,
+        CAST(EXTRACT(EPOCH FROM (pa.LastActivityDate - pa.CreationDate)) / 86400 AS INTEGER) AS PostLifespanDays,
+        CASE 
+            WHEN pa.Score >= 100 AND pa.ViewCount >= 1000 THEN 'Trending'
+            WHEN pa.Score >= 50 AND pa.ViewCount >= 500 THEN 'Popular'
+            WHEN pa.Score >= 10 AND pa.ViewCount >= 100 THEN 'Noticeable'
+            ELSE 'Standard'
+        END AS PopularityLevel,
+        CASE 
+            WHEN pa.Score >= 10 AND pa.AnswerCount >= 1 THEN 'Answered'
+            WHEN pa.Score < 10 AND pa.CommentCount >= 5 THEN 'Discussed'
+            WHEN pa.Score <= 0 AND pa.ViewCount <= 100 THEN 'Unnoticed'
+            ELSE 'Under Discussion'
+        END AS EngagementLevel,
+        CASE 
+            WHEN pa.Tags IS NOT NULL THEN 
+                split_part(pa.Tags, '><', 1)
+            ELSE 'No Tags'
+        END AS PrimaryTag,
+        CASE 
+            WHEN pa.Tags IS NOT NULL THEN 
+                SUBSTRING(pa.Tags FROM 2 FOR LENGTH(pa.Tags) - 2)
+            ELSE ''
+        END AS AllTags,
+        CASE 
+            WHEN pa.Score >= 100 AND pa.Score <= 500 THEN 'Popular Range'
+            WHEN pa.Score > 500 THEN 'Highly Popular'
+            WHEN pa.Score < 10 THEN 'Low Scoring'
+            ELSE 'Standard Range'
+        END AS ScoreRange,
+        CASE 
+            WHEN ups.PostCount > 0 THEN 
+                (pa.Score * 1.0 / NULLIF(ups.PostCount, 0))
+            ELSE 0
+        END AS AvgScorePerPost,
+        CASE 
+            WHEN ups.CommentCount > 0 THEN 
+                (pa.CommentCount * 1.0 / NULLIF(ups.CommentCount, 0))
+            ELSE 0
+        END AS CommentRatio,
+        CASE 
+            WHEN ups.Views > 0 THEN 
+                (pa.ViewCount * 1.0 / NULLIF(ups.Views, 0))
+            ELSE 0
+        END AS ViewRatio,
+        CASE 
+            WHEN pa.CommentCount > 0 THEN 
+                (pa.Score * 1.0 / NULLIF(pa.CommentCount, 0))
+            ELSE NULL
+        END AS ScoreToCommentRatio,
+        CASE 
+            WHEN pa.AnswerCount > 0 THEN 
+                (pa.Score * 1.0 / NULLIF(pa.AnswerCount, 0))
+            ELSE NULL
+        END AS ScoreToAnswerRatio,
+        CASE 
+            WHEN pa.ViewCount > 0 THEN 
+                (pa.Score * 1.0 / NULLIF(pa.ViewCount, 0))
+            ELSE NULL
+        END AS ScorePerView,
+        CASE 
+            WHEN pa.CreationDate IS NOT NULL AND pa.LastActivityDate IS NOT NULL THEN 
+                CAST(EXTRACT(EPOCH FROM (pa.LastActivityDate - pa.CreationDate)) / 86400 AS INTEGER)
+            ELSE NULL
+        END AS ActivityDurationDays,
+        pa.LastActivityDate
+    FROM UserPostStats ups
+    JOIN PostAnalysis pa ON ups.UserId = pa.OwnerUserId
+    WHERE ups.PostCount > 0 
+)
+SELECT 
+    f.UserId,
+    f.DisplayName,
+    f.Reputation,
+    f.PostCount,
+    f.CommentCount,
+    f.BadgeCount,
+    f.ActivityLevel,
+    f.PostReputationRatio,
+    f.ReputationRank,
+    f.UserTier,
+    f.LastPostDate,
+    f.LastCommentDate,
+    f.Views,
+    f.UpVotes,
+    f.DownVotes,
+    f.PostId,
+    f.Title,
+    f.Score,
+    f.ViewCount,
+    f.AnswerCount,
+    f.CommentCount,
+    f.CreationDate,
+    f.PostTypeId,
+    f.PostType,
+    f.ScoreCategory,
+    f.ScoreRank,
+    f.ScoreDenseRank,
+    f.ScoreQuartile,
+    f.PrevScore,
+    f.NextScore,
+    f.MovingAvgScore,
+    f.TotalPosts,
+    f.ScoreViewRatio,
+    f.TagCount,
+    f.CreationYear,
+    f.CreationMonth,
+    f.CreationDay,
+    f.DaysOld,
+    f.PostLifespanDays,
+    f.PopularityLevel,
+    f.EngagementLevel,
+    f.PrimaryTag,
+    f.AllTags,
+    f.ScoreRange,
+    f.AvgScorePerPost,
+    f.CommentRatio,
+    f.ViewRatio,
+    f.ScoreToCommentRatio,
+    f.ScoreToAnswerRatio,
+    f.ScorePerView,
+    f.ActivityDurationDays,
+    -- Complex calculated columns
+    CASE 
+        WHEN (f.Reputation * COALESCE(f.ScorePerView,0) * COALESCE(f.ScoreViewRatio,0)) > 1000000 THEN 'High Impact'
+        WHEN (f.Reputation * COALESCE(f.ScorePerView,0) * COALESCE(f.ScoreViewRatio,0)) > 500000 THEN 'Medium Impact'
+        WHEN (f.Reputation * COALESCE(f.ScorePerView,0) * COALESCE(f.ScoreViewRatio,0)) > 100000 THEN 'Low Impact'
+        ELSE 'Minimal Impact'
+    END AS ImpactLevel,
+    -- Subquery for determining top posts
+    (SELECT COUNT(*) 
+     FROM FinalAnalysis fa2 
+     WHERE fa2.UserId = f.UserId AND fa2.Score >= f.Score) AS UserPostRank,
+    -- Correlated subquery for reputation tier calculation
+    (SELECT COUNT(*) 
+     FROM UserStats us 
+     WHERE us.Reputation > f.Reputation) AS HigherReputationCount,
+    -- CTE-based calculation
+    (SELECT AVG(Reputation) 
+     FROM UserStats 
+     WHERE UserTier = f.UserTier AND UserId != f.UserId) AS AvgTierReputation,
+    -- Set operator example (UNION ALL) - returns a single text value; adapt to dialects that allow row constructors
+    (SELECT STRING_AGG(Type, ',') FROM (SELECT 'User' AS Type UNION ALL SELECT 'Post' AS Type) t) AS MetaTypes,
+    -- NULL handling in string operations
+    COALESCE(f.PrimaryTag, 'No Tags Available') AS TagInfo,
+    -- Complex expressions
+    CASE 
+        WHEN f.ScoreViewRatio > 1.5 AND f.AvgScorePerPost > 5 THEN 
+            ('Strong performer: ' || f.Title)
+        WHEN f.ScoreViewRatio > 1.0 AND f.AvgScorePerPost > 2 THEN 
+            ('Good performer: ' || f.Title)
+        WHEN f.ScoreViewRatio > 0.5 AND f.AvgScorePerPost > 1 THEN 
+            ('Moderate performer: ' || f.Title)
+        ELSE ('Low performer: ' || f.Title)
+    END AS PerformanceLabel,
+    -- Window function on complex data
+    ROW_NUMBER() OVER (PARTITION BY f.PostType ORDER BY f.Score DESC) AS TypeRank,
+    RANK() OVER (ORDER BY f.Score DESC) AS GlobalScoreRank,
+    DENSE_RANK() OVER (ORDER BY f.Score DESC, f.ViewCount DESC) AS DenseScoreViewRank
+FROM FinalAnalysis f
+WHERE f.Reputation > 1000 AND f.PostCount > 5
+  AND (f.Score > 0 OR f.Score IS NOT NULL)
+  AND f.CreationDate > DATE '2015-01-01'
+ORDER BY f.Reputation DESC, f.Score DESC
+LIMIT 100;

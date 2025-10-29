@@ -1,0 +1,186 @@
+WITH UserEngagementMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COALESCE(U.Views, 0) AS UserProfileViews,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        COALESCE(SUM(CASE WHEN PV.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpvotesReceivedOnPosts,
+        COALESCE(SUM(CASE WHEN PV.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownvotesReceivedOnPosts,
+        CAST(AVG(P.Score) AS NUMERIC(10,2)) AS AvgPostScore,
+        NTILE(5) OVER (ORDER BY U.Reputation DESC) AS ReputationQuintile
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Votes PV ON P.Id = PV.PostId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views
+),
+PostHistoryDetails AS (
+    SELECT
+        PH.PostId,
+        PH.PostHistoryTypeId,
+        PH.CreationDate AS HistoryDate,
+        PH.Comment,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId, PH.PostHistoryTypeId ORDER BY PH.CreationDate DESC) AS rn_latest_per_type_history
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (10, 11, 4, 5, 6)
+),
+PostStatusSummary AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.LastEditDate,
+        MAX(CASE WHEN PHD.PostHistoryTypeId = 10 AND PHD.rn_latest_per_type_history = 1 THEN PHD.HistoryDate END) AS LatestClosedDate,
+        MAX(CASE WHEN PHD.PostHistoryTypeId = 11 AND PHD.rn_latest_per_type_history = 1 THEN PHD.HistoryDate END) AS LatestReopenedDate,
+        (SELECT CR.Name FROM CloseReasonTypes CR WHERE CR.Id = CAST(PHD_LatestClose.Comment AS INTEGER) LIMIT 1) AS LatestCloseReason,
+        COUNT(DISTINCT CASE WHEN PHD.PostHistoryTypeId IN (4, 5, 6) THEN PHD.HistoryDate END) AS TotalEditEvents,
+        MIN(CASE WHEN PHD.PostHistoryTypeId IN (4, 5, 6) THEN PHD.HistoryDate END) AS FirstEditDate,
+        MAX(CASE WHEN PHD.PostHistoryTypeId IN (4, 5, 6) THEN PHD.HistoryDate END) AS LastEditByHistoryDate
+    FROM Posts P
+    LEFT JOIN PostHistoryDetails PHD ON P.Id = PHD.PostId
+    LEFT JOIN PostHistoryDetails PHD_LatestClose ON P.Id = PHD_LatestClose.PostId AND PHD_LatestClose.PostHistoryTypeId = 10 AND PHD_LatestClose.rn_latest_per_type_history = 1
+    GROUP BY P.Id, P.OwnerUserId, P.PostTypeId, P.CreationDate, P.LastActivityDate, P.LastEditDate, PHD_LatestClose.Comment
+),
+UserBadgeSummary AS (
+    SELECT
+        B.UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Badges B
+    GROUP BY B.UserId
+),
+UserAcceptedAnswerRatio AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(DISTINCT P.Id) AS TotalAnswersPosted,
+        COUNT(DISTINCT PA.Id) AS AcceptedAnswersByThisUser,
+        CAST(COUNT(DISTINCT PA.Id) AS NUMERIC) / NULLIF(COUNT(DISTINCT P.Id), 0) AS AcceptedAnswerRatio
+    FROM Posts P
+    LEFT JOIN Posts Q ON P.ParentId = Q.Id
+    LEFT JOIN Posts PA ON Q.AcceptedAnswerId = P.Id AND PA.Id = P.Id
+    WHERE P.PostTypeId = 2
+    GROUP BY P.OwnerUserId
+)
+SELECT
+    UEM.UserId,
+    UEM.DisplayName,
+    UEM.Reputation,
+    UEM.ReputationQuintile,
+    UEM.UserProfileViews,
+    UEM.TotalQuestions,
+    UEM.TotalAnswers,
+    UEM.TotalCommentsMade,
+    UEM.TotalUpvotesGiven,
+    UEM.TotalDownvotesGiven,
+    UEM.TotalUpvotesReceivedOnPosts,
+    UEM.TotalDownvotesReceivedOnPosts,
+    COALESCE(UEM.AvgPostScore, 0) AS AvgPostScore,
+    UBS.GoldBadges,
+    UBS.SilverBadges,
+    UBS.BronzeBadges,
+    UBS.TotalBadges,
+    UBS.TagBasedBadges,
+    UAAR.TotalAnswersPosted,
+    UAAR.AcceptedAnswersByThisUser,
+    COALESCE(UAAR.AcceptedAnswerRatio, 0.0) AS AcceptedAnswerRatio,
+    PSR_Agg.LatestPostActivity,
+    PSR_Agg.LatestPostEdit,
+    PSR_Agg.ClosedQuestionCount,
+    PSR_Agg.ReopenedQuestionCount,
+    PSR_Agg.DuplicateClosedQuestionCount,
+    PSR_Agg.OffTopicClosedQuestionCount,
+    RANK() OVER (ORDER BY UEM.Reputation DESC, UEM.TotalUpvotesReceivedOnPosts DESC) AS UserOverallRank,
+    DENSE_RANK() OVER (PARTITION BY UEM.ReputationQuintile ORDER BY UEM.TotalAnswers DESC, UEM.AcceptedAnswerRatio DESC) AS AnswerRankInQuintile,
+    LAG(UEM.Reputation, 1, 0) OVER (ORDER BY UEM.Reputation ASC) AS ReputationOfPreviousUser,
+    LEAD(UEM.Reputation, 1, 0) OVER (ORDER BY UEM.Reputation ASC) AS ReputationOfNextUser,
+    (SELECT COUNT(DISTINCT PH.PostId)
+     FROM PostHistory PH
+     WHERE PH.UserId = UEM.UserId
+       AND PH.PostHistoryTypeId IN (4, 5, 6)
+       AND PH.CreationDate > UEM.UserCreationDate + INTERVAL '3 months'
+    ) AS PostEditsAfterEarlyPhase,
+    CASE
+        WHEN UEM.TotalQuestions > 0 AND UEM.TotalAnswers > 0 AND UEM.TotalCommentsMade > 10 THEN 'Pro-Active Contributor'
+        WHEN UEM.TotalQuestions > 0 AND UEM.TotalAnswers = 0 THEN 'Primary Questioner'
+        WHEN UEM.TotalAnswers > 0 AND UEM.TotalQuestions = 0 THEN 'Dedicated Answerer'
+        WHEN UEM.TotalCommentsMade > 20 THEN 'Social Commentator'
+        ELSE 'Casual User'
+    END AS UserEngagementCategory,
+    (
+        SELECT STRING_AGG(DISTINCT T.TagName, '; ')
+        FROM Posts P_Tags,
+             LATERAL (
+               SELECT UNNEST(string_to_array(SUBSTRING(P_Tags.Tags FROM 2 FOR CASE WHEN P_Tags.Tags IS NULL THEN 0 ELSE (CHAR_LENGTH(P_Tags.Tags) - 2) END), '><')) AS TagName
+             ) T
+        WHERE P_Tags.OwnerUserId = UEM.UserId AND P_Tags.PostTypeId = 1
+        GROUP BY P_Tags.OwnerUserId
+    ) AS TopQuestionTags,
+    NULLIF(UEM.TotalQuestions + UEM.TotalAnswers + UEM.TotalCommentsMade + UEM.TotalUpvotesGiven + UEM.TotalDownvotesGiven, 0) AS TotalUserInteractions,
+    EXTRACT(EPOCH FROM (UEM.LastAccessDate - UEM.UserCreationDate)) / (60 * 60 * 24 * 30.4375) AS MonthsOnPlatform,
+    CAST(UEM.TotalUpvotesReceivedOnPosts AS NUMERIC) / NULLIF(UEM.TotalDownvotesReceivedOnPosts, 0) AS PostUpvoteDownvoteRatio,
+    COALESCE(PSR_Agg.HasLinkedOrDuplicatePost, FALSE) AS HasRelatedPost,
+    PSR_Agg.LatestCloseReason AS LastQuestionCloseReason,
+    (SELECT CAST(AVG(uem_inner.TotalUpvotesReceivedOnPosts) AS NUMERIC(10,2))
+     FROM UserEngagementMetrics uem_inner
+     WHERE uem_inner.ReputationQuintile = UEM.ReputationQuintile) AS AvgUpvotesInQuintile,
+    (SELECT CAST(AVG(uem_inner.TotalAnswers) AS NUMERIC(10,2))
+     FROM UserEngagementMetrics uem_inner
+     WHERE uem_inner.ReputationQuintile = UEM.ReputationQuintile) AS AvgAnswersInQuintile
+FROM UserEngagementMetrics UEM
+LEFT JOIN UserBadgeSummary UBS ON UEM.UserId = UBS.UserId
+LEFT JOIN UserAcceptedAnswerRatio UAAR ON UEM.UserId = UAAR.UserId
+LEFT JOIN (
+    SELECT
+        PSS.OwnerUserId,
+        MAX(PSS.LastActivityDate) AS LatestPostActivity,
+        MAX(PSS.LastEditDate) AS LatestPostEdit,
+        COUNT(DISTINCT CASE WHEN PSS.LatestClosedDate IS NOT NULL AND PSS.PostTypeId = 1 THEN PSS.PostId END) AS ClosedQuestionCount,
+        COUNT(DISTINCT CASE WHEN PSS.LatestReopenedDate IS NOT NULL AND PSS.PostTypeId = 1 THEN PSS.PostId END) AS ReopenedQuestionCount,
+        COUNT(DISTINCT CASE WHEN PSS.LatestCloseReason = 'Duplicate' AND PSS.PostTypeId = 1 THEN PSS.PostId END) AS DuplicateClosedQuestionCount,
+        COUNT(DISTINCT CASE WHEN PSS.LatestCloseReason LIKE '%Off-topic%' AND PSS.PostTypeId = 1 THEN PSS.PostId END) AS OffTopicClosedQuestionCount,
+        MAX(CASE WHEN PL.LinkTypeId IS NOT NULL THEN 1 ELSE 0 END) = 1 AS HasLinkedOrDuplicatePost,
+        MAX(PSS.LatestCloseReason) FILTER (WHERE PSS.PostTypeId = 1) AS LatestCloseReason
+    FROM PostStatusSummary PSS
+    LEFT JOIN PostLinks PL ON PSS.PostId = PL.PostId
+    GROUP BY PSS.OwnerUserId
+) PSR_Agg ON UEM.UserId = PSR_Agg.OwnerUserId
+WHERE
+    UEM.Reputation >= 500
+    AND UEM.UserCreationDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    AND (
+        (UEM.TotalQuestions > 5 OR UEM.TotalAnswers > 10 OR UEM.TotalCommentsMade > 50)
+        AND (UEM.TotalUpvotesReceivedOnPosts > 50 AND UEM.TotalDownvotesReceivedOnPosts < 20)
+    )
+    AND (
+        (COALESCE(UBS.GoldBadges,0) > 0 OR COALESCE(UBS.SilverBadges,0) > 2)
+        OR (COALESCE(UAAR.AcceptedAnswerRatio,0) > 0.4 AND COALESCE(UAAR.TotalAnswersPosted,0) > 5)
+        OR (UEM.ReputationQuintile = 1 AND UEM.UserProfileViews > 1000)
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostStatusSummary PSS_EXC
+        WHERE PSS_EXC.OwnerUserId = UEM.UserId
+          AND PSS_EXC.PostTypeId = 1
+          AND PSS_EXC.LatestClosedDate IS NOT NULL
+          AND EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - PSS_EXC.LatestClosedDate)) / (60 * 60 * 24 * 7) < 4
+        GROUP BY PSS_EXC.OwnerUserId
+        HAVING COUNT(DISTINCT PSS_EXC.PostId) > 2
+    )
+ORDER BY
+    UserOverallRank ASC,
+    UEM.Reputation DESC,
+    UEM.DisplayName ASC
+LIMIT 5000;

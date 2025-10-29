@@ -1,0 +1,199 @@
+-- {"query": "1608.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3304} 
+WITH UserActivity AS (
+    -- CTE 1: Aggregate user activity metrics and calculate a weighted engagement score.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostsScoreReceived,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostsViewCount,
+        -- Calculate an engagement score based on a weighted sum of activities
+        (CAST(COUNT(DISTINCT p.Id) AS DECIMAL) * 0.4) +
+        (CAST(COUNT(DISTINCT c.Id) AS DECIMAL) * 0.3) +
+        (CAST(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS DECIMAL) * 0.15) +
+        (CAST(SUM(COALESCE(p.FavoriteCount, 0)) AS DECIMAL) * 0.15) AS EngagementScore,
+        MAX(p.LastActivityDate) AS LastPostActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.CreationDate >= '2020-01-01' -- Focus on users created after a certain date
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostDetailsExtended AS (
+    -- CTE 2: Extract detailed post information, including historical data, tag aggregation, and window functions.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS CurrentScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        ph_initial_body.CreationDate AS InitialBodyCreationDate,
+        ph_initial_body.Text AS InitialBodyText,
+        ph_initial_title.Text AS InitialTitleText,
+        STRING_AGG(DISTINCT t.TagName, '><') WITHIN GROUP (ORDER BY t.TagName) AS AggregatedTags, -- Aggregate tags into a single string
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditCount, -- Edits to Title, Body, or Tags
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS TotalCloseVotes, -- Total times closed
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS TotalReopenVotes, -- Total times reopened
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL THEN CAST(ph.Comment AS INT) ELSE NULL END) AS LastCloseReasonTypeId,
+        COALESCE(LENGTH(ph_initial_body.Text), 0) AS InitialPostBodyLength,
+        -- Correlated subquery: count comments made *after* the post's last edit by a different user
+        (SELECT COUNT(DISTINCT cmt.Id)
+         FROM Comments cmt
+         WHERE cmt.PostId = p.Id
+           AND cmt.CreationDate > p.LastEditDate
+           AND cmt.UserId IS DISTINCT FROM p.OwnerUserId -- Different user commented
+        ) AS CommentsAfterOwnerEdit,
+        DATEDIFF(hour, p.CreationDate, p.LastActivityDate) AS HoursSinceCreationToLastActivity,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS ScoreOfPreviousPostByOwner, -- Window function: score of the owner's immediately preceding post
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS MovingAvgScoreForPostType, -- Window function: 5-post moving average score
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankWithinPostTypeByPerformance
+    FROM Posts p
+    LEFT JOIN PostHistory ph_initial_body ON p.Id = ph_initial_body.PostId AND ph_initial_body.PostHistoryTypeId = 2 -- Initial Body
+    LEFT JOIN PostHistory ph_initial_title ON p.Id = ph_initial_title.PostId AND ph_initial_title.PostHistoryTypeId = 1 -- Initial Title
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    -- Complex string join to extract tags from the 'Tags' column
+    LEFT JOIN Tags t ON p.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE p.PostTypeId IN (1, 2) -- Filter for Questions and Answers
+      AND p.CreationDate >= '2020-01-01'
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount,
+        p.FavoriteCount, p.ClosedDate, p.LastEditDate, p.LastActivityDate, ph_initial_body.CreationDate,
+        ph_initial_body.Text, ph_initial_title.Text
+),
+ModerationActions AS (
+    -- CTE 3: Details about post closure and reopening events, including associated close reasons.
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS ActionDate,
+        ph.PostHistoryTypeId,
+        cr.Name AS CloseReasonName,
+        ph.UserId AS ActionUserId,
+        DATEDIFF(minute, LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate), ph.CreationDate) AS MinutesSincePreviousHistoryEvent,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 'Closed'
+                 WHEN ph.PostHistoryTypeId = 11 THEN 'Reopened'
+                 ELSE 'Other' END) OVER (PARTITION BY ph.PostId) AS FinalModerationState
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes cr ON ph.PostHistoryTypeId = 10 AND ph.Comment = CAST(cr.Id AS VARCHAR)
+    WHERE ph.PostHistoryTypeId IN (10, 11) -- Only consider Close and Reopen events
+      AND ph.CreationDate >= '2020-01-01'
+)
+-- Main query: Joins all CTEs and performs final aggregations, conditional logic, and set operations.
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.EngagementScore,
+    ua.QuestionsAsked,
+    COALESCE(pde.PostId, -1) AS AnalyzedPostId, -- Use -1 for users without relevant posts
+    pde.PostTypeId,
+    pde.Title,
+    pde.PostCreationDate,
+    pde.CurrentScore,
+    pde.ViewCount,
+    pde.AggregatedTags,
+    pde.TotalEditCount,
+    pde.TotalCloseVotes,
+    pde.TotalReopenVotes,
+    ma.CloseReasonName AS LastClosureReason,
+    ma.ActionDate AS LastClosureDate,
+    pde.CommentsAfterOwnerEdit,
+    pde.ScoreOfPreviousPostByOwner,
+    pde.MovingAvgScoreForPostType,
+    pde.RankWithinPostTypeByPerformance,
+    NTILE(10) OVER (ORDER BY ua.EngagementScore DESC) AS EngagementDecile, -- Divide users into 10 engagement groups
+    -- Correlated subquery: Average score of questions asked by the same user within 30 days around this post's creation
+    (SELECT AVG(q.Score)
+     FROM Posts q
+     WHERE q.OwnerUserId = ua.UserId
+       AND q.PostTypeId = 1
+       AND q.CreationDate BETWEEN pde.PostCreationDate - INTERVAL '30 day' AND pde.PostCreationDate + INTERVAL '30 day'
+       AND q.Id != pde.PostId
+    ) AS AvgPeerQuestionScoreAroundCreation,
+    CASE
+        WHEN pde.ClosedDate IS NOT NULL AND pde.TotalReopenVotes = 0 THEN 'Closed_Never_Reopened'
+        WHEN pde.ClosedDate IS NOT NULL AND pde.TotalReopenVotes > 0 THEN 'Closed_Then_Reopened'
+        WHEN pde.PostTypeId = 1 AND pde.AnswerCount = 0 AND pde.ViewCount > 500 AND pde.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 day' THEN 'Unanswered_HighlyViewed_Old'
+        WHEN pde.OwnerUserId IS NULL THEN 'Community_Owned_Or_Deleted_User'
+        ELSE 'Active_Or_Answered_Post'
+    END AS PostLifecycleStatus,
+    b.Name AS FirstGoldBadgeName,
+    b.Date AS FirstGoldBadgeDate,
+    'Main Analysis Branch' AS QueryBranchIdentifier
+FROM UserActivity ua
+LEFT JOIN PostDetailsExtended pde ON ua.UserId = pde.OwnerUserId
+LEFT JOIN ModerationActions ma ON pde.PostId = ma.PostId AND ma.PostHistoryTypeId = 10 AND ma.ActionDate = (
+    SELECT MAX(ma_inner.ActionDate) FROM ModerationActions ma_inner
+    WHERE ma_inner.PostId = pde.PostId AND ma_inner.PostHistoryTypeId = 10
+) -- Join on the latest closure event
+LEFT JOIN (SELECT UserId, Name, Date FROM Badges WHERE Class = 1 QUALIFY ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY Date) = 1) b ON ua.UserId = b.UserId -- First Gold Badge
+WHERE
+    (ua.EngagementScore > 100 OR ua.Reputation > 5000) -- Filter for highly engaged or high reputation users
+    AND (pde.PostId IS NULL OR (pde.CurrentScore >= 0 AND pde.ViewCount >= 50 AND pde.InitialPostBodyLength > 100)) -- Include users without posts, or posts meeting specific criteria
+    AND (pde.AggregatedTags IS NULL OR pde.AggregatedTags NOT LIKE '%<sql>%' OR pde.AggregatedTags LIKE '%<postgresql>%') -- Complex tag filtering: either no tags, or not 'sql' OR specifically 'postgresql'
+    AND (ua.DisplayName NOT LIKE '%test%' OR ua.DisplayName IS NULL)
+    AND (pde.LastCloseReasonTypeId NOT IN (103, 104, 105) OR pde.LastCloseReasonTypeId IS NULL) -- Exclude specific common close reasons
+UNION ALL
+-- UNION ALL branch: Focus on posts with significant link activity or very high scores, regardless of owner engagement.
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    NULL AS EngagementScore, -- Not computed for this branch
+    NULL AS QuestionsAsked,
+    p.Id AS AnalyzedPostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS CurrentScore,
+    p.ViewCount,
+    STRING_AGG(DISTINCT t.TagName, '><') WITHIN GROUP (ORDER BY t.TagName) AS AggregatedTags,
+    NULL AS TotalEditCount,
+    NULL AS TotalCloseVotes,
+    NULL AS TotalReopenVotes,
+    NULL AS LastClosureReason,
+    NULL AS LastClosureDate,
+    NULL AS CommentsAfterOwnerEdit,
+    NULL AS ScoreOfPreviousPostByOwner,
+    NULL AS MovingAvgScoreForPostType,
+    NULL AS RankWithinPostTypeByPerformance,
+    NULL AS EngagementDecile,
+    (SELECT AVG(sub_p.Score) FROM Posts sub_p WHERE sub_p.ParentId = p.Id) AS AvgAnswerScoreForQuestion, -- Subquery for avg score of answers to a question
+    CASE
+        WHEN COUNT(DISTINCT pl.RelatedPostId) > 0 THEN 'Has_Linked_Posts'
+        WHEN p.Score > 1000 THEN 'Very_High_Score_Post'
+        ELSE 'Other_Linked_Post_Type'
+    END AS PostLifecycleStatus,
+    NULL AS FirstGoldBadgeName,
+    NULL AS FirstGoldBadgeDate,
+    'Linked Post Analysis Branch' AS QueryBranchIdentifier
+FROM Posts p
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 1 -- Only 'Linked' posts
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Tags t ON p.Tags LIKE '%<' || t.TagName || '>%'
+WHERE
+    p.PostTypeId = 1 -- Only questions for this branch
+    AND p.Score > 500 -- High-scoring questions
+    AND p.CreationDate BETWEEN '2018-01-01' AND '2021-12-31'
+    AND p.AcceptedAnswerId IS NOT NULL -- Must have an accepted answer
+    AND (pl.Id IS NOT NULL OR p.FavoriteCount > 50) -- Either linked OR very popular
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation, p.Id, p.PostTypeId, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AcceptedAnswerId, p.FavoriteCount
+HAVING COUNT(DISTINCT pl.RelatedPostId) > 1 OR p.FavoriteCount > 100 -- At least two linked posts or over 100 favorites
+ORDER BY Reputation DESC, EngagementScore DESC NULLS LAST, CurrentScore DESC, PostCreationDate ASC
+;

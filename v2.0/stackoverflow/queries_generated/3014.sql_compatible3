@@ -1,0 +1,160 @@
+WITH
+UserStats AS (
+    SELECT
+        u.Id                              AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(b.GoldCnt,   0)          AS GoldBadges,
+        COALESCE(b.SilverCnt, 0)          AS SilverBadges,
+        COALESCE(b.BronzeCnt, 0)          AS BronzeBadges,
+        COALESCE(p.QCnt,      0)          AS QuestionCnt,
+        COALESCE(p.ACnt,      0)          AS AnswerCnt,
+        COALESCE(v.UpCnt,    0)           AS UpVoteCnt,
+        COALESCE(v.DownCnt,  0)           AS DownVoteCnt,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC,
+                                    COALESCE(b.GoldCnt,0) DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN (
+        SELECT
+            UserId,
+            SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCnt,
+            SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCnt,
+            SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCnt
+        FROM Badges
+        GROUP BY UserId
+    ) b ON u.Id = b.UserId
+    LEFT JOIN (
+        SELECT
+            OwnerUserId,
+            SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QCnt,
+            SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS ACnt
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) p ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT
+            v.UserId,
+            SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpCnt,
+            SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownCnt
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        GROUP BY v.UserId
+    ) v ON u.Id = v.UserId
+),
+
+TagActivity AS (
+    SELECT
+        t.TagName,
+        us.UserId,
+        us.DisplayName,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS TagQuestionCnt,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS TagAnswerCnt,
+        MAX(p.CreationDate)                     AS LastTagPostDate
+    FROM Posts p
+    JOIN UserStats us ON p.OwnerUserId = us.UserId
+    CROSS JOIN LATERAL (
+        SELECT trim(BOTH '<>' FROM tag) AS TagName
+        FROM (
+            SELECT regexp_substr(p.Tags, '(?<=^|>)[^<>]+(?=$|>)', 1, n) AS tag
+            FROM (
+                SELECT generate_series(1, 100) AS n
+            ) nums
+            WHERE regexp_substr(p.Tags, '(?<=^|>)[^<>]+(?=$|>)', 1, n) IS NOT NULL
+        ) split_tags
+    ) t
+    WHERE p.Tags IS NOT NULL
+    GROUP BY t.TagName, us.UserId, us.DisplayName
+),
+
+RankedTagUsers AS (
+    SELECT
+        TagName,
+        UserId,
+        DisplayName,
+        TagQuestionCnt,
+        TagAnswerCnt,
+        LastTagPostDate,
+        ROW_NUMBER() OVER (PARTITION BY TagName
+                           ORDER BY TagQuestionCnt + TagAnswerCnt DESC) AS TagUserRank
+    FROM TagActivity
+),
+
+UserTopTag AS (
+    SELECT
+        us.UserId,
+        (SELECT rt.TagName
+         FROM RankedTagUsers rt
+         WHERE rt.UserId = us.UserId
+         ORDER BY rt.TagUserRank
+         LIMIT 1)                                    AS TopTag,
+        (SELECT rt.TagQuestionCnt
+         FROM RankedTagUsers rt
+         WHERE rt.UserId = us.UserId AND rt.TagName =
+               (SELECT rt2.TagName
+                FROM RankedTagUsers rt2
+                WHERE rt2.UserId = us.UserId
+                ORDER BY rt2.TagUserRank
+                LIMIT 1))                           AS TopTagQuestions,
+        (SELECT rt.TagAnswerCnt
+         FROM RankedTagUsers rt
+         WHERE rt.UserId = us.UserId AND rt.TagName =
+               (SELECT rt2.TagName
+                FROM RankedTagUsers rt2
+                WHERE rt2.UserId = us.UserId
+                ORDER BY rt2.TagUserRank
+                LIMIT 1))                           AS TopTagAnswers,
+        (SELECT rt.LastTagPostDate
+         FROM RankedTagUsers rt
+         WHERE rt.UserId = us.UserId AND rt.TagName =
+               (SELECT rt2.TagName
+                FROM RankedTagUsers rt2
+                WHERE rt2.UserId = us.UserId
+                ORDER BY rt2.TagUserRank
+                LIMIT 1))                           AS TopTagLastPost
+    FROM UserStats us
+)
+
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionCnt,
+    us.AnswerCnt,
+    us.UpVoteCnt,
+    us.DownVoteCnt,
+    us.RepRank,
+    COALESCE(ut.TopTag, '(none)')                     AS TopTag,
+    COALESCE(ut.TopTagQuestions, 0)                  AS TopTagQuestions,
+    COALESCE(ut.TopTagAnswers,   0)                  AS TopTagAnswers,
+    ut.TopTagLastPost,
+    CASE WHEN us.RepRank <= 10 THEN 'Elite' ELSE 'Regular' END AS UserTier
+FROM UserStats us
+LEFT JOIN UserTopTag ut ON us.UserId = ut.UserId
+WHERE us.Reputation > 1000
+   OR (us.GoldBadges > 0 AND us.UpVoteCnt > 5000)
+UNION ALL
+SELECT
+    NULL                                           AS UserId,
+    'SUMMARY'                                      AS DisplayName,
+    SUM(us.Reputation)                             AS Reputation,
+    SUM(us.GoldBadges)                             AS GoldBadges,
+    SUM(us.SilverBadges)                           AS SilverBadges,
+    SUM(us.BronzeBadges)                           AS BronzeBadges,
+    SUM(us.QuestionCnt)                            AS QuestionCnt,
+    SUM(us.AnswerCnt)                              AS AnswerCnt,
+    SUM(us.UpVoteCnt)                              AS UpVoteCnt,
+    SUM(us.DownVoteCnt)                            AS DownVoteCnt,
+    NULL                                           AS RepRank,
+    NULL                                           AS TopTag,
+    NULL                                           AS TopTagQuestions,
+    NULL                                           AS TopTagAnswers,
+    NULL                                           AS TopTagLastPost,
+    NULL                                           AS UserTier
+FROM UserStats us
+WHERE us.Reputation > 1000
+   OR (us.GoldBadges > 0 AND us.UpVoteCnt > 5000)
+ORDER BY RepRank
+LIMIT 100;

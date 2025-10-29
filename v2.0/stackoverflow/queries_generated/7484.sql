@@ -1,0 +1,279 @@
+-- {"query": "7484.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2608} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        AVG(p.Score) as AvgScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') as AllTags,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as AcceptedQuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) as ClosedQuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.CommunityOwnedDate IS NOT NULL THEN p.Id END) as CommunityOwnedQuestions,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, ' | ') as QuestionTitles,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Body END, ' | ') as AnswerBodies
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, PostCount DESC) as ScoreRank,
+        RANK() OVER (ORDER BY Reputation DESC, TotalScore DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY BadgeCount DESC, TotalScore DESC) as BadgeRank,
+        NTILE(100) OVER (ORDER BY TotalScore) as ScorePercentile,
+        PERCENT_RANK() OVER (ORDER BY TotalScore) as ScorePercentileRank,
+        LAG(Reputation, 1) OVER (ORDER BY TotalScore DESC) as PrevUserReputation,
+        LEAD(Reputation, 1) OVER (ORDER BY TotalScore DESC) as NextUserReputation,
+        AVG(TotalScore) OVER (PARTITION BY SUBSTRING(DisplayName, 1, 1)) as AvgScoreByInitialLetter,
+        STDDEV(TotalScore) OVER (PARTITION BY SUBSTRING(DisplayName, 1, 1)) as StdDevScoreByInitialLetter
+    FROM UserActivityStats
+),
+UserPostDetails AS (
+    SELECT 
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.PostCount,
+        r.CommentCount,
+        r.BadgeCount,
+        r.LastPostDate,
+        r.LastCommentDate,
+        r.QuestionCount,
+        r.AnswerCount,
+        r.TotalScore,
+        r.TotalViews,
+        r.AvgScore,
+        r.AllTags,
+        r.AcceptedQuestionCount,
+        r.ClosedQuestionCount,
+        r.CommunityOwnedQuestions,
+        r.QuestionTitles,
+        r.AnswerBodies,
+        r.ScoreRank,
+        r.ReputationRank,
+        r.BadgeRank,
+        r.ScorePercentile,
+        r.ScorePercentileRank,
+        r.PrevUserReputation,
+        r.NextUserReputation,
+        r.AvgScoreByInitialLetter,
+        r.StdDevScoreByInitialLetter,
+        CASE 
+            WHEN r.ScorePercentile >= 90 THEN 'Top 10%'
+            WHEN r.ScorePercentile >= 75 THEN 'Top 25%'
+            WHEN r.ScorePercentile >= 50 THEN 'Top 50%'
+            WHEN r.ScorePercentile >= 25 THEN 'Top 75%'
+            ELSE 'Bottom 25%'
+        END as PerformanceTier,
+        CASE 
+            WHEN r.QuestionCount = 0 AND r.AnswerCount = 0 THEN 'Inactive'
+            WHEN r.QuestionCount > 0 AND r.AnswerCount = 0 THEN 'Question-Only'
+            WHEN r.QuestionCount = 0 AND r.AnswerCount > 0 THEN 'Answer-Only'
+            ELSE 'Both'
+        END as ActivityType,
+        CASE 
+            WHEN (r.QuestionCount * 1.0 / NULLIF(r.PostCount, 0)) >= 0.7 THEN 'Question-Focused'
+            WHEN (r.AnswerCount * 1.0 / NULLIF(r.PostCount, 0)) >= 0.7 THEN 'Answer-Focused'
+            ELSE 'Balanced'
+        END as FocusType,
+        CASE 
+            WHEN r.TotalScore < 100 THEN 'Beginner'
+            WHEN r.TotalScore BETWEEN 100 AND 999 THEN 'Intermediate'
+            WHEN r.TotalScore BETWEEN 1000 AND 9999 THEN 'Advanced'
+            WHEN r.TotalScore >= 10000 THEN 'Expert'
+            ELSE 'Unknown'
+        END as ExperienceLevel
+    FROM RankedUsers r
+    WHERE r.PostCount > 0 OR r.CommentCount > 0 OR r.BadgeCount > 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderately Popular'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        AVG(t.Count) OVER () as AvgTagCount,
+        MAX(t.Count) OVER () as MaxTagCount,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) as PrevCount,
+        LEAD(t.Count, 1) OVER (ORDER BY t.Count DESC) as NextCount,
+        NTILE(10) OVER (ORDER BY t.Count) as Decile
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND LENGTH(t.TagName) > 0
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.Comment,
+        ph.Text,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15) THEN 'Moderation'
+            WHEN ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9) THEN 'Edit'
+            WHEN ph.PostHistoryTypeId IN (16, 17, 18, 19, 20, 22, 24, 25, 31, 33, 34, 35, 36, 37, 38) THEN 'Special'
+            ELSE 'Other'
+        END as HistoryTypeCategory,
+        DATEDIFF(day, ph.CreationDate, GETDATE()) as DaysSinceEvent,
+        COUNT(*) OVER (PARTITION BY ph.PostId) as HistoryEventsPerPost,
+        DENSE_RANK() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) as EventSequence,
+        RANK() OVER (PARTITION BY ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) as RecentEventsByType
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= DATEADD(year, -1, GETDATE())
+),
+ComplexQueryResults AS (
+    SELECT 
+        up.UserId,
+        up.DisplayName,
+        up.Reputation,
+        up.PostCount,
+        up.CommentCount,
+        up.BadgeCount,
+        up.LastPostDate,
+        up.LastCommentDate,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.TotalScore,
+        up.TotalViews,
+        up.AvgScore,
+        up.AllTags,
+        up.AcceptedQuestionCount,
+        up.ClosedQuestionCount,
+        up.CommunityOwnedQuestions,
+        up.QuestionTitles,
+        up.AnswerBodies,
+        up.ScoreRank,
+        up.ReputationRank,
+        up.BadgeRank,
+        up.ScorePercentile,
+        up.ScorePercentileRank,
+        up.PrevUserReputation,
+        up.NextUserReputation,
+        up.AvgScoreByInitialLetter,
+        up.StdDevScoreByInitialLetter,
+        up.PerformanceTier,
+        up.ActivityType,
+        up.FocusType,
+        up.ExperienceLevel,
+        ta.TagName,
+        ta.Count as TagCount,
+        ta.PopularityLevel,
+        ta.PopularityRank,
+        ta.AvgTagCount,
+        ta.MaxTagCount,
+        ta.Decile,
+        ph.PostId,
+        ph.HistoryTypeCategory,
+        ph.DaysSinceEvent,
+        ph.HistoryEventsPerPost,
+        ph.EventSequence,
+        ph.RecentEventsByType,
+        CASE 
+            WHEN up.PostCount >= 100 AND up.TotalScore >= 10000 THEN 'Elite'
+            WHEN up.PostCount >= 50 AND up.TotalScore >= 5000 THEN 'Veteran'
+            WHEN up.PostCount >= 10 AND up.TotalScore >= 500 THEN 'Active'
+            WHEN up.PostCount >= 1 THEN 'Regular'
+            ELSE 'New'
+        END as EngagementLevel
+    FROM UserPostDetails up
+    LEFT JOIN TagAnalysis ta ON ta.TagName IN (SELECT value FROM STRING_SPLIT(up.AllTags, ','))
+    LEFT JOIN PostHistoryAnalysis ph ON ph.PostId IN (
+        SELECT Id FROM Posts p WHERE p.OwnerUserId = up.UserId
+    )
+    WHERE up.UserId > 0
+      AND (up.QuestionCount > 0 OR up.AnswerCount > 0 OR up.CommentCount > 0)
+      AND (ta.TagName IS NOT NULL OR ph.PostId IS NOT NULL)
+)
+SELECT TOP 1000 
+    UserId,
+    DisplayName,
+    Reputation,
+    PostCount,
+    CommentCount,
+    BadgeCount,
+    LastPostDate,
+    LastCommentDate,
+    QuestionCount,
+    AnswerCount,
+    TotalScore,
+    TotalViews,
+    AvgScore,
+    AllTags,
+    AcceptedQuestionCount,
+    ClosedQuestionCount,
+    CommunityOwnedQuestions,
+    QuestionTitles,
+    AnswerBodies,
+    ScoreRank,
+    ReputationRank,
+    BadgeRank,
+    ScorePercentile,
+    ScorePercentileRank,
+    PrevUserReputation,
+    NextUserReputation,
+    AvgScoreByInitialLetter,
+    StdDevScoreByInitialLetter,
+    PerformanceTier,
+    ActivityType,
+    FocusType,
+    ExperienceLevel,
+    TagName,
+    TagCount,
+    PopularityLevel,
+    PopularityRank,
+    AvgTagCount,
+    MaxTagCount,
+    Decile,
+    PostId,
+    HistoryTypeCategory,
+    DaysSinceEvent,
+    HistoryEventsPerPost,
+    EventSequence,
+    RecentEventsByType,
+    EngagementLevel,
+    CONCAT(
+        'User ', 
+        DisplayName, 
+        ' (ID:', UserId, 
+        ') has ', 
+        PostCount, 
+        ' posts and ', 
+        BadgeCount, 
+        ' badges, ', 
+        CASE WHEN QuestionCount > 0 THEN 'asked ' ELSE 'never asked ' END,
+        QuestionCount, 
+        ' questions with an average score of ', 
+        COALESCE(ROUND(AvgScore, 2), 0), 
+        '. Tag analysis shows the most popular tag is ', 
+        COALESCE(TagName, 'N/A'), 
+        ' with ', 
+        COALESCE(TagCount, 0), 
+        ' uses.'
+    ) AS UserProfileSummary
+FROM ComplexQueryResults
+WHERE PostCount > 0 
+  AND Reputation > 0 
+  AND (TagName IS NOT NULL OR PostId IS NOT NULL)
+ORDER BY TotalScore DESC, PostCount DESC, BadgeCount DESC, Reputation DESC;

@@ -1,0 +1,112 @@
+WITH
+    user_stats AS (
+        SELECT
+            u.id                                     AS user_id,
+            u.displayname,
+            u.reputation,
+            COUNT(p.id)                FILTER (WHERE p.posttypeid = 1) AS q_cnt,
+            COUNT(p.id)                FILTER (WHERE p.posttypeid = 2) AS a_cnt,
+            AVG(p.score)               FILTER (WHERE p.posttypeid = 1) AS avg_q_score,
+            AVG(p.score)               FILTER (WHERE p.posttypeid = 2) AS avg_a_score,
+            SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END)          AS up_votes,
+            SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END)          AS down_votes,
+            MAX(p.creationdate)                                    AS last_post_dt
+        FROM users u
+        LEFT JOIN posts  p ON p.owneruserid = u.id
+        LEFT JOIN votes  v ON v.postid = p.id
+        GROUP BY u.id, u.displayname, u.reputation
+    ),
+
+    badge_counts AS (
+        SELECT
+            b.userid                               AS user_id,
+            COUNT(*)               FILTER (WHERE b.class = 1) AS gold,
+            COUNT(*)               FILTER (WHERE b.class = 2) AS silver,
+            COUNT(*)               FILTER (WHERE b.class = 3) AS bronze
+        FROM badges b
+        GROUP BY b.userid
+    ),
+
+    recent_activity AS (
+        SELECT
+            act.userid,
+            MAX(act.activity_dt) AS recent_dt
+        FROM (
+            SELECT owneruserid AS userid, creationdate AS activity_dt FROM posts   WHERE owneruserid IS NOT NULL
+            UNION ALL
+            SELECT userid      AS userid, creationdate AS activity_dt FROM comments WHERE userid      IS NOT NULL
+            UNION ALL
+            SELECT userid      AS userid, creationdate AS activity_dt FROM votes    WHERE userid      IS NOT NULL
+            UNION ALL
+            SELECT userid      AS userid, creationdate AS activity_dt FROM badges   WHERE userid      IS NOT NULL
+        ) act
+        GROUP BY act.userid
+    ),
+
+    tag_rank AS (
+        SELECT
+            t.tagname,
+            t.count,
+            ROW_NUMBER() OVER (ORDER BY t.count DESC) AS rk
+        FROM tags t
+        WHERE COALESCE(t.ismodERATORonly, 0) = 0
+    ),
+
+    user_top_tags AS (
+        SELECT
+            u.id                                                   AS user_id,
+            STRING_AGG(CONCAT(tr.tagname, ':', CAST(tr.count AS VARCHAR)), ', ')
+                FILTER (WHERE tr.rk <= 5)                         AS top5_tags
+        FROM users u
+        LEFT JOIN postlinks pl   ON pl.postid = (
+            SELECT p.id
+            FROM posts p
+            WHERE p.owneruserid = u.id
+            ORDER BY p.creationdate DESC
+            LIMIT 1
+        )
+        LEFT JOIN tags tr       ON tr.id = pl.relatedpostid
+        GROUP BY u.id
+    )
+
+SELECT
+    u.id,
+    u.displayname,
+    us.reputation,
+    us.q_cnt,
+    us.a_cnt,
+    COALESCE(us.avg_q_score,0)      AS avg_q_score,
+    COALESCE(us.avg_a_score,0)      AS avg_a_score,
+    us.up_votes,
+    us.down_votes,
+    bc.gold,
+    bc.silver,
+    bc.bronze,
+    ra.recent_dt,
+    utt.top5_tags,
+    us.last_post_dt
+FROM users u
+LEFT JOIN user_stats        us  ON us.user_id = u.id
+LEFT JOIN badge_counts      bc  ON bc.user_id = u.id
+LEFT JOIN recent_activity   ra  ON ra.userid   = u.id
+LEFT JOIN user_top_tags     utt ON utt.user_id = u.id
+WHERE
+    (u.reputation > 15000 OR us.a_cnt > 200)
+    AND (us.last_post_dt IS NULL OR us.last_post_dt > DATE '2020-01-01')
+    AND (bc.gold IS NOT NULL OR bc.silver IS NOT NULL)
+    AND utt.top5_tags IS NOT NULL
+GROUP BY
+    u.id, u.displayname, us.reputation,
+    us.q_cnt, us.a_cnt, us.avg_q_score, us.avg_a_score,
+    us.up_votes, us.down_votes,
+    bc.gold, bc.silver, bc.bronze,
+    ra.recent_dt, utt.top5_tags, us.last_post_dt
+HAVING COUNT(*) FILTER (WHERE utt.top5_tags IS NOT NULL) > 0
+ORDER BY us.reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE FALSE;

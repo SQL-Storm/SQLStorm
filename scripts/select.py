@@ -473,6 +473,7 @@ def main():
     argparser.add_argument("-p", "--parse", help="The parseable queries")
     argparser.add_argument("-e", "--execution", help="The executable queries")
     argparser.add_argument("-b", "--batch_output_file", help="Batch output file in case an error occurred", default=None)
+    argparser.add_argument("--no-rewrite", default=False, action='store_true', help="If set, do not rewrite the queries before making them compatible")
     args = argparser.parse_args()
 
     query_src_dir = os.path.join(args.version, args.dataset, "queries_generated")
@@ -487,8 +488,9 @@ def main():
                 sys.exit(0)
 
     # Rewrite the queries
-    log.header2("Rewrite queries")
-    rewritten_queries = rewrite_queries(query_src_dir, args.dataset)
+    if not args.no_rewrite:
+        log.header2("Rewrite queries")
+        rewritten_queries = rewrite_queries(query_src_dir, args.dataset)
 
     postfix = ["_rewritten"]
     not_compatible, compatible = [], []
@@ -574,7 +576,8 @@ def main():
     write_sql_queries_file(query_dest_dir, executable)
 
     log.header2("Summary")
-    log.info(f"{rewritten_queries:5} queries rewritten")
+    if not args.no_rewrite:
+        log.info(f"{rewritten_queries:5} queries rewritten")
     log.info(f"{regenerated_queries:5} queries regenerated ({len(not_compatible)} not compatible, {len(compatible)} compatible)")
     log.info(f"{query_count:5} queries copied")
     log.info(f"{len(duplicates):5} duplicated queries deleted ({query_count - len(duplicates)} distinct queries)")

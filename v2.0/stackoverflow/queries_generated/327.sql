@@ -1,0 +1,279 @@
+-- {"query": "327.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2434} 
+with recent_posts as (
+  select
+    p.id,
+    p.posttypeid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.owneryserid as owneruserid,
+    p.title,
+    p.tags,
+    p.answercount,
+    p.closeddate,
+    u.reputation,
+    u.location,
+    u.displayname
+  from posts p
+  left join users u on u.id = p.owneruserid
+  where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+tag_expanded as (
+  select
+    rp.id as post_id,
+    lower(trim(tg)) as tag_name
+  from recent_posts rp
+  cross join lateral unnest(
+    case
+      when rp.tags is null then array[]::varchar[]
+      when length(rp.tags) <= 2 then array[]::varchar[]
+      else string_to_array(substring(rp.tags, 2, length(rp.tags) - 2), '><')
+    end
+  ) as tg
+),
+post_scores as (
+  select
+    p.id,
+    coalesce(sum(case v.votetypeid when 2 then 1 when 3 then -1 else 0 end), 0) as net_votes,
+    count(*) filter (where v.votetypeid = 5) as favorites,
+    max(v.creationdate) as last_vote_at
+  from posts p
+  left join votes v on v.postid = p.id
+  group by p.id
+),
+comment_stats as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    avg(c.score) filter (where c.score is not null) as avg_comment_score,
+    max(c.creationdate) as last_comment_at
+  from comments c
+  group by c.postid
+),
+accepted_status as (
+  select
+    q.id as question_id,
+    case when a.id is not null then 1 else 0 end as has_accepted_answer,
+    a.owneruserid as accepted_owner_id,
+    a.score as accepted_score
+  from posts q
+  left join posts a on a.id = q.acceptedanswerid
+  where q.posttypeid = 1
+),
+post_links_rollup as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 1) as linked_count,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_count,
+    bool_or(pl.linktypeid = 3) as is_marked_duplicate
+  from postlinks pl
+  group by pl.postid
+),
+post_history_flags as (
+  select
+    ph.postid,
+    max(ph.creationdate) filter (where ph.posthistorytypeid in (10,11)) as last_close_or_reopen,
+    count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+    count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+    count(*) filter (where ph.posthistorytypeid in (12,13)) as delete_undelete_events,
+    max(case when ph.posthistorytypeid = 10 and ph.comment ~ '^[0-9]+$' then ph.comment::int end) as last_close_reason_id
+  from posthistory ph
+  group by ph.postid
+),
+user_badge_rollup as (
+  select
+    b.userid,
+    count(*) as total_badges,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges,
+    max(b.date) as last_badge_at
+  from badges b
+  group by b.userid
+),
+tag_popularity as (
+  select
+    te.tag_name,
+    count(distinct te.post_id) as posts_with_tag,
+    sum(rp.viewcount) as total_views_for_tag,
+    avg(rp.score) as avg_score_for_tag
+  from tag_expanded te
+  join recent_posts rp on rp.id = te.post_id
+  group by te.tag_name
+),
+ranked_posts as (
+  select
+    rp.id,
+    rp.posttypeid,
+    rp.creationdate,
+    rp.score,
+    rp.viewcount,
+    rp.owneruserid,
+    rp.title,
+    rp.tags,
+    rp.answercount,
+    rp.closeddate,
+    rp.reputation,
+    rp.location,
+    rp.displayname,
+    ps.net_votes,
+    ps.favorites,
+    ps.last_vote_at,
+    cs.comment_count,
+    cs.avg_comment_score,
+    cs.last_comment_at,
+    coalesce(plr.linked_count, 0) as linked_count,
+    coalesce(plr.duplicate_count, 0) as duplicate_count,
+    coalesce(phf.close_events, 0) as close_events,
+    coalesce(phf.reopen_events, 0) as reopen_events,
+    phf.last_close_or_reopen,
+    phf.last_close_reason_id,
+    coalesce(ub.total_badges, 0) as owner_total_badges,
+    coalesce(ub.gold_badges, 0) as owner_gold_badges,
+    coalesce(ub.silver_badges, 0) as owner_silver_badges,
+    coalesce(ub.bronze_badges, 0) as owner_bronze_badges,
+    ub.last_badge_at,
+    row_number() over (partition by rp.posttypeid order by rp.score desc nulls last, ps.net_votes desc nulls last, rp.viewcount desc nulls last) as rn_by_type,
+    rank() over (order by coalesce(ps.net_votes,0) + coalesce(rp.score,0) + coalesce(cs.comment_count,0) desc) as global_rank,
+    percentile_cont(0.9) within group (order by coalesce(ps.net_votes,0) + coalesce(rp.score,0)) over () as p90_score_votes,
+    sum(coalesce(ps.net_votes,0)) over (partition by rp.owneruserid) as owner_total_net_votes
+  from recent_posts rp
+  left join post_scores ps on ps.id = rp.id
+  left join comment_stats cs on cs.postid = rp.id
+  left join post_links_rollup plr on plr.postid = rp.id
+  left join post_history_flags phf on phf.postid = rp.id
+  left join user_badge_rollup ub on ub.userid = rp.owneruserid
+),
+normalized as (
+  select
+    r.*,
+    case
+      when viewcount is null or viewcount = 0 then null
+      else (score::numeric + coalesce(net_votes,0)) / nullif(viewcount,0)
+    end as engagement_ratio,
+    case
+      when last_vote_at is null then 0
+      when last_comment_at is null then 1
+      when last_vote_at >= last_comment_at then 1
+      else 0
+    end as votes_more_recent_than_comments,
+    case
+      when tags is null then 0
+      when length(tags) <= 2 then 0
+      else cardinality(string_to_array(substring(tags, 2, length(tags)-2), '><'))
+    end as tag_count
+  from ranked_posts r
+),
+correlated_user_peer as (
+  select
+    n.id as post_id,
+    (
+      select avg(p2.score)
+      from posts p2
+      where p2.owneruserid = n.owneruserid
+        and p2.creationdate >= n.creationdate - interval '30 days'
+        and p2.creationdate < n.creationdate + interval '30 days'
+        and p2.id <> n.id
+    ) as owner_peer_avg_score
+  from normalized n
+),
+heavy_join as (
+  select
+    n.*,
+    cup.owner_peer_avg_score,
+    tpop.tag_name as dominant_tag,
+    tpop.posts_with_tag,
+    tpop.total_views_for_tag,
+    tpop.avg_score_for_tag,
+    case
+      when n.tag_count = 0 then null
+      else (
+        select te2.tag_name
+        from tag_expanded te2
+        where te2.post_id = n.id
+        order by coalesce(tp2.posts_with_tag, 0) desc, te2.tag_name
+        limit 1
+      )
+    end as top_tag_by_popularity
+  from normalized n
+  left join correlated_user_peer cup on cup.post_id = n.id
+  left join lateral (
+    select te.tag_name
+    from tag_expanded te
+    where te.post_id = n.id
+    limit 1
+  ) lte on true
+  left join tag_popularity tpop on tpop.tag_name = lte.tag_name
+  left join lateral (
+    select
+      te3.tag_name,
+      tp3.posts_with_tag
+    from tag_expanded te3
+    left join tag_popularity tp3 on tp3.tag_name = te3.tag_name
+    where te3.post_id = n.id
+    order by tp3.posts_with_tag desc nulls last, te3.tag_name
+    limit 1
+  ) lt on true
+)
+select
+  h.id,
+  h.posttypeid,
+  h.creationdate,
+  h.title,
+  coalesce(h.top_tag_by_popularity, h.dominant_tag) as representative_tag,
+  h.tag_count,
+  h.score,
+  h.net_votes,
+  h.viewcount,
+  h.engagement_ratio,
+  h.comment_count,
+  h.avg_comment_score,
+  h.linked_count,
+  h.duplicate_count,
+  h.close_events,
+  h.reopen_events,
+  h.last_close_or_reopen,
+  h.last_close_reason_id,
+  h.owneruserid,
+  h.displayname as owner_displayname,
+  h.reputation as owner_reputation,
+  h.owner_total_badges,
+  h.owner_gold_badges,
+  h.owner_silver_badges,
+  h.owner_bronze_badges,
+  h.owner_total_net_votes,
+  h.owner_peer_avg_score,
+  h.votes_more_recent_than_comments,
+  h.global_rank,
+  h.rn_by_type,
+  case when h.global_rank <= 100 then 'TOP100'
+       when h.global_rank <= 1000 then 'TOP1K'
+       else 'REST' end as global_bucket,
+  case when h.engagement_ratio is null then 'NO_VIEWS'
+       when h.engagement_ratio >= (
+         select avg(engagement_ratio) + stddev_pop(engagement_ratio)
+         from normalized
+       ) then 'HIGH'
+       when h.engagement_ratio <= (
+         select avg(engagement_ratio) - stddev_pop(engagement_ratio)
+         from normalized
+       ) then 'LOW'
+       else 'MEDIUM' end as engagement_band
+from heavy_join h
+where
+  (h.posttypeid in (1,2) or (h.posttypeid not in (1,2) and h.viewcount is not null))
+  and coalesce(h.score, 0) + coalesce(h.net_votes, 0) >= 0
+  and not (h.duplicate_count > 0 and h.score < 0)
+  and (
+    h.owneruserid is null
+    or exists (
+      select 1
+      from users u2
+      where u2.id = h.owneruserid
+        and (u2.reputation >= 1000 or coalesce(u2.websiteurl, '') <> '')
+    )
+  )
+order by
+  h.global_rank,
+  h.rn_by_type
+limit 500;

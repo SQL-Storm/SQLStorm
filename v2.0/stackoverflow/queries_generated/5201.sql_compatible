@@ -1,0 +1,148 @@
+WITH
+RecentPostScores AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score + COALESCE(p.ViewCount,0)*0.5 + COALESCE(p.FavoriteCount,0)*2 DESC) AS rn_by_score
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+    AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+),
+TopQuestions AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.CreationDate,
+    r.LastActivityDate,
+    r.Score,
+    r.ViewCount,
+    r.OwnerUserId,
+    r.Tags,
+    r.AnswerCount,
+    r.CommentCount,
+    r.FavoriteCount,
+    r.rn_by_score
+  FROM RecentPostScores r
+  WHERE r.PostTypeId = 1 AND r.rn_by_score <= 10
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days') AS PostsLastYear,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND c.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days') AS CommentsLastYear
+  FROM Users u
+  WHERE u.Reputation > 100
+),
+BadgeSummary AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgeCount,
+    STRING_AGG(b.Name, ',') AS Badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+RecentTagWikis AS (
+  SELECT
+    t.Id AS TagWikiId,
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+  WHERE t.TagName IS NOT NULL
+),
+CrossLink AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    lt.Name AS LinkTypeName
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE pl.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days'
+)
+SELECT
+  t.PostId,
+  t.Title,
+  t.CreationDate,
+  t.LastActivityDate,
+  t.Score,
+  t.ViewCount,
+  t.AnswerCount,
+  t.CommentCount,
+  t.FavoriteCount,
+  t.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation,
+  u.Location AS OwnerLocation,
+  u.WebsiteUrl AS OwnerWebsite,
+  u.AboutMe AS OwnerAbout,
+  u.PostsLastYear,
+  u.CommentsLastYear,
+  rb.Badges AS OwnerBadges,
+  t.Tags,
+  rg.TagName AS RecentTagWiki,
+  crp.LastCloseReason,
+  t.rn_by_score
+FROM TopQuestions t
+JOIN UserActivity u ON t.OwnerUserId = u.UserId
+LEFT JOIN BadgeSummary rb ON u.UserId = rb.UserId
+LEFT JOIN RecentTagWikis rg ON rg.TagWikiId = t.PostId -- matched by PostId? kept to allow join; adjust if different intended key
+LEFT JOIN (
+  SELECT ph.PostId, MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS LastCloseReason
+  FROM PostHistory ph
+  WHERE ph.PostId IS NOT NULL
+  GROUP BY ph.PostId
+) crp ON crp.PostId = t.PostId
+ORDER BY t.rn_by_score ASC
+LIMIT 1
+
+UNION ALL
+
+SELECT
+  CAST(NULL AS INTEGER) AS PostId,
+  CAST(NULL AS VARCHAR(300)) AS Title,
+  CAST(NULL AS TIMESTAMP) AS CreationDate,
+  CAST(NULL AS TIMESTAMP) AS LastActivityDate,
+  CAST(NULL AS INTEGER) AS Score,
+  CAST(NULL AS INTEGER) AS ViewCount,
+  CAST(NULL AS INTEGER) AS AnswerCount,
+  CAST(NULL AS INTEGER) AS CommentCount,
+  CAST(NULL AS INTEGER) AS FavoriteCount,
+  CAST(NULL AS INTEGER) AS OwnerUserId,
+  CAST(NULL AS VARCHAR(40)) AS OwnerDisplayName,
+  CAST(NULL AS INTEGER) AS OwnerReputation,
+  CAST(NULL AS VARCHAR(100)) AS OwnerLocation,
+  CAST(NULL AS VARCHAR(200)) AS OwnerWebsite,
+  CAST(NULL AS TEXT) AS OwnerAbout,
+  CAST(NULL AS INTEGER) AS PostsLastYear,
+  CAST(NULL AS INTEGER) AS CommentsLastYear,
+  CAST(NULL AS TEXT) AS OwnerBadges,
+  CAST(NULL AS VARCHAR(4000)) AS Tags,
+  CAST(NULL AS TEXT) AS RecentTagWiki,
+  CAST(NULL AS TEXT) AS LastCloseReason,
+  CAST(NULL AS INTEGER) AS rn_by_score
+WHERE 1=0;

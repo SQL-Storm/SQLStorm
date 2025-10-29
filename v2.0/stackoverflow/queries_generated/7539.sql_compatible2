@@ -1,0 +1,208 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COUNT(DISTINCT c.Id) AS Comments,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(p.Score) AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL AND p.AnswerCount > 0 THEN 'Unanswered'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'No Answers'
+            ELSE 'Other'
+        END AS QuestionStatus,
+        CASE 
+            WHEN p.Score >= 10 THEN 'High'
+            WHEN p.Score >= 5 THEN 'Medium'
+            WHEN p.Score >= 0 THEN 'Low'
+            ELSE 'Negative'
+        END AS ScoreCategory,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        NTILE(4) OVER (ORDER BY p.ViewCount DESC) AS ViewQuartile,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostSequence,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostDate,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+      AND p.OwnerUserId IS NOT NULL
+      AND p.CreationDate >= DATE '2020-01-01'
+),
+UserPerformance AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.Views,
+        us.UpVotes,
+        us.DownVotes,
+        us.TotalPosts,
+        us.Questions,
+        us.Answers,
+        us.Badges,
+        us.Comments,
+        us.LastPostDate,
+        us.AvgPostScore,
+        us.AllTags,
+        CASE 
+            WHEN us.Questions > 0 THEN CAST(us.Answers AS DOUBLE PRECISION) / NULLIF(MAX(us.Questions) OVER (), 0)
+            ELSE 0 
+        END AS AnswerRatio,
+        CASE 
+            WHEN us.Badges > 0 THEN (us.UpVotes + us.DownVotes) / CAST(us.Badges AS DOUBLE PRECISION)
+            ELSE 0 
+        END AS VotePerBadge,
+        (us.Views - LAG(us.Views) OVER (ORDER BY us.Views)) AS ViewsChange,
+        RANK() OVER (ORDER BY us.Reputation DESC, us.Views DESC, us.TotalPosts DESC) AS UserRank,
+        DENSE_RANK() OVER (ORDER BY (us.UpVotes - us.DownVotes) DESC) AS VoteRank
+    FROM UserStats us
+    WHERE us.TotalPosts > 0
+),
+QuestionMetrics AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.QuestionStatus,
+        pa.ScoreCategory,
+        pa.ScoreRank,
+        pa.ViewQuartile,
+        pa.PostSequence,
+        CASE 
+            WHEN pa.PreviousPostDate IS NULL THEN NULL
+            ELSE (CAST(pa.CreationDate AS DATE) - CAST(pa.PreviousPostDate AS DATE))
+        END AS DaysBetweenPosts,
+        pa.PreviousPostScore,
+        CASE 
+            WHEN pa.PreviousPostScore IS NOT NULL THEN (pa.Score - pa.PreviousPostScore)
+            ELSE 0 
+        END AS ScoreChange,
+        REGEXP_REPLACE(pa.Tags, '<([^>]+)>', '\1', 'g') AS CleanTags,
+        CASE 
+            WHEN pa.QuestionStatus = 'Answered' AND pa.Score >= 5 THEN 'PopularAnswered'
+            WHEN pa.QuestionStatus = 'Answered' AND pa.Score < 5 THEN 'LessPopularAnswered'
+            WHEN pa.QuestionStatus IN ('Unanswered', 'No Answers') AND pa.ViewCount >= 1000 THEN 'HighViewUnanswered'
+            ELSE 'Other'
+        END AS QuestionClassification
+    FROM PostAnalysis pa
+    WHERE pa.PostTypeId = 1
+),
+ComplexAnalysis AS (
+    SELECT 
+        qp.PostId,
+        qp.Title,
+        qp.Score,
+        qp.ViewCount,
+        qp.CreationDate,
+        qp.OwnerUserId,
+        qp.QuestionStatus,
+        qp.ScoreCategory,
+        qp.ScoreRank,
+        qp.ViewQuartile,
+        qp.PostSequence,
+        qp.DaysBetweenPosts,
+        qp.ScoreChange,
+        qp.CleanTags,
+        qp.QuestionClassification,
+        DENSE_RANK() OVER (PARTITION BY qp.OwnerUserId ORDER BY qp.Score DESC) AS OwnerTopScore,
+        ROW_NUMBER() OVER (ORDER BY qp.Score DESC, qp.ViewCount DESC) AS GlobalRank,
+        PERCENT_RANK() OVER (ORDER BY qp.Score DESC) AS ScorePercentile,
+        NTILE(10) OVER (ORDER BY qp.ViewCount DESC) AS ViewDecile
+    FROM QuestionMetrics qp
+    WHERE qp.Score >= 0 AND qp.ViewCount > 0
+)
+SELECT 
+    ca.PostId,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.CreationDate,
+    ca.OwnerUserId,
+    ca.QuestionStatus,
+    ca.ScoreCategory,
+    ca.ScoreRank,
+    ca.ViewQuartile,
+    ca.PostSequence,
+    ca.DaysBetweenPosts,
+    ca.ScoreChange,
+    ca.CleanTags,
+    ca.QuestionClassification,
+    ca.OwnerTopScore,
+    ca.GlobalRank,
+    ca.ScorePercentile,
+    ca.ViewDecile,
+    CASE 
+        WHEN ca.Score > 100 THEN 'VIP'
+        WHEN ca.Score > 50 THEN 'High'
+        WHEN ca.Score > 10 THEN 'Medium'
+        WHEN ca.Score > 0 THEN 'Low'
+        WHEN ca.Score IS NULL THEN NULL
+        ELSE 'Negative'
+    END AS ScoreTier,
+    CASE 
+        WHEN ca.ViewQuartile BETWEEN 1 AND 2 THEN 'High Engagement'
+        WHEN ca.ViewQuartile = 3 THEN 'Medium Engagement'
+        WHEN ca.ViewQuartile = 4 THEN 'Low Engagement'
+        ELSE 'Unknown'
+    END AS EngagementLevel,
+    LAG(ca.Title, 1) OVER (ORDER BY ca.CreationDate) AS PreviousPostTitle,
+    LAG(ca.Score, 1) OVER (ORDER BY ca.CreationDate) AS PreviousPostScore,
+    CASE 
+        WHEN ca.DaysBetweenPosts IS NULL THEN NULL
+        WHEN ca.DaysBetweenPosts <= 1 THEN 'Daily'
+        WHEN ca.DaysBetweenPosts <= 7 THEN 'Weekly'
+        WHEN ca.DaysBetweenPosts <= 30 THEN 'Monthly'
+        ELSE 'Rare'
+    END AS PostingFrequency
+FROM ComplexAnalysis ca
+WHERE ca.QuestionClassification IN ('PopularAnswered', 'HighViewUnanswered', 'LessPopularAnswered')
+  AND ca.ScorePercentile > 0.75
+  AND ca.ViewDecile >= 5
+  AND ca.Score > 0
+  AND ca.CleanTags IS NOT NULL
+  AND ca.OwnerUserId IN (
+    SELECT UserId 
+    FROM UserPerformance 
+    WHERE UserRank <= 100 AND VoteRank <= 100
+  )
+  AND ca.PostId IN (
+    SELECT PostId 
+    FROM PostLinks 
+    WHERE LinkTypeId = 3 
+      AND RelatedPostId IN (
+        SELECT Id FROM Posts WHERE PostTypeId = 1 AND Score > 100
+      )
+  )
+ORDER BY ca.Score DESC, ca.ViewCount DESC, ca.CreationDate DESC
+FETCH FIRST 1000 ROWS ONLY;

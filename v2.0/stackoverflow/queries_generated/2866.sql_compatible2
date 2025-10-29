@@ -1,0 +1,191 @@
+WITH 
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END),0) AS QuestionsCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END),0) AS AnswersCount,
+        COALESCE(COUNT(DISTINCT b.Id),0) AS BadgeCount,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS MaxQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 AND p.Score IS NOT NULL THEN p.Score END) AS AvgAnswerScore,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10,12)) AS CloseOrDeleteEdits,
+        (MAX(u.LastAccessDate) OVER () - u.LastAccessDate) AS DaysSinceLastAccess
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+), 
+TopActiveUsers AS (
+    SELECT 
+        ua.*,
+        ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC, ua.BadgeCount DESC, ua.QuestionsCount + ua.AnswersCount DESC) AS Rank
+    FROM UserActivity ua
+    WHERE ua.Reputation >= 1000
+),
+PostsWithCommentsAndVotes AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(c.CommentCount, 0) AS CommentsCount,
+        COALESCE(v.UpVotes, 0) AS UpVotes,
+        COALESCE(v.DownVotes, 0) AS DownVotes,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.AcceptedAnswerId,
+        p.Tags,
+        p.ClosedDate
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId,
+               SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+               SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+), 
+RankedPosts AS (
+    SELECT 
+        pwc.PostId,
+        pwc.PostTypeId,
+        pwc.Title,
+        pwc.CreationDate,
+        pwc.Score,
+        pwc.ViewCount,
+        pwc.CommentsCount,
+        pwc.UpVotes,
+        pwc.DownVotes,
+        pwc.OwnerUserId,
+        pwc.OwnerName,
+        pwc.AcceptedAnswerId,
+        pwc.Tags,
+        pwc.ClosedDate,
+        RANK() OVER (PARTITION BY pwc.PostTypeId ORDER BY pwc.Score DESC, pwc.ViewCount DESC) AS PostRank,
+        ROW_NUMBER() OVER (PARTITION BY pwc.OwnerUserId ORDER BY pwc.CreationDate DESC) AS UserPostRecencyRank,
+        CASE 
+            WHEN pwc.Tags IS NULL THEN ARRAY[]::text[] 
+            ELSE string_to_array(substring(pwc.Tags FROM 2 FOR char_length(pwc.Tags) - 2), '><')
+        END AS TagArray,
+        EXISTS (
+            SELECT 1 FROM PostLinks pl 
+            WHERE pl.PostId = pwc.PostId AND pl.LinkTypeId = 3
+        ) AS IsDuplicate
+    FROM PostsWithCommentsAndVotes pwc
+),
+DuplicateLinksInfo AS (
+    SELECT 
+        pl.PostId,
+        COUNT(*) AS DuplicateCount,
+        STRING_AGG(DISTINCT p2.Title, ' || ') AS DuplicateOfTitles
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId AND lt.Name = 'Duplicate'
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    GROUP BY pl.PostId
+),
+CorrelatedUserBadges AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+)
+SELECT 
+    ru.PostId,
+    ru.PostTypeId,
+    ru.Title,
+    ru.CreationDate,
+    ru.Score,
+    ru.ViewCount,
+    ru.CommentsCount,
+    ru.UpVotes,
+    ru.DownVotes,
+    ru.OwnerUserId,
+    ru.OwnerName,
+    ru.AcceptedAnswerId,
+    ru.ClosedDate,
+    ru.PostRank,
+    ru.UserPostRecencyRank,
+    array_to_string(ru.TagArray, ', ') AS Tags,
+    CASE WHEN ru.IsDuplicate THEN TRUE ELSE FALSE END AS IsMarkedDuplicate,
+    COALESCE(dli.DuplicateCount, 0) AS DuplicateLinkCount,
+    COALESCE(dli.DuplicateOfTitles, '') AS DuplicateOfTitles,
+    ta.Reputation,
+    ta.BadgeCount,
+    ta.QuestionsCount,
+    ta.AnswersCount,
+    ta.CloseOrDeleteEdits,
+    ta.DaysSinceLastAccess,
+    cub.GoldBadges,
+    cub.SilverBadges,
+    cub.BronzeBadges,
+    CASE 
+        WHEN ru.ClosedDate IS NOT NULL THEN 'Closed on ' || TO_CHAR(CAST(ru.ClosedDate AS DATE), 'YYYY-MM-DD')
+        ELSE 'Open'
+    END AS PostStatus,
+    AVG(p.Score) OVER (PARTITION BY ru.OwnerUserId) AS OwnerAveragePostScore,
+    (SELECT c.Text 
+     FROM Comments c 
+     WHERE c.PostId = ru.PostId AND c.Text IS NOT NULL 
+     ORDER BY c.CreationDate DESC 
+     LIMIT 1) AS LatestNonNullComment,
+    (SELECT COUNT(*) 
+     FROM Posts ans 
+     WHERE ans.ParentId = ru.PostId AND ans.PostTypeId = 2) AS AnswerCountForQuestion
+FROM RankedPosts ru
+LEFT JOIN TopActiveUsers ta ON ta.UserId = ru.OwnerUserId
+LEFT JOIN DuplicateLinksInfo dli ON dli.PostId = ru.PostId
+LEFT JOIN CorrelatedUserBadges cub ON cub.UserId = ru.OwnerUserId
+LEFT JOIN Posts p ON p.OwnerUserId = ru.OwnerUserId
+WHERE ru.PostRank <= 50
+GROUP BY
+    ru.PostId,
+    ru.PostTypeId,
+    ru.Title,
+    ru.CreationDate,
+    ru.Score,
+    ru.ViewCount,
+    ru.CommentsCount,
+    ru.UpVotes,
+    ru.DownVotes,
+    ru.OwnerUserId,
+    ru.OwnerName,
+    ru.AcceptedAnswerId,
+    ru.ClosedDate,
+    ru.PostRank,
+    ru.UserPostRecencyRank,
+    ru.TagArray,
+    ru.IsDuplicate,
+    dli.DuplicateCount,
+    dli.DuplicateOfTitles,
+    ta.Reputation,
+    ta.BadgeCount,
+    ta.QuestionsCount,
+    ta.AnswersCount,
+    ta.CloseOrDeleteEdits,
+    ta.DaysSinceLastAccess,
+    cub.GoldBadges,
+    cub.SilverBadges,
+    cub.BronzeBadges,
+    p.Score,
+    ta.UserId,
+    ta.Reputation
+ORDER BY 
+    ta.Reputation DESC NULLS LAST, 
+    ru.Score DESC, 
+    ru.ViewCount DESC
+LIMIT 100;

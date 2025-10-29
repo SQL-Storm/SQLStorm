@@ -1,0 +1,122 @@
+WITH UserAgg AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END)                             AS QuestionCount,
+           COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END)                             AS AnswerCount,
+           SUM(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score ELSE 0 END)                AS TotalScore,
+           MAX(p.CreationDate)                                                        AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeAgg AS (
+    SELECT b.UserId,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END)                                   AS GoldBadges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END)                                   AS SilverBadges,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END)                                   AS BronzeBadges,
+           COUNT(CASE WHEN b.TagBased = TRUE THEN 1 END)                              AS TagBasedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TagContribution AS (
+    SELECT u.Id                                          AS UserId,
+           t.TagName,
+           COUNT(*)                                      AS TagPostCount,
+           ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+    ) tags ON true
+    JOIN Tags t ON t.TagName = tags.TagName
+    GROUP BY u.Id, t.TagName
+),
+TopTagPerUser AS (
+    SELECT UserId, TagName, TagPostCount
+    FROM TagContribution
+    WHERE TagRank = 1
+),
+RecentActivity AS (
+    SELECT u.Id AS UserId,
+           COALESCE(
+               (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.UserId = u.Id),
+               (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.UserId = u.Id)
+           ) AS LastVoteOrComment
+    FROM Users u
+),
+ScoreLag AS (
+    SELECT p.OwnerUserId,
+           p.Id,
+           p.Score,
+           LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)           AS PrevScore,
+           p.Score - COALESCE(LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate), 0) AS ScoreDelta
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserScoreChanges AS (
+    SELECT OwnerUserId,
+           SUM(CASE WHEN ScoreDelta > 0 THEN ScoreDelta ELSE 0 END)   AS PositiveScoreDelta,
+           SUM(CASE WHEN ScoreDelta < 0 THEN -ScoreDelta ELSE 0 END) AS NegativeScoreDelta
+    FROM ScoreLag
+    GROUP BY OwnerUserId
+),
+Combined AS (
+    SELECT ua.Id,
+           ua.DisplayName,
+           ua.Reputation,
+           ua.QuestionCount,
+           ua.AnswerCount,
+           ua.TotalScore,
+           COALESCE(ba.GoldBadges, 0)    AS GoldBadges,
+           COALESCE(ba.SilverBadges, 0)  AS SilverBadges,
+           COALESCE(ba.BronzeBadges, 0)  AS BronzeBadges,
+           COALESCE(ba.TagBasedBadges,0) AS TagBasedBadges,
+           tp.TagName,
+           tp.TagPostCount,
+           ra.LastVoteOrComment,
+           COALESCE(us.PositiveScoreDelta, 0) AS PosScoreDelta,
+           COALESCE(us.NegativeScoreDelta, 0) AS NegScoreDelta,
+           CASE
+               WHEN ua.Reputation IS NULL          THEN 'NoRep'
+               WHEN ua.Reputation < 1000           THEN 'Low'
+               WHEN ua.Reputation < 10000          THEN 'Medium'
+               ELSE                               'High'
+           END                                   AS ReputationTier,
+           CASE
+               WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = ua.Id AND p.AcceptedAnswerId IS NOT NULL)
+               THEN 1 ELSE 0
+           END                                   AS HasAcceptedAnswers
+    FROM UserAgg ua
+    LEFT JOIN BadgeAgg ba          ON ba.UserId = ua.Id
+    LEFT JOIN TopTagPerUser tp    ON tp.UserId = ua.Id
+    LEFT JOIN RecentActivity ra   ON ra.UserId = ua.Id
+    LEFT JOIN UserScoreChanges us ON us.OwnerUserId = ua.Id
+)
+SELECT *
+FROM Combined
+WHERE ReputationTier <> 'Low' OR GoldBadges > 0
+UNION ALL
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0            AS QuestionCount,
+    0            AS AnswerCount,
+    0            AS TotalScore,
+    0            AS GoldBadges,
+    0            AS SilverBadges,
+    0            AS BronzeBadges,
+    0            AS TagBasedBadges,
+    NULL         AS TagName,
+    NULL         AS TagPostCount,
+    NULL         AS LastVoteOrComment,
+    0            AS PosScoreDelta,
+    0            AS NegScoreDelta,
+    'Inactive'   AS ReputationTier,
+    0            AS HasAcceptedAnswers
+FROM Users u
+WHERE u.LastAccessDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2' YEAR
+  AND NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+ORDER BY Reputation DESC NULLS LAST
+LIMIT 100;

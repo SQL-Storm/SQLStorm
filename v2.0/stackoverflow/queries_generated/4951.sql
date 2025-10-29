@@ -1,0 +1,126 @@
+-- {"query": "4951.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1480} 
+WITH TaggedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.FavoriteCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.ViewCount AS PostViewCount,
+        CASE WHEN p.Tags LIKE '%<sql>%' THEN 1 ELSE 0 END AS IsSqlTag,
+        CASE WHEN p.Tags LIKE '%<performance>%' THEN 1 ELSE 0 END AS IsPerformanceTag,
+        CASE WHEN p.Tags LIKE '%<optimization>%' THEN 1 ELSE 0 END AS IsOptimizationTag,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRankByUser,
+        AVG(CAST(c.Score AS DECIMAL)) OVER (PARTITION BY p.OwnerUserId, p.PostTypeId) AS AvgCommentScorePerUser,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.OwnerUserId != -1
+    GROUP BY
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.FavoriteCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.ViewCount,
+        p.Tags,
+        p.PostTypeId
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        u.CreationDate AS UserCreationDate,
+        COUNT(tp.PostId) AS TotalPosts,
+        SUM(tp.PostScore) AS TotalPostScore,
+        SUM(tp.FavoriteCount) AS TotalFavoriteCount,
+        SUM(tp.AnswerCount) AS TotalAnswerCount,
+        SUM(tp.CommentCount) AS TotalCommentCount,
+        AVG(tp.PostViewCount) AS AvgPostViewCount,
+        SUM(tp.IsSqlTag) AS SqlTagPosts,
+        SUM(tp.IsPerformanceTag) AS PerformanceTagPosts,
+        SUM(tp.IsOptimizationTag) AS OptimizationTagPosts,
+        MAX(tp.PostCreationDate) AS LastPostDate,
+        AVG(tp.AvgCommentScorePerUser) AS AvgCommentScoreForUser,
+        SUM(tp.UpvoteCount) AS TotalUpvotesReceived,
+        SUM(tp.DownvoteCount) AS TotalDownvotesReceived,
+        COUNT(CASE WHEN tp.PostRankByUser <= 5 THEN 1 END) AS Top5PostsCount
+    FROM Users u
+    LEFT JOIN TaggedPosts tp ON u.Id = tp.OwnerUserId
+    GROUP BY
+        u.Id,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate
+),
+PostLaggedScore AS (
+    SELECT
+        Id,
+        Score,
+        CreationDate,
+        LAG(Score, 1, 0) OVER (ORDER BY CreationDate) AS PreviousScore
+    FROM Posts
+    WHERE PostTypeId = 1
+)
+SELECT
+    u.DisplayName AS UserDisplayName,
+    u.Reputation,
+    ua.TotalPosts,
+    ua.TotalPostScore,
+    ua.AvgPostViewCount,
+    ua.SqlTagPosts,
+    ua.PerformanceTagPosts,
+    ua.OptimizationTagPosts,
+    ua.TotalUpvotesReceived,
+    ua.TotalDownvotesReceived,
+    CASE
+        WHEN ua.TotalUpvotesReceived > 0 THEN CAST(ua.TotalUpvotesReceived AS DECIMAL) / (ua.TotalUpvotesReceived + ua.TotalDownvotesReceived) * 100
+        ELSE 0
+    END AS UpvotePercentage,
+    ua.Top5PostsCount,
+    pl.Score AS LatestPostScore,
+    pl.Score - pl.PreviousScore AS ScoreDelta,
+    CASE
+        WHEN u.CreationDate < DATE_SUB(NOW(), INTERVAL 1 YEAR) THEN 'Veteran'
+        ELSE 'Newer'
+    END AS UserStatus,
+    COALESCE(u.Location, 'Unknown') AS UserLocation,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+    (
+        SELECT COUNT(DISTINCT ph.PostId)
+        FROM PostHistory ph
+        WHERE ph.UserId = u.Id
+        AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+        AND ph.CreationDate >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+    ) AS RecentEdits,
+    (
+        SELECT COUNT(DISTINCT ph.PostId)
+        FROM PostHistory ph
+        WHERE ph.UserId = u.Id
+        AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)
+        AND ph.CreationDate >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+    ) AS RecentModerationActions
+FROM Users u
+JOIN UserActivity ua ON u.Id = ua.UserId
+LEFT JOIN PostLaggedScore pl ON u.Id = (SELECT OwnerUserId FROM Posts WHERE Id = pl.Id) -- Assuming we want the latest post's score diff
+WHERE ua.TotalPosts >= 5 -- Ensure users have contributed a minimum number of posts
+AND ua.AvgPostViewCount > 100 -- Focus on users whose posts have some visibility
+AND ua.Reputation > 1000
+ORDER BY
+    ua.TotalPostScore DESC,
+    ua.AvgPostViewCount DESC,
+    ua.TotalUpvotesReceived DESC
+LIMIT 100;

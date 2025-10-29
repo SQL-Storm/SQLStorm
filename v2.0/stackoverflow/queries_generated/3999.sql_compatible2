@@ -1,0 +1,133 @@
+WITH RecentPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id                                 AS UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(b.Id)                           AS TotalBadges,
+        STRING_AGG(DISTINCT b.Name, ', ')     AS BadgeNames
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+UserVoteStats AS (
+    SELECT
+        p.OwnerUserId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN vt.Id = 5 THEN 1 ELSE 0 END) AS Favorites
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    JOIN Posts p ON p.Id = v.PostId
+    GROUP BY p.OwnerUserId
+),
+TopTagUsage AS (
+    SELECT
+        t.TagName,
+        COUNT(*)                                 AS QuestionCount,
+        AVG(p.Score)                             AS AvgScore,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') AS ActiveUsers
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+    HAVING COUNT(*) > 1000
+),
+RecentPostAgg AS (
+    SELECT
+        OwnerUserId,
+        COUNT(*)    AS PostCount,
+        AVG(Score)  AS AvgScore
+    FROM RecentPosts
+    WHERE rn = 1
+    GROUP BY OwnerUserId
+),
+TagTable AS (
+    SELECT
+        p.OwnerUserId,
+        tname AS TagName
+    FROM Posts p,
+         LATERAL regexp_split_to_table(p.Tags, '[><]') AS tname
+    JOIN Tags t ON t.TagName = tname
+    WHERE p.PostTypeId = 1
+)
+SELECT *
+FROM (
+    SELECT
+        u.Id,
+        COALESCE(u.DisplayName, 'Anonymous')               AS DisplayName,
+        u.Reputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalBadges,
+        ub.BadgeNames,
+        COALESCE(rp.PostCount, 0)                          AS RecentPostCount,
+        COALESCE(rp.AvgScore, 0)                           AS RecentAvgScore,
+        COALESCE(vs.UpVotes, 0)                            AS TotalUpVotes,
+        COALESCE(vs.DownVotes, 0)                          AS TotalDownVotes,
+        COALESCE(vs.Favorites, 0)                          AS TotalFavorites,
+        CASE
+            WHEN u.Reputation >= 20000 THEN 'Legendary'
+            WHEN u.Reputation >= 10000 THEN 'Expert'
+            WHEN u.Reputation >= 5000  THEN 'Veteran'
+            ELSE 'Contributor'
+        END                                               AS ReputationTier,
+        STRING_AGG(DISTINCT tt.TagName, '; ')             AS PopularTags
+    FROM Users u
+    LEFT JOIN UserBadgeStats ub
+           ON ub.UserId = u.Id
+    LEFT JOIN RecentPostAgg rp
+           ON rp.OwnerUserId = u.Id
+    LEFT JOIN UserVoteStats vs
+           ON vs.OwnerUserId = u.Id
+    LEFT JOIN TagTable tt
+           ON tt.OwnerUserId = u.Id
+    WHERE u.CreationDate < (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR)
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation,
+        ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges,
+        ub.TotalBadges, ub.BadgeNames,
+        rp.PostCount, rp.AvgScore,
+        vs.UpVotes, vs.DownVotes, vs.Favorites
+    HAVING COALESCE(ub.TotalBadges,0) + COALESCE(rp.PostCount,0) > 10
+    ORDER BY u.Reputation DESC
+    LIMIT 100
+
+    UNION ALL
+
+    SELECT
+        NULL                                          AS Id,
+        'Aggregated Stats'                            AS DisplayName,
+        NULL                                          AS Reputation,
+        SUM(ub.GoldBadges)                            AS GoldBadges,
+        SUM(ub.SilverBadges)                          AS SilverBadges,
+        SUM(ub.BronzeBadges)                          AS BronzeBadges,
+        SUM(ub.TotalBadges)                           AS TotalBadges,
+        NULL                                          AS BadgeNames,
+        SUM(rp.PostCount)                             AS RecentPostCount,
+        AVG(rp.AvgScore)                              AS RecentAvgScore,
+        SUM(vs.UpVotes)                               AS TotalUpVotes,
+        SUM(vs.DownVotes)                             AS TotalDownVotes,
+        SUM(vs.Favorites)                             AS TotalFavorites,
+        NULL                                          AS ReputationTier,
+        NULL                                          AS PopularTags
+    FROM Users u
+    LEFT JOIN UserBadgeStats ub ON ub.UserId = u.Id
+    LEFT JOIN RecentPostAgg rp ON rp.OwnerUserId = u.Id
+    LEFT JOIN UserVoteStats vs ON vs.OwnerUserId = u.Id
+    WHERE u.CreationDate < (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR
+    )
+) AS combined;

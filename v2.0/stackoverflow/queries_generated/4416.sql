@@ -1,0 +1,128 @@
+-- {"query": "4416.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1301} 
+
+WITH
+  PostScoreTrend AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.Score,
+      p.CreationDate,
+      LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PostSequence
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId IN (1, 2) AND p.Score IS NOT NULL
+  ),
+  UserPostActivity AS (
+    SELECT
+      pst.OwnerUserId,
+      COUNT(DISTINCT pst.PostId) AS TotalPosts,
+      SUM(CASE WHEN pst.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN pst.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      AVG(pst.Score) AS AverageScore,
+      MAX(pst.Score) AS MaxScore,
+      MIN(pst.Score) AS MinScore,
+      COUNT(CASE WHEN pst.PostSequence > 1 AND pst.Score > pst.PreviousScore THEN 1 END) AS PostsWithScoreIncrease,
+      SUM(CASE WHEN pst.PostSequence > 1 AND pst.Score > pst.PreviousScore THEN (pst.Score - pst.PreviousScore) ELSE 0 END) AS TotalScoreIncrease,
+      COUNT(CASE WHEN pst.PostSequence > 1 AND pst.Score < pst.PreviousScore THEN 1 END) AS PostsWithScoreDecrease,
+      SUM(CASE WHEN pst.PostSequence > 1 AND pst.Score < pst.PreviousScore THEN (pst.Score - pst.PreviousScore) ELSE 0 END) AS TotalScoreDecrease
+    FROM PostScoreTrend AS pst
+    GROUP BY
+      pst.OwnerUserId
+  ),
+  RecentPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId AS EditorUserId,
+      ph.CreationDate AS EditDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) /* Edit Title, Edit Body, Edit Tags */
+  ),
+  TopEditors AS (
+    SELECT
+      UserId,
+      COUNT(*) AS EditCount
+    FROM RecentPostEdits
+    WHERE
+      rn <= 5
+    GROUP BY
+      UserId
+    HAVING
+      COUNT(*) >= 3
+  )
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  upa.TotalPosts,
+  upa.QuestionCount,
+  upa.AnswerCount,
+  upa.AverageScore,
+  upa.MaxScore,
+  upa.MinScore,
+  upa.PostsWithScoreIncrease,
+  upa.TotalScoreIncrease,
+  upa.PostsWithScoreDecrease,
+  upa.TotalScoreDecrease,
+  COALESCE(te.EditCount, 0) AS RecentEditActivityCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = u.Id AND b.Class = 1
+  ) AS GoldBadgeCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = u.Id AND b.Class = 2
+  ) AS SilverBadgeCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = u.Id AND b.Class = 3
+  ) AS BronzeBadgeCount,
+  CASE WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website' WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'Stack Overflow Internal' ELSE 'External Website' END AS WebsiteCategory,
+  CASE WHEN upa.TotalPosts IS NULL THEN 0 ELSE CAST(upa.PostsWithScoreIncrease AS REAL) / upa.TotalPosts * 100 END AS PercentagePostsGainingScore,
+  (
+    SELECT
+      COUNT(*)
+    FROM Posts AS p
+    WHERE
+      p.OwnerUserId = u.Id AND p.FavoriteCount > 100
+  ) AS HighlyFavoritedPostCount,
+  (
+    SELECT
+      SUM(p.ViewCount)
+    FROM Posts AS p
+    WHERE
+      p.OwnerUserId = u.Id AND p.PostTypeId = 1
+  ) AS TotalQuestionViews,
+  CASE
+    WHEN u.AboutMe IS NOT NULL AND LENGTH(TRIM(u.AboutMe)) > 100 THEN 'Detailed AboutMe'
+    WHEN u.AboutMe IS NOT NULL AND LENGTH(TRIM(u.AboutMe)) > 0 THEN 'Brief AboutMe'
+    ELSE 'No AboutMe'
+  END AS AboutMeStatus,
+  CASE WHEN EXISTS (SELECT 1 FROM Comments AS c WHERE c.UserId = u.Id AND c.Score > 10) THEN TRUE ELSE FALSE END AS HasHighScoringComment
+FROM Users AS u
+LEFT JOIN UserPostActivity AS upa
+  ON u.Id = upa.OwnerUserId
+LEFT JOIN TopEditors AS te
+  ON u.Id = te.UserId
+WHERE
+  u.Reputation > 1000
+  AND u.LastAccessDate BETWEEN DATE('now', '-1 year') AND DATE('now')
+  AND (upa.TotalPosts IS NULL OR upa.TotalPosts > 5)
+ORDER BY
+  u.Reputation DESC,
+  upa.AverageScore DESC
+LIMIT 100;

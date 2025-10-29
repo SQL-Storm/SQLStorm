@@ -1,0 +1,171 @@
+WITH RecursiveTagRelations AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        u.Id AS OwnerUserId,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY p.Score DESC) AS TagPostRank
+    FROM Tags t
+    JOIN Posts p ON p.Tags ILIKE CONCAT('%<', t.TagName, '>%')
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+),
+TopTagPosts AS (
+    SELECT TagId, PostId, PostScore, OwnerUserId
+    FROM RecursiveTagRelations
+    WHERE TagPostRank <= 5
+),
+UserBadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(MAX(b.Date), CAST('1900-01-01' AS timestamp)) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+LatestEdits AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastEditDate,
+        STRING_AGG(pht.Name, ', ' ORDER BY pht.Id) AS EditTypes
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    WHERE ph.PostId IN (SELECT PostId FROM TopTagPosts)
+      AND ph.PostHistoryTypeId IN (4,5,6)
+    GROUP BY ph.PostId
+),
+PostVoteStats AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters,
+        SUM(COALESCE(v.BountyAmount,0)) AS TotalBounty
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.Id IN (SELECT PostId FROM TopTagPosts)
+    GROUP BY p.Id
+),
+PostCommentsSummary AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(COALESCE(u.DisplayName, c.UserDisplayName, 'Anonymous'), ', ' ORDER BY MAX(c.CreationDate) DESC) AS RecentCommenters
+    FROM Comments c
+    LEFT JOIN Users u ON u.Id = c.UserId
+    WHERE c.PostId IN (SELECT PostId FROM TopTagPosts)
+    GROUP BY c.PostId
+),
+CombinedPostData AS (
+    SELECT
+        t.TagName,
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation,
+        u.Location,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.LastBadgeDate,
+        le.LastEditDate,
+        le.EditTypes,
+        pvs.UpVotes,
+        pvs.DownVotes,
+        pvs.UniqueVoters,
+        pvs.TotalBounty,
+        pcs.CommentCount,
+        pcs.LastCommentDate,
+        pcs.RecentCommenters,
+        ttp.OwnerUserId
+    FROM TopTagPosts ttp
+    JOIN Posts p ON p.Id = ttp.PostId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN UserBadgeSummary us ON us.UserId = u.Id
+    LEFT JOIN LatestEdits le ON le.PostId = p.Id
+    LEFT JOIN PostVoteStats pvs ON pvs.PostId = p.Id
+    LEFT JOIN PostCommentsSummary pcs ON pcs.PostId = p.Id
+    LEFT JOIN Tags t ON t.Id = ttp.TagId
+    WHERE ttp.TagId = ttp.TagId
+),
+RankedPosts AS (
+    SELECT
+        *,
+        RANK() OVER (PARTITION BY TagName ORDER BY Score DESC, ViewCount DESC, CreationDate DESC) AS PostRank,
+        ROW_NUMBER() OVER (PARTITION BY OwnerName ORDER BY Score DESC) AS UserTopPostRank
+    FROM CombinedPostData
+),
+FilteredPosts AS (
+    SELECT *
+    FROM RankedPosts
+    WHERE PostRank <= 3
+      AND (COALESCE(GoldBadges,0) + COALESCE(SilverBadges,0) + COALESCE(BronzeBadges,0)) > 0
+      AND CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+      AND (UpVotes > DownVotes OR UpVotes IS NULL)
+      AND COALESCE(TotalBounty,0) > 0
+      AND Location IS NOT NULL
+      AND LOWER(Location) NOT LIKE '%unknown%'
+)
+SELECT
+    fp.TagName,
+    fp.PostId,
+    fp.Title,
+    fp.CreationDate,
+    fp.Score,
+    fp.ViewCount,
+    fp.AnswerCount,
+    fp.OwnerName,
+    fp.OwnerReputation,
+    fp.Location,
+    fp.GoldBadges,
+    fp.SilverBadges,
+    fp.BronzeBadges,
+    fp.LastBadgeDate,
+    fp.LastEditDate,
+    fp.EditTypes,
+    fp.UpVotes,
+    fp.DownVotes,
+    fp.UniqueVoters,
+    fp.TotalBounty,
+    fp.CommentCount,
+    fp.LastCommentDate,
+    regexp_replace(fp.RecentCommenters, '[^\\w, ]', '', 'g') AS SanitizedRecentCommenters,
+    ROUND(fp.AnswerCount * 1.0 / NULLIF(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - fp.CreationDate))/86400,0), 4) AS AnswersPerDay,
+    CASE WHEN fp.Score > 10 AND fp.ViewCount > 5000 AND fp.UpVotes > 100 THEN 'Highly Active'
+         WHEN fp.Score > 0 THEN 'Active'
+         ELSE 'Less Active' END AS PostActivityLevel,
+    (
+        SELECT COUNT(*)
+        FROM Comments c2
+        JOIN Posts p2 ON p2.Id = c2.PostId
+        WHERE c2.UserId = fp.OwnerUserId
+          AND p2.OwnerUserId = fp.OwnerUserId
+          AND c2.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    ) AS OwnerRecentCommentCount,
+    (
+        SELECT string_agg(DISTINCT tag_sub.tag, ', ') FROM (
+            SELECT unnest(string_to_array(substring(p3.Tags from 2 for char_length(p3.Tags) - 2), '><')) AS tag
+            FROM Posts p3
+            WHERE p3.OwnerUserId = fp.OwnerUserId AND p3.PostTypeId = 1
+        ) AS tag_sub
+    ) AS OwnerDistinctTags,
+    fp.OwnerUserId
+FROM FilteredPosts fp
+LEFT JOIN Users uo ON uo.DisplayName = fp.OwnerName
+ORDER BY fp.TagName, fp.Score DESC, fp.ViewCount DESC
+LIMIT 100;

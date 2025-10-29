@@ -1,0 +1,55 @@
+-- {"query": "6619.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 638} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) AS TotalWikis,
+    COUNT(DISTINCT p.AcceptedAnswerId) AS TotalAcceptedAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) * 
+    (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId = 1) AS AverageAnswersPerQuestion,
+    SUM(p.Score) AS TotalScore,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalViewsOnQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.ViewCount ELSE 0 END) AS TotalViewsOnAnswers,
+    MAX(u.LastAccessDate) AS LastAccess,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.LastActivityDate) AS LastActivityDate,
+    COUNT(DISTINCT b.Id) AS TotalBadges,
+    SUM(v.BountyAmount) AS TotalBounty,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN p.Id ELSE NULL END) AS TotalDuplicates,
+    (
+        SELECT COUNT(*) 
+        FROM Posts 
+        WHERE Posts.Id = p.Id AND Posts.PostTypeId = 1 AND Posts.ClosedDate IS NOT NULL
+    ) AS TotalClosedQuestions,
+    (
+        SELECT STRING_AGG(TagName, ', ')
+        FROM Tags 
+        JOIN Posts ON Tags.ExcerptPostId = Posts.Id
+        WHERE Posts.Id = p.Id
+    ) AS TagList
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Votes v ON u.Id = v.UserId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+WHERE 
+    (u.Reputation > 10000 OR u.Reputation IS NULL)
+    AND (p.CreationDate >= '2020-01-01' OR p.CreationDate IS NULL)
+    AND (ph.Comment IS NOT NULL AND ph.Comment NOT LIKE '%Duplicate%')
+GROUP BY 
+    u.Id
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    TotalScore DESC, 
+    TotalPosts DESC;

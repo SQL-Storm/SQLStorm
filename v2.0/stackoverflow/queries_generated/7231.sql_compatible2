@@ -1,0 +1,241 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2) END, ', ') AS AllTags,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) AS HighViewQuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 10 THEN p.Id END) AS HighScoreAnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.Id END) AS QuestionWithAnswersCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.CommentCount > 0 THEN p.Id END) AS QuestionWithCommentsCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.LastEditDate IS NOT NULL THEN p.Id END) AS EditedAnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) AS ClosedQuestionCount,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount END) AS MaxQuestionViewCount,
+        MIN(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS MinAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        us.*,
+        ROW_NUMBER() OVER (ORDER BY TotalQuestionScore DESC, Reputation DESC) AS RankByScore,
+        RANK() OVER (ORDER BY BadgeCount DESC, PostCount DESC) AS RankByBadges,
+        DENSE_RANK() OVER (ORDER BY AvgQuestionScore DESC, AvgAnswerScore DESC) AS RankByPerformance
+    FROM UserStats us
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT ph.Id) AS HistoryCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) AS CloseReopenDeleteCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1, 4, 5, 6) THEN ph.Id END) AS EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (24, 35, 36, 37, 38) THEN ph.Id END) AS MigrationCount,
+        MAX(ph.CreationDate) AS LastActivityDate,
+        COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 12, 13, 25) THEN 1 ELSE 0 END), 0) AS ClosureEvents,
+        COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId IN (11, 13) THEN 1 ELSE 0 END), 0) AS ReopenEvents
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE u.Reputation > 5000
+    GROUP BY u.Id, u.DisplayName
+),
+PerformanceStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        STRING_AGG(DISTINCT p.Title, ', ') AS PostTitles,
+        STRING_AGG(DISTINCT p.Tags, ', ') AS AllPostTags,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.Score) AS MaxScore,
+        MIN(p.Score) AS MinScore,
+        SUM(CASE WHEN p.Score > 100 OR (p.PostTypeId = 1 AND p.ViewCount > 10000) THEN 1 ELSE 0 END) AS HighImpactPosts,
+        COUNT(DISTINCT p.OwnerUserId) AS DistinctOwnerCount,
+        COUNT(DISTINCT p.ParentId) AS AnswerParentCount,
+        COUNT(DISTINCT CASE WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN p.Id END) AS TaggedPosts,
+        COUNT(DISTINCT CASE WHEN p.CreationDate >= DATE '2020-01-01' THEN p.Id END) AS RecentPosts,
+        COUNT(DISTINCT CASE WHEN p.CreationDate BETWEEN DATE '2019-01-01' AND DATE '2019-12-31' THEN p.Id END) AS Year2019Posts
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation >= 10000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+CombinedStats AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.BadgeCount,
+        tu.LastPostDate,
+        tu.CommentCount,
+        tu.TotalQuestionScore,
+        tu.TotalAnswerScore,
+        tu.AvgQuestionScore,
+        tu.AvgAnswerScore,
+        tu.AllTags,
+        tu.HighViewQuestionCount,
+        tu.HighScoreAnswerCount,
+        tu.QuestionWithAnswersCount,
+        tu.QuestionWithCommentsCount,
+        tu.EditedAnswerCount,
+        tu.ClosedQuestionCount,
+        tu.MaxQuestionViewCount,
+        tu.MinAnswerScore,
+        tu.RankByScore,
+        tu.RankByBadges,
+        tu.RankByPerformance,
+        ua.HistoryCount,
+        ua.CloseReopenDeleteCount,
+        ua.EditCount,
+        ua.MigrationCount,
+        ua.LastActivityDate,
+        ua.ClosureEvents,
+        ua.ReopenEvents,
+        ps.PostCount AS PerfPostCount,
+        ps.QuestionCount AS PerfQuestionCount,
+        ps.AnswerCount AS PerfAnswerCount,
+        ps.PostTitles,
+        ps.AllPostTags,
+        ps.LastPostDate AS PerfLastPostDate,
+        ps.BadgeCount AS PerfBadgeCount,
+        ps.TotalScore,
+        ps.AvgScore,
+        ps.MaxScore,
+        ps.MinScore,
+        ps.HighImpactPosts,
+        ps.DistinctOwnerCount,
+        ps.AnswerParentCount AS PerfAnswerParentCount,
+        ps.TaggedPosts,
+        ps.RecentPosts,
+        ps.Year2019Posts
+    FROM TopUsers tu
+    INNER JOIN UserActivity ua ON tu.UserId = ua.UserId
+    INNER JOIN PerformanceStats ps ON tu.UserId = ps.UserId
+)
+SELECT 
+    cs.UserId,
+    cs.DisplayName,
+    cs.Reputation,
+    cs.PostCount,
+    cs.QuestionCount,
+    cs.AnswerCount,
+    cs.BadgeCount,
+    cs.LastPostDate,
+    cs.CommentCount,
+    cs.TotalQuestionScore,
+    cs.TotalAnswerScore,
+    cs.AvgQuestionScore,
+    cs.AvgAnswerScore,
+    cs.AllTags,
+    cs.HighViewQuestionCount,
+    cs.HighScoreAnswerCount,
+    cs.QuestionWithAnswersCount,
+    cs.QuestionWithCommentsCount,
+    cs.EditedAnswerCount,
+    cs.ClosedQuestionCount,
+    cs.MaxQuestionViewCount,
+    cs.MinAnswerScore,
+    cs.RankByScore,
+    cs.RankByBadges,
+    cs.RankByPerformance,
+    cs.HistoryCount,
+    cs.CloseReopenDeleteCount,
+    cs.EditCount,
+    cs.MigrationCount,
+    cs.LastActivityDate,
+    cs.ClosureEvents,
+    cs.ReopenEvents,
+    cs.PerfPostCount,
+    cs.PerfQuestionCount,
+    cs.PerfAnswerCount,
+    cs.PostTitles,
+    cs.AllPostTags,
+    cs.PerfLastPostDate,
+    cs.PerfBadgeCount,
+    cs.TotalScore,
+    cs.AvgScore,
+    cs.MaxScore,
+    cs.MinScore,
+    cs.HighImpactPosts,
+    cs.DistinctOwnerCount,
+    cs.PerfAnswerParentCount,
+    cs.TaggedPosts,
+    cs.RecentPosts,
+    cs.Year2019Posts,
+    CASE WHEN cs.Reputation > 100000 THEN 'Elite' ELSE 'Regular' END AS UserTier,
+    CASE WHEN cs.HistoryCount > 1000 THEN 'HighlyActive' ELSE 'Moderate' END AS ActivityLevel,
+    CASE WHEN cs.HighImpactPosts > 10 THEN 'Influencer' ELSE 'Contributor' END AS ImpactLevel,
+    CASE WHEN cs.BadgeCount > 100 THEN 'Accomplished' ELSE 'Achiever' END AS AchievementLevel,
+    COALESCE(
+        CASE WHEN cs.MaxScore - cs.MinScore > 100 THEN 'HighVariation' ELSE 'ModerateVariation' END,
+        'N/A'
+    ) AS ScoreVariation,
+    (CASE WHEN cs.PostCount > 0 THEN cs.TotalScore / cs.PostCount ELSE 0 END) AS AvgScorePerPost,
+    (CASE WHEN cs.QuestionCount > 0 THEN cs.TotalQuestionScore / cs.QuestionCount ELSE 0 END) AS AvgQuestionScorePerQuestion,
+    (CASE WHEN cs.AnswerCount > 0 THEN cs.TotalAnswerScore / cs.AnswerCount ELSE 0 END) AS AvgAnswerScorePerAnswer,
+    GREATEST(0, cs.PerfBadgeCount - cs.HistoryCount) AS BadgeAdjustment,
+    COALESCE(
+        (CHAR_LENGTH(cs.AllTags) - CHAR_LENGTH(REPLACE(cs.AllTags, ',', '')) + 1) / NULLIF((CHAR_LENGTH(cs.AllTags) - CHAR_LENGTH(REPLACE(cs.AllTags, ' ', '')) + 1), 0),
+        0
+    ) AS AvgTagsPerPost,
+    (cs.RecentPosts * 100.0 / NULLIF(cs.PostCount, 0)) AS RecentPostsPercentage,
+    CASE WHEN cs.Year2019Posts > 0 THEN 'Active2019' ELSE 'Inactive2019' END AS Year2019Status,
+    CASE WHEN cs.QuestionCount > 0 AND cs.AnswerCount > 0 THEN ROUND((cs.AnswerCount * 100.0 / cs.QuestionCount), 2) ELSE 0 END AS AnswerToQuestionRatio,
+    CASE WHEN cs.TotalAnswerScore > 0 THEN ROUND((cs.TotalQuestionScore * 100.0 / cs.TotalAnswerScore), 2) ELSE 0 END AS QuestionToAnswerScoreRatio,
+    CASE WHEN cs.HistoryCount > 0 THEN (cs.CloseReopenDeleteCount * 100.0 / cs.HistoryCount) ELSE 0 END AS ClosureToHistoryRatio,
+    CASE WHEN cs.HistoryCount > 0 THEN (cs.MigrationCount * 100.0 / cs.HistoryCount) ELSE 0 END AS MigrationToHistoryRatio,
+    CASE WHEN cs.HistoryCount > 100 THEN 1 ELSE 0 END AS SignificantActivity,
+    CASE WHEN cs.TaggedPosts > 10 THEN 1 ELSE 0 END AS WellTagged,
+    CASE WHEN cs.HighImpactPosts > 5 THEN 1 ELSE 0 END AS HighImpactUser,
+    CASE WHEN cs.BadgeCount >= 50 AND cs.HistoryCount >= 500 THEN 1 ELSE 0 END AS VeteranUser,
+    ROUND(AVG(cs.TotalScore) OVER (ORDER BY cs.Reputation ROWS BETWEEN 10 PRECEDING AND CURRENT ROW), 2) AS MovingAverageScore,
+    LAG(cs.Reputation, 1) OVER (ORDER BY cs.Reputation) AS PreviousReputation,
+    LAG(cs.PostCount, 1) OVER (ORDER BY cs.Reputation) AS PreviousPostCount,
+    LEAD(cs.Reputation, 1) OVER (ORDER BY cs.Reputation) AS NextReputation,
+    ROW_NUMBER() OVER (ORDER BY cs.Reputation DESC) AS OverallRank,
+    DENSE_RANK() OVER (ORDER BY cs.Reputation DESC) AS ReputationRank,
+    RANK() OVER (ORDER BY cs.TotalScore DESC) AS ScoreRank,
+    NTILE(4) OVER (ORDER BY cs.BadgeCount DESC) AS BadgeQuartile,
+    CASE WHEN RANK() OVER (ORDER BY cs.Reputation DESC) <= 100 THEN 'Top100' ELSE 'Others' END AS ReputationTier,
+    CASE WHEN cs.Reputation BETWEEN 10000 AND 99999 THEN 'ModerateElite' WHEN cs.Reputation >= 100000 THEN 'Elite' ELSE 'Standard' END AS EliteStatus,
+    CASE WHEN cs.QuestionCount > 0 AND cs.AnswerCount > 0 THEN 1 ELSE 0 END AS HasBothPosts,
+    CASE WHEN cs.Reputation > 10000 AND cs.HistoryCount > 100 THEN 1 ELSE 0 END AS ActiveElite,
+    CASE WHEN cs.LastPostDate >= DATE '2023-01-01' THEN 1 ELSE 0 END AS RecentActive,
+    CASE WHEN cs.LastActivityDate >= DATE '2023-01-01' THEN 1 ELSE 0 END AS RecentActivity
+FROM CombinedStats cs
+WHERE cs.Reputation > 10000
+  AND cs.PostCount > 0
+  AND cs.BadgeCount >= 10
+  AND cs.HistoryCount >= 50
+  AND cs.RecentPosts > 0
+  AND cs.Year2019Posts > 0
+  AND (cs.TotalAnswerScore > 100 OR cs.TotalQuestionScore > 100)
+ORDER BY cs.Reputation DESC, cs.HistoryCount DESC
+LIMIT 1000;

@@ -1,0 +1,89 @@
+-- {"query": "4843.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1043} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        ROW_NUMBER() OVER(PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) as rn_score,
+        AVG(p.Score) OVER(PARTITION BY p.PostTypeId) as avg_score_by_type,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 1
+            ELSE 0
+        END AS is_closed,
+        SUM(CASE WHEN c.Id IS NOT NULL THEN 1 ELSE 0 END) OVER(PARTITION BY p.Id) as comment_count_aggregated
+    FROM
+        Posts p
+    LEFT JOIN
+        PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    WHERE p.OwnerUserId IS NOT NULL AND p.CreationDate > '2023-01-01'
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS linked_post_count,
+        MAX(pl.CreationDate) AS latest_link_date
+    FROM
+        PostLinks pl
+    WHERE pl.LinkTypeId = 1
+    GROUP BY pl.PostId
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.OwnerDisplayName,
+    rp.PostCreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.ClosedDate,
+    rp.is_closed,
+    rp.avg_score_by_type,
+    rp.comment_count_aggregated,
+    COALESCE(pla.linked_post_count, 0) AS total_linked_posts,
+    CASE
+        WHEN rp.rn_score <= 10 THEN 'Top 10 by Score'
+        WHEN rp.Score > rp.avg_score_by_type * 2 THEN 'Above Average Score (x2)'
+        WHEN rp.comment_count_aggregated > 50 THEN 'High Comment Activity'
+        ELSE 'Standard Activity'
+    END AS performance_category,
+    UPPER(LEFT(COALESCE(rp.OwnerDisplayName, 'Anonymous User'), 3)) AS owner_initials,
+    CASE
+        WHEN DATEDIFF(day, rp.PostCreationDate, GETDATE()) > 365 THEN 'Older Than 1 Year'
+        WHEN DATEDIFF(day, rp.PostCreationDate, GETDATE()) BETWEEN 30 AND 365 THEN '30 Days to 1 Year'
+        ELSE 'Less Than 30 Days'
+    END AS age_group,
+    CASE
+        WHEN rp.FavoriteCount > 100 AND rp.Score > 500 THEN 'Highly Favorited and Scored'
+        WHEN rp.ViewCount > 100000 THEN 'High View Count'
+        ELSE 'Moderate Activity'
+    END AS engagement_level,
+    CASE WHEN rp.OwnerUserId = 1 THEN 'Community User' ELSE 'Regular User' END AS owner_type,
+    COALESCE(rp.OwnerDisplayName, rp.OwnerUserId::VARCHAR) AS display_name_or_id,
+    CASE
+        WHEN rp.PostTypeName = 'Question' AND rp.AnswerCount = 0 AND rp.CommentCount > 0 AND rp.ClosedDate IS NULL AND rp.CreationDate < DATEADD(month, -6, GETDATE()) THEN 'Unanswered Question with Comments (Old)'
+        WHEN rp.PostTypeName = 'Answer' AND rp.Score < 0 AND rp.CreationDate < DATEADD(month, -3, GETDATE()) THEN 'Negatively Scored Old Answer'
+        ELSE 'Other'
+    END AS special_status
+FROM
+    RankedPosts rp
+LEFT JOIN
+    PostLinkAnalysis pla ON rp.PostId = pla.PostId
+WHERE
+    rp.rn_score <= 100 OR rp.Score > rp.avg_score_by_type * 1.5
+ORDER BY
+    rp.PostTypeId, rp.Score DESC;

@@ -1,0 +1,35 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(ph.CreationDate) AS LatestPostHistory,
+    STRING_AGG(DISTINCT p.Tags, ', ') AS CommonTags,
+    MAX(v.BountyAmount) AS HighestBounty
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+WHERE 
+    u.Reputation > 1000
+    AND p.PostTypeId IN (1, 2)
+    AND ph.PostHistoryTypeId = 5
+    AND ph.CreationDate BETWEEN DATE_TRUNC('month', CAST('2024-10-01' AS DATE)) AND CAST('2024-10-01' AS DATE)
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location
+HAVING 
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) > 5
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC
+LIMIT 100;

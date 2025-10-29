@@ -1,0 +1,247 @@
+-- {"query": "7112.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2426} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_date,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) as avg_score_3posts,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as score_rank,
+        NTILE(100) OVER (ORDER BY p.Score) as score_percentile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) as QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        AVG(p.Score) as AvgScore,
+        COUNT(DISTINCT p.Tags) as DistinctTagCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        CASE 
+            WHEN MAX(p.CreationDate) < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' THEN 'Inactive'
+            WHEN MAX(p.CreationDate) < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days' THEN 'Active'
+            ELSE 'VeryActive'
+        END as ActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        p.Id as RelatedPostId,
+        p.Title as RelatedPostTitle,
+        p.Score as RelatedPostScore,
+        p.CreationDate as RelatedPostDate,
+        CASE WHEN p.Score > 10 THEN 'High' ELSE 'Low' END as ScoreCategory,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY p.CreationDate DESC) as post_rank,
+        RANK() OVER (ORDER BY t.Count DESC) as tag_rank
+    FROM Tags t
+    INNER JOIN Posts p ON t.WikiPostId = p.Id OR t.ExcerptPostId = p.Id
+    WHERE p.PostTypeId = 1 AND p.Score IS NOT NULL
+),
+ComplexQuery AS (
+    SELECT 
+        rp.Id as PostId,
+        rp.Title,
+        rp.Score,
+        rp.ViewCount,
+        rp.TagAnalysisCount,
+        rp.LastActivityDate,
+        rp.rn as PostRank,
+        rp.prev_score,
+        rp.prev_date,
+        rp.avg_score_3posts,
+        CASE 
+            WHEN rp.score_rank <= 10 THEN 'Top10'
+            WHEN rp.score_rank <= 100 THEN 'Top100'
+            ELSE 'Other'
+        END as ScoreTier,
+        rp.score_percentile,
+        u.DisplayName as AuthorName,
+        u.Reputation as AuthorReputation,
+        ua.ActivityLevel,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.TotalScore,
+        ta.TagName,
+        ta.Count as TagCount,
+        ta.RelatedPostScore,
+        ta.RelatedPostDate,
+        CASE 
+            WHEN rp.Score > 0 AND rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'AboveAverage'
+            WHEN rp.Score = 0 THEN 'ZeroScore'
+            ELSE 'BelowAverage'
+        END as ScorePerformance,
+        DATEDIFF('DAY', rp.prev_date, rp.CreationDate) as DaysSinceLastPost,
+        CASE 
+            WHEN ua.QuestionCount > 10 AND ua.AnswerCount > 5 THEN 'ActiveContributor'
+            WHEN ua.QuestionCount > 5 OR ua.AnswerCount > 2 THEN 'RegularContributor'
+            ELSE 'OccasionalContributor'
+        END as ContributorType,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rp.Id AND v.VoteTypeId = 2) as Upvotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rp.Id AND v.VoteTypeId = 3) as Downvotes,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.Id),
+            0
+        ) as CommentCount,
+        CASE 
+            WHEN rp.AnswerCount > 0 AND (rp.AnswerCount * 1.0 / NULLIF(rp.ViewCount, 0)) > 0.1 THEN 'HighAnswerRatio'
+            WHEN rp.AnswerCount = 0 THEN 'NoAnswers'
+            ELSE 'LowAnswerRatio'
+        END as AnswerRatioCategory,
+        COALESCE(
+            (SELECT Name FROM Badges b WHERE b.UserId = rp.OwnerUserId ORDER BY b.Date DESC LIMIT 1),
+            'NoBadge'
+        ) as RecentBadge,
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = rp.Id AND pl.LinkTypeId = 3) THEN 'DuplicatePost'
+            WHEN EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = rp.Id AND ph.PostHistoryTypeId = 10) THEN 'ClosedPost'
+            ELSE 'RegularPost'
+        END as PostStatus,
+        CASE 
+            WHEN rp.Tags IS NOT NULL AND LENGTH(rp.Tags) > 0 THEN 
+                (SELECT STRING_AGG(TRIM(SUBSTR(rp.Tags, pos + 1, CHARINDEX('>', rp.Tags, pos) - pos - 1)), ', ')
+                 FROM (SELECT 1 as pos UNION ALL SELECT 4 UNION ALL SELECT 7 UNION ALL SELECT 10) p
+                 WHERE pos <= LENGTH(rp.Tags) AND SUBSTR(rp.Tags, pos, 1) = '<')
+            ELSE 'NoTags'
+        END as ExtractedTags
+    FROM RankedPosts rp
+    INNER JOIN Users u ON rp.OwnerUserId = u.Id
+    LEFT JOIN UserActivity ua ON u.Id = ua.UserId
+    LEFT JOIN TagAnalysis ta ON ta.RelatedPostId = rp.Id
+    WHERE rp.PostTypeId = 1 
+        AND (rp.CreationDate BETWEEN cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days' AND cast('2024-10-01 12:34:56' as timestamp))
+        AND (rp.Score BETWEEN 0 AND 500)
+        AND (ua.QuestionCount > 1 OR ua.AnswerCount > 1)
+        AND rp.score_rank <= 500
+        AND (rp.avg_score_3posts BETWEEN 0 AND 100)
+        AND ta.TagName IS NOT NULL
+)
+SELECT 
+    cq.PostId,
+    cq.Title,
+    cq.Score,
+    cq.ViewCount,
+    cq.TagAnalysisCount,
+    cq.LastActivityDate,
+    cq.PostRank,
+    cq.prev_score,
+    cq.prev_date,
+    cq.avg_score_3posts,
+    cq.ScoreTier,
+    cq.score_percentile,
+    cq.AuthorName,
+    cq.AuthorReputation,
+    cq.ActivityLevel,
+    cq.QuestionCount,
+    cq.AnswerCount,
+    cq.TotalScore,
+    cq.TagName,
+    cq.TagCount,
+    cq.RelatedPostScore,
+    cq.RelatedPostDate,
+    cq.ScorePerformance,
+    cq.DaysSinceLastPost,
+    cq.ContributorType,
+    cq.Upvotes,
+    cq.Downvotes,
+    cq.CommentCount,
+    cq.AnswerRatioCategory,
+    cq.RecentBadge,
+    cq.PostStatus,
+    cq.ExtractedTags,
+    CONCAT(
+        'Post #', 
+        cq.PostId, 
+        ' by ', 
+        cq.AuthorName, 
+        ' with ', 
+        cq.Score, 
+        ' score and ', 
+        cq.CommentCount, 
+        ' comments'
+    ) as PostSummary,
+    CASE 
+        WHEN cq.Score > 100 AND cq.AnswerCount > 10 AND cq.CommentCount > 5 THEN 'HighValuePost'
+        WHEN cq.Score > 50 AND cq.AnswerCount > 5 AND cq.CommentCount > 2 THEN 'MediumValuePost'
+        ELSE 'LowValuePost'
+    END as PostValueCategory,
+    CASE 
+        WHEN cq.ActivityLevel = 'VeryActive' AND cq.Score > 50 THEN 'TopContributor'
+        WHEN cq.ActivityLevel = 'Active' AND cq.Score > 25 THEN 'RegularContributor'
+        ELSE 'OccasionalContributor'
+    END as ContributorRank
+FROM ComplexQuery cq
+WHERE cq.PostId IN (SELECT Id FROM Posts WHERE ParentId IS NOT NULL)
+UNION ALL
+SELECT 
+    NULL as PostId,
+    'AGGREGATED_METRICS' as Title,
+    SUM(cq.Score) as Score,
+    SUM(cq.ViewCount) as ViewCount,
+    COUNT(*) as TagAnalysisCount,
+    MAX(cq.LastActivityDate) as LastActivityDate,
+    NULL as PostRank,
+    AVG(cq.prev_score) as prev_score,
+    NULL as prev_date,
+    AVG(cq.avg_score_3posts) as avg_score_3posts,
+    'AGGREGATE' as ScoreTier,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cq.score_percentile) as score_percentile,
+    'METRICS' as AuthorName,
+    SUM(cq.AuthorReputation) as AuthorReputation,
+    'AGGREGATED' as ActivityLevel,
+    SUM(cq.QuestionCount) as QuestionCount,
+    SUM(cq.AnswerCount) as AnswerCount,
+    SUM(cq.TotalScore) as TotalScore,
+    'ALL_TAGS' as TagName,
+    COUNT(DISTINCT cq.TagName) as TagCount,
+    AVG(cq.RelatedPostScore) as RelatedPostScore,
+    NULL as RelatedPostDate,
+    'AGGREGATE' as ScorePerformance,
+    NULL as DaysSinceLastPost,
+    'AGGREGATED' as ContributorType,
+    SUM(cq.Upvotes) as Upvotes,
+    SUM(cq.Downvotes) as Downvotes,
+    SUM(cq.CommentCount) as CommentCount,
+    'AGGREGATED' as AnswerRatioCategory,
+    'AGGREGATED' as RecentBadge,
+    'AGGREGATED' as PostStatus,
+    'AGGREGATED' as ExtractedTags,
+    'AGGREGATED_METRICS_SUMMARY' as PostSummary,
+    'AGGREGATED_CATEGORY' as PostValueCategory,
+    'AGGREGATED_RANK' as ContributorRank
+FROM ComplexQuery cq
+WHERE cq.PostId IS NOT NULL
+GROUP BY cq.TagName
+HAVING COUNT(*) >= 0
+ORDER BY 
+   CASE WHEN cq.PostId IS NULL THEN 1 ELSE 0 END,
+    cq.Score DESC,
+    cq.ViewCount DESC,
+    cq.LastActivityDate DESC;

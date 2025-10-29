@@ -1,0 +1,156 @@
+WITH 
+    TopQuestions AS (
+        SELECT 
+            p.Id AS QuestionId,
+            p.OwnerUserId,
+            p.Title,
+            p.Score,
+            p.ViewCount,
+            p.CreationDate,
+            p.Tags,
+            p.FavoriteCount,
+            COALESCE(p.AcceptedAnswerId, 0) AS HasAcceptedAnswer,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn_q
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.OwnerUserId IS NOT NULL
+    ),
+    QuestionVotes AS (
+        SELECT 
+            v.PostId,
+            SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes,
+            COUNT(*) AS TotalVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        GROUP BY v.PostId
+    ),
+    AnswerStats AS (
+        SELECT 
+            p.ParentId AS QuestionId,
+            SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveAnswers,
+            SUM(CASE WHEN p.Score <= 0 THEN 1 ELSE 0 END) AS NonPositiveAnswers,
+            MAX(p.Score) AS MaxAnswerScore,
+            AVG(p.Score) AS AvgAnswerScore
+        FROM Posts p
+        WHERE p.PostTypeId = 2
+        GROUP BY p.ParentId
+    ),
+    UserReputation AS (
+        SELECT 
+            u.Id AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate AS UserCreation,
+            u.LastAccessDate,
+            COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVotes,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadgeCount,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadgeCount,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadgeCount,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rn_user
+        FROM Users u
+    ),
+    RecentBadges AS (
+        SELECT 
+            b.UserId,
+            STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Date >= CAST('2024-10-01' AS date) - INTERVAL '30' DAY) AS RecentBadgeNames,
+            COUNT(*) FILTER (WHERE b.Date >= CAST('2024-10-01' AS date) - INTERVAL '30' DAY) AS RecentBadgeCount
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    TagInfo AS (
+        SELECT 
+            t.TagName,
+            t.Count AS TagUseCount,
+            CASE WHEN t.IsModeratorOnly IS TRUE THEN 1 ELSE 0 END AS IsModOnly,
+            CASE WHEN t.IsRequired IS TRUE THEN 1 ELSE 0 END AS IsRequired,
+            p.Title AS WikiTitle,
+            pn."Text" AS WikiExcerpt
+        FROM Tags t
+        LEFT JOIN Posts p  ON t.WikiPostId    = p.Id
+        LEFT JOIN Posts pn ON t.ExcerptPostId = pn.Id
+    )
+SELECT 
+    ur.UserId,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.NetVotes,
+    ur.GoldBadgeCount,
+    ur.SilverBadgeCount,
+    ur.BronzeBadgeCount,
+    rb.RecentBadgeCount,
+    COALESCE(rb.RecentBadgeNames,'') AS RecentBadgeNames,
+    tq.QuestionId,
+    tq.Title,
+    tq.Score AS QuestionScore,
+    tq.ViewCount,
+    tq.FavoriteCount,
+    CASE WHEN tq.HasAcceptedAnswer > 0 THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+    qv.UpVotes AS QuestionUpVotes,
+    qv.DownVotes AS QuestionDownVotes,
+    qv.TotalVotes AS QuestionTotalVotes,
+    asb.PositiveAnswers,
+    asb.NonPositiveAnswers,
+    asb.MaxAnswerScore,
+    asb.AvgAnswerScore,
+    ROW_NUMBER() OVER (PARTITION BY ur.UserId ORDER BY tq.Score DESC) AS QuestionRankWithinUser,
+    CASE 
+        WHEN tq.Tags IS NOT NULL THEN 
+            split_part(substr(tq.Tags, 2, length(tq.Tags)-2), '><', 1)
+        ELSE NULL
+    END AS PrimaryTag,
+    ti.TagUseCount,
+    ti.IsModOnly,
+    ti.IsRequired,
+    ti.WikiTitle,
+    LEFT(ti.WikiExcerpt, 200) AS WikiExcerptSnippet
+FROM UserReputation ur
+LEFT JOIN RecentBadges   rb ON ur.UserId = rb.UserId
+LEFT JOIN TopQuestions   tq ON ur.UserId = tq.OwnerUserId AND tq.rn_q = 1
+LEFT JOIN QuestionVotes  qv ON tq.QuestionId = qv.PostId
+LEFT JOIN AnswerStats    asb ON tq.QuestionId = asb.QuestionId
+LEFT JOIN TagInfo        ti ON 
+    (CASE 
+        WHEN tq.Tags IS NOT NULL THEN split_part(substr(tq.Tags, 2, length(tq.Tags)-2), '><', 1)
+        ELSE NULL
+    END) = ti.TagName
+WHERE ur.rn_user <= 1000
+  AND (tq.Score IS NULL OR tq.Score > 0)
+
+UNION ALL
+
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0),
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1),
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2),
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3),
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM Users u
+WHERE u.Reputation > (SELECT AVG(Reputation) FROM Users)
+  AND NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.Score >= 10)
+
+ORDER BY Reputation DESC
+LIMIT 50;

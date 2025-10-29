@@ -1,0 +1,30 @@
+-- {"query": "5250.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 376} 
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS QuestionCount,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+  MAX(u.CreationDate) AS LastActiveDate,
+  STRING_AGG(DISTINCT b.Name, ',') FILTER (WHERE b.TagBased = 1) AS TaggedBadges,
+  AVG(COALESCE(p.Score, 0)) AS AvgPostScore,
+  SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionViews,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2,3)
+  LEFT JOIN Badges b ON b.UserId = u.Id
+WHERE
+  u.AccountId IS NOT NULL
+  AND u.Reputation > 100
+  AND u.LastAccessDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation
+HAVING
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) > 5
+ORDER BY
+  TotalQuestionViews DESC, UpvotesReceived - DownvotesReceived DESC
+LIMIT 100;

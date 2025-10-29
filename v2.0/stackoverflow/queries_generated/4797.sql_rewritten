@@ -1,0 +1,122 @@
+-- {"query": "4797.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1465} 
+WITH PostVoteCounts AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE NULL END) AS UpVoteCount,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE NULL END) AS DownVoteCount,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) - SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS NetVoteScore,
+        MAX(CASE WHEN vt.Name = 'AcceptedByOriginator' THEN v.CreationDate ELSE NULL END) AS AcceptedDate
+    FROM Posts p
+    JOIN Votes v ON p.Id = v.PostId
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE vt.Name IN ('UpMod', 'DownMod', 'AcceptedByOriginator')
+    GROUP BY p.Id
+),
+AnswerDetails AS (
+    SELECT
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.OwnerUserId AS AnswererUserId,
+        p.CreationDate AS AnswerCreationDate,
+        pvc.UpVoteCount AS AnswerUpVotes,
+        pvc.DownVoteCount AS AnswerDownVotes,
+        pvc.NetVoteScore AS AnswerNetVoteScore,
+        ROW_NUMBER() OVER(PARTITION BY p.ParentId ORDER BY COALESCE(pvc.NetVoteScore, 0) DESC, pvc.AcceptedDate DESC, p.CreationDate ASC) AS AnswerRank
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN PostVoteCounts pvc ON p.Id = pvc.PostId
+    WHERE pt.Name = 'Answer'
+),
+QuestionDetails AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.OwnerUserId AS QuestionerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.Title AS QuestionTitle,
+        p.Tags AS QuestionTags,
+        p.AnswerCount AS TotalAnswerCount,
+        pvc.UpVoteCount AS QuestionUpVotes,
+        pvc.DownVoteCount AS QuestionDownVotes,
+        pvc.NetVoteScore AS QuestionNetVoteScore,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS QuestionStatus
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN PostVoteCounts pvc ON p.Id = pvc.PostId
+    WHERE pt.Name = 'Question'
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT q.QuestionId) AS QuestionsAsked,
+        COUNT(DISTINCT a.AnswerId) AS AnswersGiven,
+        SUM(a.AnswerUpVotes) AS TotalAnswerUpVotesReceived,
+        SUM(a.AnswerDownVotes) AS TotalAnswerDownVotesReceived,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 ELSE NULL END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 ELSE NULL END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 ELSE NULL END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN QuestionDetails q ON u.Id = q.QuestionerUserId
+    LEFT JOIN AnswerDetails a ON u.Id = a.AnswererUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostTagCounts AS (
+    SELECT
+        TRIM(tags.tag) AS TagName,
+        COUNT(*) AS TagUseCount
+    FROM Posts
+    CROSS APPLY STRING_SPLIT(REPLACE(REPLACE(Tags, '<', ''), '>', ''), ' ') AS tags
+    WHERE Tags IS NOT NULL
+    GROUP BY TRIM(tags.tag)
+)
+SELECT
+    qd.QuestionId,
+    qd.QuestionTitle,
+    qd.QuestionCreationDate,
+    qd.QuestionerUserId,
+    COALESCE(ue.DisplayName, 'Unknown User') AS QuestionerDisplayName,
+    ue.Reputation AS QuestionerReputation,
+    qd.QuestionStatus,
+    qd.QuestionNetVoteScore,
+    ad.AnswerId AS BestAnswerId,
+    ad.AnswererUserId AS BestAnswererUserId,
+    COALESCE(bue.DisplayName, 'Unknown User') AS BestAnswererDisplayName,
+    ad.AnswerNetVoteScore AS BestAnswerNetVoteScore,
+    ad.AnswerUpVotes AS BestAnswerUpVotes,
+    (
+        SELECT COUNT(*)
+        FROM Comments c
+        WHERE c.PostId = qd.QuestionId
+          AND c.UserId IS NOT NULL
+          AND c.Text LIKE '%interesting%'
+    ) AS CommentCountWithInteresting,
+    CASE
+        WHEN qd.QuestionTags LIKE '%<sql>%' THEN 'SQL Related'
+        WHEN qd.QuestionTags LIKE '%<performance>%' THEN 'Performance Related'
+        ELSE 'Other'
+    END AS TagCategory,
+    CAST(SUBSTRING(qd.QuestionTitle, 1, 50) AS VARCHAR(50)) AS ShortTitle,
+    CASE
+        WHEN qd.QuestionCreationDate < DATEADD(day, -365, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Old'
+        WHEN qd.QuestionCreationDate >= DATEADD(day, -30, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Recent'
+        ELSE 'Mid-Age'
+    END AS AgeGroup,
+    ptc.TagUseCount AS PrimaryTagUseCount
+FROM QuestionDetails qd
+LEFT JOIN UserEngagement ue ON qd.QuestionerUserId = ue.UserId
+LEFT JOIN AnswerDetails ad ON qd.QuestionId = ad.QuestionId AND ad.AnswerRank = 1
+LEFT JOIN UserEngagement bue ON ad.AnswererUserId = bue.UserId
+LEFT JOIN PostTagCounts ptc ON LEFT(TRIM(qd.QuestionTags), CHARINDEX('>', qd.QuestionTags + '>') - 1) = ptc.TagName
+WHERE qd.QuestionId IN (
+    SELECT PostId
+    FROM PostHistory
+    WHERE PostHistoryTypeId = 10 AND Comment = '102' -- Off-topic close votes
+) OR qd.QuestionId IN (
+    SELECT RelatedPostId
+    FROM PostLinks
+    WHERE LinkTypeId = 3 -- Duplicate links
+)
+ORDER BY qd.QuestionCreationDate DESC
+LIMIT 100;

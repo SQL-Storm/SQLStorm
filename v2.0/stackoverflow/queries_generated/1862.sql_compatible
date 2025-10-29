@@ -1,0 +1,196 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        SUM(CASE WHEN PV.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceivedOnPosts,
+        SUM(CASE WHEN PV.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceivedOnPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersProvided
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Votes PV ON P.Id = PV.PostId AND PV.VoteTypeId IN (2, 3)
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+QuestionPerformanceMetrics AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        COALESCE(Q.AnswerCount, 0) AS AnswerCount,
+        TRIM(REPLACE(REPLACE(REPLACE(Q.Tags, '><', ' '), '<', ''), '>', '')) AS CleanedTags,
+        Q.FavoriteCount,
+        Q.ClosedDate,
+        Q.LastActivityDate,
+        (SELECT COUNT(DISTINCT PL.RelatedPostId) FROM PostLinks PL WHERE PL.PostId = Q.Id AND PL.LinkTypeId = 3) AS DuplicateCount,
+        RANK() OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.Score DESC, Q.CreationDate DESC) AS RankByScore
+    FROM Posts Q
+    WHERE Q.PostTypeId = 1
+),
+PostEditAnalysisAggregated AS (
+    SELECT
+        PostId,
+        COUNT(Id) AS TotalRevisions,
+        COUNT(DISTINCT UserId) AS DistinctEditors,
+        MAX(CreationDate) AS LastEditDate,
+        MIN(CreationDate) AS FirstEditDate,
+        (MAX(CreationDate) - MIN(CreationDate)) AS TimeSpanOfEdits,
+        MAX(CASE WHEN prev_edit_time IS NOT NULL AND EXTRACT(EPOCH FROM (CreationDate - prev_edit_time)) < 3600 THEN 1 ELSE 0 END) AS HasQuickSuccessiveEdit
+    FROM (
+        SELECT
+            PH.PostId,
+            PH.Id,
+            PH.UserId,
+            PH.CreationDate,
+            LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS prev_edit_time
+        FROM PostHistory PH
+        WHERE PH.PostHistoryTypeId IN (4, 5, 6)
+    ) AS EditHistoryWithLag
+    GROUP BY PostId
+    HAVING COUNT(Id) > 1
+),
+TopTagsByInfluence AS (
+    SELECT
+        T.TagName,
+        AVG(P.Score) AS AveragePostScore,
+        AVG(P.ViewCount) AS AverageViewCount,
+        DENSE_RANK() OVER (ORDER BY AVG(P.Score) DESC, AVG(P.ViewCount) DESC) AS TagInfluenceRank
+    FROM Tags T
+    JOIN Posts P ON P.Tags LIKE '%' || T.TagName || '%'
+    WHERE P.PostTypeId = 1 AND P.Score IS NOT NULL AND P.ViewCount IS NOT NULL
+    GROUP BY T.TagName
+    HAVING COUNT(P.Id) > 50
+),
+UserCommentSentiment AS (
+    SELECT
+        C.UserId,
+        SUM(CASE WHEN LOWER(C.Text) LIKE '%thank%' OR LOWER(C.Text) LIKE '%appreciat%' THEN 1 ELSE 0 END) AS PositiveCommentCount,
+        SUM(CASE WHEN LOWER(C.Text) LIKE '%bug%' OR LOWER(C.Text) LIKE '%error%' OR LOWER(C.Text) LIKE '%issue%' THEN 1 ELSE 0 END) AS NegativeCommentCount,
+        AVG(C.Score) AS AvgUserCommentScore
+    FROM Comments C
+    WHERE C.UserId IS NOT NULL
+    GROUP BY C.UserId
+),
+SpecialUserTypes AS (
+    SELECT
+        UAS.UserId,
+        'HighRep_ManyQs' AS UserTypeCategory
+    FROM UserActivitySummary UAS
+    WHERE UAS.Reputation >= 10000 AND UAS.QuestionsAsked >= 50
+    UNION ALL
+    SELECT
+        UAS.UserId,
+        'Prolific_Answerer' AS UserTypeCategory
+    FROM UserActivitySummary UAS
+    WHERE UAS.AnswersProvided >= 100 AND NULLIF(UAS.TotalUpvotesReceivedOnPosts, 0) > 3 * NULLIF(UAS.TotalDownvotesReceivedOnPosts, 0)
+    UNION ALL
+    SELECT
+        P.OwnerUserId AS UserId,
+        'Community_Contributor' AS UserTypeCategory
+    FROM Posts P
+    WHERE P.CommunityOwnedDate IS NOT NULL OR EXISTS (SELECT 1 FROM PostEditAnalysisAggregated PEA WHERE PEA.PostId = P.Id AND PEA.TotalRevisions > 10)
+    GROUP BY P.OwnerUserId
+)
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate,
+    U.LastAccessDate,
+    UAS.TotalPostsOwned,
+    UAS.TotalCommentsMade,
+    UAS.TotalUpvotesGiven,
+    UAS.TotalDownvotesGiven,
+    UAS.TotalUpvotesReceivedOnPosts,
+    UAS.TotalDownvotesReceivedOnPosts,
+    UAS.QuestionsAsked,
+    UAS.AnswersProvided,
+    QP_Best.QuestionId AS BestQuestionId,
+    QP_Best.QuestionCreationDate AS BestQuestionCreationDate,
+    QP_Best.QuestionScore AS BestQuestionScore,
+    QP_Best.ViewCount AS BestQuestionViewCount,
+    QP_Best.AnswerCount AS BestQuestionAnswerCount,
+    QP_Best.CleanedTags AS BestQuestionTags,
+    QP_Best.FavoriteCount AS BestQuestionFavoriteCount,
+    QP_Best.ClosedDate AS BestQuestionClosedDate,
+    QP_Best.LastActivityDate AS BestQuestionLastActivityDate,
+    QP_Best.DuplicateCount AS BestQuestionDuplicateCount,
+    (SELECT AVG(SubP.Score) FROM Posts SubP WHERE SubP.OwnerUserId = U.Id AND SubP.PostTypeId = 1 AND SubP.Id <> QP_Best.QuestionId) AS AvgOwnerOtherQuestionScore,
+    PEA_User.AvgPostRevisions AS UserAvgPostRevisions,
+    PEA_User.AvgDistinctEditors AS UserAvgDistinctEditors,
+    PEA_User.AvgTimeSpanOfEdits AS UserAvgTimeSpanOfEditsSeconds,
+    PEA_User.HasAnyQuickSuccessiveEdit AS UserHasAnyQuickSuccessiveEdit,
+    TT.TagName AS MostInfluentialTagOfBestQuestion,
+    TT.TagInfluenceRank,
+    UCS.PositiveCommentCount AS UserPositiveCommentCount,
+    UCS.NegativeCommentCount AS UserNegativeCommentCount,
+    UCS.AvgUserCommentScore,
+    SUT.UserTypeCategory,
+    (SELECT B.Name FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1 ORDER BY B.Date DESC LIMIT 1) AS LatestGoldBadgeName,
+    (SELECT COALESCE(SUM(V.BountyAmount), 0) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId = 8) AS TotalBountyPostedByUser,
+    LAG(UAS.Reputation, 1, 0) OVER (PARTITION BY U.Id ORDER BY UAS.LastAccessDate) AS PreviousReputationByAccessDate,
+    AVG(UAS.Reputation) OVER (ORDER BY UAS.CreationDate ROWS BETWEEN 99 PRECEDING AND CURRENT ROW) AS MovingAvgReputation99Users,
+    (SELECT CR.Name FROM CloseReasonTypes CR WHERE CR.Id = CAST(SUBSTRING(PHC.Comment FROM 1 FOR 4) AS SMALLINT) LIMIT 1) AS LatestQuestionCloseReason,
+    CASE
+        WHEN UAS.Reputation >= 20000 AND UAS.QuestionsAsked > 100 THEN 'Legendary_User'
+        WHEN UAS.Reputation >= 5000 AND UAS.AnswersProvided > 50 THEN 'Expert_Contributor'
+        WHEN UAS.Reputation < 100 AND UAS.TotalPostsOwned = 0 THEN 'Newbie_Lurker'
+        WHEN U.DisplayName IS NULL OR LENGTH(U.DisplayName) < 5 THEN 'Anonymous_Or_Placeholder'
+        ELSE 'General_Participant'
+    END AS UserEngagementTier,
+    COALESCE(U.Location, 'Unknown Region') AS UserLocation,
+    U.Views AS UserProfileViews,
+    U.AboutMe,
+    EXISTS (SELECT 1 FROM Posts A WHERE A.AcceptedAnswerId = QP_Best.QuestionId AND A.PostTypeId = 2 AND A.CreationDate > (U.LastAccessDate - INTERVAL '1 year')) AS HasRecentAcceptedAnswerForBestQuestion,
+    NOT EXISTS (SELECT 1 FROM Badges B WHERE B.UserId = U.Id AND B.Name = 'Critic' AND B.Date > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months')) AS NotCriticBadgeRecently
+FROM Users U
+LEFT JOIN UserActivitySummary UAS ON U.Id = UAS.UserId
+LEFT JOIN QuestionPerformanceMetrics QP_Best ON U.Id = QP_Best.OwnerUserId AND QP_Best.RankByScore = 1
+LEFT JOIN (
+    SELECT
+        P.OwnerUserId,
+        AVG(PEA.TotalRevisions) AS AvgPostRevisions,
+        AVG(PEA.DistinctEditors) AS AvgDistinctEditors,
+        AVG(EXTRACT(EPOCH FROM PEA.TimeSpanOfEdits)) AS AvgTimeSpanOfEdits,
+        MAX(PEA.HasQuickSuccessiveEdit) AS HasAnyQuickSuccessiveEdit
+    FROM Posts P
+    JOIN PostEditAnalysisAggregated PEA ON P.Id = PEA.PostId
+    WHERE P.PostTypeId = 1
+    GROUP BY P.OwnerUserId
+) AS PEA_User ON U.Id = PEA_User.OwnerUserId
+LEFT JOIN TopTagsByInfluence TT ON QP_Best.CleanedTags LIKE '%' || TT.TagName || '%' AND TT.TagInfluenceRank = 1
+LEFT JOIN UserCommentSentiment UCS ON U.Id = UCS.UserId
+LEFT JOIN SpecialUserTypes SUT ON U.Id = SUT.UserId
+LEFT JOIN PostHistory PHC ON QP_Best.QuestionId = PHC.PostId AND PHC.PostHistoryTypeId = 10 AND PHC.Comment IS NOT NULL
+WHERE
+    UAS.Reputation IS NOT NULL AND UAS.Reputation > 100
+    AND UAS.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years')
+    AND (
+        (U.Location IS NOT NULL AND U.Location LIKE '%USA%')
+        OR (U.WebsiteUrl IS NOT NULL AND U.WebsiteUrl LIKE '%stackexchange.com%')
+        OR (U.AboutMe IS NOT NULL AND LOWER(U.AboutMe) LIKE '%developer%')
+    )
+    AND (QP_Best.QuestionScore IS NULL OR QP_Best.QuestionScore > 10)
+    AND (QP_Best.ClosedDate IS NULL OR QP_Best.ClosedDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'))
+    AND (PEA_User.AvgPostRevisions IS NULL OR PEA_User.AvgPostRevisions < 50)
+    AND (UCS.PositiveCommentCount IS NULL OR UCS.PositiveCommentCount > UCS.NegativeCommentCount)
+    AND (
+        (SELECT COUNT(DISTINCT B.Id) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) >= 2
+        OR (U.UpVotes + U.DownVotes > 1000 AND U.Reputation > 5000)
+    )
+ORDER BY
+    UAS.Reputation DESC,
+    UAS.TotalPostsOwned DESC,
+    QP_Best.QuestionScore DESC,
+    TT.TagInfluenceRank ASC
+LIMIT 10000;

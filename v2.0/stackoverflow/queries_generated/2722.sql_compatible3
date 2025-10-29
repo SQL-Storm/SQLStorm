@@ -1,0 +1,228 @@
+WITH RecursiveUserBadges AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date DESC NULLS LAST) AS BadgeRank
+    FROM 
+        Users u
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+UserTopBadges AS (
+    SELECT UserId, DisplayName, GoldBadges, SilverBadges, BronzeBadges
+    FROM RecursiveUserBadges
+    WHERE BadgeRank = 1
+),
+QuestionStats AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        AVG(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCount,
+        AVG(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCount,
+        JSONB_AGG(DISTINCT pht.Name ORDER BY pht.Id) FILTER (WHERE pht.Name IS NOT NULL) AS HistoryTypesTouched,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS UserTopQuestionRank
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Comments c ON c.PostId = p.Id
+    LEFT JOIN 
+        Votes v ON v.PostId = p.Id
+    LEFT JOIN 
+        PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN 
+        PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE 
+        p.PostTypeId = 1
+    GROUP BY 
+        p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount
+),
+AnswerStats AS (
+    SELECT 
+        a.Id,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        a.Score,
+        a.CreationDate,
+        COUNT(DISTINCT c.Id) AS AnswerCommentCount,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM 
+        Posts a
+    LEFT JOIN 
+        Comments c ON c.PostId = a.Id
+    LEFT JOIN 
+        Votes v ON v.PostId = a.Id
+    WHERE 
+        a.PostTypeId = 2
+    GROUP BY 
+        a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate
+),
+QuestionAnswerSummary AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.CommentCount,
+        q.HistoryTypesTouched,
+        a.AnswerRank,
+        a.Id AS AnswerId,
+        a.AnswerOwnerUserId,
+        a.Score AS AnswerScore,
+        a.AnswerCommentCount,
+        a.UpVotes,
+        a.DownVotes,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAcceptedAnswer
+    FROM 
+        QuestionStats q
+    LEFT JOIN 
+        AnswerStats a ON q.Id = a.QuestionId
+    WHERE 
+        a.AnswerRank IS NOT NULL
+),
+DuplicateLinks AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM 
+        PostLinks pl 
+    INNER JOIN 
+        LinkTypes lt ON lt.Id = pl.LinkTypeId AND lt.Name = 'Duplicate'
+    INNER JOIN 
+        Posts p1 ON p1.Id = pl.PostId
+    INNER JOIN 
+        Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE 
+        p1.PostTypeId = 1 AND p2.PostTypeId = 1
+),
+TagAggregates AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        COALESCE(p.ViewCount, 0) AS PostViewCount,
+        COALESCE(p.Score, 0) AS PostScore
+    FROM 
+        Tags t
+    LEFT JOIN 
+        Posts p ON p.Id = t.ExcerptPostId
+),
+UserActivityWindows AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COUNT(DISTINCT p.Id) OVER (PARTITION BY u.Id) AS TotalPosts,
+        COUNT(DISTINCT b.Id) OVER (PARTITION BY u.Id) AS TotalBadges,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocationReputationRank
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Badges b ON b.UserId = u.Id
+)
+SELECT 
+    qs.QuestionId,
+    qs.Title,
+    u.DisplayName AS QuestionOwner,
+    qs.QuestionScore,
+    qs.ViewCount AS QuestionViews,
+    qs.AnswerCount,
+    qs.FavoriteCount,
+    qs.CommentCount AS QuestionComments,
+    array_to_string(qs.HistoryTypesTouched, ', ') AS HistoryTypesTouched,
+    qs.AnswerId,
+    auser.DisplayName AS AnswerOwner,
+    qs.AnswerScore,
+    qs.AnswerCommentCount,
+    qs.UpVotes AS AnswerUpVotes,
+    qs.DownVotes AS AnswerDownVotes,
+    CASE WHEN qs.IsAcceptedAnswer = 1 THEN 'Accepted' ELSE 'Not Accepted' END AS AnswerStatus,
+    ul.RelatedPostId AS DuplicateOfQuestionId,
+    ul.RelatedPostTitle AS DuplicateOfQuestionTitle,
+    tutb.GoldBadges,
+    tutb.SilverBadges,
+    tutb.BronzeBadges,
+    taw.TotalPosts AS UserTotalPosts,
+    taw.TotalBadges AS UserTotalBadges,
+    taw.ReputationRank,
+    taw.LocationReputationRank,
+    tagagg.TagName,
+    tagagg.TagCount,
+    tagagg.PostViewCount,
+    tagagg.PostScore
+FROM
+    QuestionAnswerSummary qs
+LEFT JOIN 
+    Users u ON u.Id = qs.OwnerUserId
+LEFT JOIN 
+    Users auser ON auser.Id = qs.AnswerOwnerUserId
+LEFT JOIN 
+    DuplicateLinks ul ON ul.PostId = qs.QuestionId
+LEFT JOIN 
+    UserTopBadges tutb ON tutb.UserId = qs.OwnerUserId
+LEFT JOIN 
+    UserActivityWindows taw ON taw.UserId = qs.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT UNNEST(string_to_array(SUBSTRING(t.Tags FROM 2 FOR CHAR_LENGTH(t.Tags) - 2), '><')) AS single_tag, t.Id AS tid
+    FROM Posts t WHERE t.Id = qs.QuestionId
+) qtags ON true
+LEFT JOIN 
+    TagAggregates tagagg ON tagagg.TagName = qtags.single_tag
+WHERE
+    qs.QuestionScore > 5
+    AND (qs.AnswerScore > 0 OR qs.AnswerId IS NULL)
+GROUP BY
+    qs.QuestionId,
+    qs.Title,
+    u.DisplayName,
+    qs.QuestionScore,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.FavoriteCount,
+    qs.CommentCount,
+    qs.HistoryTypesTouched,
+    qs.AnswerId,
+    auser.DisplayName,
+    qs.AnswerScore,
+    qs.AnswerCommentCount,
+    qs.UpVotes,
+    qs.DownVotes,
+    qs.IsAcceptedAnswer,
+    ul.RelatedPostId,
+    ul.RelatedPostTitle,
+    tutb.GoldBadges,
+    tutb.SilverBadges,
+    tutb.BronzeBadges,
+    taw.TotalPosts,
+    taw.TotalBadges,
+    taw.ReputationRank,
+    taw.LocationReputationRank,
+    tagagg.TagName,
+    tagagg.TagCount,
+    tagagg.PostViewCount,
+    tagagg.PostScore
+ORDER BY 
+    qs.QuestionScore DESC, qs.AnswerScore DESC NULLS LAST
+LIMIT 100;

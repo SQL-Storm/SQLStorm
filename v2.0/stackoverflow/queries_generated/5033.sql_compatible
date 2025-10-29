@@ -1,0 +1,104 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.PostTypeId,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.LastActivityDate IS NOT NULL
+    AND p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180' DAY
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    SUM(p.Score) AS total_score,
+    AVG(p.ViewCount) AS avg_views,
+    COUNT(*) AS post_count
+  FROM Posts p,
+       LATERAL (
+         SELECT regexp_replace(tag, '^<|>$', '') AS TagName
+         FROM unnest(string_to_array(trim(both '<' from p.Tags), '><')) AS tag
+       ) t
+  GROUP BY t.TagName
+),
+CorrelatedStats AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    v.TotalUp AS UpVotesForPost,
+    v.TotalDown AS DownVotesForPost,
+    c.Name AS CloseReason,
+    b.Date AS BadgeDate,
+    u.Reputation,
+    u.Location,
+    u.DisplayName,
+    p.LastActivityDate
+  FROM Posts p
+  LEFT JOIN (
+    SELECT V.PostId,
+           SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUp,
+           SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDown
+    FROM Votes V
+    GROUP BY V.PostId
+  ) v ON v.PostId = p.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    AND ph.PostHistoryTypeId = 10
+  LEFT JOIN CloseReasonTypes c ON CAST(JSON_VALUE(ph.Text, '$.CloseReasonId') AS SMALLINT) = c.Id
+  LEFT JOIN Badges b ON b.TagBased = 0 AND b.UserId = p.OwnerUserId
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  WHERE p.LastActivityDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '60' DAY
+),
+Windowed AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    u.DisplayName,
+    u.Reputation,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.LastActivityDate DESC NULLS LAST, p.ViewCount DESC, p.Score DESC
+    ) AS rn_owner
+  FROM Posts p
+  JOIN Users u ON u.Id = p.OwnerUserId
+  WHERE p.PostTypeId = 1
+)
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.OwnerUserId,
+  rp.ViewCount,
+  rp.Score,
+  rp.UpVotesForPost,
+  rp.DownVotesForPost,
+  rp.CloseReason,
+  rp.BadgeDate,
+  rp.Reputation,
+  rp.Location,
+  rp.DisplayName,
+  wt.TagName,
+  wt.total_score,
+  wt.avg_views,
+  wt.post_count
+FROM CorrelatedStats rp
+LEFT JOIN TopTags wt ON TRUE
+LEFT JOIN Posts p2 ON p2.Id = rp.PostId
+LEFT JOIN LATERAL (
+  SELECT regexp_replace(tag, '^<|>$', '') AS TagName, p2.Id AS PostId
+  FROM unnest(string_to_array(coalesce(p2.Tags, ''), '><')) AS tag
+) ut ON ut.PostId = rp.PostId
+ORDER BY rp.LastActivityDate DESC
+LIMIT 100;

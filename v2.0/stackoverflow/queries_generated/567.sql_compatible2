@@ -1,0 +1,334 @@
+with
+engaged_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(u.websiteurl, '') as websiteurl,
+    u.upvotes - u.downvotes as net_votes,
+    u.views,
+    count(distinct p.id) filter (where p.posttypeid in (1,2)) as total_posts,
+    count(distinct c.id) as total_comments,
+    count(distinct b.id) as total_badges,
+    sum(case when b.class = 1 then 5 when b.class = 2 then 2 when b.class = 3 then 1 else 0 end) as badge_score,
+    sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as vote_impact,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_flow,
+    max(p.creationdate) as last_post_date,
+    max(c.creationdate) as last_comment_date
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  left join badges b on b.userid = u.id
+  left join votes v on v.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.websiteurl, u.upvotes, u.downvotes, u.views
+),
+recent_post_activity as (
+  select
+    p.owneruserid as user_id,
+    date_trunc('month', p.creationdate) as month_bucket,
+    count(*) as posts_in_month,
+    sum(case when p.posttypeid = 1 then 1 else 0 end) as questions_in_month,
+    sum(case when p.posttypeid = 2 then 1 else 0 end) as answers_in_month,
+    cast(avg(p.score) as numeric(12,4)) as avg_post_score
+  from posts p
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '24 months'
+    and p.owneruserid is not null
+  group by p.owneruserid, date_trunc('month', p.creationdate)
+),
+rolling_activity as (
+  select
+    r.user_id,
+    r.month_bucket,
+    sum(r.posts_in_month) over (partition by r.user_id order by r.month_bucket rows between 2 preceding and current row) as posts_last_3m,
+    sum(r.answers_in_month) over (partition by r.user_id order by r.month_bucket rows between 2 preceding and current row) as answers_last_3m,
+    sum(r.questions_in_month) over (partition by r.user_id order by r.month_bucket rows between 2 preceding and current row) as questions_last_3m,
+    avg(r.avg_post_score) over (partition by r.user_id order by r.month_bucket rows between 2 preceding and current row) as avg_score_last_3m
+  from recent_post_activity r
+),
+question_quality as (
+  select
+    q.owneruserid as user_id,
+    count(*) as total_questions,
+    sum(case when q.acceptedanswerid is not null then 1 else 0 end) as accepted_questions,
+    avg(case when q.acceptedanswerid is not null then 1.0 else 0.0 end) as accept_rate,
+    sum(case when q.score > 0 then 1 else 0 end) as pos_scored,
+    sum(case when q.score < 0 then 1 else 0 end) as neg_scored,
+    sum(case when q.closeddate is not null then 1 else 0 end) as closed_q,
+    cast(avg(q.viewcount) as numeric(12,4)) as avg_views,
+    percentile_cont(0.9) within group (order by q.viewcount) as p90_views
+  from posts q
+  where q.posttypeid = 1
+    and q.owneruserid is not null
+  group by q.owneruserid
+),
+answer_quality as (
+  select
+    a.owneruserid as user_id,
+    count(*) as total_answers,
+    sum(case when a.score > 0 then 1 else 0 end) as pos_answers,
+    sum(case when a.score < 0 then 1 else 0 end) as neg_answers,
+    cast(avg(a.score) as numeric(12,4)) as avg_answer_score,
+    max(a.score) as max_answer_score,
+    sum(case when a.id in (select acceptedanswerid from posts where acceptedanswerid is not null) then 1 else 0 end) as accepted_as_answer
+  from posts a
+  where a.posttypeid = 2
+    and a.owneruserid is not null
+  group by a.owneruserid
+),
+duplicate_involvement as (
+  select
+    u.id as user_id,
+    count(distinct pl.id) filter (where pl.linktypeid = 3 and p.owneruserid = u.id) as dup_as_source,
+    count(distinct pl.id) filter (where pl.linktypeid = 3 and rp.owneruserid = u.id) as dup_as_target
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join postlinks pl on pl.postid = p.id
+  left join posts rp on rp.id = pl.relatedpostid
+  group by u.id
+),
+badge_tempo as (
+  select
+    b.userid as user_id,
+    min(b.date) as first_badge_date,
+    count(distinct b.name) as unique_badges,
+    count(*) filter (where b.tagbased = true) as tag_badges
+  from badges b
+  group by b.userid
+),
+edit_and_close_signals as (
+  select
+    p.owneruserid as user_id,
+    sum(case when ph.posthistorytypeid in (4,5,6,7,8,9,24) then 1 else 0 end) as edits_any,
+    sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as closed_events,
+    sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopened_events,
+    sum(case when ph.posthistorytypeid = 50 then 1 else 0 end) as community_bumps,
+    sum(case when ph.posthistorytypeid in (52,53) then 1 else 0 end) as hot_q_events,
+    sum(case when ph.posthistorytypeid = 10 and nullif(ph.comment,'') is not null and ph.comment ~ '^[0-9]+' then 1 else 0 end) as close_with_reason
+  from posthistory ph
+  join posts p on p.id = ph.postid
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+question_primary_tags as (
+  select
+    q.owneruserid as user_id,
+    lower(trim(tname)) as tag,
+    count(*) as tag_uses
+  from posts q
+  cross join lateral unnest(
+    case
+      when q.posttypeid = 1 and q.tags is not null and length(q.tags) > 2
+        then string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')
+      else cast(array[] as varchar[])
+    end
+  ) as tname
+  where q.posttypeid = 1 and q.owneruserid is not null
+  group by q.owneruserid, lower(trim(tname))
+),
+top_tag as (
+  select distinct on (user_id)
+    user_id, tag, tag_uses
+  from question_primary_tags
+  order by user_id, tag_uses desc, tag asc
+),
+normalized as (
+  select
+    e.user_id,
+    e.displayname,
+    e.reputation,
+    e.creationdate,
+    e.location,
+    e.websiteurl,
+    e.net_votes,
+    e.views,
+    e.total_posts,
+    e.total_comments,
+    e.total_badges,
+    e.badge_score,
+    e.vote_impact,
+    e.bounty_flow,
+    q.accept_rate,
+    q.avg_views,
+    a.avg_answer_score,
+    a.max_answer_score,
+    coalesce(a.total_answers,0) as total_answers,
+    coalesce(q.total_questions,0) as total_questions,
+    d.dup_as_source,
+    d.dup_as_target,
+    b.first_badge_date,
+    b.unique_badges,
+    b.tag_badges,
+    ec.edits_any,
+    ec.closed_events,
+    ec.reopened_events,
+    ec.community_bumps,
+    ec.hot_q_events,
+    ec.close_with_reason,
+    tt.tag as top_tag,
+    tt.tag_uses as top_tag_uses,
+    (
+      0.35 * coalesce(least(greatest(cast(e.reputation as numeric) / nullif((select max(reputation) from users),0), 0), 1), 0)
+      + 0.15 * coalesce(least(greatest((coalesce(a.total_answers,0) + coalesce(q.total_questions,0))::numeric / nullif((select max(total_posts) from engaged_users),0), 0), 1), 0)
+      + 0.15 * coalesce(least(greatest(cast(e.upvotes - e.downvotes as numeric) / nullif((select max(upvotes - downvotes) from users),0), 0), 1), 0)
+      + 0.10 * coalesce(least(greatest(a.avg_answer_score / nullif((select nullif(max(avg_answer_score),0) from answer_quality),0), 0), 1), 0)
+      + 0.10 * coalesce(least(greatest(q.accept_rate, 0), 1), 0)
+      + 0.05 * coalesce(least(greatest(cast(b.unique_badges as numeric) / nullif((select max(unique_badges) from badge_tempo),0), 0), 1), 0)
+      + 0.10 * coalesce(least(greatest(cast(rc.posts_last_3m as numeric) / nullif((select max(posts_last_3m) from rolling_activity),0), 0), 1), 0)
+    ) as engagement_score
+  from engaged_users e
+  left join question_quality q on q.user_id = e.user_id
+  left join answer_quality a on a.user_id = e.user_id
+  left join duplicate_involvement d on d.user_id = e.user_id
+  left join badge_tempo b on b.user_id = e.user_id
+  left join edit_and_close_signals ec on ec.user_id = e.user_id
+  left join top_tag tt on tt.user_id = e.user_id
+  left join lateral (
+    select posts_last_3m
+    from rolling_activity ra
+    where ra.user_id = e.user_id
+    order by ra.month_bucket desc
+    limit 1
+  ) rc on true
+),
+ranked as (
+  select
+    n.user_id,
+    n.displayname,
+    n.reputation,
+    n.creationdate,
+    n.location,
+    n.websiteurl,
+    n.net_votes,
+    n.views,
+    n.total_posts,
+    n.total_comments,
+    n.total_badges,
+    n.badge_score,
+    n.vote_impact,
+    n.bounty_flow,
+    n.accept_rate,
+    n.avg_views,
+    n.avg_answer_score,
+    n.max_answer_score,
+    n.total_answers,
+    n.total_questions,
+    n.dup_as_source,
+    n.dup_as_target,
+    n.first_badge_date,
+    n.unique_badges,
+    n.tag_badges,
+    n.edits_any,
+    n.closed_events,
+    n.reopened_events,
+    n.community_bumps,
+    n.hot_q_events,
+    n.close_with_reason,
+    n.top_tag,
+    n.top_tag_uses,
+    n.engagement_score,
+    dense_rank() over (order by n.engagement_score desc nulls last) as dense_rank,
+    row_number() over (order by n.engagement_score desc nulls last, coalesce(n.total_posts,0) desc, n.reputation desc) as row_rank,
+    ntile(10) over (order by n.engagement_score desc nulls last) as decile
+  from normalized n
+),
+risk_signals as (
+  select
+    r.user_id,
+    (
+      case
+        when coalesce(r.closed_events,0) > coalesce(r.reopened_events,0) + 5 then 0.9
+        when coalesce(r.neg_answers,0) + coalesce((select neg_scored from question_quality q where q.user_id = r.user_id),0) > 20 then 0.7
+        when coalesce(r.dup_as_source,0) > 10 then 0.6
+        when r.accept_rate is not null and r.accept_rate < 0.2 then 0.5
+        else 0.2
+      end
+      + case when r.top_tag is null then 0.05 else 0 end
+      + case when r.avg_answer_score is not null and r.avg_answer_score < 0 then 0.1 else 0 end
+    ) as risk_score
+  from ranked r
+),
+velocity_extremes as (
+  (
+    select ra.user_id, 'surge' as kind, ra.posts_last_3m as val
+    from rolling_activity ra
+    where ra.posts_last_3m = (select max(posts_last_3m) from rolling_activity r2 where r2.user_id = ra.user_id)
+  )
+  union all
+  (
+    select ra.user_id, 'slump' as kind, ra.posts_last_3m as val
+    from rolling_activity ra
+    where ra.posts_last_3m = (select min(posts_last_3m) from rolling_activity r2 where r2.user_id = ra.user_id)
+  )
+),
+velocity_pivot as (
+  select
+    ve.user_id,
+    max(case when kind = 'surge' then val end) as max_3m_posts,
+    max(case when kind = 'slump' then val end) as min_3m_posts
+  from velocity_extremes ve
+  group by ve.user_id
+)
+select
+  r.row_rank,
+  r.dense_rank,
+  r.decile,
+  r.user_id,
+  coalesce(r.displayname, '(unknown)') as displayname,
+  r.reputation,
+  r.total_posts,
+  r.total_comments,
+  r.total_badges,
+  r.badge_score,
+  r.vote_impact,
+  r.bounty_flow,
+  r.total_questions,
+  r.total_answers,
+  r.accept_rate,
+  r.avg_views,
+  r.avg_answer_score,
+  r.max_answer_score,
+  r.dup_as_source,
+  r.dup_as_target,
+  r.edits_any,
+  r.closed_events,
+  r.reopened_events,
+  r.community_bumps,
+  r.hot_q_events,
+  r.top_tag,
+  r.top_tag_uses,
+  to_char(r.creationdate, 'YYYY-MM-DD') as user_since,
+  coalesce(to_char((select max(last_post_date) from engaged_users eu where eu.user_id = r.user_id), 'YYYY-MM-DD'), '') as last_post_date,
+  coalesce(to_char((select max(last_comment_date) from engaged_users eu where eu.user_id = r.user_id), 'YYYY-MM-DD'), '') as last_comment_date,
+  coalesce(vp.max_3m_posts, 0) as max_3m_posts,
+  coalesce(vp.min_3m_posts, 0) as min_3m_posts,
+  rs.risk_score,
+  r.engagement_score,
+  case
+    when r.top_tag is null then 'Generalist'
+    when r.top_tag like any (array['sql%','postgres%','mysql%']) then 'Data'
+    when r.top_tag ~ '^(c\+\+|java|python|javascript)$' then 'CoreLang'
+    when position('web' in r.top_tag) > 0 then 'Web'
+    else initcap(regexp_replace(r.top_tag, '[^a-zA-Z]+', ' '))
+  end as specialization,
+  case
+    when r.location is null or btrim(r.location) = '' then 'Unknown'
+    when lower(r.location) similar to '%(remote|internet|earth|world|anywhere)%' then 'Remote'
+    else split_part(r.location, ',', 1)
+  end as region_hint
+from ranked r
+left join risk_signals rs on rs.user_id = r.user_id
+left join velocity_pivot vp on vp.user_id = r.user_id
+where
+  coalesce(r.engagement_score, 0) > 0
+  and (
+    (r.accept_rate is not null and r.accept_rate >= 0.25)
+    or (r.total_answers + r.total_questions) >= 10
+    or (r.total_badges >= 3 and r.avg_answer_score is not null)
+  )
+  and (
+    coalesce(r.vote_impact, 0) + coalesce(r.badge_score, 0) + coalesce(r.community_bumps, 0) - coalesce(r.closed_events, 0)
+  ) > -10
+order by r.row_rank
+limit 200;

@@ -1,0 +1,101 @@
+-- {"query": "3637.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1922} 
+WITH 
+-- Basic per‑user aggregates, using correlated subqueries and COALESCE
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0)               AS NetVotes,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount
+    FROM Users u
+),
+
+-- De‑normalize tags for questions, using string functions and UNNEST
+TagQuestions AS (
+    SELECT 
+        p.Id                                   AS QuestionId,
+        unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS Tag,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1               -- only questions
+      AND p.Tags IS NOT NULL
+),
+
+-- Combine user stats with tag data; uses LEFT JOIN, window function, CASE and NULL handling
+UserTagStats AS (
+    SELECT 
+        us.Id                               AS UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        t.Tag,
+        /* Count of questions the user asked that carry this tag */
+        COUNT(DISTINCT tq.QuestionId) 
+            FILTER (WHERE tq.OwnerUserId = us.Id)                     AS OwnQuestions,
+        /* Count of *other* users' questions with this tag that the user answered */
+        COUNT(DISTINCT a.Id) 
+            FILTER (WHERE a.OwnerUserId = us.Id)                     AS AnsweredQuestions,
+        /* Sum of scores on those answered questions */
+        COALESCE(SUM(tq.Score) 
+            FILTER (WHERE a.OwnerUserId = us.Id),0)                  AS AnsweredScore,
+        ROW_NUMBER() OVER (PARTITION BY t.Tag 
+                           ORDER BY us.Reputation DESC,
+                                    us.GoldBadges DESC,
+                                    us.SilverBadges DESC)      AS TagRank
+    FROM UserStats us
+    LEFT JOIN TagQuestions t      ON TRUE                              -- cartesian to get every tag
+    LEFT JOIN TagQuestions tq    ON tq.Tag = t.Tag
+    LEFT JOIN Posts a            ON a.ParentId = tq.QuestionId 
+                                    AND a.PostTypeId = 2                 -- answers
+    WHERE (tq.OwnerUserId = us.Id)                               -- own questions
+       OR (a.OwnerUserId = us.Id)                               -- answered questions
+    GROUP BY us.Id, us.DisplayName, us.Reputation,
+             us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+             t.Tag
+),
+
+-- Top 5 users per tag
+TopTagUsers AS (
+    SELECT *
+    FROM UserTagStats
+    WHERE TagRank <= 5
+),
+
+-- Users with no posts and no badges (to test outer joins and NULL logic)
+InactiveUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        0 AS GoldBadges,
+        0 AS SilverBadges,
+        0 AS BronzeBadges,
+        NULL::varchar(35) AS Tag,
+        0 AS OwnQuestions,
+        0 AS AnsweredQuestions,
+        0 AS AnsweredScore,
+        NULL::int AS TagRank
+    FROM Users u
+    WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+      AND NOT EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id)
+)
+
+-- Final result set combines the two branches with UNION ALL and orders for benchmark readability
+SELECT *
+FROM TopTagUsers
+UNION ALL
+SELECT *
+FROM InactiveUsers
+ORDER BY 
+    Tag NULLS FIRST,
+    TagRank NULLS LAST,
+    Reputation DESC;

@@ -1,0 +1,105 @@
+-- {"query": "3911.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2190} 
+
+WITH UserReputationChanges AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpVotesGiven,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3) AS DownVotesGiven
+    FROM Users u
+    WHERE u.Reputation IS NOT NULL
+), TopPosts AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Id,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1   -- questions
+), UserTagActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        t.TagName,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(p.Score) AS TotalScore,
+        MAX(p.CreationDate) AS LastActivity
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(trim(both '><' FROM p.Tags), '><')) AS TagName
+    ) AS tags ON true
+    JOIN Tags t ON t.TagName = tags.TagName
+    GROUP BY u.Id, t.TagName
+    HAVING COUNT(*) > 5
+), RecentComments AS (
+    SELECT 
+        c.PostId,
+        c.UserId,
+        c.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC) AS rn
+    FROM Comments c
+    WHERE c.CreationDate > now() - interval '30 days'
+)
+SELECT 
+    urc.UserId,
+    urc.Reputation,
+    urc.GoldBadges,
+    urc.SilverBadges,
+    urc.BronzeBadges,
+    urc.UpVotesGiven,
+    urc.DownVotesGiven,
+    COALESCE(tp.Title, '[No Top Question]')        AS TopQuestionTitle,
+    COALESCE(tp.Score, 0)                         AS TopQuestionScore,
+    COALESCE(uta.TagName, '[No Active Tag]')      AS TopTag,
+    uta.QuestionCount,
+    uta.AnswerCount,
+    uta.TotalScore,
+    CASE 
+        WHEN rc.PostId IS NOT NULL THEN 'RecentComment'
+        ELSE 'NoRecentComment'
+    END                                           AS RecentCommentFlag,
+    DATE_TRUNC('day', GREATEST(u.CreationDate, u.LastAccessDate, COALESCE(rc.CreationDate, TIMESTAMP '1970-01-01'))) AS LastActiveDay
+FROM UserReputationChanges urc
+LEFT JOIN (
+    SELECT OwnerUserId, Title, Score
+    FROM TopPosts
+    WHERE rn = 1
+) tp ON tp.OwnerUserId = urc.UserId
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM UserTagActivity uta
+    WHERE uta.UserId = urc.UserId
+    ORDER BY uta.TotalScore DESC NULLS LAST
+    LIMIT 1
+) uta ON true
+LEFT JOIN LATERAL (
+    SELECT rc.*
+    FROM RecentComments rc
+    WHERE rc.PostId = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = urc.UserId
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    )
+    AND rc.rn = 1
+) rc ON true
+LEFT JOIN Users u ON u.Id = urc.UserId
+WHERE (urc.Reputation > 10000 OR urc.GoldBadges > 0)
+ORDER BY urc.Reputation DESC NULLS LAST
+LIMIT 100
+OFFSET 0
+
+UNION ALL
+
+SELECT 
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+FROM (SELECT 1) AS dummy
+WHERE NOT EXISTS (SELECT 1 FROM Users WHERE Reputation > 0);

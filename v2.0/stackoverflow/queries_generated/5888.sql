@@ -1,0 +1,113 @@
+-- {"query": "5888.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 831} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '180 days'
+),
+TopTags AS (
+  SELECT
+    unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tagname
+  FROM Posts p
+  JOIN RecentActivePosts rap ON rap.PostId = p.Id
+  WHERE p.Tags IS NOT NULL
+),
+TagStats AS (
+  SELECT
+    tagname AS Tag,
+    COUNT(*) AS PostCount,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.ViewCount) AS TotalViews,
+    MAX(p.CreationDate) AS MostRecentPost
+  FROM TopTags tt
+  JOIN Posts p ON p.Tags LIKE '%' || tt.tagname || '%'
+  GROUP BY tagname
+),
+TwoLevelJoins AS (
+  SELECT
+    ro.PostId,
+    ro.Title AS PostTitle,
+    ro.CreationDate AS PostCreationDate,
+    ro.LastActivityDate AS PostLastActivity,
+    ro.Score AS PostScore,
+    ro.ViewCount,
+    u.Id AS OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    COALESCE(b.Date, rp.MigrationDate) AS RelevantDate,
+    rp.TargetPostId
+  FROM RecentActivePosts ro
+  LEFT JOIN Users u ON ro.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT
+      th.PostId,
+      th.CreationDate AS MigrationDate,
+      th.Comment AS MigrationComment,
+      th.Text AS MigrationText,
+      th.PostHistoryTypeId
+    FROM PostHistory th
+    WHERE th.PostHistoryTypeId IN (16,36,50) -- Community Owned / Migrated (to/from) / Hot
+  ) rp ON rp.PostId = ro.PostId
+  LEFT JOIN PostLinks pl ON pl.PostId = ro.PostId
+  LEFT JOIN Posts t ON t.Id = pl.RelatedPostId
+  WHERE ro.PostTypeId = 1
+),
+Agg AS (
+  SELECT
+    PT.Tag,
+    COUNT(*) AS QualifiedPosts,
+    SUM(RO.ViewCount) AS TotalViewsAcrossPosts,
+    AVG(RO.PostScore) AS AvgPostScore
+  FROM TwoLevelJoins RO
+  JOIN (
+    SELECT TagName AS Tag FROM Tags
+  ) PT ON RO.Tags LIKE '%' || PT.Tag || '%'
+  GROUP BY PT.Tag
+)
+SELECT
+  rap.PostId,
+  rap.PostTitle,
+  rap.OwnerDisplayName,
+  rap.Reputation,
+  rap.PostCreationDate,
+  rap.PostLastActivity,
+  rap.PostScore,
+  rap.ViewCount,
+  rap.AnswerCount,
+  rap.CommentCount,
+  rap.FavoriteCount,
+  TO_CHAR(rap.PostCreationDate, 'YYYY-MM-DD') AS CreationDay,
+  ARRAY_AGG(DISTINCT tt.Tag) AS TagsOnPost,
+  ts.PostCount AS RelatedTagPostCount,
+  ts.AvgScore AS RelatedTagAvgScore
+FROM TwoLevelJoins rap
+LEFT JOIN TagStats ts ON ts.Tag = ANY (SELECT unnest(string_to_array(substring(rap.Tags, 2, length(rap.Tags)-2), '><')))
+GROUP BY
+  rap.PostId,
+  rap.PostTitle,
+  rap.OwnerDisplayName,
+  rap.Reputation,
+  rap.PostCreationDate,
+  rap.PostLastActivity,
+  rap.PostScore,
+  rap.ViewCount,
+  rap.AnswerCount,
+  rap.CommentCount,
+  rap.FavoriteCount,
+  rap.PostCreationDate,
+  ts.PostCount,
+  ts.AvgScore
+ORDER BY rap.PostLastActivity DESC
+LIMIT 100;

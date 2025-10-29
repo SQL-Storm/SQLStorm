@@ -1,0 +1,145 @@
+-- {"query": "2794.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1383} 
+with Recursive_User_Activity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as TotalQuestions,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as TotalAnswers,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        coalesce(sum(vtUp.VoteCount),0) as UpVotesReceived,
+        coalesce(sum(vtDown.VoteCount),0) as DownVotesReceived,
+        max(badges.Class) as HighestBadgeClass
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select v.PostId, count(*) as VoteCount
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        where vt.Name = 'UpMod'
+        group by v.PostId
+    ) as vtUp on vtUp.PostId = p.Id
+    left join (
+        select v.PostId, count(*) as VoteCount
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        where vt.Name = 'DownMod'
+        group by v.PostId
+    ) as vtDown on vtDown.PostId = p.Id
+    left join (
+        select UserId, min(Class) as Class
+        from Badges
+        group by UserId
+    ) as badges on badges.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+Ranked_User_Activity as (
+    select *,
+        row_number() over (order by TotalPosts desc, Reputation desc nulls last) as UserRank,
+        dense_rank() over (partition by Location order by TotalPosts desc nulls last) as LocationRank
+    from Recursive_User_Activity
+),
+Top_Tags as (
+    select 
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        coalesce(p.Score,0) as MaxScore,
+        coalesce(ans.AvgAnswerScore,0) as AvgAnswerScore
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId
+    left join (
+        select
+            child.ParentId,
+            avg(child.Score) as AvgAnswerScore
+        from Posts child
+        where child.PostTypeId = 2
+        group by child.ParentId
+    ) ans on ans.ParentId = t.ExcerptPostId
+    where t.Count > 1000
+    order by t.Count desc
+    limit 10
+),
+DuplicateLinksSummary as (
+    select 
+        pl.PostId,
+        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicateCount,
+        bool_or(pl.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') as HasRecentDuplicateLink
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+QuestionWithAcceptedAnswerInfo AS (
+    select p.Id as QuestionId, p.Title, p.Score, p.ViewCount, p.Tags, p.AcceptedAnswerId,
+        aa.Score as AcceptedAnswerScore,
+        row_number() over (partition by p.Id order by a.Score desc nulls last) as AnswerRank
+    from Posts p
+    left join Posts aa on aa.Id = p.AcceptedAnswerId
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1
+),
+UserBadgeCounts AS (
+    select UserId,
+        count(*) filter (where Class = 1) as GoldBadges,
+        count(*) filter (where Class = 2) as SilverBadges,
+        count(*) filter (where Class = 3) as BronzeBadges
+    from Badges
+    group by UserId
+)
+select 
+    rua.UserId,
+    rua.DisplayName,
+    rua.Reputation,
+    rua.TotalPosts,
+    rua.TotalQuestions,
+    rua.TotalAnswers,
+    rua.UpVotesReceived,
+    rua.DownVotesReceived,
+    rua.HighestBadgeClass,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ru.Location,
+    ru.LocationRank,
+    tt.TagName,
+    tt.Count as TagCount,
+    tt.MaxScore as TagExcerptMaxScore,
+    tt.AvgAnswerScore as TagAvgAnswerScore,
+    dls.DuplicateCount,
+    dls.HasRecentDuplicateLink,
+    qwai.Title as TopQuestionTitle,
+    qwai.Score as TopQuestionScore,
+    qwai.ViewCount as TopQuestionViewCount,
+    coalesce(subCt.RecentCommentCount,0) as RecentCommentCount,
+    coalesce(round((rua.TotalPosts::decimal / nullif(date_part('day', cast('2024-10-01 12:34:56' as timestamp) - rua.CreationDate),0)),4),0) as PostsPerDayAverage,
+    case 
+        when rua.Location is null then 'Unknown' 
+        else rua.Location 
+    end as LocationDisplay,
+    case 
+        when rua.Reputation >= 100000 then 'Legend'
+        when rua.Reputation >= 10000 then 'Expert'
+        when rua.Reputation >= 1000 then 'Intermediate'
+        else 'Beginner' 
+    end as ReputationLevel,
+    left(rua.DisplayName || ' [' || rua.UserId || ']', 40) as UserLabel
+from Ranked_User_Activity rua
+left join UserBadgeCounts ubc on ubc.UserId = rua.UserId
+left join Top_Tags tt on true
+left join DuplicateLinksSummary dls on dls.PostId = (
+    select p.Id from Posts p where p.OwnerUserId = rua.UserId and p.PostTypeId = 1 order by p.ViewCount desc limit 1
+)
+left join QuestionWithAcceptedAnswerInfo qwai on qwai.QuestionId = dls.PostId
+left join lateral (
+    select count(*) as RecentCommentCount 
+    from Comments c
+    join Posts p2 on p2.Id = c.PostId
+    where p2.OwnerUserId = rua.UserId and c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+) subCt on true
+where rua.TotalPosts > 10 and rua.Reputation > 1000
+order by rua.TotalPosts desc, rua.Reputation desc
+limit 20;

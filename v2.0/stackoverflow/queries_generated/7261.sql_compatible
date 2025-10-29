@@ -1,0 +1,212 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY u.Views DESC) as ViewRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank,
+        AVG(t.Count) OVER () as AvgTagCount
+    FROM Tags t
+    WHERE t.Count > (SELECT AVG("Count") FROM Tags)
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                CASE 
+                    WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+                    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+                    ELSE 'Unanswered'
+                END
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostStatus,
+        CASE 
+            WHEN p.Score > 10 THEN 'High'
+            WHEN p.Score > 0 THEN 'Medium'
+            WHEN p.Score = 0 THEN 'Zero'
+            ELSE 'Negative'
+        END as ScoreCategory,
+        COALESCE(p.Tags, '') as CleanTags,
+        CHAR_LENGTH(COALESCE(p.Tags, '')) as TagsLength,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 
+                CAST(p.AnswerCount AS DOUBLE PRECISION) / NULLIF(p.ViewCount, 0)
+            ELSE 0
+        END as AnswerViewRatio,
+        CAST((julianday('2024-10-01 12:34:56') - julianday(p.CreationDate)) AS INTEGER) as AgeInDays,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRankByType
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.CreationDate >= datetime('2024-10-01 12:34:56', '-2 years')
+      AND p.ContentLicense = 'CC BY-SA 2.5'
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.CreationDate, p.OwnerUserId, p.PostTypeId, p.Tags, p.AcceptedAnswerId, p.ClosedDate
+),
+DetailedAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.PostTypeId,
+        pa.PostStatus,
+        pa.ScoreCategory,
+        pa.TagsLength,
+        pa.VoteCount,
+        pa.AnswerViewRatio,
+        pa.AgeInDays,
+        pa.ScoreRankByType,
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.Questions,
+        ua.Answers,
+        ut.TagName,
+        ut.Count as TagCount,
+        ut.TagRank,
+        CASE 
+            WHEN pa.Score > (SELECT AVG(Score) FROM PostAnalysis) THEN 'AboveAverage'
+            WHEN pa.Score < (SELECT AVG(Score) FROM PostAnalysis) THEN 'BelowAverage'
+            ELSE 'Average'
+        END as ScorePerformance,
+        CASE 
+            WHEN pa.ViewCount > (SELECT AVG(ViewCount) FROM PostAnalysis) THEN 'Popular'
+            WHEN pa.ViewCount < (SELECT AVG(ViewCount) FROM PostAnalysis) THEN 'Unpopular'
+            ELSE 'Neutral'
+        END as PopularityLevel,
+        ABS(pa.Score - (SELECT AVG(Score) FROM PostAnalysis)) as ScoreDeviation,
+        DENSE_RANK() OVER (ORDER BY pa.ViewCount DESC) as ViewRank,
+        PERCENT_RANK() OVER (ORDER BY pa.Score) as ScorePercentile,
+        NTILE(4) OVER (ORDER BY pa.Score) as ScoreQuartile
+    FROM PostAnalysis pa
+    LEFT JOIN UserActivityStats ua ON pa.OwnerUserId = ua.UserId
+    LEFT JOIN TopTags ut ON ut.TagRank = 1
+    WHERE pa.PostStatus IN ('Answered', 'Closed', 'Answer')
+)
+SELECT
+    da.PostId,
+    da.Title,
+    da.Score,
+    da.ViewCount,
+    da.AnswerCount,
+    da.CommentCount,
+    da.CreationDate,
+    da.OwnerUserId,
+    da.PostStatus,
+    da.ScoreCategory,
+    da.TagsLength,
+    da.VoteCount,
+    da.AnswerViewRatio,
+    da.AgeInDays,
+    da.ScoreRankByType,
+    da.UserId,
+    da.DisplayName,
+    da.Reputation,
+    da.TotalPosts,
+    da.Questions,
+    da.Answers,
+    da.TagName,
+    da.TagCount,
+    da.TagRank,
+    da.ScorePerformance,
+    da.PopularityLevel,
+    da.ScoreDeviation,
+    da.ViewRank,
+    da.ScorePercentile,
+    da.ScoreQuartile,
+    CASE 
+        WHEN da.ScorePerformance = 'AboveAverage' AND da.PopularityLevel = 'Popular' THEN 'HighImpact'
+        WHEN da.ScorePerformance = 'BelowAverage' AND da.PopularityLevel = 'Unpopular' THEN 'LowImpact'
+        WHEN da.ScorePerformance = 'AboveAverage' AND da.PopularityLevel = 'Unpopular' THEN 'HighScoreLowViews'
+        ELSE 'MixedImpact'
+    END as ImpactCategory,
+    (SELECT GROUP_CONCAT(DISTINCT SUBSTR(da2.TagName, 1, 10), ', ')
+     FROM DetailedAnalysis da2
+     WHERE da2.PostId = da.PostId
+    ) as RelatedTags,
+    ROW_NUMBER() OVER (PARTITION BY da.ScorePerformance ORDER BY da.ViewCount DESC) as PerformanceRank,
+    RANK() OVER (ORDER BY da.Score DESC, da.ViewCount DESC) as OverallRank,
+    LAG(da.Score) OVER (ORDER BY da.Score DESC) as PreviousScore,
+    LEAD(da.Score) OVER (ORDER BY da.Score DESC) as NextScore,
+    COUNT(*) OVER () as TotalRecords,
+    AVG(da.Score) OVER () as AvgScore,
+    MAX(da.Score) OVER () as MaxScore,
+    MIN(da.Score) OVER () as MinScore,
+    SUM(da.ViewCount) OVER () as TotalViews,
+    CASE 
+        WHEN da.ViewCount > 0 THEN 
+            CAST((da.VoteCount * 100.0) / NULLIF(da.ViewCount, 0) AS NUMERIC(5,2))
+        ELSE 0
+    END as VoteToViewRatio,
+    CASE 
+        WHEN da.AgeInDays <= 30 THEN 'New'
+        WHEN da.AgeInDays <= 180 THEN 'Fresh'
+        WHEN da.AgeInDays <= 365 THEN 'Mature'
+        ELSE 'Legacy'
+    END as PostAgeCategory,
+    CASE 
+        WHEN da.Reputation >= 10000 THEN 'Veteran'
+        WHEN da.Reputation >= 1000 THEN 'Experienced'
+        ELSE 'Beginner'
+    END as UserExperienceLevel
+FROM DetailedAnalysis da
+WHERE da.Reputation > 100
+  AND da.ViewCount > 10
+  AND da.Score IS NOT NULL
+  AND da.VoteCount IS NOT NULL
+  AND da.AnswerViewRatio IS NOT NULL
+  AND da.ScoreDeviation > 0
+  AND (
+    da.PostStatus IN ('Answered', 'Closed') 
+    OR (da.PostTypeId = 2 AND da.AnswerCount > 0)
+  )
+  AND (
+    da.ScorePerformance IN ('AboveAverage', 'Average') 
+    OR (da.ScorePerformance = 'BelowAverage' AND da.ViewCount > 100)
+  )
+ORDER BY 
+    da.Score DESC,
+    da.ViewCount DESC,
+    da.VoteCount DESC,
+    da.CreationDate DESC
+LIMIT 1000;

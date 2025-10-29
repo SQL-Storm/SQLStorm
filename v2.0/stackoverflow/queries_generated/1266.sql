@@ -1,0 +1,209 @@
+-- {"query": "1266.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3378} 
+
+WITH UserEngagement AS (
+    -- CTE 1: Aggregates detailed engagement metrics for users, including tag usage and vote sums.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostsScore,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostsViewCount,
+        COUNT(DISTINCT C.Id) AS TotalCommentsWritten,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentsScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE NULL END) AS AverageAnswerScore,
+        COUNT(DISTINCT tag_name_parsed.TagName) AS DistinctTagsUsed,
+        STRING_AGG(DISTINCT tag_name_parsed.TagName, ';') FILTER (WHERE tag_name_parsed.TagName IS NOT NULL) AS AllUniqueTags,
+        SUM(CASE WHEN V_Received.VoteTypeId IN (1, 2) THEN 1 ELSE 0 END) AS UpvotesReceived, -- AcceptedByOriginator (1) and UpMod (2)
+        SUM(CASE WHEN V_Received.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Votes AS V_Received ON P.Id = V_Received.PostId AND V_Received.VoteTypeId IN (1, 2, 3) -- Votes *received* by posts owned by the user
+    LEFT JOIN (
+        SELECT PostId, UNNEST(string_to_array(substring(Tags, 2, length(Tags)-2), '><')) AS TagName
+        FROM Posts WHERE Tags IS NOT NULL AND Tags != '><'
+    ) AS tag_name_parsed ON P.Id = tag_name_parsed.PostId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+), PostLifecycleHistory AS (
+    -- CTE 2: Tracks key historical events for posts, including edits, closes, and reopens.
+    SELECT
+        PH.PostId,
+        MIN(PH.CreationDate) AS InitialCreationDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS LastEditDateByHistory,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE NULL END) AS EditCount, -- Title, Body, Tags edits
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE NULL END) AS CloseEventCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE NULL END) AS ReopenEventCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 16 THEN PH.CreationDate ELSE NULL END) AS CommunityOwnedByHistoryDate,
+        (
+            -- Correlated subquery to find the UserId of the last person to edit a post.
+            SELECT ph_inner.UserId
+            FROM PostHistory AS ph_inner
+            WHERE ph_inner.PostId = PH.PostId
+            AND ph_inner.PostHistoryTypeId IN (4, 5, 6) -- Edit types
+            ORDER BY ph_inner.CreationDate DESC
+            LIMIT 1
+        ) AS LastEditorUserIdByHistory
+    FROM PostHistory AS PH
+    GROUP BY PH.PostId
+), RelatedContentAnalysis AS (
+    -- CTE 3: Analyzes links and duplicate relationships for posts.
+    SELECT
+        P.Id AS PostId,
+        COUNT(DISTINCT PL_Linked.RelatedPostId) AS CountLinkedPosts,
+        COUNT(DISTINCT PL_Duplicate.RelatedPostId) AS CountDuplicateOfPosts,
+        MAX(PL_Linked.CreationDate) AS LatestLinkedDate,
+        MAX(PL_Duplicate.CreationDate) AS LatestDuplicateDate
+    FROM Posts AS P
+    LEFT JOIN PostLinks AS PL_Linked ON P.Id = PL_Linked.PostId AND PL_Linked.LinkTypeId = 1 -- Linked
+    LEFT JOIN PostLinks AS PL_Duplicate ON P.Id = PL_Duplicate.PostId AND PL_Duplicate.LinkTypeId = 3 -- Duplicate
+    GROUP BY P.Id
+)
+-- Main Query: Joins CTEs, applies window functions, complex predicates, and set operators.
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.UserCreationDate,
+    UE.TotalPosts,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    UE.TotalPostsScore,
+    UE.TotalPostsViewCount,
+    UE.TotalCommentsWritten,
+    UE.AverageAnswerScore,
+    UE.DistinctTagsUsed,
+    UE.AllUniqueTags,
+    UE.UpvotesReceived,
+    UE.DownvotesReceived,
+    P.Id AS PostId,
+    COALESCE(P.Title, 'N/A') AS PostTitle,
+    P.Tags AS PostTags,
+    PT.Name AS PostTypeName,
+    P.CreationDate AS PostCreationDate,
+    P.Score AS PostScore,
+    P.ViewCount AS PostViewCount,
+    COALESCE(P.AnswerCount, 0) AS AnswerCountOnQuestion,
+    P.FavoriteCount AS PostFavoriteCount,
+    PLH.EditCount AS PostEditCount,
+    PLH.CloseEventCount AS PostCloseCount,
+    PLH.ReopenEventCount AS PostReopenCount,
+    (PLH.CommunityOwnedByHistoryDate IS NOT NULL OR P.CommunityOwnedDate IS NOT NULL) AS IsCommunityWiki,
+    AGE(CURRENT_TIMESTAMP, P.CreationDate) AS PostAge,
+    EXTRACT(EPOCH FROM (COALESCE(PLH.LastEditDateByHistory, P.LastEditDate, P.CreationDate) - P.CreationDate)) AS TimeToFirstActivitySeconds,
+    RCA.CountLinkedPosts,
+    RCA.CountDuplicateOfPosts,
+    RANK() OVER (PARTITION BY UE.UserId ORDER BY P.Score DESC, P.ViewCount DESC) AS RankOfPostByUser, -- Window function
+    NTILE(5) OVER (ORDER BY UE.Reputation DESC, UE.TotalPostsScore DESC) AS ReputationEngagementQuintile, -- Window function
+    LAG(P.Score, 1, 0) OVER (PARTITION BY UE.UserId ORDER BY P.CreationDate) AS PreviousPostScore, -- Window function
+    (
+        SELECT COUNT(B.Id)
+        FROM Badges AS B
+        WHERE B.UserId = UE.UserId
+        AND B.Class = 1 -- Gold badges
+        AND B.Date BETWEEN UE.UserCreationDate AND P.CreationDate
+    ) AS GoldBadgesAtPostCreation, -- Correlated subquery for user badges history
+    (
+        SELECT ARRAY_AGG(CR.Name)
+        FROM PostHistory AS PH_Close
+        LEFT JOIN CloseReasonTypes AS CR ON CAST(PH_Close.Comment AS SMALLINT) = CR.Id
+        WHERE PH_Close.PostId = P.Id
+        AND PH_Close.PostHistoryTypeId = 10 -- Post Closed
+        AND PH_Close.Comment ~ '^[0-9]+$' -- Ensure comment is a number for close reason ID
+    ) AS CloseReasonNames, -- Correlated subquery with string aggregation
+    CASE
+        WHEN P.ClosedDate IS NOT NULL AND PLH.ReopenEventCount > 0 THEN 'Closed and Reopened'
+        WHEN P.ClosedDate IS NOT NULL AND PLH.CloseEventCount > 0 THEN 'Closed Permanently'
+        WHEN P.AcceptedAnswerId IS NOT NULL AND P.PostTypeId = 1 THEN 'Question with Accepted Answer'
+        WHEN P.PostTypeId = 2 AND P.ParentId IS NOT NULL AND P.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2) THEN 'High Score Answer' -- Non-correlated subquery
+        ELSE 'Active/Other'
+    END AS PostStatusCategory,
+    P.Body ILIKE '%performance%' AND P.Tags ILIKE '%<sql>%' AS ContainsSQLPerformanceKeyword, -- String expressions and complicated predicate
+    COALESCE(P.OwnerDisplayName, UE.DisplayName, 'Unknown User') AS EffectiveOwnerDisplayName -- NULL logic with COALESCE
+FROM UserEngagement AS UE
+INNER JOIN Posts AS P ON UE.UserId = P.OwnerUserId
+LEFT JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+LEFT JOIN PostLifecycleHistory AS PLH ON P.Id = PLH.PostId
+LEFT JOIN RelatedContentAnalysis AS RCA ON P.Id = RCA.PostId
+WHERE
+    UE.Reputation >= 5000 AND P.CreationDate >= CURRENT_DATE - INTERVAL '3 years' -- Filter for active, high-rep users and recent posts
+    AND P.PostTypeId IN (1, 2) -- Only questions and answers
+    AND (P.ViewCount > 1000 OR P.Score > 50) -- Criteria for "impactful" posts
+    AND P.Body IS NOT NULL AND LENGTH(P.Body) > 200 -- Only posts with substantial content
+    AND P.CommunityOwnedDate IS NULL -- Exclude community wikis from this main branch for explicit owner analysis
+
+UNION ALL
+
+-- Second branch of the query: Focus on community-driven or less-attributed content and specific post types.
+SELECT
+    NULL AS UserId,
+    'Community/Orphaned' AS DisplayName,
+    0 AS Reputation,
+    NULL AS UserCreationDate,
+    NULL AS TotalPosts,
+    NULL AS TotalQuestions,
+    NULL AS TotalAnswers,
+    P.Score AS TotalPostsScore, -- Only post score available for anonymous/community
+    P.ViewCount AS TotalPostsViewCount,
+    P.CommentCount AS TotalCommentsWritten, -- Only post comment count
+    NULL AS AverageAnswerScore,
+    NULL AS DistinctTagsUsed,
+    STRING_AGG(DISTINCT tag_name_parsed.TagName, ';') FILTER (WHERE tag_name_parsed.TagName IS NOT NULL) AS AllUniqueTags,
+    NULL AS UpvotesReceived,
+    NULL AS DownvotesReceived,
+    P.Id AS PostId,
+    COALESCE(P.Title, 'N/A') AS PostTitle,
+    P.Tags AS PostTags,
+    PT.Name AS PostTypeName,
+    P.CreationDate AS PostCreationDate,
+    P.Score AS PostScore,
+    P.ViewCount AS PostViewCount,
+    COALESCE(P.AnswerCount, 0) AS AnswerCountOnQuestion,
+    P.FavoriteCount AS PostFavoriteCount,
+    PLH.EditCount AS PostEditCount,
+    PLH.CloseEventCount AS PostCloseCount,
+    PLH.ReopenEventCount AS PostReopenCount,
+    (PLH.CommunityOwnedByHistoryDate IS NOT NULL OR P.CommunityOwnedDate IS NOT NULL) AS IsCommunityWiki,
+    AGE(CURRENT_TIMESTAMP, P.CreationDate) AS PostAge,
+    EXTRACT(EPOCH FROM (COALESCE(PLH.LastEditDateByHistory, P.LastEditDate, P.CreationDate) - P.CreationDate)) AS TimeToFirstActivitySeconds,
+    RCA.CountLinkedPosts,
+    RCA.CountDuplicateOfPosts,
+    NULL AS RankOfPostByUser, -- Not applicable for non-user posts
+    NULL AS ReputationEngagementQuintile, -- Not applicable
+    NULL AS PreviousPostScore, -- Not applicable
+    NULL AS GoldBadgesAtPostCreation,
+    (
+        SELECT ARRAY_AGG(CR.Name)
+        FROM PostHistory AS PH_Close
+        LEFT JOIN CloseReasonTypes AS CR ON CAST(PH_Close.Comment AS SMALLINT) = CR.Id
+        WHERE PH_Close.PostId = P.Id
+        AND PH_Close.PostHistoryTypeId = 10
+        AND PH_Close.Comment ~ '^[0-9]+$'
+    ) AS CloseReasonNames,
+    CASE
+        WHEN P.OwnerUserId IS NULL AND P.LastEditorUserId IS NULL AND P.Score < 0 THEN 'Orphaned and Downvoted'
+        WHEN P.PostTypeId = 5 AND P.Tags ILIKE '%<community-wiki>%' THEN 'TagWiki Community Edit'
+        WHEN P.PostTypeId = 1 AND P.ClosedDate IS NOT NULL AND P.Tags ILIKE '%<off-topic>%' THEN 'Off-Topic Closed Question'
+        ELSE 'Generic Community Post'
+    END AS PostStatusCategory,
+    P.Body ILIKE '%deprecated%' OR P.Tags ILIKE '%<legacy>%' AS ContainsDeprecatedKeyword,
+    COALESCE(P.OwnerDisplayName, 'Community') AS EffectiveOwnerDisplayName
+FROM Posts AS P
+LEFT JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+LEFT JOIN PostLifecycleHistory AS PLH ON P.Id = PLH.PostId
+LEFT JOIN RelatedContentAnalysis AS RCA ON P.Id = RCA.PostId
+LEFT JOIN (
+    SELECT PostId, UNNEST(string_to_array(substring(Tags, 2, length(Tags)-2), '><')) AS TagName
+    FROM Posts WHERE Tags IS NOT NULL AND Tags != '><'
+) AS tag_name_parsed ON P.Id = tag_name_parsed.PostId
+WHERE
+    P.CreationDate >= CURRENT_DATE - INTERVAL '5 years'
+    AND (P.OwnerUserId IS NULL OR P.OwnerUserId = -1 OR P.CommunityOwnedDate IS NOT NULL) -- Community, deleted owner, or explicitly community wiki
+    AND P.PostTypeId IN (1, 2, 5) -- Questions, Answers, TagWikis
+    AND P.Body IS NOT NULL AND LENGTH(P.Body) > 50 -- Minimum content length
+GROUP BY P.Id, P.Title, P.Tags, PT.Name, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount, PLH.EditCount, PLH.CloseEventCount, PLH.ReopenEventCount, P.CommunityOwnedDate, PLH.CommunityOwnedByHistoryDate, PLH.LastEditDateByHistory, P.LastEditDate, RCA.CountLinkedPosts, RCA.CountDuplicateOfPosts, P.OwnerUserId, P.LastEditorUserId, P.ClosedDate, P.Body, P.OwnerDisplayName, P.CommentCount, tag_name_parsed.TagName -- Ensure grouping for STRING_AGG in UNION ALL part.
+
+ORDER BY Reputation DESC NULLS LAST, PostScore DESC, PostCreationDate DESC;

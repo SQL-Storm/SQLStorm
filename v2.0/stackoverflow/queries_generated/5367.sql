@@ -1,0 +1,130 @@
+-- {"query": "5367.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 900} 
+WITH
+RecentActive AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.FavoriteCount,
+    p.CommentCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.ContentLicense,
+    ROW_NUMBER() OVER (ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '180 days'
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    u.Location,
+    u.WebsiteUrl,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate >= NOW() - INTERVAL '365 days') AS PostsLastYear,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND c.CreationDate >= NOW() - INTERVAL '365 days') AS CommentsLastYear
+  FROM Users u
+  WHERE u.AccountId IS NOT NULL
+),
+Aggregated AS (
+  SELECT
+    r.PostId,
+    r.PostTypeId,
+    r.Title,
+    r.CreationDate,
+    r.LastActivityDate,
+    r.Score,
+    r.ViewCount,
+    r.Tags,
+    r.CommentCount,
+    r.FavoriteCount,
+    r.ParentId,
+    r.AcceptedAnswerId,
+    r.ContentLicense,
+    ta.TagName,
+    ua.UserId,
+    ua.DisplayName AS OwnerDisplayName,
+    v.TotalUpVotes,
+    v.TotalDownVotes,
+    v.Accepted AS IsAccepted,
+    c.TotalComments,
+    gar.ReplyCount
+  FROM RecentActive r
+  LEFT JOIN TopTags ta
+    ON POSITION(ta.TagName IN r.Tags) > 0
+  LEFT JOIN UserActivity ua
+    ON r.OwnerUserId = ua.UserId
+  LEFT JOIN (
+    SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+           SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+           SUM(CASE WHEN VoteTypeId = 1 THEN 1 ELSE 0 END) AS Accepted
+    FROM Votes
+    GROUP BY PostId
+  ) v ON v.PostId = r.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS TotalComments
+    FROM Comments
+    GROUP BY PostId
+  ) c ON c.PostId = r.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS ReplyCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 1
+    GROUP BY PostId
+  ) gar ON gar.PostId = r.Id
+  WHERE r.rn <= 100
+),
+Windowed AS (
+  SELECT
+    a.*,
+    ROW_NUMBER() OVER (PARTITION BY COALESCE(a.ParentId, a.PostId) ORDER BY a.LastActivityDate DESC) AS rn_by_parent
+  FROM Aggregated a
+)
+SELECT
+  p.PostId,
+  p.PostTypeId,
+  p.Title,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.Score,
+  p.ViewCount,
+  p.Tags,
+  p.CommentCount,
+  p.FavoriteCount,
+  p.ParentId,
+  p.AcceptedAnswerId,
+  p.ContentLicense,
+  p.TagName,
+  p.OwnerDisplayName,
+  p.TotalUpVotes,
+  p.TotalDownVotes,
+  p.IsAccepted,
+  p.TotalComments,
+  p.ReplyCount
+FROM Windowed p
+WHERE p.rn_by_parent = 1
+ORDER BY p.LastActivityDate DESC, p.Score DESC
+LIMIT 200;

@@ -1,0 +1,50 @@
+-- {"query": "5552.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 537} 
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS PostsCreated,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+  AVG(p.Score) AS AvgPostScore,
+  MAX(p.LastActivityDate) AS LastActive,
+  AVG(DATEDIFF(day, u.CreationDate, COALESCE(p.LastActivityDate, cast('2024-10-01' as date)))) AS AvgDaysToFirstActivity,
+  COALESCE(b.TotalBadges, 0) AS TotalBadges,
+  STRING_AGG(DISTINCT b.Name, ',') WITHIN GROUP (ORDER BY b.Name) AS BadgeNames,
+  SUM(CASE
+        WHEN v.VoteTypeId = 2 THEN 1
+        WHEN v.VoteTypeId = 1 THEN 0
+        ELSE 0
+      END) AS UpvotesReceived,
+  SUM(CASE
+        WHEN v.VoteTypeId = 3 THEN 1
+        ELSE 0
+      END) AS DownvotesReceived,
+  MAX(CASE WHEN w.IsHot THEN w.HotRank ELSE NULL END) AS PeakHotRank
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS TotalBadges
+    FROM Badges
+    GROUP BY OwnerUserId
+  ) b ON b.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+    AND v.CreationDate >= DATEADD(year, -1, cast('2024-10-01' as date)) -- last year activity
+  LEFT JOIN (
+    SELECT
+      p2.OwnerUserId,
+      MAX(CASE WHEN p2.Score > 0 THEN 1 ELSE 0 END) AS IsHot,
+      ROW_NUMBER() OVER (ORDER BY p2.Score DESC, p2.LastActivityDate DESC) AS HotRank
+    FROM Posts p2
+    WHERE p2.PostTypeId = 1
+    GROUP BY p2.OwnerUserId
+  ) w ON w.OwnerUserId = u.Id
+WHERE
+  u.Id IS NOT NULL
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation, b.TotalBadges
+HAVING
+  COUNT(DISTINCT p.Id) > 0
+ORDER BY
+  PeakHotRank NULLS LAST, UPPER(u.DisplayName);

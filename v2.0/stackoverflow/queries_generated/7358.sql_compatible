@@ -1,0 +1,235 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_owner_score,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score > 10 THEN 'High_Question'
+            WHEN p.PostTypeId = 2 AND p.Score > 5 THEN 'High_Answer'
+            ELSE 'Regular'
+        END as post_category,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                CARDINALITY(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><'))
+            ELSE 0 
+        END as tag_count,
+        COALESCE(p.ViewCount, 0) - COALESCE(LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate), 0) as view_change,
+        (COALESCE(p.Score, 0) - COALESCE(p.AnswerCount, 0)) * COALESCE(p.CommentCount, 0) as score_comment_factor
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2022-01-01'
+),
+UserActivity AS (
+    SELECT 
+        u.Id as user_id,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT r.Id) as recent_posts,
+        COUNT(DISTINCT CASE WHEN r.PostTypeId = 1 THEN r.Id END) as recent_questions,
+        COUNT(DISTINCT CASE WHEN r.PostTypeId = 2 THEN r.Id END) as recent_answers,
+        AVG(r.Score) as avg_post_score,
+        MAX(r.CreationDate) as last_activity,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as rep_rank,
+        ROW_NUMBER() OVER (PARTITION BY CASE WHEN u.Reputation > 10000 THEN 1 ELSE 0 END ORDER BY u.Views DESC) as high_rep_views_rank
+    FROM Users u
+    LEFT JOIN RankedPosts r ON u.Id = r.OwnerUserId
+    WHERE u.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        RANK() OVER (ORDER BY t.Count DESC) as tag_rank,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) as prev_count,
+        (t.Count - LAG(t.Count) OVER (ORDER BY t.Count DESC)) as count_diff
+    FROM Tags t
+    WHERE t.Count > 100
+),
+QualifiedPosts AS (
+    SELECT 
+        rp.Id,
+        rp.PostTypeId,
+        rp.Title,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.LastActivityDate,
+        rp.post_category,
+        rp.tag_count,
+        rp.view_change,
+        rp.score_comment_factor,
+        rp.prev_score,
+        rp.avg_owner_score,
+        ua.user_id,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.recent_posts,
+        ua.avg_post_score,
+        t.TagName,
+        t.Count as tag_count_rank,
+        tt.tag_rank,
+        CASE 
+            WHEN rp.Score > 50 AND rp.AnswerCount > 10 AND rp.CommentCount > 5 THEN 'Highly Engaged'
+            WHEN rp.Score > 20 AND rp.AnswerCount > 5 THEN 'Moderately Engaged'
+            WHEN rp.Score > 0 AND rp.CommentCount > 0 THEN 'Engaged'
+            ELSE 'Passive'
+        END as engagement_level,
+        CASE 
+            WHEN (rp.LastActivityDate - rp.CreationDate) > INTERVAL '30 days' THEN 'Long_Lived'
+            WHEN (rp.LastActivityDate - rp.CreationDate) > INTERVAL '7 days' THEN 'Medium_Lived'
+            WHEN (rp.LastActivityDate - rp.CreationDate) > INTERVAL '1 day' THEN 'Short_Lived'
+            ELSE 'Fresh'
+        END as age_category
+    FROM RankedPosts rp
+    INNER JOIN UserActivity ua ON rp.OwnerUserId = ua.user_id
+    LEFT JOIN TopTags tt ON tt.tag_rank <= 5
+    LEFT JOIN Tags t ON t.TagName = ANY(string_to_array(TRIM(BOTH '<>' FROM rp.Tags), '><'))
+    WHERE rp.rn <= 3
+        AND rp.Score > 0
+        AND (rp.PostTypeId = 1 OR rp.PostTypeId = 2)
+        AND ua.Reputation > 100
+        AND tt.tag_rank IS NOT NULL
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.UserDisplayName,
+        ph.Comment,
+        ph.Text,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 
+                CASE 
+                    WHEN ph.Comment ~ '^[0-9]+$' THEN 'numeric_reason'
+                    WHEN ph.Comment IS NOT NULL THEN 'text_reason'
+                    ELSE 'no_reason'
+                END
+            ELSE 'other_type'
+        END as reason_category,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as event_seq,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) as prev_event_date,
+        EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) as time_since_prev_event
+    FROM PostHistory ph
+    INNER JOIN QualifiedPosts qp ON ph.PostId = qp.Id
+    WHERE ph.CreationDate >= TIMESTAMP '2022-01-01'
+)
+SELECT 
+    'Performance_Benchmark_Results' as report_title,
+    COUNT(*) as total_posts,
+    COUNT(DISTINCT qp.user_id) as unique_users,
+    COUNT(DISTINCT CASE WHEN qp.post_category = 'High_Question' THEN qp.Id END) as high_questions,
+    COUNT(DISTINCT CASE WHEN qp.post_category = 'High_Answer' THEN qp.Id END) as high_answers,
+    AVG(qp.Score) as avg_score,
+    AVG(qp.ViewCount) as avg_views,
+    AVG(qp.Reputation) as avg_user_rep,
+    AVG(qp.avg_post_score) as avg_user_post_score,
+    COUNT(DISTINCT CASE WHEN qp.engagement_level = 'Highly Engaged' THEN qp.Id END) as highly_engaged_posts,
+    COUNT(DISTINCT CASE WHEN qp.engagement_level = 'Moderately Engaged' THEN qp.Id END) as moderately_engaged_posts,
+    COUNT(DISTINCT CASE WHEN qp.engagement_level = 'Engaged' THEN qp.Id END) as engaged_posts,
+    COUNT(DISTINCT CASE WHEN qp.engagement_level = 'Passive' THEN qp.Id END) as passive_posts,
+    COUNT(DISTINCT CASE WHEN qp.age_category = 'Long_Lived' THEN qp.Id END) as long_lived_posts,
+    COUNT(DISTINCT CASE WHEN qp.age_category = 'Medium_Lived' THEN qp.Id END) as medium_lived_posts,
+    COUNT(DISTINCT CASE WHEN qp.age_category = 'Short_Lived' THEN qp.Id END) as short_lived_posts,
+    COUNT(DISTINCT CASE WHEN qp.age_category = 'Fresh' THEN qp.Id END) as fresh_posts,
+    COUNT(DISTINCT CASE WHEN pha.PostId IS NOT NULL THEN pha.PostId END) as posts_with_history,
+    AVG(CASE WHEN pha.PostId IS NOT NULL THEN pha.time_since_prev_event END) as avg_time_between_events,
+    COUNT(DISTINCT CASE WHEN pha.reason_category = 'numeric_reason' THEN pha.PostId END) as numeric_reason_events,
+    COUNT(DISTINCT CASE WHEN pha.reason_category = 'text_reason' THEN pha.PostId END) as text_reason_events,
+    COUNT(DISTINCT CASE WHEN pha.reason_category = 'other_type' THEN pha.PostId END) as other_type_events
+FROM QualifiedPosts qp
+LEFT JOIN PostHistoryAnalysis pha ON qp.Id = pha.PostId
+WHERE qp.CreationDate >= TIMESTAMP '2022-01-01'
+GROUP BY 
+    (SELECT COUNT(*) FROM QualifiedPosts WHERE CreationDate >= TIMESTAMP '2022-01-01')
+HAVING 
+    COUNT(*) > 0
+UNION ALL
+SELECT 
+    'Tag_Category_Statistics' as report_title,
+    COUNT(*) as total_posts,
+    0 as unique_users,
+    0 as high_questions,
+    0 as high_answers,
+    AVG(t.Count) as avg_tag_count,
+    0 as avg_views,
+    0 as avg_user_rep,
+    0 as avg_user_post_score,
+    COUNT(DISTINCT CASE WHEN t.Count > 1000 THEN t.TagName END) as high_popularity_tags,
+    COUNT(DISTINCT CASE WHEN t.Count BETWEEN 500 AND 1000 THEN t.TagName END) as medium_popularity_tags,
+    COUNT(DISTINCT CASE WHEN t.Count < 500 THEN t.TagName END) as low_popularity_tags,
+    0 as highly_engaged_posts,
+    0 as moderately_engaged_posts,
+    0 as engaged_posts,
+    0 as passive_posts,
+    0 as long_lived_posts,
+    0 as medium_lived_posts,
+    0 as short_lived_posts,
+    0 as fresh_posts,
+    0 as posts_with_history,
+    0 as avg_time_between_events,
+    0 as numeric_reason_events,
+    0 as text_reason_events,
+    0 as other_type_events
+FROM TopTags t
+WHERE t.tag_rank <= 10
+HAVING 
+    COUNT(*) > 0
+UNION ALL
+SELECT 
+    'User_Rep_Benchmarks' as report_title,
+    0 as total_posts,
+    COUNT(*) as unique_users,
+    0 as high_questions,
+    0 as high_answers,
+    0 as avg_score,
+    0 as avg_views,
+    AVG(u.Reputation) as avg_user_rep,
+    0 as avg_user_post_score,
+    0 as highly_engaged_posts,
+    0 as moderately_engaged_posts,
+    0 as engaged_posts,
+    0 as passive_posts,
+    0 as long_lived_posts,
+    0 as medium_lived_posts,
+    0 as short_lived_posts,
+    0 as fresh_posts,
+    0 as posts_with_history,
+    0 as avg_time_between_events,
+    0 as numeric_reason_events,
+    0 as text_reason_events,
+    0 as other_type_events
+FROM UserActivity u
+WHERE u.rep_rank <= 100
+HAVING 
+    COUNT(*) > 0
+ORDER BY 
+    CASE report_title
+        WHEN 'Performance_Benchmark_Results' THEN 1
+        WHEN 'Tag_Category_Statistics' THEN 2
+        WHEN 'User_Rep_Benchmarks' THEN 3
+    END;

@@ -1,0 +1,109 @@
+WITH 
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        u.UpVotes,
+        u.DownVotes
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+BadgeAgg AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 5 WHEN b.Class = 2 THEN 3 ELSE 1 END) AS BadgeScore,
+        STRING_AGG(DISTINCT b.Name, ',') AS BadgeList,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentVotes AS (
+    SELECT 
+        v.UserId,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotesRecent,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotesRecent,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= (DATE '2024-10-01' - INTERVAL '30' DAY)
+    GROUP BY v.UserId
+),
+TopQuestionPerUser AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Id,
+        p.Title,
+        p.Score,
+        p.Tags,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY p.Score DESC NULLS LAST, p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+UserRanking AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.NetVotes,
+        (us.Reputation + us.NetVotes + COALESCE(ba.BadgeScore, 0)) AS CompositeScore,
+        RANK() OVER (ORDER BY (us.Reputation + us.NetVotes + COALESCE(ba.BadgeScore, 0)) DESC) AS GlobalRank
+    FROM UserStats us
+    LEFT JOIN BadgeAgg ba ON ba.UserId = us.Id
+    GROUP BY us.Id, us.DisplayName, us.Reputation, us.NetVotes, ba.BadgeScore
+)
+SELECT 
+    ur.Id,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.NetVotes,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.LastPostDate,
+    COALESCE(ba.BadgeScore, 0) AS BadgeScore,
+    COALESCE(ba.BadgeList, '') AS Badges,
+    ba.LatestBadgeDate,
+    COALESCE(rv.UpVotesRecent, 0) AS UpVotesLast30d,
+    COALESCE(rv.DownVotesRecent, 0) AS DownVotesLast30d,
+    COALESCE(rv.LastVoteDate, TIMESTAMP '1970-01-01 00:00:00') AS LastVoteDate,
+    tp.Id AS TopQuestionId,
+    tp.Title AS TopQuestionTitle,
+    tp.Score AS TopQuestionScore,
+    CASE 
+        WHEN ur.Reputation > 20000 THEN 'Veteran'
+        WHEN ur.Reputation BETWEEN 5000 AND 20000 THEN 'Experienced'
+        ELSE 'Newbie' 
+    END AS ReputationTier,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.UserId = ur.Id 
+       AND c.CreationDate >= (DATE '2024-10-01' - INTERVAL '7' DAY)
+    ) AS RecentCommentCount,
+    CASE 
+        WHEN tp.Tags IS NOT NULL THEN 
+            REPLACE(REPLACE(SUBSTRING(tp.Tags FROM 2 FOR LENGTH(tp.Tags) - 2), '><', ', '), '>', '')
+        ELSE NULL 
+    END AS TopQuestionTags,
+    ur.GlobalRank,
+    CASE 
+        WHEN (ur.Reputation > 5000 AND us.AnswerCount > 10) 
+             OR (COALESCE(ba.BadgeScore, 0) >= 10 AND COALESCE(rv.UpVotesRecent, 0) > 50) THEN 1 
+        ELSE 0 
+    END AS IsPowerUser,
+    ur.CompositeScore
+FROM UserRanking ur
+JOIN UserStats us ON us.Id = ur.Id
+LEFT JOIN BadgeAgg ba ON ba.UserId = ur.Id
+LEFT JOIN RecentVotes rv ON rv.UserId = ur.Id
+LEFT JOIN TopQuestionPerUser tp ON tp.OwnerUserId = ur.Id AND tp.rn = 1
+WHERE ur.CompositeScore > 1000
+ORDER BY ur.CompositeScore DESC
+LIMIT 100
+OFFSET 0;

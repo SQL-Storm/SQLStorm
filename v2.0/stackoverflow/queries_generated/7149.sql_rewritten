@@ -1,0 +1,210 @@
+-- {"query": "7149.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1980} 
+WITH UserPostStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) as TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as Answers,
+        SUM(p.Score) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        MAX(p.ViewCount) as MaxViews,
+        MIN(p.CreationDate) as FirstPostDate,
+        MAX(p.CreationDate) as LastPostDate,
+        COUNT(DISTINCT p.Tags) as UniqueTags,
+        STRING_AGG(DISTINCT p.Tags, '; ') as AllTags,
+        COUNT(DISTINCT c.Id) as TotalComments,
+        COUNT(DISTINCT CASE WHEN c.Score > 0 THEN c.Id END) as PositiveComments,
+        COUNT(DISTINCT CASE WHEN c.Score < 0 THEN c.Id END) as NegativeComments
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question without Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostTypeCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High View'
+            WHEN p.ViewCount > 100 THEN 'Medium View'
+            WHEN p.ViewCount > 10 THEN 'Low View'
+            ELSE 'Very Low View'
+        END as ViewCategory,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) as TimelineRow,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) as PrevScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) as NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as UserAvgScore,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as UserPostCount,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Avg Question'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Below Avg Question'
+            ELSE 'Avg Question'
+        END as ScoreBasis
+    FROM Posts p
+    WHERE p.CreationDate >= '2015-01-01'
+    AND p.PostTypeId IN (1, 2)
+),
+CombinedAnalysis AS (
+    SELECT 
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.TotalPosts,
+        ups.Questions,
+        ups.Answers,
+        ups.TotalScore,
+        ups.AvgScore,
+        ups.MaxViews,
+        ups.FirstPostDate,
+        ups.LastPostDate,
+        ups.UniqueTags,
+        ups.AllTags,
+        ups.TotalComments,
+        ups.PositiveComments,
+        ups.NegativeComments,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.PostTypeId,
+        pa.Tags,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.PostTypeCategory,
+        pa.ViewCategory,
+        pa.ScoreRank,
+        pa.TimelineRow,
+        pa.PrevScore,
+        pa.NextScore,
+        pa.UserAvgScore,
+        pa.UserPostCount,
+        pa.ScoreBasis,
+        CASE 
+            WHEN pa.Score > 0 AND pa.AnswerCount > 0 THEN CAST((pa.Score * 100.0 / NULLIF(pa.AnswerCount, 0)) AS DECIMAL(10,2))
+            ELSE NULL 
+        END as ScorePerAnswer,
+        CASE 
+            WHEN pa.ViewCount > 0 THEN CAST((pa.Score * 100.0 / NULLIF(pa.ViewCount, 0)) AS DECIMAL(10,2))
+            ELSE NULL 
+        END as ScorePerView,
+        IIF(ups.TotalComments > 0, CAST(ups.PositiveComments * 100.0 / ups.TotalComments AS DECIMAL(5,2)), NULL) as PositiveCommentRatio,
+        IIF(ups.TotalPosts > 0, CAST(ups.Questions * 100.0 / ups.TotalPosts AS DECIMAL(5,2)), NULL) as QuestionPercentage
+    FROM UserPostStats ups
+    LEFT JOIN PostAnalysis pa ON ups.UserId = pa.OwnerUserId
+    WHERE ups.TotalPosts > 0
+),
+ComplexCalculation AS (
+    SELECT 
+        *,
+        (Select COUNT(*) FROM Posts ps WHERE ps.OwnerUserId = ca.UserId AND ps.PostTypeId = 1 AND ps.CreationDate >= DATEADD(YEAR, -1, cast('2024-10-01 12:34:56' as timestamp))) as RecentQuestions,
+        (Select COUNT(*) FROM Posts ps WHERE ps.OwnerUserId = ca.UserId AND ps.PostTypeId = 2 AND ps.CreationDate >= DATEADD(YEAR, -1, cast('2024-10-01 12:34:56' as timestamp))) as RecentAnswers,
+        CASE WHEN ca.Score > ca.UserAvgScore THEN 'Above User Average' ELSE 'Below User Average' END as PerformanceIndicator,
+        CASE 
+            WHEN ca.ViewCategory = 'High View' AND ca.Score > 50 THEN 'Popular High Scoring'
+            WHEN ca.ViewCategory = 'Medium View' AND ca.Score > 10 THEN 'Moderate View Scoring'
+            ELSE 'Normal'
+        END as ContentPerformance,
+        ABS(ISNULL(ca.NextScore, 0) - ISNULL(ca.PrevScore, 0)) as ScoreChange,
+        COALESCE(NULLIF(ca.UniqueTags, 0), 1) as TagFactor,
+        CASE WHEN ca.MaxViews > 500 THEN 1 ELSE 0 END as HighlyViewed,
+        CASE WHEN ca.AvgScore > 10 THEN 1 ELSE 0 END as HighScoringUser
+    FROM CombinedAnalysis ca
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    TotalPosts,
+    Questions,
+    Answers,
+    TotalScore,
+    AvgScore,
+    MaxViews,
+    FirstPostDate,
+    LastPostDate,
+    UniqueTags,
+    AllTags,
+    TotalComments,
+    PositiveComments,
+    NegativeComments,
+    PostId,
+    Title,
+    Score,
+    ViewCount,
+    CreationDate,
+    PostTypeId,
+    Tags,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    PostTypeCategory,
+    ViewCategory,
+    ScoreRank,
+    TimelineRow,
+    PrevScore,
+    NextScore,
+    UserAvgScore,
+    UserPostCount,
+    ScoreBasis,
+    ScorePerAnswer,
+    ScorePerView,
+    PositiveCommentRatio,
+    QuestionPercentage,
+    RecentQuestions,
+    RecentAnswers,
+    PerformanceIndicator,
+    ContentPerformance,
+    ScoreChange,
+    TagFactor,
+    HighlyViewed,
+    HighScoringUser,
+    CASE 
+        WHEN (RecentQuestions + RecentAnswers) > 10 THEN 'Active Contributor'
+        WHEN (RecentQuestions + RecentAnswers) > 5 THEN 'Moderate Contributor'
+        ELSE 'Infrequent Contributor'
+    END as ContributionLevel,
+    CASE 
+        WHEN Reputation > 100000 AND TotalPosts > 100 THEN 'Elite Contributor'
+        WHEN Reputation > 50000 AND TotalPosts > 50 THEN 'Veteran Contributor'
+        WHEN Reputation > 10000 AND TotalPosts > 20 THEN 'Experienced Contributor'
+        ELSE 'Regular Contributor'
+    END as ContributorTier,
+    DATEDIFF(DAY, FirstPostDate, LastPostDate) as ActivityDurationDays,
+    ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) as OverallRanking,
+    RANK() OVER (PARTITION BY PostTypeCategory ORDER BY Score DESC) as CategoryRanking,
+    COUNT(*) OVER () as TotalRowsProcessed,
+    STDEV(Score) OVER (PARTITION BY UserId) as UserScoreStdDev,
+    PERCENT_RANK() OVER (ORDER BY Score) as ScorePercentile,
+    CUME_DIST() OVER (ORDER BY Score) as ScoreCumulativeDistribution
+FROM ComplexCalculation
+WHERE (Score > 0 OR Score IS NULL)
+  AND (ViewCount > 0 OR ViewCount IS NULL)
+  AND (TotalPosts > 0 OR TotalPosts IS NULL)
+  AND (Reputation >= 100 OR Reputation IS NULL)
+  AND (FirstPostDate IS NOT NULL)
+  AND ABS(ScorePerView) < 1000
+  AND (ScoreChange IS NULL OR ScoreChange <= 100)
+ORDER BY Score DESC, Reputation DESC
+OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY;

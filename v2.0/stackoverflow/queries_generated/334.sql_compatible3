@@ -1,0 +1,10 @@
+where (
+    (r.quality_rank <= 500 or (r.monthly_rank <= 10 and r.score >= 0))
+    and coalesce(r.tag_count, 0) between 1 and 7
+    and (r.is_closed = 0 or r.ever_reopened = 1 or r.community_bumped = 1)
+    and (r.upvotes - r.downvotes >= -2)
+    and (r.bounty_awarded is null or r.bounty_awarded >= 0)
+    and (r.distinct_commenters is null or length(r.distinct_commenters) >= 0)
+)
+order by r.quality_rank, r.creationdate desc
+limit 500;

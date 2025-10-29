@@ -1,0 +1,161 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END)           AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END)           AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END)           AS BronzeBadges,
+        COALESCE(SUM(p.Score),0)                          AS TotalPostScore,
+        COALESCE(SUM(vup.VoteCnt),0)                      AS UpVotesGiven,
+        COALESCE(SUM(vdown.VoteCnt),0)                    AS DownVotesGiven
+    FROM Users u
+    LEFT JOIN Badges b          ON b.UserId = u.Id
+    LEFT JOIN Posts p           ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT v.UserId, COUNT(*) AS VoteCnt
+        FROM Votes v
+        WHERE v.VoteTypeId = 2
+        GROUP BY v.UserId
+    ) vup ON vup.UserId = u.Id
+    LEFT JOIN (
+        SELECT v.UserId, COUNT(*) AS VoteCnt
+        FROM Votes v
+        WHERE v.VoteTypeId = 3
+        GROUP BY v.UserId
+    ) vdown ON vdown.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+TagUsage AS (
+    SELECT 
+        t.TagName,
+        COUNT(*)                                    AS QuestionCount,
+        SUM(p.Score)                                AS TotalScore,
+        AVG(p.ViewCount)                            AS AvgViews,
+        COUNT(DISTINCT p.OwnerUserId)               AS DistinctAuthors
+    FROM Posts p
+    JOIN (
+        SELECT p2.Id,
+               TRIM(BOTH '<>' FROM p2.Tags) AS tags,
+               UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p2.Tags), '><')) AS tag
+        FROM Posts p2
+    ) ttag ON ttag.Id = p.Id
+    JOIN Tags t ON t.TagName = ttag.tag
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2023-01-01' AS DATE)
+    GROUP BY t.TagName
+),
+
+TopTags AS (
+    SELECT TagName
+    FROM TagUsage
+    ORDER BY QuestionCount DESC
+    LIMIT 10
+),
+
+RecentClosed AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.ClosedDate,
+        ph.Comment                     AS CloseReason,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE p.ClosedDate IS NOT NULL
+      AND ph.PostHistoryTypeId = 10
+),
+
+UserLatestQuestion AS (
+    SELECT 
+        p.OwnerUserId,
+        MAX(p.CreationDate) AS LatestQDate,
+        MAX(p.Id) KEEP (DENSE_RANK FIRST ORDER BY p.CreationDate DESC) AS LatestQId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+),
+
+MainResult AS (
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.TotalPostScore,
+    us.UpVotesGiven,
+    us.DownVotesGiven,
+    COALESCE(rc.CloseReason, 'Open')            AS CurrentCloseReason,
+    rc.ClosedDate,
+    CASE
+        WHEN us.Reputation > 100000 AND us.GoldBadges >= 5 THEN 'Legendary'
+        WHEN us.Reputation > 20000                           THEN 'Power User'
+        ELSE                                                  'Contributor'
+    END                                          AS UserTier,
+    STRING_AGG(DISTINCT tt.TagName, ', ')       AS TopTagList,
+    COUNT(*) AS row_count
+FROM UserStats us
+LEFT JOIN UserLatestQuestion ulq ON ulq.OwnerUserId = us.Id
+LEFT JOIN (
+    SELECT rc.Id, rc.CloseReason, rc.ClosedDate, rc.rn
+    FROM RecentClosed rc
+) rc ON rc.Id = ulq.LatestQId AND rc.rn = 1
+LEFT JOIN (
+    SELECT 
+        p.OwnerUserId,
+        t.TagName
+    FROM Posts p
+    JOIN (
+        SELECT p2.Id,
+               UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p2.Tags), '><')) AS tag
+        FROM Posts p2
+    ) ATAG ON ATAG.Id = p.Id
+    JOIN Tags t ON t.TagName = ATAG.tag
+    WHERE p.PostTypeId = 1
+) tt ON tt.OwnerUserId = us.Id
+WHERE us.Reputation IS NOT NULL
+GROUP BY 
+    us.Id, us.DisplayName, us.Reputation,
+    us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+    us.TotalPostScore, us.UpVotesGiven, us.DownVotesGiven,
+    rc.CloseReason, rc.ClosedDate
+HAVING COUNT(*) > 0
+)
+
+SELECT *
+FROM MainResult
+ORDER BY Reputation DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+
+UNION ALL
+
+SELECT 
+    NULL AS Id,
+    '---' AS DisplayName,
+    NULL AS Reputation,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS TotalPostScore,
+    NULL AS UpVotesGiven,
+    NULL AS DownVotesGiven,
+    NULL AS CurrentCloseReason,
+    NULL AS ClosedDate,
+    NULL AS UserTier,
+    NULL AS TopTagList,
+    0 AS row_count
+WHERE EXISTS (
+    SELECT 1
+    FROM Tags tg
+    WHERE tg.IsModeratorOnly = 1
+      AND NOT EXISTS (
+          SELECT 1
+          FROM Posts p
+          JOIN Users u ON u.Id = p.OwnerUserId
+          WHERE p.Id = tg.ExcerptPostId
+            AND u.Reputation > 50000
+      )
+);

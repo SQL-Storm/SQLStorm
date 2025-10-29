@@ -1,0 +1,79 @@
+-- {"query": "5113.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 611} 
+WITH TopUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+  WHERE u.Reputation > 1000
+),
+TagActivity AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionPosts,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerPosts
+  FROM Tags ta
+  JOIN Posts p ON ta.Id = p.Tags::text::varchar[] -- placeholder to mimic tag relation
+  GROUP BY t.TagName
+),
+RecentBadges AS (
+  SELECT
+    b.Id AS BadgeId,
+    b.UserId,
+    b.Name,
+    b.Date,
+    b.Class,
+    b.TagBased,
+    ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn
+  FROM Badges b
+)
+SELECT
+  tu.UserId,
+  tu.DisplayName,
+  tu.Reputation,
+  tu.CreationDate AS UserCreation,
+  tu.LastAccessDate AS UserLastAccess,
+  tu.Views,
+  tu.UpVotes,
+  tu.DownVotes,
+  tu.AccountId,
+  COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+  COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+  AVG(p.Score) AS AvgPostScore,
+  MAX(p.LastActivityDate) AS LastActivity,
+  ARRAY_AGG(DISTINCT c.Text) FILTER (WHERE c.PostId IS NOT NULL) AS RecentCommentsTexts,
+  JSON_AGG(
+    JSON_BUILD_OBJECT(
+      'badge_id', b.BadgeId,
+      'name', b.Name,
+      'date', b.Date,
+      'class', b.Class,
+      'tag_based', b.TagBased
+    )
+  ) AS Badges
+FROM TopUsers tu
+LEFT JOIN Posts p ON p.OwnerUserId = tu.UserId
+LEFT JOIN Comments c ON c.PostId = p.Id
+LEFT JOIN RecentBadges rb ON rb.UserId = tu.UserId AND rb.rn = 1
+LEFT JOIN Badges b ON b.UserId = tu.UserId
+GROUP BY
+  tu.UserId,
+  tu.DisplayName,
+  tu.Reputation,
+  tu.CreationDate,
+  tu.LastAccessDate,
+  tu.Views,
+  tu.UpVotes,
+  tu.DownVotes,
+  tu.AccountId
+HAVING COUNT(p.Id) > 0
+ORDER BY tu.Reputation DESC
+LIMIT 100;

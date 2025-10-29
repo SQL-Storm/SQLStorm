@@ -1,0 +1,304 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.Body,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        COALESCE(p.ViewCount, 0) + COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as ActivityScore,
+        CAST(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400 AS INTEGER) as DaysActive,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            WHEN p.Score > 10 THEN 'LowVoted'
+            ELSE 'Unvoted'
+        END as VoteCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        LAG(p.ViewCount, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevViews,
+        CASE 
+            WHEN p.Score > LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) THEN 'Improved'
+            WHEN p.Score < LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) THEN 'Declined'
+            ELSE 'Stable'
+        END as ScoreTrend
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400 AS INTEGER) as AccountAgeDays,
+        CASE 
+            WHEN u.Reputation > 100000 THEN 'Elite'
+            WHEN u.Reputation > 50000 THEN 'Master'
+            WHEN u.Reputation > 10000 THEN 'Expert'
+            ELSE 'Regular'
+        END as ReputationLevel,
+        COUNT(DISTINCT ps.PostId) as TotalPosts,
+        SUM(COALESCE(ps.Score, 0)) as TotalScore,
+        AVG(COALESCE(ps.Score, 0)) as AvgScore,
+        SUM(COALESCE(ps.ViewCount, 0)) as TotalViews
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopPosts AS (
+    SELECT 
+        ps.PostId,
+        ps.PostTypeId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.Title,
+        ps.Tags,
+        ps.ActivityScore,
+        ps.ScoreTrend,
+        us.DisplayName as OwnerName,
+        us.Reputation as OwnerReputation,
+        us.TotalPosts,
+        us.TotalScore,
+        DENSE_RANK() OVER (ORDER BY ps.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY ps.ViewCount DESC) as ViewRank
+    FROM PostStats ps
+    INNER JOIN UserStats us ON ps.OwnerUserId = us.UserId
+    WHERE ps.Score > (SELECT AVG(Score) FROM PostStats WHERE PostTypeId = 1)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 500 THEN 'Moderate'
+            WHEN t.Count > 100 THEN 'Niche'
+            ELSE 'Obscure'
+        END as PopularityLevel,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) as PrevCount
+    FROM Tags t
+    WHERE t.Count > 0
+),
+CommentAnalysis AS (
+    SELECT 
+        c.PostId,
+        c.UserId,
+        c.Score,
+        c.Text,
+        c.CreationDate,
+        u.DisplayName as CommenterName,
+        u.Reputation as CommenterReputation,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate ASC) as CommentSequence,
+        COUNT(*) OVER (PARTITION BY c.PostId) as TotalComments,
+        AVG(c.Score) OVER (PARTITION BY c.PostId) as AvgCommentScore
+    FROM Comments c
+    LEFT JOIN Users u ON c.UserId = u.Id
+    WHERE c.Score > 0
+)
+SELECT 
+    'Performance Benchmark Report' as ReportTitle,
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT tp.PostId) as TotalPostsWithScore,
+    COUNT(DISTINCT tp.OwnerUserId) as TotalUniqueAuthors,
+    AVG(tp.Score) as AvgPostScore,
+    MAX(tp.Score) as MaxPostScore,
+    MIN(tp.Score) as MinPostScore,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13) 
+        AND EXISTS (
+            SELECT 1 
+            FROM Posts p 
+            WHERE p.Id = ph.PostId 
+            AND p.PostTypeId = 1
+        )
+    ) as ClosedReopenedPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1 
+        AND p.ClosedDate IS NOT NULL
+    ) as ClosedQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 2 
+        AND p.AcceptedAnswerId IS NOT NULL
+    ) as AcceptedAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM UserStats us 
+        WHERE us.Reputation > 10000
+    ) as TopReputationUsers,
+    (
+        SELECT COUNT(*) 
+        FROM TagAnalysis ta 
+        WHERE ta.PopularityLevel = 'Popular'
+    ) as PopularTags,
+    (
+        SELECT COUNT(*) 
+        FROM CommentAnalysis ca 
+        WHERE ca.TotalComments > 5
+    ) as HighCommentPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.Body LIKE '%<code>%' 
+        AND p.PostTypeId = 1
+    ) as QuestionWithCodeBlocks,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.Text IS NOT NULL 
+        AND LENGTH(ph.Text) > 1000
+    ) as LongHistoryRecords,
+    (
+        SELECT COUNT(*) 
+        FROM Users u 
+        WHERE u.WebsiteUrl IS NOT NULL 
+        AND u.WebsiteUrl <> ''
+    ) as UsersWithWebsite,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.Tags IS NOT NULL 
+        AND p.Tags <> ''
+    ) as QuestionsWithTags,
+    (
+        SELECT SUM(ps.ActivityScore) 
+        FROM PostStats ps
+    ) as TotalActivityScore,
+    (
+        SELECT AVG(us.TotalScore) 
+        FROM UserStats us
+    ) as AvgUserScore,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.ViewCount > 10000
+    ) as HighlyViewedPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.AnswerCount > 10
+    ) as QuestionsWithManyAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.CommentCount > 20
+    ) as QuestionsWithManyComments,
+    (
+        SELECT COALESCE(SUM(ps.Score), 0) 
+        FROM PostStats ps 
+        WHERE ps.PostType = 'Question'
+    ) as TotalQuestionScore,
+    (
+        SELECT COALESCE(SUM(ps.Score), 0) 
+        FROM PostStats ps 
+        WHERE ps.PostType = 'Answer'
+    ) as TotalAnswerScore,
+    (
+        SELECT ROUND(AVG(us.AccountAgeDays), 2) 
+        FROM UserStats us
+    ) as AvgAccountAgeDays
+FROM TopPosts tp
+LEFT JOIN UserStats us ON tp.OwnerUserId = us.UserId
+LEFT JOIN TagAnalysis ta ON tp.Tags LIKE '%' || ta.TagName || '%'
+LEFT JOIN CommentAnalysis ca ON tp.PostId = ca.PostId
+LEFT JOIN Posts p ON tp.PostId = p.Id
+LEFT JOIN Users u ON tp.OwnerUserId = u.Id
+WHERE tp.ScoreRank <= 100 
+AND tp.ViewRank <= 100
+AND (tp.Score > 100 OR tp.ViewCount > 1000)
+AND (tp.OwnerReputation > 1000 OR tp.TotalScore > 500)
+AND EXISTS (
+    SELECT 1 
+    FROM Posts p2 
+    WHERE p2.ParentId = tp.PostId 
+    AND p2.PostTypeId = 2
+)
+AND NOT EXISTS (
+    SELECT 1 
+    FROM PostHistory ph 
+    WHERE ph.PostId = tp.PostId 
+    AND ph.PostHistoryTypeId IN (35, 36)
+)
+AND (
+    SELECT COUNT(*) 
+    FROM Posts p3 
+    WHERE p3.ParentId = tp.PostId
+) >= 0
+AND tp.ActivityScore > 100
+AND tp.ScoreTrend IN ('Improved', 'Stable')
+AND tp.PostType IN ('Question', 'Answer')
+GROUP BY tp.OwnerUserId, tp.Score, tp.ViewCount, tp.Title, tp.Tags, tp.OwnerName, tp.OwnerReputation, tp.TotalPosts, tp.TotalScore, tp.PostId, tp.ActivityScore, tp.ScoreTrend, tp.PostType
+HAVING COUNT(*) > 1
+UNION ALL
+SELECT 
+    'Performance Metrics Summary' as ReportTitle,
+    COUNT(*) as TotalRecords,
+    0 as TotalPostsWithScore,
+    0 as TotalUniqueAuthors,
+    0 as AvgPostScore,
+    0 as MaxPostScore,
+    0 as MinPostScore,
+    0 as ClosedReopenedPosts,
+    0 as ClosedQuestions,
+    0 as AcceptedAnswers,
+    0 as TopReputationUsers,
+    0 as PopularTags,
+    0 as HighCommentPosts,
+    0 as QuestionWithCodeBlocks,
+    0 as LongHistoryRecords,
+    0 as UsersWithWebsite,
+    0 as QuestionsWithTags,
+    0 as TotalActivityScore,
+    0 as AvgUserScore,
+    0 as HighlyViewedPosts,
+    0 as QuestionsWithManyAnswers,
+    0 as QuestionsWithManyComments,
+    0 as TotalQuestionScore,
+    0 as TotalAnswerScore,
+    0 as AvgAccountAgeDays
+FROM Posts p
+WHERE p.PostTypeId = 1
+AND p.Score > 1000
+AND EXISTS (
+    SELECT 1 
+    FROM Users u 
+    WHERE u.Id = p.OwnerUserId 
+    AND u.Reputation > 50000
+)
+AND NOT EXISTS (
+    SELECT 1 
+    FROM PostHistory ph 
+    WHERE ph.PostId = p.Id 
+    AND ph.PostHistoryTypeId = 17
+)
+AND (
+    SELECT COUNT(*) 
+    FROM Comments c 
+    WHERE c.PostId = p.Id
+) > 50
+AND p.ViewCount > 5000
+ORDER BY ReportTitle;

@@ -1,0 +1,272 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as avg_score_3,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as score_category,
+        COALESCE(p.Title, 'No Title') as safe_title,
+        TRIM(BOTH '<>' FROM COALESCE(p.Tags, '')) as cleaned_tags,
+        STRING_AGG(p.Tags, ', ') OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS UNBOUNDED PRECEDING) as user_tag_history,
+        EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400.0 as days_since_creation
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id as user_id,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answer_count,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        MAX(p.Score) as max_score,
+        MIN(p.CreationDate) as first_post_date,
+        MAX(p.CreationDate) as last_post_date
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Rare'
+        END as tag_popularity,
+        RANK() OVER (ORDER BY t.Count DESC) as popularity_rank,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) - t.Count as count_difference,
+        AVG(t.Count) OVER (ORDER BY t.Count DESC ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as moving_avg_count
+    FROM Tags t
+),
+ComplexComments AS (
+    SELECT 
+        c.Id,
+        c.PostId,
+        c.UserId,
+        c.Score,
+        c.Text,
+        c.CreationDate,
+        LENGTH(c.Text) as text_length,
+        CASE 
+            WHEN c.Score > 10 THEN 'Highly Rated'
+            WHEN c.Score > 5 THEN 'Moderate Rated'
+            ELSE 'Low Rated'
+        END as rating_category,
+        REGEXP_REPLACE(c.Text, '[^a-zA-Z0-9\s]', '', 'g') as cleaned_text,
+        INITCAP(SUBSTR(c.Text, 1, 50)) as first_50_chars
+    FROM Comments c
+    WHERE LENGTH(c.Text) > 50
+),
+CombinedAnalysis AS (
+    SELECT 
+        rp.Id,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.rn,
+        rp.prev_score,
+        rp.avg_score_3,
+        rp.score_category,
+        rp.safe_title,
+        rp.cleaned_tags,
+        rp.user_tag_history,
+        rp.days_since_creation,
+        us.total_posts,
+        us.question_count,
+        us.answer_count,
+        us.total_score,
+        us.avg_score,
+        us.max_score,
+        us.first_post_date,
+        us.last_post_date,
+        ta.TagName,
+        ta.Count as tag_count,
+        -- replaced direct reference to ta.tag_popularity with its CASE expression to ensure column exists
+        CASE 
+            WHEN ta.Count > 1000 THEN 'Popular'
+            WHEN ta.Count > 100 THEN 'Moderate'
+            ELSE 'Rare'
+        END as tag_popularity,
+        ta.popularity_rank,
+        ca.Score as comment_score,
+        ca.text_length,
+        ca.rating_category,
+        ca.cleaned_text
+    FROM RankedPosts rp
+    LEFT JOIN UserStats us ON rp.OwnerUserId = us.user_id
+    LEFT JOIN ComplexComments ca ON rp.Id = ca.PostId
+    LEFT JOIN Tags ta ON rp.cleaned_tags LIKE '%' || ta.TagName || '%'
+    WHERE rp.days_since_creation < 365
+    AND us.total_posts > 0
+    AND ta.Count > 0
+),
+PerformanceMetrics AS (
+    SELECT
+        COUNT(*) as total_records,
+        COUNT(DISTINCT OwnerUserId) as unique_users,
+        AVG(Score) as avg_score,
+        MIN(CreationDate) as earliest_date,
+        MAX(CreationDate) as latest_date,
+        COUNT(DISTINCT CASE WHEN Score > 0 THEN Id END) as positive_score_count,
+        COUNT(DISTINCT CASE WHEN Score < 0 THEN Id END) as negative_score_count,
+        COUNT(DISTINCT CASE WHEN AnswerCount > 0 THEN Id END) as answered_questions,
+        COUNT(DISTINCT CASE WHEN CommentCount > 0 THEN Id END) as commented_posts,
+        COUNT(DISTINCT CASE WHEN FavoriteCount > 0 THEN Id END) as favorited_posts,
+        AVG(AnswerCount) as avg_answer_count,
+        AVG(CommentCount) as avg_comment_count,
+        AVG(ViewCount) as avg_view_count,
+        AVG(days_since_creation) as avg_days_active
+    FROM CombinedAnalysis
+)
+SELECT
+    pm.total_records,
+    pm.unique_users,
+    pm.avg_score,
+    pm.earliest_date,
+    pm.latest_date,
+    pm.positive_score_count,
+    pm.negative_score_count,
+    pm.answered_questions,
+    pm.commented_posts,
+    pm.favorited_posts,
+    pm.avg_answer_count,
+    pm.avg_comment_count,
+    pm.avg_view_count,
+    pm.avg_days_active,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1 
+        AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+        AND p.OwnerUserId IN (
+            SELECT Id FROM Users u 
+            WHERE u.Reputation > 10000
+        )
+    ) as high_reputation_questions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 2 
+        AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2)
+        AND NOT EXISTS (
+            SELECT 1 FROM Posts p2 
+            WHERE p2.ParentId = p.Id 
+            AND p2.Score = (
+                SELECT MAX(Score) FROM Posts p3 
+                WHERE p3.ParentId = p.Id
+            )
+        )
+    ) as questions_with_no_best_answer,
+    (
+        SELECT COUNT(*) 
+        FROM Users u 
+        WHERE u.AccountId IN (
+            SELECT AccountId 
+            FROM Users 
+            GROUP BY AccountId 
+            HAVING COUNT(*) > 1
+        )
+    ) as duplicate_accounts,
+    (
+        SELECT COUNT(*) 
+        FROM Tags t 
+        WHERE t.Count > (
+            SELECT AVG(Count) * 2 
+            FROM Tags
+        )
+    ) as highly_popular_tags,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId IN (6, 7, 8) 
+        AND p.Score > 100
+    ) as special_post_types,
+    (
+        SELECT COUNT(DISTINCT p.OwnerUserId) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1 
+        AND EXISTS (
+            SELECT 1 FROM Posts p2 
+            WHERE p2.PostTypeId = 2 
+            AND p2.ParentId = p.Id
+            AND p2.Score > 5
+        )
+    ) as users_with_popular_answers,
+    (
+        SELECT AVG(AnswerCount) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1 
+        AND p.AnswerCount > 0
+    ) as avg_answers_per_question,
+    (
+        SELECT AVG(Score) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1 
+        AND p.Score > 0
+    ) as avg_positive_question_score,
+    (
+        SELECT MAX(Score) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 2 
+        AND p.Score > 0
+    ) as max_positive_answer_score,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 2 
+        AND p.Score = 0
+    ) as zero_score_answers,
+    (
+        SELECT COUNT(DISTINCT UserId) 
+        FROM Comments c 
+        WHERE c.Score > 10
+    ) as highly_rated_commenters,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        JOIN Votes v ON p.Id = v.PostId 
+        WHERE v.VoteTypeId = 2 
+        AND p.Score > 50
+        AND v.UserId IN (
+            SELECT Id FROM Users 
+            WHERE Reputation > 10000
+        )
+    ) as high_reputation_upvotes,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1 
+        AND p.AnswerCount > 10
+        AND p.Score > 100
+    ) as highly_scored_question_with_many_answers
+FROM PerformanceMetrics pm;

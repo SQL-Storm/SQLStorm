@@ -1,0 +1,96 @@
+WITH
+RecentTopUsers AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    ROW_NUMBER() OVER (
+      PARTITION BY CASE WHEN u.Reputation > 1000 THEN 1 ELSE 0 END
+      ORDER BY u.Reputation DESC, u.LastAccessDate DESC
+    ) AS rn
+  FROM Users u
+  WHERE u.CreationDate >= DATEADD(MONTH, -24, CAST('2024-10-01 12:34:56' AS TIMESTAMP))
+    AND (u.Location IS NULL OR TRIM(u.Location) <> '')
+),
+
+UserBadges AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgeCount,
+    MAX(b.Date) AS LastBadgeDate
+  FROM Badges b
+  GROUP BY b.UserId
+),
+
+UserPostActivity AS (
+  SELECT
+    p.OwnerUserId,
+    COUNT(*) AS PostCount,
+    MAX(p.LastActivityDate) AS LastActivity
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+
+LinkedPostStats AS (
+  SELECT
+    pl.PostId,
+    COUNT(CASE WHEN lt.Name = 'Linked' THEN 1 END) AS LinkCount,
+    COUNT(CASE WHEN lt.Name = 'Duplicate' THEN 1 END) AS DupCount,
+    p.OwnerUserId
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  JOIN Posts p ON p.Id = pl.PostId
+  GROUP BY pl.PostId, p.OwnerUserId
+),
+
+TimeWindowMetrics AS (
+  SELECT
+    v.PostId,
+    v.UserId,
+    v.VoteTypeId,
+    v.CreationDate,
+    SUM(CASE WHEN vt.Name IN ('UpMod', 'AcceptedByOriginator', 'Favorite') THEN 1 ELSE 0 END) OVER (
+      PARTITION BY v.PostId
+      ORDER BY v.CreationDate
+      ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+    ) AS RollingEngagement28d,
+    ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate) AS seq
+  FROM Votes v
+  JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+)
+
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  ub.BadgeCount,
+  ub.LastBadgeDate,
+  upa.PostCount,
+  upa.LastActivity,
+  lps.LinkCount,
+  lps.DupCount,
+  pv.LastView AS Last30dViews,
+  twm.RollingEngagement28d,
+  twm.seq
+FROM RecentTopUsers u
+LEFT JOIN UserBadges ub ON ub.UserId = u.Id
+LEFT JOIN UserPostActivity upa ON upa.OwnerUserId = u.Id
+LEFT JOIN LinkedPostStats lps ON lps.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT
+    p.OwnerUserId,
+    SUM(p.ViewCount) AS LastView
+  FROM Posts p
+  WHERE p.CreationDate >= DATEADD(DAY, -30, CAST('2024-10-01 12:34:56' AS TIMESTAMP))
+  GROUP BY p.OwnerUserId
+) pv ON pv.OwnerUserId = u.Id
+LEFT JOIN TimeWindowMetrics twm ON twm.UserId = u.Id
+ORDER BY u.Reputation DESC, u.LastAccessDate DESC
+FETCH FIRST 100 ROWS ONLY;

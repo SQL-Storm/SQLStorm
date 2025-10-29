@@ -1,0 +1,217 @@
+-- {"query": "1594.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2948} 
+WITH UserActivityMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        COUNT(DISTINCT P_Q.Id) AS TotalQuestionsPosted,
+        COUNT(DISTINCT P_A.Id) AS TotalAnswersPosted,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COALESCE(AVG(P_Q.Score), 0.0) AS AvgQuestionScore,
+        COALESCE(AVG(P_A.Score), 0.0) AS AvgAnswerScore,
+        COALESCE(AVG(C.Score), 0.0) AS AvgCommentScore,
+        SUM(CASE WHEN P_Q.ViewCount IS NOT NULL THEN P_Q.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        MAX(U.LastAccessDate) AS UserLastActivity
+    FROM Users U
+    LEFT JOIN Posts P_Q ON U.Id = P_Q.OwnerUserId AND P_Q.PostTypeId = 1 -- Questions
+    LEFT JOIN Posts P_A ON U.Id = P_A.OwnerUserId AND P_A.PostTypeId = 2 -- Answers
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id
+),
+PostTaggingAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))) AS TagName
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+),
+PostLifecycleSummary AS (
+    SELECT
+        P.Id AS PostId,
+        P.CreationDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edit
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseHistoryCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenHistoryCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS DeleteHistoryCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS FirstClosedDateHistory,
+        COALESCE(P.ClosedDate, P.LastActivityDate, P.LastEditDate, P.CreationDate) AS EffectiveActivityDate
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    WHERE P.PostTypeId = 1 -- Focus on Questions
+    GROUP BY P.Id, P.CreationDate, P.LastEditDate, P.LastActivityDate, P.ClosedDate
+),
+DetailedPostHistory AS (
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS HistoryDate,
+        PHT.Name AS HistoryTypeName,
+        PH.Comment,
+        PH.Text,
+        CASE
+            WHEN PH.PostHistoryTypeId = 10 AND PH.Comment ~ '^[0-9]+$' THEN PH.Comment::smallint
+            ELSE NULL
+        END AS CloseReasonTypeId_Parsed
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE PH.PostHistoryTypeId IN (10, 11, 19, 20) -- Post Closed, Post Reopened, Question Protected, Question Unprotected
+),
+TopQuestionTags AS (
+    SELECT
+        PTS.PostId,
+        PTS.TagName,
+        ROW_NUMBER() OVER (PARTITION BY PTS.PostId ORDER BY COUNT(V.Id) DESC, PTS.TagName) AS rn_tag_votes -- Rank tags by votes on questions
+    FROM PostTaggingAnalysis PTS
+    JOIN Posts P ON PTS.PostId = P.Id
+    LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId = 2 -- UpMod votes
+    GROUP BY PTS.PostId, PTS.TagName
+),
+UserBadgeSummary AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+),
+RecentHighActivityPosts AS (
+    -- Posts created in the last year with significant activity
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId AS PostOwnerId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.PostTypeId,
+        'Recent High Activity' AS ActivityType
+    FROM Posts P
+    WHERE P.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+      AND P.Score >= 10
+      AND P.ViewCount >= 500
+      AND P.PostTypeId = 1 -- Questions
+    UNION ALL
+    -- Posts with many answers and comments regardless of age
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId AS PostOwnerId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.PostTypeId,
+        'Many Answers/Comments' AS ActivityType
+    FROM Posts P
+    WHERE P.AnswerCount >= 10
+      AND P.CommentCount >= 20
+      AND P.PostTypeId = 1 -- Questions
+),
+PostEditFrequency AS (
+    SELECT
+        P.Id AS PostId,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEntries,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN PH.Id END) AS EditRevisionCount,
+        COUNT(DISTINCT CASE WHEN PH.UserId = P.OwnerUserId THEN PH.Id END) AS OwnerEditCount,
+        AVG(EXTRACT(EPOCH FROM (PH.CreationDate - P.CreationDate))) / (60 * 60 * 24) AS AvgDaysToFirstEdit -- average days from creation to any edit
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY P.Id, P.OwnerUserId, P.CreationDate
+)
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    COALESCE(U.Location, 'Unspecified Location') AS UserLocation,
+    U.CreationDate AS UserRegistrationDate,
+    U.LastAccessDate,
+    UAM.TotalQuestionsPosted,
+    UAM.TotalAnswersPosted,
+    UAM.AvgQuestionScore,
+    UAM.AvgAnswerScore,
+    UBS.GoldBadges,
+    UBS.SilverBadges,
+    UBS.BronzeBadges,
+    P.Id AS QuestionId,
+    P.Title AS QuestionTitle,
+    P.CreationDate AS QuestionCreationDate,
+    P.Score AS QuestionScore,
+    P.ViewCount AS QuestionViewCount,
+    PLS.EditCount AS QuestionEditCount,
+    PLS.CloseHistoryCount AS QuestionCloseEvents,
+    PLS.ReopenHistoryCount AS QuestionReopenEvents,
+    PLS.DeleteHistoryCount AS QuestionDeleteEvents,
+    COALESCE(DATE_PART('day', PLS.ClosedDate - PLS.CreationDate), -1) AS DaysUntilClosed, -- -1 if not closed
+    TQT.TagName AS PrimaryQuestionTag,
+    CR.Name AS LastCloseReason,
+    CASE
+        WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN P.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+        WHEN P.AnswerCount > 0 THEN 'Answered'
+        ELSE 'Open'
+    END AS QuestionStatus,
+    -- String manipulations
+    UPPER(LEFT(COALESCE(U.DisplayName, 'UNKNOWN'), 3)) AS DisplayNamePrefix,
+    REPLACE(REPLACE(P.Title, 'SQL', 'StructuredQueryLanguage'), 'DB', 'Database') AS TransformedTitle,
+    LENGTH(P.Body) AS QuestionBodyLength,
+    -- Complex Calculation / Predicate
+    ((UAM.AvgQuestionScore * 0.4 + UAM.AvgAnswerScore * 0.3 + UAM.TotalCommentsMade * 0.1) * (1 + (UBS.GoldBadges * 0.05 + UBS.SilverBadges * 0.02))) AS UserEngagementScore,
+    -- Window Function
+    RANK() OVER (PARTITION BY COALESCE(U.Location, 'Unspecified Location') ORDER BY U.Reputation DESC, U.CreationDate ASC) AS RankInLocationByReputation,
+    NTILE(10) OVER (ORDER BY UAM.UserLastActivity DESC, U.Reputation DESC) AS ActivityReputationDecile,
+    -- Correlated Subquery: Check if user has an answer that has more upvotes than its parent question
+    EXISTS (
+        SELECT 1
+        FROM Posts A_corr
+        JOIN Posts Q_corr ON A_corr.ParentId = Q_corr.Id
+        WHERE A_corr.OwnerUserId = U.Id
+          AND A_corr.PostTypeId = 2
+          AND A_corr.Score > Q_corr.Score
+          AND A_corr.CreationDate BETWEEN U.CreationDate AND U.LastAccessDate -- within user's active period
+    ) AS HasHigherScoringAnswerThanParentQuestion,
+    -- Another Correlated Subquery: Check if the question was closed due to a duplicate of a post from another highly reputable user
+    EXISTS (
+        SELECT 1
+        FROM DetailedPostHistory DPH_corr
+        JOIN CloseReasonTypes CRT_corr ON DPH_corr.CloseReasonTypeId_Parsed = CRT_corr.Id
+        JOIN PostLinks PL_corr ON DPH_corr.PostId = PL_corr.PostId AND PL_corr.LinkTypeId = 3 -- Duplicate link type
+        JOIN Posts RelatedQ_corr ON PL_corr.RelatedPostId = RelatedQ_corr.Id
+        JOIN Users RelatedU_corr ON RelatedQ_corr.OwnerUserId = RelatedU_corr.Id
+        WHERE DPH_corr.PostId = P.Id
+          AND DPH_corr.HistoryTypeName = 'Post Closed'
+          AND CRT_corr.Name LIKE '%Duplicate%'
+          AND RelatedU_corr.Reputation > 50000 -- highly reputable
+          AND RelatedQ_corr.CreationDate < P.CreationDate -- the duplicate must be older
+    ) AS ClosedAsDuplicateOfHighRepUserQuestion,
+    -- Set Operator (simplified as an indicator here due to main query complexity)
+    CASE WHEN RHAP.PostId IS NOT NULL THEN TRUE ELSE FALSE END AS IsHighActivityOrManyAnswersPost,
+    PEF.TotalHistoryEntries,
+    PEF.EditRevisionCount,
+    PEF.OwnerEditCount,
+    PEF.AvgDaysToFirstEdit
+FROM Users U
+LEFT JOIN UserActivityMetrics UAM ON U.Id = UAM.UserId
+LEFT JOIN UserBadgeSummary UBS ON U.Id = UBS.UserId
+LEFT JOIN Posts P ON U.Id = P.OwnerUserId AND P.PostTypeId = 1
+LEFT JOIN PostLifecycleSummary PLS ON P.Id = PLS.PostId
+LEFT JOIN (SELECT PostId, TagName FROM TopQuestionTags WHERE rn_tag_votes = 1) TQT ON P.Id = TQT.PostId
+LEFT JOIN (
+    SELECT DISTINCT ON (PostId)
+        PostId,
+        CRT.Name
+    FROM DetailedPostHistory DPH
+    JOIN CloseReasonTypes CRT ON DPH.CloseReasonTypeId_Parsed = CRT.Id
+    WHERE DPH.HistoryTypeName = 'Post Closed'
+    ORDER BY PostId, DPH.HistoryDate DESC
+) CR ON P.Id = CR.PostId -- Last close reason
+LEFT JOIN RecentHighActivityPosts RHAP ON P.Id = RHAP.PostId
+LEFT JOIN PostEditFrequency PEF ON P.Id = PEF.PostId
+WHERE U.Reputation > 1000 -- Filter influential users
+  AND U.Views > 50 -- Users with some profile views
+  AND (UAM.TotalQuestionsPosted > 0 OR UAM.TotalAnswersPosted > 0)
+  AND (P.CreationDate IS NULL OR P.CreationDate > '2019-01-01') -- Focus on more recent posts or users without posts
+  AND COALESCE(U.Location, '') NOT LIKE '%[TEST]%' -- Exclude test locations
+ORDER BY
+    UserEngagementScore DESC,
+    U.Reputation DESC,
+    U.LastAccessDate DESC
+LIMIT 1000;

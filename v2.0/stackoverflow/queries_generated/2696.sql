@@ -1,0 +1,175 @@
+-- {"query": "2696.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1483} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        array[t.TagName] as AncestorPath,
+        1 as Depth
+    from Tags t
+    where t.IsModeratorOnly = 0
+
+    union all
+
+    select 
+        t.Id,
+        t.TagName,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.AncestorPath || t.TagName,
+        r.Depth + 1
+    from Tags t
+    join RecursiveTagHierarchy r on r.ExcerptPostId = t.WikiPostId
+    where t.IsModeratorOnly = 0 and not t.TagName = any(r.AncestorPath)
+),
+
+PostInfo as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        coalesce(p.FavoriteCount, 0) as FavoriteCount,
+        coalesce(p.CommentCount, 0) as CommentCount,
+        count(distinct b.Id) as UserBadgeCount,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotes
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id and b.Date <= p.CreationDate
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.Tags, p.AcceptedAnswerId, u.DisplayName, p.FavoriteCount, p.CommentCount
+),
+
+AnswerStats as (
+    select
+        p.ParentId as QuestionId,
+        count(p.Id) as AnswerCount,
+        avg(p.Score) as AvgAnswerScore,
+        sum(case when p.OwnerUserId is null then 0 else 1 end) as AnswerWithOwnerCount
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+
+QuestionTagExplode as (
+    select 
+        pi.PostId,
+        unnest(string_to_array(substring(pi.Tags, 2, length(pi.Tags) - 2), '><')) as Tag
+    from PostInfo pi
+    where pi.PostTypeId = 1 and pi.Tags is not null
+),
+
+TagPopularity as (
+    select
+        qte.Tag,
+        count(qte.PostId) as QuestionCount,
+        avg(pi.Score) as AvgQuestionScore,
+        sum(pi.FavoriteCount) as TotalFavorites,
+        rank() over (order by count(qte.PostId) desc) as PopularityRank
+    from QuestionTagExplode qte
+    join PostInfo pi on pi.PostId = qte.PostId
+    group by qte.Tag
+),
+
+UserEngagement as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        coalesce(sum(p.ViewCount),0) as TotalPostViews,
+        coalesce(sum(b.Class),0) as BadgeWeight,
+        count(distinct c.Id) as CommentCount,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UserUpVotes,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as UserDownVotes,
+        dense_rank() over (order by coalesce(sum(p.Score),0) desc) as ScoreRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+
+LatestPostHistory as (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as LastEditDate,
+        ph.UserId as EditorUserId,
+        ph.UserDisplayName as EditorName,
+        ph.Comment as EditComment
+    from PostHistory ph
+    order by ph.PostId, ph.CreationDate desc
+),
+
+QuestionDuplicates as (
+    select pl.PostId as DuplicateQuestionId, pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+    where pl.LinkTypeId = 3 -- Duplicate link type
+),
+
+CompositeScores as (
+   select
+       pi.PostId,
+       pi.Title,
+       pi.Score,
+       pi.ViewCount,
+       pi.FavoriteCount,
+       ans.AnswerCount,
+       ans.AvgAnswerScore,
+       pop.PopularityRank,
+       ue.TotalPostScore,
+       ue.BadgeWeight,
+       ue.CommentCount,
+       ue.ScoreRank,
+       case when qd.DuplicateQuestionId is not null then true else false end as IsDuplicate,
+       row_number() over (partition by pi.PostTypeId order by pi.Score desc, pi.ViewCount desc) as PostRank
+   from PostInfo pi
+   left join AnswerStats ans on ans.QuestionId = pi.PostId
+   left join QuestionTagExplode qte on qte.PostId = pi.PostId
+   left join TagPopularity pop on pop.Tag = qte.Tag
+   left join UserEngagement ue on ue.UserId = pi.OwnerUserId
+   left join QuestionDuplicates qd on qd.DuplicateQuestionId = pi.PostId
+   where pi.PostTypeId in (1, 2)
+)
+
+select
+    cs.PostId,
+    cs.Title,
+    cs.Score,
+    cs.ViewCount,
+    cs.FavoriteCount,
+    cs.AnswerCount,
+    cs.AvgAnswerScore,
+    cs.PopularityRank,
+    cs.TotalPostScore,
+    cs.BadgeWeight,
+    cs.CommentCount,
+    cs.ScoreRank,
+    cs.IsDuplicate,
+    lh.LastEditDate,
+    lh.EditComment,
+    ue.DisplayName as OwnerDisplayName,
+    ue.UserId as OwnerUserId
+from CompositeScores cs
+left join LatestPostHistory lh on lh.PostId = cs.PostId
+left join UserEngagement ue on ue.UserId = cs.OwnerUserId
+where cs.Score > 
+    (select avg(Score) from Posts where PostTypeId = cs.PostTypeId)
+and cs.ViewCount > 1000
+and (
+    cs.IsDuplicate = false
+    or cs.IsDuplicate is null
+)
+order by cs.PostRank, cs.Score desc, cs.ViewCount desc
+limit 100;

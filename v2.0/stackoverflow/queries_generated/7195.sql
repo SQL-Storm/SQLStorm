@@ -1,0 +1,245 @@
+-- {"query": "7195.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2409} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (PARTITION BY u.AccountId ORDER BY u.CreationDate) as AccountMemberRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01' 
+      AND u.DisplayName IS NOT NULL
+      AND u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.AccountId
+    HAVING COUNT(DISTINCT p.Id) > 0 OR COUNT(DISTINCT c.Id) > 0 OR COUNT(DISTINCT b.Id) > 0
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        TotalScore,
+        LastPostDate,
+        PostRank,
+        ReputationRank,
+        AccountMemberRank,
+        CASE 
+            WHEN PostCount > 100 THEN 'Elite'
+            WHEN PostCount > 50 THEN 'Veteran'
+            WHEN PostCount > 10 THEN 'Regular'
+            ELSE 'Newbie'
+        END as UserCategory,
+        CASE 
+            WHEN SUM(TotalScore) OVER (PARTITION BY AccountMemberRank) > 1000 THEN 'HighlyActive'
+            WHEN SUM(TotalScore) OVER (PARTITION BY AccountMemberRank) > 500 THEN 'Active'
+            ELSE 'Moderate'
+        END as ActivityLevel
+    FROM UserActivityStats
+),
+QuestionStats AS (
+    SELECT 
+        p.ParentId as QuestionId,
+        COUNT(p.Id) as AnswerCount,
+        AVG(p.Score) as AvgAnswerScore,
+        MAX(p.Score) as MaxAnswerScore,
+        MIN(p.CreationDate) as FirstAnswerDate,
+        MAX(p.CreationDate) as LastAnswerDate,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) as PositiveAnswers,
+        SUM(CASE WHEN p.Score < 0 THEN 1 ELSE 0 END) as NegativeAnswers,
+        STRING_AGG(p.OwnerDisplayName, ', ' ORDER BY p.CreationDate) as Answerers
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as TagPopularity,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) - t.Count as PopularityChange
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastEditDate,
+        p.OwnerUserId,
+        p.OwnerDisplayName,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'QuestionWithAcceptedAnswer'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL THEN 'QuestionWithoutAcceptedAnswer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostClassification,
+        CASE 
+            WHEN p.Score >= 100 THEN 'HighlyRated'
+            WHEN p.Score >= 50 THEN 'Rated'
+            WHEN p.Score >= 0 THEN 'Neutral'
+            ELSE 'LowRated'
+        END as ScoreCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'Viral'
+            WHEN p.ViewCount > 100 THEN 'Popular'
+            WHEN p.ViewCount > 10 THEN 'Notable'
+            ELSE 'Obscure'
+        END as ViewCategory,
+        DATEDIFF(day, p.CreationDate, COALESCE(p.LastEditDate, p.CreationDate)) as DaysSinceCreation,
+        CASE
+            WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', '')) + 1
+            ELSE 0
+        END as TagCount,
+        COALESCE(qs.AnswerCount, 0) as AnswerCountCorrected,
+        COALESCE(qs.AvgAnswerScore, 0) as AvgAnswerScore,
+        COALESCE(qs.MaxAnswerScore, 0) as MaxAnswerScore,
+        COALESCE(qs.FirstAnswerDate, p.CreationDate) as FirstAnswerDate,
+        COALESCE(qs.LastAnswerDate, p.CreationDate) as LastAnswerDate,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.PostTypeId = 1 THEN
+                CASE WHEN p.Tags LIKE '%<tag1>%' OR p.Tags LIKE '%<tag2>%' THEN 'TechRelated'
+                     WHEN p.Tags LIKE '%<tag3>%' OR p.Tags LIKE '%<tag4>%' THEN 'SportsRelated'
+                     ELSE 'Uncategorized' END
+            ELSE 'NotApplicable'
+        END as Category
+    FROM Posts p
+    LEFT JOIN QuestionStats qs ON p.Id = qs.QuestionId
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= '2020-01-01'
+),
+UserPostComparison AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        t.PostCount,
+        t.Reputation,
+        t.CommentCount,
+        t.BadgeCount,
+        t.TotalScore,
+        t.PostRank,
+        t.ReputationRank,
+        CASE 
+            WHEN t.PostCount > 50 AND t.TotalScore > 1000 THEN 'PowerUser'
+            WHEN t.PostCount > 20 AND t.TotalScore > 500 THEN 'ActiveContributor'
+            WHEN t.PostCount > 5 AND t.TotalScore > 100 THEN 'RegularMember'
+            ELSE 'CasualUser'
+        END as UserRole,
+        CASE 
+            WHEN t.PostCount > (SELECT AVG(PostCount) FROM UserActivityStats) THEN 'AboveAverageWriter'
+            ELSE 'BelowAverageWriter'
+        END as WritingPerformance
+    FROM Users u
+    JOIN UserActivityStats t ON u.Id = t.UserId
+    WHERE u.Id IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2020-01-01')
+),
+FinalAnalysis AS (
+    SELECT 
+        cp.PostId,
+        cp.Title,
+        cp.Body,
+        cp.Score,
+        cp.ViewCount,
+        cp.CreationDate,
+        cp.LastEditDate,
+        cp.OwnerUserId,
+        cp.OwnerDisplayName,
+        cp.AcceptedAnswerId,
+        cp.AnswerCountCorrected,
+        cp.AvgAnswerScore,
+        cp.MaxAnswerScore,
+        cp.FirstAnswerDate,
+        cp.LastAnswerDate,
+        cp.PostClassification,
+        cp.ScoreCategory,
+        cp.ViewCategory,
+        cp.DaysSinceCreation,
+        cp.TagCount,
+        cp.Category,
+        u.UserRole,
+        u.WritingPerformance,
+        CASE 
+            WHEN cp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2020-01-01') THEN 'AboveAverage'
+            ELSE 'BelowAverage'
+        END as ScorePerformance,
+        CASE 
+            WHEN cp.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2020-01-01') THEN 'AboveAverageViews'
+            ELSE 'BelowAverageViews'
+        END as ViewPerformance,
+        COALESCE(ta.TagPopularity, 'Unknown') as TagPopularity,
+        COALESCE(ta.PopularityChange, 0) as PopularityChange,
+        DENSE_RANK() OVER (ORDER BY cp.Score DESC) as ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY cp.PostClassification ORDER BY cp.Score DESC) as ClassificationScoreRank,
+        RANK() OVER (PARTITION BY cp.Category ORDER BY cp.ViewCount DESC) as CategoryViewRank
+    FROM ComplexPostAnalysis cp
+    JOIN UserPostComparison u ON cp.OwnerUserId = u.UserId
+    LEFT JOIN TagAnalysis ta ON cp.Tags IS NOT NULL AND EXISTS (
+        SELECT 1 FROM (VALUES ('<tag1>'), ('<tag2>'), ('<tag3>')) AS v(tag) 
+        WHERE cp.Tags LIKE '%' + v.tag + '%'
+    )
+    WHERE cp.Score IS NOT NULL 
+      AND cp.ViewCount IS NOT NULL
+      AND cp.CreationDate IS NOT NULL
+)
+SELECT 
+    *,
+    CASE 
+        WHEN ScorePerformance = 'AboveAverage' AND ViewPerformance = 'AboveAverageViews' THEN 'HighImpactPost'
+        WHEN ScorePerformance = 'AboveAverage' OR ViewPerformance = 'AboveAverageViews' THEN 'GoodPost'
+        ELSE 'AveragePost'
+    END as PostImpactLevel,
+    CASE 
+        WHEN Score > 100 AND ViewCount > 1000 THEN 'Trending'
+        WHEN Score > 50 AND ViewCount > 500 THEN 'Popular'
+        WHEN Score > 10 AND ViewCount > 100 THEN 'Notable'
+        ELSE 'Standard'
+    END as PostStatus,
+    DATEDIFF(day, CreationDate, GETDATE()) as DaysSincePost,
+    CASE 
+        WHEN ABS(MaxAnswerScore - AvgAnswerScore) < 10 THEN 'StableAnswers'
+        WHEN MaxAnswerScore - AvgAnswerScore > 50 THEN 'HighScoringAnswers'
+        ELSE 'VariableAnswers'
+    END as AnswerQuality,
+    COALESCE(AnswerCountCorrected, 0) * 100.0 / NULLIF(ViewCount, 0) as AnswerToViewRatio,
+    CASE 
+        WHEN AnswerCountCorrected > 0 THEN 
+            CASE WHEN DaysSinceCreation > 0 THEN 
+                AnswerCountCorrected * 1.0 / DaysSinceCreation * 30.0 
+            ELSE 0 END
+        ELSE 0 
+    END as AnswersPerMonth
+FROM FinalAnalysis
+WHERE PostStatus IN ('Trending', 'Popular', 'Notable')
+  AND ScoreCategory IN ('HighlyRated', 'Rated')
+  AND ViewCategory IN ('Viral', 'Popular')
+ORDER BY Score DESC, ViewCount DESC, DaysSinceCreation ASC, PostId DESC
+LIMIT 5000;

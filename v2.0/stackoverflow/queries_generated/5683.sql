@@ -1,0 +1,79 @@
+-- {"query": "5683.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 620} 
+WITH escalating_comments AS (
+  SELECT
+    c.PostId,
+    AVG(c.Score) AS avg_score,
+    COUNT(*) AS comment_count
+  FROM Comments c
+  GROUP BY c.PostId
+),
+top_posts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Views,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.CommentCount,
+    p.Body,
+    p.LastEditorDisplayName,
+    p.LastEditDate,
+    COALESCE(ec.avg_score, 0) AS avg_comment_score,
+    COALESCE(ec.comment_count, 0) AS total_comments
+  FROM Posts p
+  LEFT JOIN escalating_comments ec ON ec.PostId = p.Id
+  LEFT JOIN LATERAL (
+    SELECT 1
+  ) AS d ON true
+  WHERE p.PostTypeId = 1 -- Questions
+)
+SELECT
+  tp.Id AS QuestionId,
+  tp.Title,
+  tp.CreationDate,
+  tp.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  tp.Views,
+  tp.Score AS QuestionScore,
+  tp.ViewCount,
+  tp.Tags,
+  tp.LastActivityDate,
+  tp.AnswerCount,
+  tp.FavoriteCount,
+  tp.CommentCount,
+  tp.Body,
+  tp.LastEditorDisplayName,
+  tp.LastEditDate,
+  tp.avg_comment_score,
+  tp.total_comments,
+  -- Window function: rank questions by score within creation month, then by views
+  RANK() OVER (
+    PARTITION BY DATE_TRUNC('month', tp.CreationDate)
+    ORDER BY tp.Score DESC, tp.Views DESC, tp.Id
+  ) AS month_rank,
+  -- Correlated subquery: number of tags above 1, 2, 3 counts in the Tags for the post
+  (SELECT COUNT(*) FROM UNNEST(string_to_array(tp.Tags, '><')) AS t(tag) WHERE t.tag ~ '.*') AS tag_count
+FROM top_posts tp
+JOIN Users u ON u.Id = tp.OwnerUserId
+LEFT JOIN PostLinks pl ON pl.PostId = tp.Id AND pl.LinkTypeId = 1
+LEFT JOIN Posts linked ON linked.Id = pl.RelatedPostId
+LEFT JOIN Votes v ON v.PostId = tp.Id
+LEFT JOIN PostHistory ph ON ph.PostId = tp.Id
+WHERE tp.total_comments > 0
+  AND (tp.LastEditDate IS NULL OR tp.LastEditDate > tp.CreationDate - INTERVAL '180 days')
+  AND EXISTS (
+    SELECT 1
+    FROM Votes v2
+    WHERE v2.PostId = tp.Id
+      AND v2.VoteTypeId = 2 -- UpMod
+  )
+ORDER BY month_rank, tp.LastActivityDate DESC
+LIMIT 100;

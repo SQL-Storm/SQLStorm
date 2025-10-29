@@ -1,0 +1,389 @@
+-- {"query": "909.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3765} 
+with recent_questions as (
+    select
+        p.Id as QuestionId,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        coalesce(p.AnswerCount, 0) as AnswerCount
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+),
+owner_enriched as (
+    select
+        rq.*,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views as ProfileViews,
+        extract(epoch from (coalesce(u.LastAccessDate, rq.CreationDate) - rq.CreationDate))/86400.0 as DaysToLastAccess
+    from recent_questions rq
+    left join Users u on u.Id = rq.OwnerUserId
+),
+answers as (
+    select
+        a.ParentId as QuestionId,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate
+    from Posts a
+    where a.PostTypeId = 2
+),
+accepted as (
+    select
+        q.Id as QuestionId,
+        q.AcceptedAnswerId
+    from Posts q
+    where q.PostTypeId = 1
+      and q.AcceptedAnswerId is not null
+),
+answer_stats as (
+    select
+        a.QuestionId,
+        count(*) as AnswerCnt,
+        sum(case when a.AnswerScore > 0 then 1 else 0 end) as PosAnswerCnt,
+        max(a.AnswerScore) as MaxAnswerScore,
+        min(a.AnswerScore) as MinAnswerScore,
+        avg(a.AnswerScore::numeric) as AvgAnswerScore,
+        min(a.AnswerCreationDate) as FirstAnswerAt,
+        max(a.AnswerCreationDate) as LastAnswerAt
+    from answers a
+    group by a.QuestionId
+),
+votes_agg as (
+    select
+        v.PostId as QuestionId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesCnt,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesCnt,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as FavoriteCnt,
+        sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal
+    from Votes v
+    group by v.PostId
+),
+close_events as (
+    select
+        ph.PostId as QuestionId,
+        min(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as FirstClosedAt,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as LastClosedAt,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseEvents,
+        -- Extract last close reason id from Comment when type is Close
+        max(
+            case when ph.PostHistoryTypeId = 10 then
+                nullif(regexp_replace(coalesce(ph.Comment, ''), '[^0-9]', '', 'g'), '')
+            end
+        )::int as LastCloseReasonId
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11)
+    group by ph.PostId
+),
+dup_links as (
+    select
+        pl.PostId as QuestionId,
+        count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinksCnt,
+        count(*) filter (where pl.LinkTypeId = 1) as LinkedCnt
+    from PostLinks pl
+    group by pl.PostId
+),
+tag_expanded as (
+    select
+        rq.QuestionId,
+        unnest(string_to_array(substring(coalesce(rq.Tags,''), 2, greatest(length(coalesce(rq.Tags,'')) - 2, 0)), '><')) as TagName
+    from recent_questions rq
+),
+tag_metrics as (
+    select
+        te.QuestionId,
+        count(*) as TagCount,
+        sum(t.Count) as SumTagUsage,
+        max(t.Count) as MaxTagUsage,
+        sum(case when t.IsModeratorOnly then 1 else 0 end) as ModOnlyTags,
+        sum(case when t.IsRequired then 1 else 0 end) as RequiredTags
+    from tag_expanded te
+    left join Tags t on lower(t.TagName) = lower(te.TagName)
+    group by te.QuestionId
+),
+owner_quality as (
+    select
+        u.Id as OwnerUserId,
+        count(*) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as TotalQuestions,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as TotalAnswers,
+        avg(coalesce(p.Score,0)::numeric) as AvgPostScore,
+        max(p.Score) as MaxPostScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+),
+time_buckets as (
+    select
+        rq.QuestionId,
+        date_trunc('week', rq.CreationDate) as WeekBucket,
+        date_trunc('month', rq.CreationDate) as MonthBucket,
+        extract(isodow from rq.CreationDate) as Dow,
+        extract(hour from rq.CreationDate) as HourOfDay
+    from recent_questions rq
+),
+rankings as (
+    select
+        rq.QuestionId,
+        row_number() over (order by rq.Score desc nulls last, rq.ViewCount desc nulls last, rq.CreationDate desc) as GlobalRank,
+        dense_rank() over (partition by tm.TagCount order by rq.Score desc, rq.ViewCount desc) as RankWithinTagCount,
+        percent_rank() over (order by coalesce(va.UpVotesCnt,0) - coalesce(va.DownVotesCnt,0)) as VoteBalancePct,
+        ntile(10) over (order by rq.ViewCount nulls last) as ViewDecile
+    from recent_questions rq
+    left join tag_metrics tm on tm.QuestionId = rq.QuestionId
+    left join votes_agg va on va.QuestionId = rq.QuestionId
+),
+string_feats as (
+    select
+        rq.QuestionId,
+        length(coalesce(rq.Title,'')) as TitleLen,
+        length(regexp_replace(coalesce(rq.Title,''), '\s+', '', 'g')) as TitleLenNoSpace,
+        (regexp_matches(coalesce(rq.Title,''), '(?i)\b(how|why|what|where|when|which|can|should)\b')) is not null as HasInterrogative,
+        position('?' in coalesce(rq.Title,'')) > 0 as HasQuestionMark,
+        coalesce(nullif(trim(coalesce(rq.Title,'')),''), '[no title]') as NormalizedTitle
+    from recent_questions rq
+),
+first_answer_latency as (
+    select
+        rq.QuestionId,
+        extract(epoch from (min(a.AnswerCreationDate) - rq.CreationDate))/3600.0 as HoursToFirstAnswer
+    from recent_questions rq
+    left join answers a on a.QuestionId = rq.QuestionId
+    group by rq.QuestionId, rq.CreationDate
+),
+accepted_answer_stats as (
+    select
+        rq.QuestionId,
+        case when ac.AcceptedAnswerId is not null then 1 else 0 end as HasAccepted,
+        aa.Score as AcceptedScore,
+        extract(epoch from (aa.CreationDate - rq.CreationDate))/3600.0 as HoursToAccepted
+    from recent_questions rq
+    left join accepted ac on ac.QuestionId = rq.QuestionId
+    left join Posts aa on aa.Id = ac.AcceptedAnswerId
+),
+null_logic as (
+    select
+        rq.QuestionId,
+        coalesce(tm.TagCount, 0) as TagCountNZ,
+        coalesce(va.UpVotesCnt, 0) - coalesce(va.DownVotesCnt, 0) as VoteBalanceNZ,
+        coalesce(va.FavoriteCnt, 0) as FavoriteCntNZ,
+        coalesce(va.BountyTotal, 0) as BountyTotalNZ,
+        coalesce(asg.AnswerCnt, rq.AnswerCount) as AnswerCntNZ
+    from recent_questions rq
+    left join tag_metrics tm on tm.QuestionId = rq.QuestionId
+    left join votes_agg va on va.QuestionId = rq.QuestionId
+    left join answer_stats asg on asg.QuestionId = rq.QuestionId
+),
+question_bucket_scores as (
+    select
+        rq.QuestionId,
+        (coalesce(rq.Score,0)
+         + 0.5 * coalesce(va.UpVotesCnt,0)
+         - 0.7 * coalesce(va.DownVotesCnt,0)
+         + 0.1 * coalesce(rq.ViewCount,0)
+         + 2.0 * coalesce(aas.HasAccepted,0)
+         + 0.2 * coalesce(nl.AnswerCntNZ,0)
+         + 0.05 * coalesce(tm.SumTagUsage,0)
+         + 0.3 * coalesce(dm.DuplicateLinksCnt,0)
+        )::numeric as CompositeScore
+    from recent_questions rq
+    left join votes_agg va on va.QuestionId = rq.QuestionId
+    left join accepted_answer_stats aas on aas.QuestionId = rq.QuestionId
+    left join null_logic nl on nl.QuestionId = rq.QuestionId
+    left join tag_metrics tm on tm.QuestionId = rq.QuestionId
+    left join dup_links dm on dm.QuestionId = rq.QuestionId
+),
+owner_agg as (
+    select
+        oe.QuestionId,
+        oq.TotalPosts,
+        oq.TotalQuestions,
+        oq.TotalAnswers,
+        oq.AvgPostScore,
+        oq.MaxPostScore,
+        case when coalesce(oe.Reputation,0) = 0 then null else (oe.UpVotes - oe.DownVotes)::numeric / oe.Reputation end as VoteRepRatio
+    from owner_enriched oe
+    left join owner_quality oq on oq.OwnerUserId = oe.OwnerUserId
+),
+post_history_flags as (
+    select
+        rq.QuestionId,
+        count(*) filter (where ph.PostHistoryTypeId in (24)) as SuggestedEditApplied,
+        count(*) filter (where ph.PostHistoryTypeId in (50)) as CommunityBumps,
+        count(*) filter (where ph.PostHistoryTypeId in (52)) as HotNetworkSelected,
+        count(*) filter (where ph.PostHistoryTypeId in (53)) as HotNetworkRemoved
+    from recent_questions rq
+    left join PostHistory ph on ph.PostId = rq.QuestionId
+    group by rq.QuestionId
+),
+week_averages as (
+    select
+        tb.WeekBucket,
+        avg(rq.Score::numeric) as AvgScoreWeek,
+        avg(rq.ViewCount::numeric) as AvgViewsWeek
+    from time_buckets tb
+    join recent_questions rq on rq.QuestionId = tb.QuestionId
+    group by tb.WeekBucket
+),
+deviation_from_week as (
+    select
+        tb.QuestionId,
+        (rq.Score - wa.AvgScoreWeek)::numeric as ScoreDevWeek,
+        (rq.ViewCount - wa.AvgViewsWeek)::numeric as ViewDevWeek
+    from time_buckets tb
+    join recent_questions rq on rq.QuestionId = tb.QuestionId
+    left join week_averages wa on wa.WeekBucket = tb.WeekBucket
+),
+comment_pings as (
+    select
+        c.PostId as QuestionId,
+        count(*) filter (where c.Text ~* '@[A-Za-z0-9_-]{1,40}') as AtMentions,
+        max(c.CreationDate) as LastCommentAt,
+        sum(c.Score) as SumCommentScore
+    from Comments c
+    group by c.PostId
+),
+final_scored as (
+    select
+        rq.QuestionId,
+        rq.CreationDate,
+        rq.Title,
+        rq.Tags,
+        oe.DisplayName as OwnerName,
+        oe.Reputation,
+        oe.Location,
+        nl.TagCountNZ,
+        nl.VoteBalanceNZ,
+        nl.FavoriteCntNZ,
+        nl.BountyTotalNZ,
+        nl.AnswerCntNZ,
+        asg.MaxAnswerScore,
+        fas.HoursToFirstAnswer,
+        aas.HasAccepted,
+        aas.AcceptedScore,
+        aas.HoursToAccepted,
+        ce.CloseEvents,
+        ce.FirstClosedAt,
+        ce.LastClosedAt,
+        ce.LastCloseReasonId,
+        dl.DuplicateLinksCnt,
+        dl.LinkedCnt,
+        tm.SumTagUsage,
+        tm.MaxTagUsage,
+        tm.ModOnlyTags,
+        tm.RequiredTags,
+        tb.WeekBucket,
+        tb.MonthBucket,
+        tb.Dow,
+        tb.HourOfDay,
+        rk.GlobalRank,
+        rk.RankWithinTagCount,
+        rk.VoteBalancePct,
+        rk.ViewDecile,
+        sf.TitleLen,
+        sf.TitleLenNoSpace,
+        sf.HasInterrogative,
+        sf.HasQuestionMark,
+        oh.TotalPosts,
+        oh.TotalQuestions,
+        oh.TotalAnswers,
+        oh.AvgPostScore,
+        oh.MaxPostScore,
+        oh.VoteRepRatio,
+        phf.SuggestedEditApplied,
+        phf.CommunityBumps,
+        phf.HotNetworkSelected,
+        phf.HotNetworkRemoved,
+        dfw.ScoreDevWeek,
+        dfw.ViewDevWeek,
+        cp.AtMentions,
+        cp.LastCommentAt,
+        cp.SumCommentScore,
+        qb.CompositeScore,
+        -- a complicated predicate-based bucketization
+        case
+            when aas.HasAccepted = 1 and nl.AnswerCntNZ >= 3 and nl.VoteBalanceNZ >= 5 then 'Resolved-HighEngagement'
+            when aas.HasAccepted = 1 and nl.AnswerCntNZ >= 1 then 'Resolved'
+            when ce.CloseEvents > 0 then 'Closed'
+            when ce.LastCloseReasonId in (101) then 'Duplicate'
+            when nl.VoteBalanceNZ < 0 and coalesce(asg.MaxAnswerScore,0) <= 0 then 'Contentious'
+            when qb.CompositeScore >= (select percentile_disc(0.9) within group (order by CompositeScore) from question_bucket_scores) then 'Top10Composite'
+            else 'Open'
+        end as StatusBucket
+    from recent_questions rq
+    left join owner_enriched oe on oe.QuestionId = rq.QuestionId
+    left join null_logic nl on nl.QuestionId = rq.QuestionId
+    left join answer_stats asg on asg.QuestionId = rq.QuestionId
+    left join first_answer_latency fas on fas.QuestionId = rq.QuestionId
+    left join accepted_answer_stats aas on aas.QuestionId = rq.QuestionId
+    left join close_events ce on ce.QuestionId = rq.QuestionId
+    left join dup_links dl on dl.QuestionId = rq.QuestionId
+    left join tag_metrics tm on tm.QuestionId = rq.QuestionId
+    left join time_buckets tb on tb.QuestionId = rq.QuestionId
+    left join rankings rk on rk.QuestionId = rq.QuestionId
+    left join string_feats sf on sf.QuestionId = rq.QuestionId
+    left join owner_agg oh on oh.QuestionId = rq.QuestionId
+    left join post_history_flags phf on phf.QuestionId = rq.QuestionId
+    left join deviation_from_week dfw on dfw.QuestionId = rq.QuestionId
+    left join comment_pings cp on cp.QuestionId = rq.QuestionId
+    left join question_bucket_scores qb on qb.QuestionId = rq.QuestionId
+),
+set_ops as (
+    select QuestionId, 'Hot' as Flag
+    from final_scored
+    where HotNetworkSelected > 0
+    union
+    select QuestionId, 'Bumped' as Flag
+    from final_scored
+    where CommunityBumps > 0
+    union
+    select QuestionId, 'Accepted' as Flag
+    from final_scored
+    where HasAccepted = 1
+),
+correlated_filters as (
+    select
+        fs.*
+    from final_scored fs
+    where fs.ScoreDevWeek >= (
+        select avg(fs2.ScoreDevWeek)
+        from final_scored fs2
+        where date_trunc('week', fs2.CreationDate) = date_trunc('week', fs.CreationDate)
+    )
+)
+select
+    cf.QuestionId,
+    cf.CreationDate,
+    cf.OwnerName,
+    cf.Reputation,
+    cf.Title,
+    cf.Tags,
+    cf.TagCountNZ,
+    cf.VoteBalanceNZ,
+    cf.FavoriteCntNZ,
+    cf.BountyTotalNZ,
+    cf.AnswerCntNZ,
+    cf.HasAccepted,
+    cf.CompositeScore,
+    cf.GlobalRank,
+    cf.RankWithinTagCount,
+    cf.ViewDecile,
+    cf.StatusBucket,
+    string_agg(distinct so.Flag, ',' order by so.Flag) as Flags,
+    rank() over (order by cf.CompositeScore desc, cf.ViewCount desc nulls last) as OverallRank
+from correlated_filters cf
+left join set_ops so on so.QuestionId = cf.QuestionId
+group by
+    cf.QuestionId, cf.CreationDate, cf.OwnerName, cf.Reputation, cf.Title, cf.Tags,
+    cf.TagCountNZ, cf.VoteBalanceNZ, cf.FavoriteCntNZ, cf.BountyTotalNZ, cf.AnswerCntNZ,
+    cf.HasAccepted, cf.CompositeScore, cf.GlobalRank, cf.RankWithinTagCount, cf.ViewDecile, cf.StatusBucket, cf.ViewCount
+order by OverallRank
+limit 500;

@@ -1,0 +1,118 @@
+WITH
+    UserStats AS (
+        SELECT
+            u.Id                                   AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(u.Views, 0)                   AS Views,
+            COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+            COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+            SUM(CASE WHEN p.PostTypeId IN (1, 2) THEN p.Score ELSE 0 END) AS TotalScore,
+            AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1, 2))            AS AvgScore,
+            COUNT(b.Id)                                          AS BadgeCount,
+            MAX(p.CreationDate)                                 AS LastPostDate
+        FROM Users u
+        LEFT JOIN Posts   p ON p.OwnerUserId = u.Id
+        LEFT JOIN Badges  b ON b.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+    ),
+
+    TagMetrics AS (
+        SELECT
+            t.TagName,
+            t.Count                                     AS TagUseCount,
+            COUNT(DISTINCT p.Id)                        AS PostsWithTag,
+            AVG(p.Score)                                AS AvgTagScore,
+            MAX(p.CreationDate)                         AS LatestTagPost
+        FROM Tags t
+        LEFT JOIN Posts p
+               ON p.Tags IS NOT NULL
+              AND POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+        GROUP BY t.TagName, t.Count
+    ),
+
+    RecentVotes AS (
+        SELECT
+            v.PostId,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+            MAX(v.CreationDate)                       AS LastVoteDate
+        FROM Votes v
+        WHERE v.CreationDate >= DATE '2024-10-01' - INTERVAL '30' DAY
+        GROUP BY v.PostId
+    )
+
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.TotalScore,
+    us.AvgScore,
+    us.BadgeCount,
+    us.LastPostDate,
+    COALESCE(rv.UpVotes, 0)                AS RecentUpVotes,
+    COALESCE(rv.DownVotes, 0)              AS RecentDownVotes,
+    rv.LastVoteDate,
+    tm.TagName,
+    tm.TagUseCount,
+    tm.PostsWithTag,
+    tm.AvgTagScore,
+    tm.LatestTagPost,
+    ROW_NUMBER() OVER (PARTITION BY us.UserId ORDER BY tm.AvgTagScore DESC) AS TagRank,
+    CASE
+        WHEN us.Reputation > 20000                     THEN 'High'
+        WHEN us.Reputation BETWEEN 5000 AND 19999      THEN 'Medium'
+        ELSE                                               'Low'
+    END                                      AS ReputationTier,
+    (us.Views / NULLIF(us.QuestionCount + us.AnswerCount, 0)) AS ViewsPerPost,
+    (
+        SELECT STRING_AGG(DISTINCT b.Name, ', ')
+        FROM Badges b
+        WHERE b.UserId = us.UserId AND b.Class = 1
+    )                                        AS GoldBadges
+FROM UserStats us
+LEFT JOIN (
+        SELECT p.OwnerUserId, p.Id, p.CreationDate,
+               ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+        FROM Posts p
+) latest_post ON latest_post.OwnerUserId = us.UserId AND latest_post.rn = 1
+LEFT JOIN RecentVotes rv ON rv.PostId = latest_post.Id
+LEFT JOIN TagMetrics tm
+       ON tm.TagName = ANY (string_to_array(substring(us.DisplayName FROM 1 FOR 10), ''))
+WHERE
+    (us.Reputation IS NOT NULL AND us.Reputation > 0)
+    OR (us.BadgeCount > 5 AND (us.QuestionCount + us.AnswerCount) > 0)
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS BIGINT)                      AS UserId,
+    'Aggregate'                              AS DisplayName,
+    SUM(us.Reputation)                       AS Reputation,
+    SUM(us.QuestionCount)                    AS QuestionCount,
+    SUM(us.AnswerCount)                      AS AnswerCount,
+    SUM(us.TotalScore)                       AS TotalScore,
+    AVG(us.AvgScore)                         AS AvgScore,
+    SUM(us.BadgeCount)                       AS BadgeCount,
+    MAX(us.LastPostDate)                     AS LastPostDate,
+    SUM(COALESCE(rv.UpVotes,0))              AS RecentUpVotes,
+    SUM(COALESCE(rv.DownVotes,0))            AS RecentDownVotes,
+    MAX(rv.LastVoteDate)                     AS LastVoteDate,
+    CAST(NULL AS TEXT)                       AS TagName,
+    CAST(NULL AS BIGINT)                     AS TagUseCount,
+    CAST(NULL AS BIGINT)                     AS PostsWithTag,
+    CAST(NULL AS NUMERIC)                    AS AvgTagScore,
+    CAST(NULL AS TIMESTAMP)                  AS LatestTagPost,
+    CAST(NULL AS BIGINT)                     AS TagRank,
+    CAST(NULL AS TEXT)                       AS ReputationTier,
+    CAST(NULL AS NUMERIC)                    AS ViewsPerPost,
+    CAST(NULL AS TEXT)                       AS GoldBadges
+FROM UserStats us
+LEFT JOIN RecentVotes rv ON rv.PostId IS NOT NULL
+GROUP BY CAST(NULL AS BIGINT), 'Aggregate'
+HAVING COUNT(*) > 1000
+
+ORDER BY ReputationTier DESC, Reputation DESC
+LIMIT 500;

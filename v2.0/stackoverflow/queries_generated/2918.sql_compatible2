@@ -1,0 +1,153 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, 1 AS Level, ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = true
+  UNION ALL
+    SELECT t.Id, t.TagName, r.Level + 1, r.Path || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON r.Id <> t.Id AND t.IsRequired = true
+    WHERE NOT t.TagName = ANY(r.Path)
+      AND r.Level < 3
+), UserBadgeRanks AS (
+    SELECT 
+      b.UserId, 
+      COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+      COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+      COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+), UserPostStats AS (
+    SELECT
+      u.Id AS UserId,
+      COALESCE(pq.QuestionCount,0) AS QuestionCount,
+      COALESCE(pa.AnswerCount,0) AS AnswerCount,
+      u.Reputation,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes,
+      u.CreationDate,
+      u.LastAccessDate,
+      ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN (
+      SELECT OwnerUserId, COUNT(*) AS QuestionCount
+      FROM Posts
+      WHERE PostTypeId = 1
+      GROUP BY OwnerUserId
+    ) pq ON pq.OwnerUserId = u.Id
+    LEFT JOIN (
+      SELECT OwnerUserId, COUNT(*) AS AnswerCount
+      FROM Posts
+      WHERE PostTypeId = 2
+      GROUP BY OwnerUserId
+    ) pa ON pa.OwnerUserId = u.Id
+), PostMaxScores AS (
+    SELECT p.ParentId, MAX(p.Score) AS MaxAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+    GROUP BY p.ParentId
+), QuestionAnswerRanks AS (
+    SELECT
+      a.Id,
+      a.ParentId,
+      a.OwnerUserId,
+      a.Score,
+      RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+), ClosedQuestionsWithReasons AS (
+    SELECT ph.PostId, crt.Name AS CloseReason, ph.CreationDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10
+), DuplicatePostPairs AS (
+    SELECT pl.PostId, pl.RelatedPostId
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+), TextSearchTags AS (
+    SELECT p.Id, p.Title, p.Tags,
+      string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><') AS TagArray
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+), ComplexUsers AS (
+    SELECT
+      u.Id,
+      u.DisplayName,
+      COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+      COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+      COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+      up.QuestionCount,
+      up.AnswerCount,
+      up.Reputation,
+      up.Views,
+      up.UpVotes,
+      up.DownVotes,
+      CASE
+        WHEN u.LastAccessDate > (DATE '2024-10-01' - INTERVAL '30' DAY) THEN 'Active'
+        ELSE 'Inactive'
+      END AS ActivityStatus
+    FROM Users u
+    LEFT JOIN UserBadgeRanks ub ON ub.UserId = u.Id
+    LEFT JOIN UserPostStats up ON up.UserId = u.Id
+    WHERE up.UserRank <= 100
+), DetailedAnswerAnalysis AS (
+    SELECT 
+      qa.Id AS AnswerId,
+      qa.ParentId AS QuestionId,
+      qa.OwnerUserId,
+      qa.Score,
+      qa.AnswerRank,
+      q.Title AS QuestionTitle,
+      MAX(CASE WHEN pl.PostId = qa.ParentId THEN pl.RelatedPostId END) AS DuplicateOf,
+      pq.MaxAnswerScore,
+      ca.CloseReason,
+      (CASE WHEN qa.AnswerRank = 1 THEN true ELSE false END) AS IsTopScoringAnswer
+    FROM QuestionAnswerRanks qa
+    JOIN Posts q ON q.Id = qa.ParentId
+    LEFT JOIN PostMaxScores pq ON pq.ParentId = qa.ParentId
+    LEFT JOIN DuplicatePostPairs pl ON pl.PostId = qa.ParentId
+    LEFT JOIN ClosedQuestionsWithReasons ca ON ca.PostId = qa.ParentId
+    GROUP BY qa.Id, qa.ParentId, qa.OwnerUserId, qa.Score, qa.AnswerRank, q.Title, pq.MaxAnswerScore, ca.CloseReason
+), UserActivityWindow AS (
+    SELECT 
+      Id,
+      DisplayName,
+      Reputation,
+      CreationDate,
+      LastAccessDate,
+      SUM(GoldBadges) OVER (ORDER BY Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningGoldBadges,
+      SUM(SilverBadges) OVER (ORDER BY Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningSilverBadges,
+      SUM(BronzeBadges) OVER (ORDER BY Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningBronzeBadges
+    FROM ComplexUsers
+), BenchmarkOutput AS (
+    SELECT 
+      ua.Id AS UserId,
+      ua.DisplayName,
+      ua.Reputation,
+      ua.CreationDate,
+      ua.LastAccessDate,
+      ua.GoldBadges,
+      ua.SilverBadges,
+      ua.BronzeBadges,
+      ua.QuestionCount,
+      ua.AnswerCount,
+      da.AnswerId,
+      da.Score AS AnswerScore,
+      da.AnswerRank,
+      da.QuestionId,
+      SUBSTRING(da.QuestionTitle FROM 1 FOR 50) || CASE WHEN LENGTH(da.QuestionTitle) > 50 THEN '...' ELSE '' END AS ShortQuestionTitle,
+      COALESCE(da.DuplicateOf, -1) AS DuplicateQuestionId,
+      da.CloseReason,
+      da.IsTopScoringAnswer,
+      ua.ActivityStatus,
+      CASE WHEN ua.Views > 10000 THEN 'High' ELSE 'Low' END AS ViewLevel,
+      SUBSTR(COALESCE(u.AboutMe, ''), 1, 100) AS AboutTextSnippet
+    FROM ComplexUsers ua
+    LEFT JOIN DetailedAnswerAnalysis da ON da.OwnerUserId = ua.Id
+    LEFT JOIN Users u ON u.Id = ua.Id
+    WHERE da.AnswerRank <= 3 OR da.AnswerRank IS NULL
+)
+SELECT *
+FROM BenchmarkOutput
+ORDER BY Reputation DESC, AnswerScore DESC NULLS LAST, UserId
+LIMIT 100;

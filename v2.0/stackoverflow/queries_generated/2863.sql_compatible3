@@ -1,0 +1,162 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        COALESCE(t.ExcerptPostId, 0) AS ExcerptPostId,
+        COALESCE(t.WikiPostId, 0) AS WikiPostId,
+        CAST(ARRAY[t.TagName] AS varchar[]) AS TagPath
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        COALESCE(child.ExcerptPostId, 0),
+        COALESCE(child.WikiPostId, 0),
+        parent.TagPath || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy parent
+      ON child.Id != parent.Id
+     AND child.IsModeratorOnly = FALSE
+     AND array_length(parent.TagPath, 1) < 3
+    WHERE child.IsRequired = FALSE
+),
+QuestionsWithMetrics AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        u.Reputation AS OwnerReputation,
+        u.DisplayName AS OwnerName,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10, 11)) AS CloseReopenEvents,
+        MAX(COALESCE(ph.CreationDate, TIMESTAMP '1900-01-01')) AS LastCloseReopenDate,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        (
+            SELECT COUNT(*)
+            FROM Votes v
+            WHERE v.PostId = p.Id
+              AND v.VoteTypeId = 3
+        ) AS DownVotesCount,
+        (
+            SELECT COUNT(*)
+            FROM Votes v
+            WHERE v.PostId = p.Id
+              AND v.VoteTypeId = 2
+        ) AS UpVotesCount
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 11)
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.Tags, u.Reputation, u.DisplayName, p.ClosedDate
+),
+UserBadgeRanks AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId = 1) AS AcceptedAnswerVotes
+    FROM Posts a
+    LEFT JOIN Votes v ON v.PostId = a.Id AND v.VoteTypeId = 1
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+PopularTags AS (
+    SELECT
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) AS TagName,
+        p.Id AS PostId,
+        p.Score,
+        p.ViewCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+TagRankings AS (
+    SELECT
+        pt.TagName,
+        COUNT(DISTINCT pt.PostId) AS NumQuestions,
+        AVG(pt.Score) AS AvgScore,
+        SUM(pt.ViewCount) AS TotalViews,
+        ROW_NUMBER() OVER (ORDER BY AVG(pt.Score) DESC, COUNT(DISTINCT pt.PostId) DESC) AS RankByScore
+    FROM PopularTags pt
+    GROUP BY pt.TagName
+),
+AcceptedAnswerDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.OwnerUserId AS AcceptedAnswerOwnerId,
+        u.Reputation AS AcceptedAnswerOwnerReputation
+    FROM Posts q
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+)
+SELECT
+    q.QuestionId,
+    q.Title,
+    q.OwnerName,
+    q.OwnerReputation,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    q.IsClosed,
+    q.CloseReopenEvents,
+    q.LastCloseReopenDate,
+    q.UpVotesCount,
+    q.DownVotesCount,
+    COALESCE(ab.GoldBadges, 0) AS OwnerGoldBadges,
+    COALESCE(ab.SilverBadges, 0) AS OwnerSilverBadges,
+    COALESCE(ab.BronzeBadges, 0) AS OwnerBronzeBadges,
+    a.AvgAnswerScore AS AverageAnswerScore,
+    a.MaxAnswerScore,
+    aad.AcceptedAnswerScore,
+    aad.AcceptedAnswerOwnerReputation,
+    tr.TagName,
+    tr.RankByScore,
+    STRING_AGG(DISTINCT phs.Name ORDER BY phs.Name) FILTER (WHERE phs.Name IS NOT NULL) AS PostHistoryEventNames
+FROM QuestionsWithMetrics q
+LEFT JOIN UserBadgeRanks ab ON ab.UserId = q.OwnerUserId
+LEFT JOIN AnswerStats a ON a.QuestionId = q.QuestionId
+LEFT JOIN AcceptedAnswerDetails aad ON aad.QuestionId = q.QuestionId
+LEFT JOIN TagRankings tr ON tr.TagName = (
+    SELECT unnest(string_to_array(substring(q.Tags from 2 for char_length(q.Tags) - 2), '><'))
+    ORDER BY 1
+    LIMIT 1
+)
+LEFT JOIN PostHistory ph ON ph.PostId = q.QuestionId AND ph.PostHistoryTypeId IN (10,11,12,13,14,15,19,20)
+LEFT JOIN PostHistoryTypes phs ON phs.Id = ph.PostHistoryTypeId
+WHERE q.AnswerCount > 1
+GROUP BY
+    q.QuestionId, q.Title, q.OwnerName, q.OwnerReputation, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount, q.IsClosed,
+    q.CloseReopenEvents, q.LastCloseReopenDate, q.UpVotesCount, q.DownVotesCount,
+    ab.GoldBadges, ab.SilverBadges, ab.BronzeBadges,
+    a.AvgAnswerScore, a.MaxAnswerScore,
+    aad.AcceptedAnswerScore, aad.AcceptedAnswerOwnerReputation,
+    tr.TagName, tr.RankByScore
+ORDER BY q.Score DESC, q.ViewCount DESC
+LIMIT 25;

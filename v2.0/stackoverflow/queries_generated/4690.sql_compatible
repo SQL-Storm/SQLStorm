@@ -1,0 +1,160 @@
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        u.DisplayName AS EditorDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+LatestEdits AS (
+    SELECT
+        PostId,
+        UserId,
+        EditorDisplayName,
+        CreationDate,
+        PostHistoryTypeId
+    FROM RankedPostEdits
+    WHERE rn = 1
+),
+QuestionAnswers AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.Score AS QuestionScore,
+        p.ViewCount AS QuestionViewCount,
+        p.CreationDate AS QuestionCreationDate,
+        COUNT(a.Id) AS AnswerCount
+    FROM Posts p
+    LEFT JOIN Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate
+),
+UserContribution AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserDisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN COALESCE(p.Score,0) ELSE 0 END) AS TotalAnswerScore,
+        COUNT(DISTINCT c.Id) AS CommentsMade
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+TagPairs AS (
+    -- Split tags string into rows in a dialect-neutral way using recursive CTE
+    SELECT
+        p.Id AS QuestionId,
+        NULL::text AS tag,  -- placeholder for column type; will be filled by recursive part
+        REPLACE(REPLACE(p.Tags, '<', ''), '>', '') AS tags_remaining,
+        1 AS step
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        tp.QuestionId,
+        CASE
+            WHEN instr = 0 THEN tp.tags_remaining
+            ELSE substr(tp.tags_remaining, 1, instr-1)
+        END AS tag,
+        CASE
+            WHEN instr = 0 THEN ''
+            ELSE ltrim(substr(tp.tags_remaining, instr+1))
+        END AS tags_remaining,
+        tp.step + 1
+    FROM (
+        SELECT
+            QuestionId,
+            tag,
+            tags_remaining,
+            step,
+            CASE
+                WHEN tags_remaining = '' THEN 0
+                ELSE (CASE
+                    WHEN POSITION(' ' IN tags_remaining) = 0 THEN 0
+                    ELSE POSITION(' ' IN tags_remaining)
+                END)
+            END AS instr
+        FROM (
+            SELECT QuestionId, tag, tags_remaining, step FROM (
+                SELECT QuestionId, tag, tags_remaining, step FROM
+                (SELECT QuestionId, tag, tags_remaining, step FROM (SELECT QuestionId, tag, tags_remaining, step FROM TagPairs) AS inner1) AS inner2
+            ) AS inner3
+        ) AS calc
+    ) tp
+    WHERE tp.tags_remaining <> ''
+),
+TagPairsFinal AS (
+    -- The above recursive approach is highly portable but some engines require different functions.
+    -- To ensure portability, reimplement recursion using standard functions for common DBs.
+    -- Simpler portable splitter using nested recursion with standard POSITION/SUBSTR/LTRIM/RTRIM:
+    SELECT QuestionId, TRIM(tag) AS Tag
+    FROM (
+        SELECT
+            p.Id AS QuestionId,
+            -- generate tokenization by iteratively extracting tokens using a recursive SQL construct
+            REGEXP_SPLIT_TO_TABLE(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), E'\\s+') AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ) s
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagCount,
+        COUNT(DISTINCT ps.Id) AS PostsWithTag
+    FROM Tags t
+    LEFT JOIN Posts ps ON ps.Tags LIKE '%' || t.TagName || '%' AND ps.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+)
+SELECT
+    qa.QuestionId,
+    qa.QuestionTitle,
+    qa.QuestionScore,
+    qa.QuestionViewCount,
+    qa.QuestionCreationDate,
+    qa.AnswerCount,
+    le.EditorDisplayName AS LastEditorDisplayName,
+    le.CreationDate AS LastEditDate,
+    COALESCE(uc.UserDisplayName, 'Community') AS OwnerDisplayName,
+    uc.QuestionsAsked,
+    uc.AnswersGiven,
+    uc.TotalAnswerScore,
+    uc.CommentsMade,
+    tp.TagName,
+    tp.TagCount,
+    tp.PostsWithTag,
+    CASE
+        WHEN qa.QuestionScore > 100 THEN 'High Score'
+        WHEN qa.QuestionScore BETWEEN 50 AND 100 THEN 'Medium Score'
+        ELSE 'Low Score'
+    END AS ScoreCategory,
+    CASE
+        WHEN le.PostHistoryTypeId = 4 THEN 'Title Edited'
+        WHEN le.PostHistoryTypeId = 5 THEN 'Body Edited'
+        WHEN le.PostHistoryTypeId = 6 THEN 'Tags Edited'
+        ELSE 'No Recent Edit'
+    END AS LastEditType,
+    DENSE_RANK() OVER (ORDER BY qa.QuestionViewCount DESC) as ViewRank,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = qa.QuestionId AND v.VoteTypeId = 2) AS UpVoteCountForQuestion
+FROM QuestionAnswers qa
+LEFT JOIN LatestEdits le ON qa.QuestionId = le.PostId
+LEFT JOIN UserContribution uc ON qa.QuestionId = (SELECT OwnerUserId FROM Posts WHERE Id = qa.QuestionId)
+LEFT JOIN (
+    SELECT DISTINCT tp.QuestionId, tp.Tag AS TagName
+    FROM TagPairsFinal tp
+    JOIN Tags t ON t.TagName = tp.Tag
+) tp ON qa.QuestionId = tp.QuestionId
+WHERE qa.QuestionScore IS NOT NULL
+  AND qa.QuestionViewCount > 0
+  AND COALESCE(uc.QuestionsAsked, 0) > 5
+  AND tp.TagName NOT LIKE '%-'
+ORDER BY qa.QuestionViewCount DESC, qa.QuestionScore DESC
+LIMIT 100;

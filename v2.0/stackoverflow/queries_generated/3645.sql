@@ -1,0 +1,124 @@
+-- {"query": "3645.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2356} 
+
+/*  Complex performance‑benchmarking query on the StackOverflow schema  */
+WITH
+    /* Recent posts (last 30 days) */
+    recent_posts AS (
+        SELECT
+            p.Id,
+            p.OwnerUserId,
+            p.PostTypeId,
+            p.CreationDate,
+            p.Score,
+            p.Tags
+        FROM Posts p
+        WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+          AND p.OwnerUserId IS NOT NULL
+    ),
+
+    /* Aggregate post stats per user */
+    user_post_stats AS (
+        SELECT
+            u.Id                              AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(*) FILTER (WHERE rp.PostTypeId = 1)                AS question_cnt,
+            COUNT(*) FILTER (WHERE rp.PostTypeId = 2)                AS answer_cnt,
+            COALESCE(SUM(rp.Score),0)                               AS total_score,
+            COALESCE(AVG(rp.Score),0)                               AS avg_score,
+            /* distinct tags across recent posts */
+            COUNT(DISTINCT CASE
+                               WHEN rp.Tags IS NOT NULL
+                               THEN regexp_split_to_table(rp.Tags,'[><]')
+                           END)                                      AS distinct_tag_cnt
+        FROM Users u
+        LEFT JOIN recent_posts rp ON rp.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    /* Badge summary per user */
+    user_badge_stats AS (
+        SELECT
+            b.UserId                                     AS user_id,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt,
+            COUNT(*)                                     AS total_badges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    /* Votes on recent posts (last 90 days) */
+    recent_votes AS (
+        SELECT
+            v.PostId,
+            v.VoteTypeId,
+            COUNT(*) AS vote_cnt
+        FROM Votes v
+        WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+        GROUP BY v.PostId, v.VoteTypeId
+    ),
+
+    /* Vote aggregation per user */
+    user_vote_agg AS (
+        SELECT
+            u.Id                                            AS user_id,
+            SUM(CASE WHEN rv.VoteTypeId = 2 THEN rv.vote_cnt ELSE 0 END) AS up_votes,
+            SUM(CASE WHEN rv.VoteTypeId = 3 THEN rv.vote_cnt ELSE 0 END) AS down_votes
+        FROM Users u
+        LEFT JOIN Posts p      ON p.OwnerUserId = u.Id
+        LEFT JOIN recent_votes rv ON rv.PostId = p.Id
+        GROUP BY u.Id
+    ),
+
+    /* Users that satisfy at least one of the “high‑impact” predicates */
+    high_impact_users AS (
+        SELECT ups.user_id
+        FROM user_post_stats ups
+        LEFT JOIN user_badge_stats ubs ON ubs.user_id = ups.user_id
+        WHERE ups.Reputation > 50000
+           OR ubs.total_badges >= 10
+           OR ups.distinct_tag_cnt > 5
+           OR ups.answer_cnt > 100
+    )
+
+SELECT
+    ups.user_id,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.question_cnt,
+    ups.answer_cnt,
+    ups.total_score,
+    ROUND(ups.avg_score,2)                               AS avg_score,
+    ups.distinct_tag_cnt,
+    COALESCE(ubs.gold_cnt,0)                             AS gold_badges,
+    COALESCE(ubs.silver_cnt,0)                           AS silver_badges,
+    COALESCE(ubs.bronze_cnt,0)                           AS bronze_badges,
+    COALESCE(ubs.total_badges,0)                         AS total_badges,
+    COALESCE(uva.up_votes,0)                             AS recent_up_votes,
+    COALESCE(uva.down_votes,0)                           AS recent_down_votes,
+    /* Reputation trend compared to previous row in descending order */
+    CASE
+        WHEN ups.Reputation > LAG(ups.Reputation) OVER (ORDER BY ups.Reputation DESC) THEN '↑'
+        WHEN ups.Reputation < LAG(ups.Reputation) OVER (ORDER BY ups.Reputation DESC) THEN '↓'
+        ELSE '='
+    END                                                   AS rep_trend,
+    CONCAT('Tags:', COALESCE(ups.distinct_tag_cnt::text,'0')) AS tag_info,
+    /* Score per answer, avoiding division by zero */
+    CASE
+        WHEN ups.answer_cnt = 0 THEN NULL
+        ELSE ROUND(ups.total_score::numeric / NULLIF(ups.answer_cnt,0),2)
+    END                                                   AS score_per_answer
+FROM user_post_stats      ups
+LEFT JOIN user_badge_stats   ubs ON ubs.user_id = ups.user_id
+LEFT JOIN user_vote_agg      uva ON uva.user_id = ups.user_id
+WHERE ups.user_id IN (SELECT user_id FROM high_impact_users)
+ORDER BY ups.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+/* Ensure the result set always contains at least one row */
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE NOT EXISTS (SELECT 1 FROM high_impact_users);

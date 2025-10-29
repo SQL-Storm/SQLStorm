@@ -1,0 +1,218 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersCreated,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN VT.Name = 'UpMod' THEN 1 ELSE 0 END) AS TotalUpVotesReceivedOnPosts,
+        SUM(CASE WHEN VT.Name = 'DownMod' THEN 1 ELSE 0 END) AS TotalDownVotesReceivedOnPosts,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        MAX(C.CreationDate) AS LastCommentDate,
+        COUNT(DISTINCT V_Given.Id) AS TotalVotesGivenByThisUser,
+        CAST(
+            U.Reputation * 0.7
+            + COALESCE(SUM(CASE WHEN VT.Name = 'UpMod' THEN 1 ELSE 0 END), 0) * 0.5
+            - COALESCE(SUM(CASE WHEN VT.Name = 'DownMod' THEN 1 ELSE 0 END), 0) * 0.2
+            + COUNT(DISTINCT P.Id) * 1.5
+            + COUNT(DISTINCT C.Id) * 0.8
+            + COUNT(DISTINCT B.Id) * 1.0
+            - (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - U.LastAccessDate)) / (3600 * 24 * 30.0)) * 0.1
+        AS NUMERIC) AS UserActivityScore
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    LEFT JOIN Votes AS V_Given ON U.Id = V_Given.UserId
+    LEFT JOIN Votes AS V_Received ON P.Id = V_Received.PostId AND V_Received.VoteTypeId IN (2,3)
+    LEFT JOIN VoteTypes AS VT ON V_Received.VoteTypeId = VT.Id
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes, U.LastAccessDate
+),
+PostQualityMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Title,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.OwnerUserId,
+        P.LastEditorUserId,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        COUNT(DISTINCT C.Id) AS CommentCountOnPost,
+        COUNT(DISTINCT PH_Edit.UserId) AS DistinctEditors,
+        MAX(CASE WHEN PH_Close.PostHistoryTypeId = 10 THEN PH_Close.CreationDate ELSE NULL END) AS LastCloseDate,
+        (
+            SELECT CR.Name
+            FROM PostHistory PH_CR
+            JOIN CloseReasonTypes CR ON CR.Id = CAST(PH_CR.Comment AS INTEGER)
+            WHERE PH_CR.PostId = P.Id
+              AND PH_CR.PostHistoryTypeId = 10
+            ORDER BY PH_CR.CreationDate DESC
+            LIMIT 1
+        ) AS LastCloseReason,
+        CASE
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            WHEN P.ClosedDate IS NOT NULL THEN COALESCE(
+                'Closed (' ||
+                (SELECT CR.Name
+                 FROM CloseReasonTypes CR
+                 JOIN PostHistory PH_Closed ON CAST(PH_Closed.Comment AS INTEGER) = CR.Id
+                 WHERE PH_Closed.PostId = P.Id
+                   AND PH_Closed.PostHistoryTypeId = 10
+                 ORDER BY PH_Closed.CreationDate DESC
+                 LIMIT 1)
+                || ')',
+                'Closed (Unknown Reason)'
+            )
+            WHEN P.AnswerCount > 0 AND P.Score > 5 THEN 'Active & Good'
+            ELSE 'Open'
+        END AS PostStatusDerived,
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS PostScoreRank,
+        CAST(COALESCE(P.CommentCount, 0) + COALESCE(P.FavoriteCount, 0) * 2 AS NUMERIC) / NULLIF(P.ViewCount, 0) AS EngagementRatio,
+        (P.Title ILIKE '%sql%' OR P.Title ILIKE '%database%' OR COALESCE(P.Tags, '') ILIKE '%<sql>%') AS ContainsDBKeywords,
+        (
+            SELECT AVG(A.Score)
+            FROM Posts A
+            WHERE A.ParentId = P.Id AND A.PostTypeId = 2
+        ) AS AverageAnswerScore,
+        COUNT(DISTINCT CASE WHEN PH_History.PostHistoryTypeId IN (4,5,6) AND PH_History.UserId <> P.OwnerUserId THEN PH_History.UserId ELSE NULL END) AS ExternalContributorEditCount
+    FROM Posts AS P
+    LEFT JOIN Comments AS C ON P.Id = C.PostId
+    LEFT JOIN PostHistory AS PH_Edit ON P.Id = PH_Edit.PostId AND PH_Edit.PostHistoryTypeId IN (4,5,6)
+    LEFT JOIN PostHistory AS PH_Close ON P.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory AS PH_History ON P.Id = PH_History.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.Title, P.CreationDate, P.Score, P.ViewCount, P.OwnerUserId, P.LastEditorUserId,
+        P.LastEditDate, P.LastActivityDate, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.AcceptedAnswerId, P.AnswerCount, P.Tags
+),
+TagUsageDiversity AS (
+    SELECT
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS PostsWithTag,
+        AVG(P.Score) AS AvgScoreForTag,
+        MAX(P.CreationDate) AS LastUsedDateForTag,
+        CAST(COUNT(DISTINCT P.Id) AS NUMERIC) / NULLIF(SUM(COUNT(DISTINCT P.Id)) OVER (), 0) * 100 AS PercentageOfPostsInTagSet,
+        SUM(CASE WHEN P.ViewCount > 1000 THEN 1 ELSE 0 END) AS HighViewPostsWithTagCount
+    FROM Tags AS T
+    JOIN Posts AS P ON P.Tags LIKE '%<' || T.TagName || '>%'
+    WHERE P.PostTypeId IN (1,4,5)
+    GROUP BY T.TagName
+    HAVING COUNT(DISTINCT P.Id) > 10
+),
+InterestingPostsAndUsers AS (
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        UE.Reputation,
+        UE.UserActivityScore,
+        UE.TotalPostsCreated,
+        UE.TotalUpVotesReceivedOnPosts,
+        UE.TotalCommentsMade,
+        PQ.PostId,
+        PQ.Title,
+        PQ.PostScore,
+        PQ.ViewCount,
+        PQ.LastCloseReason,
+        PQ.PostStatusDerived,
+        PQ.EngagementRatio,
+        PQ.ContainsDBKeywords,
+        PQ.AverageAnswerScore,
+        TU.TagName,
+        TU.AvgScoreForTag,
+        COALESCE(PQ.ExternalContributorEditCount, 0) AS PostExternalContributorEditCount,
+        (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - PQ.PostCreationDate)) / (3600 * 24 * 365.25)) AS PostAgeYears
+    FROM UserEngagement AS UE
+    JOIN PostQualityMetrics AS PQ ON UE.UserId = PQ.OwnerUserId
+    LEFT JOIN Posts AS P_TagLookup ON PQ.PostId = P_TagLookup.Id
+    LEFT JOIN TagUsageDiversity AS TU ON P_TagLookup.Tags LIKE '%<' || TU.TagName || '>%'
+    WHERE
+        PQ.PostTypeId = 1
+        AND UE.UserActivityScore > 500
+        AND PQ.EngagementRatio > 0.01
+        AND PQ.PostScore > 5
+        AND PQ.PostScoreRank <= 1000
+        AND PQ.ContainsDBKeywords
+        AND (PQ.AverageAnswerScore IS NULL OR PQ.AverageAnswerScore > 3)
+        AND (P_TagLookup.ClosedDate IS NULL OR P_TagLookup.ClosedDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+)
+SELECT
+    IPU.UserId,
+    IPU.DisplayName,
+    IPU.Reputation,
+    IPU.UserActivityScore,
+    IPU.TotalPostsCreated,
+    IPU.TotalUpVotesReceivedOnPosts,
+    IPU.TotalCommentsMade,
+    IPU.PostId,
+    IPU.Title,
+    IPU.PostScore,
+    IPU.ViewCount,
+    IPU.EngagementRatio,
+    IPU.PostStatusDerived,
+    IPU.LastCloseReason,
+    IPU.TagName,
+    IPU.AvgScoreForTag,
+    IPU.PostAgeYears,
+    IPU.PostExternalContributorEditCount,
+    CASE
+        WHEN IPU.Reputation > 10000 AND IPU.PostScore > 10 AND IPU.EngagementRatio > 0.05 THEN 'Elite Contribution'
+        WHEN IPU.UserActivityScore > 1000 AND IPU.PostExternalContributorEditCount > 1 THEN 'Collaborative Excellence'
+        WHEN IPU.PostAgeYears < 0.5 AND IPU.PostScore > 7 AND IPU.TotalCommentsMade > 5 THEN 'Recent Hot Topic'
+        WHEN IPU.LastCloseReason IS NOT NULL AND IPU.LastCloseReason ILIKE '%duplicate%' THEN 'Duplicate (Handled)'
+        ELSE 'General Active'
+    END AS ContributionTier,
+    NTILE(5) OVER (ORDER BY IPU.EngagementRatio DESC) AS EngagementQuintile
+FROM InterestingPostsAndUsers AS IPU
+WHERE
+    IPU.PostAgeYears < 5
+    AND IPU.Reputation > 100
+    AND IPU.PostScore > 0
+    AND IPU.TotalPostsCreated > 0
+
+UNION ALL
+
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.UserActivityScore,
+    UE.TotalPostsCreated,
+    UE.TotalUpVotesReceivedOnPosts,
+    UE.TotalCommentsMade,
+    PQ.PostId,
+    PQ.Title,
+    PQ.PostScore,
+    PQ.ViewCount,
+    PQ.EngagementRatio,
+    PQ.PostStatusDerived,
+    PQ.LastCloseReason,
+    TU.TagName,
+    TU.AvgScoreForTag,
+    (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - PQ.PostCreationDate)) / (3600 * 24 * 365.25)) AS PostAgeYears,
+    COALESCE(PQ.ExternalContributorEditCount, 0) AS PostExternalContributorEditCount,
+    'Discussion Magnet' AS ContributionTier,
+    NTILE(5) OVER (ORDER BY PQ.CommentCountOnPost DESC) AS EngagementQuintile
+FROM UserEngagement AS UE
+JOIN PostQualityMetrics AS PQ ON UE.UserId = PQ.OwnerUserId
+LEFT JOIN Posts AS P_TagLookup ON PQ.PostId = P_TagLookup.Id
+LEFT JOIN TagUsageDiversity AS TU ON P_TagLookup.Tags LIKE '%<' || TU.TagName || '>%'
+WHERE
+    PQ.PostTypeId = 1
+    AND UE.Reputation > 5000
+    AND UE.TotalPostsCreated BETWEEN 1 AND 10
+    AND PQ.CommentCountOnPost > 10
+    AND PQ.PostScore > 1
+    AND (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - PQ.PostCreationDate)) / (3600 * 24 * 365.25)) < 3
+ORDER BY Reputation DESC, UserActivityScore DESC, EngagementQuintile ASC, PostAgeYears ASC;

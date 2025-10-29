@@ -1,0 +1,490 @@
+WITH recent_users AS (
+    SELECT u.id AS user_id,
+           u.displayname,
+           u.reputation,
+           u.location,
+           u.creationdate,
+           u.upvotes,
+           u.downvotes,
+           COALESCE(NULLIF(TRIM(u.websiteurl), ''), 'unknown') AS websiteurl_norm
+    FROM users u
+    WHERE u.creationdate >= DATE_TRUNC('month', CAST('2024-10-01 12:34:56' AS timestamp)) - INTERVAL '24 months'
+),
+badge_counts AS (
+    SELECT b.userid,
+           SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+           SUM(CASE WHEN b.class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+           SUM(CASE WHEN b.class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+           COUNT(*) AS total_badges,
+           MAX(b.date) AS last_badge_date
+    FROM badges b
+    GROUP BY b.userid
+),
+recent_questions AS (
+    SELECT p.id AS question_id,
+           p.owneruserid AS user_id,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.favoritecount,
+           p.answercount,
+           p.title,
+           p.tags,
+           p.closeddate,
+           p.acceptedanswerid
+    FROM posts p
+    WHERE p.posttypeid = 1
+      AND p.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+),
+answers AS (
+    SELECT a.id AS answer_id,
+           a.parentid AS question_id,
+           a.owneruserid AS answerer_id,
+           a.creationdate,
+           a.score AS answer_score
+    FROM posts a
+    WHERE a.posttypeid = 2
+),
+question_activity AS (
+    SELECT q.question_id,
+           q.user_id,
+           q.creationdate,
+           q.score,
+           q.viewcount,
+           q.favoritecount,
+           q.answercount,
+           q.title,
+           q.tags,
+           q.closeddate,
+           q.acceptedanswerid,
+           COUNT(ans.answer_id) AS total_answers_last_year,
+           MAX(ans.creationdate) AS last_answer_date,
+           SUM(CASE WHEN ans.answer_score > 0 THEN 1 ELSE 0 END) AS positive_answers
+    FROM recent_questions q
+    LEFT JOIN answers ans
+      ON ans.question_id = q.question_id
+     AND ans.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+    GROUP BY q.question_id, q.user_id, q.creationdate, q.score, q.viewcount, q.favoritecount, q.answercount, q.title, q.tags, q.closeddate, q.acceptedanswerid
+),
+duplicates AS (
+    SELECT pl.postid AS duplicate_id,
+           pl.relatedpostid AS original_id,
+           pl.creationdate AS dup_link_date
+    FROM postlinks pl
+    WHERE pl.linktypeid = 3
+),
+close_events AS (
+    SELECT ph.postid,
+           MIN(ph.creationdate) AS first_close_date,
+           MAX(CASE WHEN ph.posthistorytypeid = 11 THEN ph.creationdate END) AS last_reopen_date,
+           COUNT(*) FILTER (WHERE ph.posthistorytypeid = 10) AS close_votes_count,
+           MAX(CASE WHEN ph.posthistorytypeid = 10 AND ph.comment ~ '^[0-9]+$' THEN ph.comment END) AS last_close_reason_id
+    FROM posthistory ph
+    WHERE ph.posthistorytypeid IN (10,11)
+    GROUP BY ph.postid
+),
+vote_agg AS (
+    SELECT v.postid,
+           SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS upvotes,
+           SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) AS downvotes,
+           SUM(CASE WHEN v.votetypeid = 8 THEN COALESCE(v.bountyamount,0) ELSE 0 END) AS bounty_started,
+           SUM(CASE WHEN v.votetypeid = 9 THEN COALESCE(v.bountyamount,0) ELSE 0 END) AS bounty_awarded,
+           COUNT(*) FILTER (WHERE v.votetypeid IN (2,3)) AS total_votes
+    FROM votes v
+    WHERE v.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+    GROUP BY v.postid
+),
+tag_expanded AS (
+    SELECT q.question_id,
+           UNNEST(STRING_TO_ARRAY(SUBSTRING(COALESCE(q.tags, ''), 2, GREATEST(LENGTH(COALESCE(q.tags, ''))-2,0)), '><')) AS tag
+    FROM question_activity q
+),
+per_tag_metrics AS (
+    SELECT t.tag,
+           COUNT(DISTINCT t.question_id) AS questions_tagged,
+           SUM(qa.score) AS total_score_tagged,
+           AVG(qa.viewcount) AS avg_views_tagged
+    FROM tag_expanded t
+    JOIN question_activity qa ON qa.question_id = t.question_id
+    GROUP BY t.tag
+),
+user_question_rollup AS (
+    SELECT qa.user_id,
+           COUNT(*) AS questions_asked,
+           SUM(CASE WHEN qa.acceptedanswerid IS NOT NULL THEN 1 ELSE 0 END) AS accepted_count,
+           AVG(qa.score) AS avg_question_score,
+           MAX(qa.viewcount) AS max_views,
+           SUM(qa.favoritecount) AS total_favorites,
+           SUM(COALESCE(va.upvotes,0)) AS question_upvotes,
+           SUM(COALESCE(va.downvotes,0)) AS question_downvotes,
+           SUM(COALESCE(va.total_votes,0)) AS question_total_votes,
+           SUM(COALESCE(va.bounty_started,0)) AS total_bounty_started,
+           SUM(COALESCE(va.bounty_awarded,0)) AS total_bounty_awarded,
+           COUNT(*) FILTER (WHERE qa.closeddate IS NOT NULL) AS closed_questions
+    FROM question_activity qa
+    LEFT JOIN vote_agg va ON va.postid = qa.question_id
+    GROUP BY qa.user_id
+),
+comment_stats AS (
+    SELECT c.userid,
+           COUNT(*) AS comments_made,
+           AVG(c.score) AS avg_comment_score,
+           MAX(c.creationdate) AS last_comment_date
+    FROM comments c
+    WHERE c.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+    GROUP BY c.userid
+),
+answerer_interactions AS (
+    SELECT a.answerer_id AS user_id,
+           COUNT(*) FILTER (WHERE q.user_id = a.answerer_id) AS self_answers,
+           COUNT(DISTINCT CASE WHEN q.user_id <> a.answerer_id THEN q.user_id END) AS distinct_users_helped,
+           AVG(a.answer_score) AS avg_answer_score
+    FROM answers a
+    JOIN recent_questions q ON q.question_id = a.question_id
+    GROUP BY a.answerer_id
+),
+dup_stats AS (
+    SELECT q.user_id,
+           COUNT(DISTINCT d.duplicate_id) AS duplicates_of_their_questions,
+           MIN(d.dup_link_date) AS first_dup_date
+    FROM duplicates d
+    JOIN question_activity q ON q.question_id = d.duplicate_id
+    GROUP BY q.user_id
+),
+user_cohorts AS (
+    SELECT ru.user_id,
+           CASE
+               WHEN ru.reputation >= 50000 THEN 'legend'
+               WHEN ru.reputation >= 10000 THEN 'expert'
+               WHEN ru.reputation >= 2000 THEN 'intermediate'
+               WHEN ru.reputation >= 1 THEN 'beginner'
+               ELSE 'new'
+           END AS cohort,
+           DATE_TRUNC('quarter', ru.creationdate) AS signup_quarter
+    FROM recent_users ru
+),
+user_enriched AS (
+    SELECT ru.user_id,
+           ru.displayname,
+           ru.reputation,
+           ru.location,
+           ru.creationdate,
+           ru.upvotes,
+           ru.downvotes,
+           ru.websiteurl_norm,
+           uc.cohort,
+           uc.signup_quarter,
+           COALESCE(bc.gold_badges,0) AS gold_badges,
+           COALESCE(bc.silver_badges,0) AS silver_badges,
+           COALESCE(bc.bronze_badges,0) AS bronze_badges,
+           COALESCE(bc.total_badges,0) AS total_badges,
+           bc.last_badge_date
+    FROM recent_users ru
+    LEFT JOIN user_cohorts uc ON uc.user_id = ru.user_id
+    LEFT JOIN badge_counts bc ON bc.userid = ru.user_id
+),
+user_final AS (
+    SELECT ue.user_id,
+           ue.displayname,
+           ue.reputation,
+           ue.location,
+           ue.creationdate,
+           ue.upvotes,
+           ue.downvotes,
+           ue.websiteurl_norm,
+           ue.cohort,
+           ue.signup_quarter,
+           ue.gold_badges,
+           ue.silver_badges,
+           ue.bronze_badges,
+           ue.total_badges,
+           ue.last_badge_date,
+           COALESCE(uqr.questions_asked,0) AS questions_asked,
+           COALESCE(uqr.accepted_count,0) AS accepted_count,
+           COALESCE(uqr.avg_question_score,0) AS avg_question_score,
+           COALESCE(uqr.max_views,0) AS max_views,
+           COALESCE(uqr.total_favorites,0) AS total_favorites,
+           COALESCE(uqr.question_upvotes,0) AS question_upvotes,
+           COALESCE(uqr.question_downvotes,0) AS question_downvotes,
+           COALESCE(uqr.question_total_votes,0) AS question_total_votes,
+           COALESCE(uqr.total_bounty_started,0) AS total_bounty_started,
+           COALESCE(uqr.total_bounty_awarded,0) AS total_bounty_awarded,
+           COALESCE(uqr.closed_questions,0) AS closed_questions,
+           COALESCE(cs.comments_made,0) AS comments_made,
+           COALESCE(cs.avg_comment_score,0) AS avg_comment_score,
+           cs.last_comment_date,
+           COALESCE(ai.self_answers,0) AS self_answers,
+           COALESCE(ai.distinct_users_helped,0) AS distinct_users_helped,
+           COALESCE(ai.avg_answer_score,0) AS avg_answer_score,
+           COALESCE(ds.duplicates_of_their_questions,0) AS duplicates_of_their_questions,
+           ds.first_dup_date
+    FROM user_enriched ue
+    LEFT JOIN user_question_rollup uqr ON uqr.user_id = ue.user_id
+    LEFT JOIN comment_stats cs ON cs.userid = ue.user_id
+    LEFT JOIN answerer_interactions ai ON ai.user_id = ue.user_id
+    LEFT JOIN dup_stats ds ON ds.user_id = ue.user_id
+),
+ranked_users AS (
+    SELECT uf.user_id,
+           uf.displayname,
+           uf.reputation,
+           uf.location,
+           uf.creationdate,
+           uf.upvotes,
+           uf.downvotes,
+           uf.websiteurl_norm,
+           uf.cohort,
+           uf.signup_quarter,
+           uf.gold_badges,
+           uf.silver_badges,
+           uf.bronze_badges,
+           uf.total_badges,
+           uf.last_badge_date,
+           uf.questions_asked,
+           uf.accepted_count,
+           uf.avg_question_score,
+           uf.max_views,
+           uf.total_favorites,
+           uf.question_upvotes,
+           uf.question_downvotes,
+           uf.question_total_votes,
+           uf.total_bounty_started,
+           uf.total_bounty_awarded,
+           uf.closed_questions,
+           uf.comments_made,
+           uf.avg_comment_score,
+           uf.last_comment_date,
+           uf.self_answers,
+           uf.distinct_users_helped,
+           uf.avg_answer_score,
+           uf.duplicates_of_their_questions,
+           uf.first_dup_date,
+           ROW_NUMBER() OVER (ORDER BY (uf.questions_asked*2 + uf.total_badges + uf.question_upvotes - uf.question_downvotes + uf.comments_made/10.0 + uf.total_bounty_awarded/100.0) DESC NULLS LAST, uf.reputation DESC) AS activity_rank_desc,
+           PERCENT_RANK() OVER (ORDER BY COALESCE(NULLIF(uf.location,''), 'zzz') ASC) AS location_alpha_percentile,
+           NTILE(10) OVER (ORDER BY uf.reputation DESC) AS reputation_decile
+    FROM user_final uf
+),
+thresholds AS (
+    SELECT
+        PERCENTILE_DISC(0.50) WITHIN GROUP (ORDER BY questions_asked) AS p50_questions,
+        PERCENTILE_DISC(0.90) WITHIN GROUP (ORDER BY total_badges) AS p90_badges,
+        PERCENTILE_DISC(0.75) WITHIN GROUP (ORDER BY question_upvotes - question_downvotes) AS p75_net_votes
+    FROM ranked_users
+),
+flagged_users AS (
+    SELECT ru.user_id,
+           ru.displayname,
+           ru.reputation,
+           ru.location,
+           ru.creationdate,
+           ru.upvotes,
+           ru.downvotes,
+           ru.websiteurl_norm,
+           ru.cohort,
+           ru.signup_quarter,
+           ru.gold_badges,
+           ru.silver_badges,
+           ru.bronze_badges,
+           ru.total_badges,
+           ru.last_badge_date,
+           ru.questions_asked,
+           ru.accepted_count,
+           ru.avg_question_score,
+           ru.max_views,
+           ru.total_favorites,
+           ru.question_upvotes,
+           ru.question_downvotes,
+           ru.question_total_votes,
+           ru.total_bounty_started,
+           ru.total_bounty_awarded,
+           ru.closed_questions,
+           ru.comments_made,
+           ru.avg_comment_score,
+           ru.last_comment_date,
+           ru.self_answers,
+           ru.distinct_users_helped,
+           ru.avg_answer_score,
+           ru.duplicates_of_their_questions,
+           ru.first_dup_date,
+           ru.activity_rank_desc,
+           ru.location_alpha_percentile,
+           ru.reputation_decile,
+           CASE
+               WHEN ru.questions_asked >= t.p50_questions AND ru.total_badges >= t.p90_badges THEN 'power-contributor'
+               WHEN (ru.question_upvotes - ru.question_downvotes) < t.p75_net_votes AND ru.duplicates_of_their_questions > 0 THEN 'needs-guidance'
+               WHEN ru.closed_questions >= GREATEST(1, ru.questions_asked/4) THEN 'often-closed'
+               ELSE 'standard'
+           END AS engagement_label
+    FROM ranked_users ru
+    CROSS JOIN thresholds t
+),
+close_reason_mapping AS (
+    SELECT '1' AS id, 'duplicate' AS name UNION ALL
+    SELECT '2', 'off-topic' UNION ALL
+    SELECT '3', 'opinion-based' UNION ALL
+    SELECT '4', 'too-broad' UNION ALL
+    SELECT '5', 'unclear'
+),
+recent_close_details AS (
+    SELECT ce.postid,
+           ce.first_close_date,
+           ce.last_reopen_date,
+           ce.close_votes_count,
+           crm.name AS last_close_reason_name
+    FROM close_events ce
+    LEFT JOIN close_reason_mapping crm
+      ON crm.id = CAST(CAST(NULLIF(ce.last_close_reason_id, '') AS integer) AS text)
+         -- compare as text after normalizing to integer then text
+         = crm.id
+),
+question_summary AS (
+    SELECT qa.question_id,
+           qa.user_id,
+           qa.score,
+           qa.viewcount,
+           qa.favoritecount,
+           qa.answercount,
+           qa.closeddate,
+           COALESCE(va.upvotes,0) AS upvotes,
+           COALESCE(va.downvotes,0) AS downvotes,
+           COALESCE(rcd.close_votes_count,0) AS close_votes_count,
+           rcd.last_close_reason_name
+    FROM question_activity qa
+    LEFT JOIN vote_agg va ON va.postid = qa.question_id
+    LEFT JOIN recent_close_details rcd ON rcd.postid = qa.question_id
+),
+user_quality AS (
+    SELECT qs.user_id,
+           AVG(CASE WHEN qs.closeddate IS NULL THEN 1.0 ELSE 0.2 END * (qs.score + COALESCE(qs.upvotes,0) - COALESCE(qs.downvotes,0) + LEAST(COALESCE(qs.favoritecount,0), 50))) AS quality_index,
+           SUM(CASE WHEN LOWER(COALESCE(qs.last_close_reason_name, '')) LIKE '%duplicate%' THEN 1 ELSE 0 END) AS dup_closes,
+           SUM(qs.close_votes_count) AS total_close_votes
+    FROM question_summary qs
+    GROUP BY qs.user_id
+),
+label_adjusted AS (
+    SELECT fu.user_id,
+           fu.displayname,
+           fu.reputation,
+           fu.location,
+           fu.creationdate,
+           fu.upvotes,
+           fu.downvotes,
+           fu.websiteurl_norm,
+           fu.cohort,
+           fu.signup_quarter,
+           fu.gold_badges,
+           fu.silver_badges,
+           fu.bronze_badges,
+           fu.total_badges,
+           fu.last_badge_date,
+           fu.questions_asked,
+           fu.accepted_count,
+           fu.avg_question_score,
+           fu.max_views,
+           fu.total_favorites,
+           fu.question_upvotes,
+           fu.question_downvotes,
+           fu.question_total_votes,
+           fu.total_bounty_started,
+           fu.total_bounty_awarded,
+           fu.closed_questions,
+           fu.comments_made,
+           fu.avg_comment_score,
+           fu.last_comment_date,
+           fu.self_answers,
+           fu.distinct_users_helped,
+           fu.avg_answer_score,
+           fu.duplicates_of_their_questions,
+           fu.first_dup_date,
+           fu.activity_rank_desc,
+           fu.location_alpha_percentile,
+           fu.reputation_decile,
+           uq.quality_index,
+           uq.dup_closes,
+           uq.total_close_votes,
+           CASE WHEN fu.engagement_label = 'standard' AND uq.quality_index > 50 THEN 'rising-star'
+                WHEN fu.engagement_label = 'needs-guidance' AND uq.dup_closes = 0 THEN 'recovering'
+                ELSE fu.engagement_label
+           END AS adjusted_label
+    FROM flagged_users fu
+    LEFT JOIN user_quality uq ON uq.user_id = fu.user_id
+)
+SELECT
+    la.user_id,
+    la.displayname,
+    la.cohort,
+    la.signup_quarter,
+    la.reputation,
+    la.reputation_decile,
+    la.questions_asked,
+    la.accepted_count,
+    la.avg_question_score,
+    la.question_upvotes,
+    la.question_downvotes,
+    la.total_badges,
+    la.gold_badges,
+    la.silver_badges,
+    la.bronze_badges,
+    la.comments_made,
+    la.avg_comment_score,
+    la.self_answers,
+    la.distinct_users_helped,
+    la.total_bounty_started,
+    la.total_bounty_awarded,
+    la.closed_questions,
+    la.duplicates_of_their_questions,
+    COALESCE(la.quality_index, 0) AS quality_index,
+    la.adjusted_label,
+    la.location_alpha_percentile,
+    la.activity_rank_desc,
+    GREATEST(la.questions_asked, 1) AS safe_questions_asked,
+    CASE WHEN la.websiteurl_norm ILIKE 'http%' THEN la.websiteurl_norm ELSE NULL END AS normalized_websiteurl,
+    CAST('2024-10-01 12:34:56' AS timestamp) AS generated_at
+FROM label_adjusted la
+WHERE (la.reputation >= 1000 OR la.questions_asked >= 5 OR la.total_badges >= 10)
+  AND COALESCE(la.location, '') IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM posts px
+      WHERE px.owneruserid = la.user_id
+        AND px.posttypeid = 1
+        AND px.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 days'
+        AND px.score < 0
+  )
+UNION ALL
+SELECT
+    u.id AS user_id,
+    u.displayname,
+    'legacy' AS cohort,
+    DATE_TRUNC('year', u.creationdate) AS signup_quarter,
+    u.reputation,
+    10 AS reputation_decile,
+    0 AS questions_asked,
+    0 AS accepted_count,
+    0 AS avg_question_score,
+    0 AS question_upvotes,
+    0 AS question_downvotes,
+    0 AS total_badges,
+    0 AS gold_badges,
+    0 AS silver_badges,
+    0 AS bronze_badges,
+    0 AS comments_made,
+    CAST(NULL AS double precision) AS avg_comment_score,
+    0 AS self_answers,
+    0 AS distinct_users_helped,
+    0 AS total_bounty_started,
+    0 AS total_bounty_awarded,
+    0 AS closed_questions,
+    0 AS duplicates_of_their_questions,
+    CAST(0 AS double precision) AS quality_index,
+    'no-activity' AS adjusted_label,
+    CAST(1 AS double precision) AS location_alpha_percentile,
+    999999 AS activity_rank_desc,
+    0 AS safe_questions_asked,
+    NULL AS normalized_websiteurl,
+    CAST('2024-10-01 12:34:56' AS timestamp) AS generated_at
+FROM users u
+WHERE u.creationdate < DATE_TRUNC('month', CAST('2024-10-01 12:34:56' AS timestamp)) - INTERVAL '24 months'
+  AND u.reputation >= 100000
+ORDER BY activity_rank_desc, reputation DESC, user_id
+LIMIT 500;

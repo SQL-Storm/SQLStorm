@@ -1,0 +1,244 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS UserTotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS UserQuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS UserAnswerCount,
+        COALESCE(SUM(P.Score), 0) AS UserTotalPostScore,
+        COALESCE(AVG(P.Score) FILTER (WHERE P.Score IS NOT NULL), 0.0) AS UserAvgPostScore,
+        COUNT(DISTINCT C.Id) AS UserCommentCount,
+        MAX(PH.CreationDate) AS LatestPostHistoryEntryDate,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / (60 * 60 * 24) AS DaysSinceCreationToLastAccess
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN PostHistory AS PH ON U.Id = PH.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostDetailsAndEngagement AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        COALESCE(P.AnswerCount, 0) AS PostAnswerCount,
+        COALESCE(P.CommentCount, 0) AS PostCommentCount,
+        COALESCE(P.FavoriteCount, 0) AS PostFavoriteCount,
+        P.OwnerUserId,
+        U_Owner.DisplayName AS OwnerDisplayName,
+        COALESCE(U_Owner.Reputation, 0) AS OwnerReputation,
+        P.Title,
+        P.Tags,
+        P.ClosedDate,
+        COUNT(DISTINCT PH.UserId) FILTER (WHERE PH.UserId IS NOT NULL AND PH.UserId != P.OwnerUserId) AS NumberOfOtherEditors,
+        EXTRACT(EPOCH FROM (P.LastEditDate - P.CreationDate)) / 3600 AS HoursToLastEdit,
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS RankInPostTypeByScore,
+        COALESCE(AVG(C.Score) FILTER (WHERE C.Score IS NOT NULL), 0.0) AS AverageCommentScore,
+        COUNT(DISTINCT C.UserId) AS UniqueCommenters,
+        (SELECT COALESCE(AP.Score, 0) FROM Posts AS AP WHERE AP.Id = P.AcceptedAnswerId) AS AcceptedAnswerScore,
+        MAX(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS HasDuplicateLink,
+        TRUE AS IsQuestionPost
+    FROM Posts AS P
+    INNER JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+    LEFT JOIN Users AS U_Owner ON P.OwnerUserId = U_Owner.Id
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+    LEFT JOIN Comments AS C ON P.Id = C.PostId
+    LEFT JOIN PostLinks AS PL ON P.Id = PL.PostId
+    WHERE P.PostTypeId = 1
+    GROUP BY P.Id, P.PostTypeId, PT.Name, P.CreationDate, P.LastEditDate, P.LastActivityDate, P.Score, P.ViewCount,
+             P.AnswerCount, P.CommentCount, P.FavoriteCount, P.OwnerUserId, U_Owner.DisplayName, U_Owner.Reputation,
+             P.Title, P.Tags, P.ClosedDate
+
+    UNION ALL
+
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        NULL AS ViewCount,
+        NULL AS PostAnswerCount,
+        COALESCE(P.CommentCount, 0) AS PostCommentCount,
+        COALESCE(P.FavoriteCount, 0) AS PostFavoriteCount,
+        P.OwnerUserId,
+        U_Owner.DisplayName AS OwnerDisplayName,
+        COALESCE(U_Owner.Reputation, 0) AS OwnerReputation,
+        NULL AS Title,
+        NULL AS Tags,
+        P.ClosedDate,
+        COUNT(DISTINCT PH.UserId) FILTER (WHERE PH.UserId IS NOT NULL AND PH.UserId != P.OwnerUserId) AS NumberOfOtherEditors,
+        EXTRACT(EPOCH FROM (P.LastEditDate - P.CreationDate)) / 3600 AS HoursToLastEdit,
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS RankInPostTypeByScore,
+        COALESCE(AVG(C.Score) FILTER (WHERE C.Score IS NOT NULL), 0.0) AS AverageCommentScore,
+        COUNT(DISTINCT C.UserId) AS UniqueCommenters,
+        (SELECT COALESCE(ParentP.Score, 0) FROM Posts AS ParentP WHERE ParentP.Id = P.ParentId AND ParentP.AcceptedAnswerId = P.Id) AS AcceptedAnswerScore,
+        0 AS HasDuplicateLink,
+        FALSE AS IsQuestionPost
+    FROM Posts AS P
+    INNER JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+    LEFT JOIN Users AS U_Owner ON P.OwnerUserId = U_Owner.Id
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+    LEFT JOIN Comments AS C ON P.Id = C.PostId
+    WHERE P.PostTypeId = 2
+    GROUP BY P.Id, P.PostTypeId, PT.Name, P.CreationDate, P.LastEditDate, P.LastActivityDate, P.Score, P.ViewCount,
+             P.AnswerCount, P.CommentCount, P.FavoriteCount, P.OwnerUserId, U_Owner.DisplayName, U_Owner.Reputation,
+             P.Title, P.Tags, P.ClosedDate
+),
+RecentHighActivityUsers AS (
+    SELECT
+        U.Id AS UserId,
+        COUNT(DISTINCT C.Id) AS RecentCommentCount,
+        COUNT(DISTINCT P.Id) AS RecentPostCount
+    FROM Users AS U
+    LEFT JOIN Comments AS C ON U.Id = C.UserId AND C.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days')
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId AND P.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days')
+    GROUP BY U.Id
+    HAVING COUNT(DISTINCT C.Id) >= 5 OR COUNT(DISTINCT P.Id) >= 2
+),
+PostTagAnalysis AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS TaggedPostCount,
+        AVG(p.Score) AS AvgScoreForTag,
+        MAX(p.CreationDate) AS LastPostWithTagDate,
+        MIN(p.CreationDate) AS FirstPostWithTagDate
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT TRIM(tag) AS TagName
+        FROM (
+            SELECT regexp_split_to_table(
+                substring(p.tags from 2 for char_length(p.tags) - 2),
+                '><'
+            ) AS tag
+        ) s
+    ) t
+    WHERE p.Tags IS NOT NULL AND p.Tags <> '><' AND p.PostTypeId = 1
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) >= 50
+)
+SELECT
+    UAS.UserId,
+    UAS.Reputation,
+    UAS.UserCreationDate,
+    UAS.DaysSinceCreationToLastAccess,
+    UAS.UserTotalPosts,
+    UAS.UserQuestionCount,
+    UAS.UserAnswerCount,
+    UAS.UserTotalPostScore,
+    UAS.UserAvgPostScore,
+    UAS.GoldBadges,
+    UAS.SilverBadges,
+    UAS.BronzeBadges,
+    PD.PostId,
+    PD.PostTypeName,
+    PD.PostCreationDate,
+    PD.PostScore,
+    COALESCE(PD.ViewCount, 0) AS PostViewCount,
+    PD.PostAnswerCount,
+    PD.PostCommentCount,
+    PD.PostFavoriteCount,
+    PD.NumberOfOtherEditors,
+    PD.HoursToLastEdit,
+    PD.RankInPostTypeByScore,
+    PD.AverageCommentScore,
+    PD.UniqueCommenters,
+    PD.AcceptedAnswerScore,
+    PD.HasDuplicateLink,
+    CASE WHEN PD.IsQuestionPost THEN LENGTH(PD.Title) ELSE 0 END AS TitleLength,
+    CASE WHEN PD.IsQuestionPost THEN SUBSTRING(PD.Title FROM 1 FOR 10) ELSE NULL END AS TitleStart,
+    CASE WHEN PD.IsQuestionPost THEN (LOWER(PD.Title) LIKE '%sql%' OR LOWER(PD.Title) LIKE '%database%') ELSE FALSE END AS IsSqlOrDatabaseTitle,
+    COALESCE(PD.PostScore * 1.0 / GREATEST(1, COALESCE(PD.ViewCount, 0)), 0.0) AS ScorePerViewRatio,
+    COALESCE(PD.PostAnswerCount * 1.0 / GREATEST(1, GREATEST(COALESCE(PD.PostCommentCount, 0), 1)), 0.0) AS AnswersPerCommentRatio,
+    CASE
+        WHEN PD.PostScore >= 50 AND COALESCE(PD.ViewCount, 0) >= 1000 THEN 'High Impact'
+        WHEN PD.PostScore >= 10 AND COALESCE(PD.ViewCount, 0) >= 100 THEN 'Medium Impact'
+        ELSE 'Low Impact'
+    END AS PostImpactCategory,
+    (RHAU.RecentCommentCount IS NOT NULL OR RHAU.RecentPostCount IS NOT NULL) AS IsRecentlyHighlyActiveUser,
+    COALESCE(RHAU.RecentCommentCount, 0) AS RecentCommentCount,
+    COALESCE(RHAU.RecentPostCount, 0) AS RecentPostCount,
+    (UAS.UserTotalPostScore + UAS.GoldBadges * 10 + UAS.SilverBadges * 5 + UAS.BronzeBadges * 1 + COALESCE(UAS.UserQuestionCount, 0) * 2 + COALESCE(UAS.UserAnswerCount, 0) * 3) AS UserEngagementScore,
+    CASE
+        WHEN PD.IsQuestionPost THEN (
+            SELECT STRING_AGG(TSA.TagName || ' (' || CAST(TSA.TaggedPostCount AS varchar) || ')', '; ')
+            FROM PostTagAnalysis AS TSA
+            WHERE PD.Tags LIKE '%' || '<' || TSA.TagName || '>' || '%'
+        )
+        ELSE NULL
+    END AS RelatedTagInfo,
+    (
+        SELECT AVG(COALESCE(U_Commenter.Reputation, 0))
+        FROM Comments AS C_Corr
+        JOIN Users AS U_Commenter ON C_Corr.UserId = U_Commenter.Id
+        WHERE C_Corr.PostId = PD.PostId
+    ) AS AvgCommenterReputation,
+    AVG(PD.PostScore) OVER (PARTITION BY PD.OwnerUserId, EXTRACT(YEAR FROM PD.PostCreationDate) ORDER BY PD.PostCreationDate) AS RunningAvgOwnerScoreByYear,
+    (PD.PostCreationDate - UAS.UserCreationDate) AS DaysSinceOwnerFirstPostToCurrentPost
+FROM UserActivitySummary AS UAS
+LEFT JOIN PostDetailsAndEngagement AS PD ON UAS.UserId = PD.OwnerUserId
+LEFT JOIN RecentHighActivityUsers AS RHAU ON UAS.UserId = RHAU.UserId
+WHERE
+    UAS.Reputation > 1000
+    AND PD.PostId IS NOT NULL
+    AND PD.PostScore > 0
+    AND (
+        (PD.PostTypeName = 'Question' AND PD.PostAnswerCount > 0 AND PD.AcceptedAnswerScore > 0)
+        OR (PD.PostTypeName = 'Answer' AND PD.AcceptedAnswerScore > 0)
+    )
+    AND PD.PostCreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years')
+GROUP BY
+    UAS.UserId,
+    UAS.Reputation,
+    UAS.UserCreationDate,
+    UAS.DaysSinceCreationToLastAccess,
+    UAS.UserTotalPosts,
+    UAS.UserQuestionCount,
+    UAS.UserAnswerCount,
+    UAS.UserTotalPostScore,
+    UAS.UserAvgPostScore,
+    UAS.GoldBadges,
+    UAS.SilverBadges,
+    UAS.BronzeBadges,
+    PD.PostId,
+    PD.PostTypeName,
+    PD.PostCreationDate,
+    PD.PostScore,
+    PD.ViewCount,
+    PD.PostAnswerCount,
+    PD.PostCommentCount,
+    PD.PostFavoriteCount,
+    PD.NumberOfOtherEditors,
+    PD.HoursToLastEdit,
+    PD.RankInPostTypeByScore,
+    PD.AverageCommentScore,
+    PD.UniqueCommenters,
+    PD.AcceptedAnswerScore,
+    PD.HasDuplicateLink,
+    PD.IsQuestionPost,
+    PD.Title,
+    PD.Tags,
+    PD.OwnerUserId,
+    RHAU.RecentCommentCount,
+    RHAU.RecentPostCount
+ORDER BY
+    UAS.Reputation DESC,
+    PD.PostScore DESC,
+    PD.PostCreationDate DESC
+LIMIT 1000;

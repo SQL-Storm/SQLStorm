@@ -1,0 +1,111 @@
+-- {"query": "4692.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1272} 
+
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_desc,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS rn_score_desc,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS avg_score_per_type,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS previous_post_score
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+),
+UserPostActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN rp.PostTypeId = 1 THEN rp.PostId ELSE NULL END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN rp.PostTypeId = 2 THEN rp.PostId ELSE NULL END) AS AnswerCount,
+        SUM(rp.PostScore) AS TotalScoreReceived,
+        AVG(rp.PostScore) AS AvgScorePerPost,
+        MAX(rp.PostCreationDate) AS LastPostDate,
+        COUNT(CASE WHEN rp.ClosedDate IS NOT NULL THEN rp.PostId ELSE NULL END) AS ClosedPostCount,
+        SUM(CASE WHEN rp.AnswerCount > 0 THEN 1 ELSE 0 END) AS PostsWithAnswers
+    FROM Users u
+    LEFT JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+CommentAnalysis AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCountOnPost,
+        SUM(c.Score) AS TotalCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    GROUP BY c.PostId
+),
+PostWithCommentData AS (
+    SELECT
+        rp.*,
+        ca.CommentCountOnPost,
+        ca.TotalCommentScore,
+        ca.LastCommentDate
+    FROM RankedPosts rp
+    LEFT JOIN CommentAnalysis ca ON rp.PostId = ca.PostId
+),
+PostLinkMetrics AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 1
+    GROUP BY pl.PostId
+)
+SELECT
+    upa.UserId,
+    upa.DisplayName,
+    upa.Reputation,
+    upa.QuestionCount,
+    upa.AnswerCount,
+    upa.TotalScoreReceived,
+    upa.AvgScorePerPost,
+    upa.LastPostDate,
+    upa.ClosedPostCount,
+    upa.PostsWithAnswers,
+    MAX(pwpcd.PostScore) AS MaxPostScoreByThisUser,
+    MIN(pwpcd.PostScore) AS MinPostScoreByThisUser,
+    AVG(pwpcd.CommentCountOnPost) AS AvgCommentCountOnUserPosts,
+    SUM(pwpcd.CommentCountOnPost) AS TotalCommentsOnUserPosts,
+    COUNT(DISTINCT CASE WHEN pwpcd.PostTypeId = 1 AND pwpcd.ClosedDate IS NOT NULL THEN pwpcd.PostId ELSE NULL END) AS ClosedQuestions,
+    COUNT(DISTINCT CASE WHEN pwpcd.PostTypeId = 1 AND pwpcd.AnswerCount > 5 THEN pwpcd.PostId ELSE NULL END) AS QuestionsWithManyAnswers,
+    SUM(CASE WHEN pwpcd.PostTypeName LIKE '%Wiki%' THEN 1 ELSE 0 END) AS WikiPostCount,
+    AVG(pwpcd.TotalCommentScore) AS AvgCommentScoreOnUserPosts,
+    (upa.Reputation * 1.0 / NULLIF(upa.QuestionCount + upa.AnswerCount, 0)) AS ReputationPerPostRatio,
+    CASE
+        WHEN upa.LastPostDate > DATE('now', '-30 day') THEN 'Active Recently'
+        WHEN upa.LastPostDate > DATE('now', '-180 day') THEN 'Moderately Active'
+        ELSE 'Less Active'
+    END AS ActivityLevel,
+    COALESCE(plm.LinkCount, 0) AS OutgoingLinkCount
+FROM UserPostActivity upa
+LEFT JOIN PostWithCommentData pwpcd ON upa.UserId = pwpcd.OwnerUserId
+LEFT JOIN PostLinkMetrics plm ON upa.UserId = plm.PostId
+WHERE upa.Reputation > 100
+GROUP BY
+    upa.UserId,
+    upa.DisplayName,
+    upa.Reputation,
+    upa.QuestionCount,
+    upa.AnswerCount,
+    upa.TotalScoreReceived,
+    upa.AvgScorePerPost,
+    upa.LastPostDate,
+    upa.ClosedPostCount,
+    upa.PostsWithAnswers,
+    plm.LinkCount
+HAVING
+    COUNT(pwpcd.PostId) > 0 OR upa.UserId IS NOT NULL
+ORDER BY
+    upa.Reputation DESC, upa.TotalScoreReceived DESC
+LIMIT 100;

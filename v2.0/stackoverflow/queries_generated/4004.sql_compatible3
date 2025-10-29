@@ -1,0 +1,215 @@
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ViewCount,
+      p.ClosedDate,
+      pt.Name AS PostTypeName,
+      CASE
+        WHEN p.Title IS NOT NULL THEN LENGTH(p.Title)
+        ELSE 0
+      END AS TitleLength,
+      CASE
+        WHEN p.Tags IS NOT NULL THEN (LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', ''))) + 1
+        ELSE 0
+      END AS TagCount,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.CreationDate > TIMESTAMP '2023-01-01'
+  ),
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT p.Id) AS PostsCreated,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+      COUNT(DISTINCT c.Id) AS CommentsMade,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c
+      ON u.Id = c.UserId
+    LEFT JOIN Votes v
+      ON u.Id = v.UserId
+    WHERE
+      u.Id <> -1
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  PostAnalysis AS (
+    SELECT
+      rp.PostId,
+      rp.PostTypeName,
+      rp.Score,
+      rp.AnswerCount,
+      rp.CommentCount,
+      rp.FavoriteCount,
+      rp.ViewCount,
+      rp.TitleLength,
+      rp.TagCount,
+      CAST((EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - rp.CreationDate)) / 86400) AS INTEGER) AS DaysSinceCreation,
+      CASE
+        WHEN rp.ClosedDate IS NOT NULL THEN CAST((EXTRACT(EPOCH FROM (rp.ClosedDate - rp.CreationDate)) / 86400) AS INTEGER)
+        ELSE NULL
+      END AS DaysToClose,
+      ue.DisplayName AS OwnerDisplayName,
+      ue.Reputation AS OwnerReputation,
+      ue.UserCreationDate,
+      CASE
+        WHEN rp.Score > 0 AND rp.AnswerCount > 0 THEN CAST(rp.Score AS DOUBLE PRECISION) / rp.AnswerCount
+        WHEN rp.Score > 0 THEN CAST(rp.Score AS DOUBLE PRECISION)
+        ELSE 0
+      END AS ScorePerAnswer,
+      CASE
+        WHEN rp.ViewCount > 0 AND rp.AnswerCount > 0 THEN CAST(rp.ViewCount AS DOUBLE PRECISION) / rp.AnswerCount
+        WHEN rp.ViewCount > 0 THEN CAST(rp.ViewCount AS DOUBLE PRECISION)
+        ELSE 0
+      END AS ViewsPerAnswer,
+      CASE
+        WHEN rp.CommentCount > 0 THEN 'Has Comments'
+        ELSE 'No Comments'
+      END AS CommentStatus,
+      CASE
+        WHEN rp.Score > 100 THEN 'High Score'
+        WHEN rp.Score > 10 THEN 'Medium Score'
+        ELSE 'Low Score'
+      END AS ScoreBracket,
+      CASE
+        WHEN ue.LastPostDate IS NOT NULL AND CAST((EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - ue.LastPostDate)) / 86400) AS INTEGER) < 30 THEN 'Active User'
+        ELSE 'Inactive User'
+      END AS UserActivityStatus,
+      COALESCE(rp.FavoriteCount, 0) AS NonNullFavoriteCount,
+      (
+        SELECT
+          MAX(ph.CreationDate)
+        FROM PostHistory ph
+        WHERE
+          ph.PostId = rp.PostId AND ph.PostHistoryTypeId BETWEEN 4 AND 9
+      ) AS LastEditDate,
+      rp.CreationDate
+    FROM RankedPosts rp
+    JOIN UserEngagement ue
+      ON rp.OwnerUserId = ue.UserId
+    WHERE
+      rp.rn <= 100
+  )
+SELECT
+  pa.PostId,
+  pa.PostTypeName,
+  pa.Score,
+  pa.AnswerCount,
+  pa.CommentCount,
+  pa.FavoriteCount,
+  pa.ViewCount,
+  pa.TitleLength,
+  pa.TagCount,
+  pa.DaysSinceCreation,
+  pa.DaysToClose,
+  pa.OwnerDisplayName,
+  pa.OwnerReputation,
+  pa.UserCreationDate,
+  pa.ScorePerAnswer,
+  pa.ViewsPerAnswer,
+  pa.CommentStatus,
+  pa.ScoreBracket,
+  pa.UserActivityStatus,
+  pa.NonNullFavoriteCount,
+  pa.LastEditDate,
+  AVG(pa.Score) OVER (
+    PARTITION BY pa.PostTypeName
+    ORDER BY pa.CreationDate
+    RANGE BETWEEN 365 PRECEDING AND CURRENT ROW
+  ) AS AvgScoreLastYearForType,
+  CASE
+    WHEN pa.Score > 500 THEN 'Elite Post'
+    ELSE 'Standard Post'
+  END AS PostTier,
+  pa.CreationDate
+FROM PostAnalysis pa
+UNION ALL
+SELECT
+  rp.Id AS PostId,
+  pt.Name AS PostTypeName,
+  rp.Score,
+  rp.AnswerCount,
+  rp.CommentCount,
+  rp.FavoriteCount,
+  rp.ViewCount,
+  CASE
+    WHEN rp.Title IS NOT NULL THEN LENGTH(rp.Title)
+    ELSE 0
+  END AS TitleLength,
+  CASE
+    WHEN rp.Tags IS NOT NULL THEN (LENGTH(rp.Tags) - LENGTH(REPLACE(rp.Tags, '><', ''))) + 1
+    ELSE 0
+  END AS TagCount,
+  CAST((EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - rp.CreationDate)) / 86400) AS INTEGER) AS DaysSinceCreation,
+  CASE
+    WHEN rp.ClosedDate IS NOT NULL THEN CAST((EXTRACT(EPOCH FROM (rp.ClosedDate - rp.CreationDate)) / 86400) AS INTEGER)
+    ELSE NULL
+  END AS DaysToClose,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation,
+  u.CreationDate AS UserCreationDate,
+  CASE
+    WHEN rp.Score > 0 AND rp.AnswerCount > 0 THEN CAST(rp.Score AS DOUBLE PRECISION) / rp.AnswerCount
+    WHEN rp.Score > 0 THEN CAST(rp.Score AS DOUBLE PRECISION)
+    ELSE 0
+  END AS ScorePerAnswer,
+  CASE
+    WHEN rp.ViewCount > 0 AND rp.AnswerCount > 0 THEN CAST(rp.ViewCount AS DOUBLE PRECISION) / rp.AnswerCount
+    WHEN rp.ViewCount > 0 THEN CAST(rp.ViewCount AS DOUBLE PRECISION)
+    ELSE 0
+  END AS ViewsPerAnswer,
+  CASE
+    WHEN rp.CommentCount > 0 THEN 'Has Comments'
+    ELSE 'No Comments'
+  END AS CommentStatus,
+  CASE
+    WHEN rp.Score > 100 THEN 'High Score'
+    WHEN rp.Score > 10 THEN 'Medium Score'
+    ELSE 'Low Score'
+  END AS ScoreBracket,
+  CASE
+    WHEN u.LastAccessDate IS NOT NULL AND CAST((EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.LastAccessDate)) / 86400) AS INTEGER) < 90 THEN 'Active User'
+    ELSE 'Inactive User'
+  END AS UserActivityStatus,
+  COALESCE(rp.FavoriteCount, 0) AS NonNullFavoriteCount,
+  (
+    SELECT
+      MAX(ph.CreationDate)
+    FROM PostHistory ph
+    WHERE
+      ph.PostId = rp.Id AND ph.PostHistoryTypeId BETWEEN 4 AND 9
+  ) AS LastEditDate,
+  NULL AS AvgScoreLastYearForType,
+  'Historical Elite Post' AS PostTier,
+  rp.CreationDate
+FROM Posts rp
+JOIN PostTypes pt
+  ON rp.PostTypeId = pt.Id
+LEFT JOIN Users u
+  ON rp.OwnerUserId = u.Id
+WHERE
+  rp.Score > 1000 AND rp.CreationDate < TIMESTAMP '2010-01-01'
+ORDER BY
+  Score DESC;

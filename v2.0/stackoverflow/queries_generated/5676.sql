@@ -1,0 +1,122 @@
+-- {"query": "5676.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 991} 
+WITH top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    COALESCE(SUM(v.BountyAmount), 0) AS TotalBounty
+  FROM Users u
+  LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId = 8
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+    u.Location, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+recent_badges AS (
+  SELECT
+    b.UserId,
+    b.Name AS BadgeName,
+    b.Date,
+    b.Class,
+    b.TagBased
+  FROM Badges b
+  WHERE b.Date >= date('2023-01-01')
+),
+popular_posts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.Tags,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2)
+),
+post_history_summary AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.Comment,
+    ph.Text,
+    ph.RevisionGUID,
+    ph.ContentLicense
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10,11,16,24,50) -- notable history events
+),
+linked_posts AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkTypeName
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  WHERE lt.Id IN (1,3)
+),
+recent_comments AS (
+  SELECT
+    c.PostId,
+    c.Id AS CommentId,
+    c.UserId,
+    c.Text,
+    c.CreationDate
+  FROM Comments c
+  WHERE c.CreationDate >= date('2024-01-01')
+),
+complex_mask AS (
+  SELECT
+    up.UserId,
+    up.DisplayName,
+    up.Reputation,
+    up.TotalBounty,
+    rb.BadgeName
+  FROM top_users up
+  LEFT JOIN recent_badges rb ON rb.UserId = up.UserId
+  WHERE up.Reputation > 10000
+)
+SELECT
+  cu.UserId,
+  cu.DisplayName,
+  cu.Reputation,
+  cu.TotalBounty,
+  cu.Location,
+  SUM(CASE WHEN pp.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+  SUM(CASE WHEN pp.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+  MAX(pp.Score) AS MaxScore,
+  MAX(pp.ViewCount) AS MaxViews,
+  MAX(pp.LastActivityDate) AS LastActive,
+  ARRAY_AGG(DISTINCT tp.TagName) FILTER (WHERE tp.TagName IS NOT NULL) AS TagsUsed,
+  (SELECT COUNT(*) FROM recent_comments rc WHERE rc.UserId = cu.UserId) AS RecentCommentsByUser,
+  (SELECT COUNT(*) FROM post_history_summary phs WHERE phs.UserId = cu.UserId) AS HistoryEventsByUser,
+  (SELECT json_agg(JSON_BUILD_OBJECT('RelatedPost', lp.RelatedPostId, 'LinkType', lp.LinkTypeName))
+     FROM linked_posts lp
+     WHERE lp.PostId IN (
+       SELECT p.Id FROM popular_posts p WHERE p.OwnerUserId = cu.UserId
+     )
+  ) AS LinkedPostsInfo,
+  (SELECT json_agg(JSON_BUILD_OBJECT('Comment', rc.Text, 'Date', rc.CreationDate))
+     FROM recent_comments rc
+     WHERE rc.PostId IN (SELECT Id FROM popular_posts WHERE OwnerUserId = cu.UserId)
+  ) AS RecentComments
+FROM complex_mask cu
+LEFT JOIN popular_posts pp ON pp.OwnerUserId = cu.UserId
+LEFT JOIN Posts p ON p.Id = pp.Id
+LEFT JOIN Tags t ON t.Id = p.Tags::int
+LEFT JOIN (SELECT DISTINCT TagName FROM Tags) tp ON TRUE
+GROUP BY cu.UserId, cu.DisplayName, cu.Reputation, cu.TotalBounty, cu.Location
+ORDER BY cu.Reputation DESC, cu.TotalBounty DESC
+LIMIT 100;

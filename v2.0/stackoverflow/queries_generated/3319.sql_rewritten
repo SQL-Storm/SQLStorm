@@ -1,0 +1,115 @@
+-- {"query": "3319.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1925} 
+WITH UserPosts AS (
+    SELECT 
+        u.Id                                           AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)    AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)    AS AnswerCount,
+        COALESCE(SUM(p.Score),0)                       AS TotalScore,
+        MIN(p.CreationDate)                           AS FirstPostDate,
+        MAX(p.CreationDate)                           AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p
+           ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                      AS BadgeCount,
+        MAX(CASE WHEN b.Class = 1 THEN b.Date END)   AS LastGoldDate,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+UserTagUsage AS (
+    SELECT 
+        up.UserId,
+        UNNEST( STRING_TO_ARRAY( SUBSTRING(p.Tags,2,LENGTH(p.Tags)-2) , '><' ) ) AS Tag
+    FROM UserPosts up
+    JOIN Posts p
+         ON p.OwnerUserId = up.UserId
+        AND p.PostTypeId = 1
+        AND p.Tags IS NOT NULL
+),
+
+TagStats AS (
+    SELECT 
+        ut.UserId,
+        COUNT(*)                                          AS TagUseCount,
+        STRING_AGG(DISTINCT t.TagName, ', ') FILTER (WHERE t.Count > 1000) AS PopularTags
+    FROM UserTagUsage ut
+    LEFT JOIN Tags t
+           ON t.TagName = ut.Tag
+    GROUP BY ut.UserId
+),
+
+Combined AS (
+    SELECT 
+        up.UserId,
+        up.DisplayName,
+        up.Reputation,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.TotalScore,
+        up.FirstPostDate,
+        up.LastPostDate,
+        COALESCE(ub.BadgeCount,0)                         AS BadgeCount,
+        ub.LastGoldDate,
+        ub.BronzeBadges,
+        COALESCE(ts.TagUseCount,0)                        AS TagUseCount,
+        ts.PopularTags
+    FROM UserPosts up
+    LEFT JOIN UserBadges ub ON ub.UserId = up.UserId
+    LEFT JOIN TagStats   ts ON ts.UserId = up.UserId
+)
+
+SELECT
+    c.UserId,
+    c.DisplayName,
+    c.Reputation,
+    c.QuestionCount,
+    c.AnswerCount,
+    c.TotalScore,
+    c.BadgeCount,
+    CASE 
+        WHEN c.LastGoldDate IS NULL THEN 'Never' 
+        ELSE TO_CHAR(c.LastGoldDate,'YYYY-MM-DD') 
+    END                                          AS LastGoldBadge,
+    c.PopularTags,
+    ROW_NUMBER() OVER (ORDER BY c.Reputation DESC, c.TotalScore DESC) AS ReputationRank,
+    PERCENT_RANK() OVER (ORDER BY c.TotalScore)                         AS ScorePercentile,
+    (SELECT COUNT(*) 
+       FROM Posts p2 
+      WHERE p2.OwnerUserId = c.UserId AND p2.Score > 0)                 AS PositiveScorePosts,
+    (SELECT COUNT(*) 
+       FROM Votes v 
+      WHERE v.UserId = c.UserId AND v.VoteTypeId = 2)                    AS UpVotesGiven
+FROM Combined c
+WHERE c.Reputation > 1000
+  AND (c.QuestionCount + c.AnswerCount) > 10
+  AND (c.TagUseCount = 0 OR c.TagUseCount > 5)
+ORDER BY c.Reputation DESC
+LIMIT 10
+
+UNION ALL
+
+SELECT
+    NULL                      AS UserId,
+    'Aggregates'              AS DisplayName,
+    NULL                      AS Reputation,
+    SUM(c.QuestionCount)      AS QuestionCount,
+    SUM(c.AnswerCount)        AS AnswerCount,
+    SUM(c.TotalScore)         AS TotalScore,
+    SUM(c.BadgeCount)         AS BadgeCount,
+    NULL                      AS LastGoldBadge,
+    NULL                      AS PopularTags,
+    NULL                      AS ReputationRank,
+    NULL                      AS ScorePercentile,
+    NULL                      AS PositiveScorePosts,
+    NULL                      AS UpVotesGiven
+FROM Combined c
+WHERE c.Reputation > 1000;

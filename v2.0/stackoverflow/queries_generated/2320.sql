@@ -1,0 +1,198 @@
+-- {"query": "2320.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1771} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+  UNION ALL
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        rh.TagPath || child.TagName
+    FROM Tags child
+    JOIN PostLinks pl ON pl.PostId = child.ExcerptPostId
+    JOIN RecursiveTagHierarchy rh ON rh.Id = pl.RelatedPostId
+    WHERE child.TagName IS NOT NULL AND child.Id != rh.Id AND array_position(rh.TagPath, child.TagName) IS NULL
+),
+UserBadgesRanked AS (
+    SELECT
+        b.UserId,
+        b.Name,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Class, b.Date) AS BadgeRank
+    FROM Badges b
+    WHERE b.Class IN (1,2,3) AND b.Date >= NOW() - INTERVAL '1 year'
+),
+TopBadgesPerUser AS (
+    SELECT UserId, Name, Class FROM UserBadgesRanked WHERE BadgeRank <= 3
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionsCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswersCount,
+        COALESCE(SUM(p.Score),0) AS TotalPostScore,
+        COALESCE(SUM(vt.UpVotes),0) AS TotalUpVotes,
+        COALESCE(SUM(vt.DownVotes),0) AS TotalDownVotes,
+        EXTRACT(EPOCH FROM (NOW() - u.CreationDate)) / 86400::float AS DaysSinceCreation,
+        CASE 
+          WHEN EXTRACT(EPOCH FROM (NOW() - u.LastAccessDate)) / 86400::float > 365 THEN 'Inactive'
+          WHEN EXTRACT(EPOCH FROM (NOW() - u.LastAccessDate)) / 86400::float BETWEEN 30 AND 365 THEN 'Semi-active'
+          ELSE 'Active'
+        END AS ActivityStatus
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            v.UserId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        WHERE v.UserId IS NOT NULL
+        GROUP BY v.UserId
+    ) vt ON vt.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.CreationDate, u.LastAccessDate
+),
+PostCloseReasons AS (
+    SELECT 
+        p.Id AS PostId,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS ClosedDate
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10 -- Post Closed
+    JOIN CloseReasonTypes crt ON crt.Id = ph.Comment::int
+),
+PostStats AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        pru.DisplayName AS OwnerName,
+        COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id), 0) AS CommentCount,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2), 0) AS UpVotes,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3), 0) AS DownVotes,
+        COALESCE(pl.LinkCount,0) AS LinkOutCount,
+        p.ClosedDate IS NOT NULL AS IsClosed,
+        p.ClosedDate
+    FROM Posts p
+    LEFT JOIN Users pru ON pru.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS LinkCount
+        FROM PostLinks
+        GROUP BY PostId
+    ) pl ON pl.PostId = p.Id
+),
+TopQuestionsWithAnswers AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        q.Tags,
+        q.OwnerName,
+        q.AcceptedAnswerId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        a.OwnerName AS AnswerOwner,
+        a.CommentCount AS AnswerComments,
+        RANK() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM PostStats q
+    LEFT JOIN PostStats a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+        AND q.IsClosed = false
+),
+RankedAnswers AS (
+    SELECT * FROM TopQuestionsWithAnswers WHERE AnswerRank <= 3
+),
+ComplexUserSelection AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsCount,
+        ua.AnswersCount,
+        ua.TotalPostScore,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ua.ActivityStatus,
+        COALESCE(tb.Name,'No Badge') AS TopBadgeName,
+        COALESCE(tb.Class, 4) AS TopBadgeClass
+    FROM UserActivity ua
+    LEFT JOIN (
+        SELECT DISTINCT ON (UserId) UserId, Name, Class
+        FROM TopBadgesPerUser
+        ORDER BY UserId, Class ASC, Name ASC
+    ) tb ON tb.UserId = ua.UserId
+    WHERE ua.TotalPostScore > 10 AND ua.DaysSinceCreation > 30
+),
+FinalResult AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.QuestionDate,
+        q.QuestionScore,
+        q.QuestionViews,
+        q.Tags,
+        q.OwnerName AS QuestionOwner,
+        a.AnswerId,
+        a.AnswerScore,
+        a.AnswerDate,
+        a.AnswerOwner,
+        a.AnswerComments,
+        cus.DisplayName AS TopUser,
+        cus.TopBadgeName,
+        cus.TopBadgeClass,
+        cus.ActivityStatus,
+        COALESCE(pcr.CloseReason, 'Open') AS PostCloseReason
+    FROM RankedAnswers a
+    JOIN PostStats q ON q.Id = a.QuestionId
+    LEFT JOIN ComplexUserSelection cus ON cus.DisplayName = a.AnswerOwner
+    LEFT JOIN PostCloseReasons pcr ON pcr.PostId = q.Id
+    WHERE (a.AnswerScore > q.QuestionScore/2 OR a.AnswerId = q.AcceptedAnswerId)
+)
+SELECT
+    fr.QuestionId,
+    LEFT(fr.Title, 120) || CASE WHEN LENGTH(fr.Title) > 120 THEN '...' ELSE '' END AS ShortTitle,
+    fr.QuestionDate,
+    fr.QuestionScore,
+    fr.QuestionViews,
+    fr.Tags,
+    fr.QuestionOwner,
+    fr.AnswerId,
+    fr.AnswerScore,
+    fr.AnswerDate,
+    fr.AnswerOwner,
+    fr.AnswerComments,
+    fr.TopUser,
+    fr.TopBadgeName,
+    CASE fr.TopBadgeClass
+        WHEN 1 THEN 'Gold'
+        WHEN 2 THEN 'Silver'
+        WHEN 3 THEN 'Bronze'
+        ELSE 'None'
+    END AS TopBadgeClassName,
+    fr.ActivityStatus,
+    fr.PostCloseReason,
+    CASE
+        WHEN fr.PostCloseReason <> 'Open' THEN 'Closed Post'
+        WHEN fr.AnswerScore > fr.QuestionScore THEN 'Popular Answer'
+        ELSE 'Normal'
+    END AS PostEvaluation,
+    CONCAT('Tags: ', COALESCE(fr.Tags, '<none>')) AS TagSummary
+FROM FinalResult fr
+WHERE fr.QuestionDate > NOW() - INTERVAL '6 months'
+ORDER BY fr.QuestionScore DESC, fr.AnswerScore DESC, fr.QuestionDate DESC
+LIMIT 50;

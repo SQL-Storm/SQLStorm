@@ -1,0 +1,191 @@
+with recursive TagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        cast(cast(t.TagName as varchar(1000)) as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        th.Level + 1,
+        th.Path || ' > ' || t.TagName
+    from Tags t
+    join TagHierarchy th on t.Id = (
+        select cast(unnested as integer)
+        from (
+            select unnest(string_to_array(t.TagName, '_')) as unnested
+        ) subquery
+        order by cast(unnested as integer)
+        limit 1
+    )
+    where th.Level < 3
+),
+UserEngagement as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(count(distinct p.Id) filter (where p.PostTypeId = 1),0) as QuestionsAsked,
+        coalesce(count(distinct p2.Id) filter (where p2.PostTypeId = 2),0) as AnswersGiven,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as UpVotesReceived,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as DownVotesReceived,
+        max(p.LastActivityDate) as LastActivity,
+        bool_or(b.Class = 1) as HasGoldBadge
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts p2 on p2.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id or v.PostId = p2.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+AnswerWithParentQuestion as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        q.Title as QuestionTitle,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        q.Score as QuestionScore,
+        u.DisplayName as AnswererName,
+        (
+            select count(*)
+            from Comments c
+            where c.PostId = a.Id and c.Score > 1
+        ) as HighScoreCommentsCount,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    join Posts q on q.Id = a.ParentId
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+FilteredPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        ph.CreationDate as LastClosedDate,
+        crt.Name as CloseReasonName,
+        row_number() over (partition by p.Id order by ph.CreationDate desc) as CloseEventRank
+    from Posts p
+    left join PostHistory ph 
+        on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on cast(crt.Id as varchar) = ph.Comment
+    where p.PostTypeId = 1
+),
+CloseReasonsSummary as (
+    select
+        CloseReasonName,
+        count(*) as ClosedQuestionsCount,
+        avg(Score) as AvgScoreClosedQuestions,
+        max(ViewCount) as MaxViewCountClosedQuestions
+    from FilteredPosts
+    where CloseEventRank = 1
+    group by CloseReasonName
+),
+CombinedSet as (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.QuestionsAsked,
+        u.AnswersGiven,
+        u.UpVotesReceived,
+        u.DownVotesReceived,
+        u.HasGoldBadge,
+        lag(u.Reputation) over (order by u.Reputation desc) as PrevRep,
+        lead(u.Reputation) over (order by u.Reputation desc) as NextRep,
+        (cast(u.UpVotesReceived as numeric) / nullif(u.UpVotesReceived + u.DownVotesReceived,0)) as UpVoteRatio,
+        (select count(*) from Badges b where b.UserId = u.UserId and b.Class = 1) as GoldBadgesCount,
+        coalesce((select count(*) from Posts p where p.OwnerUserId = u.UserId and p.PostTypeId=1 and p.CreationDate > (cast('2024-10-01' as date) - interval '1 year')),0) as RecentQuestions
+    from UserEngagement u
+    where u.Reputation > 1000
+),
+AnnotatedAnswers as (
+    select
+        a.AnswerId,
+        a.QuestionId,
+        a.QuestionTitle,
+        a.AnswerScore,
+        a.AnswerDate,
+        a.QuestionScore,
+        a.AnswererName,
+        a.HighScoreCommentsCount,
+        a.AnswerRank,
+        case 
+            when a.AnswerRank = 1 and a.AnswerScore > 10 then 'Top and Popular'
+            when a.AnswerRank > 1 and a.AnswerScore > 5 then 'Popular but not Top'
+            else 'Regular'
+        end as AnswerCategory
+    from AnswerWithParentQuestion a
+),
+FinalOutput as (
+    select
+        c.UserId,
+        c.DisplayName,
+        c.Reputation,
+        c.QuestionsAsked,
+        c.AnswersGiven,
+        c.UpVotesReceived,
+        c.DownVotesReceived,
+        c.HasGoldBadge,
+        c.GoldBadgesCount,
+        c.RecentQuestions,
+        avg(a.AnswerScore) filter (where a.AnswerCategory = 'Top and Popular') as AvgTopPopularAnswerScore,
+        max(a.HighScoreCommentsCount) filter (where a.AnswerCategory = 'Top and Popular') as MaxTopPopularComments,
+        cr.CloseReasonName,
+        cr.ClosedQuestionsCount,
+        cr.AvgScoreClosedQuestions,
+        cr.MaxViewCountClosedQuestions
+    from CombinedSet c
+    left join AnnotatedAnswers a on a.AnswererName = c.DisplayName
+    left join FilteredPosts fp on fp.OwnerUserId = c.UserId and fp.CloseEventRank = 1
+    left join CloseReasonsSummary cr on cr.CloseReasonName = fp.CloseReasonName
+    group by 
+        c.UserId,
+        c.DisplayName,
+        c.Reputation,
+        c.QuestionsAsked,
+        c.AnswersGiven,
+        c.UpVotesReceived,
+        c.DownVotesReceived,
+        c.HasGoldBadge,
+        c.GoldBadgesCount,
+        c.RecentQuestions,
+        cr.CloseReasonName,
+        cr.ClosedQuestionsCount,
+        cr.AvgScoreClosedQuestions,
+        cr.MaxViewCountClosedQuestions
+)
+select
+    UserId,
+    DisplayName,
+    Reputation,
+    QuestionsAsked,
+    AnswersGiven,
+    UpVotesReceived,
+    DownVotesReceived,
+    HasGoldBadge,
+    GoldBadgesCount,
+    RecentQuestions,
+    coalesce(AvgTopPopularAnswerScore,0) as AvgTopPopularAnswerScore,
+    coalesce(MaxTopPopularComments,0) as MaxTopPopularComments,
+    CloseReasonName,
+    ClosedQuestionsCount,
+    AvgScoreClosedQuestions,
+    MaxViewCountClosedQuestions
+from FinalOutput
+where (coalesce(AvgTopPopularAnswerScore,0) > 5 or CloseReasonName is not null)
+order by Reputation desc, ClosedQuestionsCount desc
+limit 100;

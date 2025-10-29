@@ -131,24 +131,27 @@ def complexity(r: Result):
             if r.attributes[k] > l:
                 comp = max(comp, c + 1)
 
-    tree = r.tree
-
-    for op in tree.values():
-        comp = map_complexity(op.label, complexity_operators, "operator", comp)
+    for op in r.tree.values():
+        op_comp = 0
+        op_comp = map_complexity(op.label, complexity_operators, "operator", op_comp)
         count(op.label, operator_counts, r.query)
 
         if op.label == "Join" or op.label == "GroupJoin":
             join_type = op.attributes.split("|")[1]
-            comp = map_complexity(join_type, complexity_join_type, "join type", comp)
+            op_comp = map_complexity(join_type, complexity_join_type, "join type", op_comp)
             count(join_type, join_type_counts, r.query)
 
         for exp in op.expression_list:
             category = get_expression_category(exp.label)
-            comp = map_complexity(category, complexity_expression_categories, "expression category", comp)
+            op_comp = map_complexity(category, complexity_expression_categories, "expression category", op_comp)
             count(category, expression_category_counts, r.query)
 
-            comp = map_complexity(normalize_type(exp.type), complexity_types, "expression type", comp)
+            op_comp = map_complexity(normalize_type(exp.type), complexity_types, "expression type", op_comp)
             count(normalize_type(exp.type), type_counts, r.query)
+
+        comp = max(comp, op_comp)
+        # Add complexity attribute to operator
+        op.complexity = complexity_classes[op_comp]
 
     return complexity_classes[comp]
 
@@ -205,7 +208,7 @@ def compute(result_file, output_file):
                                 "scans", "joins", "aggregations", "sorts", "windows", "iterations", "distinct_trees", "distinct_operators", "complexity"])
         writer.writeheader()
 
-        writer_operators = csv.DictWriter(csvfile_operators, fieldnames=["query", "operator", "attributes"])
+        writer_operators = csv.DictWriter(csvfile_operators, fieldnames=["query", "operator", "attributes", "complexity"])
         writer_operators.writeheader()
 
         writer_expressions = csv.DictWriter(csvfile_expressions, fieldnames=["query", "expression", "category", "type", "attributes"])
@@ -218,7 +221,7 @@ def compute(result_file, output_file):
 
                 for op in queries[q].tree.values():
                     # Ensure JSON serialization won't fail on unexpected objects by falling back to str
-                    writer_operators.writerow({"query": q, "operator": op.label, "attributes": op.attributes})
+                    writer_operators.writerow({"query": q, "operator": op.label, "attributes": op.attributes, "complexity": op.complexity})
 
                     for exp in op.expression_list:
                         category = get_expression_category(exp.label)

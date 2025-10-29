@@ -1,0 +1,43 @@
+-- {"query": "5027.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 404} 
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS PostCount,
+  SUM(p.Score) AS TotalScore,
+  AVG(p.ViewCount) AS AvgViewsPerPost,
+  MAX(p.LastActivityDate) AS LastActivity,
+  STRING_AGG(DISTINCT t.Name, ',') AS Tagset,
+  COALESCE(b.GoldCount, 0) AS GoldBadges,
+  COALESCE(b.SilverCount, 0) AS SilverBadges,
+  COALESCE(b.BronzeCount, 0) AS BronzeBadges
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT
+      pb.UserId,
+      SUM(CASE WHEN pb.Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+      SUM(CASE WHEN pb.Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+      SUM(CASE WHEN pb.Class = 3 THEN 1 ELSE 0 END) AS BronzeCount
+    FROM Badges pb
+    GROUP BY pb.UserId
+  ) b ON b.UserId = u.Id
+  LEFT JOIN UNNEST(
+    STRING_TO_ARRAY(
+      COALESCE(p.Tags, ''), '><'
+    )
+  ) AS tagname ON TRUE
+  LEFT JOIN Tags t ON t.TagName = tagname
+WHERE
+  u.CreationDate <= NOW() - INTERVAL '180 days'
+  AND u.Location IS NOT NULL
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation, b.GoldCount, b.SilverCount, b.BronzeCount
+HAVING
+  COUNT(DISTINCT p.Id) > 0
+ORDER BY
+  TotalScore DESC NULLS LAST,
+  PostCount DESC,
+  u.Reputation DESC
+LIMIT 100;

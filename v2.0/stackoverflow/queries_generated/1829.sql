@@ -1,0 +1,189 @@
+-- {"query": "1829.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2604} 
+
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(AVG(p.Score), 0) AS AveragePostScore,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoriteCounts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COALESCE(AVG(c.Score), 0) AS AverageCommentScore,
+        MAX(p.LastEditDate) AS LastPostEditByUser,
+        MAX(c.CreationDate) AS LastCommentByUserActivity
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views
+),
+PostVoteSummary AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END), 0) AS AcceptedVotesCount
+    FROM
+        Posts p
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    GROUP BY
+        p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount, p.CommentCount, p.FavoriteCount, p.Tags, p.CreationDate, p.LastActivityDate
+),
+BadgeMetrics AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges,
+        MIN(b.Date) AS FirstBadgeDate,
+        MAX(b.Date) AS LastBadgeDate
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+PostContentEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId AS EditorUserId,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate ELSE NULL END) AS LastContentEditDate,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE NULL END) AS ContentEditCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 1 ELSE NULL END) AS StatusChangeCount -- Closed, Reopened, Deleted, Undeleted
+    FROM
+        PostHistory ph
+    WHERE
+        ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13) -- Edit Title, Body, Tags, and status changes
+    GROUP BY
+        ph.PostId, ph.UserId
+),
+TopTagsSummary AS (
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><'))) AS TagName,
+        COUNT(DISTINCT p.Id) AS TaggedPostCount,
+        SUM(p.Score) AS TotalTagScore,
+        AVG(p.ViewCount) AS AvgTagViewCount,
+        MAX(p.CreationDate) AS LatestTagPostDate
+    FROM
+        Posts p
+    WHERE
+        p.Tags IS NOT NULL AND p.PostTypeId = 1 -- Only questions have meaningful tags
+    GROUP BY
+        TagName
+    HAVING
+        COUNT(DISTINCT p.Id) > 50 AND SUM(p.Score) > 100 -- Filter for reasonably popular tags
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.UserProfileViews,
+    ue.TotalPosts,
+    ue.TotalQuestions,
+    ue.TotalAnswers,
+    ue.AveragePostScore,
+    ue.TotalFavoriteCounts,
+    ue.TotalComments,
+    bm.GoldBadges,
+    bm.SilverBadges,
+    bm.BronzeBadges,
+    -- Window Function: Rank users by a composite activity-engagement score
+    RANK() OVER (ORDER BY (ue.Reputation * 0.4 + ue.AveragePostScore * 0.3 + ue.TotalComments * 0.1 + COALESCE(bm.TotalBadges, 0) * 0.2) DESC, ue.LastAccessDate DESC) AS UserEngagementRank,
+    -- Window Function: Calculate the average reputation of users in the same 'reputation bracket' (e.g., within 1000 reputation points)
+    AVG(ue.Reputation) OVER (PARTITION BY FLOOR(ue.Reputation / 1000) ORDER BY ue.CreationDate) AS AvgReputationInBracket,
+    -- Correlated Subquery: Find the creation date of the highest-scored *question* by this user
+    (SELECT
+        MAX(pvs_sub.PostCreationDate)
+     FROM
+        PostVoteSummary pvs_sub
+     WHERE
+        pvs_sub.OwnerUserId = ue.UserId
+        AND pvs_sub.PostTypeId = 1 -- Only questions
+        AND pvs_sub.PostScore = (SELECT MAX(pvs_inner.PostScore) FROM PostVoteSummary pvs_inner WHERE pvs_inner.OwnerUserId = pvs_sub.OwnerUserId AND pvs_inner.PostTypeId = 1)
+     LIMIT 1 -- In case of multiple posts with same max score, pick one
+    ) AS DateOfHighestScoredQuestion,
+    -- Complicated Expression/Calculation: "User Influence Score"
+    (ue.Reputation * 0.6) + (ue.TotalPosts * ue.AveragePostScore * 0.01) + (ue.UserProfileViews * 0.05) + (COALESCE(bm.GoldBadges, 0) * 100) + (COALESCE(bm.SilverBadges, 0) * 50) + (COALESCE(bm.BronzeBadges, 0) * 10)
+    AS UserInfluenceScore,
+    -- String Expression & NULL Logic: Categorize users based on DisplayName and Location
+    CASE
+        WHEN ue.DisplayName ILIKE '%dev%' OR ue.DisplayName ILIKE '%engineer%' THEN 'Software Professional'
+        WHEN ue.DisplayName IS NULL OR ue.DisplayName = '' THEN 'Anonymous Contributor'
+        WHEN u.Location IS NULL OR u.Location = '' THEN 'Location Unknown'
+        ELSE 'General Participant'
+    END AS UserCategory,
+    -- Date Calculation & NULL Logic: Days elapsed since last activity relative to user creation
+    COALESCE(EXTRACT(EPOCH FROM (ue.LastAccessDate - ue.UserCreationDate)) / (3600 * 24), 0) AS DaysActiveSinceCreation,
+    -- Subquery: Average ViewCount for posts owned by this user that have been edited by someone other than the owner
+    (SELECT
+        COALESCE(AVG(pce_other.ViewCount), 0)
+     FROM
+        PostVoteSummary pce_other
+     INNER JOIN
+        PostContentEdits ph_other ON pce_other.PostId = ph_other.PostId
+     WHERE
+        pce_other.OwnerUserId = ue.UserId
+        AND ph_other.EditorUserId <> ue.UserId -- Edited by someone else
+        AND ph_other.ContentEditCount > 0
+    ) AS AvgViewCountOfExternallyEditedPosts,
+    -- Outer Join & NULL handling for the most popular tag associated with user's posts
+    tts.TagName AS TopAssociatedTagName,
+    tts.TaggedPostCount AS TopAssociatedTagPostCount,
+    tts.TotalTagScore AS TopAssociatedTagScore,
+    -- Complicated Predicate: Identify users whose first badge was obtained relatively quickly after creation
+    CASE
+        WHEN bm.FirstBadgeDate IS NOT NULL AND (bm.FirstBadgeDate - ue.UserCreationDate) < INTERVAL '30 days' THEN TRUE
+        ELSE FALSE
+    END AS EarlyAchiever
+FROM
+    UserEngagement ue
+LEFT JOIN
+    BadgeMetrics bm ON ue.UserId = bm.UserId
+LEFT JOIN Users u ON ue.UserId = u.Id -- Join back to Users for Location
+LEFT JOIN LATERAL (
+    -- Find the most popular tag from the user's top 5 highest scored questions
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(p_tags.Tags FROM 2 FOR LENGTH(p_tags.Tags)-2), '><'))) AS TagName_unnested
+    FROM
+        PostVoteSummary p_tags
+    WHERE
+        p_tags.OwnerUserId = ue.UserId
+        AND p_tags.PostTypeId = 1
+        AND p_tags.Tags IS NOT NULL
+    ORDER BY p_tags.PostScore DESC, p_tags.ViewCount DESC
+    LIMIT 1
+) AS user_primary_tag ON TRUE
+LEFT JOIN TopTagsSummary tts ON user_primary_tag.TagName_unnested = tts.TagName
+WHERE
+    ue.Reputation >= 5000 -- Filter for established users
+    AND ue.TotalPosts > 20
+    AND ue.AveragePostScore >= 10
+    AND ue.LastAccessDate >= (NOW() - INTERVAL '6 months') -- Recently active
+    AND ue.TotalComments >= 10
+    -- Another complex predicate: Users with high profile views or significant badge collection
+    AND (ue.UserProfileViews > 5000 OR COALESCE(bm.TotalBadges, 0) > 20 OR ue.TotalFavoriteCounts > 100)
+    -- Predicate involving relative activity: user has been active for at least 1 year AND (either has recent activity OR has accumulated many upvotes)
+    AND (EXTRACT(EPOCH FROM (ue.LastAccessDate - ue.UserCreationDate)) / (3600 * 24)) > 365
+    AND (ue.LastAccessDate > (NOW() - INTERVAL '3 months') OR (SELECT SUM(UpVotesReceived) FROM PostVoteSummary WHERE OwnerUserId = ue.UserId) > 500)
+ORDER BY
+    UserInfluenceScore DESC, ue.Reputation DESC
+LIMIT 500;

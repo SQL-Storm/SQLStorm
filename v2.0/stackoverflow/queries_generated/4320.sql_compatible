@@ -1,0 +1,132 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        ROW_NUMBER() OVER(PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.Title IS NOT NULL AND LENGTH(p.Title) > 10
+),
+RecentAnswers AS (
+    SELECT
+        pr.Id AS PostId,
+        pr.ParentId AS QuestionId,
+        pr.OwnerUserId,
+        pr.CreationDate AS AnswerCreationDate,
+        u.DisplayName AS AnswererDisplayName,
+        u.Reputation AS AnswererReputation,
+        ROW_NUMBER() OVER(PARTITION BY pr.ParentId ORDER BY pr.CreationDate ASC) AS ans_rn
+    FROM Posts pr
+    JOIN Users u ON pr.OwnerUserId = u.Id
+    WHERE pr.PostTypeId = 2 AND pr.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '30 days')
+),
+QuestionAnswerMetrics AS (
+    SELECT
+        q.PostId AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.OwnerDisplayName AS QuestionOwner,
+        q.OwnerReputation AS QuestionOwnerRep,
+        COUNT(ra.PostId) AS AnswerCount,
+        SUM(CASE WHEN q.PostId = ra.PostId AND q.PostId IS NOT NULL AND ra.PostId IS NOT NULL AND q.PostId = ra.PostId AND q.PostId = ra.PostId AND q.PostId = ra.PostId THEN CASE WHEN q.PostId = ra.PostId THEN 1 ELSE 0 END ELSE 0 END) AS IsAcceptedAnswer,
+        MAX(ra.AnswererReputation) AS MaxAnswererReputation,
+        AVG(ra.AnswererReputation) AS AvgAnswererReputation,
+        STRING_AGG(ra.AnswererDisplayName, '; ' ORDER BY ra.AnswerCreationDate) AS TopAnswerers
+    FROM RankedPosts q
+    LEFT JOIN RecentAnswers ra ON q.PostId = ra.QuestionId
+    WHERE q.PostTypeId = 1 AND q.rn <= 100
+    GROUP BY q.PostId, q.Title, q.OwnerDisplayName, q.OwnerReputation
+),
+UserPostContribution AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName
+),
+TagEngagement AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS QuestionsWithTag,
+        SUM(p.Score) AS TotalScoreForTag,
+        AVG(p.AnswerCount) AS AvgAnswersPerQuestion
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%' AND p.PostTypeId = 1
+    WHERE t.TagName NOT LIKE '%-%'
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 50
+),
+ComplexJoinResult AS (
+    SELECT
+        qam.QuestionId,
+        qam.QuestionTitle,
+        qam.QuestionOwner,
+        qam.QuestionOwnerRep,
+        qam.AnswerCount,
+        qam.AvgAnswererReputation,
+        ta.TagName,
+        ta.QuestionsWithTag,
+        CASE
+            WHEN qam.AvgAnswererReputation > qam.QuestionOwnerRep THEN 'MoreExperiencedAnswerers'
+            WHEN qam.AvgAnswererReputation < qam.QuestionOwnerRep THEN 'LessExperiencedAnswerers'
+            ELSE 'SimilarExperienceAnswerers'
+        END AS ExperienceComparison,
+        COALESCE(u.DisplayName, 'N/A') AS MostFrequentCommenter,
+        CASE WHEN qam.AnswerCount > 5 THEN 'HighAnswerRate' ELSE 'NormalAnswerRate' END AS AnswerRateCategory,
+        qam.MaxAnswererReputation
+    FROM QuestionAnswerMetrics qam
+    JOIN TagEngagement ta ON qam.QuestionTitle LIKE '%' || ta.TagName || '%' OR qam.QuestionTitle LIKE '%' || UPPER(ta.TagName) || '%'
+    LEFT JOIN (
+        SELECT PostId, UserId, COUNT(*) AS comment_count
+        FROM Comments
+        GROUP BY PostId, UserId
+        ORDER BY comment_count DESC
+        LIMIT 1
+    ) AS top_commenter ON qam.QuestionId = top_commenter.PostId
+    LEFT JOIN Users u ON top_commenter.UserId = u.Id
+    WHERE qam.AnswerCount > 0 AND qam.MaxAnswererReputation > 1000
+)
+SELECT
+    cj.QuestionId,
+    cj.QuestionTitle,
+    cj.QuestionOwner,
+    cj.ExperienceComparison,
+    cj.AnswerRateCategory,
+    cj.TagName,
+    cj.QuestionsWithTag,
+    cj.AnswerCount,
+    cj.AvgAnswererReputation,
+    UPPER(REPLACE(cj.MostFrequentCommenter, ' ', '_')) AS FormattedCommenter,
+    COALESCE(pht.Name, 'Unknown History Type') AS LastEditType,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+    COUNT(DISTINCT ph.Id) AS PostHistoryEntries
+FROM ComplexJoinResult cj
+LEFT JOIN PostHistory ph ON cj.QuestionId = ph.PostId
+LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id AND ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+LEFT JOIN Votes v ON cj.QuestionId = v.PostId AND v.VoteTypeId = 2
+WHERE cj.QuestionOwnerRep > 5000
+GROUP BY
+    cj.QuestionId,
+    cj.QuestionTitle,
+    cj.QuestionOwner,
+    cj.ExperienceComparison,
+    cj.AnswerRateCategory,
+    cj.TagName,
+    cj.QuestionsWithTag,
+    cj.AnswerCount,
+    cj.AvgAnswererReputation,
+    UPPER(REPLACE(cj.MostFrequentCommenter, ' ', '_')),
+    COALESCE(pht.Name, 'Unknown History Type')
+HAVING COUNT(ph.Id) > 10 OR SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 50
+ORDER BY cj.AnswerCount DESC, cj.AvgAnswererReputation DESC;

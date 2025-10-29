@@ -1,0 +1,141 @@
+-- {"query": "2102.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1230} 
+with RecursiveTagStats as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count as TagPostCount,
+        p.OwnerUserId,
+        u.DisplayName,
+        row_number() over (partition by t.Id order by p.CreationDate desc) as rn
+    from Tags t
+    join Posts p on p.Tags like '%' || t.TagName || '%'
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 -- questions
+),
+UserReputationWithBadgeCounts as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(sum(case when b.Class = 1 then 1 else 0 end),0) as GoldBadges,
+        coalesce(sum(case when b.Class = 2 then 1 else 0 end),0) as SilverBadges,
+        coalesce(sum(case when b.Class = 3 then 1 else 0 end),0) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopQuestionsWithAnswers as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        u.DisplayName as QuestionOwner,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        coalesce(a.AnswerCount,0) as AnswerCount,
+        coalesce(a.AcceptedAnswerScore, 0) as AcceptedAnswerScore,
+        coalesce(a.TopAnswerScore, 0) as TopAnswerScore
+    from Posts q
+    left join (
+        select 
+            ParentId,
+            count(*) as AnswerCount,
+            max(Score) as TopAnswerScore,
+            max(case when Id = (select AcceptedAnswerId from Posts where Id = ParentId) then Score else null end) as AcceptedAnswerScore
+        from Posts
+        where PostTypeId = 2 -- answers
+        group by ParentId
+    ) a on a.ParentId = q.Id
+    left join Users u on u.Id = q.OwnerUserId
+    where q.PostTypeId = 1
+),
+RankedCloseReasons as (
+    select 
+        crt.Id,
+        crt.Name,
+        dense_rank() over (order by crt.Name) as ReasonRank
+    from CloseReasonTypes crt
+),
+LastUserActivity as (
+    select
+        u.Id as UserId,
+        max(p.LastActivityDate) as LastPostActivity,
+        max(c.CreationDate) as LastCommentActivity,
+        greatest(coalesce(max(p.LastActivityDate), '1900-01-01'::timestamp), coalesce(max(c.CreationDate), '1900-01-01'::timestamp)) as LastActivity
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id
+)
+select 
+    rts.TagId,
+    rts.TagName,
+    rts.TagPostCount,
+    rts.OwnerUserId,
+    urwb.DisplayName as TagQuestionOwner,
+    urwb.Reputation as OwnerReputation,
+    urwb.GoldBadges,
+    urwb.SilverBadges,
+    urwb.BronzeBadges,
+    tq.QuestionId,
+    tq.Title,
+    tq.QuestionScore,
+    tq.ViewCount,
+    tq.AnswerCount,
+    tq.AcceptedAnswerScore,
+    tq.TopAnswerScore,
+    rc.Name as CloseReasonName,
+    rc.ReasonRank,
+    lua.LastActivity,
+    case 
+        when lua.LastActivity > now() - interval '30 day' then 'Active' 
+        else 'Inactive' 
+    end as UserActivityStatus,
+    concat('Post ', coalesce(tq.QuestionId::text, 'N/A'), ': "', coalesce(tq.Title, 'No Title'), '" owned by ', coalesce(tq.QuestionOwner, 'unknown')) as PostSummary,
+    substring(coalesce(tq.Title, '') from '(\w+){2,}') as ExtractedWords,
+    case when tq.ViewCount > 10000 then 'Popular' else 'Regular' end as PopularityLabel,
+    case 
+        when tq.Score > 50 then 'Highly Scored' 
+        when tq.Score between 10 and 50 then 'Moderately Scored' 
+        else 'Low Scored' 
+    end as ScoreLabel
+from RecursiveTagStats rts
+left join UserReputationWithBadgeCounts urwb on urwb.Id = rts.OwnerUserId
+left join TopQuestionsWithAnswers tq on tq.Id = rts.OwnerUserId
+left join RankedCloseReasons rc on rc.Id = (
+    select pht.PostHistoryTypeId from PostHistory pht where ph.t.Id = tq.QuestionId and pht.PostHistoryTypeId = 10 limit 1
+)
+left join LastUserActivity lua on lua.UserId = rts.OwnerUserId
+where rts.rn = 1
+and (
+    (urwb.Reputation > 5000 or urwb.GoldBadges >= 5)
+    or 
+    (tq.AnswerCount > 5 and tq.AcceptedAnswerScore > 10)
+)
+union
+select 
+    t.Id,
+    t.TagName,
+    t.Count,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+from Tags t
+where not exists (
+    select 1 from Posts p where p.Tags like '%' || t.TagName || '%'
+)
+order by TagPostCount desc nulls last, OwnerReputation desc nulls last, CloseReasonName nulls last
+limit 100;

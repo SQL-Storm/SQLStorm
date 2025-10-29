@@ -1,0 +1,155 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE NOT EXISTS (
+        SELECT 1 FROM Posts p
+        JOIN Posts p2 ON p.Id = p2.ParentId
+        WHERE p.Tags LIKE '%' || t.TagName || '%'
+    )
+    UNION ALL
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Path || t2.TagName
+    FROM RecursiveTagHierarchy r
+    JOIN Posts p ON p.Tags LIKE '%' || r.TagName || '%'
+    JOIN Tags t2 ON p.Tags LIKE '%' || t2.TagName || '%'
+    WHERE NOT t2.TagName = ANY(r.Path)
+),
+UserReputRank AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS RepRank,
+        RANK() OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY u.Reputation DESC NULLS LAST) AS LocationRepRank
+    FROM Users u
+    WHERE u.Reputation IS NOT NULL
+),
+QuestionAnswerStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        COUNT(a.Id) AS TotalAnswers,
+        AVG(COALESCE(a.Score,0)) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        MIN(a.Score) AS MinAnswerScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesOnQuestion,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesOnQuestion,
+        COUNT(DISTINCT c.Id) AS TotalCommentsOnQuestion
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Votes v ON v.PostId = q.Id
+    LEFT JOIN Comments c ON c.PostId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount
+),
+PostHistoryAnalysis AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        p.Title,
+        ph.UserId,
+        u.DisplayName,
+        ph.CreationDate,
+        ph.Comment,
+        COUNT(*) OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId) AS HistoryTypeCountPerPost
+    FROM PostHistory ph
+    LEFT JOIN Posts p ON p.Id = ph.PostId
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId IN (10,11,12,13,19,20)
+),
+UserBadgeAgg AS (
+    SELECT 
+        b.UserId,
+        u.DisplayName,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeEarned,
+        COUNT(DISTINCT b.Name) AS UniqueBadges
+    FROM Badges b
+    JOIN Users u ON u.Id = b.UserId
+    GROUP BY b.UserId, u.DisplayName
+),
+DuplicatePosts AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        p1.Title AS OriginalTitle,
+        p2.Title AS DuplicateTitle,
+        ph.Comment AS CloseReason,
+        ph.CreationDate AS CloseDate
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    LEFT JOIN PostHistory ph ON ph.PostId = pl.PostId AND ph.PostHistoryTypeId = 10 AND ph.Comment = '101'
+    WHERE pl.LinkTypeId = 3
+)
+SELECT 
+    qas.QuestionId,
+    qas.Title AS QuestionTitle,
+    qas.QuestionCreation,
+    qas.QuestionScore,
+    qas.QuestionViews,
+    qas.TotalAnswers,
+    qas.AvgAnswerScore,
+    qas.MaxAnswerScore,
+    qas.MinAnswerScore,
+    qas.UpVotesOnQuestion,
+    qas.DownVotesOnQuestion,
+    qas.TotalCommentsOnQuestion,
+    uba.GoldBadges,
+    uba.SilverBadges,
+    uba.BronzeBadges,
+    uba.UniqueBadges,
+    uba.LastBadgeEarned,
+    ur.Reputation,
+    ur.RepRank,
+    ur.LocationRepRank,
+    phs.HistoryTypeCountPerPost,
+    phs.PostHistoryTypeId,
+    phs.UserId AS EditorUserId,
+    phs.DisplayName AS EditorDisplayName,
+    dup.DuplicateTitle,
+    dup.CloseReason,
+    dup.CloseDate,
+    CASE
+        WHEN qas.QuestionScore > 100 THEN 'High Score'
+        WHEN qas.QuestionScore BETWEEN 50 AND 100 THEN 'Medium Score'
+        ELSE 'Low Score'
+    END AS ScoreCategory,
+    CASE 
+        WHEN COALESCE(uba.GoldBadges,0) > 5 THEN 'Elite'
+        WHEN COALESCE(uba.GoldBadges,0) BETWEEN 1 AND 5 THEN 'Experienced'
+        ELSE 'Novice'
+    END AS UserBadgeLevel,
+    CONCAT(
+        LEFT(qas.Title, 30),
+        '...',
+        COALESCE(SUBSTR(uba.DisplayName, 1, 10), 'Anonymous'),
+        '-',
+        TO_CHAR(qas.QuestionCreation, 'YYYY-MM-DD')
+    ) AS TitleSnippet
+FROM QuestionAnswerStats qas
+LEFT JOIN UserBadgeAgg uba ON uba.UserId = (
+    SELECT p.OwnerUserId FROM Posts p WHERE p.Id = qas.QuestionId AND p.OwnerUserId IS NOT NULL LIMIT 1
+)
+LEFT JOIN UserReputRank ur ON ur.Id = (
+    SELECT p.OwnerUserId FROM Posts p WHERE p.Id = qas.QuestionId AND p.OwnerUserId IS NOT NULL LIMIT 1
+)
+LEFT JOIN PostHistoryAnalysis phs ON phs.PostId = qas.QuestionId
+LEFT JOIN DuplicatePosts dup ON dup.PostId = qas.QuestionId
+WHERE (qas.TotalAnswers > 5 OR qas.QuestionScore > 10)
+  AND (COALESCE(uba.GoldBadges,0) > 0 OR COALESCE(ur.Reputation,0) > 2000)
+ORDER BY qas.QuestionScore DESC, COALESCE(uba.GoldBadges,0) DESC, COALESCE(ur.Reputation,0) DESC
+LIMIT 100;

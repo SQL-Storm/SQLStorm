@@ -1,0 +1,220 @@
+-- {"query": "7030.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1795} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        MAX(p.CreationDate) as LastPostDate,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        DATEDIFF(day, p.CreationDate, GETDATE()) as AgeInDays,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Gold'
+            WHEN p.Score >= 50 THEN 'Silver'
+            WHEN p.Score >= 10 THEN 'Bronze'
+            ELSE 'None'
+        END as ScoreTier,
+        COALESCE(
+            CASE WHEN p.AnswerCount > 0 THEN 
+                CAST(p.Score AS FLOAT) / CAST(p.AnswerCount AS FLOAT) 
+            END, 
+            0
+        ) as ScorePerAnswer,
+        (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2) as TotalAnswers,
+        (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2 AND Score > 0) as PositiveAnswers
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+BadgeRankings AS (
+    SELECT 
+        b.UserId,
+        b.Name as BadgeName,
+        b.Date as BadgeDate,
+        COUNT(*) OVER (PARTITION BY b.UserId ORDER BY b.Date) as BadgeSequence,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date) as BadgeOrder,
+        CASE 
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver'
+            ELSE 'Bronze'
+        END as BadgeTier,
+        DENSE_RANK() OVER (ORDER BY b.Class, b.Date) as GlobalBadgeRank
+    FROM Badges b
+    WHERE b.TagBased = 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.Tags LIKE '%' + t.TagName + '%' 
+            AND p.PostTypeId = 1
+        ) as QuestionCount,
+        (
+            SELECT AVG(p.Score) 
+            FROM Posts p 
+            WHERE p.Tags LIKE '%' + t.TagName + '%' 
+            AND p.PostTypeId = 1
+        ) as AvgScore,
+        (
+            SELECT MAX(p.CreationDate) 
+            FROM Posts p 
+            WHERE p.Tags LIKE '%' + t.TagName + '%' 
+            AND p.PostTypeId = 1
+        ) as LastQuestionDate
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+),
+ComplexStats AS (
+    SELECT 
+        us.UserId,
+        us.Reputation,
+        us.DisplayName,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.BadgeCount,
+        us.VoteCount,
+        us.CommentCount,
+        us.ReputationRank,
+        ps.ScoreTier,
+        ps.AgeInDays,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount as PostAnswerCount,
+        ps.ScorePerAnswer,
+        ta.TagCount,
+        ta.QuestionCount as TagQuestionCount,
+        ta.AvgScore as TagAvgScore,
+        br.BadgeName,
+        br.BadgeOrder,
+        br.BadgeSequence,
+        br.BadgeTier,
+        CASE 
+            WHEN us.QuestionCount > 0 AND us.AnswerCount > 0 
+            THEN CAST(us.QuestionCount AS FLOAT) / CAST(us.AnswerCount AS FLOAT)
+            ELSE NULL 
+        END as QuestionAnswerRatio
+    FROM UserStats us
+    JOIN PostAnalysis ps ON us.UserId = ps.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON ps.Title LIKE '%' + ta.TagName + '%'
+    LEFT JOIN BadgeRankings br ON us.UserId = br.UserId
+    WHERE us.QuestionCount > 0 OR us.AnswerCount > 0
+)
+SELECT DISTINCT 
+    cs.UserId,
+    cs.DisplayName,
+    cs.Reputation,
+    cs.ReputationRank,
+    cs.QuestionCount,
+    cs.AnswerCount,
+    cs.BadgeCount,
+    cs.VoteCount,
+    cs.CommentCount,
+    cs.ScoreTier,
+    cs.AgeInDays,
+    cs.Score,
+    cs.ViewCount,
+    cs.PostAnswerCount,
+    cs.ScorePerAnswer,
+    cs.TagCount,
+    cs.TagQuestionCount,
+    cs.TagAvgScore,
+    cs.BadgeName,
+    cs.BadgeOrder,
+    cs.BadgeSequence,
+    cs.BadgeTier,
+    cs.QuestionAnswerRatio,
+    CASE 
+        WHEN cs.Reputation > 10000 THEN 'Elite'
+        WHEN cs.Reputation > 5000 THEN 'Expert'
+        WHEN cs.Reputation > 1000 THEN 'Advanced'
+        ELSE 'Beginner'
+    END as UserLevel,
+    CASE 
+        WHEN cs.QuestionCount > 100 AND cs.AnswerCount > 500 THEN 'Heavy Contributor'
+        WHEN cs.QuestionCount > 50 AND cs.AnswerCount > 250 THEN 'Regular Contributor'
+        WHEN cs.QuestionCount > 10 OR cs.AnswerCount > 50 THEN 'Occasional Contributor'
+        ELSE 'Newbie'
+    END as ContributionLevel,
+    CASE 
+        WHEN cs.ScorePerAnswer > 2 THEN 'High Quality Answers'
+        WHEN cs.ScorePerAnswer > 1 THEN 'Moderate Quality Answers'
+        WHEN cs.ScorePerAnswer > 0 THEN 'Low Quality Answers'
+        ELSE 'No Answer Quality'
+    END as AnswerQuality,
+    CASE 
+        WHEN cs.BadgeCount > 10 AND cs.Reputation > 1000 THEN 'Awarded User'
+        WHEN cs.BadgeCount > 5 THEN 'Active User'
+        ELSE 'Basic User'
+    END as AchievementLevel,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = cs.UserId 
+        AND p.PostTypeId = 2 
+        AND p.Score > 0
+    ) as PositiveAnswers,
+    (
+        SELECT AVG(p.Score) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = cs.UserId 
+        AND p.PostTypeId = 1
+    ) as AvgQuestionScore,
+    (
+        SELECT AVG(p.Score) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = cs.UserId 
+        AND p.PostTypeId = 2
+    ) as AvgAnswerScore,
+    COALESCE((SELECT TOP 1 t.TagName FROM Tags t WHERE t.Count = (SELECT MAX(t2.Count) FROM Tags t2 WHERE t2.TagName LIKE '%' + t.TagName + '%')), 'No Tag') as MostPopularTag,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.UserId = cs.UserId 
+        AND c.Score > 0
+    ) as PositiveComments,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = cs.UserId 
+        AND p.CreationDate >= DATEADD(year, -1, GETDATE())
+    ) as RecentPosts
+FROM ComplexStats cs
+WHERE cs.Reputation > 100 
+    AND cs.QuestionCount > 0 
+    AND cs.AnswerCount > 0
+    AND NOT EXISTS (
+        SELECT 1 FROM Users u 
+        WHERE u.Id = cs.UserId 
+        AND u.DisplayName IS NULL
+    )
+    AND cs.AgeInDays <= 3650
+ORDER BY cs.Reputation DESC, cs.QuestionCount DESC, cs.AnswerCount DESC
+OPTION (MAXDOP 8, RECOMPILE)

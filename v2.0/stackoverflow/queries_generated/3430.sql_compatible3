@@ -1,0 +1,149 @@
+WITH UserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(AVG(p.Score), 0) AS AvgPostScore,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RecentVotes AS (
+    SELECT
+        v.UserId,
+        COUNT(*) FILTER (WHERE vt.Name = 'UpMod')   AS UpVotesGiven,
+        COUNT(*) FILTER (WHERE vt.Name = 'DownMod') AS DownVotesGiven,
+        COUNT(*) FILTER (WHERE vt.Name = 'Favorite') AS FavoritesGiven,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+),
+PostTags AS (
+    /* Split tags like '<tag1><tag2>' into rows using SQL-standard functions.
+       This implementation uses a recursive CTE to extract tags which is portable. */
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM substring_part)) AS TagName
+    FROM Posts p
+    JOIN LATERAL (
+        WITH RECURSIVE parts(pos, rest) AS (
+            SELECT 1, p.Tags
+            UNION ALL
+            SELECT
+                CASE
+                    WHEN instr.pos IS NULL THEN NULL
+                    ELSE instr.pos + 1
+                END,
+                CASE
+                    WHEN instr.next_pos = 0 THEN NULL
+                    ELSE substring(rest FROM instr.next_pos)
+                END
+            FROM (
+                SELECT rest,
+                    (CASE WHEN rest IS NULL THEN NULL WHEN POSITION('><' IN rest) = 0 THEN 0 ELSE POSITION('><' IN rest) END) AS next_pos,
+                    POSITION('><' IN rest) AS pos_marker
+                FROM (SELECT p.Tags AS rest) AS r
+            ) instr
+            WHERE rest IS NOT NULL AND (instr.next_pos IS NOT NULL)
+        )
+        SELECT DISTINCT substring(
+            p.Tags FROM
+            (CASE WHEN pos_start.start_pos IS NULL THEN 1 ELSE pos_start.start_pos END)
+            FOR
+            (CASE WHEN pos_end.end_pos IS NULL THEN CHAR_LENGTH(p.Tags) - (CASE WHEN pos_start.start_pos IS NULL THEN 0 ELSE pos_start.start_pos - 1 END) ELSE pos_end.end_pos - (CASE WHEN pos_start.start_pos IS NULL THEN 1 ELSE pos_start.start_pos END) END)
+        ) AS substring_part
+        FROM (VALUES (1)) AS v(dummy) -- single row to allow the SELECT below to reference p
+        LEFT JOIN LATERAL (
+            SELECT 2 + COALESCE(NULLIF(POSITION('<' IN p.Tags),0),0) AS start_pos
+        ) pos_start ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT POSITION('><' IN p.Tags) AS end_pos
+        ) pos_end ON TRUE
+        WHERE p.Tags IS NOT NULL
+    ) splits ON TRUE
+    WHERE p.Tags IS NOT NULL
+),
+UserTagAffinity AS (
+    SELECT
+        us.UserId,
+        pt.TagName,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (5,6)) AS EditCount,
+        ROW_NUMBER() OVER (PARTITION BY us.UserId ORDER BY COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (5,6)) DESC) AS TagAffinityRank
+    FROM UserStats us
+    JOIN Posts p ON p.OwnerUserId = us.UserId AND p.PostTypeId = 1
+    JOIN PostTags pt ON pt.PostId = p.Id
+    JOIN Tags tt ON tt.TagName = pt.TagName
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (5,6)
+    GROUP BY us.UserId, pt.TagName
+),
+LatestPostPerUser AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+)
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.TotalPostScore,
+    us.AvgPostScore,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.LastPostDate,
+    rv.UpVotesGiven,
+    rv.DownVotesGiven,
+    rv.FavoritesGiven,
+    rv.LastVoteDate,
+    lp.Title AS LatestPostTitle,
+    lp.CreationDate AS LatestPostDate,
+    COALESCE(uta.TagName, 'None') AS TopTagByEdits,
+    COALESCE(uta.EditCount, 0) AS EditsOnTopTag,
+    CASE 
+        WHEN us.Reputation > 20000 THEN 'Elite'
+        WHEN us.Reputation BETWEEN 5000 AND 20000 THEN 'Pro'
+        WHEN us.Reputation BETWEEN 1000 AND 4999 THEN 'Active'
+        ELSE 'Newbie'
+    END AS ReputationBand,
+    CASE 
+        WHEN us.AnswerCount = 0 THEN NULL
+        ELSE ROUND(CAST(us.QuestionCount AS numeric) / NULLIF(us.AnswerCount,0), 2)
+    END AS QtoARatio,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM PostLinks pl
+            WHERE pl.PostId = lp.PostId AND pl.LinkTypeId = 3
+        ) THEN 1 ELSE 0 END AS IsDuplicateLinked
+FROM UserStats us
+LEFT JOIN RecentVotes rv ON rv.UserId = us.UserId
+LEFT JOIN LatestPostPerUser lp ON lp.UserId = us.UserId AND lp.rn = 1
+LEFT JOIN UserTagAffinity uta ON uta.UserId = us.UserId AND uta.TagAffinityRank = 1
+WHERE us.Reputation > 1000
+ORDER BY us.Reputation DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

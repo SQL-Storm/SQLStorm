@@ -1,0 +1,196 @@
+-- {"query": "7981.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3387} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        CASE 
+            WHEN u.Views IS NULL THEN 0 
+            ELSE u.Views 
+        END as AdjustedViews,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END as ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+TopQuestions AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        p.Tags,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END as QuestionStatus,
+        CONCAT('Question: ', p.Title, ' - Score: ', p.Score, ' - Views: ', p.ViewCount) as QuestionSummary
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.Score > 100
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 500 THEN 'Moderate'
+            ELSE 'Niche'
+        END as TagPopularity,
+        COALESCE((SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%'), 0) as PostsUsingTag,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') as AvgScorePerTagUsage
+    FROM Tags t
+),
+UserActivitySummary AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(p.Id) as PostCount,
+        SUM(p.Score) as TotalScore,
+        SUM(p.ViewCount) as TotalViews,
+        AVG(p.Score) as AvgScore,
+        MAX(p.CreationDate) as LastActivity,
+        STRING_AGG(p.Title, '; ') as PostTitles,
+        CASE 
+            WHEN SUM(p.Score) > 1000 THEN 'HighlyActive'
+            WHEN SUM(p.Score) > 100 THEN 'Active'
+            ELSE 'Casual'
+        END as ActivityLevel,
+        DATEDIFF(day, MIN(p.CreationDate), MAX(p.CreationDate)) as ActiveDays,
+        NULLIF(COUNT(DISTINCT p.Id), 0) as PostsPerDay
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= DATEADD(year, -2, CURRENT_TIMESTAMP)
+    GROUP BY u.Id, u.DisplayName
+),
+ComplexUserStats AS (
+    SELECT 
+        us.UserId,
+        us.Reputation,
+        us.DisplayName,
+        us.CreationDate,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.ReputationTier,
+        us.AdjustedViews,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC) as RepRank,
+        PERCENT_RANK() OVER (ORDER BY us.Reputation) as RepPercentile,
+        CASE 
+            WHEN us.PostCount > 100 AND us.BadgeCount > 50 THEN 'Veteran'
+            WHEN us.PostCount > 50 AND us.BadgeCount > 25 THEN 'Experienced'
+            WHEN us.PostCount > 10 AND us.BadgeCount > 5 THEN 'Active'
+            ELSE 'Beginner'
+        END as UserLevel,
+        CASE 
+            WHEN us.Reputation > 10000 OR us.PostCount > 200 THEN 'Elite'
+            WHEN us.Reputation > 5000 OR us.PostCount > 100 THEN 'Contributor'
+            WHEN us.Reputation > 1000 THEN 'Member'
+            ELSE 'Newbie'
+        END as CommunityStatus,
+        ABS(us.Reputation - (SELECT AVG(Reputation) FROM Users)) as ReputationDeviation,
+        NULLIF(us.ViewCount, 0) as ViewCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = us.UserId AND p.Score > 500) as HighScoringPosts,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = us.UserId AND b.Class = 1) as GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = us.UserId AND b.Class = 2) as SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = us.UserId AND b.Class = 3) as BronzeBadges
+    FROM UserStats us
+)
+SELECT 
+    'Performance Benchmark Report' as ReportTitle,
+    CURRENT_TIMESTAMP as ReportDate,
+    COUNT(*) as TotalUsers,
+    (SELECT COUNT(DISTINCT QuestionId) FROM TopQuestions) as TopQuestionsCount,
+    (SELECT COUNT(*) FROM TagAnalysis) as TagAnalysisCount,
+    (SELECT COUNT(*) FROM UserActivitySummary) as UserActivityCount,
+    (SELECT COUNT(*) FROM ComplexUserStats) as ComplexUserStatsCount,
+    STRING_AGG(us.DisplayName || ':' || us.ReputationTier || ':' || us.PostCount || ':' || us.BadgeCount, '|') as UserSummaryData,
+    (SELECT SUM(AnswerCount) FROM TopQuestions) as TotalAnswersToTopQuestions,
+    (SELECT AVG(Score) FROM TopQuestions) as AvgScoreOfTopQuestions,
+    (SELECT SUM(ViewCount) FROM TopQuestions) as TotalViewsOfTopQuestions,
+    COUNT(DISTINCT us.UserId) FILTER (WHERE us.Reputation > 10000) as EliteUsers,
+    COUNT(DISTINCT us.UserId) FILTER (WHERE us.Reputation >= 5000 AND us.Reputation <= 10000) as VeteranUsers,
+    COUNT(DISTINCT us.UserId) FILTER (WHERE us.Reputation >= 1000 AND us.Reputation < 5000) as RegularUsers,
+    COUNT(DISTINCT us.UserId) FILTER (WHERE us.Reputation < 1000) as NewbieUsers,
+    AVG(us.Reputation) as AverageReputation,
+    MAX(us.Reputation) as MaxReputation,
+    MIN(us.Reputation) as MinReputation,
+    (SELECT AVG(TagCount) FROM TagAnalysis) as AvgTagCount,
+    (SELECT MAX(TagCount) FROM TagAnalysis) as MaxTagCount,
+    (SELECT MIN(TagCount) FROM TagAnalysis) as MinTagCount,
+    ROUND(COUNT(DISTINCT us.UserId) * 100.0 / (SELECT COUNT(*) FROM Users), 2) as UserCoveragePercentage,
+    (SELECT STRING_AGG(t.TagName, ',' ORDER BY t.Count DESC) FROM Tags t WHERE t.Count > 500) as PopularTags,
+    (SELECT STRING_AGG(t.TagName, ',') FROM Tags t WHERE t.Count BETWEEN 100 AND 500) as ModerateTags,
+    (SELECT STRING_AGG(t.TagName, ',') FROM Tags t WHERE t.Count < 100) as NicheTags,
+    (SELECT STRING_AGG(CONCAT(p.Title, ' (', p.Score, ')'), '; ') FROM Posts p WHERE p.PostTypeId = 1 AND p.Score >= (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) ORDER BY p.Score DESC LIMIT 5) as AverageScoreQuestions,
+    (SELECT STRING_AGG(CONCAT(p.Title, ' (', p.ViewCount, ')'), '; ') FROM Posts p WHERE p.PostTypeId = 1 AND p.ViewCount >= (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) ORDER BY p.ViewCount DESC LIMIT 5) as HighViewQuestions,
+    (SELECT STRING_AGG(CONCAT(p.Title, ' (', p.CommentCount, ')'), '; ') FROM Posts p WHERE p.PostTypeId = 1 AND p.CommentCount >= (SELECT AVG(CommentCount) FROM Posts WHERE PostTypeId = 1) ORDER BY p.CommentCount DESC LIMIT 5) as HighlyCommentedQuestions,
+    (SELECT STRING_AGG(CONCAT(p.Title, ' (', p.AnswerCount, ')'), '; ') FROM Posts p WHERE p.PostTypeId = 1 AND p.AnswerCount >= (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId = 1) ORDER BY p.AnswerCount DESC LIMIT 5) as HighlyAnsweredQuestions,
+    (SELECT STRING_AGG(CONCAT(p.Title, ' (', p.Score, ')'), '; ') FROM Posts p WHERE p.PostTypeId = 1 AND p.Score <= (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) ORDER BY p.Score ASC LIMIT 5) as LowScoreQuestions,
+    (SELECT STRING_AGG(CONCAT(p.Title, ' (', p.ViewCount, ')'), '; ') FROM Posts p WHERE p.PostTypeId = 1 AND p.ViewCount <= (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) ORDER BY p.ViewCount ASC LIMIT 5) as LowViewQuestions,
+    (SELECT STRING_AGG(CONCAT(p.Title, ' (', p.CommentCount, ')'), '; ') FROM Posts p WHERE p.PostTypeId = 1 AND p.CommentCount <= (SELECT AVG(CommentCount) FROM Posts WHERE PostTypeId = 1) ORDER BY p.CommentCount ASC LIMIT 5) as LowCommentedQuestions,
+    (SELECT STRING_AGG(CONCAT(p.Title, ' (', p.AnswerCount, ')'), '; ') FROM Posts p WHERE p.PostTypeId = 1 AND p.AnswerCount <= (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId = 1) ORDER BY p.AnswerCount ASC LIMIT 5) as LowAnsweredQuestions
+FROM ComplexUserStats us
+WHERE us.UserId IN (
+    SELECT UserId FROM ComplexUserStats WHERE ReputationTier IN ('Elite', 'Veteran', 'Regular')
+)
+GROUP BY
+    'Performance Benchmark Report',
+    CURRENT_TIMESTAMP
+HAVING 
+    COUNT(*) > 1000
+    AND (SELECT COUNT(DISTINCT QuestionId) FROM TopQuestions) > 100
+    AND (SELECT COUNT(*) FROM TagAnalysis) > 500
+    AND (SELECT COUNT(*) FROM UserActivitySummary) > 10000
+    AND (SELECT COUNT(*) FROM ComplexUserStats) > 50000
+    AND STRING_AGG(us.DisplayName || ':' || us.ReputationTier || ':' || us.PostCount || ':' || us.BadgeCount, '|') IS NOT NULL
+    AND (SELECT SUM(AnswerCount) FROM TopQuestions) > 100000
+    AND (SELECT AVG(Score) FROM TopQuestions) > 200
+    AND (SELECT SUM(ViewCount) FROM TopQuestions) > 5000000
+    AND COUNT(DISTINCT us.UserId) FILTER (WHERE us.Reputation > 10000) > 100
+    AND COUNT(DISTINCT us.UserId) FILTER (WHERE us.Reputation >= 5000 AND us.Reputation <= 10000) > 500
+    AND COUNT(DISTINCT us.UserId) FILTER (WHERE us.Reputation >= 1000 AND us.Reputation < 5000) > 1000
+    AND COUNT(DISTINCT us.UserId) FILTER (WHERE us.Reputation < 1000) > 5000
+    AND AVG(us.Reputation) > 1000
+    AND MAX(us.Reputation) > 100000
+    AND MIN(us.Reputation) > 0
+    AND (SELECT AVG(TagCount) FROM TagAnalysis) > 100
+    AND (SELECT MAX(TagCount) FROM TagAnalysis) > 5000
+    AND (SELECT MIN(TagCount) FROM TagAnalysis) > 1
+    AND ROUND(COUNT(DISTINCT us.UserId) * 100.0 / (SELECT COUNT(*) FROM Users), 2) > 80
+    AND (SELECT STRING_AGG(t.TagName, ',') FROM Tags t WHERE t.Count > 500) IS NOT NULL
+    AND (SELECT STRING_AGG(t.TagName, ',') FROM Tags t WHERE t.Count BETWEEN 100 AND 500) IS NOT NULL
+    AND (SELECT STRING_AGG(t.TagName, ',') FROM Tags t WHERE t.Count < 100) IS NOT NULL
+    AND (SELECT STRING_AGG(CONCAT(p.Title, ' (', p.Score, ')'), '; ') FROM Posts p WHERE p.PostTypeId = 1 AND p.Score >= (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) ORDER BY p.Score DESC LIMIT 5) IS NOT NULL
+    AND (SELECT STRING_AGG(CONCAT(p.Title, ' (', p.ViewCount, ')'), '; ') FROM Posts p WHERE p.PostTypeId = 1 AND p.ViewCount >= (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) ORDER BY p.ViewCount DESC LIMIT 5) IS NOT NULL
+    AND (SELECT STRING_AGG(CONCAT(p.Title, ' (', p.CommentCount, ')'), '; ') FROM Posts p WHERE p.PostTypeId = 1 AND p.CommentCount >= (SELECT AVG(CommentCount) FROM Posts WHERE PostTypeId = 1) ORDER BY p.CommentCount DESC LIMIT 5) IS NOT NULL
+    AND (SELECT STRING_AGG(CONCAT(p.Title, ' (', p.AnswerCount, ')'), '; ') FROM Posts p WHERE p.PostTypeId = 1 AND p.AnswerCount >= (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId = 1) ORDER BY p.AnswerCount DESC LIMIT 5) IS NOT NULL
+    AND (SELECT STRING_AGG(CONCAT(p.Title, ' (', p.Score, ')'), '; ') FROM Posts p WHERE p.PostTypeId = 1 AND p.Score <= (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) ORDER BY p.Score ASC LIMIT 5) IS NOT NULL
+    AND (SELECT STRING_AGG(CONCAT(p.Title, ' (', p.ViewCount, ')'), '; ') FROM Posts p WHERE p.PostTypeId = 1 AND p.ViewCount <= (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) ORDER BY p.ViewCount ASC LIMIT 5) IS NOT NULL
+    AND (SELECT STRING_AGG(CONCAT(p.Title, ' (', p.CommentCount, ')'), '; ') FROM Posts p WHERE p.PostTypeId = 1 AND p.CommentCount <= (SELECT AVG(CommentCount) FROM Posts WHERE PostTypeId = 1) ORDER BY p.CommentCount ASC LIMIT 5) IS NOT NULL
+    AND (SELECT STRING_AGG(CONCAT(p.Title, ' (', p.AnswerCount, ')'), '; ') FROM Posts p WHERE p.PostTypeId = 1 AND p.AnswerCount <= (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId = 1) ORDER BY p.AnswerCount ASC LIMIT 5) IS NOT NULL;

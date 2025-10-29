@@ -1,0 +1,227 @@
+WITH UserActivityMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT C.Id) AS CommentCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceived,
+        SUM(CASE WHEN VP.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        COUNT(DISTINCT B.Id) FILTER (WHERE B.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT B.Id) FILTER (WHERE B.Class = 2) AS SilverBadges,
+        MAX(P.CreationDate) AS LatestPostDate,
+        MIN(P.CreationDate) AS EarliestPostDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId IN (1, 2)
+    LEFT JOIN Votes VP ON U.Id = VP.UserId AND VP.VoteTypeId IN (2, 3, 5)
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostHistoryAggregated AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        MAX(PH.CreationDate) AS LastHistoryDate,
+        (
+            SELECT AVG(EXTRACT(EPOCH FROM (current_ph.CreationDate - current_ph.PrevCreationDate)))
+            FROM (
+                SELECT
+                    ph_inner.CreationDate,
+                    LAG(ph_inner.CreationDate) OVER (PARTITION BY ph_inner.PostId ORDER BY ph_inner.CreationDate) AS PrevCreationDate
+                FROM PostHistory ph_inner
+                WHERE ph_inner.PostId = PH.PostId
+            ) current_ph
+            WHERE current_ph.PrevCreationDate IS NOT NULL
+        ) AS AvgTimeBetweenHistoryEventsSeconds,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        EXISTS (
+            SELECT 1 FROM PostHistory ph_mod
+            WHERE ph_mod.PostId = PH.PostId AND ph_mod.Comment ILIKE '%moderator%'
+        ) AS HasModeratorCommentHistory
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+ComplexPostAttributes AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS DirectCommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.Tags,
+        COALESCE(P.ViewCount, 0) + COALESCE(P.Score * 10, 0) + COALESCE(P.CommentCount * 5, 0) + COALESCE(P.FavoriteCount * 20, 0) AS CompositeEngagementScore,
+        LENGTH(P.Body) AS BodyLength,
+        COUNT(DISTINCT C.Id) AS TotalCommentsOnPost,
+        AVG(C.Score) AS AvgCommentScore,
+        COUNT(DISTINCT PL.RelatedPostId) FILTER (WHERE PL.LinkTypeId = 1) AS LinkedPostsCount,
+        COUNT(DISTINCT PL.RelatedPostId) FILTER (WHERE PL.LinkTypeId = 3) AS DuplicatePostsCount,
+        NULLIF(TRIM(LOWER(SUBSTRING(P.Tags FROM 2 FOR (CHAR_LENGTH(P.Tags) - 2)))), '') AS ParsedTagsString,
+        CASE
+            WHEN P.Tags LIKE '%<sql>%' OR P.Tags LIKE '%<database>%' OR P.Tags LIKE '%<performance>%' OR P.Tags LIKE '%<query-optimization>%' THEN TRUE
+            ELSE FALSE
+        END AS IsDatabaseRelated,
+        EXISTS (
+            SELECT 1 FROM Comments sc JOIN Users su ON sc.UserId = su.Id
+            WHERE sc.PostId = P.Id AND su.Reputation > 1000
+        ) AS HasHighRepCommenter,
+        (P.Title ILIKE '%performance%' OR P.Title ILIKE '%optimization%' OR P.Title ILIKE '%benchmark%' OR P.Title ILIKE '%speed%') AS TitleIndicatesPerformance,
+        (
+            SELECT COALESCE(AVG(sc_inner.Score), 0)
+            FROM Comments sc_inner
+            JOIN Posts p_inner ON sc_inner.PostId = p_inner.Id
+            WHERE p_inner.OwnerUserId = P.OwnerUserId
+              AND p_inner.CreationDate >= P.CreationDate - INTERVAL '1 year'
+              AND p_inner.CreationDate <= P.CreationDate
+        ) AS AvgOwnerCommentScoreLastYear
+    FROM Posts P
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.Tags, P.Body, P.Title
+),
+TopPerformingEntities AS (
+    SELECT
+        UAM.UserId,
+        UAM.DisplayName,
+        UAM.Reputation,
+        UAM.QuestionCount,
+        UAM.AnswerCount,
+        UAM.TotalUpvotesReceived,
+        CPA.PostId,
+        CPA.PostTypeId,
+        CPA.Score AS PostScore,
+        CPA.ViewCount AS PostViewCount,
+        CPA.BodyLength,
+        CPA.CompositeEngagementScore,
+        PHA.EditCount,
+        PHA.AvgTimeBetweenHistoryEventsSeconds,
+        CPA.IsDatabaseRelated,
+        CPA.TitleIndicatesPerformance,
+        PHA.HasModeratorCommentHistory,
+        RANK() OVER (PARTITION BY CPA.PostTypeId ORDER BY CPA.CompositeEngagementScore DESC, PHA.EditCount DESC) AS RankByEngagementAndEdits,
+        NTILE(10) OVER (ORDER BY UAM.Reputation DESC, UAM.TotalUpvotesReceived DESC) AS ReputationTier,
+        SUM(CPA.Score) OVER (PARTITION BY UAM.UserId ORDER BY CPA.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeUserScore,
+        (CAST(UAM.Reputation AS numeric) / NULLIF(EXTRACT(DAY FROM AGE(TIMESTAMP '2024-10-01 12:34:56', UAM.UserCreationDate)), 0)) AS ReputationPerDay,
+        COALESCE(UAM.GoldBadges * 100 + UAM.SilverBadges * 50, 0) AS BadgeValueScore,
+        (SELECT COUNT(DISTINCT T.TagName) FROM UNNEST(string_to_array(SUBSTRING(CPA.Tags FROM 2 FOR (CHAR_LENGTH(CPA.Tags) - 2)), '><')) AS T(TagName)) AS DistinctTagsCount,
+        EXISTS (
+            SELECT 1 FROM Badges b_inner
+            WHERE b_inner.UserId = UAM.UserId
+              AND b_inner.Class = 1
+              AND b_inner.Date > UAM.EarliestPostDate
+        ) AS HasLateGoldBadge
+    FROM UserActivityMetrics UAM
+    LEFT JOIN ComplexPostAttributes CPA ON UAM.UserId = CPA.OwnerUserId
+    LEFT JOIN PostHistoryAggregated PHA ON CPA.PostId = PHA.PostId
+    WHERE
+        UAM.Reputation > (SELECT COALESCE(AVG(Reputation), 0) * 5 FROM Users WHERE Id IS NOT NULL)
+        AND CPA.PostTypeId IN (1, 2)
+        AND (CPA.BodyLength > 500 OR CPA.TotalCommentsOnPost > 10 OR CPA.AvgOwnerCommentScoreLastYear > 5)
+        AND CPA.PostCreationDate >= DATE '2020-01-01'
+        AND CPA.ParsedTagsString IS NOT NULL
+        AND PHA.EditCount > 0
+),
+HighlyEngagedUsers AS (
+    SELECT
+        TPE.UserId,
+        TPE.DisplayName,
+        TPE.Reputation,
+        TPE.QuestionCount,
+        TPE.AnswerCount,
+        TPE.TotalUpvotesReceived,
+        TPE.PostId,
+        TPE.PostTypeId,
+        TPE.PostScore,
+        TPE.PostViewCount,
+        TPE.EditCount,
+        TPE.CompositeEngagementScore,
+        TPE.ReputationPerDay,
+        TPE.BadgeValueScore,
+        TPE.DistinctTagsCount,
+        TPE.HasLateGoldBadge
+    FROM TopPerformingEntities TPE
+    WHERE
+        TPE.ReputationTier = 1
+        AND TPE.RankByEngagementAndEdits <= 10
+        AND TPE.DistinctTagsCount > 5
+        AND TPE.HasLateGoldBadge IS TRUE
+),
+PerformanceRelatedContent AS (
+    SELECT
+        TPE.UserId,
+        TPE.DisplayName,
+        TPE.Reputation,
+        TPE.QuestionCount,
+        TPE.AnswerCount,
+        TPE.TotalUpvotesReceived,
+        TPE.PostId,
+        TPE.PostTypeId,
+        TPE.PostScore,
+        TPE.PostViewCount,
+        TPE.EditCount,
+        TPE.CompositeEngagementScore,
+        TPE.ReputationPerDay,
+        TPE.BadgeValueScore,
+        TPE.AvgTimeBetweenHistoryEventsSeconds,
+        TPE.IsDatabaseRelated,
+        TPE.TitleIndicatesPerformance,
+        TPE.HasModeratorCommentHistory
+    FROM TopPerformingEntities TPE
+    WHERE
+        (TPE.IsDatabaseRelated OR TPE.TitleIndicatesPerformance)
+        AND TPE.PostScore > 50
+        AND TPE.EditCount > 3
+        AND TPE.AvgTimeBetweenHistoryEventsSeconds IS NOT NULL
+        AND TPE.AvgTimeBetweenHistoryEventsSeconds < (3600 * 24 * 7)
+        AND TPE.HasModeratorCommentHistory IS TRUE
+)
+SELECT
+    HEU.UserId,
+    HEU.DisplayName,
+    'Highly Engaged User' AS Category,
+    HEU.Reputation,
+    HEU.QuestionCount,
+    HEU.AnswerCount,
+    HEU.TotalUpvotesReceived,
+    HEU.PostId,
+    HEU.PostTypeId,
+    HEU.PostScore,
+    HEU.PostViewCount,
+    HEU.EditCount,
+    HEU.CompositeEngagementScore,
+    HEU.ReputationPerDay,
+    HEU.BadgeValueScore
+FROM HighlyEngagedUsers HEU
+WHERE HEU.UserId IS NOT NULL
+UNION ALL
+SELECT
+    PRC.UserId,
+    PRC.DisplayName,
+    'Performance Content Contributor' AS Category,
+    PRC.Reputation,
+    PRC.QuestionCount,
+    PRC.AnswerCount,
+    PRC.TotalUpvotesReceived,
+    PRC.PostId,
+    PRC.PostTypeId,
+    PRC.PostScore,
+    PRC.PostViewCount,
+    PRC.EditCount,
+    PRC.CompositeEngagementScore,
+    PRC.ReputationPerDay,
+    PRC.BadgeValueScore
+FROM PerformanceRelatedContent PRC
+WHERE PRC.UserId IS NOT NULL
+ORDER BY Reputation DESC, CompositeEngagementScore DESC, PostId
+LIMIT 100;

@@ -1,0 +1,133 @@
+-- {"query": "7567.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1173} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        DATEDIFF(day, u.CreationDate, GETDATE()) as AccountAgeDays,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END as UserTier,
+        ISNULL(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) as QuestionCount,
+        ISNULL(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) as AnswerCount,
+        ISNULL(SUM(p.Score), 0) as TotalScore,
+        ISNULL(AVG(p.Score), 0) as AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        STRING_AGG(b.Name, ', ') within GROUP (ORDER BY b.Date) as BadgeNames,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) as ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) as RecentByType
+    FROM Posts p
+    LEFT JOIN Badges b ON p.OwnerUserId = b.UserId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId, p.PostTypeId, p.Tags
+),
+CommunityMetrics AS (
+    SELECT 
+        'Total Users' as MetricName,
+        COUNT(*) as MetricValue
+    FROM Users
+    
+    UNION ALL
+    
+    SELECT 
+        'Total Posts' as MetricName,
+        COUNT(*) as MetricValue
+    FROM Posts
+    
+    UNION ALL
+    
+    SELECT 
+        'Total Comments' as MetricName,
+        COUNT(*) as MetricValue
+    FROM Comments
+    
+    UNION ALL
+    
+    SELECT 
+        'Total Badges' as MetricName,
+        COUNT(*) as MetricValue
+    FROM Badges
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.PostCount,
+    uas.CommentCount,
+    uas.BadgeCount,
+    uas.VoteCount,
+    uas.UserTier,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.TotalScore,
+    uas.AvgPostScore,
+    uas.AccountAgeDays,
+    uas.LastPostDate,
+    uas.LastCommentDate,
+    uas.LastBadgeDate,
+    CASE 
+        WHEN uas.PostCount > 0 AND uas.CommentCount > 0 AND uas.BadgeCount > 0 
+        THEN 'High Engagement'
+        WHEN uas.PostCount > 0 OR uas.CommentCount > 0 OR uas.BadgeCount > 0 
+        THEN 'Moderate Engagement'
+        ELSE 'Low Engagement'
+    END as EngagementLevel,
+    tp.Title as TopPostTitle,
+    tp.Score as TopPostScore,
+    tp.ViewCount as TopPostViews,
+    tp.CommentCount as TopPostComments,
+    tp.VoteCount as TopPostVotes,
+    tp.ScoreRank,
+    tp.RecentByType,
+    tp.Tags as TopPostTags,
+    tp.BadgeNames as TopPostBadges,
+    ISNULL(cm.MetricValue, 0) as CommunityMetric
+FROM UserActivityStats uas
+LEFT JOIN TopPosts tp ON uas.UserId = tp.OwnerUserId AND tp.ScoreRank = 1
+LEFT JOIN CommunityMetrics cm ON 1=1
+WHERE 
+    uas.Reputation > 100
+    AND (uas.PostCount > 1 OR uas.CommentCount > 1 OR uas.BadgeCount > 1)
+    AND uas.AccountAgeDays > 30
+    AND (
+        uas.LastPostDate >= DATEADD(day, -30, GETDATE())
+        OR uas.LastCommentDate >= DATEADD(day, -30, GETDATE())
+        OR uas.LastBadgeDate >= DATEADD(day, -30, GETDATE())
+    )
+ORDER BY 
+    uas.TotalScore DESC,
+    uas.Reputation DESC,
+    uas.PostCount DESC,
+    uas.AccountAgeDays ASC
+OPTION (MAXDOP 4, RECOMPILE);

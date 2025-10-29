@@ -1,0 +1,155 @@
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.Count, t.IsModeratorOnly, t.IsRequired, 1 as Level
+    from Tags t
+    where t.IsRequired = 1
+    union all
+    select t2.Id, t2.TagName, t2.Count, t2.IsModeratorOnly, t2.IsRequired, r.Level + 1
+    from Tags t2
+    inner join RecursiveTagHierarchy r on t2.Id = (
+        select pt.RelatedPostId
+        from PostLinks pt
+        join Posts p on pt.PostId = p.Id
+        where p.PostTypeId = 1 and pt.LinkTypeId = 1 and pt.PostId = r.Id
+        order by pt.RelatedPostId
+        fetch first 1 row only
+    )
+    where r.Level < 5
+),
+UserActivityAndBadgeStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(b.BadgeCount,0) as TotalBadges,
+        coalesce(b.GoldBadges,0) as GoldBadges,
+        coalesce(b.SilverBadges,0) as SilverBadges,
+        coalesce(b.BronzeBadges,0) as BronzeBadges,
+        count(distinct p.Id) as QuestionsAsked,
+        count(distinct a.Id) as AnswersGiven,
+        avg(p.Score) filter (where p.PostTypeId = 1) as AvgQuestionScore,
+        avg(a.Score) filter (where a.PostTypeId = 2) as AvgAnswerScore,
+        max(p.CreationDate) as LastQuestionDate,
+        max(a.CreationDate) as LastAnswerDate
+    from Users u
+    left join (
+        select UserId, 
+            count(*) as BadgeCount,
+            sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+            sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+            sum(case when Class = 3 then 1 else 0 end) as BronzeBadges
+        from Badges
+        group by UserId
+    ) b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, b.BadgeCount, b.GoldBadges, b.SilverBadges, b.BronzeBadges
+),
+PostEngagement as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        coalesce(v.UpVotes, 0) as UpVotes,
+        coalesce(v.DownVotes, 0) as DownVotes,
+        coalesce(c.CommentCount,0) as CommentCount,
+        coalesce(pl.LinkedPostsCount,0) as LinkedPostsCount,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankByScore
+    from Posts p
+    left join (
+        select PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by PostId
+    ) v on v.PostId = p.Id
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) c on c.PostId = p.Id
+    left join (
+        select PostId, count(*) as LinkedPostsCount
+        from PostLinks
+        where LinkTypeId = 1
+        group by PostId
+    ) pl on pl.PostId = p.Id
+),
+ClosedQuestionsWithDetails as (
+    select 
+        p.Id,
+        p.Title,
+        u.DisplayName as OwnerDisplayName,
+        p.CreationDate,
+        p.ClosedDate,
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName
+    from Posts p
+    join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 and p.ClosedDate is not null
+)
+select 
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.TotalBadges,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.QuestionsAsked,
+    u.AnswersGiven,
+    coalesce(u.AvgQuestionScore,0) as AvgQuestionScore,
+    coalesce(u.AvgAnswerScore,0) as AvgAnswerScore,
+    p.PostCount,
+    p.AvgScore,
+    p.MaxScore,
+    p.MinScore,
+    p.TotalUpVotes,
+    p.TotalDownVotes,
+    p.TotalComments,
+    max(cq.ClosedDate) as LastClosedQuestionDate,
+    count(distinct cq.Id) as ClosedQuestionsCount,
+    string_agg(distinct coalesce(cq.CloseReasonName, 'Unknown'), ', ') filter (where cq.CloseReasonName is not null) as CloseReasonsEncountered
+from UserActivityAndBadgeStats u
+left join (
+    select OwnerUserId,
+        count(*) as PostCount,
+        avg(Score) as AvgScore,
+        max(Score) as MaxScore,
+        min(Score) as MinScore,
+        sum(UpVotes) as TotalUpVotes,
+        sum(DownVotes) as TotalDownVotes,
+        sum(CommentCount) as TotalComments
+    from PostEngagement
+    group by OwnerUserId
+) p on p.OwnerUserId = u.UserId
+left join ClosedQuestionsWithDetails cq on cq.OwnerDisplayName = u.DisplayName
+group by 
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.TotalBadges,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.QuestionsAsked,
+    u.AnswersGiven,
+    u.AvgQuestionScore,
+    u.AvgAnswerScore,
+    p.PostCount,
+    p.AvgScore,
+    p.MaxScore,
+    p.MinScore,
+    p.TotalUpVotes,
+    p.TotalDownVotes,
+    p.TotalComments
+having count(distinct cq.Id) > 0
+order by u.Reputation desc, ClosedQuestionsCount desc
+limit 100;

@@ -1,0 +1,200 @@
+-- {"query": "1437.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2841} 
+WITH UserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        CAST(u.UpVotes AS NUMERIC) / NULLIF(u.UpVotes + u.DownVotes, 0) AS UserUpvoteRatio,
+        COUNT(DISTINCT p.Id) AS TotalPostsByOwner,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 THEN 0 END) AS SilverBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.UpVotes, u.DownVotes
+),
+PostEditSummary AS (
+    WITH RelevantPostHistory AS (
+        SELECT
+            ph.Id,
+            ph.PostId,
+            ph.UserId,
+            ph.PostHistoryTypeId,
+            ph.CreationDate,
+            LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PrevEditDate
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (4, 5, 6, 8, 9) -- Edit Title, Body, Tags, Rollback Body/Tags
+    )
+    SELECT
+        rph.PostId,
+        COUNT(rph.Id) AS EditCount,
+        COUNT(DISTINCT rph.UserId) AS DistinctEditorCount,
+        MAX(rph.CreationDate) AS LatestEditHistoryDate,
+        MIN(ph_initial.CreationDate) AS InitialCreationHistoryDate,
+        SUM(CASE WHEN rph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS MajorEditCount,
+        SUM(CASE WHEN ph_close_del.PostHistoryTypeId IN (10,12) THEN 1 ELSE 0 END) AS CloseDeleteVotes,
+        AVG(EXTRACT(EPOCH FROM (rph.CreationDate - rph.PrevEditDate))) AS AvgSecondsBetweenEdits
+    FROM RelevantPostHistory rph
+    LEFT JOIN PostHistory ph_initial ON rph.PostId = ph_initial.PostId AND ph_initial.PostHistoryTypeId IN (1,2,3)
+    LEFT JOIN PostHistory ph_close_del ON rph.PostId = ph_close_del.PostId AND ph_close_del.PostHistoryTypeId IN (10,12)
+    GROUP BY rph.PostId
+),
+PostLinkDetails AS (
+    SELECT
+        pl.PostId AS LinkedPostId,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedToCount,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateOfCount,
+        ARRAY_AGG(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateOriginals
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+CommentStats AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS TotalComments,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        AVG(c.Score) AS AvgCommentScore,
+        SUM(CASE WHEN c.CreationDate > NOW() - INTERVAL '30 days' THEN 1 ELSE 0 END) AS RecentCommentCount
+    FROM Comments c
+    GROUP BY c.PostId
+),
+PostPerformanceRanking AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        (p.Score * 0.4 + p.ViewCount * 0.05 + COALESCE(p.AnswerCount, 0) * 0.15 + COALESCE(p.CommentCount, 0) * 0.2 + COALESCE(p.FavoriteCount, 0) * 0.2) AS WeightedPostScore,
+        CAST(p.ViewCount AS NUMERIC) / NULLIF(p.Score, 0) AS ViewScoreRatio,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY (p.Score * 0.4 + p.ViewCount * 0.05 + COALESCE(p.AnswerCount, 0) * 0.15 + COALESCE(p.CommentCount, 0) * 0.2 + COALESCE(p.FavoriteCount, 0) * 0.2) DESC) AS RankByWeightedScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS OwnerCumulativeAvgPostScore,
+        COUNT(p.Id) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate RANGE BETWEEN INTERVAL '90 days' PRECEDING AND CURRENT ROW) AS OwnerRecentPostCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2, 4, 5)
+)
+SELECT
+    p.Id AS PostId,
+    p.Title,
+    pt.Name AS PostTypeName,
+    u_owner.DisplayName AS OwnerDisplayName,
+    us_owner.Reputation AS OwnerReputation,
+    us_owner.UserUpvoteRatio AS OwnerUpvoteRatio,
+    us_owner.GoldBadges AS OwnerGoldBadges,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    -- Complex calculation for Post "Influence" Score
+    (
+        ppr.WeightedPostScore
+        + (us_owner.Reputation / 1000.0) * 0.1
+        + COALESCE(us_owner.UserUpvoteRatio, 0.5) * 50
+        + COALESCE(cs.RecentCommentCount, 0) * 2
+        + (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) * 0.5 -- Correlated Subquery
+    ) AS OverallInfluenceScore,
+    COALESCE(cs.TotalComments, 0) AS TotalComments,
+    COALESCE(cs.AvgCommentScore, 0.0) AS AvgCommentScore,
+    COALESCE(cs.LatestCommentDate, p.CreationDate) AS LatestCommentDate,
+    COALESCE(pes.EditCount, 0) AS TotalEditHistoryEntries,
+    COALESCE(pes.DistinctEditorCount, 0) AS DistinctEditorCount,
+    COALESCE(pes.MajorEditCount, 0) AS MajorBodyTagTitleEdits,
+    COALESCE(pes.AvgSecondsBetweenEdits, 0) AS AvgSecondsBetweenEdits,
+    COALESCE(pld.LinkedToCount, 0) AS LinkedPostCount,
+    COALESCE(pld.DuplicateOfCount, 0) AS DuplicatePostCount,
+    pld.DuplicateOriginals AS DuplicateOriginalPostIds,
+    -- String expression: Extract first tag and check for specific keywords
+    LOWER(SPLIT_PART(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><', 1)) AS FirstTag,
+    p.Tags,
+    -- NULL logic and CASE statement for detailed post status
+    CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'CLOSED_OR_RESOLVED'
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'ANSWERED_ACCEPTED'
+        WHEN p.LastEditorUserId IS NOT NULL AND p.LastEditDate > p.LastActivityDate - INTERVAL '7 days' THEN 'RECENTLY_EDITED_ACTIVE'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'COMMUNITY_WIKI'
+        ELSE 'OPEN_PENDING_ACTIVITY'
+    END AS DetailedPostStatus,
+    -- Correlated Subquery: average score of answers to this specific question, if it's a question
+    (
+        SELECT COALESCE(AVG(ans.Score), 0.0)
+        FROM Posts ans
+        WHERE ans.ParentId = p.Id AND ans.PostTypeId = 2
+    ) AS AvgScoreOfAnswersToThisQuestion,
+    -- Non-correlated Subquery: Check if post has any "offensive" or "spam" votes
+    EXISTS (
+        SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (4, 12)
+    ) AS HasNegativeModerationVotes,
+    -- LastEditor details with outer join and NULL handling
+    COALESCE(u_last_editor.DisplayName, 'N/A') AS LastEditorDisplayName,
+    u_last_editor.Reputation AS LastEditorReputation,
+    ppr.RankByWeightedScore,
+    ppr.OwnerCumulativeAvgPostScore,
+    ppr.OwnerRecentPostCount,
+    p.Body AS PostBodySample
+FROM
+    Posts p
+INNER JOIN
+    PostTypes pt ON p.PostTypeId = pt.Id
+INNER JOIN
+    Users u_owner ON p.OwnerUserId = u_owner.Id
+LEFT JOIN
+    Users u_last_editor ON p.LastEditorUserId = u_last_editor.Id
+LEFT JOIN
+    UserStats us_owner ON u_owner.Id = us_owner.UserId
+LEFT JOIN
+    UserStats us_last_editor ON u_last_editor.Id = us_last_editor.UserId
+LEFT JOIN
+    PostEditSummary pes ON p.Id = pes.PostId
+LEFT JOIN
+    PostLinkDetails pld ON p.Id = pld.LinkedPostId
+LEFT JOIN
+    CommentStats cs ON p.Id = cs.PostId
+INNER JOIN
+    PostPerformanceRanking ppr ON p.Id = ppr.PostId
+WHERE
+    p.CreationDate >= '2022-01-01'
+    AND p.CreationDate < NOW() - INTERVAL '30 days'
+    AND p.ViewCount > 5000
+    AND p.Score > 100
+    AND COALESCE(us_owner.Reputation, 0) > 1000
+    AND (
+        p.Tags ILIKE '%<sql>%' OR
+        p.Tags ILIKE '%<database>%' OR
+        p.Title ILIKE '%performance%' OR
+        p.Title ILIKE '%optimization%'
+    )
+    AND COALESCE(cs.TotalComments, 0) > 5
+    AND COALESCE(pes.DistinctEditorCount, 0) >= 2
+    AND COALESCE(ppr.ViewScoreRatio, 0) < 50
+    -- Correlated Subquery in WHERE: ensures post isn't vastly overshadowed by owner's other recent answers
+    AND p.Score > COALESCE((
+        SELECT MAX(p_other.Score) * 0.7
+        FROM Posts p_other
+        WHERE p_other.OwnerUserId = p.OwnerUserId
+          AND p_other.PostTypeId = 2
+          AND p_other.Id <> p.Id
+          AND p_other.CreationDate > p.CreationDate - INTERVAL '1 year'
+    ), 0)
+    -- Set Operator (EXCEPT) within a subquery in WHERE: filter out posts whose owners have
+    -- closed questions as duplicates but never reopened any.
+    AND p.OwnerUserId NOT IN (
+        SELECT ph_closed.UserId
+        FROM PostHistory ph_closed
+        WHERE ph_closed.PostHistoryTypeId = 10 -- Post Closed
+          AND ph_closed.Comment = '101' -- Specific close reason for 'Duplicate'
+          AND ph_closed.PostId IN (SELECT p_q.Id FROM Posts p_q WHERE p_q.PostTypeId = 1) -- Ensure it's a question
+        EXCEPT
+        SELECT ph_reopened.UserId
+        FROM PostHistory ph_reopened
+        WHERE ph_reopened.PostHistoryTypeId = 11 -- Post Reopened
+    )
+ORDER BY
+    OverallInfluenceScore DESC,
+    p.CreationDate DESC,
+    ppr.RankByWeightedScore ASC
+LIMIT 1000;

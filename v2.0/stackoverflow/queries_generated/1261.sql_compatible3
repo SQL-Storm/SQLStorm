@@ -1,0 +1,259 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersGiven,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        AVG(COALESCE(P.Score, 0)) AS AvgPostScore,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        MAX(P.LastActivityDate) AS LatestPostActivityDate,
+        MAX(C.CreationDate) AS LatestCommentDate,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        MAX(B.Date) AS LatestBadgeDate,
+        NTILE(5) OVER (ORDER BY U.Reputation DESC) AS ReputationTier
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        U.Views, U.UpVotes, U.DownVotes
+),
+PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.Body,
+        P.OwnerUserId,
+        P.LastActivityDate,
+        P.Title,
+        P.Tags,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        TRIM(SUBSTRING(P.Tags FROM POSITION('<' IN P.Tags) + 1 FOR POSITION('>' IN P.Tags) - POSITION('<' IN P.Tags) - 1)) AS PrimaryTag,
+        (DATE_PART('year', AGE(TIMESTAMP '2024-10-01 12:34:56', P.CreationDate)) * 12
+         + DATE_PART('month', AGE(TIMESTAMP '2024-10-01 12:34:56', P.CreationDate))) AS PostAgeMonths,
+        CASE
+            WHEN P.Body ILIKE '%performance%' OR P.Body ILIKE '%optimization%' OR P.Body ILIKE '%latency%' THEN TRUE
+            ELSE FALSE
+        END AS MentionsPerformance,
+        EXTRACT(EPOCH FROM (MIN(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4,5,6)) - P.CreationDate)) / 3600 AS HoursToFirstEdit,
+        COUNT(DISTINCT PH.UserId) FILTER (WHERE PH.PostHistoryTypeId IN (4,5,6) AND PH.UserId IS NOT NULL) AS UniqueEditors,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) = 1 AS WasReopened
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.AcceptedAnswerId, P.ParentId, P.CreationDate, P.Score,
+        P.ViewCount, P.Body, P.OwnerUserId, P.LastActivityDate, P.Title, P.Tags,
+        P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate
+),
+QuestionDerivedMetrics AS (
+    SELECT
+        Q.PostId AS QuestionId,
+        Q.OwnerUserId AS QuestionOwnerUserId,
+        Q.PostCreationDate AS QuestionCreationDate,
+        Q.PostScore AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        Q.AnswerCount AS QuestionAnswerCount,
+        Q.PostCommentCount AS QuestionCommentCount,
+        Q.FavoriteCount AS QuestionFavoriteCount,
+        Q.Title AS QuestionTitle,
+        Q.PrimaryTag,
+        Q.PostAgeMonths,
+        Q.MentionsPerformance,
+        Q.HoursToFirstEdit,
+        Q.UniqueEditors,
+        Q.WasReopened,
+        Q.AcceptedAnswerId AS AcceptedAnswerPostId,
+        A.PostId AS AnswerId,
+        A.OwnerUserId AS AnswerOwnerUserId,
+        A.PostScore AS AnswerScore,
+        A.PostCreationDate AS AnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY Q.PostId ORDER BY A.PostScore DESC, A.PostCreationDate DESC) AS AnswerScoreRank,
+        COALESCE(CAST(Q.AnswerCount AS NUMERIC) / NULLIF(Q.ViewCount, 0) * 100, 0) AS ViewToAnswerRatio,
+        EXTRACT(EPOCH FROM (PD_AA.PostCreationDate - Q.PostCreationDate)) / (24 * 3600) AS DaysToAcceptance,
+        Q.Tags,
+        Q.PostTypeId
+    FROM PostHistoricalMetrics Q
+    LEFT JOIN PostHistoricalMetrics A ON Q.PostId = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN PostHistoricalMetrics PD_AA ON Q.AcceptedAnswerId = PD_AA.PostId AND Q.PostTypeId = 1
+    WHERE Q.PostTypeId = 1
+)
+SELECT
+    QDM.QuestionId,
+    QDM.QuestionTitle,
+    QDM.PrimaryTag,
+    QDM.QuestionCreationDate,
+    QDM.QuestionScore,
+    QDM.QuestionViewCount,
+    QDM.QuestionAnswerCount,
+    QDM.QuestionFavoriteCount,
+    QDM.MentionsPerformance,
+    QDM.DaysToAcceptance,
+    QDM.ViewToAnswerRatio,
+    QDM.HoursToFirstEdit,
+    QDM.UniqueEditors,
+    QDM.WasReopened,
+    UES_Q.DisplayName AS QuestionOwnerDisplayName,
+    UES_Q.Reputation AS QuestionOwnerReputation,
+    UES_Q.TotalQuestionsAsked AS QuestionOwnerTotalQuestions,
+    UES_Q.ReputationTier AS QuestionOwnerReputationTier,
+    UES_A.DisplayName AS AcceptedAnswerOwnerDisplayName,
+    UES_A.Reputation AS AcceptedAnswerOwnerReputation,
+    UES_A.TotalAnswersGiven AS AcceptedAnswerOwnerTotalAnswers,
+    QDM.AnswerScore AS TopAnswerScore,
+    QDM.AnswerCreationDate AS TopAnswerCreationDate,
+    (
+        SELECT AVG(P_UO.Score)
+        FROM Posts P_UO
+        WHERE P_UO.OwnerUserId = QDM.QuestionOwnerUserId AND P_UO.Id != QDM.QuestionId
+          AND P_UO.CreationDate < QDM.QuestionCreationDate
+          AND P_UO.Score IS NOT NULL
+    ) AS AvgQuestionOwnerOtherPostScore,
+    EXISTS (
+        SELECT 1
+        FROM Comments C_Link
+        WHERE C_Link.PostId = QDM.QuestionId
+          AND (C_Link.Text ILIKE '%http://%' OR C_Link.Text ILIKE '%https://%')
+    ) AS HasExternalLinkInComments,
+    (
+        COALESCE(QDM.QuestionScore, 0) * 1.5
+        + COALESCE(QDM.QuestionFavoriteCount, 0) * 2.0
+        + COALESCE(QDM.QuestionViewCount, 0) / 100.0
+        + (CASE WHEN QDM.AcceptedAnswerPostId IS NOT NULL THEN 100 ELSE 0 END)
+        - (CASE WHEN QDM.PostAgeMonths > 12 THEN (QDM.PostAgeMonths - 12) * 5 ELSE 0 END)
+        + (CASE WHEN QDM.MentionsPerformance THEN 50 ELSE 0 END)
+        + (CASE WHEN QDM.WasReopened THEN 25 ELSE 0 END)
+    ) AS HotnessScore,
+    SUM(QDM.AnswerScore) OVER (PARTITION BY QDM.QuestionId ORDER BY QDM.AnswerCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) /
+    NULLIF(SUM(QDM.AnswerScore) OVER (PARTITION BY QDM.QuestionId), 0) * 100 AS CumulativeAnswerScorePercent,
+    CASE
+        WHEN QDM.Tags ILIKE '%<javascript>%' AND QDM.Tags ILIKE '%<node.js>%' THEN 'JavaScript/Node.js Stack'
+        WHEN QDM.Tags ILIKE '%<python>%' AND QDM.Tags ILIKE '%<django>%' THEN 'Python/Django Stack'
+        WHEN QDM.Tags ILIKE '%<c#>%<asp.net-core>%' THEN 'C#/.NET Core Stack'
+        WHEN QDM.Tags ILIKE '%<java>%' AND QDM.Tags ILIKE '%<spring>%' THEN 'Java/Spring Stack'
+        ELSE 'Other/Mixed Stack'
+    END AS TechStackCategory,
+    (
+        SELECT MAX(DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - PHC.CreationDate))
+        FROM PostHistory PHC
+        WHERE PHC.PostId = QDM.QuestionId
+        AND PHC.PostHistoryTypeId = 10
+    ) AS DaysSinceLastClosedVote
+FROM QuestionDerivedMetrics QDM
+LEFT JOIN UserEngagementSummary UES_Q ON QDM.QuestionOwnerUserId = UES_Q.UserId
+LEFT JOIN UserEngagementSummary UES_A ON QDM.AnswerOwnerUserId = UES_A.UserId
+WHERE
+    QDM.PostTypeId = 1
+    AND QDM.AnswerScoreRank = 1
+    AND QDM.QuestionViewCount > 10000
+    AND QDM.QuestionAnswerCount >= 3
+    AND QDM.QuestionFavoriteCount > 50
+    AND QDM.QuestionCreationDate BETWEEN TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5 year' AND TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 month'
+    AND (UES_Q.Reputation IS NULL OR UES_Q.Reputation > 1000)
+    AND QDM.WasReopened = FALSE
+    AND (
+        SELECT COUNT(DISTINCT PH_Edit.UserId)
+        FROM PostHistory PH_Edit
+        WHERE PH_Edit.PostId = QDM.QuestionId
+          AND PH_Edit.PostHistoryTypeId IN (4, 5, 6)
+          AND PH_Edit.UserId IS NOT NULL
+    ) >= 2
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostLinks PL_Dup
+        WHERE PL_Dup.PostId = QDM.QuestionId
+          AND PL_Dup.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate')
+    )
+    AND (QDM.PrimaryTag IS NULL OR QDM.PrimaryTag NOT ILIKE '%obsolete%')
+
+UNION ALL
+
+SELECT
+    QDM_ALT.PostId AS QuestionId,
+    QDM_ALT.Title AS QuestionTitle,
+    QDM_ALT.PrimaryTag,
+    QDM_ALT.PostCreationDate AS QuestionCreationDate,
+    QDM_ALT.PostScore AS QuestionScore,
+    QDM_ALT.ViewCount AS QuestionViewCount,
+    QDM_ALT.AnswerCount AS QuestionAnswerCount,
+    QDM_ALT.FavoriteCount AS QuestionFavoriteCount,
+    QDM_ALT.MentionsPerformance,
+    NULL AS DaysToAcceptance,
+    COALESCE(CAST(QDM_ALT.AnswerCount AS NUMERIC) / NULLIF(QDM_ALT.ViewCount, 0) * 100, 0) AS ViewToAnswerRatio,
+    QDM_ALT.HoursToFirstEdit,
+    QDM_ALT.UniqueEditors,
+    QDM_ALT.WasReopened,
+    UES_Q_ALT.DisplayName AS QuestionOwnerDisplayName,
+    UES_Q_ALT.Reputation AS QuestionOwnerReputation,
+    UES_Q_ALT.TotalQuestionsAsked AS QuestionOwnerTotalQuestions,
+    UES_Q_ALT.ReputationTier AS QuestionOwnerReputationTier,
+    NULL AS AcceptedAnswerOwnerDisplayName,
+    NULL AS AcceptedAnswerOwnerReputation,
+    NULL AS AcceptedAnswerOwnerTotalAnswers,
+    NULL AS TopAnswerScore,
+    NULL AS TopAnswerCreationDate,
+    (
+        SELECT AVG(P_UO_ALT.Score)
+        FROM Posts P_UO_ALT
+        WHERE P_UO_ALT.OwnerUserId = QDM_ALT.OwnerUserId AND P_UO_ALT.Id != QDM_ALT.PostId
+          AND P_UO_ALT.CreationDate < QDM_ALT.PostCreationDate
+          AND P_UO_ALT.Score IS NOT NULL
+    ) AS AvgQuestionOwnerOtherPostScore,
+    EXISTS (
+        SELECT 1
+        FROM Comments C_Link_ALT
+        WHERE C_Link_ALT.PostId = QDM_ALT.PostId
+          AND (C_Link_ALT.Text ILIKE '%http://%' OR C_Link_ALT.Text ILIKE '%https://%')
+    ) AS HasExternalLinkInComments,
+    (
+        COALESCE(QDM_ALT.PostScore, 0) * 1.0
+        + COALESCE(QDM_ALT.PostCommentCount, 0) * 5.0
+        + COALESCE(QDM_ALT.ViewCount, 0) / 500.0
+        + (CASE WHEN QDM_ALT.MentionsPerformance THEN 20 ELSE 0 END)
+        + (CASE WHEN QDM_ALT.PostAgeMonths < 6 THEN 30 ELSE 0 END)
+    ) AS HotnessScore,
+    NULL AS CumulativeAnswerScorePercent,
+    CASE
+        WHEN QDM_ALT.Tags ILIKE '%<security>%' OR QDM_ALT.Tags ILIKE '%<privacy>%' THEN 'Security/Privacy Topic'
+        WHEN QDM_ALT.Tags ILIKE '%<data-science>%' OR QDM_ALT.Tags ILIKE '%<machine-learning>%' THEN 'Data Science/ML Topic'
+        ELSE 'General Discussion Topic'
+    END AS TechStackCategory,
+    (
+        SELECT MAX(DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - PHC_ALT.CreationDate))
+        FROM PostHistory PHC_ALT
+        WHERE PHC_ALT.PostId = QDM_ALT.PostId
+        AND PHC_ALT.PostHistoryTypeId = 10
+    ) AS DaysSinceLastClosedVote
+FROM PostHistoricalMetrics QDM_ALT
+LEFT JOIN UserEngagementSummary UES_Q_ALT ON QDM_ALT.OwnerUserId = UES_Q_ALT.UserId
+WHERE
+    QDM_ALT.PostTypeId = 1
+    AND QDM_ALT.PostCommentCount >= 20
+    AND QDM_ALT.ViewCount BETWEEN 1000 AND 10000
+    AND QDM_ALT.PostAgeMonths <= 12
+    AND QDM_ALT.ClosedDate IS NULL
+    AND QDM_ALT.AcceptedAnswerId IS NULL
+    AND EXISTS (
+        SELECT 1
+        FROM Comments C_Recent
+        WHERE C_Recent.PostId = QDM_ALT.PostId
+          AND C_Recent.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 month'
+    )
+ORDER BY HotnessScore DESC, QuestionCreationDate DESC
+LIMIT 1000;

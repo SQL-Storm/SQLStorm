@@ -1,0 +1,215 @@
+WITH UserAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        u.DisplayName,
+        u.Location,
+        COUNT(DISTINCT p.Id) AS TotalOwnedPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS OwnedQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS OwnedAnswers,
+        SUM(p.Score) AS TotalOwnedPostScore,
+        SUM(p.ViewCount) AS TotalOwnedPostViews,
+        SUM(p.AnswerCount) AS TotalAnswersOnOwnedQuestions,
+        SUM(p.FavoriteCount) AS TotalOwnedPostFavorites,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        (
+            SELECT cc.Text
+            FROM Comments cc
+            WHERE cc.UserId = u.Id
+            ORDER BY cc.CreationDate DESC
+            LIMIT 1
+        ) AS LatestCommentTextByUser
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes, u.DisplayName, u.Location
+),
+PostDetailsWithHistory AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.CommentCount AS PostCommentCount,
+        COALESCE(p.Title, SUBSTR(p.Body, 1, 100) || '...') AS PostTitleOrExcerpt,
+        CASE
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+            THEN (
+                SELECT ARRAY_AGG(TRIM(tag))
+                FROM UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS t(tag)
+            )
+            ELSE CAST(ARRAY[] AS VARCHAR[]) 
+        END AS ParsedTags,
+        p.AcceptedAnswerId,
+        EXISTS (
+            SELECT 1
+            FROM PostHistory ph_close
+            WHERE ph_close.PostId = p.Id
+              AND ph_close.PostHistoryTypeId = 10
+              AND ph_close.Comment IN ('101', '102')
+        ) AS IsClosedDueToDuplicateOrOffTopic,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEntries,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN 1 ELSE 0 END) AS TotalEditHistoryEvents,
+        EXISTS (
+            SELECT 1
+            FROM Comments co_corr
+            WHERE co_corr.PostId = p.Id AND co_corr.Text ILIKE '%bug%'
+        ) AS HasBugComment
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.Body, p.Tags, p.AcceptedAnswerId
+),
+PostVoteSummary AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotes
+    FROM Votes v
+    WHERE v.VoteTypeId IN (1, 2, 3, 5)
+    GROUP BY v.PostId
+),
+UserPostTrends AS (
+    SELECT
+        pdh.OwnerUserId AS UserId,
+        pdh.PostId,
+        pdh.PostCreationDate,
+        pdh.PostScore,
+        COALESCE(pvs.UpVotesReceived, 0) AS PostUpVotes,
+        COALESCE(pvs.DownVotesReceived, 0) AS PostDownVotes,
+        COALESCE(pvs.AcceptedVotes, 0) AS PostAcceptedVotes,
+        AVG(pdh.PostScore) OVER (
+            PARTITION BY pdh.OwnerUserId
+            ORDER BY pdh.PostCreationDate
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS RollingAvgPostScoreLast30Days,
+        LAG(pdh.PostScore, 1, 0) OVER (PARTITION BY pdh.OwnerUserId ORDER BY pdh.PostCreationDate) AS PreviousPostScore
+    FROM PostDetailsWithHistory pdh
+    LEFT JOIN PostVoteSummary pvs ON pdh.PostId = pvs.PostId
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.LastAccessDate,
+    ua.UserProfileViews,
+    ua.UserUpVotes,
+    ua.UserDownVotes,
+    ua.TotalOwnedPosts,
+    ua.OwnedQuestions,
+    ua.OwnedAnswers,
+    ua.TotalOwnedPostScore,
+    ua.TotalOwnedPostViews,
+    ua.TotalAnswersOnOwnedQuestions,
+    ua.TotalOwnedPostFavorites,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.TotalCommentsMade,
+    ua.LatestCommentTextByUser,
+    ua.Location,
+    SUM(upt.PostUpVotes) AS TotalUpVotesOnOwnedPosts,
+    SUM(upt.PostDownVotes) AS TotalDownVotesOnOwnedPosts,
+    SUM(upt.PostAcceptedVotes) AS TotalAcceptedAnswersContributed,
+    COALESCE(AVG(upt.RollingAvgPostScoreLast30Days), 0) AS OverallAvgRollingPostScore,
+    CAST(
+        (
+            EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - ua.LastAccessDate)) / (60 * 60 * 24) * -0.1 +
+            EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - ua.UserCreationDate)) / (60 * 60 * 24) * 0.01 +
+            COALESCE(ua.OwnedQuestions + ua.OwnedAnswers, 0) * 0.5 +
+            COALESCE(ua.TotalCommentsMade, 0) * 0.2
+        ) AS NUMERIC(10,2)
+    ) AS UserActivityScore,
+    (
+        ua.Reputation * 0.4 +
+        COALESCE(ua.TotalOwnedPostScore, 0) * 0.2 +
+        COALESCE(ua.GoldBadges, 0) * 10 +
+        COALESCE(ua.SilverBadges, 0) * 5 +
+        COALESCE(ua.BronzeBadges, 0) * 1 +
+        COALESCE(ua.TotalCommentsMade, 0) * 0.05 +
+        COALESCE(SUM(upt.PostUpVotes), 0) * 0.1 -
+        COALESCE(SUM(upt.PostDownVotes), 0) * 0.05 -
+        COALESCE(SUM(CASE WHEN pdh.HasBugComment THEN 1 ELSE 0 END), 0) * 2
+    ) AS InfluenceScore,
+    RANK() OVER (
+        ORDER BY
+            (
+                ua.Reputation * 0.4 +
+                COALESCE(ua.TotalOwnedPostScore, 0) * 0.2 +
+                COALESCE(ua.GoldBadges, 0) * 10 +
+                COALESCE(ua.SilverBadges, 0) * 5 +
+                COALESCE(ua.BronzeBadges, 0) * 1 +
+                COALESCE(ua.TotalCommentsMade, 0) * 0.05 +
+                COALESCE(SUM(upt.PostUpVotes), 0) * 0.1 -
+                COALESCE(SUM(upt.PostDownVotes), 0) * 0.05 -
+                COALESCE(SUM(CASE WHEN pdh.HasBugComment THEN 1 ELSE 0 END), 0) * 2
+            ) DESC, ua.UserId
+    ) AS InfluenceRank,
+    CASE
+        WHEN ua.OwnedQuestions > ua.OwnedAnswers * 2 AND ua.OwnedQuestions > 5 THEN 'Question-Focused'
+        WHEN ua.OwnedAnswers > ua.OwnedQuestions * 2 AND ua.OwnedAnswers > 5 THEN 'Answer-Focused'
+        WHEN ua.OwnedQuestions > 0 OR ua.OwnedAnswers > 0 THEN 'Balanced Contributor'
+        ELSE 'Observer'
+    END AS ContributionFocus,
+    (
+        SELECT STRING_AGG(tag_unnested, ', ')
+        FROM PostDetailsWithHistory pdh_tags, UNNEST(pdh_tags.ParsedTags) AS tag_unnested
+        WHERE pdh_tags.OwnerUserId = ua.UserId
+        GROUP BY pdh_tags.OwnerUserId
+        ORDER BY COUNT(tag_unnested) DESC
+        LIMIT 5
+    ) AS Top5TagsByPosts
+FROM UserAggregates ua
+LEFT JOIN UserPostTrends upt ON ua.UserId = upt.UserId
+LEFT JOIN PostDetailsWithHistory pdh ON upt.PostId = pdh.PostId
+WHERE
+    ua.Reputation > 500 AND
+    ua.TotalOwnedPosts > 5 AND
+    (ua.GoldBadges > 0 OR ua.SilverBadges > 0) AND
+    (ua.Location IS NOT NULL AND ua.Location <> '') AND
+    ua.DisplayName IS NOT NULL AND LENGTH(ua.DisplayName) > 2 AND
+    EXISTS (
+        SELECT 1
+        FROM Posts p_high_view
+        WHERE p_high_view.OwnerUserId = ua.UserId
+          AND p_high_view.PostTypeId = 1
+          AND p_high_view.ViewCount > 10000
+          AND p_high_view.Score > 50
+    ) AND
+    NOT EXISTS (
+        SELECT 1
+        FROM Posts p_low_score
+        WHERE p_low_score.OwnerUserId = ua.UserId
+        GROUP BY p_low_score.OwnerUserId
+        HAVING AVG(p_low_score.Score) < -5
+    )
+GROUP BY
+    ua.UserId, ua.DisplayName, ua.Reputation, ua.UserCreationDate, ua.LastAccessDate, ua.UserProfileViews,
+    ua.UserUpVotes, ua.UserDownVotes, ua.TotalOwnedPosts, ua.OwnedQuestions, ua.OwnedAnswers,
+    ua.TotalOwnedPostScore, ua.TotalOwnedPostViews, ua.TotalAnswersOnOwnedQuestions,
+    ua.TotalOwnedPostFavorites, ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges,
+    ua.TotalCommentsMade, ua.LatestCommentTextByUser, ua.Location
+HAVING
+    COALESCE(SUM(upt.PostUpVotes), 0) > COALESCE(SUM(upt.PostDownVotes), 0) * 1.5 AND
+    COALESCE(AVG(upt.RollingAvgPostScoreLast30Days), 0) > 0
+ORDER BY
+    InfluenceRank ASC, UserActivityScore DESC
+LIMIT 100;

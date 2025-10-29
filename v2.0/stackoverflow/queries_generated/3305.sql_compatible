@@ -1,0 +1,142 @@
+WITH
+UserPostAgg AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL) AS QuestionsWithAccepted,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p
+        ON p.OwnerUserId = u.Id
+           AND (p.Score IS NULL OR p.Score > 0)
+           AND (p.ClosedDate IS NULL OR p.ClosedDate > CAST('2024-10-01' AS date) - INTERVAL '1 year')
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserBadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVoteAgg AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    JOIN Posts p ON p.Id = v.PostId
+    GROUP BY p.OwnerUserId
+),
+UserTagRank AS (
+    SELECT
+        u.Id AS UserId,
+        t.TagName,
+        COUNT(*) AS AnsweredCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Users u
+    JOIN Posts p
+        ON p.OwnerUserId = u.Id
+           AND p.PostTypeId = 2
+    LEFT JOIN LATERAL (
+        SELECT TRIM(BOTH '<>' FROM tg) AS Tag
+        FROM UNNEST(string_to_array(p.Tags, '><')) AS tg
+    ) AS taglist ON TRUE
+    JOIN Tags t ON t.TagName = taglist.Tag
+    GROUP BY u.Id, t.TagName
+),
+QuestionAnswerTiming AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwner,
+        MIN(a.CreationDate) - q.CreationDate AS TimeToFirstAnswer,
+        MIN(a.CreationDate) AS FirstAnswerDate
+    FROM Posts q
+    LEFT JOIN Posts a
+        ON a.ParentId = q.Id
+           AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.OwnerUserId
+),
+UserTimingAgg AS (
+    SELECT
+        qa.QuestionOwner AS UserId,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM qa.TimeToFirstAnswer)) AS MedianAnswerLagSec,
+        AVG(EXTRACT(EPOCH FROM qa.TimeToFirstAnswer)) AS AvgAnswerLagSec
+    FROM QuestionAnswerTiming qa
+    WHERE qa.TimeToFirstAnswer IS NOT NULL
+    GROUP BY qa.QuestionOwner
+)
+SELECT
+    upa.Id,
+    upa.DisplayName,
+    upa.Reputation,
+    upa.QuestionCount,
+    upa.AnswerCount,
+    upa.QuestionsWithAccepted,
+    ROUND(CAST(upa.AvgScore AS numeric), 2) AS AvgScore,
+    ub.BadgeCount,
+    ub.GoldBadges,
+    ub.LastBadgeDate,
+    uv.UpVotes,
+    uv.DownVotes,
+    ut.MedianAnswerLagSec,
+    ut.AvgAnswerLagSec,
+    CASE
+        WHEN upa.AnswerCount = 0 THEN NULL
+        ELSE CAST(upa.AnswerCount AS double precision) / NULLIF(upa.QuestionCount, 0)
+    END AS AnswerToQuestionRatio,
+    COALESCE(upa.LastPostDate, CAST('1970-01-01' AS timestamp)) AS LastPostDate,
+    NULL AS TagName,
+    NULL AS AnsweredCount,
+    NULL AS TagRank,
+    NULL AS Dummy1,
+    NULL AS Dummy2,
+    NULL AS Dummy3,
+    NULL AS Dummy4
+FROM UserPostAgg upa
+LEFT JOIN UserBadgeAgg ub   ON ub.UserId = upa.Id
+LEFT JOIN UserVoteAgg uv    ON uv.UserId = upa.Id
+LEFT JOIN UserTimingAgg ut  ON ut.UserId = upa.Id
+WHERE upa.Reputation > 1000
+   OR COALESCE(ub.GoldBadges, 0) > 0
+   OR upa.AnswerCount > 50
+
+UNION ALL
+
+SELECT
+    utr.UserId,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    utr.TagName,
+    utr.AnsweredCount,
+    utr.TagRank,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM UserTagRank utr
+WHERE utr.TagRank = 1
+  AND utr.AnsweredCount >= 10
+
+ORDER BY 1, 13 DESC;

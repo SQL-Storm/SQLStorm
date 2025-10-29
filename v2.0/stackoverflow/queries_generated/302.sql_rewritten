@@ -1,0 +1,300 @@
+-- {"query": "302.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2829} 
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    u.websiteurl,
+    coalesce(nullif(trim(u.aboutme), ''), '(no bio)') as aboutme_norm,
+    row_number() over (order by u.creationdate desc, u.id desc) as rn_newest
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+badge_rollup as (
+  select
+    b.userid,
+    count(*) as total_badges,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    min(b.date) as first_badge_date,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+posts_enriched as (
+  select
+    p.id,
+    p.posttypeid,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.commentcount,
+    p.favoritecount,
+    p.acceptedanswerid,
+    p.parentid,
+    p.title,
+    p.tags,
+    coalesce(p.lastactivitydate, p.creationdate) as activity_ts,
+    case
+      when p.posttypeid = 1 then 'Question'
+      when p.posttypeid = 2 then 'Answer'
+      else 'Other'
+    end as posttype_name,
+    (p.score * greatest(p.viewcount, 1))::bigint as score_view_product
+  from posts p
+),
+user_activity as (
+  select
+    u.id as user_id,
+    count(*) filter (where p.posttypeid = 1) as question_count,
+    count(*) filter (where p.posttypeid = 2) as answer_count,
+    sum(p.score) as total_score,
+    avg(nullif(p.score, 0)) as avg_nonzero_score,
+    max(p.viewcount) as max_views,
+    sum(case when p.acceptedanswerid is not null then 1 else 0 end) as questions_with_accepted,
+    min(p.creationdate) as first_post_date,
+    max(p.creationdate) as last_post_date
+  from users u
+  left join posts_enriched p on p.owneruserid = u.id
+  group by u.id
+),
+comment_stats as (
+  select
+    p.owneruserid as user_id,
+    count(c.id) as comment_count,
+    coalesce(sum(c.score), 0) as comment_score_sum,
+    max(c.creationdate) as last_comment_date
+  from posts p
+  left join comments c on c.postid = p.id
+  group by p.owneruserid
+),
+vote_breakdown as (
+  select
+    p.owneruserid as user_id,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_rcvd,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_rcvd,
+    sum(case when v.votetypeid = 1 then 1 else 0 end) as accepts_rcvd,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites_rcvd
+  from posts p
+  left join votes v on v.postid = p.id
+  group by p.owneruserid
+),
+duplicate_links as (
+  select
+    pl.relatedpostid as canonical_qid,
+    count(*) as dup_count
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.relatedpostid
+),
+closed_reasons as (
+  select
+    ph.postid,
+    max(ph.creationdate) as latest_closed_date,
+    (regexp_replace(coalesce(ph.comment, ''), '[^0-9]', '', 'g'))::int as close_reason_id
+  from posthistory ph
+  where ph.posthistorytypeid = 10
+  group by ph.postid, (regexp_replace(coalesce(ph.comment, ''), '[^0-9]', '', 'g'))
+),
+question_quality as (
+  select
+    q.id as qid,
+    q.owneruserid as user_id,
+    q.score,
+    q.viewcount,
+    q.answercount,
+    q.title,
+    q.tags,
+    coalesce(dl.dup_count, 0) as dup_inbound_count,
+    case
+      when cr.close_reason_id in (101, 1) then 'Duplicate'
+      when cr.close_reason_id in (102, 2) then 'Off-topic'
+      when cr.close_reason_id in (103) then 'Needs details/clarity'
+      when cr.close_reason_id in (104) then 'Needs more focus'
+      when cr.close_reason_id in (105, 3, 4, 7, 10, 20) then 'Other'
+      else null
+    end as last_close_bucket,
+    row_number() over (partition by q.owneruserid order by q.score desc nulls last, q.viewcount desc nulls last, q.id) as rn_best_by_user
+  from posts_enriched q
+  left join duplicate_links dl on dl.canonical_qid = q.id
+  left join closed_reasons cr on cr.postid = q.id
+  where q.posttypeid = 1
+),
+answer_accept_ratio as (
+  select
+    a.owneruserid as user_id,
+    count(*) as answers_given,
+    sum(case when a.id = q.acceptedanswerid then 1 else 0 end) as answers_accepted,
+    case when count(*) > 0 then sum(case when a.id = q.acceptedanswerid then 1 else 0 end)::decimal / count(*) else null end as accept_rate
+  from posts_enriched a
+  join posts_enriched q on q.id = a.parentid and q.posttypeid = 1
+  where a.posttypeid = 2
+  group by a.owneruserid
+),
+top_tags as (
+  select
+    q.owneruserid as user_id,
+    unnest(string_to_array(substring(q.tags from 2 for char_length(q.tags)-2), '><')) as tagname
+  from posts_enriched q
+  where q.posttypeid = 1 and q.tags is not null and char_length(q.tags) > 2
+),
+tag_rank as (
+  select
+    user_id,
+    tagname,
+    count(*) as tag_count,
+    row_number() over (partition by user_id order by count(*) desc, tagname) as rn
+  from top_tags
+  group by user_id, tagname
+),
+user_top_tag as (
+  select user_id, tagname as top_tag, tag_count
+  from tag_rank
+  where rn = 1
+),
+activity_window as (
+  select
+    p.owneruserid as user_id,
+    p.id as post_id,
+    p.posttypeid,
+    p.activity_ts,
+    count(*) over (partition by p.owneruserid) as posts_by_user,
+    lag(p.activity_ts) over (partition by p.owneruserid order by p.activity_ts) as prev_activity_ts,
+    lead(p.activity_ts) over (partition by p.owneruserid order by p.activity_ts) as next_activity_ts
+  from posts_enriched p
+),
+inactivity_gaps as (
+  select
+    user_id,
+    max(extract(epoch from (activity_ts - prev_activity_ts))) as max_gap_seconds
+  from activity_window
+  where prev_activity_ts is not null
+  group by user_id
+),
+recent_hot_candidates as (
+  select
+    q.qid,
+    q.user_id,
+    q.title,
+    q.viewcount,
+    q.score,
+    q.dup_inbound_count,
+    q.last_close_bucket,
+    (q.viewcount::numeric / nullif(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - (select min(creationdate) from posts where id = q.qid))) / 3600.0, 0)) as views_per_hour_since_post
+  from question_quality q
+  where q.rn_best_by_user <= 3
+),
+user_core as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.creationdate,
+    ru.location,
+    ru.websiteurl,
+    ru.aboutme_norm,
+    ru.rn_newest
+  from recent_users ru
+  where ru.rn_newest <= 1000
+),
+score_percentiles as (
+  select
+    qa.user_id,
+    percentile_cont(0.5) within group (order by qa.score) as p50_score,
+    percentile_cont(0.9) within group (order by qa.score) as p90_score
+  from (
+    select user_id, score
+    from question_quality
+    union all
+    select owneruserid as user_id, score
+    from posts_enriched
+    where posttypeid = 2
+  ) qa
+  group by qa.user_id
+),
+heaviest_posts as (
+  select
+    p.owneruserid as user_id,
+    p.id as post_id,
+    p.score_view_product,
+    dense_rank() over (partition by p.owneruserid order by p.score_view_product desc nulls last, p.id) as dr
+  from posts_enriched p
+  where p.posttypeid in (1,2)
+)
+select
+  uc.user_id,
+  uc.displayname,
+  uc.reputation,
+  uc.creationdate as user_creation,
+  coalesce(nullif(uc.location, ''), '(unknown)') as location,
+  uc.websiteurl,
+  left(uc.aboutme_norm, 120) as about_snippet,
+  ua.question_count,
+  ua.answer_count,
+  ua.total_score,
+  round(coalesce(ua.avg_nonzero_score, 0), 2) as avg_nonzero_score,
+  ua.max_views,
+  coalesce(ua.questions_with_accepted, 0) as questions_with_accepted,
+  br.total_badges,
+  br.gold_badges,
+  br.silver_badges,
+  br.bronze_badges,
+  vt.upvotes_rcvd,
+  vt.downvotes_rcvd,
+  vt.accepts_rcvd,
+  vt.favorites_rcvd,
+  ar.answers_given,
+  ar.answers_accepted,
+  round(ar.accept_rate::numeric, 4) as answer_accept_rate,
+  ut.top_tag,
+  ut.tag_count as top_tag_count,
+  iq.max_gap_seconds,
+  sp.p50_score,
+  sp.p90_score,
+  hp.post_id as top_heavy_post_id,
+  hp.score_view_product as top_heavy_post_weight,
+  rhc.qid as featured_qid,
+  rhc.title as featured_title,
+  rhc.viewcount as featured_views,
+  rhc.score as featured_score,
+  rhc.dup_inbound_count as featured_dup_inbound_count,
+  rhc.last_close_bucket as featured_last_close_bucket,
+  round(rhc.views_per_hour_since_post::numeric, 4) as featured_views_per_hour,
+  case
+    when coalesce(vt.upvotes_rcvd,0) - coalesce(vt.downvotes_rcvd,0) > 100 then 'Highly Upvoted'
+    when coalesce(vt.upvotes_rcvd,0) - coalesce(vt.downvotes_rcvd,0) between 10 and 100 then 'Well Received'
+    when coalesce(vt.upvotes_rcvd,0) - coalesce(vt.downvotes_rcvd,0) between -10 and 9 then 'Mixed'
+    else 'Controversial'
+  end as reception_bucket
+from user_core uc
+left join user_activity ua on ua.user_id = uc.user_id
+left join badge_rollup br on br.userid = uc.user_id
+left join vote_breakdown vt on vt.user_id = uc.user_id
+left join answer_accept_ratio ar on ar.user_id = uc.user_id
+left join user_top_tag ut on ut.user_id = uc.user_id
+left join inactivity_gaps iq on iq.user_id = uc.user_id
+left join score_percentiles sp on sp.user_id = uc.user_id
+left join lateral (
+  select hp.post_id, hp.score_view_product
+  from heaviest_posts hp
+  where hp.user_id = uc.user_id and hp.dr = 1
+  limit 1
+) hp on true
+left join lateral (
+  select rhc.qid, rhc.title, rhc.viewcount, rhc.score, rhc.dup_inbound_count, rhc.last_close_bucket, rhc.views_per_hour_since_post
+  from recent_hot_candidates rhc
+  where rhc.user_id = uc.user_id
+  order by rhc.views_per_hour_since_post desc nulls last, rhc.score desc nulls last, rhc.qid
+  limit 1
+) rhc on true
+where coalesce(ua.question_count, 0) + coalesce(ua.answer_count, 0) > 0
+order by
+  case when uc.reputation >= 10000 then 1 when uc.reputation >= 1000 then 2 else 3 end,
+  coalesce(vt.upvotes_rcvd,0) - coalesce(vt.downvotes_rcvd,0) desc,
+  uc.user_id
+limit 200;

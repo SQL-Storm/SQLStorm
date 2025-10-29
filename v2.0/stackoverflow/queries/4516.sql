@@ -1,0 +1,174 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.PostHistoryTypeId,
+      ph.CreationDate,
+      ph.UserId,
+      ph.Comment,
+      ph.Text AS RevisionText,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  PostEditDetails AS (
+    SELECT
+      rpe.PostId,
+      MAX(CASE WHEN rpe.PostHistoryTypeId = 4 THEN rpe.RevisionText END) AS LastTitleEdit,
+      MAX(CASE WHEN rpe.PostHistoryTypeId = 5 THEN rpe.RevisionText END) AS LastBodyEdit,
+      MAX(CASE WHEN rpe.PostHistoryTypeId = 6 THEN rpe.RevisionText END) AS LastTagsEdit,
+      MAX(CASE WHEN rpe.PostHistoryTypeId = 4 THEN rpe.CreationDate END) AS LastTitleEditDate,
+      MAX(CASE WHEN rpe.PostHistoryTypeId = 5 THEN rpe.CreationDate END) AS LastBodyEditDate,
+      MAX(CASE WHEN rpe.PostHistoryTypeId = 6 THEN rpe.CreationDate END) AS LastTagsEditDate,
+      MAX(CASE WHEN rpe.PostHistoryTypeId = 4 THEN rpe.UserId END) AS LastTitleEditorUserId,
+      MAX(CASE WHEN rpe.PostHistoryTypeId = 5 THEN rpe.UserId END) AS LastBodyEditorUserId,
+      MAX(CASE WHEN rpe.PostHistoryTypeId = 6 THEN rpe.UserId END) AS LastTagsEditorUserId
+    FROM RankedPostEdits rpe
+    WHERE
+      rpe.rn = 1
+    GROUP BY
+      rpe.PostId
+  ),
+  UserPostCounts AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+    FROM Posts p
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY
+      p.OwnerUserId
+  ),
+  HighReputationUsers AS (
+    SELECT
+      u.Id
+    FROM Users u
+    WHERE
+      u.Reputation > 100000
+  ),
+  FirstComments AS (
+    SELECT
+      Id,
+      PostId,
+      Text,
+      CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY CreationDate ASC) AS rn
+    FROM Comments
+  ),
+  PostLinkCounts AS (
+    SELECT
+      p.Id AS PostId,
+      COUNT(pl.Id) AS LinkCount
+    FROM Posts p
+    LEFT JOIN PostLinks pl
+      ON p.Id = pl.PostId OR p.Id = pl.RelatedPostId
+    WHERE
+      p.CreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+      AND p.Score > 0
+      AND p.ViewCount > 1000
+      AND (p.Title LIKE '%performance%' OR p.Tags LIKE '%performance%')
+      AND p.OwnerUserId IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+      )
+    GROUP BY
+      p.Id
+  )
+SELECT
+  p.Id AS PostId,
+  pt.Name AS PostType,
+  p.Title,
+  u.DisplayName AS OwnerDisplayName,
+  p.CreationDate AS PostCreationDate,
+  p.LastActivityDate,
+  p.Score AS PostScore,
+  p.ViewCount AS PostViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  ped.LastTitleEdit,
+  ped.LastBodyEdit,
+  ped.LastTagsEdit,
+  ped.LastTitleEditDate,
+  ped.LastBodyEditDate,
+  ped.LastTagsEditDate,
+  ped.LastTitleEditorUserId,
+  ped.LastBodyEditorUserId,
+  ped.LastTagsEditorUserId,
+  c.Id AS FirstCommentId,
+  c.Text AS FirstCommentText,
+  c.CreationDate AS FirstCommentDate,
+  upc.TotalPosts AS OwnerTotalPosts,
+  upc.QuestionCount AS OwnerQuestionCount,
+  upc.AnswerCount AS OwnerAnswerCount,
+  (
+    SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+  ) AS UpVoteCount,
+  (
+    SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3
+  ) AS DownVoteCount,
+  CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+  COALESCE(p.ContentLicense, 'Unknown') AS ContentLicense,
+  CASE WHEN hr.Id IS NOT NULL THEN 'High Rep User' ELSE 'Standard User' END AS OwnerReputationStatus,
+  COALESCE(plc.LinkCount, 0) AS LinkCount
+FROM Posts p
+JOIN PostTypes pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN Users u
+  ON p.OwnerUserId = u.Id
+LEFT JOIN PostEditDetails ped
+  ON p.Id = ped.PostId
+LEFT JOIN FirstComments c
+  ON p.Id = c.PostId AND c.rn = 1
+LEFT JOIN UserPostCounts upc
+  ON p.OwnerUserId = upc.OwnerUserId
+LEFT JOIN HighReputationUsers hr
+  ON u.Id = hr.Id
+LEFT JOIN PostLinkCounts plc
+  ON p.Id = plc.PostId
+WHERE
+  p.CreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+  AND p.Score > 0
+  AND p.ViewCount > 1000
+  AND (p.Title LIKE '%performance%' OR p.Tags LIKE '%performance%')
+  AND p.OwnerUserId IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+  )
+GROUP BY
+  p.Id,
+  pt.Name,
+  p.Title,
+  u.DisplayName,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  ped.LastTitleEdit,
+  ped.LastBodyEdit,
+  ped.LastTagsEdit,
+  ped.LastTitleEditDate,
+  ped.LastBodyEditDate,
+  ped.LastTagsEditDate,
+  ped.LastTitleEditorUserId,
+  ped.LastBodyEditorUserId,
+  ped.LastTagsEditorUserId,
+  c.Id,
+  c.Text,
+  c.CreationDate,
+  upc.TotalPosts,
+  upc.QuestionCount,
+  upc.AnswerCount,
+  p.ClosedDate,
+  p.ContentLicense,
+  hr.Id,
+  plc.LinkCount
+ORDER BY
+  p.LastActivityDate DESC
+LIMIT 100;

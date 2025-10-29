@@ -1,0 +1,140 @@
+WITH
+RecentActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate AS PostDate,
+    COALESCE(p.ViewCount, 0) AS Views,
+    p.Score,
+    p.OwnerUserId,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS rn
+  FROM
+    Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE
+    p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)
+),
+UserPostTypeCounts AS (
+  SELECT
+    a.UserId,
+    SUM(CASE WHEN a.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsLast30,
+    SUM(CASE WHEN a.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersLast30,
+    SUM(CASE WHEN a.PostTypeId = 4 THEN 1 ELSE 0 END) AS TagWikiExcerptsLast30,
+    SUM(CASE WHEN a.PostTypeId = 5 THEN 1 ELSE 0 END) AS TagWikisLast30
+  FROM
+    RecentActivity a
+  GROUP BY
+    a.UserId
+),
+UserBadges AS (
+  SELECT
+    b.UserId,
+    SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadges,
+    MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGold,
+    MAX(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS HasSilver,
+    MAX(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS HasBronze
+  FROM
+    Badges b
+  GROUP BY
+    b.UserId
+),
+LastEditsPre AS (
+  SELECT
+    ph.PostId,
+    ph.Id AS HistoryId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.Comment,
+    ph.Text,
+    ph.RevisionGUID,
+    ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+  FROM
+    PostHistory ph
+  WHERE
+    ph.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '60' DAY)
+),
+LastEdits AS (
+  SELECT
+    le.PostId,
+    le.HistoryId,
+    le.PostHistoryTypeId,
+    le.CreationDate,
+    le.UserId,
+    le.Comment,
+    le.Text,
+    le.RevisionGUID
+  FROM
+    LastEditsPre le
+  WHERE
+    le.rn <= 5
+),
+RankedPosts AS (
+  SELECT
+    a.UserId,
+    a.PostId,
+    a.PostTypeId,
+    a.Title,
+    a.Views,
+    a.Score,
+    a.PostDate,
+    ROW_NUMBER() OVER (PARTITION BY a.UserId ORDER BY a.Views DESC, a.Score DESC, a.PostDate DESC) AS RankByPopularity
+  FROM
+    RecentActivity a
+),
+QualifiedPosts AS (
+  SELECT
+    rp.UserId,
+    rp.PostId,
+    rp.Title,
+    rp.Views,
+    rp.Score,
+    rp.PostDate,
+    rp.RankByPopularity
+  FROM
+    RankedPosts rp
+    JOIN Posts p ON p.Id = rp.PostId
+  WHERE
+    p.CommunityOwnedDate IS NULL
+    AND rp.Score >= 5
+    AND rp.Views >= 10
+    AND rp.RankByPopularity <= 100
+)
+SELECT
+  qa.UserId,
+  u.DisplayName AS UserDisplayName,
+  u.Reputation,
+  qa.PostId,
+  qa.Title AS PostTitle,
+  qa.Views AS PostViews,
+  qa.Score AS PostScore,
+  qa.PostDate,
+  qpsc.QuestionsLast30,
+  qpsc.AnswersLast30,
+  qbd.TagBasedBadges,
+  qbd.HasGold AS GoldBadge,
+  qbd.HasSilver AS SilverBadge,
+  qbd.HasBronze AS BronzeBadge,
+  (
+    SELECT STRING_AGG(h_concat, ' | ')
+    FROM (
+      SELECT CONCAT(h.PostHistoryTypeId, ':', h.Text) AS h_concat
+      FROM LastEdits h
+      WHERE h.PostId = qa.PostId
+      ORDER BY h.CreationDate DESC
+    ) sub
+  ) AS RecentEditSummaries
+FROM
+  QualifiedPosts qa
+  JOIN Users u ON u.Id = qa.UserId
+  LEFT JOIN UserPostTypeCounts qpsc ON qpsc.UserId = qa.UserId
+  LEFT JOIN UserBadges qbd ON qbd.UserId = qa.UserId
+WHERE
+  qa.RankByPopularity <= 50
+ORDER BY
+  qa.PostDate DESC,
+  qa.Score DESC;

@@ -1,0 +1,176 @@
+WITH UserActivityStats AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.PostTypeId = 1), 0.0) AS AvgQuestionScore,
+        COALESCE(MAX(GREATEST(p.LastActivityDate, c.CreationDate)), u.LastAccessDate) AS LastEngagementDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.LastAccessDate
+),
+PostEngagementDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        q.AnswerCount,
+        q.CommentCount AS QuestionCommentCount,
+        q.FavoriteCount AS QuestionFavoriteCount,
+        q.OwnerUserId,
+        q.Title AS QuestionTitle,
+        q.Tags AS QuestionTags,
+        q.AcceptedAnswerId,
+        aa.OwnerUserId AS AcceptedAnswerOwnerUserId,
+        aa.Score AS AcceptedAnswerScore,
+        CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer,
+        EXTRACT(EPOCH FROM (aa.CreationDate - q.CreationDate)) / 3600.0 AS TimeUntilAcceptedHours,
+        (SELECT ph.Comment
+         FROM PostHistory ph
+         WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId = 10
+         ORDER BY ph.CreationDate ASC
+         LIMIT 1) AS FirstCloseReasonComment,
+        (SELECT ph.CreationDate
+         FROM PostHistory ph
+         WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId = 10
+         ORDER BY ph.CreationDate ASC
+         LIMIT 1) AS FirstCloseDate,
+        COUNT(DISTINCT ph_edit.Id) FILTER (WHERE ph_edit.PostHistoryTypeId IN (4, 5, 6) AND ph_edit.CreationDate > (q.CreationDate - INTERVAL '90 days')) AS RecentEditCount,
+        COUNT(DISTINCT ph_reopen.Id) FILTER (WHERE ph_reopen.PostHistoryTypeId = 11) AS ReopenCount
+    FROM Posts q
+    LEFT JOIN Posts aa ON q.AcceptedAnswerId = aa.Id
+    LEFT JOIN PostHistory ph_edit ON q.Id = ph_edit.PostId
+    LEFT JOIN PostHistory ph_reopen ON q.Id = ph_reopen.PostId
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.CommentCount, q.FavoriteCount, q.OwnerUserId, q.Title, q.Tags, q.AcceptedAnswerId, aa.OwnerUserId, aa.Score, aa.CreationDate
+),
+RecentGoldBadges AS (
+    SELECT
+        b.UserId,
+        b.Name AS RecentGoldBadgeName,
+        b.Date AS RecentGoldBadgeDate,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn
+    FROM Badges b
+    WHERE b.Class = 1 AND b.TagBased = FALSE
+),
+TopQuestionTags AS (
+    SELECT
+        Id AS PostId,
+        SUBSTRING(Tags, 2, LENGTH(Tags) - 2) AS CleanTags
+    FROM Posts
+    WHERE PostTypeId = 1 AND Tags IS NOT NULL AND Tags <> ''
+),
+ParsedTags AS (
+    SELECT
+        PostId,
+        TRIM(UNNEST(STRING_TO_ARRAY(CleanTags, '><'))) AS TagName
+    FROM TopQuestionTags
+),
+TagFrequency AS (
+    SELECT
+        pt.PostId,
+        pt.TagName,
+        COUNT(*) OVER (PARTITION BY pt.PostId, pt.TagName) AS TagCountForQuestion,
+        ROW_NUMBER() OVER (PARTITION BY pt.PostId ORDER BY COUNT(*) OVER (PARTITION BY pt.PostId, pt.TagName) DESC, pt.TagName) AS TagRankForQuestion
+    FROM ParsedTags pt
+    WHERE pt.TagName IS NOT NULL AND pt.TagName <> ''
+),
+UserCategories AS (
+    SELECT u.Id AS UserId, 'HighReputationUser' AS Category
+    FROM Users u
+    WHERE u.Reputation >= 10000
+    UNION ALL
+    SELECT uas.UserId, 'RecentActivePoster' AS Category
+    FROM UserActivityStats uas
+    WHERE uas.TotalPosts >= 50 AND uas.LastEngagementDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+    UNION ALL
+    SELECT u.Id AS UserId, 'VeteranUser' AS Category
+    FROM Users u
+    WHERE u.CreationDate <= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years' AND u.Reputation >= 500
+),
+AggregatedUserCategories AS (
+    SELECT
+        UserId,
+        STRING_AGG(Category, ', ' ORDER BY Category) AS UserCategoriesList
+    FROM UserCategories
+    GROUP BY UserId
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.Views AS UserProfileViews,
+    uas.TotalPosts,
+    uas.TotalComments,
+    uas.AvgQuestionScore,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - uas.LastEngagementDate)) AS DaysSinceLastEngagement,
+    rgb.RecentGoldBadgeName,
+    rgb.RecentGoldBadgeDate,
+    q.QuestionId,
+    q.QuestionTitle,
+    q.QuestionScore,
+    q.QuestionViewCount,
+    q.AnswerCount,
+    q.QuestionCommentCount,
+    q.QuestionFavoriteCount,
+    q.HasAcceptedAnswer,
+    q.TimeUntilAcceptedHours,
+    q.FirstCloseReasonComment,
+    crt.Name AS CloseReasonTypeName,
+    q.FirstCloseDate,
+    q.RecentEditCount,
+    q.ReopenCount,
+    RANK() OVER (ORDER BY u.Reputation DESC, u.Id) AS ReputationRank,
+    NTILE(10) OVER (ORDER BY u.Reputation DESC) AS ReputationDecile,
+    AVG(q.QuestionScore) OVER (PARTITION BY COALESCE(u.Location, 'UnknownLocation')) AS AvgQuestionScoreByLocation,
+    COUNT(q.QuestionId) OVER (PARTITION BY u.Id ORDER BY q.QuestionCreationDate) AS UserQuestionCumulativeCount,
+    (SELECT COUNT(ph.Id)
+     FROM PostHistory ph
+     WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId = 35
+     LIMIT 1) > 0 AS HasMigratedPostAway,
+    CASE
+        WHEN u.Reputation >= 10000 AND uas.TotalPosts >= 50 AND uas.AvgQuestionScore >= 5 THEN 'PowerUser'
+        WHEN u.Reputation >= 1000 AND uas.TotalPosts >= 10 AND uas.AvgQuestionScore >= 2 THEN 'ActiveContributor'
+        WHEN u.Reputation < 100 AND u.Views <= 10 THEN 'Newbie'
+        ELSE 'Regular'
+    END AS UserTier,
+    COALESCE(u.Location, 'Unknown') AS UserLocation,
+    UPPER(LEFT(COALESCE(u.DisplayName, 'UNKNOWN'), 1)) AS FirstLetterOfDisplayName,
+    REPLACE(REPLACE(q.QuestionTags, '&lt;', '<'), '&gt;', '>') AS CleanedQuestionTags,
+    SUBSTRING(q.QuestionTitle, 1, 50) AS QuestionTitleSnippet,
+    (SELECT STRING_AGG(tf.TagName, ', ' ORDER BY tf.TagRankForQuestion) FROM TagFrequency tf WHERE tf.PostId = q.QuestionId AND tf.TagRankForQuestion <= 3) AS Top3QuestionTags,
+    aau.DisplayName AS AcceptedAnswererName,
+    aau.Reputation AS AcceptedAnswererReputation,
+    (SELECT COUNT(pl.Id)
+     FROM PostLinks pl
+     WHERE pl.PostId = q.QuestionId AND pl.LinkTypeId = 3
+     ) > 0 AS IsMarkedAsDuplicate,
+    q.QuestionViewCount * COALESCE(q.AnswerCount, 0) / (EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - q.QuestionCreationDate)) + 1.0) AS QuestionActivityIndex,
+    CASE
+        WHEN q.QuestionViewCount > 5000 AND q.AnswerCount > 10 AND q.QuestionScore > 20 THEN 'VeryHot'
+        WHEN q.QuestionViewCount > 1000 AND q.AnswerCount > 5 AND q.QuestionScore > 10 THEN 'Hot'
+        ELSE 'Normal'
+    END AS QuestionHeatStatus,
+    auc.UserCategoriesList
+FROM Users u
+LEFT JOIN UserActivityStats uas ON u.Id = uas.UserId
+LEFT JOIN RecentGoldBadges rgb ON u.Id = rgb.UserId AND rgb.rn = 1
+LEFT JOIN PostEngagementDetails q ON u.Id = q.OwnerUserId
+LEFT JOIN CloseReasonTypes crt ON CAST(SUBSTRING(q.FirstCloseReasonComment FROM '^[0-9]+') AS INTEGER) = crt.Id
+LEFT JOIN Users aau ON q.AcceptedAnswerOwnerUserId = aau.Id
+LEFT JOIN AggregatedUserCategories auc ON u.Id = auc.UserId
+WHERE
+    u.Reputation IS NOT NULL
+    AND u.Reputation > 0
+    AND u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    AND (u.Location LIKE '%United States%' OR u.Location LIKE '%Canada%' OR u.Location IS NULL)
+    AND (q.QuestionId IS NULL OR (q.QuestionScore > 0 OR q.QuestionFavoriteCount > 0 OR q.QuestionCommentCount > 0))
+    AND (q.QuestionId IS NULL OR NOT EXISTS (
+        SELECT 1 FROM PostLinks pl_dup
+        WHERE pl_dup.RelatedPostId = q.QuestionId AND pl_dup.LinkTypeId = 3
+    ))
+ORDER BY ReputationRank ASC, u.Id, q.QuestionCreationDate DESC;

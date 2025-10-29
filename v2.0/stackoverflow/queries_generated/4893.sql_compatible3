@@ -1,0 +1,95 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_post_type,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCountPerPost,
+        AVG(CAST(p.Score AS DOUBLE)) OVER (PARTITION BY p.PostTypeId) AS AvgScorePerPostType,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) OVER (PARTITION BY p.PostTypeId) AS ClosedCountPerPostType,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.Score > 0
+      AND p.Title IS NOT NULL
+      AND p.Title <> ''
+      AND CHAR_LENGTH(p.Title) > 10
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (2, 5)) AS BodyEdits,
+        MAX(ph.CreationDate) AS LastEditDate,
+        CASE WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website' ELSE 'Has Website' END AS WebsiteStatus,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        STRING_AGG(b.Name, ', ' ORDER BY b.Date DESC) AS RecentBadges
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes, CASE WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website' ELSE 'Has Website' END
+    HAVING u.Reputation > 1000
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(pl.Id) AS OutgoingLinks,
+        SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateLinks
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.Title,
+    rp.PostScore,
+    rp.PostViewCount,
+    rp.AnswerCount,
+    rp.CommentCountPerPost,
+    rp.AvgScorePerPostType,
+    rp.ClosedCountPerPostType,
+    rp.ViewRank,
+    ua.DisplayName AS OwnerDisplayName,
+    ua.Reputation AS OwnerReputation,
+    ua.UserCreationDate,
+    ua.BodyEdits,
+    ua.WebsiteStatus,
+    pl.OutgoingLinks,
+    pl.DuplicateLinks,
+    CASE
+        WHEN rp.PostCreationDate < ua.UserCreationDate THEN 'Post Older Than User'
+        ELSE 'Post Newer Than User'
+    END AS UserPostAgeComparison,
+    COALESCE(rp.FavoriteCount, 0) AS SafeFavoriteCount,
+    (rp.PostTypeName || ' - ' || COALESCE(ua.DisplayName, 'Unknown')) AS TypeAndOwner,
+    rp.PostScore + COALESCE(rp.AnswerCount * 5, 0) - COALESCE(rp.CommentCountPerPost * 2, 0) AS WeightedScore,
+    NULL AS ClosedDateIntervalPlaceholder,
+    CASE WHEN rp.ClosedDate IS NOT NULL THEN FLOOR(EXTRACT(EPOCH FROM (rp.ClosedDate - rp.PostCreationDate)) / 86400) ELSE NULL END AS DaysOpenBeforeClose,
+    SUBSTRING(rp.Title FROM 1 FOR 20) AS ShortTitle
+FROM RankedPosts rp
+JOIN UserActivity ua ON rp.OwnerUserId = ua.UserId
+LEFT JOIN PostLinkAnalysis pl ON rp.PostId = pl.PostId
+WHERE rp.rn_post_type <= 100
+  AND rp.PostScore > 50
+  AND rp.PostViewCount > 10000
+  AND ua.BadgeCount >= 5
+  AND ua.LastEditDate > rp.PostCreationDate
+ORDER BY rp.ViewRank, rp.PostScore DESC;

@@ -1,0 +1,261 @@
+-- {"query": "1166.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4388} 
+WITH UserEngagement AS (
+    -- CTE 1: Aggregate user-level engagement statistics including post counts, scores, and comment activity.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        U.Views AS UserProfileViews,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        AVG(COALESCE(P.Score, 0)) AS AveragePostScore,
+        MAX(COALESCE(P.Score, 0)) AS MaxPostScore,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        -- Count questions owned by the user that have an accepted answer
+        SUM(CASE WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswers,
+        -- Count answers provided by the user that were accepted on other questions
+        SUM(CASE WHEN P_Ans.OwnerUserId = U.Id AND P_Q.AcceptedAnswerId = P_Ans.Id THEN 1 ELSE 0 END) AS UserProvidedAcceptedAnswers
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Posts P_Q ON P_Q.PostTypeId = 1 -- For questions
+    LEFT JOIN Posts P_Ans ON P_Ans.PostTypeId = 2 AND P_Q.AcceptedAnswerId = P_Ans.Id AND P_Ans.OwnerUserId = U.Id -- For accepted answers provided by this user
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes, U.Views
+),
+BadgeSummary AS (
+    -- CTE 2: Summarize badge counts per user, categorized by class (Gold, Silver, Bronze).
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges B
+    GROUP BY B.UserId
+),
+PostVoteMetrics AS (
+    -- CTE 3: Calculate detailed vote metrics for each post, including counts for various vote types.
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount AS PostAnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount AS PostFavoriteCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived, -- UpMod
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived, -- DownMod
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoritesReceived, -- Favorite
+        SUM(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVotes, -- AcceptedByOriginator
+        SUM(CASE WHEN V.VoteTypeId = 10 THEN 1 ELSE 0 END) AS DeletionVotes,
+        SUM(CASE WHEN V.VoteTypeId = 12 THEN 1 ELSE 0 END) AS SpamVotes
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    GROUP BY P.Id, P.OwnerUserId, P.PostTypeId, P.CreationDate, P.LastActivityDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount
+),
+UserPostPerformanceRank AS (
+    -- CTE 4: Combine user engagement and badge info, calculate a complex composite score, and rank users using window functions.
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        UE.Reputation,
+        UE.UserCreationDate,
+        UE.LastAccessDate,
+        UE.TotalPosts,
+        UE.TotalQuestions,
+        UE.TotalAnswers,
+        UE.AveragePostScore,
+        UE.MaxPostScore,
+        COALESCE(BS.GoldBadges, 0) AS GoldBadges,
+        COALESCE(BS.SilverBadges, 0) AS SilverBadges,
+        COALESCE(BS.BronzeBadges, 0) AS BronzeBadges,
+        (UE.Reputation * 0.4 + UE.AveragePostScore * 0.2 + COALESCE(BS.GoldBadges, 0) * 50 + UE.TotalQuestions * 5 + UE.UserProvidedAcceptedAnswers * 25) AS CompositeScore,
+        RANK() OVER (ORDER BY (UE.Reputation * 0.4 + UE.AveragePostScore * 0.2 + COALESCE(BS.GoldBadges, 0) * 50 + UE.TotalQuestions * 5 + UE.UserProvidedAcceptedAnswers * 25) DESC) AS OverallUserRank,
+        NTILE(10) OVER (ORDER BY UE.Reputation DESC) AS ReputationDecile
+    FROM UserEngagement UE
+    LEFT JOIN BadgeSummary BS ON UE.UserId = BS.UserId
+    WHERE UE.Reputation > 0 -- Exclude users with 0 reputation (often deleted or system users)
+    AND UE.TotalPosts > 0
+),
+PostEditHistorySummary AS (
+    -- CTE 5: Summarize post edit history, counting edits, distinct editors, and calculating edit duration.
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalEdits,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditors,
+        MIN(PH.CreationDate) AS FirstEditDate,
+        MAX(PH.CreationDate) AS LastEditDate,
+        EXTRACT(EPOCH FROM (MAX(PH.CreationDate) - MIN(PH.CreationDate))) AS EditDurationSeconds,
+        -- Example of a correlated subquery to get the display name of the last editor
+        (SELECT U2.DisplayName FROM Users U2 WHERE U2.Id = PH.UserId ORDER BY PH.CreationDate DESC LIMIT 1) AS LastEditorDisplayName_Correlated
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) -- Edit Title, Body, Tags or Rollbacks
+    GROUP BY PH.PostId, PH.UserId -- UserId is used in correlated subquery, so must be in GROUP BY for PH.Id=PH.UserId to work (or use LATERAL JOIN)
+),
+DuplicateLinkAnalysis AS (
+    -- CTE 6: Identify posts involved in duplicate links, providing details about the duplicate.
+    SELECT
+        PL.PostId,
+        PL.RelatedPostId AS DuplicateOfPostId,
+        P_Dup.Title AS DuplicateOfPostTitle,
+        P_Dup.OwnerUserId AS DuplicateOfOwnerUserId,
+        PL.CreationDate AS LinkCreationDate,
+        AGE(CURRENT_TIMESTAMP, PL.CreationDate) AS LinkAge -- Calculate age of the link
+    FROM PostLinks PL
+    JOIN Posts P ON PL.PostId = P.Id
+    JOIN Posts P_Dup ON PL.RelatedPostId = P_Dup.Id
+    WHERE PL.LinkTypeId = 3 -- Duplicate link type
+    AND P.PostTypeId = 1 -- Only consider questions
+),
+TagAnalysis AS (
+    -- CTE 7: Analyze global tag usage frequency, score, and average score for all questions.
+    SELECT
+        TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))) AS TagName,
+        COUNT(P.Id) AS TaggedPostCount,
+        SUM(P.Score) AS TotalTagScore,
+        AVG(P.Score) AS AverageTagScore
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')))
+),
+ClosedPostReasonBreakdown AS (
+    -- CTE 8: Analyze posts that were closed, extracting the reason and linking to post creator.
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS ClosedDate,
+        CR.Name AS CloseReasonName,
+        P.OwnerUserId AS PostCreatorId,
+        P.CreationDate AS PostCreationDate,
+        -- Use LAG window function to find the previous post history entry date for a post
+        LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousHistoryDate,
+        CASE
+            WHEN CR.Name ILIKE '%duplicate%' THEN 'Duplicate'
+            WHEN CR.Name ILIKE '%off-topic%' THEN 'Off-Topic'
+            WHEN CR.Name ILIKE '%clarity%' THEN 'Needs Clarity'
+            WHEN CR.Name ILIKE '%focus%' THEN 'Needs More Focus'
+            ELSE 'Other'
+        END AS CloseReasonCategory
+    FROM PostHistory PH
+    JOIN CloseReasonTypes CR ON PH.Comment::smallint = CR.Id -- Cast Comment to smallint for join, as per schema description
+    JOIN Posts P ON PH.PostId = P.Id
+    WHERE PH.PostHistoryTypeId = 10 -- Post Closed
+)
+-- Main Query: Orchestrates data from all CTEs to provide a comprehensive view of top-performing users and their posts.
+SELECT
+    UPP.UserId,
+    UPP.DisplayName,
+    UPP.Reputation,
+    UPP.OverallUserRank,
+    UPP.ReputationDecile,
+    UPP.TotalPosts,
+    UPP.TotalQuestions,
+    UPP.TotalAnswers,
+    UPP.AveragePostScore,
+    UPP.MaxPostScore,
+    UPP.GoldBadges,
+    UPP.SilverBadges,
+    UPP.BronzeBadges,
+    COALESCE(PVM_TopQ.UpVotesReceived, 0) AS TopQuestionUpVotes,
+    COALESCE(PVM_TopQ.DownVotesReceived, 0) AS TopQuestionDownVotes,
+    COALESCE(PVM_TopQ.PostViewCount, 0) AS TopQuestionViewCount,
+    PVM_TopQ.PostId AS TopQuestionId,
+    PVM_TopQ.PostScore AS TopQuestionScore,
+    EXTRACT(DAY FROM (UPP.LastAccessDate - UPP.UserCreationDate)) AS DaysSinceUserCreation,
+    COALESCE(PEHS.TotalEdits, 0) AS TotalEditsOnTopQuestion,
+    COALESCE(PEHS.DistinctEditors, 0) AS DistinctEditorsOnTopQuestion,
+    COALESCE(PEHS.EditDurationSeconds, 0) AS TopQuestionEditDurationSeconds,
+    COALESCE(DLA.DuplicateOfPostId, -1) AS LinkedDuplicatePostId,
+    COALESCE(DLA.DuplicateOfPostTitle, 'N/A') AS LinkedDuplicatePostTitle,
+    COALESCE(DLA.LinkAge, INTERVAL '0 days') AS DuplicateLinkAge,
+    -- Aggregate distinct close reasons for the user's top question
+    STRING_AGG(DISTINCT CPR.CloseReasonCategory, '; ') FILTER (WHERE CPR.CloseReasonCategory IS NOT NULL) AS TopPostCloseReasonCategories,
+    -- Count how many times the top question was closed (can be reopened and reclosed)
+    COUNT(DISTINCT CPR.PostId) FILTER (WHERE CPR.PostId IS NOT NULL) AS TopPostClosedEventsCount,
+    -- Aggregate influential tags (globally popular tags) that the user has used
+    STRING_AGG(DISTINCT TA_Global.TagName, ', ') FILTER (WHERE TA_Global.TagName IS NOT NULL AND TA_Global.TaggedPostCount > 100) AS UserInfluentialTags,
+    -- Advanced User Post Metric: A complex calculation aggregating post characteristics for each user.
+    (
+        SELECT
+            SUM(CASE
+                WHEN LENGTH(COALESCE(P_Inner.Body, '')) > 500 AND P_Inner.Score > 10 THEN 1 -- Long, well-scored post
+                WHEN P_Inner.ViewCount > 10000 AND P_Inner.AnswerCount >= 5 AND P_Inner.AcceptedAnswerId IS NOT NULL THEN 2 -- Highly viewed, many answers, accepted
+                WHEN P_Inner.FavoriteCount IS NOT NULL AND P_Inner.FavoriteCount > 50 THEN 3 -- Many favorites
+                ELSE 0
+            END)
+        FROM Posts P_Inner
+        WHERE P_Inner.OwnerUserId = UPP.UserId
+        AND P_Inner.PostTypeId IN (1, 2)
+        AND P_Inner.CreationDate BETWEEN UPP.UserCreationDate AND UPP.LastAccessDate
+        AND (P_Inner.ClosedDate IS NULL OR P_Inner.CommunityOwnedDate IS NOT NULL) -- Not closed, or community owned
+    ) AS AdvancedUserPostMetric,
+    -- Display Name Category: Classify users based on their display name patterns and reputation.
+    CASE
+        WHEN UPP.DisplayName IS NULL OR LENGTH(TRIM(UPP.DisplayName)) < 3 THEN 'Anonymous/Short'
+        WHEN UPP.DisplayName ILIKE '%admin%' OR UPP.DisplayName ILIKE '%mod%' OR UPP.DisplayName ILIKE '%staff%' THEN 'Admin/Mod-like'
+        WHEN UPP.DisplayName ILIKE 'user%' AND UPP.Reputation < 100 THEN 'LowReputationUser'
+        ELSE 'Regular'
+    END AS DisplayNameCategory,
+    -- Top Post Engagement Status: Uses COALESCE and NULLIF for a specific NULL logic expression.
+    COALESCE(NULLIF(MAX(CASE WHEN PVM_TopQ.PostId IS NOT NULL THEN 'High Engagement' ELSE NULL END), 'High Engagement'), 'Low Engagement') AS TopPostEngagementStatus
+FROM UserPostPerformanceRank UPP
+LEFT JOIN (
+    -- Subquery to find the single highest-scoring question per user, breaking ties by view count, favorites, and ID.
+    SELECT
+        PVM.PostId,
+        PVM.OwnerUserId,
+        PVM.PostScore,
+        PVM.PostViewCount,
+        PVM.UpVotesReceived,
+        PVM.DownVotesReceived,
+        PVM.FavoritesReceived,
+        ROW_NUMBER() OVER (PARTITION BY PVM.OwnerUserId ORDER BY PVM.PostScore DESC, PVM.PostViewCount DESC, PVM.FavoritesReceived DESC, PVM.PostId) AS rn
+    FROM PostVoteMetrics PVM
+    WHERE PVM.PostTypeId = 1 -- Only questions
+) PVM_TopQ ON UPP.UserId = PVM_TopQ.OwnerUserId AND PVM_TopQ.rn = 1
+LEFT JOIN PostEditHistorySummary PEHS ON PVM_TopQ.PostId = PEHS.PostId
+LEFT JOIN DuplicateLinkAnalysis DLA ON PVM_TopQ.PostId = DLA.PostId
+LEFT JOIN ClosedPostReasonBreakdown CPR ON PVM_TopQ.PostId = CPR.PostId
+LEFT JOIN (
+    -- Subquery to identify distinct tags used by the user in their questions.
+    SELECT DISTINCT P.OwnerUserId AS UserId, TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))) AS TagName
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+) AS UserUsedTags ON UPP.UserId = UserUsedTags.UserId
+LEFT JOIN TagAnalysis TA_Global ON UserUsedTags.TagName = TA_Global.TagName
+WHERE UPP.Reputation > (SELECT AVG(U_Avg.Reputation) * 1.5 FROM Users U_Avg WHERE U_Avg.Reputation > 0) -- Filter for users significantly above average reputation
+AND UPP.TotalQuestions > 5
+AND UPP.ReputationDecile <= 4 -- Select users in the top 40% by reputation
+AND (PVM_TopQ.UpVotesReceived IS NULL OR PVM_TopQ.UpVotesReceived > COALESCE(PVM_TopQ.DownVotesReceived, 0) * 1.5) -- Top question has significantly more upvotes or no votes recorded
+AND (PVM_TopQ.PostViewCount IS NULL OR PVM_TopQ.PostViewCount > 500) -- Top question has significant views or no views recorded
+-- A complex predicate combining various conditions, potentially leading to varied execution paths
+AND (
+    (UPP.GoldBadges > 0 AND UPP.AveragePostScore > 5)
+    OR
+    (UPP.TotalAnswers > 10 AND UPP.QuestionsWithAcceptedAnswers > 2 AND UPP.UserProvidedAcceptedAnswers > 0)
+    OR
+    (UPP.TotalPosts > 50 AND UPP.LastAccessDate > NOW() - INTERVAL '6 months')
+)
+GROUP BY
+    UPP.UserId, UPP.DisplayName, UPP.Reputation, UPP.OverallUserRank, UPP.ReputationDecile,
+    UPP.TotalPosts, UPP.TotalQuestions, UPP.TotalAnswers, UPP.AveragePostScore, UPP.MaxPostScore,
+    UPP.GoldBadges, UPP.SilverBadges, UPP.BronzeBadges,
+    PVM_TopQ.UpVotesReceived, PVM_TopQ.DownVotesReceived, PVM_TopQ.PostViewCount,
+    PVM_TopQ.PostId, PVM_TopQ.PostScore,
+    UPP.LastAccessDate, UPP.UserCreationDate,
+    PEHS.TotalEdits, PEHS.DistinctEditors, PEHS.EditDurationSeconds,
+    DLA.DuplicateOfPostId, DLA.DuplicateOfPostTitle, DLA.LinkAge
+HAVING
+    COUNT(DISTINCT PVM_TopQ.PostId) > 0 -- Ensure a top post was found for the user
+    AND SUM(CASE WHEN CPR.CloseReasonCategory = 'Duplicate' THEN 1 ELSE 0 END) < 2 -- The top post wasn't closed as duplicate more than once
+ORDER BY UPP.OverallUserRank ASC, UPP.Reputation DESC, AdvancedUserPostMetric DESC
+LIMIT 1000;

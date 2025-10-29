@@ -1,0 +1,188 @@
+-- {"query": "7383.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2133} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        DATEDIFF(CURRENT_TIMESTAMP, MAX(p.CreationDate)) AS DaysSinceLastPost,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                ROUND(
+                    CAST(SUM(CASE WHEN p.Score > 0 THEN p.Score ELSE 0 END) AS FLOAT) / 
+                    CAST(COUNT(DISTINCT p.Id) AS FLOAT), 2
+                )
+            ELSE 0 
+        END AS AvgScorePerPost,
+        STRING_AGG(
+            CASE 
+                WHEN p.PostTypeId = 1 THEN 'Q' 
+                WHEN p.PostTypeId = 2 THEN 'A' 
+                ELSE 'O' 
+            END, 
+            '' ORDER BY p.CreationDate
+        ) AS PostTypeSequence
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT *, 
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalPosts DESC) AS RankByReputation,
+        DENSE_RANK() OVER (ORDER BY TotalPosts DESC) AS RankByPostCount,
+        PERCENT_RANK() OVER (ORDER BY Reputation DESC) AS ReputationPercentile,
+        NTILE(10) OVER (ORDER BY Reputation DESC) AS ReputationDecile
+    FROM UserActivityStats
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        STRING_AGG(
+            CASE WHEN u.Id IS NOT NULL THEN u.DisplayName ELSE 'Anonymous' END,
+            ', ' ORDER BY u.Reputation DESC LIMIT 5
+        ) AS TopContributors,
+        COUNT(DISTINCT p.Id) AS TagUsageCount,
+        AVG(p.Score) AS AvgScoreOfTagPosts
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE t.Count > 100
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+UserPostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        u.Id AS AuthorId,
+        u.DisplayName AS AuthorName,
+        p.OwnerDisplayName,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                CASE 
+                    WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+                    WHEN p.AnswerCount > 0 THEN 2
+                    ELSE 3
+                END
+            WHEN p.PostTypeId = 2 THEN 
+                CASE 
+                    WHEN p.ParentId IS NOT NULL AND EXISTS(
+                        SELECT 1 FROM Posts pa WHERE pa.Id = p.ParentId AND pa.AcceptedAnswerId = p.Id
+                    ) THEN 1
+                    ELSE 2
+                END
+            ELSE 0
+        END AS PostStatus,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(p.Tags, '') AS Tags,
+        LENGTH(p.Body) AS BodyLength,
+        DATEDIFF(CURRENT_TIMESTAMP, p.CreationDate) AS AgeInDays,
+        CASE 
+            WHEN p.CreationDate >= '2020-01-01' THEN '2020+'
+            WHEN p.CreationDate >= '2015-01-01' THEN '2015-2019'
+            WHEN p.CreationDate >= '2010-01-01' THEN '2010-2014'
+            ELSE 'Pre-2010'
+        END AS PostAgeGroup,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Highly Upvoted'
+            WHEN p.Score >= 25 THEN 'Upvoted'
+            WHEN p.Score >= 0 THEN 'Neutral'
+            WHEN p.Score >= -25 THEN 'Downvoted'
+            ELSE 'Highly Downvoted'
+        END AS ScoreCategory
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= '2020-01-01'
+      AND (p.Score IS NULL OR p.Score >= -10)
+),
+TaggedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        u.DisplayName AS AuthorName,
+        t.TagName,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY p.CreationDate DESC) AS TagRank,
+        AVG(p.Score) OVER (PARTITION BY t.TagName) AS AvgScorePerTag,
+        COUNT(*) OVER (PARTITION BY t.TagName) AS PostsInTag
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    JOIN (
+        SELECT DISTINCT TagName 
+        FROM Tags 
+        WHERE Count > 50
+    ) AS popular_tags ON p.Tags LIKE '%' || popular_tags.TagName || '%'
+    JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= '2020-01-01'
+),
+UserEngagement AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE -1 END ELSE 0 END) AS NetVotes,
+        COUNT(DISTINCT v.PostId) AS PostsVotedOn,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.PostId END) AS Favorites,
+        AVG(CASE WHEN v.VoteTypeId IN (2, 3) THEN v.CreationDate END) AS AvgVoteDate,
+        STRING_AGG(v.PostId::VARCHAR, ',') AS VotedPostIds,
+        CASE WHEN COUNT(DISTINCT v.PostId) > 0 THEN 'Active' ELSE 'Inactive' END AS UserActivityStatus
+    FROM Users u
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+)
+SELECT 
+    'Performance Benchmarking Report' AS ReportTitle,
+    COUNT(*) AS TotalUsers,
+    COUNT(DISTINCT u.Id) AS ActiveUsers,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT c.Id) AS Comments,
+    COUNT(DISTINCT b.Id) AS Badges,
+    AVG(r.Reputation) AS AvgReputation,
+    MAX(r.Reputation) AS MaxReputation,
+    COUNT(DISTINCT CASE WHEN DATEDIFF(CURRENT_TIMESTAMP, p.CreationDate) < 30 THEN p.Id END) AS RecentPosts,
+    COUNT(DISTINCT CASE WHEN (p.Score > 50 OR p.ViewCount > 1000) THEN p.Id END) AS HighImpactPosts,
+    COUNT(DISTINCT CASE WHEN u.Reputation > 1000 THEN u.Id END) AS HighReputationUsers,
+    COUNT(DISTINCT CASE WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 10 THEN p.Id END) AS TaggedPosts,
+    COUNT(DISTINCT CASE WHEN p.Body IS NOT NULL AND LENGTH(p.Body) > 100 THEN p.Id END) AS LengthyPosts,
+    COUNT(DISTINCT CASE WHEN p.CreationDate BETWEEN '2020-01-01' AND '2020-12-31' THEN p.Id END) AS Posts2020,
+    COUNT(DISTINCT CASE WHEN p.OwnerUserId IS NOT NULL THEN p.Id END) AS PostsByRegisteredUsers,
+    COUNT(DISTINCT CASE WHEN p.OwnerUserId IS NULL THEN p.Id END) AS PostsByAnonymous,
+    COUNT(DISTINCT CASE WHEN u.AccountId IS NOT NULL THEN u.Id END) AS AccountUsers,
+    COUNT(DISTINCT CASE WHEN u.AccountId IS NULL THEN u.Id END) AS NonAccountUsers
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN RankedUsers r ON u.Id = r.UserId
+WHERE u.Id > 0
+  AND (u.CreationDate >= '2020-01-01' OR p.CreationDate >= '2020-01-01')
+  AND (p.PostTypeId IN (1, 2) OR c.Id IS NOT NULL OR b.Id IS NOT NULL)
+HAVING COUNT(*) > 0
+ORDER BY 
+    COUNT(DISTINCT p.Id) DESC,
+    AVG(r.Reputation) DESC,
+    COUNT(DISTINCT CASE WHEN p.Score > 100 THEN p.Id END) DESC
+LIMIT 1000;

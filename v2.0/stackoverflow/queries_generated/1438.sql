@@ -1,0 +1,175 @@
+-- {"query": "1438.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2234} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Votes AS v ON u.Id = v.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    WHERE u.CreationDate >= (CURRENT_TIMESTAMP - INTERVAL '5 years')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostEngagementMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.Title,
+        p.Tags,
+        (p.Score + COALESCE(p.FavoriteCount, 0) * 2) * 1.0 / NULLIF(p.ViewCount + 10, 0) AS EngagementRatio,
+        LENGTH(p.Body) AS BodyLength,
+        EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 3600.0 AS PostAgeHours,
+        COALESCE(ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'), 1), 0) AS TagCount,
+        -- Correlated subquery for latest significant edit date
+        (SELECT MAX(ph.CreationDate)
+         FROM PostHistory AS ph
+         WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6, 8, 10, 11) -- Edit Title, Body, Tags, Rollback Body, Post Closed, Post Reopened
+        ) AS LastEditOrStatusChangeDate,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate ASC) AS RankByScoreInType,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScoreForPostType
+    FROM Posts AS p
+    INNER JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+    WHERE p.CreationDate >= (CURRENT_TIMESTAMP - INTERVAL '3 years')
+    AND p.PostTypeId IN (1, 2) -- Only Questions and Answers
+    AND p.Body IS NOT NULL
+),
+HighlyInteractedPosts AS (
+    SELECT
+        pem.PostId,
+        pem.PostTypeId,
+        pem.PostTypeName,
+        pem.OwnerUserId,
+        pem.PostCreationDate,
+        pem.Title,
+        pem.Score,
+        pem.ViewCount,
+        pem.EngagementRatio,
+        pem.BodyLength,
+        pem.PostAgeHours,
+        pem.TagCount,
+        pem.LastEditOrStatusChangeDate,
+        pem.RankByScoreInType,
+        pem.AvgScoreForPostType,
+        'High Score' AS InteractionCategory
+    FROM PostEngagementMetrics AS pem
+    WHERE pem.Score > 75 AND pem.ViewCount > 500
+    UNION ALL
+    SELECT
+        pem.PostId,
+        pem.PostTypeId,
+        pem.PostTypeName,
+        pem.OwnerUserId,
+        pem.PostCreationDate,
+        pem.Title,
+        pem.Score,
+        pem.ViewCount,
+        pem.EngagementRatio,
+        pem.BodyLength,
+        pem.PostAgeHours,
+        pem.TagCount,
+        pem.LastEditOrStatusChangeDate,
+        pem.RankByScoreInType,
+        pem.AvgScoreForPostType,
+        'High Engagement' AS InteractionCategory
+    FROM PostEngagementMetrics AS pem
+    WHERE pem.EngagementRatio > 0.7 AND pem.ViewCount > 200 AND pem.Score > 10
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    uas.GoldBadges,
+    hip.PostId,
+    hip.PostTypeName,
+    hip.Title,
+    hip.Score AS PostScore,
+    hip.ViewCount AS PostViewCount,
+    hip.EngagementRatio AS PostEngagementRatio,
+    hip.InteractionCategory AS PostCategory,
+    hip.BodyLength,
+    hip.PostAgeHours,
+    hip.TagCount,
+    hip.LastEditOrStatusChangeDate,
+    hip.RankByScoreInType,
+    hip.AvgScoreForPostType,
+    -- Identify the actual accepted answer for questions, if available
+    COALESCE(acc_ans.Id, -1) AS AcceptedAnswerId,
+    acc_ans.Score AS AcceptedAnswerScore,
+    COALESCE(LENGTH(acc_ans.Body), 0) AS AcceptedAnswerBodyLength,
+    -- Latest comment text and score using a correlated subquery
+    (SELECT c.Text
+     FROM Comments AS c
+     WHERE c.PostId = hip.PostId
+     ORDER BY c.CreationDate DESC
+     LIMIT 1
+    ) AS LatestCommentText,
+    (SELECT c.Score
+     FROM Comments AS c
+     WHERE c.PostId = hip.PostId
+     ORDER BY c.CreationDate DESC
+     LIMIT 1
+    ) AS LatestCommentScore,
+    -- Determine if the post has a duplicate or related high-impact post
+    CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM PostLinks AS pl
+            INNER JOIN HighlyInteractedPosts AS related_hip ON pl.RelatedPostId = related_hip.PostId
+            WHERE pl.PostId = hip.PostId AND pl.LinkTypeId IN (1, 3) -- Linked or Duplicate
+        ) THEN TRUE
+        ELSE FALSE
+    END AS HasLinkedOrDuplicatedHighImpactPost,
+    -- Calculate reputation growth rate per month for the user at the time of post creation
+    COALESCE(
+        uas.Reputation * 1.0 / NULLIF(
+            EXTRACT(EPOCH FROM (hip.PostCreationDate - uas.UserCreationDate)) / (3600.0 * 24 * 30.4375), 0
+        ),
+        0.0
+    ) AS RepPerMonthAtPostCreation,
+    -- Identify users with highly engaged questions (more than 3 questions with engagement ratio > 0.8)
+    SUM(CASE WHEN hip.PostTypeId = 1 AND hip.EngagementRatio > 0.8 THEN 1 ELSE 0 END) OVER (PARTITION BY uas.UserId) AS HighEngagementQuestionsCount,
+    -- The average score of all answers by this user
+    AVG(CASE WHEN hip.PostTypeId = 2 THEN hip.Score END) OVER (PARTITION BY uas.UserId) AS AvgAnswerScoreByUser
+FROM UserActivitySummary AS uas
+INNER JOIN HighlyInteractedPosts AS hip ON uas.UserId = hip.OwnerUserId
+LEFT JOIN Posts AS acc_ans ON hip.PostTypeId = 1 AND acc_ans.Id = (SELECT p_q.AcceptedAnswerId FROM Posts p_q WHERE p_q.Id = hip.PostId AND p_q.PostTypeId = 1)
+WHERE
+    uas.Reputation > 7500
+    AND uas.TotalQuestions > 7
+    AND uas.GoldBadges >= 2
+    AND hip.PostCreationDate BETWEEN (uas.LastAccessDate - INTERVAL '1 year') AND uas.LastAccessDate -- Post created within a year before user's last access
+    AND hip.BodyLength > 150
+    AND (LOWER(hip.Title) LIKE '%api%' OR LOWER(hip.Tags) LIKE '%<json>%' OR LOWER(hip.Tags) LIKE '%<xml>%') -- Focus on tech-specific tags/titles
+    AND hip.LastEditOrStatusChangeDate IS NOT NULL -- Only posts that have seen significant activity
+    AND (hip.FavoriteCount IS NOT NULL OR hip.CommentCount > 5) -- Posts with some explicit favoriting or comment activity
+    AND NOT EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = hip.PostId AND ph.PostHistoryTypeId = 10 AND ph.Comment::smallint = 101) -- Exclude posts explicitly closed as duplicate (CloseReasonId 101)
+ORDER BY
+    uas.Reputation DESC,
+    hip.EngagementRatio DESC,
+    hip.AvgScoreForPostType DESC,
+    RepPerMonthAtPostCreation DESC
+LIMIT 500;

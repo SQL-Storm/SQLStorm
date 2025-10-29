@@ -1,0 +1,327 @@
+-- {"query": "4261.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4122} 
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.Title,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RowNumDesc,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS RowNumScoreDesc,
+      LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostCreationDate,
+      LEAD(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostCreationDate,
+      (
+        (
+          JULIANDAY(p.LastEditDate) - JULIANDAY(p.CreationDate)
+        ) * 24
+      ) AS EditLagHours,
+      CASE
+        WHEN p.AnswerCount > 0 THEN CAST(p.Score AS REAL) / p.AnswerCount
+        ELSE NULL
+      END AS ScorePerAnswer,
+      CASE
+        WHEN p.ViewCount > 0 THEN CAST(p.Score AS REAL) / p.ViewCount
+        ELSE NULL
+      END AS ScorePerView,
+      CASE
+        WHEN p.FavoriteCount > 0 THEN CAST(p.Score AS REAL) / p.FavoriteCount
+        ELSE NULL
+      END AS ScorePerFavorite,
+      CASE
+        WHEN p.CommentCount > 0 THEN CAST(p.Score AS REAL) / p.CommentCount
+        ELSE NULL
+      END AS ScorePerComment
+    FROM Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+  ),
+  UserPostAggregates AS (
+    SELECT
+      rp.OwnerUserId,
+      COUNT(rp.PostId) AS TotalPosts,
+      AVG(rp.PostScore) AS AvgPostScore,
+      SUM(rp.PostScore) AS TotalPostScore,
+      MAX(rp.PostScore) AS MaxPostScore,
+      AVG(rp.AnswerCount) AS AvgAnswerCount,
+      SUM(rp.AnswerCount) AS TotalAnswerCount,
+      MAX(rp.AnswerCount) AS MaxAnswerCount,
+      AVG(rp.CommentCount) AS AvgCommentCount,
+      SUM(rp.CommentCount) AS TotalCommentCount,
+      MAX(rp.CommentCount) AS MaxCommentCount,
+      AVG(rp.FavoriteCount) AS AvgFavoriteCount,
+      SUM(rp.FavoriteCount) AS TotalFavoriteCount,
+      MAX(rp.FavoriteCount) AS MaxFavoriteCount,
+      AVG(rp.EditLagHours) AS AvgEditLagHours,
+      AVG(rp.ScorePerAnswer) AS AvgScorePerAnswer,
+      AVG(rp.ScorePerView) AS AvgScorePerView,
+      AVG(rp.ScorePerFavorite) AS AvgScorePerFavorite,
+      AVG(rp.ScorePerComment) AS AvgScorePerComment
+    FROM RankedPosts AS rp
+    GROUP BY
+      rp.OwnerUserId
+  ),
+  PostInteractions AS (
+    SELECT
+      p.Id AS PostId,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      COUNT(DISTINCT v.Id) AS VoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteCount,
+      SUM(CASE WHEN v.VoteTypeId = 8 THEN 1 ELSE 0 END) AS BountyStartCount
+    FROM Posts AS p
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    LEFT JOIN Votes AS v
+      ON p.Id = v.PostId
+    GROUP BY
+      p.Id
+  )
+SELECT
+  u.DisplayName,
+  COALESCE(upa.TotalPosts, 0) AS UserTotalPosts,
+  COALESCE(upa.AvgPostScore, 0) AS UserAvgPostScore,
+  COALESCE(upa.TotalPostScore, 0) AS UserTotalPostScore,
+  COALESCE(upa.MaxPostScore, 0) AS UserMaxPostScore,
+  COALESCE(upa.AvgAnswerCount, 0) AS UserAvgAnswerCount,
+  COALESCE(upa.TotalAnswerCount, 0) AS UserTotalAnswerCount,
+  COALESCE(upa.MaxAnswerCount, 0) AS UserMaxAnswerCount,
+  COALESCE(upa.AvgCommentCount, 0) AS UserAvgCommentCount,
+  COALESCE(upa.TotalCommentCount, 0) AS UserTotalCommentCount,
+  COALESCE(upa.MaxCommentCount, 0) AS UserMaxCommentCount,
+  COALESCE(upa.AvgFavoriteCount, 0) AS UserAvgFavoriteCount,
+  COALESCE(upa.TotalFavoriteCount, 0) AS UserTotalFavoriteCount,
+  COALESCE(upa.MaxFavoriteCount, 0) AS UserMaxFavoriteCount,
+  COALESCE(upa.AvgEditLagHours, 0) AS UserAvgEditLagHours,
+  COALESCE(upa.AvgScorePerAnswer, 0) AS UserAvgScorePerAnswer,
+  COALESCE(upa.AvgScorePerView, 0) AS UserAvgScorePerView,
+  COALESCE(upa.AvgScorePerFavorite, 0) AS UserAvgScorePerFavorite,
+  COALESCE(upa.AvgScorePerComment, 0) AS UserAvgScorePerComment,
+  SUM(pi.CommentCount) AS TotalCommentsOnUserPosts,
+  SUM(pi.VoteCount) AS TotalVotesOnUserPosts,
+  SUM(pi.UpVoteCount) AS TotalUpVotesOnUserPosts,
+  SUM(pi.DownVoteCount) AS TotalDownVotesOnUserPosts,
+  SUM(pi.FavoriteCount) AS TotalFavoritesOnUserPosts,
+  SUM(pi.BountyStartCount) AS TotalBountyStartsOnUserPosts,
+  COUNT(DISTINCT CASE WHEN rp.RowNumDesc <= 5 THEN rp.PostId ELSE NULL END) AS Top5RecentPosts,
+  COUNT(DISTINCT CASE WHEN rp.RowNumScoreDesc <= 5 THEN rp.PostId ELSE NULL END) AS Top5HighestScoringPosts,
+  AVG(rp.EditLagHours) FILTER (WHERE rp.EditLagHours IS NOT NULL) AS AvgNonNullEditLagHours,
+  SUM(CASE WHEN rp.PostScore > 100 THEN 1 ELSE 0 END) AS PostsWithScoreOver100,
+  SUM(CASE WHEN rp.AnswerCount > 10 THEN 1 ELSE 0 END) AS PostsWithMoreThan10Answers,
+  SUM(rp.PostScore) AS SumOfAllPostScores,
+  AVG(rp.PostScore) AS AverageOfAllPostScores,
+  MAX(rp.PostScore) AS MaximumOfAllPostScores,
+  MIN(rp.PostScore) AS MinimumOfAllPostScores,
+  AVG(rp.AnswerCount) AS AverageOfAllAnswerCounts,
+  AVG(rp.CommentCount) AS AverageOfAllCommentCounts,
+  AVG(rp.FavoriteCount) AS AverageOfAllFavoriteCounts,
+  AVG(rp.ViewCount) AS AverageOfAllViewCounts,
+  COUNT(rp.PostId) AS TotalPostsConsidered,
+  SUM(rp.PostScore) FILTER (WHERE rp.PostTypeId = 1) AS TotalQuestionScore,
+  SUM(rp.PostScore) FILTER (WHERE rp.PostTypeId = 2) AS TotalAnswerScore,
+  SUM(rp.AnswerCount) FILTER (WHERE rp.PostTypeId = 1) AS TotalQuestionAnswerCount,
+  AVG(rp.PostScore - rp.NextPostScore) AS AvgScoreDifferenceWithNextPost,
+  AVG(rp.PostScore - rp.PreviousPostScore) AS AvgScoreDifferenceWithPreviousPost,
+  (
+    SELECT
+      COUNT(*)
+    FROM Posts AS p2
+    WHERE
+      p2.OwnerUserId = u.Id AND p2.ClosedDate IS NOT NULL
+  ) AS UserClosedPostsCount,
+  (
+    SELECT
+      AVG(CAST(JULIANDAY(p3.ClosedDate) - JULIANDAY(p3.CreationDate) AS REAL))
+    FROM Posts AS p3
+    WHERE
+      p3.OwnerUserId = u.Id AND p3.ClosedDate IS NOT NULL
+  ) AS AvgTimeToCloseSeconds,
+  COALESCE(
+    (
+      SELECT
+        COUNT(*)
+      FROM PostLinks AS pl
+      WHERE
+        pl.PostId = u.Id AND pl.LinkTypeId = 3
+    ),
+    0
+  ) AS UserDuplicateLinksCount,
+  u.Reputation AS UserReputation,
+  u.Views AS UserTotalViews,
+  u.UpVotes AS UserTotalUpVotes,
+  u.DownVotes AS UserTotalDownVotes,
+  DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate) AS UserAgeDays,
+  DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), u.LastAccessDate) AS UserLastAccessAgeDays,
+  CASE
+    WHEN u.WebsiteUrl IS NULL THEN 'NoWebsite'
+    WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'StackOverflowRelated'
+    ELSE 'ExternalWebsite'
+  END AS WebsiteType,
+  CASE
+    WHEN INSTR(u.AboutMe, 'SQL') > 0 THEN 'SQLInterest'
+    WHEN INSTR(u.AboutMe, 'Database') > 0 THEN 'DatabaseInterest'
+    ELSE 'OtherInterest'
+  END AS AboutMeInterest,
+  CASE
+    WHEN u.Location LIKE '%USA%' THEN 'USALocation'
+    WHEN u.Location LIKE '%Canada%' THEN 'CanadaLocation'
+    ELSE 'OtherLocation'
+  END AS UserLocationCategory,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = u.Id AND b.Class = 1
+  ) AS GoldBadges,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = u.Id AND b.Class = 2
+  ) AS SilverBadges,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = u.Id AND b.Class = 3
+  ) AS BronzeBadges,
+  (
+    SELECT
+      SUM(b.Class)
+    FROM Badges AS b
+    WHERE
+      b.UserId = u.Id
+  ) AS SumBadgeClasses,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostHistory AS ph
+    WHERE
+      ph.UserId = u.Id AND ph.PostHistoryTypeId IN (4, 5, 6)
+  ) AS UserEditsCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostHistory AS ph
+    WHERE
+      ph.UserId = u.Id AND ph.PostHistoryTypeId IN (10, 12, 14, 19, 33)
+  ) AS UserModerationActions,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostHistory AS ph
+    WHERE
+      ph.UserId = u.Id AND ph.PostHistoryTypeId IN (11, 13, 15, 20, 34)
+  ) AS UserModerationReversals,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments AS c
+    WHERE
+      c.UserId = u.Id AND c.Score > 5
+  ) AS UserHighScoringComments,
+  (
+    SELECT
+      COUNT(*)
+    FROM Votes AS v
+    WHERE
+      v.UserId = u.Id AND v.VoteTypeId IN (2, 5)
+  ) AS UserUpvotesAndFavorites,
+  (
+    SELECT
+      COUNT(*)
+    FROM Votes AS v
+    WHERE
+      v.UserId = u.Id AND v.VoteTypeId = 3
+  ) AS UserDownvotes,
+  COALESCE(COUNT(DISTINCT pht.Id), 0) AS TotalPostHistoryEntries,
+  COUNT(DISTINCT CASE WHEN pht.PostHistoryTypeId = 2 THEN pht.Id ELSE NULL END) AS BodyEditCount,
+  COUNT(DISTINCT CASE WHEN pht.PostHistoryTypeId = 4 THEN pht.Id ELSE NULL END) AS TitleEditCount,
+  COUNT(DISTINCT CASE WHEN pht.PostHistoryTypeId = 6 THEN pht.Id ELSE NULL END) AS TagsEditCount,
+  COUNT(DISTINCT CASE WHEN pht.PostHistoryTypeId = 10 THEN pht.Id ELSE NULL END) AS CloseVoteCount,
+  COUNT(DISTINCT CASE WHEN pht.PostHistoryTypeId = 11 THEN pht.Id ELSE NULL END) AS ReopenVoteCount,
+  COUNT(DISTINCT CASE WHEN pht.PostHistoryTypeId = 12 THEN pht.Id ELSE NULL END) AS DeleteVoteCount,
+  COUNT(DISTINCT CASE WHEN pht.PostHistoryTypeId = 13 THEN pht.Id ELSE NULL END) AS UndeleteVoteCount,
+  COUNT(DISTINCT CASE WHEN pht.PostHistoryTypeId = 19 THEN pht.Id ELSE NULL END) AS ProtectVoteCount,
+  COUNT(DISTINCT CASE WHEN pht.PostHistoryTypeId = 20 THEN pht.Id ELSE NULL END) AS UnprotectVoteCount,
+  AVG(JULIANDAY(ph.CreationDate)) AS AvgPostHistoryCreationDay,
+  MAX(JULIANDAY(ph.CreationDate)) AS MaxPostHistoryCreationDay,
+  MIN(JULIANDAY(ph.CreationDate)) AS MinPostHistoryCreationDay,
+  SUM(CASE WHEN ph.Comment <> '' AND ph.Comment IS NOT NULL THEN 1 ELSE 0 END) AS PostsWithHistoryComments,
+  COUNT(DISTINCT ph.RevisionGUID) AS DistinctRevisionGUIDs,
+  COUNT(DISTINCT ph.PostId) AS DistinctPostsInHistory,
+  COUNT(DISTINCT ph.UserId) AS DistinctUsersInHistory,
+  SUM(CASE WHEN ph.Text LIKE '%`%' THEN 1 ELSE 0 END) AS PostsWithBackticksInHistoryText,
+  SUM(CASE WHEN ph.Text LIKE '%*%' THEN 1 ELSE 0 END) AS PostsWithAsterisksInHistoryText,
+  SUM(CASE WHEN ph.Text LIKE '%[^a-zA-Z0-9 ]%' THEN 1 ELSE 0 END) AS PostsWithSpecialCharsInHistoryText,
+  COUNT(DISTINCT p.Id) AS DistinctPostsWithHistory,
+  COUNT(DISTINCT ph.Id) AS TotalPostHistoryEntriesForPosts,
+  SUM(CASE WHEN ph.PostHistoryTypeId = 2 THEN LENGTH(ph.Text) ELSE 0 END) AS TotalBodyEditChars,
+  AVG(LENGTH(ph.Text)) AS AvgHistoryTextLength,
+  MAX(LENGTH(ph.Text)) AS MaxHistoryTextLength,
+  MIN(LENGTH(ph.Text)) AS MinHistoryTextLength,
+  SUM(CASE WHEN ph.Comment IS NOT NULL THEN LENGTH(ph.Comment) ELSE 0 END) AS TotalHistoryCommentChars,
+  AVG(LENGTH(ph.Comment)) AS AvgHistoryCommentLength,
+  MAX(LENGTH(ph.Comment)) AS MaxHistoryCommentLength,
+  MIN(LENGTH(ph.Comment)) AS MinHistoryCommentLength,
+  SUM(CASE WHEN ph.PostHistoryTypeId IN (2, 5) AND ph.Text IS NOT NULL THEN 1 ELSE 0 END) AS RawBodyEditHistoryEntries,
+  SUM(CASE WHEN ph.PostHistoryTypeId IN (1, 4) AND ph.Text IS NOT NULL THEN 1 ELSE 0 END) AS TitleEditHistoryEntries,
+  SUM(CASE WHEN ph.PostHistoryTypeId IN (3, 6) AND ph.Text IS NOT NULL THEN 1 ELSE 0 END) AS TagsEditHistoryEntries,
+  SUM(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL THEN CAST(ph.Comment AS INTEGER) ELSE NULL END) AS TotalCloseReasonIdsSum,
+  COUNT(DISTINCT CASE WHEN ph.Text LIKE '%"OriginalQuestionIds"%' THEN ph.PostId ELSE NULL END) AS PostsWithOriginalQuestionIdsInHistoryText
+FROM Users AS u
+LEFT JOIN RankedPosts AS rp
+  ON u.Id = rp.OwnerUserId
+LEFT JOIN UserPostAggregates AS upa
+  ON u.Id = upa.OwnerUserId
+LEFT JOIN PostInteractions AS pi
+  ON rp.PostId = pi.PostId
+LEFT JOIN PostHistory AS ph
+  ON u.Id = ph.UserId
+LEFT JOIN Posts AS p
+  ON ph.PostId = p.Id
+LEFT JOIN PostHistoryTypes AS pht
+  ON ph.PostHistoryTypeId = pht.Id
+WHERE
+  u.Reputation > 1000
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  u.WebsiteUrl,
+  u.AboutMe,
+  u.Location,
+  u.Views,
+  u.UpVotes,
+  u.DownVotes,
+  upa.TotalPosts,
+  upa.AvgPostScore,
+  upa.TotalPostScore,
+  upa.MaxPostScore,
+  upa.AvgAnswerCount,
+  upa.TotalAnswerCount,
+  upa.MaxAnswerCount,
+  upa.AvgCommentCount,
+  upa.TotalCommentCount,
+  upa.MaxCommentCount,
+  upa.AvgFavoriteCount,
+  upa.TotalFavoriteCount,
+  upa.MaxFavoriteCount,
+  upa.AvgEditLagHours,
+  upa.AvgScorePerAnswer,
+  upa.AvgScorePerView,
+  upa.AvgScorePerFavorite,
+  upa.AvgScorePerComment
+ORDER BY
+  UserReputation DESC,
+  UserTotalPosts DESC;

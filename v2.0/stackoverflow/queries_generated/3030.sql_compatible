@@ -1,0 +1,181 @@
+WITH
+user_base AS (
+    SELECT
+        u.Id                                   AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate                         AS user_created,
+        MIN(p.CreationDate) OVER (PARTITION BY u.Id)   AS first_post_date,
+        MAX(p.CreationDate) OVER (PARTITION BY u.Id)   AS last_post_date,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)    AS question_cnt,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)    AS answer_cnt,
+        COUNT(DISTINCT p.Tags) FILTER (WHERE p.PostTypeId = 1) AS distinct_tag_sets,
+        COALESCE(SUM(v.Score) FILTER (WHERE v.VoteTypeId = 2),0) -
+        COALESCE(SUM(v.Score) FILTER (WHERE v.VoteTypeId = 3),0) AS net_vote_score
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v   ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+
+user_badges AS (
+    SELECT
+        b.UserId                              AS user_id,
+        COUNT(*) FILTER (WHERE b.Class = 1)   AS gold_cnt,
+        COUNT(*) FILTER (WHERE b.Class = 2)   AS silver_cnt,
+        COUNT(*) FILTER (WHERE b.Class = 3)   AS bronze_cnt,
+        COUNT(DISTINCT b.Name)                AS distinct_badge_cnt,
+        STRING_AGG(DISTINCT b.Name, '; ') 
+            FILTER (WHERE b.Class = 1)       AS gold_names,
+        STRING_AGG(DISTINCT b.Name, '; ') 
+            FILTER (WHERE b.Class = 2)       AS silver_names,
+        STRING_AGG(DISTINCT b.Name, '; ') 
+            FILTER (WHERE b.Class = 3)       AS bronze_names
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+latest_post AS (
+    SELECT
+        p.OwnerUserId                         AS user_id,
+        p.Id                                  AS post_id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate                        AS post_date,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+
+top_tags AS (
+    SELECT TagName
+    FROM Tags
+    ORDER BY "Count" DESC
+    LIMIT 5
+),
+user_tag_overlap AS (
+    SELECT
+        ub.user_id,
+        COUNT(DISTINCT t.TagName) AS overlap_tag_cnt
+    FROM user_base ub
+    JOIN Posts p          ON p.OwnerUserId = ub.user_id AND p.PostTypeId = 1
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(
+                TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag
+    ) AS t_raw
+    JOIN Tags t           ON t.TagName = t_raw.tag
+    WHERE t.TagName IN (SELECT TagName FROM top_tags)
+    GROUP BY ub.user_id
+),
+
+users_with_accepted AS (
+    SELECT DISTINCT
+        q.OwnerUserId AS asker_id,
+        a.OwnerUserId AS answerer_id
+    FROM Posts q
+    JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1 AND a.PostTypeId = 2
+),
+
+answer_score_before_first_q AS (
+    SELECT
+        ub.user_id,
+        COALESCE((
+            SELECT AVG(a.Score)
+            FROM Posts a
+            WHERE a.OwnerUserId = ub.user_id
+              AND a.PostTypeId = 2
+              AND a.CreationDate < ub.first_post_date
+        ), 0) AS avg_early_answer_score
+    FROM user_base ub
+),
+
+high_impact_users AS (
+    SELECT user_id FROM user_badges WHERE gold_cnt >= 3
+    UNION
+    SELECT user_id FROM user_base WHERE net_vote_score > 10000
+    UNION
+    SELECT answerer_id AS user_id FROM users_with_accepted
+),
+
+final_rank AS (
+    SELECT
+        ub.user_id,
+        ub.DisplayName,
+        ub.Reputation,
+        ub.question_cnt,
+        ub.answer_cnt,
+        ub.net_vote_score,
+        ub.first_post_date,
+        ub.last_post_date,
+        ub.distinct_tag_sets,
+        COALESCE(ubc.gold_cnt,0)    AS gold_badges,
+        COALESCE(ubc.silver_cnt,0)  AS silver_badges,
+        COALESCE(ubc.bronze_cnt,0)  AS bronze_badges,
+        COALESCE(ubc.distinct_badge_cnt,0) AS distinct_badges,
+        lp.post_id,
+        lp.Title                     AS latest_title,
+        lp.post_date                 AS latest_post_date,
+        lp.PostTypeId                AS latest_post_type,
+        uto.overlap_tag_cnt          AS top5_tag_overlap,
+        asc.avg_early_answer_score   AS avg_prefirst_answer_score,
+        CASE WHEN hi.user_id IS NOT NULL THEN 1 ELSE 0 END AS is_high_impact,
+        ROW_NUMBER() OVER (ORDER BY ub.Reputation DESC,
+                                      ub.net_vote_score DESC) AS rank_by_rep
+    FROM user_base ub
+    LEFT JOIN user_badges ubc      ON ubc.user_id = ub.user_id
+    LEFT JOIN latest_post lp       ON lp.user_id = ub.user_id AND lp.rn = 1
+    LEFT JOIN user_tag_overlap uto ON uto.user_id = ub.user_id
+    LEFT JOIN answer_score_before_first_q asc ON asc.user_id = ub.user_id
+    LEFT JOIN high_impact_users hi ON hi.user_id = ub.user_id
+    GROUP BY
+        ub.user_id,
+        ub.DisplayName,
+        ub.Reputation,
+        ub.question_cnt,
+        ub.answer_cnt,
+        ub.net_vote_score,
+        ub.first_post_date,
+        ub.last_post_date,
+        ub.distinct_tag_sets,
+        ubc.gold_cnt,
+        ubc.silver_cnt,
+        ubc.bronze_cnt,
+        ubc.distinct_badge_cnt,
+        lp.post_id,
+        lp.Title,
+        lp.post_date,
+        lp.PostTypeId,
+        uto.overlap_tag_cnt,
+        asc.avg_early_answer_score,
+        hi.user_id
+)
+SELECT
+    fr.user_id,
+    fr.DisplayName,
+    fr.Reputation,
+    fr.question_cnt,
+    fr.answer_cnt,
+    fr.net_vote_score,
+    fr.first_post_date,
+    fr.last_post_date,
+    fr.distinct_tag_sets,
+    fr.gold_badges,
+    fr.silver_badges,
+    fr.bronze_badges,
+    fr.distinct_badges,
+    fr.latest_title,
+    fr.latest_post_date,
+    CASE fr.latest_post_type
+        WHEN 1 THEN 'Question'
+        WHEN 2 THEN 'Answer'
+        ELSE 'Other'
+    END AS latest_post_type_desc,
+    fr.top5_tag_overlap,
+    ROUND(fr.avg_prefirst_answer_score::numeric,2) AS avg_prefirst_answer_score,
+    fr.is_high_impact,
+    fr.rank_by_rep
+FROM final_rank fr
+WHERE fr.rank_by_rep <= 100
+ORDER BY fr.rank_by_rep;

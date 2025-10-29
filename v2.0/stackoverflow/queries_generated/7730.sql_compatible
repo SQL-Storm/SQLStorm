@@ -1,0 +1,263 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as cumulative_score
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(p.Id) as PostCount,
+        SUM(COALESCE(p.Score, 0)) as TotalScore,
+        AVG(COALESCE(p.Score, 0)) as AvgScore,
+        MAX(p.CreationDate) as LastPostDate,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title ELSE NULL END, ' | ') as QuestionTitles,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Body ELSE NULL END, ' | ') as AnswerBodies
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopQuestions AS (
+    SELECT 
+        Id,
+        Title,
+        Score,
+        ViewCount,
+        AnswerCount,
+        CommentCount,
+        FavoriteCount,
+        CreationDate,
+        OwnerUserId,
+        Tags,
+        CASE 
+            WHEN AnswerCount > 0 THEN 'Has Answers'
+            WHEN AnswerCount = 0 THEN 'No Answers'
+            ELSE 'Unknown'
+        END as AnswerStatus
+    FROM Posts 
+    WHERE PostTypeId = 1
+    AND Score >= (
+        SELECT AVG(Score) * 1.5 
+        FROM Posts 
+        WHERE PostTypeId = 1
+    )
+),
+ComplexTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        CASE 
+            WHEN t.Count > 100 THEN 'High Volume'
+            WHEN t.Count > 50 THEN 'Medium Volume'
+            WHEN t.Count > 10 THEN 'Low Volume'
+            ELSE 'Very Low Volume'
+        END as VolumeCategory,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p 
+             WHERE p.PostTypeId = 1 
+             AND p.Tags LIKE '%' || t.TagName || '%'), 
+            0
+        ) as QuestionsWithTag
+    FROM Tags t
+    WHERE t.Count > 0
+),
+PostActivity AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        (EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400)::integer as DaysSinceCreation,
+        CASE 
+            WHEN (EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400)::integer > 30 THEN 'Highly Active'
+            WHEN (EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400)::integer > 7 THEN 'Moderately Active'
+            ELSE 'Low Activity'
+        END as ActivityLevel,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Comments c 
+             WHERE c.PostId = p.Id), 
+            0
+        ) as CommentCount,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Votes v 
+             WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3)), 
+            0
+        ) as VoteCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+)
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    us.PostCount,
+    us.TotalScore,
+    us.AvgScore,
+    us.LastPostDate,
+    (
+        SELECT STRING_AGG(
+            CONCAT(q.Title, ' (Score: ', q.Score, ')'), 
+            '; '
+        ) 
+        FROM TopQuestions q 
+        WHERE q.OwnerUserId = u.Id 
+        AND q.Score > 100
+        ORDER BY q.Score DESC
+        LIMIT 5
+    ) as HighScoreQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = u.Id 
+        AND p.PostTypeId = 2
+        AND p.Score > 0
+    ) as PositiveAnswerCount,
+    (
+        SELECT STRING_AGG(
+            LOWER(p.Tags), 
+            ', '
+        ) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = u.Id 
+        AND p.PostTypeId = 1
+        AND p.Tags IS NOT NULL
+        AND LENGTH(p.Tags) > 0
+        ORDER BY p.CreationDate DESC
+        LIMIT 10
+    ) as RecentTagsUsed,
+    (
+        SELECT STRING_AGG(
+            CONCAT('V', COALESCE(v.VoteTypeId::text, '0')), 
+            ''
+        ) 
+        FROM Votes v 
+        WHERE v.UserId = u.Id 
+        AND v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)
+    ) as VotePattern,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = u.Id 
+        AND b.Class = 1
+    ) as GoldBadges,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = u.Id 
+        AND b.Class = 2
+    ) as SilverBadges,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = u.Id 
+        AND b.Class = 3
+    ) as BronzeBadges,
+    (
+        SELECT STRING_AGG(
+            CONCAT(ct.TagName, ' (', ct.Count, ')'), 
+            '; '
+        ) 
+        FROM ComplexTags ct 
+        WHERE ct.QuestionsWithTag > 0
+        AND ct.TagName IN (
+            SELECT DISTINCT tag 
+            FROM (
+                SELECT TRIM(BOTH '<>' FROM UNNEST(string_to_array(p.Tags, '><'))) AS tag 
+                FROM Posts p 
+                WHERE p.OwnerUserId = u.Id 
+                AND p.PostTypeId = 1
+            ) tags
+            WHERE tag IS NOT NULL
+            AND LENGTH(tag) > 0
+        )
+        ORDER BY ct.Count DESC
+        LIMIT 10
+    ) as RelevantTags,
+    (
+        SELECT AVG(pa.VoteCount) 
+        FROM PostActivity pa 
+        WHERE pa.Id IN (
+            SELECT Id 
+            FROM Posts 
+            WHERE OwnerUserId = u.Id 
+            AND PostTypeId = 1
+        )
+    ) as AvgVotesPerQuestion,
+    CASE 
+        WHEN u.Reputation >= 10000 THEN 'Elite'
+        WHEN u.Reputation >= 1000 THEN 'Established'
+        WHEN u.Reputation >= 100 THEN 'Beginner'
+        ELSE 'Newbie'
+    END as ReputationTier,
+    (
+        SELECT CASE 
+            WHEN COUNT(*) > 0 THEN 'Active User'
+            ELSE 'Inactive User'
+        END 
+        FROM Posts p 
+        WHERE p.OwnerUserId = u.Id 
+        AND p.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '6 months')
+    ) as RecentActivityStatus,
+    (
+        SELECT COUNT(DISTINCT p1.Id) 
+        FROM Posts p1
+        INNER JOIN Posts p2 ON p1.Id = p2.ParentId
+        WHERE p1.OwnerUserId = u.Id
+        AND p2.PostTypeId = 2
+        AND p2.Score > 0
+    ) as PositiveAnsweredQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph
+        WHERE ph.UserId = u.Id
+        AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+    ) as EditHistoryCount
+FROM Users u
+INNER JOIN UserStats us ON u.Id = us.UserId
+WHERE u.Reputation > 500
+AND u.Id IN (
+    SELECT DISTINCT OwnerUserId 
+    FROM Posts 
+    WHERE PostTypeId = 1 
+    AND Score > 50
+)
+AND u.Id IN (
+    SELECT DISTINCT UserId 
+    FROM Badges 
+    WHERE Class = 1
+)
+AND u.Id IN (
+    SELECT DISTINCT UserId 
+    FROM Votes 
+    WHERE VoteTypeId IN (2, 3, 4)
+)
+ORDER BY u.Reputation DESC
+OFFSET 10 ROWS
+FETCH NEXT 20 ROWS ONLY;

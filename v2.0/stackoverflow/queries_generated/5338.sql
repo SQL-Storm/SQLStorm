@@ -1,0 +1,126 @@
+-- {"query": "5338.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 824} 
+WITH recent_posts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+),
+tag_counts AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS tag_post_count,
+    SUM(p.Score) AS total_score,
+    AVG(p.ViewCount) AS avg_views,
+    MAX(p.LastActivityDate) AS last_activity
+  FROM (
+    SELECT
+      unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName,
+      p.Id,
+      p.Score,
+      p.ViewCount,
+      p.LastActivityDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+  ) t
+  GROUP BY t.TagName
+),
+top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+complex_posts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.Score AS post_score,
+    p.ViewCount,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    CASE
+      WHEN p.OwnerUserId IS NULL THEN 'anonymous'
+      WHEN p.OwnerUserId = -1 THEN 'community'
+      ELSE 'user'
+    END AS owner_type,
+    CASE
+      WHEN p.Score > 0 THEN 'positive'
+      WHEN p.Score < 0 THEN 'negative'
+      ELSE 'neutral'
+    END AS score_trend,
+    EXISTS (
+      SELECT 1 FROM Votes v
+      WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3)
+    ) AS has_votes
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  WHERE p.PostTypeId IN (1,2)
+),
+filtered_hub AS (
+  SELECT
+    cp.Id,
+    cp.Title,
+    cp.OwnerUserId,
+    cp.LastEditDate,
+    cp.post_score,
+    cp.ViewCount,
+    cp.CreationDate,
+    cp.LastActivityDate,
+    cp.owner_type,
+    cp.score_trend,
+    cp.has_votes,
+    ROW_NUMBER() OVER (ORDER BY cp.LastActivityDate DESC, cp.post_score DESC) AS rn
+  FROM complex_posts cp
+  WHERE cp.LastActivityDate > NOW() - INTERVAL '180 days'
+)
+SELECT
+  fh.Id AS post_id,
+  fh.Title,
+  fu.DisplayName AS owner_display_name,
+  fu.Reputation,
+  fu.Location,
+  fu.CreationDate AS owner_creation_date,
+  fh.LastEditDate,
+  fh.post_score,
+  fh.ViewCount,
+  fh.CreationDate AS post_creation_date,
+  fh.LastActivityDate,
+  fh.owner_type,
+  fh.score_trend,
+  fh.has_votes,
+  tc.TagName,
+  tc.tag_post_count,
+  tc.total_score,
+  tc.avg_views,
+  tc.last_activity
+FROM filtered_hub fh
+LEFT JOIN Users fu ON fu.Id = fh.OwnerUserId
+LEFT JOIN tag_counts tc ON TRUE
+ORDER BY fh.LastActivityDate DESC, fh.post_score DESC
+LIMIT 100;

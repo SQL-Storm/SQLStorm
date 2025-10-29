@@ -1,0 +1,110 @@
+WITH RankedAnswers AS (
+    SELECT
+        ROW_NUMBER() OVER(PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn,
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.OwnerUserId,
+        p.Score AS AnswerScore,
+        p.CreationDate AS AnswerCreationDate,
+        u.DisplayName AS AnswererDisplayName,
+        u.Reputation AS AnswererReputation,
+        CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS IsAccepted,
+        CASE
+            WHEN p.Score > q.Score THEN 'Better than Question'
+            WHEN p.Score = q.Score THEN 'Equal to Question'
+            ELSE 'Worse than Question'
+        END AS ScoreComparisonToQuestion,
+        LAG(p.Score, 1, 0) OVER(PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS PreviousAnswerScore
+    FROM Posts p
+    JOIN Posts q ON p.ParentId = q.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 2
+      AND q.PostTypeId = 1
+      AND q.ClosedDate IS NULL
+      AND p.OwnerUserId IS NOT NULL
+),
+QuestionDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerUserId,
+        q.Title AS QuestionTitle,
+        q.Tags AS QuestionTags,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.AnswerCount,
+        q.FavoriteCount,
+        u.DisplayName AS QuestionerDisplayName,
+        u.Reputation AS QuestionerReputation,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id AND c.UserId IS NOT NULL) AS CommentCountOnQuestion,
+        -- Use standard SQL date difference in days: CAST difference of timestamps to interval/day depending on dialect.
+        -- Calculate difference in days as (LastEditDate - CreationDate) in days using extract(epoch) where available.
+        CASE
+            WHEN q.LastEditDate IS NOT NULL AND q.CreationDate IS NOT NULL
+            THEN EXTRACT(EPOCH FROM (q.LastEditDate - q.CreationDate)) / 86400
+            ELSE NULL
+        END AS QuestionEditLagDays,
+        CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer
+    FROM Posts q
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    WHERE q.PostTypeId = 1
+      AND q.ClosedDate IS NULL
+),
+UserActivity AS (
+    SELECT
+        UserId,
+        COUNT(CASE WHEN VoteTypeId = 2 THEN 1 END) AS TotalUpvotes,
+        COUNT(CASE WHEN VoteTypeId = 3 THEN 1 END) AS TotalDownvotes,
+        COUNT(DISTINCT PostId) AS PostsVotedOn,
+        MAX(CreationDate) AS LastVoteDate
+    FROM Votes
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+)
+SELECT
+    qd.QuestionId,
+    qd.QuestionTitle,
+    qd.QuestionerDisplayName,
+    qd.QuestionerReputation,
+    qd.QuestionCreationDate,
+    qd.QuestionScore,
+    qd.FavoriteCount,
+    qd.CommentCountOnQuestion,
+    qd.QuestionEditLagDays,
+    qd.HasAcceptedAnswer,
+    (SELECT STRING_AGG(ra.AnswererDisplayName, '; ')
+     FROM RankedAnswers ra
+     WHERE ra.QuestionId = qd.QuestionId
+       AND ra.rn <= 3) AS Top3Answerers,
+    (SELECT STRING_AGG(CAST(ra.AnswerScore AS VARCHAR), '; ')
+     FROM RankedAnswers ra
+     WHERE ra.QuestionId = qd.QuestionId
+       AND ra.rn <= 3) AS Top3AnswerScores,
+    (SELECT AVG(ra.AnswerScore::numeric)
+     FROM RankedAnswers ra
+     WHERE ra.QuestionId = qd.QuestionId
+       AND ra.rn <= 2) AS AvgTop2AnswerScore,
+    (SELECT COUNT(*)
+     FROM RankedAnswers ra
+     WHERE ra.QuestionId = qd.QuestionId
+       AND ra.ScoreComparisonToQuestion IN ('Better than Question', 'Equal to Question')) AS AnswersBetterOrEqualQuestionScore,
+    (SELECT AVG(ra.AnswererReputation::numeric)
+     FROM RankedAnswers ra
+     WHERE ra.QuestionId = qd.QuestionId
+       AND ra.AnswererReputation IS NOT NULL) AS AvgAnswererReputation,
+    COALESCE(ua.TotalUpvotes, 0) AS QuestionerUpvotes,
+    COALESCE(ua.TotalDownvotes, 0) AS QuestionerDownvotes,
+    REPLACE(qd.QuestionTags, '><', '|') AS FormattedQuestionTags,
+    CASE WHEN qd.QuestionEditLagDays > 3 THEN 'Yes' ELSE 'No' END AS EditedAfter3Days,
+    CASE WHEN EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = qd.QuestionId AND c.UserDisplayName IS NULL) THEN 'HasAnonymousComments' ELSE 'NoAnonymousComments' END AS AnonymousCommentStatus,
+    DENSE_RANK() OVER (ORDER BY qd.QuestionScore DESC) AS QuestionScoreRank,
+    CASE
+        WHEN qd.AnswerCount > 0 THEN CAST(qd.HasAcceptedAnswer AS DOUBLE PRECISION) / qd.AnswerCount
+        ELSE 0
+    END AS AcceptanceRatio
+FROM QuestionDetails qd
+LEFT JOIN UserActivity ua ON qd.QuestionOwnerUserId = ua.UserId
+WHERE qd.QuestionScore > 10
+  AND qd.AnswerCount BETWEEN 5 AND 50
+  AND qd.QuestionerReputation > 1000
+ORDER BY qd.QuestionCreationDate DESC
+LIMIT 100;

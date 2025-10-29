@@ -1,0 +1,160 @@
+-- {"query": "7764.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1651} 
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) as HighViewQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 10 THEN p.Id END) as HighScoreAnswers,
+    COUNT(DISTINCT b.Id) as BadgesEarned,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges,
+    ROUND(AVG(CAST(p.Score AS FLOAT)), 2) as AvgPostScore,
+    MAX(p.CreationDate) as LastPostDate,
+    MIN(p.CreationDate) as FirstPostDate,
+    DATEDIFF(DAY, MIN(p.CreationDate), MAX(p.CreationDate)) as DaysActive,
+    COUNT(DISTINCT c.Id) as CommentsMade,
+    COUNT(DISTINCT pl.Id) as LinksCreated,
+    COUNT(DISTINCT ph.Id) as PostHistoryActions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+        AND p2.PostTypeId = 1 
+        AND p2.ClosedDate IS NOT NULL
+    ) as ClosedQuestions,
+    
+    -- Complex window function with partitioning and ranking
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COUNT(DISTINCT p.Id) DESC, u.Reputation DESC) as UserPostRanking,
+    
+    -- Correlated subquery with aggregation
+    (
+        SELECT TOP 1 t.TagName 
+        FROM Posts p3 
+        INNER JOIN Posts p4 ON p3.Id = p4.ParentId 
+        LEFT JOIN Tags t ON t.TagName = SUBSTRING(p3.Tags, 2, LEN(p3.Tags)-2)
+        WHERE p3.OwnerUserId = u.Id 
+        AND p3.PostTypeId = 1
+        GROUP BY t.TagName 
+        ORDER BY COUNT(*) DESC
+    ) as TopTag,
+    
+    -- CTE with complex logic for calculating user engagement metrics
+    (
+        WITH UserEngagement AS (
+            SELECT 
+                u2.Id as UserId,
+                COUNT(DISTINCT p5.Id) as TotalPosts,
+                COUNT(DISTINCT CASE WHEN p5.PostTypeId = 1 THEN p5.Id END) as Questions,
+                COUNT(DISTINCT CASE WHEN p5.PostTypeId = 2 THEN p5.Id END) as Answers,
+                COUNT(DISTINCT CASE WHEN p5.PostTypeId = 1 AND p5.ViewCount > 1000 THEN p5.Id END) as HighViewQuestions,
+                COUNT(DISTINCT CASE WHEN p5.PostTypeId = 2 AND p5.Score > 10 THEN p5.Id END) as HighScoreAnswers,
+                COUNT(DISTINCT b2.Id) as BadgesEarned,
+                MAX(p5.CreationDate) as LastPostDate,
+                MIN(p5.CreationDate) as FirstPostDate
+            FROM Users u2 
+            LEFT JOIN Posts p5 ON u2.Id = p5.OwnerUserId
+            LEFT JOIN Badges b2 ON u2.Id = b2.UserId
+            WHERE u2.Id = u.Id
+            GROUP BY u2.Id
+        )
+        SELECT 
+            CASE 
+                WHEN TotalPosts > 0 THEN 
+                    (CAST(HighScoreAnswers AS FLOAT) / CAST(NULLIF(TotalPosts, 0) AS FLOAT)) * 100 
+                ELSE 0 
+            END as AnswerQualityPercentage
+        FROM UserEngagement
+    ) as AnswerQualityPercentage,
+    
+    -- Set operators and complex string manipulations
+    (
+        SELECT STRING_AGG(
+            CASE 
+                WHEN p5.PostTypeId = 1 THEN 'Q:' + CAST(p5.Id AS VARCHAR) 
+                WHEN p5.PostTypeId = 2 THEN 'A:' + CAST(p5.Id AS VARCHAR)
+                ELSE 'O:' + CAST(p5.Id AS VARCHAR)
+            END, 
+            '; '
+        ) 
+        FROM Posts p5 
+        WHERE p5.OwnerUserId = u.Id
+        AND p5.CreationDate > DATEADD(YEAR, -1, cast('2024-10-01 12:34:56' as timestamp))
+    ) as RecentPostIds,
+    
+    -- NULL logic and complex predicates
+    COALESCE(
+        (
+            SELECT TOP 1 Title 
+            FROM Posts p6 
+            WHERE p6.OwnerUserId = u.Id 
+            AND p6.PostTypeId = 1 
+            AND p6.Title IS NOT NULL
+            ORDER BY p6.CreationDate DESC
+        ), 
+        'No Questions'
+    ) as LatestQuestionTitle,
+    
+    -- Complex calculation with multiple conditions
+    CASE 
+        WHEN u.Reputation >= 10000 AND u.ViewCount > 10000 THEN 'Elite'
+        WHEN u.Reputation >= 5000 AND u.ViewCount > 5000 THEN 'Veteran'
+        WHEN u.Reputation >= 1000 AND u.ViewCount > 1000 THEN 'Regular'
+        WHEN u.Reputation >= 100 THEN 'Newbie'
+        ELSE 'Beginner'
+    END as UserCategory,
+    
+    -- Advanced string expression with conditional logic
+    CONCAT(
+        RIGHT('000000000' + CAST(u.Reputation AS VARCHAR), 9),
+        '|',
+        CAST(DATEDIFF(DAY, u.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS VARCHAR),
+        '|',
+        CASE WHEN u.WebsiteUrl IS NOT NULL THEN 'Y' ELSE 'N' END,
+        '|',
+        CASE WHEN u.AboutMe IS NOT NULL AND LEN(u.AboutMe) > 0 THEN 'Y' ELSE 'N' END,
+        '|',
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)
+    ) as ProfileCompletionMetrics
+    
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.RelatedPostId OR u.Id = pl.PostId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+WHERE 
+    u.Id BETWEEN 1 AND 50000
+    AND (
+        p.Id IS NULL 
+        OR (p.CreationDate > DATEADD(YEAR, -2, cast('2024-10-01 12:34:56' as timestamp)) AND p.CreationDate < cast('2024-10-01 12:34:56' as timestamp))
+    )
+    AND (
+        b.Id IS NULL 
+        OR b.Date > DATEADD(YEAR, -1, cast('2024-10-01 12:34:56' as timestamp))
+    )
+GROUP BY 
+    u.Id, 
+    u.DisplayName, 
+    u.Reputation, 
+    u.ViewCount, 
+    u.CreationDate, 
+    u.WebsiteUrl, 
+    u.AboutMe
+HAVING 
+    COUNT(DISTINCT p.Id) > 0
+    AND (
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0
+        OR COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0
+    )
+ORDER BY 
+    u.Reputation DESC,
+    COUNT(DISTINCT p.Id) DESC,
+    (
+        SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2
+    ) DESC
+OFFSET 0 ROWS
+FETCH NEXT 1000 ROWS ONLY;

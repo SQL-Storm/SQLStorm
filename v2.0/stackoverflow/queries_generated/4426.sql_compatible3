@@ -1,0 +1,156 @@
+WITH
+  RankedQuestions AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.ViewCount,
+      u.DisplayName AS OwnerDisplayName,
+      ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC, p.Score DESC, p.AnswerCount DESC) AS ViewRank,
+      ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.AnswerCount DESC, p.ViewCount DESC) AS ScoreRank,
+      COALESCE(SUM(c.Score) OVER (PARTITION BY p.Id), 0) AS TotalCommentScore,
+      AVG(CAST(p.ViewCount AS BIGINT)) OVER () AS AvgSiteViewCount,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+      p.ClosedDate,
+      p.Tags
+    FROM
+      Posts p
+      LEFT JOIN Users u
+        ON p.OwnerUserId = u.Id
+      LEFT JOIN Comments c
+        ON c.PostId = p.Id
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate >= DATE '2023-01-01'
+  ),
+  HighEngagementQuestions AS (
+    SELECT
+      rq.*
+    FROM
+      RankedQuestions rq
+    WHERE
+      rq.ViewRank <= 100 OR rq.ScoreRank <= 100
+  ),
+  QuestionAnswers AS (
+    SELECT
+      p.ParentId,
+      COUNT(p.Id) AS AnswerCount,
+      SUM(p.Score) AS TotalAnswerScore,
+      AVG(CAST(p.ViewCount AS BIGINT)) AS AvgAnswerViewCount
+    FROM
+      Posts p
+    WHERE
+      p.PostTypeId = 2
+      AND p.ParentId IN (
+        SELECT PostId FROM HighEngagementQuestions
+      )
+    GROUP BY
+      p.ParentId
+  ),
+  UserContribution AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT ph.PostId) AS PostHistoryCount,
+      COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN ph.PostId END) AS BodyEditCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount,
+      COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM
+      Users u
+      LEFT JOIN PostHistory ph
+        ON u.Id = ph.UserId
+      LEFT JOIN Votes v
+        ON u.Id = v.UserId
+      LEFT JOIN Badges b
+        ON u.Id = b.UserId
+    WHERE
+      u.Id IN (SELECT OwnerUserId FROM HighEngagementQuestions)
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  TagPerformance AS (
+    SELECT
+      t.TagName,
+      COUNT(DISTINCT p.Id) AS PostCount,
+      SUM(CAST(p.Score AS BIGINT)) AS TotalScore,
+      AVG(CAST(p.ViewCount AS BIGINT)) AS AvgViewCount,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM
+      Posts p
+      JOIN Tags t
+        ON POSITION(',' || t.TagName || ',' IN (',' || REPLACE(REPLACE(p.Tags, '><', ','), '"', '') || ',')) > 0
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+    GROUP BY
+      t.TagName
+  )
+SELECT
+  heq.PostId,
+  heq.Title,
+  heq.OwnerDisplayName,
+  heq.CreationDate,
+  heq.Score,
+  heq.AnswerCount AS QuestionAnswerCount,
+  heq.ViewCount AS QuestionViewCount,
+  COALESCE(qa.AnswerCount, 0) AS TotalAnswers,
+  COALESCE(qa.TotalAnswerScore, 0) AS TotalAnswerScore,
+  heq.TotalCommentScore,
+  heq.ViewRank,
+  heq.ScoreRank,
+  CASE
+    WHEN heq.IsClosed = 1 AND heq.ClosedDate IS NOT NULL THEN TO_CHAR(heq.ClosedDate, 'YYYY-MM-DD')
+    WHEN heq.IsClosed = 0 THEN 'Not Closed'
+    ELSE 'Unknown'
+  END AS ClosureStatus,
+  uc.PostHistoryCount,
+  uc.BodyEditCount,
+  uc.UpvoteCount,
+  uc.DownvoteCount,
+  uc.BadgeCount,
+  tp.TagName,
+  tp.PostCount AS TagPostCount,
+  tp.TotalScore AS TagTotalScore,
+  tp.AvgViewCount AS TagAvgViewCount,
+  tp.LastPostDate,
+  'Engagement Ratio: ' || CAST( (CAST(heq.Score AS NUMERIC) / NULLIF(heq.ViewCount, 0)) AS VARCHAR ) AS EngagementRatio,
+  CASE WHEN heq.OwnerUserId IS NULL THEN 'Community' ELSE 'User' END AS OwnerType,
+  UPPER(SUBSTR(heq.Title, 1, 1)) || SUBSTR(heq.Title, 2) AS FormattedTitle
+FROM
+  HighEngagementQuestions heq
+  LEFT JOIN QuestionAnswers qa
+    ON heq.PostId = qa.ParentId
+  LEFT JOIN UserContribution uc
+    ON heq.OwnerUserId = uc.UserId
+  LEFT JOIN TagPerformance tp
+    ON EXISTS (
+      SELECT 1
+      FROM (
+        -- convert tag string like "<tag1><tag2>" into rows by splitting on '><'
+        SELECT TRIM(value) AS tag
+        FROM (
+          SELECT
+            CASE
+              WHEN heq.Tags IS NULL OR heq.Tags = '' THEN NULL
+              ELSE regexp_split_to_table(
+                -- remove leading '<' and trailing '>' if present
+                regexp_replace(heq.Tags, '^<|>$', '', 'g'),
+                '><'
+              )
+            END AS value
+        ) s
+      ) tags
+      WHERE tags.tag = tp.TagName
+    )
+WHERE
+  heq.Score > 50
+  OR heq.ViewCount > 10000
+  OR heq.TotalCommentScore > 200
+ORDER BY
+  heq.ScoreRank,
+  heq.ViewRank;

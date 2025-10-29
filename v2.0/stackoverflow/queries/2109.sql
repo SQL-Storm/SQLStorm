@@ -1,0 +1,178 @@
+with recursive UserReputationRank as (
+    select
+        Id,
+        DisplayName,
+        Reputation,
+        row_number() over (order by Reputation desc, Id) as Rank
+    from Users
+    where Reputation is not null
+), 
+TopUsers as (
+    select Id, DisplayName, Reputation, Rank
+    from UserReputationRank
+    where Rank <= 100
+),
+PostQuestionAnswerCounts as (
+    select
+        p.OwnerUserId,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswerCount,
+        sum(coalesce(p.Score, 0)) as TotalScore,
+        sum(coalesce(p.ViewCount, 0)) as TotalViews,
+        avg(coalesce(p.Score, 0)) as AvgScore
+    from Posts p
+    where p.OwnerUserId in (select Id from TopUsers)
+    group by p.OwnerUserId
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        count(*) as BadgeCount,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    where b.UserId in (select Id from TopUsers)
+    group by b.UserId
+),
+UserRecentActivity as (
+    select
+        p.OwnerUserId as UserId,
+        max(p.CreationDate) as LastPostDate,
+        max(ph.CreationDate) as LastPostHistoryDate,
+        max(v.CreationDate) as LastVoteDate,
+        max(c.CreationDate) as LastCommentDate
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    left join Comments c on c.PostId = p.Id
+    where p.OwnerUserId in (select Id from TopUsers)
+    group by p.OwnerUserId
+),
+UserDuplicates as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.OwnerUserId as OwnerUserId,
+        pl.LinkTypeId
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    where pl.LinkTypeId = 3
+      and p1.OwnerUserId in (select Id from TopUsers)
+),
+UserDuplicateCounts as (
+    select
+        OwnerUserId,
+        count(*) as DuplicatePostsCount
+    from UserDuplicates
+    group by OwnerUserId
+),
+UserActivityWindow as (
+    select 
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        (
+            select count(*)
+            from Posts p2
+            where p2.OwnerUserId = p.OwnerUserId
+              and p2.CreationDate between p.CreationDate - interval '30 day' and p.CreationDate
+        ) as PostsInLast30Days,
+        (
+            select avg(coalesce(p2.Score,0))
+            from Posts p2
+            where p2.OwnerUserId = p.OwnerUserId
+              and p2.CreationDate between p.CreationDate - interval '30 day' and p.CreationDate
+        ) as AvgScore30Days
+    from Posts p
+    where p.OwnerUserId in (select Id from TopUsers)
+),
+UserComplexMetrics as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        pqa.QuestionCount,
+        pqa.AnswerCount,
+        pqa.TotalScore,
+        pqa.TotalViews,
+        pqa.AvgScore,
+        coalesce(ubs.BadgeCount, 0) as BadgeCount,
+        coalesce(ubs.GoldBadges, 0) as GoldBadges,
+        coalesce(ubs.SilverBadges, 0) as SilverBadges,
+        coalesce(ubs.BronzeBadges, 0) as BronzeBadges,
+        ua.LastPostDate,
+        ua.LastPostHistoryDate,
+        ua.LastVoteDate,
+        ua.LastCommentDate,
+        coalesce(udc.DuplicatePostsCount, 0) as DuplicatePostsCount,
+        (select max(PostsInLast30Days) from UserActivityWindow where OwnerUserId = u.Id) as MaxPostsIn30Days,
+        (select max(AvgScore30Days) from UserActivityWindow where OwnerUserId = u.Id) as MaxAvgScoreIn30Days
+    from TopUsers u
+    left join PostQuestionAnswerCounts pqa on pqa.OwnerUserId = u.Id
+    left join UserBadgeSummary ubs on ubs.UserId = u.Id
+    left join UserRecentActivity ua on ua.UserId = u.Id
+    left join UserDuplicateCounts udc on udc.OwnerUserId = u.Id
+)
+select 
+    ucm.Id,
+    ucm.DisplayName,
+    ucm.Reputation,
+    ucm.QuestionCount,
+    ucm.AnswerCount,
+    ucm.TotalScore,
+    ucm.TotalViews,
+    ucm.AvgScore,
+    ucm.BadgeCount,
+    ucm.GoldBadges,
+    ucm.SilverBadges,
+    ucm.BronzeBadges,
+    cast(ucm.LastPostDate as date) as LastPostDate,
+    cast(ucm.LastPostHistoryDate as date) as LastPostHistoryDate,
+    cast(ucm.LastVoteDate as date) as LastVoteDate,
+    cast(ucm.LastCommentDate as date) as LastCommentDate,
+    ucm.DuplicatePostsCount,
+    ucm.MaxPostsIn30Days,
+    round(ucm.MaxAvgScoreIn30Days, 2) as MaxAvgScoreIn30Days,
+    case 
+        when ucm.DuplicatePostsCount > 10 then 'High Duplicate Count'
+        when ucm.MaxPostsIn30Days > 20 then 'High Activity'
+        when ucm.BadgeCount > 50 then 'Highly Decorated'
+        else 'Normal'
+    end as UserCategory,
+    substring(
+      concat_ws(' / ',
+        coalesce(ucm.DisplayName, 'unknown'),
+        case when ucm.GoldBadges > 0 then 'Gold+' else 'NoGold' end,
+        case when coalesce(ucm.AnswerCount,0) > coalesce(ucm.QuestionCount,0) then 'Answerer' else 'Questioner' end
+      ), 1, 40) as DisplaySummary
+from UserReputationRank u
+join UserComplexMetrics ucm on u.Id = ucm.Id
+where ucm.TotalScore > (
+    select avg(TotalScore) from PostQuestionAnswerCounts where OwnerUserId in (select Id from TopUsers)
+)
+group by
+    ucm.Id,
+    ucm.DisplayName,
+    ucm.Reputation,
+    ucm.QuestionCount,
+    ucm.AnswerCount,
+    ucm.TotalScore,
+    ucm.TotalViews,
+    ucm.AvgScore,
+    ucm.BadgeCount,
+    ucm.GoldBadges,
+    ucm.SilverBadges,
+    ucm.BronzeBadges,
+    ucm.LastPostDate,
+    ucm.LastPostHistoryDate,
+    ucm.LastVoteDate,
+    ucm.LastCommentDate,
+    ucm.DuplicatePostsCount,
+    ucm.MaxPostsIn30Days,
+    ucm.MaxAvgScoreIn30Days
+order by ucm.Reputation desc, ucm.TotalScore desc
+limit 50;

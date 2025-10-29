@@ -1,0 +1,199 @@
+with recursive RecursiveUserReplies as (
+    select 
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.ParentId,
+        1 as ReplyDepth,
+        p.CreationDate,
+        u.Reputation as OwnerReputation,
+        p.Score
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 2
+  union all
+    select 
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.ParentId,
+        rur.ReplyDepth + 1,
+        p.CreationDate,
+        u.Reputation,
+        p.Score
+    from Posts p
+    inner join RecursiveUserReplies rur on p.ParentId = rur.PostId
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 2
+),
+TopActiveUsers as (
+    select 
+        OwnerUserId,
+        count(*) as TotalAnswers,
+        avg(Score) as AvgAnswerScore,
+        sum(case when ReplyDepth > 1 then 1 else 0 end) as NestedRepliesCount,
+        max(CreationDate) as LastAnswerDate,
+        max(OwnerReputation) as MaxUserReputation
+    from RecursiveUserReplies
+    where OwnerUserId is not null
+    group by OwnerUserId
+    having count(*) > 50
+),
+QuestionsWithDuplicates as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        string_agg(distinct coalesce(lt.Name, 'Unknown'), ', ') as LinkTypesInDuplicates,
+        count(distinct pl.Id) as DuplicateLinksCount,
+        max(pl.CreationDate) as LatestDuplicateLinkDate
+    from Posts q
+    left join PostLinks pl on pl.PostId = q.Id and pl.LinkTypeId = 3
+    left join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags
+    having count(distinct pl.Id) > 0
+),
+BadgeCountsByUser as (
+    select 
+        UserId,
+        sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(distinct Name) as DistinctBadgesCount
+    from Badges
+    group by UserId
+),
+UserActivitySummary as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(b.GoldBadges, 0) as GoldBadges,
+        coalesce(b.SilverBadges, 0) as SilverBadges,
+        coalesce(b.BronzeBadges, 0) as BronzeBadges,
+        coalesce(b.DistinctBadgesCount, 0) as DistinctBadgesCount,
+        au.TotalAnswers,
+        au.AvgAnswerScore,
+        au.NestedRepliesCount,
+        au.LastAnswerDate
+    from Users u
+    left join BadgeCountsByUser b on u.Id = b.UserId
+    left join TopActiveUsers au on u.Id = au.OwnerUserId
+),
+RankedUserAnswers as (
+    select 
+        p.Id as AnswerId,
+        p.ParentId as QuestionId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate asc) as AnswerRankByUser,
+        dense_rank() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as AnswerRankWithinQuestion,
+        p.Body,
+        coalesce(au.AvgAnswerScore,0) as UserAvgScore,
+        coalesce(au.TotalAnswers,0) as UserTotalAnswers,
+        coalesce(u.DisplayName, 'unknown') as UserName
+    from Posts p
+    left join UserActivitySummary au on p.OwnerUserId = au.UserId
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 2 and p.OwnerUserId is not null
+),
+AnswersWithCommentsCount as (
+    select
+        a.AnswerId,
+        a.QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        a.AnswerRankByUser,
+        a.AnswerRankWithinQuestion,
+        a.Body,
+        a.UserAvgScore,
+        a.UserTotalAnswers,
+        a.UserName,
+        count(c.Id) as CommentCount,
+        max(c.CreationDate) as LastCommentDate,
+        string_agg(distinct c.UserDisplayName, ', ') filter (where c.UserDisplayName is not null) as CommentAuthors
+    from RankedUserAnswers a
+    left join Comments c on c.PostId = a.AnswerId
+    group by a.AnswerId, a.QuestionId, a.OwnerUserId, a.Score, a.CreationDate, a.AnswerRankByUser, a.AnswerRankWithinQuestion, a.Body, a.UserAvgScore, a.UserTotalAnswers, a.UserName
+),
+FinalSelect as (
+    select 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.GoldBadges,
+        uas.SilverBadges,
+        uas.BronzeBadges,
+        uas.DistinctBadgesCount,
+        uas.TotalAnswers,
+        uas.AvgAnswerScore,
+        uas.NestedRepliesCount,
+        uas.LastAnswerDate,
+        qd.QuestionId,
+        qd.Title as QuestionTitle,
+        qd.Score as QuestionScore,
+        qd.ViewCount as QuestionViews,
+        left(qd.Tags, 200) as QuestionTagsSnippet,
+        qd.DuplicateLinksCount,
+        qd.LinkTypesInDuplicates,
+        qd.LatestDuplicateLinkDate,
+        awc.AnswerId,
+        awc.Score as AnswerScore,
+        awc.CreationDate as AnswerCreationDate,
+        awc.AnswerRankByUser,
+        awc.AnswerRankWithinQuestion,
+        substring(awc.Body from 1 for 150) as AnswerBodySnippet,
+        awc.CommentCount,
+        awc.LastCommentDate,
+        awc.CommentAuthors
+    from UserActivitySummary uas
+    left join Posts q on q.OwnerUserId = uas.UserId and q.PostTypeId = 1
+    left join QuestionsWithDuplicates qd on qd.QuestionId = q.Id
+    left join AnswersWithCommentsCount awc on awc.OwnerUserId = uas.UserId and awc.QuestionId = q.Id
+    where uas.TotalAnswers > 50
+      and qd.DuplicateLinksCount > 0
+)
+select 
+    UserId,
+    DisplayName,
+    Reputation,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    DistinctBadgesCount,
+    TotalAnswers,
+    round(AvgAnswerScore,2) as AvgAnswerScore,
+    NestedRepliesCount,
+    LastAnswerDate,
+    QuestionId,
+    QuestionTitle,
+    QuestionScore,
+    QuestionViews,
+    QuestionTagsSnippet,
+    DuplicateLinksCount,
+    LinkTypesInDuplicates,
+    LatestDuplicateLinkDate,
+    AnswerId,
+    AnswerScore,
+    AnswerCreationDate,
+    AnswerRankByUser,
+    AnswerRankWithinQuestion,
+    AnswerBodySnippet,
+    CommentCount,
+    LastCommentDate,
+    CommentAuthors
+from FinalSelect
+where AnswerScore >= (
+    select avg(Score)*0.75 
+    from Posts 
+    where PostTypeId = 2 and OwnerUserId = FinalSelect.UserId
+)
+order by Reputation desc, TotalAnswers desc, AnswerScore desc
+limit 100;

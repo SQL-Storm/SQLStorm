@@ -1,0 +1,184 @@
+WITH
+  QuestionDetails AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title AS QuestionTitle,
+      p.OwnerUserId,
+      u.DisplayName AS OwnerDisplayName,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount AS QuestionViewCount,
+      p.Tags,
+      p.ClosedDate,
+      DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS QuestionSequenceForUser
+    FROM Posts p
+    JOIN Users u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+  ),
+  AnswerDetails AS (
+    SELECT
+      a.Id AS AnswerId,
+      a.ParentId AS QuestionId,
+      a.OwnerUserId,
+      au.DisplayName AS OwnerDisplayName,
+      a.CreationDate AS AnswerCreationDate,
+      a.Score AS AnswerScore,
+      a.CommentCount AS AnswerCommentCount,
+      a.ContentLicense,
+      0 AS IsAcceptedAnswer,
+      ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate) AS AnswerRankForQuestion,
+      LAG(a.Score, 1, 0) OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate) AS PreviousAnswerScore,
+      LEAD(a.Score, 1, 0) OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate) AS NextAnswerScore
+    FROM Posts a
+    JOIN Users au
+      ON a.OwnerUserId = au.Id
+    LEFT JOIN QuestionDetails q
+      ON a.ParentId = q.QuestionId
+    WHERE
+      a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+  ),
+  AnswerDetailsWithAccepted AS (
+    SELECT
+      ad.*,
+      CASE WHEN ad.AnswerId = q.AcceptedAnswerId THEN 1 ELSE 0 END AS IsAcceptedAnswerFinal
+    FROM AnswerDetails ad
+    LEFT JOIN Posts q
+      ON ad.QuestionId = q.Id
+  ),
+  TopAnswers AS (
+    SELECT
+      AnswerId,
+      QuestionId,
+      OwnerUserId,
+      OwnerDisplayName,
+      AnswerCreationDate,
+      AnswerScore,
+      IsAcceptedAnswerFinal AS IsAcceptedAnswer,
+      AnswerCommentCount,
+      ContentLicense,
+      ROW_NUMBER() OVER (ORDER BY AnswerScore DESC) AS OverallAnswerRank,
+      AnswerRankForQuestion
+    FROM AnswerDetailsWithAccepted
+    WHERE
+      AnswerRankForQuestion <= 5
+  ),
+  UserPostActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName AS UserDisplayName,
+      COUNT(p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      AVG(p.Score) AS AverageScore,
+      MAX(p.CreationDate) AS LastPostDate,
+      COUNT(DISTINCT pf.Id) AS FavoriteCount,
+      COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Posts pf
+      ON u.Id = pf.OwnerUserId AND pf.FavoriteCount > 0
+    LEFT JOIN Badges b
+      ON u.Id = b.UserId
+    WHERE
+      u.Id > 0 AND u.DisplayName IS NOT NULL
+    GROUP BY
+      u.Id,
+      u.DisplayName
+    HAVING
+      COUNT(p.Id) > 10
+  )
+SELECT
+  qd.QuestionId,
+  qd.QuestionTitle,
+  qd.OwnerDisplayName AS QuestionOwner,
+  qd.QuestionScore,
+  qd.ScoreRank,
+  qd.AnswerCount AS TotalAnswers,
+  ta.AnswerId,
+  ta.OwnerDisplayName AS AnswerOwner,
+  ta.AnswerScore,
+  ta.IsAcceptedAnswer,
+  ta.AnswerCommentCount,
+  upa.TotalPosts AS QuestionOwnerTotalPosts,
+  upa.AverageScore AS QuestionOwnerAvgScore,
+  upa.BadgeCount AS QuestionOwnerBadges,
+  COALESCE(
+    REPLACE(qd.Tags, '><', ';'),
+    'No Tags'
+  ) AS FormattedTags,
+  CAST(
+    (
+      (EXTRACT(EPOCH FROM COALESCE(qd.ClosedDate, TIMESTAMP '2024-10-01 12:34:56')) )
+      - (EXTRACT(EPOCH FROM qd.QuestionCreationDate))
+    ) / 86400 AS INTEGER
+  ) AS DaysOpenOrClosed,
+  CASE
+    WHEN qd.QuestionScore > 100 AND qd.AnswerCount > 10 AND ta.IsAcceptedAnswer = 1 THEN 'Highly Rated & Answered'
+    WHEN qd.QuestionScore < 0 THEN 'Negatively Scored'
+    WHEN qd.AnswerCount = 0 THEN 'Unanswered'
+    ELSE 'Standard'
+  END AS QuestionStatus,
+  CASE
+    WHEN ta.AnswerScore > (
+      SELECT AVG(AnswerScore) FROM AnswerDetailsWithAccepted WHERE QuestionId = qd.QuestionId
+    ) THEN 'Above Average Answer'
+    WHEN ta.AnswerScore < (
+      SELECT AVG(AnswerScore) FROM AnswerDetailsWithAccepted WHERE QuestionId = qd.QuestionId
+    ) THEN 'Below Average Answer'
+    ELSE 'Average Answer'
+  END AS AnswerQuality,
+  (qd.OwnerDisplayName || ' | ' || upa.UserDisplayName) AS OwnerPair,
+  ua.UserDisplayName AS PopularUserWhoAnswered
+FROM QuestionDetails qd
+JOIN TopAnswers ta
+  ON qd.QuestionId = ta.QuestionId
+LEFT JOIN UserPostActivity upa
+  ON qd.OwnerUserId = upa.UserId
+LEFT JOIN (
+  SELECT DISTINCT
+    ad.QuestionId,
+    au.DisplayName AS UserDisplayName
+  FROM AnswerDetailsWithAccepted ad
+  JOIN Users au
+    ON ad.OwnerUserId = au.Id
+  WHERE
+    ad.AnswerScore > 50
+) ua
+  ON qd.QuestionId = ua.QuestionId
+WHERE
+  qd.QuestionScore > 0
+  AND qd.QuestionViewCount > 1000
+  AND qd.QuestionCreationDate >= DATE '2023-01-01'
+  AND COALESCE(qd.Tags, '') <> ''
+  AND ta.AnswerScore >= 0
+GROUP BY
+  qd.QuestionId,
+  qd.QuestionTitle,
+  qd.OwnerDisplayName,
+  qd.QuestionScore,
+  qd.ScoreRank,
+  qd.AnswerCount,
+  ta.AnswerId,
+  ta.OwnerDisplayName,
+  ta.AnswerScore,
+  ta.IsAcceptedAnswer,
+  ta.AnswerCommentCount,
+  upa.TotalPosts,
+  upa.AverageScore,
+  upa.BadgeCount,
+  qd.Tags,
+  qd.ClosedDate,
+  qd.QuestionCreationDate,
+  ta.OwnerUserId,
+  upa.UserDisplayName,
+  ua.UserDisplayName
+ORDER BY
+  qd.QuestionScore DESC,
+  ta.AnswerScore DESC
+LIMIT 100;

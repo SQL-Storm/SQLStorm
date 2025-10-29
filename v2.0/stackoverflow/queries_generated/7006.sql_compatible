@@ -1,0 +1,259 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        AVG(p.Score::numeric) as AvgPostScore,
+        STDDEV_SAMP(p.Score::numeric) as PostScoreStdDev,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') as AllTags,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) * 100.0 / COUNT(DISTINCT p.Id)
+            ELSE 0 
+        END as PositiveScorePercentage
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.OwnerUserId IS NOT NULL
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Comments,
+        Badges,
+        LastPostDate,
+        LastCommentDate,
+        AvgPostScore,
+        PostScoreStdDev,
+        AllTags,
+        PositiveScorePercentage,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalPosts DESC) as RankByReputation,
+        RANK() OVER (ORDER BY TotalPosts DESC) as RankByPosts,
+        DENSE_RANK() OVER (ORDER BY Badges DESC) as RankByBadges,
+        NTILE(10) OVER (ORDER BY Reputation) as DecileOfReputation,
+        LAG(Reputation, 1) OVER (ORDER BY Reputation DESC) as PrevReputation,
+        LEAD(Reputation, 1) OVER (ORDER BY Reputation DESC) as NextReputation,
+        CASE 
+            WHEN Reputation > (SELECT AVG(Reputation::numeric) FROM Users) THEN 'AboveAverage'
+            WHEN Reputation < (SELECT AVG(Reputation::numeric) FROM Users) THEN 'BelowAverage'
+            ELSE 'Average'
+        END as ReputationLevel,
+        CASE 
+            WHEN Questions > 0 AND Answers > 0 THEN 'BothQnA'
+            WHEN Questions > 0 THEN 'Questioner'
+            WHEN Answers > 0 THEN 'Answerer'
+            ELSE 'Neither'
+        END as ContributionType
+    FROM UserActivityStats
+),
+QuestionTagAnalysis AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.OwnerDisplayName,
+        CASE 
+            WHEN NOT EXISTS (
+                SELECT 1 FROM Posts a 
+                WHERE a.ParentId = p.Id 
+                AND a.PostTypeId = 2 
+                AND a.Score > 0
+            ) THEN 'NoHighScoreAnswer'
+            ELSE 'HasHighScoreAnswer'
+        END as AnswerQualityIndicator,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM PostHistory ph 
+                WHERE ph.PostId = p.Id 
+                AND ph.PostHistoryTypeId = 10 
+                AND ph.Comment LIKE '%101%'
+            ) THEN 1
+            ELSE 0
+        END as IsDuplicate,
+        string_to_array(
+            CASE 
+                WHEN char_length(p.Tags) > 2 THEN substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2)
+                ELSE ''
+            END, 
+            '><'
+        ) as TagArray,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevQuestionScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextQuestionScore,
+        AVG(p.Score::numeric) OVER (PARTITION BY p.OwnerUserId) as AvgUserQuestionScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserQuestionRank,
+        CASE 
+            WHEN p.Score > (
+                SELECT AVG(Score::numeric) 
+                FROM Posts 
+                WHERE PostTypeId = 1 AND Score IS NOT NULL
+            ) THEN 'AboveAverage'
+            WHEN p.Score < (
+                SELECT AVG(Score::numeric) 
+                FROM Posts 
+                WHERE PostTypeId = 1 AND Score IS NOT NULL
+            ) THEN 'BelowAverage'
+            ELSE 'Average'
+        END as ScoreComparison,
+        CASE 
+            WHEN p.ViewCount > (
+                SELECT AVG(ViewCount::numeric) 
+                FROM Posts 
+                WHERE PostTypeId = 1 AND ViewCount IS NOT NULL
+            ) THEN 'Popular'
+            ELSE 'NotPopular'
+        END as PopularityStatus
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+ComplexTagAnalysis AS (
+    SELECT 
+        qt.QuestionId,
+        qt.Title,
+        qt.Tags,
+        qt.Score,
+        qt.ViewCount,
+        qt.AnswerCount,
+        qt.CommentCount,
+        qt.CreationDate,
+        qt.OwnerUserId,
+        qt.OwnerDisplayName,
+        qt.AnswerQualityIndicator,
+        qt.IsDuplicate,
+        qt.ScoreComparison,
+        qt.PopularityStatus,
+        qt.TagArray,
+        array_length(qt.TagArray, 1) as TagCount,
+        upper(substring(qt.Title FROM 1 FOR 1)) as TitleFirstLetter,
+        CASE 
+            WHEN char_length(qt.Title) > 50 THEN 'LongTitle'
+            WHEN char_length(qt.Title) < 10 THEN 'ShortTitle'
+            ELSE 'NormalTitle'
+        END as TitleLengthCategory,
+        ABS(qt.Score - qt.AvgUserQuestionScore) as ScoreDeviation,
+        qt.UserQuestionRank,
+        CASE 
+            WHEN qt.AnswerCount > 0 AND qt.AnswerCount = (
+                SELECT MAX(AnswerCount) 
+                FROM Posts p2 
+                WHERE p2.PostTypeId = 1 AND p2.OwnerUserId = qt.OwnerUserId
+            ) THEN 'TopAnswerer'
+            ELSE 'Regular'
+        END as AnswererStatus,
+        CASE 
+            WHEN qt.IsDuplicate = 1 THEN (
+                SELECT COUNT(*) 
+                FROM PostHistory ph 
+                WHERE ph.PostId = qt.QuestionId 
+                AND ph.PostHistoryTypeId = 10 
+                AND ph.Comment LIKE '%101%'
+            )
+            ELSE 0
+        END as DuplicateCount,
+        LAG(qt.Score, 1) OVER (ORDER BY qt.CreationDate) as PrevScore,
+        LEAD(qt.Score, 1) OVER (ORDER BY qt.CreationDate) as NextScore,
+        ROUND(
+            (qt.Score * 1.0 / NULLIF(qt.ViewCount, 0)) * 1000, 
+            2
+        ) as ScoreToViewRatio,
+        NULLIF(qt.Views - qt.ViewCount, 0) as ViewDifference,
+        CASE 
+            WHEN qt.ViewCount > 1000 AND qt.AnswerCount > 5 THEN 'HighTraffic'
+            WHEN qt.ViewCount < 100 AND qt.AnswerCount < 1 THEN 'LowTraffic'
+            ELSE 'MediumTraffic'
+        END as TrafficStatus,
+        DENSE_RANK() OVER (ORDER BY qt.Score DESC) as ScoreRank,
+        PERCENT_RANK() OVER (ORDER BY qt.Score) as ScorePercentile,
+        ROUND(AVG(qt.Score::numeric) OVER (), 2) as OverallAvgScore,
+        ROUND(STDDEV_SAMP(qt.Score::numeric) OVER (), 2) as OverallStdDevScore
+    FROM QuestionTagAnalysis qt
+)
+SELECT 
+    'Benchmark Query Results' as QueryType,
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT cu.UserId) as ActiveUsers,
+    COUNT(DISTINCT CASE WHEN cu.ContributionType = 'Questioner' THEN cu.UserId END) as Questioners,
+    COUNT(DISTINCT CASE WHEN cu.ContributionType = 'Answerer' THEN cu.UserId END) as Answerers,
+    COUNT(DISTINCT CASE WHEN cu.ContributionType = 'BothQnA' THEN cu.UserId END) as BothQnA,
+    COUNT(DISTINCT CASE WHEN cu.ReputationLevel = 'AboveAverage' THEN cu.UserId END) as AboveAvgReputation,
+    COUNT(DISTINCT CASE WHEN cu.ReputationLevel = 'BelowAverage' THEN cu.UserId END) as BelowAvgReputation,
+    COUNT(DISTINCT CASE WHEN ca.AnswerQualityIndicator = 'HasHighScoreAnswer' THEN ca.QuestionId END) as QuestionsWithHighScoreAnswers,
+    COUNT(DISTINCT CASE WHEN ca.IsDuplicate = 1 THEN ca.QuestionId END) as DuplicateQuestions,
+    COUNT(DISTINCT CASE WHEN ca.PopularityStatus = 'Popular' THEN ca.QuestionId END) as PopularQuestions,
+    COUNT(DISTINCT CASE WHEN ca.TagCount > 3 THEN ca.QuestionId END) as MultiTagQuestions,
+    COUNT(DISTINCT CASE WHEN ca.ScoreDeviation > 5 THEN ca.QuestionId END) as HighScoreDeviation,
+    ROUND(AVG(ca.ScoreToViewRatio), 2) as AvgScoreToViewRatio,
+    ROUND(AVG(cu.Reputation), 2) as AvgReputation,
+    ROUND(AVG(cu.TotalPosts), 2) as AvgTotalPosts,
+    ROUND(AVG(ca.Score), 2) as AvgQuestionScore,
+    ROUND(AVG(cu.Views), 2) as AvgViews,
+    ROUND(AVG(cu.UpVotes), 2) as AvgUpVotes,
+    ROUND(AVG(cu.DownVotes), 2) as AvgDownVotes,
+    STRING_AGG(
+        CASE 
+            WHEN cu.RankByPosts <= 5 THEN cu.DisplayName 
+            ELSE NULL 
+        END, ', '
+    ) as TopPosters,
+    STRING_AGG(
+        CASE 
+            WHEN cu.RankByReputation <= 3 THEN cu.DisplayName || ':' || cu.Reputation 
+            ELSE NULL 
+        END, ', '
+    ) as TopReputationHolders,
+    STRING_AGG(
+        CASE 
+            WHEN ca.ScoreRank <= 10 THEN ca.Title || ' (' || ca.Score || ')' 
+            ELSE NULL 
+        END, ', '
+    ) as TopScoringQuestions,
+    STRING_AGG(
+        CASE 
+            WHEN ca.TrafficStatus = 'HighTraffic' THEN ca.Title || ' (V:' || ca.ViewCount || ', A:' || ca.AnswerCount || ')' 
+            ELSE NULL 
+        END, ', '
+    ) as HighTrafficQuestions,
+    COUNT(DISTINCT CASE WHEN ca.TitleLengthCategory = 'LongTitle' THEN ca.QuestionId END) as LongTitleQuestions,
+    COUNT(DISTINCT CASE WHEN ca.TitleLengthCategory = 'ShortTitle' THEN ca.QuestionId END) as ShortTitleQuestions,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM ComplexTagAnalysis ca2 
+            WHERE ca2.DuplicateCount > 0
+        ) THEN 1 
+        ELSE 0 
+    END as ContainsDuplicates,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM ComplexTagAnalysis ca3 
+            WHERE ca3.ScoreDeviation > 10
+        ) THEN 1 
+        ELSE 0 
+    END as HasExtremeScoreDeviation
+FROM TopUsers cu
+FULL OUTER JOIN ComplexTagAnalysis ca ON cu.UserId = ca.OwnerUserId
+WHERE cu.UserId IS NOT NULL OR ca.QuestionId IS NOT NULL
+GROUP BY 'Benchmark Query Results';

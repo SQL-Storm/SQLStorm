@@ -1,0 +1,181 @@
+-- {"query": "3895.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1670} 
+-- Benchmark query pulling together user, post, tag and vote analytics
+WITH
+-- 1. Core user activity aggregates
+user_agg AS (
+    SELECT
+        u.Id                                 AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id)                           AS total_posts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS total_questions,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS total_answers,
+        COALESCE(SUM(p.Score), 0)             AS sum_score,
+        COALESCE(AVG(p.Score), 0)             AS avg_score,
+        MAX(p.CreationDate)                  AS last_post_date,
+        COUNT(b.Id)                           AS badge_count,
+        COUNT(DISTINCT t.TagName)             AS distinct_tags_used
+    FROM Users u
+    LEFT JOIN Posts p       ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b      ON b.UserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(p.Tags, '><')) AS raw_tag
+    ) AS tag_split ON true
+    LEFT JOIN Tags t        ON t.TagName = REPLACE(REPLACE(tag_split.raw_tag, '<', ''), '>', '')
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+-- 2. Recent vote activity (last 30 days) with window function for ranking
+recent_votes AS (
+    SELECT
+        v.PostId,
+        p.PostTypeId,
+        v.VoteTypeId,
+        v.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS vote_rank
+    FROM Votes v
+    JOIN Posts p ON p.Id = v.PostId
+    WHERE v.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '30 days')
+),
+
+-- 3. Tag popularity snapshot with null‑safe calculations
+tag_pop AS (
+    SELECT
+        t.Id                                 AS tag_id,
+        t.TagName,
+        COALESCE(t.Count, 0)                 AS tag_use_count,
+        COUNT(DISTINCT p.Id)                 AS questions_with_tag,
+        ROUND(
+            100.0 * COUNT(DISTINCT p.Id) / NULLIF(t.Count,0)
+        , 2)                                 AS pct_of_total_use,
+        MAX(p.Score)                         AS max_question_score,
+        MIN(p.Score)                         AS min_question_score,
+        AVG(p.Score)                         AS avg_question_score
+    FROM Tags t
+    LEFT JOIN Posts p
+        ON p.PostTypeId = 1                                      -- questions only
+        AND p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY t.Id, t.TagName, t.Count
+),
+
+-- 4. Correlated subquery to fetch the most recent accepted answer per question
+question_accepted AS (
+    SELECT
+        q.Id                                 AS question_id,
+        q.Title,
+        q.CreationDate,
+        (SELECT a.Id
+         FROM Posts a
+         WHERE a.Id = q.AcceptedAnswerId
+           AND a.PostTypeId = 2
+         ORDER BY a.CreationDate DESC
+         LIMIT 1)                           AS accepted_answer_id,
+        (SELECT a.Score
+         FROM Posts a
+         WHERE a.Id = q.AcceptedAnswerId
+           AND a.PostTypeId = 2
+         ORDER BY a.CreationDate DESC
+         LIMIT 1)                           AS accepted_answer_score
+    FROM Posts q
+    WHERE q.PostTypeId = 1                      -- only questions
+      AND q.AcceptedAnswerId IS NOT NULL
+),
+
+-- 5. Union of high‑scoring posts and low‑scoring posts for set operator stress
+high_low_posts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        'HIGH' AS score_bucket
+    FROM Posts p
+    WHERE p.Score >= 100
+    UNION ALL
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        'LOW' AS score_bucket
+    FROM Posts p
+    WHERE p.Score <= -10
+),
+
+-- 6. Intersection of users with both gold and bronze badges
+gold_bronze_users AS (
+    SELECT DISTINCT ub.UserId
+    FROM Badges ub
+    WHERE ub.Class = 1                                 -- gold
+    INTERSECT
+    SELECT DISTINCT ub2.UserId
+    FROM Badges ub2
+    WHERE ub2.Class = 3                                 -- bronze
+)
+
+SELECT
+    ua.user_id,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.total_posts,
+    ua.total_questions,
+    ua.total_answers,
+    ua.sum_score,
+    ua.avg_score,
+    ua.last_post_date,
+    ua.badge_count,
+    ua.distinct_tags_used,
+    COALESCE(rv.vote_rank, 0)                     AS recent_vote_rank,
+    tp.TagName,
+    tp.tag_use_count,
+    tp.questions_with_tag,
+    tp.pct_of_total_use,
+    tp.max_question_score,
+    tp.min_question_score,
+    tp.avg_question_score,
+    qa.title                                    AS accepted_question_title,
+    qa.accepted_answer_id,
+    qa.accepted_answer_score,
+    hlp.score,
+    hlp.score_bucket,
+    CASE
+        WHEN gb.UserId IS NOT NULL THEN 1
+        ELSE 0
+    END                                         AS has_gold_and_bronze_badges
+FROM user_agg ua
+LEFT JOIN recent_votes rv
+    ON rv.VoteTypeId = 2                -- upvotes
+   AND rv.vote_rank = 1
+LEFT JOIN tag_pop tp
+    ON tp.TagName = ANY (string_to_array(
+          COALESCE(
+              (SELECT string_agg(t.TagName, '><')
+               FROM Tags t
+               WHERE t.Id IN (
+                   SELECT (regexp_split_to_table(p.Tags, '><'))::int
+                   FROM Posts p
+                   WHERE p.OwnerUserId = ua.user_id
+               )
+              ), ''
+          ), '><')
+      )
+LEFT JOIN question_accepted qa
+    ON qa.question_id = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = ua.user_id
+          AND p.PostTypeId = 1
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    )
+LEFT JOIN high_low_posts hlp
+    ON hlp.Id = (
+        SELECT p2.Id
+        FROM Posts p2
+        WHERE p2.OwnerUserId = ua.user_id
+          AND p2.Score = hlp.Score
+        ORDER BY p2.CreationDate DESC
+        LIMIT 1
+    )
+LEFT JOIN gold_bronze_users gb
+    ON gb.UserId = ua.user_id
+ORDER BY ua.Reputation DESC, ua.user_id
+LIMIT 500;

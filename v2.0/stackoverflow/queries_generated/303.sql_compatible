@@ -1,0 +1,344 @@
+with recursive tag_list as (
+    select
+        p.Id as PostId,
+        lower(trim(t)) as tag,
+        1 as ord
+    from Posts p
+    cross join lateral unnest(
+        case
+            when p.Tags is null then array[]::varchar[] -- keep array literal as many dialects accept; cast left as-is if dialect supports, else can be adjusted by caller
+            else string_to_array(substring(p.Tags, 2, greatest(length(p.Tags)-2,0)), '><')
+        end
+    ) as t
+    where p.PostTypeId = 1
+), recent_users as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        coalesce(nullif(trim(u.WebsiteUrl), ''), 'n/a') as WebsiteUrl,
+        case
+            when u.ProfileImageUrl is null or u.ProfileImageUrl = '' then 0
+            else 1
+        end as HasAvatar,
+        row_number() over (order by u.Reputation desc, u.Id) as rn
+    from Users u
+    where u.CreationDate >= (select date_trunc('year', max(CreationDate)) - interval '2 years' from Users)
+), user_badge_rollup as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as gold_cnt,
+        sum(case when b.Class = 2 then 1 else 0 end) as silver_cnt,
+        sum(case when b.Class = 3 then 1 else 0 end) as bronze_cnt,
+        count(*) as total_badges,
+        max(b.Date) as last_badge_date
+    from Badges b
+    group by b.UserId
+), question_activity as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId as OwnerId,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.CreationDate,
+        q.ClosedDate,
+        count(distinct a.Id) filter (where a.PostTypeId = 2) as answers_total,
+        count(distinct c.Id) as comments_total,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as upvotes_total,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as downvotes_total,
+        count(distinct v.Id) filter (where v.VoteTypeId = 5) as favorites_total,
+        max(coalesce(a.CreationDate, q.CreationDate)) as last_activity
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Comments c on c.PostId = q.Id
+    left join Votes v on v.PostId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.OwnerUserId, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount, q.CreationDate, q.ClosedDate
+), dup_clusters as (
+    select
+        pl.RelatedPostId as CanonId,
+        count(*) as dup_count,
+        min(pl.CreationDate) as first_dup_link
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.RelatedPostId
+), edits as (
+    select
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId in (4,5,6)) as edit_count,
+        count(*) filter (where ph.PostHistoryTypeId in (10)) as close_votes_count,
+        max(ph.CreationDate) as last_edit_date,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as last_close_vote_date,
+        max(case when ph.PostHistoryTypeId = 10 then nullif(ph.Comment,'') end) as last_close_reason_id
+    from PostHistory ph
+    group by ph.PostId
+), top_tags as (
+    select
+        tl.tag,
+        count(*) as tag_q_count,
+        sum(qa.upvotes_total - qa.downvotes_total) as tag_net_votes
+    from tag_list tl
+    join question_activity qa on qa.QuestionId = tl.PostId
+    group by tl.tag
+    having count(*) > 50
+), user_qstats as (
+    select
+        qa.OwnerId as UserId,
+        count(*) as q_count,
+        avg(qa.Score) as avg_q_score,
+        percentile_cont(0.5) within group (order by qa.ViewCount) as median_views,
+        sum(case when qa.ClosedDate is not null then 1 else 0 end) as closed_qs,
+        sum(qa.upvotes_total) as total_up,
+        sum(qa.downvotes_total) as total_down,
+        sum(qa.favorites_total) as total_favs,
+        max(qa.last_activity) as last_q_activity
+    from question_activity qa
+    where qa.OwnerId is not null
+    group by qa.OwnerId
+), user_recent_activity as (
+    select
+        u.Id as UserId,
+        count(*) filter (where p.PostTypeId = 1 and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days') as recent_questions,
+        count(*) filter (where p.PostTypeId = 2 and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days') as recent_answers,
+        count(*) filter (where c.Id is not null and c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days') as recent_comments
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id
+), user_tag_focus as (
+    select
+        tl_owner.OwnerId as UserId,
+        tl.tag,
+        count(*) as tag_posts,
+        row_number() over (partition by tl_owner.OwnerId order by count(*) desc, min(tl_owner.CreationDate)) as tag_rank
+    from (
+        select q.Id, q.OwnerUserId as OwnerId, q.CreationDate
+        from Posts q
+        where q.PostTypeId = 1 and q.OwnerUserId is not null
+    ) tl_owner
+    join tag_list tl on tl.PostId = tl_owner.Id
+    group by tl_owner.OwnerId, tl.tag
+), user_top_tag as (
+    select utf.UserId, utf.tag as top_tag, tt.tag_q_count, tt.tag_net_votes
+    from user_tag_focus utf
+    left join top_tags tt on tt.tag = utf.tag
+    where utf.tag_rank = 1
+), save_candidates as (
+    select
+        ru.Id as UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.Location,
+        ru.UpVotes,
+        ru.DownVotes,
+        ru.Views,
+        ru.HasAvatar,
+        coalesce(ubr.gold_cnt,0) as gold_cnt,
+        coalesce(ubr.silver_cnt,0) as silver_cnt,
+        coalesce(ubr.bronze_cnt,0) as bronze_cnt,
+        coalesce(ubr.total_badges,0) as total_badges,
+        ubr.last_badge_date,
+        coalesce(uqs.q_count,0) as q_count,
+        coalesce(uqs.avg_q_score,0) as avg_q_score,
+        coalesce(uqs.median_views,0) as median_views,
+        coalesce(uqs.closed_qs,0) as closed_qs,
+        coalesce(uqs.total_up,0) as total_up,
+        coalesce(uqs.total_down,0) as total_down,
+        coalesce(uqs.total_favs,0) as total_favs,
+        uqs.last_q_activity,
+        ura.recent_questions,
+        ura.recent_answers,
+        ura.recent_comments,
+        utt.top_tag,
+        coalesce(utt.tag_q_count,0) as top_tag_q_count,
+        coalesce(utt.tag_net_votes,0) as top_tag_net_votes
+    from recent_users ru
+    left join user_badge_rollup ubr on ubr.UserId = ru.Id
+    left join user_qstats uqs on uqs.UserId = ru.Id
+    left join user_recent_activity ura on ura.UserId = ru.Id
+    left join user_top_tag utt on utt.UserId = ru.Id
+    where ru.rn <= 500
+), question_scores as (
+    select
+        qa.QuestionId,
+        qa.OwnerId,
+        qa.Score,
+        qa.ViewCount,
+        qa.AnswerCount,
+        qa.upvotes_total,
+        qa.downvotes_total,
+        qa.favorites_total,
+        coalesce(e.edit_count,0) as edit_count,
+        coalesce(e.close_votes_count,0) as close_votes_count,
+        e.last_edit_date,
+        e.last_close_vote_date,
+        e.last_close_reason_id,
+        case
+            when dc.CanonId is not null then 1 else 0
+        end as is_duplicate_target,
+        coalesce(dc.dup_count,0) as dup_count
+    from question_activity qa
+    left join edits e on e.PostId = qa.QuestionId
+    left join dup_clusters dc on dc.CanonId = qa.QuestionId
+), score_buckets as (
+    select
+        qs.OwnerId,
+        count(*) filter (where qs.Score >= 5) as hi_score_qs,
+        count(*) filter (where qs.Score between 1 and 4) as mid_score_qs,
+        count(*) filter (where qs.Score <= 0) as low_score_qs,
+        count(*) filter (where qs.is_duplicate_target = 1) as dup_targets,
+        avg(case when qs.ViewCount > 0 then (qs.upvotes_total - qs.downvotes_total) * 1.0 / qs.ViewCount else null end) as vote_density,
+        max(qs.dup_count) as max_dup_cluster_size
+    from question_scores qs
+    group by qs.OwnerId
+), ranked_users as (
+    select
+        sc.UserId,
+        sc.DisplayName,
+        sc.Reputation,
+        sc.Location,
+        sc.UpVotes,
+        sc.DownVotes,
+        sc.Views,
+        sc.HasAvatar,
+        sc.gold_cnt,
+        sc.silver_cnt,
+        sc.bronze_cnt,
+        sc.total_badges,
+        sc.last_badge_date,
+        sc.q_count,
+        sc.avg_q_score,
+        sc.median_views,
+        sc.closed_qs,
+        sc.total_up,
+        sc.total_down,
+        sc.total_favs,
+        sc.last_q_activity,
+        sc.recent_questions,
+        sc.recent_answers,
+        sc.recent_comments,
+        sc.top_tag,
+        sc.top_tag_q_count,
+        sc.top_tag_net_votes,
+        -- include columns used in order by
+        sc.Views as ScViews,
+        sc.UserId as Id_for_order,
+        sb.hi_score_qs,
+        sb.mid_score_qs,
+        sb.low_score_qs,
+        sb.dup_targets,
+        sb.vote_density,
+        sb.max_dup_cluster_size,
+        row_number() over (
+            order by
+                (sc.Reputation
+                 + (coalesce(sc.gold_cnt,0)*100 + coalesce(sc.silver_cnt,0)*25 + coalesce(sc.bronze_cnt,0)*5)
+                 + coalesce(sc.total_up,0)*2
+                 - coalesce(sc.total_down,0)
+                 + coalesce(sc.total_favs,0)
+                 + coalesce(sb.hi_score_qs,0)*50
+                 + coalesce(sb.mid_score_qs,0)*10
+                 - coalesce(sb.low_score_qs,0)*5
+                 + coalesce(sc.recent_answers,0)*3
+                 + coalesce(sc.recent_questions,0)*2
+                 + greatest(0, least(500, sc.Views))/10
+                ) desc,
+                sc.UserId
+        ) as rank_global
+    from save_candidates sc
+    left join score_buckets sb on sb.OwnerId = sc.UserId
+), top_users as (
+    select *
+    from ranked_users
+    where rank_global <= 100
+), user_last_post as (
+    select
+        p.OwnerUserId as UserId,
+        max(p.CreationDate) as last_post_date
+    from Posts p
+    group by p.OwnerUserId
+), final_cte as (
+    select
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.Location,
+        tu.total_badges,
+        tu.gold_cnt,
+        tu.silver_cnt,
+        tu.bronze_cnt,
+        tu.q_count,
+        tu.avg_q_score,
+        tu.median_views,
+        tu.closed_qs,
+        tu.total_up,
+        tu.total_down,
+        tu.total_favs,
+        tu.recent_questions,
+        tu.recent_answers,
+        tu.recent_comments,
+        tu.top_tag,
+        tu.top_tag_q_count,
+        tu.top_tag_net_votes,
+        tu.vote_density,
+        tu.max_dup_cluster_size,
+        tu.rank_global,
+        ulp.last_post_date,
+        case
+            when tu.top_tag is null then 'generalist'
+            when tu.top_tag_q_count >= 200 then 'expert'
+            when tu.top_tag_q_count between 50 and 199 then 'specialist'
+            else 'dabbler'
+        end as specialization_level
+    from top_users tu
+    left join user_last_post ulp on ulp.UserId = tu.UserId
+)
+select
+    f.*,
+    coalesce((
+        select string_agg(distinct tlt.tag, ', ' order by tlt.tag)
+        from tag_list tlt
+        where exists (
+            select 1
+            from Posts qp
+            where qp.Id = tlt.PostId
+              and qp.OwnerUserId = f.UserId
+        )
+    ), '(none)') as all_tags_used,
+    (
+        select count(*) from (
+            select qa.QuestionId
+            from question_activity qa
+            where qa.OwnerId = f.UserId
+            intersect
+            select pl.PostId
+            from PostLinks pl
+            where pl.LinkTypeId = 3
+        ) s
+    ) as q_marked_duplicate_count,
+    (
+        select count(*)
+        from (
+            select qa.QuestionId
+            from question_activity qa
+            where qa.OwnerId = f.UserId
+            except
+            select e.PostId
+            from edits e
+            where coalesce(e.edit_count,0) > 0
+        ) s2
+    ) as never_edited_questions,
+    case
+        when coalesce(f.Location,'') ilike '%remote%' then 'remote-friendly'
+        when coalesce(f.Location,'') = '' then 'unspecified'
+        else lower(split_part(f.Location, ',', 1))
+    end as normalized_location
+from final_cte f
+order by f.rank_global, f.UserId;

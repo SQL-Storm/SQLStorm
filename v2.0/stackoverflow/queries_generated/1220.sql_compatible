@@ -1,0 +1,221 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.CreationDate AS UserCreationDate,
+        u.Reputation,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS TotalUserUpVotes,
+        u.DownVotes AS TotalUserDownVotes,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        COALESCE(SUM(p.Score), 0) AS TotalPostsScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalPostsViewCount,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentsScore,
+        MAX(p.LastActivityDate) AS LastPostActivityDate,
+        MAX(c.CreationDate) AS LastCommentActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.CreationDate, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.LastAccessDate
+),
+PostDetailsWithCalculations AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS PostAnswerCount,
+        p.CommentCount AS PostCommentCount,
+        COALESCE(p.FavoriteCount, 0) AS PostFavoriteCount,
+        p.Title AS PostTitle,
+        p.Tags AS RawTags,
+        p.AcceptedAnswerId,
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS PostUpVoteCount,
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS PostDownVoteCount,
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)) AS LastEditDateFromHistory,
+        COALESCE(
+            CASE
+                WHEN p.Tags IS NULL THEN 0
+                ELSE CARDINALITY(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))
+            END,
+            0
+        ) AS EffectiveTagCount,
+        -- Extract the first tag, if any, after cleaning. NULL if no tags.
+        NULLIF(
+            CASE
+                WHEN p.Tags IS NULL THEN ''
+                ELSE (string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))[1]
+            END,
+            ''
+        ) AS PrimaryTagCleaned
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+),
+UserBadgeAggregates AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesCount,
+        MIN(b.Date) AS EarliestBadgeDate,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostHistoryEventMetrics AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditRevisionCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEventCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEventCount,
+        MAX(ph.CreationDate) AS MostRecentHistoryEvent
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+PostLinkStatistics AS (
+    SELECT
+        pl.PostId,
+        COUNT(CASE WHEN pl.LinkTypeId = 1 THEN 1 END) AS LinkedFromCount,
+        COUNT(CASE WHEN pl.LinkTypeId = 3 THEN 1 END) AS DuplicatedByCount,
+        MIN(pl.CreationDate) AS FirstLinkDate
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+HighEngagementContentStream AS (
+    SELECT
+        p.Id AS ContentId,
+        p.OwnerUserId AS ContentOwnerId,
+        p.CreationDate AS ContentCreationDate,
+        p.Score,
+        'Question' AS ContentType,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AssociatedCount -- Number of answers for questions
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score >= 100 AND p.ViewCount >= 5000
+    UNION ALL
+    SELECT
+        p.Id AS ContentId,
+        p.OwnerUserId AS ContentOwnerId,
+        p.CreationDate AS ContentCreationDate,
+        p.Score,
+        'Answer' AS ContentType,
+        NULL AS ViewCount, -- Answers don't have direct view counts in 'Posts' table
+        (SELECT COUNT(DISTINCT c.Id) FROM Comments c WHERE c.PostId = p.Id) AS AssociatedCount -- Number of comments for answers
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.Score >= 50
+)
+SELECT
+    uas.UserId,
+    uas.Reputation,
+    uas.UserCreationDate,
+    uas.LastAccessDate,
+    uas.TotalPostsCreated,
+    uas.QuestionsAsked,
+    uas.AnswersProvided,
+    uas.TotalPostsScore,
+    uas.TotalPostsViewCount,
+    uas.TotalCommentsMade,
+    uas.TotalCommentsScore,
+    uas.LastPostActivityDate,
+    uas.LastCommentActivityDate,
+    uba.TotalBadgesEarned,
+    uba.GoldBadgesCount,
+    uba.SilverBadgesCount,
+    uba.BronzeBadgesCount,
+    uba.EarliestBadgeDate,
+    DENSE_RANK() OVER (ORDER BY uas.Reputation DESC, uas.TotalUserUpVotes DESC) AS UserReputationRank,
+    NTILE(100) OVER (ORDER BY uas.TotalPostsCreated DESC, uas.TotalPostsScore DESC) AS PostCountScorePercentile,
+    (uas.TotalUserUpVotes - uas.TotalUserDownVotes) AS NetUserVotesAggregate,
+    (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uas.UserCreationDate)) / (3600 * 24 * 365.25)) AS AccountAgeYears,
+    AVG(pd.PostScore) OVER (PARTITION BY uas.UserId) AS AveragePostScoreByUser,
+    MAX(pd.PostScore) OVER (PARTITION BY uas.UserId) AS MaxPostScoreByUser,
+    SUM(CASE WHEN pd.PostTypeId = 1 AND pd.PostScore >= 75 THEN 1 ELSE 0 END) OVER (PARTITION BY uas.UserId) AS HighScoringQuestionsByUser,
+    COALESCE(pd.PostId, -1) AS AnalyzedPostId,
+    pd.PostTypeId AS AnalyzedPostContentType,
+    pd.PostCreationDate,
+    pd.PostScore AS AnalyzedPostCurrentScore,
+    pd.ViewCount AS AnalyzedPostViews,
+    pd.PostAnswerCount AS AnalyzedPostAnswerCount,
+    pd.PostCommentCount AS AnalyzedPostCommentCount,
+    pd.PostFavoriteCount AS AnalyzedPostFavoriteCount,
+    pd.PostTitle AS AnalyzedPostTitle,
+    pd.PrimaryTagCleaned AS AnalyzedPostPrimaryTag,
+    pd.EffectiveTagCount AS AnalyzedPostTagCount,
+    pd.PostUpVoteCount AS AnalyzedPostUpVotes,
+    pd.PostDownVoteCount AS AnalyzedPostDownVotes,
+    phm.EditRevisionCount AS PostEditHistoryRevisions,
+    phm.CloseEventCount AS PostCloseEvents,
+    phm.ReopenEventCount AS PostReopenEvents,
+    pls.LinkedFromCount AS PostLinkedCount,
+    pls.DuplicatedByCount AS PostDuplicateCount,
+    CASE
+        WHEN pd.PostTypeId = 1 AND pd.AcceptedAnswerId IS NOT NULL THEN 'Question_AcceptedAnswer'
+        WHEN pd.PostTypeId = 1 AND pd.AcceptedAnswerId IS NULL AND pd.PostAnswerCount > 0 THEN 'Question_UnacceptedAnswers'
+        WHEN pd.PostTypeId = 1 AND pd.PostAnswerCount = 0 THEN 'Question_NoAnswers'
+        WHEN pd.PostTypeId = 2 AND pd.PostId = (SELECT pq.AcceptedAnswerId FROM Posts pq WHERE pq.Id = pd.ParentId AND pq.PostTypeId = 1) THEN 'Answer_Accepted'
+        WHEN pd.PostTypeId = 2 AND pd.PostId <> (SELECT pq.AcceptedAnswerId FROM Posts pq WHERE pq.Id = pd.ParentId AND pq.PostTypeId = 1) AND pd.PostScore > 0 THEN 'Answer_UnacceptedScored'
+        WHEN pd.PostTypeId = 2 AND pd.PostScore <= 0 THEN 'Answer_LowScore'
+        ELSE 'PostType_Other'
+    END AS PostEngagementStatus,
+    -- Correlated Subquery: Check for presence of comments from a user with high reputation (potential moderator or highly trusted user)
+    EXISTS (
+        SELECT 1
+        FROM Comments cm
+        JOIN Users um ON cm.UserId = um.Id
+        WHERE cm.PostId = pd.PostId
+        AND um.Reputation >= 100000 -- Arbitrary high reputation threshold for "trusted user"
+        AND cm.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+        FETCH FIRST 1 ROW ONLY
+    ) AS HasRecentTrustedUserComment,
+    -- Elaborate String Expression with NULL Logic
+    COALESCE(
+        LEFT(
+            TRIM(REPLACE(REPLACE(REPLACE(pd.RawTags, '>', ' | '), '<', ''), ' ', '')),
+            CASE
+                WHEN LENGTH(TRIM(REPLACE(REPLACE(REPLACE(pd.RawTags, '>', ' | '), '<', ''), ' ', ''))) > 75
+                THEN 75
+                ELSE LENGTH(TRIM(REPLACE(REPLACE(REPLACE(pd.RawTags, '>', ' | '), '<', ''), ' ', '')))
+            END
+        ),
+        'NO_TAGS_ASSOCIATED'
+    ) AS FormattedTagsSnippet,
+    -- Complicated Calculation: Weighted approval ratio, handling division by zero and NULLs
+    (NULLIF(CAST(pd.PostUpVoteCount AS NUMERIC), 0) * 1.5) / NULLIF(CAST((pd.PostUpVoteCount + pd.PostDownVoteCount + pd.PostCommentCount) AS NUMERIC), 0) AS WeightedPostApprovalRatio,
+    SUM(CASE WHEN hecs.ContentType = 'Question' THEN 1 ELSE 0 END) OVER (PARTITION BY uas.UserId) AS HighEngagementQuestionsOwned,
+    SUM(CASE WHEN hecs.ContentType = 'Answer' THEN 1 ELSE 0 END) OVER (PARTITION BY uas.UserId) AS HighEngagementAnswersOwned
+FROM UserActivitySummary uas
+LEFT JOIN UserBadgeAggregates uba ON uas.UserId = uba.UserId
+LEFT JOIN PostDetailsWithCalculations pd ON uas.UserId = pd.OwnerUserId
+LEFT JOIN PostHistoryEventMetrics phm ON pd.PostId = phm.PostId
+LEFT JOIN PostLinkStatistics pls ON pd.PostId = pls.PostId
+LEFT JOIN HighEngagementContentStream hecs ON uas.UserId = hecs.ContentOwnerId
+WHERE
+    uas.Reputation >= 10000 -- Filter for significantly established users
+    AND (pd.PostId IS NULL OR pd.PostCreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '4 year')) -- Focus on more recent posts or users without any posts
+    AND (pd.PostId IS NULL OR pd.PostTypeId = 1 OR (pd.PostTypeId = 2 AND pd.PostScore >= 10)) -- Include specific post types with minimum score for answers
+    AND (
+        uas.TotalPostsCreated > 75
+        OR (uas.TotalPostsCreated = 0 AND uas.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')) -- Include active users who might only comment/vote
+    )
+    AND (
+        pd.PostId IS NULL
+        OR (
+            pd.PostScore >= 20
+            OR pd.ViewCount >= 1000
+            OR pd.PostCommentCount >= 10
+            OR pd.PostFavoriteCount >= 5
+        )
+    ) -- Filter individual posts for signs of significant engagement
+ORDER BY
+    UserReputationRank ASC,
+    PostCountScorePercentile DESC,
+    AnalyzedPostCurrentScore DESC NULLS LAST,
+    AnalyzedPostViews DESC NULLS LAST
+FETCH FIRST 2500 ROWS ONLY;

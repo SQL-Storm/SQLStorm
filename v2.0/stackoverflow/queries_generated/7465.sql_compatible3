@@ -1,0 +1,170 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - MAX(p.CreationDate))) / 86400 AS INTEGER) AS DaysSinceLastPost,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRank,
+        PERCENT_RANK() OVER (ORDER BY u.Reputation DESC) AS RepPercentile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01' AND u.CreationDate < DATE '2023-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostPerformance AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS INTEGER) AS DaysOld,
+        COALESCE(p.Score, 0) + COALESCE(p.ViewCount, 0) + COALESCE(p.AnswerCount, 0) AS EngagementScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS OwnerPostRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgOwnerScore,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        NTILE(10) OVER (ORDER BY p.Score DESC) AS ScoreDecile
+    FROM Posts p
+    WHERE p.CreationDate >= DATE '2015-01-01' 
+      AND p.CreationDate < DATE '2023-01-01'
+      AND p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.IsRequired = TRUE OR t.IsRequired = 1 THEN 'Required' ELSE 'Optional' END AS TagType,
+        CASE WHEN t.IsModeratorOnly = TRUE OR t.IsModeratorOnly = 1 THEN 'Moderator Only' ELSE 'Public' END AS AccessLevel,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS TagPopularityRank,
+        PERCENT_RANK() OVER (ORDER BY t.Count DESC) AS TagPopularityPercentile
+    FROM Tags t
+    WHERE t.Count > 100
+),
+UserActivityWithBadges AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.Views,
+        uas.UpVotes,
+        uas.DownVotes,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.LastPostDate,
+        uas.DaysSinceLastPost,
+        uas.PostRank,
+        uas.RepPercentile,
+        COUNT(DISTINCT CASE WHEN b.Name IN ('Beta', 'Pioneer', 'Stellar', 'Necromancer', 'Electorate') THEN b.Id END) AS EliteBadges,
+        CASE WHEN uas.Badges > 50 THEN 'Elite' 
+             WHEN uas.Badges > 20 THEN 'Veteran' 
+             WHEN uas.Badges > 5 THEN 'Regular' 
+             ELSE 'Newbie' END AS BadgeStatus,
+        CASE WHEN uas.TotalPosts > 1000 THEN 'Legendary'
+             WHEN uas.TotalPosts > 500 THEN 'Master'
+             WHEN uas.TotalPosts > 100 THEN 'Expert'
+             ELSE 'Beginner' END AS PostingLevel
+    FROM UserActivityStats uas
+    LEFT JOIN Badges b ON uas.UserId = b.UserId
+    GROUP BY uas.UserId, uas.DisplayName, uas.Reputation, uas.Views, uas.UpVotes, uas.DownVotes, 
+             uas.TotalPosts, uas.Questions, uas.Answers, uas.Comments, uas.Badges, 
+             uas.LastPostDate, uas.DaysSinceLastPost, uas.PostRank, uas.RepPercentile
+),
+PostWithRelated AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        p.Title AS PostTitle,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        ph.UserDisplayName,
+        ph.Text,
+        ph.Comment,
+        u.DisplayName AS OwnerDisplayName,
+        CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35, 36, 66) 
+             THEN COALESCE(ph.Comment, 'No Comment') 
+             ELSE COALESCE(ph.Text, 'No Text') END AS HistoryDetails,
+        (SELECT AVG(v.Score) FROM Votes v WHERE v.PostId = ph.PostId) AS AvgVoteScore,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ph.PostId) AS CommentCount,
+        CASE WHEN ph.PostHistoryTypeId = 10 THEN 
+            CAST(COALESCE(NULLIF(ph.Comment, ''), '0') AS INTEGER)
+            ELSE 0 END AS CloseReasonId,
+        CASE WHEN ph.PostHistoryTypeId = 10 THEN 
+            (SELECT Name FROM CloseReasonTypes crt WHERE crt.Id = CAST(COALESCE(NULLIF(ph.Comment, ''), '0') AS INTEGER))
+            ELSE NULL END AS CloseReasonName,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS RecentHistory,
+        DENSE_RANK() OVER (ORDER BY ph.CreationDate DESC) AS HistoryRank
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE ph.CreationDate >= DATE '2018-01-01'
+      AND ph.CreationDate < DATE '2023-01-01'
+)
+SELECT 
+    'Combined Performance Analysis' AS AnalysisType,
+    COUNT(DISTINCT uab.UserId) AS ActiveUsers,
+    COUNT(DISTINCT pp.PostId) AS ActivePosts,
+    COUNT(DISTINCT ta.TagName) AS PopularTags,
+    COUNT(DISTINCT pwr.PostId) AS PostHistoryRecords,
+    AVG(uab.Reputation) AS AvgReputation,
+    SUM(uab.TotalPosts) AS TotalUserPosts,
+    AVG(pp.Score) AS AvgPostScore,
+    AVG(ta.TagCount) AS AvgTagCount,
+    SUM(pp.ViewCount) AS TotalViews,
+    AVG(uab.Badges) AS AvgBadgesPerUser,
+    COUNT(DISTINCT CASE WHEN uab.BadgeStatus = 'Elite' THEN uab.UserId END) AS EliteUsers,
+    COUNT(DISTINCT CASE WHEN uab.PostingLevel = 'Legendary' THEN uab.UserId END) AS LegendaryPosters,
+    COUNT(DISTINCT CASE WHEN pp.Score > 1000 THEN pp.PostId END) AS HighScorePosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 1 AND p.CreationDate >= DATE '2020-01-01') AS RecentQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 2 AND p.CreationDate >= DATE '2020-01-01') AS RecentAnswers,
+    (SELECT COUNT(*) FROM Posts p WHERE (p.IsClosed = TRUE OR p.IsClosed = 1) AND p.CreationDate >= DATE '2020-01-01') AS RecentlyClosed,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostHistoryTypeId = 10 AND ph.CreationDate >= DATE '2020-01-01') AS CloseVotes,
+    (SELECT MIN(HistoryDate) FROM PostWithRelated) AS EarliestHistoryRecord,
+    (SELECT MAX(HistoryDate) FROM PostWithRelated) AS LatestHistoryRecord,
+    COUNT(DISTINCT CASE WHEN uab.RepPercentile > 0.9 THEN uab.UserId END) AS Top10PercentReputation,
+    COUNT(DISTINCT CASE WHEN pp.EngagementScore > 1000 THEN pp.PostId END) AS HighEngagementPosts,
+    AVG(CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - pp.CreationDate)) / 86400 AS INTEGER)) AS AvgDaysOld,
+    (SELECT COUNT(*) FROM Posts p WHERE p.ViewCount > 10000) AS HighlyViewedPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.AnswerCount > 100) AS HighlyAnsweredPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.CommentCount > 10) AS HighlyCommentedPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.FavoriteCount > 5) AS HighlyFavoritedPosts,
+    COUNT(DISTINCT CASE WHEN uab.PostRank = 1 THEN uab.UserId END) AS TopPosters,
+    (SELECT AVG(EngagementScore) FROM PostPerformance) AS AvgEngagementScore,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostHistoryTypeId IN (17, 35, 36)) AS MigrationRecords,
+    (SELECT COUNT(*) FROM Tags t WHERE t.Count > 1000) AS HighlyPopulatedTags,
+    (SELECT COUNT(*) FROM Badges b WHERE b.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.Class = 3) AS BronzeBadges,
+    (SELECT COUNT(*) FROM Posts p WHERE p.ContentLicense IS NOT NULL AND p.ContentLicense <> 'CC BY-SA 4.0') AS NonStandardLicensePosts
+FROM UserActivityWithBadges uab
+FULL OUTER JOIN PostPerformance pp ON uab.UserId = pp.OwnerUserId
+FULL OUTER JOIN TagAnalysis ta ON ta.TagName = uab.DisplayName
+FULL OUTER JOIN PostWithRelated pwr ON uab.UserId = pwr.UserId
+WHERE (uab.UserId IS NOT NULL OR pp.PostId IS NOT NULL OR ta.TagName IS NOT NULL OR pwr.PostId IS NOT NULL)
+GROUP BY 'Combined Performance Analysis', uab.UserId, uab.DisplayName, uab.Reputation, uab.Views, uab.UpVotes, uab.DownVotes, uab.TotalPosts, uab.Questions, uab.Answers, uab.Comments, uab.Badges, uab.LastPostDate, uab.DaysSinceLastPost, uab.PostRank, uab.RepPercentile, ta.TagName, ta.TagCount, pp.PostId, pp.Score, pp.ViewCount, pp.CreationDate, pp.EngagementScore, pwr.PostId, pwr.HistoryDate, pwr.UserId, pwr.PostHistoryTypeId, pwr.PostTitle, pwr.Score, pwr.ViewCount, pwr.OwnerUserId, pwr.UserDisplayName, pwr.Text, pwr.Comment, pwr.OwnerDisplayName, pwr.HistoryDetails, pwr.AvgVoteScore, pwr.CommentCount, pwr.CloseReasonId, pwr.CloseReasonName, pwr.RecentHistory, pwr.HistoryRank;

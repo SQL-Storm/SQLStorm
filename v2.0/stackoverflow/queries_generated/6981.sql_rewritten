@@ -1,0 +1,43 @@
+-- {"query": "6981.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 427} 
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.Reputation) AS MaxReputation,
+    MIN(u.CreationDate) AS EarliestUserCreationDate,
+    STRING_AGG(DISTINCT b.Name, ', ') AS BadgesEarned,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.LastActivityDate DESC) AS LastActivePostRank,
+    STRING_AGG(DISTINCT t.TagName, ', ') WITHIN GROUP AS (ORDER BY t.Count DESC) AS TopTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+         pt.Id, 
+         pt.TagName, 
+         COUNT(*) AS Count, 
+         pe.PostId AS ExcerptPostId, 
+         pw.PostId AS WikiPostId
+     FROM 
+         Tags t
+     JOIN 
+         PostTags pt ON t.Id = pt.TagId
+     JOIN 
+         Posts pe ON t.ExcerptPostId = pe.Id
+     JOIN 
+         Posts pw ON t.WikiPostId = pw.Id
+     GROUP BY 
+         pt.Id, pt.TagName, pe.PostId, pw.PostId) t ON u.Id = ANY(t.PostId)
+WHERE 
+    u.Id IS NOT NULL
+GROUP BY 
+    u.DisplayName
+HAVING 
+    COUNT(DISTINCT p.Id) > 100
+ORDER BY 
+    MaxReputation DESC, 
+    TotalPosts DESC;

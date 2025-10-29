@@ -1,0 +1,189 @@
+WITH TopUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as rn
+    FROM Users u
+    WHERE u.Reputation > 10000
+),
+QuestionStats AS (
+    SELECT p.ParentId as QuestionId,
+           COUNT(*) as AnswerCount,
+           SUM(p.Score) as TotalAnswerScore,
+           AVG(p.Score) as AvgAnswerScore,
+           MAX(p.CreationDate) as LastAnswerDate
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+TagFrequency AS (
+    SELECT t.TagName,
+           t.Count,
+           CASE 
+               WHEN t.Count > 1000 THEN 'High'
+               WHEN t.Count > 500 THEN 'Medium'
+               ELSE 'Low'
+           END as FrequencyLevel
+    FROM Tags t
+    WHERE t.Count > 100
+),
+UserActivity AS (
+    SELECT u.Id,
+           u.DisplayName,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+           COUNT(DISTINCT c.Id) as CommentCount,
+           COUNT(DISTINCT v.Id) as VoteCount,
+           MAX(p.CreationDate) as LastPostDate,
+           MAX(c.CreationDate) as LastCommentDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+ComplexQuestionAnalysis AS (
+    SELECT q.Id as QuestionId,
+           q.Title,
+           q.Score,
+           q.ViewCount,
+           q.AnswerCount,
+           q.CommentCount,
+           q.CreationDate,
+           q.OwnerUserId,
+           u.DisplayName as OwnerName,
+           COALESCE(qs.AnswerCount, 0) as AnswerCount,
+           COALESCE(qs.TotalAnswerScore, 0) as TotalAnswerScore,
+           COALESCE(qs.AvgAnswerScore, 0) as AvgAnswerScore,
+           CASE 
+               WHEN q.Score > 50 THEN 'High'
+               WHEN q.Score > 20 THEN 'Medium'
+               ELSE 'Low'
+           END as ScoreLevel,
+           CAST((CAST('2024-10-01 12:34:56' AS timestamp) - q.CreationDate) AS INTEGER) as AgeInDays,
+           CASE
+               WHEN q.AnswerCount = 0 THEN 'No Answers'
+               WHEN q.AnswerCount = 1 THEN 'One Answer'
+               WHEN q.AnswerCount > 1 THEN 'Multiple Answers'
+           END as AnswerStatus,
+           (q.Score * 1.0 / NULLIF(q.ViewCount, 0)) as ScorePerView,
+           (SELECT COUNT(*) FROM Posts p WHERE p.ParentId = q.Id AND p.PostTypeId = 2 AND p.Score > 0) as UpvotedAnswers
+    FROM Posts q
+    JOIN Users u ON q.OwnerUserId = u.Id
+    LEFT JOIN QuestionStats qs ON q.Id = qs.QuestionId
+    WHERE q.PostTypeId = 1
+      AND q.Score > 0
+      AND q.ViewCount > 10
+      AND q.CreationDate > '2020-01-01'
+)
+SELECT 
+    cq.QuestionId,
+    cq.Title,
+    cq.OwnerName,
+    cq.Score,
+    cq.ViewCount,
+    cq.AnswerCount,
+    cq.CommentCount,
+    cq.ScoreLevel,
+    cq.AgeInDays,
+    cq.AnswerStatus,
+    cq.ScorePerView,
+    cq.UpvotedAnswers,
+    CASE
+        WHEN cq.ScorePerView > 0.05 THEN 'High Engagement'
+        WHEN cq.ScorePerView > 0.02 THEN 'Medium Engagement'
+        ELSE 'Low Engagement'
+    END as EngagementLevel,
+    COALESCE(ua.QuestionCount, 0) as UserQuestionCount,
+    COALESCE(ua.AnswerCount, 0) as UserAnswerCount,
+    COALESCE(ua.CommentCount, 0) as UserCommentCount,
+    COALESCE(ua.VoteCount, 0) as UserVoteCount,
+    CASE
+        WHEN ua.LastPostDate IS NULL THEN 'Never Active'
+        WHEN CAST((CAST('2024-10-01 12:34:56' AS timestamp) - ua.LastPostDate) AS INTEGER) > 365 THEN 'Inactive'
+        WHEN CAST((CAST('2024-10-01 12:34:56' AS timestamp) - ua.LastPostDate) AS INTEGER) > 30 THEN 'Recently Inactive'
+        ELSE 'Active'
+    END as UserActivityStatus,
+    tf.FrequencyLevel as MostPopularTagLevel,
+    CASE
+        WHEN cq.AnswerCount > 0 AND cq.AvgAnswerScore > 10 THEN 'High Quality'
+        WHEN cq.AnswerCount > 0 AND cq.AvgAnswerScore <= 10 THEN 'Low Quality'
+        ELSE 'No Answers Yet'
+    END as AnswerQuality,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = cq.QuestionId 
+       AND ph.PostHistoryTypeId IN (4, 5, 6) 
+       AND ph.CreationDate > cq.CreationDate) as EditCount,
+    CASE
+        WHEN EXISTS (
+            SELECT 1 FROM PostLinks pl 
+            JOIN Posts p ON pl.RelatedPostId = p.Id 
+            WHERE pl.PostId = cq.QuestionId 
+              AND pl.LinkTypeId = 3
+        ) THEN 'Has Duplicate Link'
+        ELSE 'No Duplicate Link'
+    END as HasDuplicateLink,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.PostId = cq.QuestionId 
+       AND v.VoteTypeId = 2) as UpVotes,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.PostId = cq.QuestionId 
+       AND v.VoteTypeId = 3) as DownVotes,
+    -- Complex string manipulation
+    CONCAT(
+        'Q', cq.QuestionId, '-',
+        SUBSTRING(REPLACE(LOWER(cq.Title), ' ', '-'), 1, 30), '-',
+        CASE WHEN cq.AnswerCount > 0 THEN 'A' ELSE 'NoA' END, '-',
+        CAST(FLOOR(cq.Score / 10) AS VARCHAR(10))
+    ) as QuestionSlug,
+    -- Complex date calculations
+    CASE 
+        WHEN CAST((CAST('2024-10-01 12:34:56' AS timestamp) - cq.CreationDate) AS INTEGER) < 7 THEN 'This Week'
+        WHEN CAST((CAST('2024-10-01 12:34:56' AS timestamp) - cq.CreationDate) AS INTEGER) < 30 THEN 'Last Month'
+        WHEN CAST((CAST('2024-10-01 12:34:56' AS timestamp) - cq.CreationDate) AS INTEGER) < 365 THEN 'Last Year'
+        ELSE 'Older'
+    END as TimeRange,
+    -- Window function usage
+    ROW_NUMBER() OVER (ORDER BY cq.Score DESC) as RankByScore,
+    RANK() OVER (PARTITION BY cq.ScoreLevel ORDER BY cq.ViewCount DESC) as RankByViews,
+    DENSE_RANK() OVER (ORDER BY cq.AnswerCount DESC) as RankByAnswers,
+    -- Set operators and subqueries
+    COALESCE((
+        SELECT t.TagName
+        FROM Tags t
+        WHERE t.TagName IN (
+            SELECT TRIM(SUBSTRING(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2) FROM 1 FOR POSITION('>' IN SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2)) - 1))
+            FROM Posts p
+            WHERE p.Id = cq.QuestionId
+        )
+        ORDER BY t.Count DESC
+        FETCH FIRST 1 ROW ONLY
+    ), 'No Tags') as MostPopularTag,
+    -- Correlated subquery with window function
+    (SELECT AVG(p.Score) 
+     FROM Posts p 
+     WHERE p.ParentId = cq.QuestionId 
+       AND p.PostTypeId = 2 
+       AND p.CreationDate > '2021-01-01') as RecentAvgAnswerScore,
+    -- Null handling and complex expressions
+    CASE 
+        WHEN cq.ViewCount IS NULL OR cq.ViewCount = 0 THEN 'No Views'
+        WHEN cq.Score IS NULL THEN 'No Score'
+        ELSE 'Has Data'
+    END as DataCompleteness,
+    -- Aggregation across multiple tables
+    (SELECT SUM(v.BountyAmount) 
+     FROM Votes v 
+     WHERE v.PostId = cq.QuestionId 
+       AND v.VoteTypeId = 8
+       AND v.BountyAmount > 0) as TotalBountyAmount
+FROM ComplexQuestionAnalysis cq
+LEFT JOIN UserActivity ua ON cq.OwnerUserId = ua.Id
+LEFT JOIN TagFrequency tf ON tf.TagName LIKE '%' || SUBSTRING(cq.Title FROM 1 FOR 10) || '%'
+WHERE cq.Score > 0
+  AND cq.ViewCount > 10
+  AND cq.AgeInDays > 0
+  AND cq.AnswerCount >= 0
+ORDER BY cq.Score DESC, cq.ViewCount DESC
+LIMIT 1000;

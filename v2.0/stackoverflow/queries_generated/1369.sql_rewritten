@@ -1,0 +1,209 @@
+-- {"query": "1369.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3079} 
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserProfileViews,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        MAX(C.CreationDate) AS LastCommentActivity
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.Reputation, U.CreationDate, U.Views
+),
+PostDetailsRaw AS ( -- Raw post details for use in correlated subqueries later
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Title,
+        P.Body,
+        P.Tags,
+        COALESCE(P.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><') AS ParsedTags
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL -- Focus on posts by actual users
+),
+UserBadgesSummary AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 ELSE NULL END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 ELSE NULL END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 ELSE NULL END) AS BronzeBadges,
+        MIN(B.Date) AS FirstBadgeDate,
+        MAX(B.Date) AS LastBadgeDate
+    FROM Badges B
+    GROUP BY B.UserId
+),
+UserTagImpact AS ( -- Aggregated performance per user per relevant tag
+    SELECT
+        pdr.OwnerUserId AS UserId,
+        t.tag AS TagName,
+        COUNT(DISTINCT pdr.PostId) AS PostsInTag,
+        SUM(pdr.Score) AS TotalScoreInTag,
+        AVG(CAST(pdr.Score AS NUMERIC)) AS AvgScoreInTag,
+        MIN(pdr.PostCreationDate) AS FirstPostInTag,
+        MAX(pdr.PostCreationDate) AS LastPostInTag
+    FROM PostDetailsRaw pdr
+    CROSS JOIN UNNEST(pdr.ParsedTags) AS t(tag)
+    WHERE t.tag IN ('sql', 'database', 'performance', 'indexing', 'query-optimization')
+    GROUP BY pdr.OwnerUserId, t.tag
+),
+AggregatedUserTagImpact AS ( -- Pivoted Tag Impact for direct join to main query
+    SELECT
+        UserId,
+        MAX(CASE WHEN TagName = 'sql' THEN PostsInTag ELSE 0 END) AS SqlPostsCount,
+        MAX(CASE WHEN TagName = 'sql' THEN TotalScoreInTag ELSE 0 END) AS SqlTotalScore,
+        MAX(CASE WHEN TagName = 'database' THEN AvgScoreInTag ELSE 0.0 END) AS DatabaseAvgScore,
+        MAX(CASE WHEN TagName = 'performance' THEN PostsInTag ELSE 0 END) AS PerformancePostsCount,
+        MAX(CASE WHEN TagName = 'performance' THEN TotalScoreInTag ELSE 0 END) AS PerformanceTotalScore,
+        MAX(CASE WHEN TagName = 'indexing' THEN PostsInTag ELSE 0 END) AS IndexingPostsCount,
+        MAX(CASE WHEN TagName = 'query-optimization' THEN TotalScoreInTag ELSE 0 END) AS QueryOptTotalScore
+    FROM UserTagImpact
+    GROUP BY UserId
+)
+SELECT
+    U.Id AS UserID,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserAccountCreationDate,
+    U.LastAccessDate,
+    U.Location,
+    COALESCE(U.WebsiteUrl, 'N/A') AS WebsiteUrl,
+    U.Views AS ProfileViews,
+    U.UpVotes AS TotalUpVotesGiven,
+    U.DownVotes AS TotalDownVotesGiven,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.TotalPostScore,
+    UAS.TotalCommentsMade,
+    COALESCE(UBS.TotalBadges, 0) AS TotalBadges,
+    COALESCE(UBS.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UBS.SilverBadges, 0) AS SilverBadges,
+    COALESCE(UBS.BronzeBadges, 0) AS BronzeBadges,
+
+    -- Window functions for ranking and aggregation over user sets
+    ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, UAS.TotalPostScore DESC) AS GlobalReputationRank,
+    DENSE_RANK() OVER (PARTITION BY EXTRACT(YEAR FROM U.CreationDate) ORDER BY U.Reputation DESC) AS YearlyReputationRank,
+    LAG(U.Reputation, 1, 0) OVER (ORDER BY U.CreationDate) AS PrevUserReputationByCreationDate,
+    AVG(UAS.TotalPostScore) OVER (PARTITION BY COALESCE(U.Location, 'Unknown')) AS AvgPostScoreInLocationGroup,
+    NTILE(10) OVER (ORDER BY UAS.TotalQuestions + UAS.TotalAnswers + UAS.TotalCommentsMade DESC) AS ActivityDecile, -- Divide users into 10 activity groups
+
+    -- Correlated Subqueries for detailed post/history analysis per user
+    (
+        SELECT COUNT(PDR.PostId)
+        FROM PostDetailsRaw PDR
+        WHERE PDR.OwnerUserId = U.Id
+          AND PDR.PostTypeId = 1 -- Questions
+          AND PDR.PostCreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+    ) AS RecentQuestionsCount,
+    (
+        SELECT COUNT(PDR.PostId)
+        FROM PostDetailsRaw PDR
+        WHERE PDR.OwnerUserId = U.Id
+          AND PDR.PostTypeId = 2 -- Answers
+          AND PDR.PostCreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+    ) AS RecentAnswersCount,
+    (
+        SELECT SUM(PDR.ViewCount)
+        FROM PostDetailsRaw PDR
+        WHERE PDR.OwnerUserId = U.Id
+          AND PDR.PostTypeId = 1
+          AND PDR.PostCreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 year')
+    ) AS TotalQuestionViewsLast2Years,
+    (
+        SELECT COUNT(PH.Id)
+        FROM PostHistory PH
+        WHERE PH.UserId = U.Id
+          AND PH.PostHistoryTypeId IN (4, 5, 6, 24) -- Edited title, body, tags or suggested edit applied
+          AND PH.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 month')
+    ) AS EditsMadeLast6Months,
+    (
+        SELECT COALESCE(SUM(LinkedPostsCount), 0)
+        FROM (SELECT PL.PostId, COUNT(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE NULL END) AS LinkedPostsCount FROM PostLinks PL GROUP BY PL.PostId) AS PostLinkAggs
+        WHERE PostLinkAggs.PostId IN (SELECT PDR_inner.PostId FROM PostDetailsRaw PDR_inner WHERE PDR_inner.OwnerUserId = U.Id)
+    ) AS TotalLinkedPostsBySelf,
+    (
+        SELECT MAX(PDR_inner.Score)
+        FROM PostDetailsRaw PDR_inner
+        WHERE PDR_inner.OwnerUserId = U.Id AND PDR_inner.PostTypeId = 1
+    ) AS MaxQuestionScore,
+    (
+        SELECT MIN(PDR_inner.CreationDate)
+        FROM PostDetailsRaw PDR_inner
+        WHERE PDR_inner.OwnerUserId = U.Id AND PDR_inner.PostTypeId = 2
+    ) AS FirstAnswerDate,
+
+    -- String operations and NULL logic, complicated expressions
+    CAST(EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / (60 * 60 * 24 * 365.25) AS NUMERIC(10, 2)) AS AccountAgeYears,
+    COALESCE(LENGTH(U.AboutMe), 0) AS AboutMeLength,
+    NULLIF(TRIM(SUBSTRING(U.AboutMe, 1, 150)), '') AS AboutMeSnippet,
+    LOWER(U.DisplayName) LIKE '%dev%' AS IsDevInDisplayName,
+    UPPER(LEFT(COALESCE(U.Location, 'UNKNOWN'), 3)) AS LocationPrefix,
+
+    COALESCE(AUTI.SqlPostsCount, 0) AS SqlPostsCount,
+    COALESCE(AUTI.SqlTotalScore, 0) AS SqlTotalScore,
+    COALESCE(AUTI.DatabaseAvgScore, 0.0) AS DatabaseAvgScore,
+    COALESCE(AUTI.PerformancePostsCount, 0) AS PerformancePostsCount,
+    COALESCE(AUTI.PerformanceTotalScore, 0) AS PerformanceTotalScore,
+    COALESCE(AUTI.IndexingPostsCount, 0) AS IndexingPostsCount,
+    COALESCE(AUTI.QueryOptTotalScore, 0) AS QueryOptTotalScore,
+
+    NULLIF(UAS.TotalPostScore + U.UpVotes - U.DownVotes + COALESCE(UBS.TotalBadges * 10, 0) + (U.Views / 100), 0) AS WeightedUserImpactScore, -- Complicated calculation with NULLIF and COALESCE
+    CASE
+        WHEN COALESCE(UBS.GoldBadges, 0) >= 5 AND UAS.TotalAnswers > 50 AND U.Reputation > 50000 THEN 'Elite Contributor'
+        WHEN U.Reputation > 10000 AND UAS.TotalPostScore > 5000 AND UAS.TotalQuestions >= 10 THEN 'Highly Influential Questioner'
+        WHEN UAS.TotalAnswers >= 100 AND UAS.TotalPostScore > 7500 AND U.DownVotes < 500 THEN 'Prodigious Answerer'
+        WHEN U.LastAccessDate < (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') AND U.Reputation < 5000 THEN 'Dormant User'
+        WHEN (UAS.TotalQuestions + UAS.TotalAnswers + UAS.TotalCommentsMade) > 500 THEN 'Hyper-Active Community Member'
+        ELSE 'Regular Contributor'
+    END AS UserCategory,
+    EXISTS (
+        SELECT 1
+        FROM PostDetailsRaw Q
+        WHERE Q.OwnerUserId = U.Id
+          AND Q.PostTypeId = 1
+          AND EXISTS (
+              SELECT 1
+              FROM Posts A
+              WHERE A.ParentId = Q.PostId
+                AND A.OwnerUserId = U.Id
+                AND A.PostTypeId = 2
+          )
+    ) AS HasAnsweredOwnQuestion
+FROM Users U
+LEFT JOIN UserActivitySummary UAS ON U.Id = UAS.UserId
+LEFT JOIN UserBadgesSummary UBS ON U.Id = UBS.UserId
+LEFT JOIN AggregatedUserTagImpact AUTI ON U.Id = AUTI.UserId
+WHERE
+    U.Reputation > 500 -- Filter for reasonably established users
+    AND U.DisplayName IS NOT NULL AND TRIM(U.DisplayName) != ''
+    AND (
+        U.Location ILIKE '%us%' OR U.Location ILIKE '%europe%' OR U.Location ILIKE '%asia%' OR U.Location IS NULL
+    )
+    AND U.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 year') -- Filter for users created in the last 7 years
+    AND (
+        (U.WebsiteUrl IS NOT NULL AND LENGTH(U.WebsiteUrl) > 5) OR LENGTH(COALESCE(U.AboutMe, '')) > 50 OR U.Views > 100
+    )
+    AND (UAS.TotalQuestions > 3 OR UAS.TotalAnswers > 5 OR UAS.TotalCommentsMade > 10)
+    AND (
+        EXISTS (SELECT 1 FROM UserTagImpact UTI_filt WHERE UTI_filt.UserId = U.Id AND UTI_filt.TagName IN ('sql', 'database') AND UTI_filt.PostsInTag >= 2 AND UTI_filt.AvgScoreInTag > 1.5) OR
+        EXISTS (SELECT 1 FROM UserTagImpact UTI_filt WHERE UTI_filt.UserId = U.Id AND UTI_filt.TagName = 'performance' AND UTI_filt.TotalScoreInTag >= 20 AND UTI_filt.PostsInTag >= 1)
+    )
+    AND U.Id % 7 != 0 -- Simple, non-deterministic filter to reduce data volume for final output, keeping it diverse.
+ORDER BY
+    GlobalReputationRank ASC, UserID
+LIMIT 1000;

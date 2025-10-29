@@ -1,0 +1,165 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        MAX(p.CreationDate) as LastPostDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Expert'
+            WHEN u.Reputation > 100 THEN 'Member'
+            ELSE 'Newbie'
+        END as ReputationTier,
+        RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT b.Id) DESC) as BadgeRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopQuestions AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        u.DisplayName as AuthorName,
+        u.Reputation as AuthorReputation,
+        p.Tags,
+        CASE 
+            WHEN p.Score > 100 THEN 'Hot'
+            WHEN p.Score > 50 THEN 'Popular'
+            WHEN p.Score > 10 THEN 'Moderate'
+            ELSE 'Low'
+        END as ScoreCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) - p.Score as ScoreDifferenceFromPrevious
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Trending'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as TagPopularity,
+        RANK() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        AVG(t.Count) OVER () as AvgTagCount,
+        t.Count - AVG(t.Count) OVER () as CountVariance,
+        (t.Count * 1.0 / (SELECT MAX("Count") FROM Tags)) * 100 as PopularityPercentage
+    FROM Tags t
+),
+ActivityMetrics AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) as ActivityMonth,
+        COUNT(*) as PostsCreated,
+        COUNT(DISTINCT p.OwnerUserId) as ActiveUsers,
+        AVG(p.Score) as AvgScore,
+        MAX(p.Score) as MaxScore,
+        MIN(p.Score) as MinScore,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) as QuestionsCreated,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) as AnswersCreated,
+        COUNT(CASE WHEN p.PostTypeId = 3 THEN 1 END) as WikiCreated,
+        RANK() OVER (ORDER BY COUNT(*) DESC) as MonthlyActivityRank,
+        LAG(COUNT(*), 1) OVER (ORDER BY DATE_TRUNC('month', p.CreationDate)) as PreviousMonthPosts
+    FROM Posts p
+    WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+    GROUP BY DATE_TRUNC('month', p.CreationDate)
+)
+SELECT 
+    'Performance Benchmark Report' as ReportTitle,
+    COUNT(DISTINCT us.UserId) as TotalUsers,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1) as TotalQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2) as TotalAnswers,
+    COUNT(DISTINCT ta.TagName) as TotalTags,
+    COUNT(DISTINCT am.ActivityMonth) as MonthsWithData,
+    AVG(us.Reputation) as AvgReputation,
+    MAX(us.Reputation) as MaxReputation,
+    MIN(us.Reputation) as MinReputation,
+    (SELECT COUNT(*) FROM Badges) as TotalBadges,
+    (SELECT COUNT(*) FROM Comments) as TotalComments,
+    (SELECT COUNT(*) FROM Votes) as TotalVotes,
+    (SELECT COUNT(*) FROM PostHistory) as TotalHistoryEntries,
+    (SELECT COUNT(*) FROM PostLinks) as TotalLinks,
+    (SELECT COUNT(*) FROM Users WHERE LastAccessDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 days')) as ActiveUsersLastWeek,
+    ROUND(AVG(CAST(us.PostCount AS DOUBLE PRECISION)), 2) as AvgPostsPerUser,
+    ROUND(AVG(CAST(us.BadgeCount AS DOUBLE PRECISION)), 2) as AvgBadgesPerUser,
+    ROUND(AVG(CAST(us.CommentCount AS DOUBLE PRECISION)), 2) as AvgCommentsPerUser,
+    ROUND(AVG(CAST(us.VoteCount AS DOUBLE PRECISION)), 2) as AvgVotesPerUser,
+    (SELECT MAX(ta.TagCount) FROM TagAnalysis ta) as MaxTagCount,
+    (SELECT MIN(ta.TagCount) FROM TagAnalysis ta) as MinTagCount,
+    ROUND(AVG(ta.TagCount), 2) as AvgTagCount,
+    (SELECT COUNT(*) FROM Posts WHERE Score > 1000) as HighScorePosts,
+    (SELECT COUNT(*) FROM Posts WHERE AnswerCount > 10) as ManyAnswersQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE CommentCount > 100) as ManyCommentsPosts,
+    (SELECT COUNT(*) FROM Posts WHERE ViewCount > 10000) as HighViewPosts,
+    (SELECT COUNT(*) FROM Posts WHERE Tags IS NOT NULL AND Tags != '') as TaggedPosts,
+    (SELECT COUNT(*) FROM Posts WHERE Body IS NOT NULL AND LENGTH(Body) > 1000) as LongPosts,
+    (SELECT COUNT(*) FROM Posts WHERE LastEditDate IS NOT NULL) as EditedPosts,
+    (SELECT COUNT(*) FROM Posts WHERE LastActivityDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')) as ActiveInLast30Days,
+    (SELECT COUNT(*) FROM Posts WHERE ContentLicense IS NOT NULL AND ContentLicense != '') as LicensedPosts,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerDisplayName IS NOT NULL AND OwnerDisplayName != '') as NamedPosts,
+    (SELECT COUNT(*) FROM Posts WHERE ParentId IS NOT NULL) as AnswerPosts,
+    ((SELECT COUNT(*) FROM Posts WHERE CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 years')) * 100.0 / 
+     (SELECT COUNT(*) FROM Posts)) as RecentPercentage,
+    (SELECT COUNT(*) FROM Posts p 
+     JOIN Users u ON p.OwnerUserId = u.Id 
+     WHERE u.Reputation > 10000) as EliteUserPosts,
+    (SELECT COUNT(*) FROM Posts p 
+     JOIN Users u ON p.OwnerUserId = u.Id 
+     WHERE u.Reputation BETWEEN 1000 AND 9999) as RegularUserPosts,
+    (SELECT COUNT(*) FROM Posts p 
+     JOIN Users u ON p.OwnerUserId = u.Id 
+     WHERE u.Reputation BETWEEN 100 AND 999) as NewUserPosts,
+    (SELECT COUNT(*) FROM Posts WHERE Score > 0) as PositiveScorePosts,
+    (SELECT COUNT(*) FROM Posts WHERE Score < 0) as NegativeScorePosts,
+    (SELECT COUNT(*) FROM Posts WHERE Score = 0) as ZeroScorePosts,
+    (SELECT COUNT(*) FROM Posts WHERE Score > 100 AND ViewCount > 1000) as ViralPosts,
+    (SELECT COUNT(*) FROM Posts WHERE Score > 50 AND CommentCount > 5) as EngagedPosts,
+    (SELECT COUNT(*) FROM Posts p 
+     JOIN PostHistory ph ON p.Id = ph.PostId 
+     WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) as EditedPostsHistory,
+    (SELECT COUNT(*) FROM Posts WHERE CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')) as RecentPosts,
+    (SELECT COUNT(*) FROM Posts WHERE CreationDate < (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')) as OlderPosts
+FROM UserStats us
+FULL JOIN TagAnalysis ta ON 1=1
+FULL JOIN ActivityMetrics am ON 1=1
+WHERE (us.UserId IS NOT NULL OR ta.TagName IS NOT NULL OR am.ActivityMonth IS NOT NULL)
+  AND EXISTS (
+      SELECT 1 FROM Posts p 
+      WHERE (us.UserId IS NOT NULL AND p.OwnerUserId = us.UserId)
+         OR (us.UserId IS NOT NULL AND p.Id IN (SELECT PostId FROM PostHistory WHERE UserId = us.UserId))
+  )
+GROUP BY
+    -- group by all non-aggregated/select-list columns from the outer query
+    -- columns from SELECT that are not aggregated: ReportTitle (constant), none others except for those coming from aggregates/subqueries
+    -- but to satisfy SQL standards include grouping on constants is not necessary; keep minimal grouping to allow HAVING below
+    ReportTitle
+HAVING COUNT(DISTINCT us.UserId) > 0
+ORDER BY COUNT(DISTINCT us.UserId) DESC
+LIMIT 1;

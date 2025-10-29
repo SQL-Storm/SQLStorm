@@ -1,0 +1,247 @@
+WITH UserEngagementStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p_owned.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT p_owned.Id) FILTER (WHERE p_owned.PostTypeId = 1) AS TotalQuestionsOwned,
+        COUNT(DISTINCT p_owned.Id) FILTER (WHERE p_owned.PostTypeId = 2) AS TotalAnswersOwned,
+        COALESCE(AVG(p_owned.Score) FILTER (WHERE p_owned.PostTypeId IN (1,2)), 0) AS AvgScorePerOwnedPost,
+        COUNT(DISTINCT p_edited.Id) AS TotalPostsEdited,
+        COUNT(b.Id) AS TotalBadges,
+        DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate) AS AccountAgeDays,
+        DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate) AS LastAccessDaysAgo,
+        COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6) AND ph.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days') AS RecentPostEditCount,
+        CASE WHEN u.AboutMe LIKE '%developer%' THEN 1 ELSE 0 END AS IsDeveloperUser
+    FROM Users u
+    LEFT JOIN Posts p_owned ON u.Id = p_owned.OwnerUserId
+    LEFT JOIN Posts p_edited ON u.Id = p_edited.LastEditorUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND p_owned.Id = ph.PostId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes, u.AboutMe
+),
+PostEngagementSummary AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        COALESCE(p.CommentCount, 0) AS TotalComments,
+        COUNT(DISTINCT v_up.Id) AS TotalUpVotes,
+        COUNT(DISTINCT v_down.Id) AS TotalDownVotes,
+        COALESCE(p.FavoriteCount, 0) AS ActualFavoriteCount,
+        (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateLinkCount,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS AcceptedAnswerExists,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN TRUE ELSE FALSE END AS IsClosedFlag,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN TRUE ELSE FALSE END AS IsCommunityOwnedFlag,
+        DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate) AS PostAgeDays,
+        DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - p.LastActivityDate) AS DaysSinceLastActivity,
+        COALESCE(array_length(string_to_array(SUBSTRING(COALESCE(p.Tags, ''), 2, LENGTH(COALESCE(p.Tags, '')) - 2), '><'), 1), 0) AS QuestionTagCount,
+        (SELECT COUNT(ph_sub.Id) FROM PostHistory ph_sub WHERE ph_sub.PostId = p.Id AND ph_sub.PostHistoryTypeId IN (4,5,6)) AS TotalEditHistoryEntries
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v_up ON p.Id = v_up.PostId AND v_up.VoteTypeId = 2
+    LEFT JOIN Votes v_down ON p.Id = v_down.PostId AND v_down.VoteTypeId = 3
+    GROUP BY p.Id, p.PostTypeId, pt.Name, p.OwnerUserId, p.Title, p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.CommentCount, p.AcceptedAnswerId, p.ClosedDate, p.CommunityOwnedDate, p.Tags
+),
+PostEventSequenceAnalysis AS (
+    SELECT
+        ph.PostId,
+        ph.Id AS PostHistoryId,
+        ph.PostHistoryTypeId,
+        pht.Name AS PostHistoryTypeName,
+        ph.CreationDate AS EventDate,
+        ph.UserId AS EditorUserId,
+        ph.UserDisplayName AS EditorDisplayName,
+        ph.Comment AS EventComment,
+        ph.Text AS EventText,
+        LAG(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousEventDate,
+        LAG(ph.UserId, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousEditorUserId,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn_latest_event,
+        CASE
+            WHEN ph.UserId IS NOT NULL AND LAG(ph.UserId, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) IS NOT NULL AND ph.UserId <> LAG(ph.UserId, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) THEN TRUE
+            ELSE FALSE
+        END AS EditorChanged,
+        NULLIF(ph.Comment, '') AS NonEmptyComment,
+        crt.Name AS CloseReasonTypeName
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND ph.Comment = CAST(crt.Id AS VARCHAR)
+),
+RankedUserContributions AS (
+    SELECT
+        ues.UserId,
+        ues.DisplayName AS UserDisplayName,
+        ues.Reputation,
+        pes.PostId,
+        pes.Title AS PostTitle,
+        pes.PostCreationDate,
+        pes.Score AS PostScore,
+        pes.ViewCount,
+        pes.TotalComments,
+        pes.TotalUpVotes,
+        pes.TotalDownVotes,
+        pes.PostAgeDays,
+        ues.IsDeveloperUser,
+        ROW_NUMBER() OVER (PARTITION BY ues.UserId ORDER BY pes.Score DESC, pes.ViewCount DESC) AS UserPostRank,
+        RANK() OVER (ORDER BY pes.Score DESC, pes.ViewCount DESC) AS OverallScoreRank,
+        NTILE(2) OVER (ORDER BY pes.ViewCount DESC) AS ViewCountPercentile
+    FROM UserEngagementStats ues
+    JOIN PostEngagementSummary pes ON ues.UserId = pes.OwnerUserId
+    WHERE pes.PostTypeId = 1
+      AND pes.Score > 0
+      AND pes.TotalComments > 0
+),
+TagPerformanceMetrics AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS TotalQuestionsTagged,
+        SUM(p.ViewCount) AS TotalTagViewCount,
+        AVG(p.Score) AS AvgScorePerTag,
+        (CAST(SUM(p.ViewCount) AS NUMERIC) / NULLIF(COUNT(DISTINCT p.Id), 0)) * AVG(p.Score) AS HotnessFactor
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%') AND p.PostTypeId = 1
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT p.Id) > 50 AND AVG(p.Score) > 2
+),
+UserTopTag AS (
+    SELECT
+        ues_sub.UserId,
+        t_sub.TagName,
+        tpm_sub.HotnessFactor,
+        ROW_NUMBER() OVER (PARTITION BY ues_sub.UserId ORDER BY tpm_sub.HotnessFactor DESC) AS rn_tag_rank
+    FROM UserEngagementStats ues_sub
+    JOIN Posts p_sub ON ues_sub.UserId = p_sub.OwnerUserId
+    JOIN TagPerformanceMetrics tpm_sub ON p_sub.Tags LIKE ('%' || '<' || tpm_sub.TagName || '>' || '%')
+    JOIN Tags t_sub ON t_sub.TagName = tpm_sub.TagName
+    WHERE p_sub.PostTypeId = 1 AND p_sub.Score > 0
+    GROUP BY ues_sub.UserId, t_sub.TagName, tpm_sub.HotnessFactor
+)
+SELECT
+    'High-Performing Question by Engaged Users' AS ReportCategory,
+    rc.PostId,
+    rc.PostTitle,
+    rc.PostCreationDate,
+    rc.UserDisplayName,
+    rc.Reputation,
+    rc.PostScore,
+    rc.ViewCount,
+    rc.TotalComments,
+    pes.QuestionTagCount,
+    pes.DaysSinceLastActivity,
+    DATE_PART('hour', COALESCE(ph_first_edit.EventDate, rc.PostCreationDate) - rc.PostCreationDate) AS HoursUntilFirstEdit,
+    ph_latest_edit.EditorChanged AS LatestEditByNewUser,
+    rc.OverallScoreRank,
+    rc.UserPostRank,
+    utt.TagName AS TopContributingTag,
+    utt.HotnessFactor AS TopTagHotness,
+    NULL AS AnalysisComment
+FROM RankedUserContributions rc
+JOIN PostEngagementSummary pes ON rc.PostId = pes.PostId
+LEFT JOIN (
+    SELECT
+        PostId,
+        EventDate,
+        EditorChanged
+    FROM (
+        SELECT
+            pea.PostId,
+            pea.EventDate,
+            pea.EditorChanged,
+            ROW_NUMBER() OVER (PARTITION BY pea.PostId ORDER BY pea.EventDate ASC) AS rn
+        FROM PostEventSequenceAnalysis pea
+        WHERE pea.PostHistoryTypeId IN (4,5,6)
+    ) AS sub_first_edit
+    WHERE rn = 1
+) AS ph_first_edit ON rc.PostId = ph_first_edit.PostId
+LEFT JOIN (
+    SELECT
+        PostId,
+        EventDate,
+        EditorChanged
+    FROM (
+        SELECT
+            pea.PostId,
+            pea.EventDate,
+            pea.EditorChanged,
+            ROW_NUMBER() OVER (PARTITION BY pea.PostId ORDER BY pea.EventDate DESC) AS rn
+        FROM PostEventSequenceAnalysis pea
+        WHERE pea.PostHistoryTypeId IN (4,5,6)
+    ) AS sub_latest_edit
+    WHERE rn = 1
+) AS ph_latest_edit ON rc.PostId = ph_latest_edit.PostId
+LEFT JOIN UserTopTag utt ON rc.UserId = utt.UserId AND utt.rn_tag_rank = 1
+WHERE rc.UserPostRank <= 5
+  AND rc.ViewCountPercentile = 1
+  AND rc.Reputation > (SELECT AVG(Reputation) FROM UserEngagementStats)
+  AND pes.AcceptedAnswerExists = TRUE
+  AND pes.IsClosedFlag = FALSE
+  AND pes.TotalUpVotes > pes.TotalDownVotes * 2
+  AND UPPER(rc.PostTitle) LIKE '%SQL%'
+  AND EXISTS (SELECT 1 FROM PostHistory ph_reopened WHERE ph_reopened.PostId = rc.PostId AND ph_reopened.PostHistoryTypeId = 11)
+  AND rc.IsDeveloperUser = 1
+UNION ALL
+SELECT
+    'Controversial/Heavily Edited Post Metrics' AS ReportCategory,
+    pes.PostId,
+    pes.Title AS PostTitle,
+    pes.PostCreationDate,
+    ues.DisplayName AS UserDisplayName,
+    ues.Reputation,
+    pes.Score AS PostScore,
+    pes.ViewCount,
+    pes.TotalComments,
+    pes.QuestionTagCount,
+    pes.DaysSinceLastActivity,
+    DATE_PART('hour', pes.LastActivityDate - pes.PostCreationDate) AS HoursUntilFirstActivity,
+    FALSE AS LatestEditByNewUser,
+    NULL AS OverallScoreRank,
+    NULL AS UserPostRank,
+    NULL AS TopContributingTag,
+    NULL AS TopTagHotness,
+    CASE
+        WHEN pes.TotalEditHistoryEntries > 5 AND pes.IsClosedFlag = TRUE THEN 'Heavily Edited & Closed'
+        WHEN pes.TotalDownVotes > pes.TotalUpVotes THEN 'More Downvotes Than Upvotes'
+        WHEN pes.DuplicateLinkCount > 0 THEN 'Linked to Duplicates'
+        ELSE 'Other Notable Event'
+    END AS AnalysisComment
+FROM PostEngagementSummary pes
+JOIN UserEngagementStats ues ON pes.OwnerUserId = ues.UserId
+JOIN (
+    SELECT
+        PostId,
+        MAX(EventDate) AS LatestEventDate,
+        COUNT(DISTINCT PostHistoryId) AS EventCount,
+        SUM(CASE WHEN EditorChanged THEN 1 ELSE 0 END) AS EditorChangeCount
+    FROM PostEventSequenceAnalysis
+    WHERE PostHistoryTypeId IN (4,5,6,10,11,12,13)
+    GROUP BY PostId
+    HAVING COUNT(DISTINCT PostHistoryId) > 3 AND SUM(CASE WHEN EditorChanged THEN 1 ELSE 0 END) > 0
+) AS pe_agg ON pes.PostId = pe_agg.PostId
+WHERE pes.PostTypeId = 1
+  AND pes.PostAgeDays > 30
+  AND pes.TotalEditHistoryEntries > 3
+  AND (pes.IsClosedFlag = TRUE OR pes.TotalDownVotes > pes.TotalUpVotes)
+  AND EXISTS (
+      SELECT 1
+      FROM PostHistory ph_offtopic
+      WHERE ph_offtopic.PostId = pes.PostId
+        AND ph_offtopic.PostHistoryTypeId = 10
+        AND ph_offtopic.Comment IN (
+            SELECT CAST(Id AS VARCHAR) FROM CloseReasonTypes WHERE Name ILIKE '%off-topic%'
+        )
+  )
+  AND NOT (pes.Title ILIKE '%tutorial%' OR pes.Title ILIKE '%how to%')
+ORDER BY ReportCategory, Reputation DESC, PostScore DESC NULLS LAST, ViewCount DESC NULLS LAST;

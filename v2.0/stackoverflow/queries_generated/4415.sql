@@ -1,0 +1,218 @@
+-- {"query": "4415.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2131} 
+
+WITH RankedPostHistory AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.Comment,
+    ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) as rn
+  FROM PostHistory AS ph
+  WHERE ph.PostHistoryTypeId IN (4, 7) /* Edit Title, Rollback Title */
+),
+LatestTitles AS (
+  SELECT
+    rph.PostId,
+    p.Title AS OriginalTitle,
+    rph.Comment AS EditedOrRolledBackTitle,
+    rph.CreationDate AS EditOrRollbackDate,
+    CASE
+      WHEN rph.PostHistoryTypeId = 4 THEN 'Edited'
+      WHEN rph.PostHistoryTypeId = 7 THEN 'Rolled Back'
+      ELSE 'Unknown'
+    END AS EditType
+  FROM RankedPostHistory AS rph
+  JOIN Posts AS p
+    ON rph.PostId = p.Id
+  WHERE
+    rph.rn = 1
+),
+UserEdits AS (
+  SELECT
+    p.Id AS PostId,
+    u.DisplayName AS EditorDisplayName,
+    COUNT(DISTINCT ph.Id) AS NumberOfEdits
+  FROM Posts AS p
+  JOIN PostHistory AS ph
+    ON p.Id = ph.PostId
+  JOIN Users AS u
+    ON ph.UserId = u.Id
+  WHERE
+    ph.PostHistoryTypeId = 4 /* Edit Title */ AND u.DisplayName IS NOT NULL
+  GROUP BY
+    p.Id,
+    u.DisplayName
+),
+TopEditors AS (
+  SELECT
+    ue.PostId,
+    ue.EditorDisplayName,
+    ue.NumberOfEdits,
+    ROW_NUMBER() OVER (PARTITION BY ue.PostId ORDER BY ue.NumberOfEdits DESC) as rn
+  FROM UserEdits AS ue
+)
+SELECT
+  p.Id,
+  p.Title,
+  p.CreationDate AS PostCreationDate,
+  p.LastActivityDate,
+  pt.Name AS PostTypeName,
+  lt.Name AS LinkType,
+  COALESCE(lt.Name, 'No Link') AS LinkStatus,
+  CASE
+    WHEN lt.Name = 'Duplicate' THEN 'This post is a duplicate'
+    WHEN lt.Name = 'Linked' THEN 'This post is linked to another'
+    ELSE 'Not explicitly linked or is duplicate'
+  END AS LinkDescription,
+  lt_parent.Name AS ParentLinkType,
+  te.EditorDisplayName AS MostFrequentEditor,
+  CASE
+    WHEN te.rn = 1 AND te.NumberOfEdits > 5 THEN 'Frequent Editor'
+    ELSE 'Infrequent Editor'
+  END AS EditorCategorization,
+  lt_all.Name AS FirstLinkTypeEver,
+  lt_all.Name || '-' || COALESCE(p.OwnerDisplayName, 'Community') AS PostOwnerInfo,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+    ELSE 'Active'
+  END AS PostStatus,
+  lt.Id AS LinkTypeId,
+  lt_all.Id AS FirstLinkTypeIdEver,
+  CASE
+    WHEN SUBSTRING(p.Tags FROM 2 FOR 1) = '>' THEN 'Empty Tags'
+    WHEN p.Tags IS NULL THEN 'NULL Tags'
+    ELSE 'Tags Present'
+  END AS TagPresence,
+  CASE
+    WHEN p.ViewCount > 1000000 AND p.Score > 1000 THEN 'Highly Viewed and Scored'
+    WHEN p.ViewCount < 1000 OR p.Score < 10 THEN 'Low Engagement'
+    ELSE 'Moderate Engagement'
+  END AS EngagementLevel,
+  CASE
+    WHEN p.AnswerCount = 0 AND p.PostTypeId = 1 THEN 'No Answers'
+    WHEN p.AnswerCount > 50 AND p.PostTypeId = 1 THEN 'Many Answers'
+    ELSE 'Standard Answer Count'
+  END AS AnswerCountCategory,
+  CASE
+    WHEN p.ContentLicense = 'CC BY-SA 4.0' THEN 'Standard License'
+    WHEN p.ContentLicense IS NULL THEN 'No License Specified'
+    ELSE 'Other License'
+  END AS LicenseCategory,
+  lt_all.Id AS BaseLinkTypeId,
+  lt.Id AS CurrentLinkTypeId,
+  p.Id % 10 AS PostIdModulo10,
+  CAST(p.Score AS VARCHAR(10)) AS ScoreAsString,
+  LENGTH(p.Title) AS TitleLength,
+  COALESCE(p.FavoriteCount, 0) AS NonNullFavoriteCount,
+  LOWER(p.Title) AS LowercaseTitle,
+  UPPER(pt.Name) AS UppercasePostTypeName,
+  REPLACE(p.Title, ' ', '_') AS TitleWithUnderscores,
+  TRIM(p.DisplayName) AS TrimmedDisplayName,
+  CONCAT(p.Id, '-', COALESCE(p.OwnerDisplayName, 'Community')) AS PostIdentifier,
+  CASE
+    WHEN p.OwnerUserId IS NULL THEN TRUE
+    ELSE FALSE
+  END AS IsOwnerUserIdNull,
+  CASE
+    WHEN p.OwnerUserId = -1 THEN 'Community User'
+    WHEN p.OwnerUserId IS NULL THEN 'Null Owner'
+    ELSE 'Specific User'
+  END AS OwnerUserType,
+  CASE
+    WHEN p.LastEditDate > p.CreationDate + INTERVAL '30 day' THEN 'Significant Lag'
+    WHEN p.LastEditDate IS NULL THEN 'No Edits'
+    ELSE 'Timely Edit'
+  END AS EditLag,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM Comments AS c
+      WHERE
+        c.PostId = p.Id AND c.Score > 10
+    ) THEN 'Has High Score Comment'
+    ELSE 'No High Score Comment'
+  END AS HasHighScoreComment,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM PostLinks AS pl
+      WHERE
+        pl.PostId = p.Id AND pl.LinkTypeId = 3 /* Duplicate */
+    ) THEN 'Is Duplicate Link'
+    ELSE 'Not A Duplicate Link'
+  END AS IsDuplicateLink,
+  CASE
+    WHEN p.ViewCount / NULLIF(p.AnswerCount, 0) > 1000 THEN 'High View-to-Answer Ratio'
+    ELSE 'Normal View-to-Answer Ratio'
+  END AS ViewAnswerRatio,
+  CASE
+    WHEN p.Score < 0 THEN 'Negative Score'
+    WHEN p.Score BETWEEN 0 AND 10 THEN 'Low Score'
+    ELSE 'High Score'
+  END AS ScoreCategory,
+  CASE
+    WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Has Accepted Answer'
+    WHEN p.PostTypeId = 1 THEN 'No Accepted Answer'
+    ELSE 'Not Applicable'
+  END AS AcceptedAnswerStatus,
+  CASE
+    WHEN p.Title LIKE '%[SQL]%' OR p.Title LIKE '%[SQL Server]%' THEN 'SQL Related'
+    ELSE 'Other Topic'
+  END AS TopicCategory
+FROM Posts AS p
+JOIN PostTypes AS pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN PostLinks AS pl
+  ON p.Id = pl.PostId
+LEFT JOIN LinkTypes AS lt
+  ON pl.LinkTypeId = lt.Id AND lt.Name IN ('Linked', 'Duplicate')
+LEFT JOIN LinkTypes AS lt_parent
+  ON pl.LinkTypeId = lt_parent.Id AND lt_parent.Name = 'Linked'
+LEFT JOIN LinkTypes AS lt_all
+  ON p.Id = pl.PostId AND pl.LinkTypeId = lt_all.Id
+LEFT JOIN LatestTitles AS lt_title
+  ON p.Id = lt_title.PostId
+LEFT JOIN TopEditors AS te
+  ON p.Id = te.PostId
+WHERE
+  p.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+  AND p.Score > 0
+  AND lt_title.EditOrRollbackDate IS NOT NULL
+  AND te.rn = 1
+  AND te.NumberOfEdits > 0
+  AND (
+    lt.Name = 'Duplicate' OR p.AnswerCount > 5
+  )
+GROUP BY
+  p.Id,
+  p.Title,
+  p.CreationDate,
+  p.LastActivityDate,
+  pt.Name,
+  lt.Name,
+  lt_parent.Name,
+  te.EditorDisplayName,
+  te.rn,
+  te.NumberOfEdits,
+  lt_all.Name,
+  p.OwnerDisplayName,
+  p.ClosedDate,
+  p.CommunityOwnedDate,
+  lt.Id,
+  lt_all.Id,
+  p.Tags,
+  p.ViewCount,
+  p.Score,
+  p.AnswerCount,
+  p.ContentLicense,
+  p.PostTypeId,
+  p.AcceptedAnswerId
+HAVING
+  COUNT(DISTINCT pl.Id) < 5 OR p.Score > 100
+ORDER BY
+  p.CreationDate DESC
+LIMIT 1000;

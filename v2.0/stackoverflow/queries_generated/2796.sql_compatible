@@ -1,0 +1,162 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+
+    UNION ALL
+
+    SELECT 
+        c.Id,
+        c.TagName,
+        c.Count,
+        r.Level + 1,
+        r.TagPath || c.TagName
+    FROM Tags c
+    JOIN PostLinks pl ON pl.PostId = c.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON r.Id = pl.RelatedPostId
+    WHERE c.IsModeratorOnly = FALSE
+        AND NOT c.TagName = ANY(r.TagPath)
+        AND r.Level < 3
+),
+QuestionAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.OwnerUserId AS QuestionOwner,
+        a.Id AS AnswerId,
+        a.CreationDate AS AnswerCreation,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwner,
+        u.DisplayName AS AnswerOwnerName,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE q.PostTypeId = 1
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges,
+        MAX(CASE WHEN b.Class = 1 THEN b.Date END) AS LatestGoldBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+TopQuestionsWithActivity AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        COUNT(c.Id) AS CommentCount,
+        STRING_AGG(DISTINCT ph.Name, ', ' ORDER BY ph.Name) AS RecentHistoryTypes,
+        u.DisplayName AS OwnerDisplayName,
+        COALESCE(uv.UpVotes,0) AS OwnerUpVotes,
+        COALESCE(uv.DownVotes,0) AS OwnerDownVotes,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS Status,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS Rank
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory phs ON phs.PostId = p.Id AND phs.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+    LEFT JOIN PostHistoryTypes ph ON ph.Id = phs.PostHistoryTypeId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT Id AS UserId, SUM(UpVotes) AS UpVotes, SUM(DownVotes) AS DownVotes
+        FROM Users
+        GROUP BY Id
+    ) uv ON uv.UserId = u.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.Tags, u.DisplayName, uv.UpVotes, uv.DownVotes, p.ClosedDate
+    HAVING COUNT(c.Id) > 0
+),
+WindowedVotes AS (
+    SELECT
+        v.PostId,
+        vt.Name AS VoteType,
+        COUNT(*) OVER (PARTITION BY v.PostId, v.VoteTypeId) AS VoteTypeCount,
+        RANK() OVER (PARTITION BY v.PostId ORDER BY COUNT(*) OVER (PARTITION BY v.PostId, v.VoteTypeId) DESC) AS VoteRank
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+),
+PostTagAggregates AS (
+    SELECT
+        p.Id AS PostId,
+        TRIM(split_part(split_part(p.Tags, '>', gs.seq), '<', 2)) AS SingleTag
+    FROM Posts p
+    JOIN generate_series(1, 20) AS gs(seq) ON gs.seq <= regexp_count(p.Tags, '><') + 1
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+TagUsage AS (
+    SELECT 
+        SingleTag,
+        COUNT(*) AS UsageCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.ViewCount) AS MaxViewCount
+    FROM PostTagAggregates ta
+    JOIN Posts p ON p.Id = ta.PostId
+    GROUP BY SingleTag
+    HAVING COUNT(*) > 5
+),
+AnswersWithDuplicates AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        COUNT(DISTINCT pl.Id) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateCount
+    FROM Posts a
+    LEFT JOIN PostLinks pl ON pl.PostId = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id, a.ParentId
+)
+SELECT 
+    tqw.Rank,
+    tqw.Title AS QuestionTitle,
+    tqw.Score AS QuestionScore,
+    tqw.ViewCount AS QuestionViews,
+    tqw.OwnerDisplayName,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    COUNT(DISTINCT qa.AnswerId) FILTER (WHERE qa.AnswerRank <= 3) AS Top3AnswersCount,
+    AVG(qa.AnswerScore) FILTER (WHERE qa.AnswerRank <= 3) AS AvgTop3AnswerScore,
+    STRING_AGG(DISTINCT tu.SingleTag, ', ' ORDER BY tu.UsageCount DESC) AS PopularTags,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = tqw.Id AND c.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '7 days')) AS RecentComments,
+    CASE 
+        WHEN tqw.Status = 'Closed' AND EXISTS (
+            SELECT 1 FROM PostHistory ph 
+            WHERE ph.PostId = tqw.Id AND ph.PostHistoryTypeId = 10
+            AND ph.Comment ~ '\d+'
+        ) THEN 'Recently Closed'
+        ELSE tqw.Status
+    END AS DetailedStatus,
+    COALESCE(SUM(CASE WHEN wv.VoteType = 'UpMod' THEN wv.VoteTypeCount ELSE 0 END),0) AS TotalUpVotes,
+    COALESCE(SUM(CASE WHEN wv.VoteType = 'DownMod' THEN wv.VoteTypeCount ELSE 0 END),0) AS TotalDownVotes,
+    rh.Level AS MaxTagDepth,
+    ARRAY_TO_STRING(rh.TagPath, ' > ') AS TagHierarchyPath,
+    COALESCE(aw.DuplicateCount,0) AS AnswerDuplicateLinks
+FROM TopQuestionsWithActivity tqw
+LEFT JOIN QuestionAnswers qa ON qa.QuestionId = tqw.Id
+LEFT JOIN UserBadgeStats us ON us.UserId = tqw.OwnerUserId
+LEFT JOIN TagUsage tu ON POSITION(tu.SingleTag IN tqw.Tags) > 0
+LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = tu.SingleTag
+LEFT JOIN WindowedVotes wv ON wv.PostId = tqw.Id
+LEFT JOIN AnswersWithDuplicates aw ON aw.QuestionId = tqw.Id
+GROUP BY 
+    tqw.Rank, tqw.Title, tqw.Score, tqw.ViewCount, tqw.OwnerDisplayName, us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+    tqw.Status, tqw.Id, rh.Level, rh.TagPath, aw.DuplicateCount
+ORDER BY tqw.Rank
+FETCH FIRST 50 ROWS ONLY;

@@ -1,0 +1,149 @@
+with RecursiveBadges as (
+    select b.UserId, b.Name as BadgeName, b.Class, b.Date,
+        row_number() over (partition by b.UserId order by b.Date) as BadgeSeq
+    from Badges b
+    where b.TagBased = false
+),
+UserRecentActivity as (
+    select u.Id as UserId, u.DisplayName,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate,
+        max(ph.CreationDate) as LastEditDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopQuestions as (
+    select p.Id, p.OwnerUserId, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount,
+        coalesce(p.AcceptedAnswerId, -1) as AcceptedAnswerId,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last) as rn
+    from Posts p
+    where p.PostTypeId = 1
+),
+RecentAnswerers as (
+    select distinct a.OwnerUserId as UserId
+    from Posts a
+    where a.PostTypeId = 2
+      and a.CreationDate > (cast('2024-10-01' as date) - interval '30' day)
+),
+UserScoreStats as (
+    select u.Id as UserId,
+        sum(coalesce(p.Score,0)) as TotalPostScore,
+        avg(coalesce(p.Score,0)) as AvgPostScore,
+        max(coalesce(p.Score,0)) as MaxPostScore,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswerCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+),
+DuplicateLinks as (
+    select pl.PostId, pl.RelatedPostId, pl.CreationDate
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+),
+UserBadgeRanks as (
+    select UserId,
+           case 
+               when Class = 1 then 'Gold'
+               when Class = 2 then 'Silver'
+               when Class = 3 then 'Bronze'
+               else 'Unknown'
+           end as BadgeRank,
+           count(*) as BadgeCount
+    from Badges
+    group by UserId, Class
+),
+RecursiveDupes as (
+    select PostId, RelatedPostId, 1 as Level
+    from DuplicateLinks
+    union all
+    select d.PostId, pl.RelatedPostId, d.Level + 1
+    from RecursiveDupes d
+    join DuplicateLinks pl on d.RelatedPostId = pl.PostId
+    where d.Level < 3
+),
+QuestionsWithDupes AS (
+    select p.Id as QuestionId, p.Title, p.Score, p.ViewCount,
+        string_agg(distinct t.TagName, ', ') as Tags,
+        count(distinct rd.RelatedPostId) as DuplicateChainLength
+    from Posts p
+    left join RecursiveDupes rd on p.Id = rd.PostId
+    left join lateral (
+        select unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as TagName
+    ) t on true
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.Score, p.ViewCount
+),
+AnswerStats AS (
+    select p.ParentId as QuestionId,
+        count(*) as AnswersTotal,
+        sum(case when p.Score > 5 then 1 else 0 end) as HighlyVotedAnswers,
+        avg(p.Score) as AvgAnswerScore
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    us.TotalPostScore,
+    us.AvgPostScore,
+    us.MaxPostScore,
+    us.QuestionCount,
+    us.AnswerCount,
+    coalesce(sum(case when uba.BadgeRank = 'Gold' then uba.BadgeCount else 0 end),0) as GoldBadges,
+    coalesce(sum(case when uba.BadgeRank = 'Silver' then uba.BadgeCount else 0 end),0) as SilverBadges,
+    coalesce(sum(case when uba.BadgeRank = 'Bronze' then uba.BadgeCount else 0 end),0) as BronzeBadges,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    ua.LastEditDate,
+    ta.AnswersTotal,
+    ta.HighlyVotedAnswers,
+    ta.AvgAnswerScore,
+    qwd.QuestionId,
+    qwd.Title as SampleQuestionTitle,
+    qwd.Score as QuestionScore,
+    qwd.ViewCount as QuestionViewCount,
+    qwd.Tags as QuestionTags,
+    qwd.DuplicateChainLength,
+    case 
+        when u.Location is null then 'Unknown'
+        else upper(substring(u.Location from 1 for 3))
+    end as LocationSnippet,
+    case 
+        when u.WebsiteUrl is not null and position('http' in u.WebsiteUrl) = 1 then substring(u.WebsiteUrl from 8 for 20)
+        else 'NoWebsite'
+    end as WebsiteSnippet
+from Users u
+left join UserScoreStats us on us.UserId = u.Id
+left join UserRecentActivity ua on ua.UserId = u.Id
+left join (
+    select UserId, BadgeRank, sum(BadgeCount) as BadgeCount
+    from UserBadgeRanks
+    group by UserId, BadgeRank
+) uba on uba.UserId = u.Id
+left join RecentAnswerers ra on ra.UserId = u.Id
+left join AnswerStats ta on ta.QuestionId = (
+    select p.Id 
+    from Posts p 
+    where p.OwnerUserId = u.Id and p.PostTypeId = 1
+    order by p.CreationDate desc limit 1
+)
+left join QuestionsWithDupes qwd on qwd.QuestionId = ta.QuestionId
+where ua.LastPostDate is not null
+  and (coalesce(us.TotalPostScore,0) > 100 or coalesce(us.AvgPostScore,0) > 5)
+  and exists (
+    select 1 from RecursiveDupes rd
+    where rd.PostId = qwd.QuestionId and rd.Level = 2
+  )
+group by
+    u.Id, u.DisplayName, us.TotalPostScore, us.AvgPostScore, us.MaxPostScore, us.QuestionCount, us.AnswerCount,
+    ua.LastPostDate, ua.LastCommentDate, ua.LastEditDate,
+    ta.AnswersTotal, ta.HighlyVotedAnswers, ta.AvgAnswerScore,
+    qwd.QuestionId, qwd.Title, qwd.Score, qwd.ViewCount, qwd.Tags, qwd.DuplicateChainLength,
+    u.Location, u.WebsiteUrl
+order by us.TotalPostScore desc nulls last, ua.LastPostDate desc
+limit 100;

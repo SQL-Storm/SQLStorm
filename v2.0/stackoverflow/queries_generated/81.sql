@@ -1,0 +1,307 @@
+-- {"query": "81.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3109} 
+with params as (
+  select
+    365::int as recent_days,
+    5::int as min_answers,
+    10::int as min_score,
+    0.05::numeric as high_bounce_ratio
+),
+recent_questions as (
+  select
+    q.Id as QuestionId,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.Title,
+    q.Tags,
+    coalesce(q.AnswerCount, 0) as AnswerCount,
+    date_trunc('day', q.CreationDate) as q_day
+  from Posts q
+  join PostTypes pt on pt.Id = q.PostTypeId and pt.Name = 'Question'
+  cross join params p
+  where q.CreationDate >= now() - (p.recent_days || ' days')::interval
+    and coalesce(q.Score, 0) >= p.min_score
+),
+answers as (
+  select
+    a.ParentId as QuestionId,
+    a.Id as AnswerId,
+    a.OwnerUserId as AnswerOwnerId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreationDate,
+    (a.Id = q.AcceptedAnswerId)::int as IsAccepted
+  from Posts a
+  join PostTypes pt on pt.Id = a.PostTypeId and pt.Name = 'Answer'
+  join Posts q on q.Id = a.ParentId
+),
+comment_activity as (
+  select
+    c.PostId,
+    count(*) as CommentCount,
+    sum((coalesce(c.Score,0) > 0)::int) as PositiveCommentCount,
+    sum((coalesce(c.Score,0) < 0)::int) as NegativeCommentCount,
+    max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+),
+question_vote_agg as (
+  select
+    v.PostId as QuestionId,
+    sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+    sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+    sum(case when vt.Name = 'Favorite' then 1 else 0 end) as Favorites,
+    max(v.CreationDate) as LastVoteDate
+  from Votes v
+  join VoteTypes vt on vt.Id = v.VoteTypeId
+  group by v.PostId
+),
+answer_vote_agg as (
+  select
+    a.ParentId as QuestionId,
+    sum(case when vt.Name = 'UpMod' then 1 else 0 end) as AnswerUpVotes,
+    sum(case when vt.Name = 'DownMod' then 1 else 0 end) as AnswerDownVotes,
+    sum(case when vt.Name = 'AcceptedByOriginator' then 1 else 0 end) as AcceptedMarks
+  from Votes v
+  join VoteTypes vt on vt.Id = v.VoteTypeId
+  join Posts a on a.Id = v.PostId
+  join PostTypes pt on pt.Id = a.PostTypeId and pt.Name = 'Answer'
+  group by a.ParentId
+),
+dupe_links as (
+  select
+    pl.PostId as QuestionId,
+    count(*) filter (where lt.Name = 'Duplicate') as DuplicateLinks,
+    count(*) filter (where lt.Name = 'Linked') as LinkedLinks,
+    max(pl.CreationDate) as LastLinkDate
+  from PostLinks pl
+  join LinkTypes lt on lt.Id = pl.LinkTypeId
+  group by pl.PostId
+),
+close_events as (
+  select
+    ph.PostId as QuestionId,
+    sum((ph.PostHistoryTypeId = 10)::int) as CloseVotes, -- Post Closed
+    sum((ph.PostHistoryTypeId = 11)::int) as ReopenVotes,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as LastClosedAt,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenedAt,
+    sum(
+      case
+        when ph.PostHistoryTypeId = 10 and coalesce(ph.Comment, '') ~ '^[0-9]+$'
+        then 1 else 0
+      end
+    ) as CloseReasonsCount,
+    count(*) filter (where ph.PostHistoryTypeId in (33,34)) as PostNoticeEvents
+  from PostHistory ph
+  group by ph.PostId
+),
+user_badge_mix as (
+  select
+    u.Id as UserId,
+    count(*) filter (where b.Class = 1) as Golds,
+    count(*) filter (where b.Class = 2) as Silvers,
+    count(*) filter (where b.Class = 3) as Bronzes,
+    count(*) filter (where b.TagBased = 1) as TagBadges,
+    min(b.Date) as FirstBadgeDate,
+    max(b.Date) as LastBadgeDate
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id
+),
+question_tag_split as (
+  select
+    rq.QuestionId,
+    unnest(string_to_array(substring(rq.Tags, 2, greatest(length(rq.Tags)-2,0)), '><')) as TagName
+  from recent_questions rq
+  where rq.Tags is not null and rq.Tags like '<%>'
+),
+tag_stats as (
+  select
+    ts.TagName,
+    count(distinct ts.QuestionId) as QuestionsWithTag,
+    sum(rq.ViewCount) as TotalViewsForTag,
+    avg(rq.Score::numeric) as AvgScoreForTag
+  from question_tag_split ts
+  join recent_questions rq on rq.QuestionId = ts.QuestionId
+  group by ts.TagName
+),
+owner_enriched as (
+  select
+    rq.QuestionId,
+    u.Id as OwnerId,
+    u.Reputation,
+    u.CreationDate as UserCreated,
+    u.LastAccessDate,
+    coalesce(nullif(bm.Golds,0),0) as Golds,
+    coalesce(nullif(bm.Silvers,0),0) as Silvers,
+    coalesce(nullif(bm.Bronzes,0),0) as Bronzes,
+    coalesce(bm.TagBadges,0) as TagBadges,
+    bm.FirstBadgeDate,
+    bm.LastBadgeDate
+  from recent_questions rq
+  left join Users u on u.Id = rq.OwnerUserId
+  left join user_badge_mix bm on bm.UserId = u.Id
+),
+answer_agg as (
+  select
+    a.QuestionId,
+    count(*) as Answers,
+    sum((a.AnswerScore > 0)::int) as PositiveAnswers,
+    sum((a.AnswerScore < 0)::int) as NegativeAnswers,
+    sum(a.IsAccepted) as AcceptedCount,
+    max(a.AnswerCreationDate) as LastAnswerAt
+  from answers a
+  group by a.QuestionId
+),
+engagement as (
+  select
+    rq.QuestionId,
+    rq.ViewCount,
+    qa.Answers,
+    qa.PositiveAnswers,
+    qa.NegativeAnswers,
+    qa.AcceptedCount,
+    (qa.Answers::numeric / nullif(rq.ViewCount::numeric,0)) as AnswersPerView,
+    coalesce(ca.CommentCount,0) as CommentCount,
+    (coalesce(ca.CommentCount,0)::numeric / nullif(rq.ViewCount::numeric,0)) as CommentsPerView,
+    greatest(coalesce(qa.LastAnswerAt, rq.CreationDate), coalesce(ca.LastCommentDate, rq.CreationDate)) as LastEngagementAt
+  from recent_questions rq
+  left join answer_agg qa on qa.QuestionId = rq.QuestionId
+  left join comment_activity ca on ca.PostId = rq.QuestionId
+),
+quality_signals as (
+  select
+    rq.QuestionId,
+    rq.Score,
+    qv.UpVotes,
+    qv.DownVotes,
+    qv.Favorites,
+    av.AnswerUpVotes,
+    av.AnswerDownVotes,
+    av.AcceptedMarks,
+    dl.DuplicateLinks,
+    dl.LinkedLinks,
+    ce.CloseVotes,
+    ce.ReopenVotes,
+    ce.LastClosedAt,
+    ce.LastReopenedAt,
+    ce.PostNoticeEvents
+  from recent_questions rq
+  left join question_vote_agg qv on qv.QuestionId = rq.QuestionId
+  left join answer_vote_agg av on av.QuestionId = rq.QuestionId
+  left join dupe_links dl on dl.QuestionId = rq.QuestionId
+  left join close_events ce on ce.QuestionId = rq.QuestionId
+),
+normalized as (
+  select
+    rq.QuestionId,
+    rq.Title,
+    rq.Tags,
+    oe.OwnerId,
+    oe.Reputation,
+    oe.Golds, oe.Silvers, oe.Bronzes, oe.TagBadges,
+    rq.CreationDate,
+    e.ViewCount, e.Answers, e.CommentCount,
+    e.AnswersPerView, e.CommentsPerView, e.LastEngagementAt,
+    qs.Score, qs.UpVotes, qs.DownVotes, qs.Favorites,
+    qs.AnswerUpVotes, qs.AnswerDownVotes, qs.AcceptedMarks,
+    qs.DuplicateLinks, qs.LinkedLinks, qs.CloseVotes, qs.ReopenVotes,
+    qs.LastClosedAt, qs.LastReopenedAt, qs.PostNoticeEvents,
+    ts.TagName,
+    ts.QuestionsWithTag, ts.TotalViewsForTag, ts.AvgScoreForTag
+  from recent_questions rq
+  left join owner_enriched oe on oe.QuestionId = rq.QuestionId
+  left join engagement e on e.QuestionId = rq.QuestionId
+  left join quality_signals qs on qs.QuestionId = rq.QuestionId
+  left join lateral (
+    select t.TagName, t.QuestionsWithTag, t.TotalViewsForTag, t.AvgScoreForTag
+    from question_tag_split qts
+    join tag_stats t on t.TagName = qts.TagName
+    where qts.QuestionId = rq.QuestionId
+    order by t.QuestionsWithTag desc nulls last, t.TagName
+    limit 1
+  ) ts on true
+),
+scored as (
+  select
+    n.*,
+    -- composite score using various signals with NULL safety
+    (
+      coalesce(n.Score,0) * 2
+      + coalesce(n.UpVotes,0) * 1.5
+      - coalesce(n.DownVotes,0) * 1.5
+      + coalesce(n.Favorites,0) * 1.0
+      + coalesce(n.AnswerUpVotes,0) * 0.75
+      - coalesce(n.AnswerDownVotes,0) * 0.75
+      + least(coalesce(n.AcceptedMarks,0),1) * 5
+      - coalesce(n.DuplicateLinks,0) * 3
+      - coalesce(n.CloseVotes,0) * 4
+      + coalesce(n.ReopenVotes,0) * 2
+      + coalesce(n.LinkedLinks,0) * 0.25
+      + coalesce(n.Golds,0) * 4
+      + coalesce(n.Silvers,0) * 2
+      + coalesce(n.Bronzes,0) * 1
+      + greatest(0, least(10, coalesce(n.Reputation,0) / 1000))::numeric
+      + coalesce((n.AnswersPerView * 100),0)
+      + coalesce((n.CommentsPerView * 10),0)
+    )::numeric as CompositeScore
+  from normalized n
+),
+ranked as (
+  select
+    s.*,
+    row_number() over (order by s.CompositeScore desc, s.ViewCount desc nulls last) as rn,
+    rank() over (order by s.CompositeScore desc) as rnk,
+    percent_rank() over (order by s.CompositeScore desc) as pct,
+    ntile(10) over (order by s.CompositeScore desc) as decile,
+    sum(coalesce(s.ViewCount,0)) over (order by s.CompositeScore desc rows between unbounded preceding and current row) as RunningViews
+  from scored s
+),
+filtered as (
+  select
+    r.*
+  from ranked r
+  cross join params p
+  where coalesce(r.Answers,0) >= p.min_answers
+    and coalesce(r.CloseVotes,0) <= 1
+    and (
+      -- bounce heuristic: few answers and many views
+      (coalesce(r.AnswersPerView,0) < p.high_bounce_ratio)
+      or (coalesce(r.AcceptedMarks,0) = 0)
+    )
+)
+select
+  f.rn,
+  f.rnk,
+  round(f.pct::numeric, 4) as pct,
+  f.decile,
+  f.QuestionId,
+  coalesce(nullif(trim(regexp_replace(f.Title, '\s+', ' ', 'g')), ''), '[untitled]') as TitleNormalized,
+  f.OwnerId,
+  f.Reputation,
+  f.Golds, f.Silvers, f.Bronzes, f.TagBadges,
+  f.CreationDate,
+  f.ViewCount,
+  f.Answers,
+  f.CommentCount,
+  coalesce(f.AnswersPerView,0)::numeric(12,6) as AnswersPerView,
+  coalesce(f.CommentsPerView,0)::numeric(12,6) as CommentsPerView,
+  f.LastEngagementAt,
+  f.Score, f.UpVotes, f.DownVotes, f.Favorites,
+  f.AnswerUpVotes, f.AnswerDownVotes, f.AcceptedMarks,
+  f.DuplicateLinks, f.LinkedLinks, f.CloseVotes, f.ReopenVotes,
+  f.LastClosedAt, f.LastReopenedAt, f.PostNoticeEvents,
+  f.TagName as DominantTag,
+  f.QuestionsWithTag,
+  f.TotalViewsForTag,
+  coalesce(f.AvgScoreForTag,0)::numeric(12,4) as AvgScoreForTag,
+  f.CompositeScore,
+  case
+    when f.CompositeScore >= percentile_disc(0.95) within group (order by f.CompositeScore) over () then 'Top 5%'
+    when f.CompositeScore >= percentile_disc(0.90) within group (order by f.CompositeScore) over () then 'Top 10%'
+    when f.CompositeScore >= percentile_disc(0.75) within group (order by f.CompositeScore) over () then 'Top 25%'
+    else 'Other'
+  end as ScoreBucket
+from filtered f
+order by f.CompositeScore desc, f.ViewCount desc nulls last
+limit 200;

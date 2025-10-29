@@ -1,0 +1,194 @@
+-- {"query": "2440.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1921} 
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        b.Date,
+        row_number() over (partition by u.Id order by b.Date desc, b.Class) as BadgeRank,
+        sum(case when b.Class = 1 then 3 when b.Class = 2 then 2 else 1 end) over (partition by u.Id) as BadgeScore
+    from 
+        Users u
+    left join Badges b on b.UserId = u.Id
+    where b.Name is not null
+), UserTopBadges as (
+    select UserId, DisplayName, BadgeName, BadgeClass, Date, BadgeRank, BadgeScore
+    from RecursiveUserBadges
+    where BadgeRank <= 3
+), QuestionAnswerStats as (
+    select
+        p.OwnerUserId,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        avg(nullif(p.Score,0)) filter (where p.PostTypeId in (1,2)) as AvgPostScore,
+        max(p.Score) filter (where p.PostTypeId in (1,2)) as MaxPostScore,
+        sum(p.ViewCount) filter (where p.PostTypeId = 1) as TotalQuestionViews
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+), UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.AvgPostScore,
+        ua.MaxPostScore,
+        ua.TotalQuestionViews,
+        ltd.Name as LastBadge,
+        prune.BadgeScore
+    from Users u
+    left join (
+        select UserId, BadgeName, BadgeClass, Date,
+            first_value(BadgeName) over (partition by UserId order by Date desc nulls last) as LastBadgeName
+        from Badges
+    ) ltd on ltd.UserId = u.Id and ltd.BadgeName is not null
+    left join QuestionAnswerStats ua on ua.OwnerUserId = u.Id
+    left join (
+        select UserId, max(BadgeScore) as BadgeScore
+        from RecursiveUserBadges group by UserId
+    ) prune on prune.UserId = u.Id
+), RecentPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Body,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.AcceptedAnswerId,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as PostRank
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1, 2)
+), QuestionAnswerDetails as (
+    select
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.CreationDate as QuestionDate,
+        q.OwnerUserId as QuestionOwner,
+        q.OwnerName as QuestionOwnerName,
+        q.Score as QuestionScore,
+        q.AcceptedAnswerId,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.OwnerName as AnswerOwnerName,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        a.Body as AnswerBody,
+        pht.Name as PostHistoryType,
+        (select count(*) from Comments c where c.PostId = a.Id) as AnswerCommentsCount,
+        dense_rank() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join PostHistoryTypes pht on pht.Id = (
+        select ph.PostHistoryTypeId from PostHistory ph
+        where ph.PostId = q.Id
+        order by ph.CreationDate desc limit 1
+    )
+    where q.PostTypeId = 1
+), PostLinksInfo as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts p1 on p1.Id = pl.PostId
+    left join Posts p2 on p2.Id = pl.RelatedPostId
+), DuplicateQuestions as (
+    select distinct pl.PostId
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+), CombinedUserVotes as (
+    select
+        post.OwnerUserId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesOnPosts,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesOnPosts,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as FavoriteVotesOnPosts
+    from Votes v
+    join Posts post on post.Id = v.PostId
+    group by post.OwnerUserId
+), FinalSelection as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Location,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.AvgPostScore,
+        ua.MaxPostScore,
+        coalesce(cuv.UpVotesOnPosts,0) as UpVotesOnPosts,
+        coalesce(cuv.DownVotesOnPosts,0) as DownVotesOnPosts,
+        coalesce(cuv.FavoriteVotesOnPosts,0) as FavoriteVotesOnPosts,
+        max(pb.BadgeClass) filter (where pb.UserId = ua.UserId) as MaxBadgeClass,
+        count(pb.Id) filter (where pb.UserId = ua.UserId) as TotalBadges,
+        count(distinct dq.PostId) as DuplicateQuestionCount,
+        max(qa.QuestionScore) filter (where qa.QuestionOwner = ua.UserId) as MaxQuestionScore,
+        max(qa.AnswerScore) filter (where qa.AnswerOwnerUserId = ua.UserId) as MaxAnswerScore
+    from UserActivity ua
+    left join Badges pb on pb.UserId = ua.UserId
+    left join CombinedUserVotes cuv on cuv.OwnerUserId = ua.UserId
+    left join DuplicateQuestions dq on dq.PostId in (
+        select p.Id from Posts p where p.OwnerUserId = ua.UserId and p.PostTypeId = 1
+    )
+    left join Posts qaq on qaq.OwnerUserId = ua.UserId and qaq.PostTypeId = 1
+    left join Posts qaa on qaa.OwnerUserId = ua.UserId and qaa.PostTypeId = 2
+    left join QuestionAnswerDetails qa on (qa.QuestionOwner = ua.UserId or qa.AnswerOwnerUserId = ua.UserId)
+    group by ua.UserId, ua.DisplayName, ua.Reputation, ua.Location,
+        ua.QuestionCount, ua.AnswerCount, ua.AvgPostScore, ua.MaxPostScore,
+        coalesce(cuv.UpVotesOnPosts,0),
+        coalesce(cuv.DownVotesOnPosts,0),
+        coalesce(cuv.FavoriteVotesOnPosts,0)
+)
+select 
+    fs.UserId,
+    fs.DisplayName,
+    fs.Reputation,
+    fs.Location,
+    fs.QuestionCount,
+    fs.AnswerCount,
+    fs.AvgPostScore,
+    fs.MaxPostScore,
+    fs.UpVotesOnPosts,
+    fs.DownVotesOnPosts,
+    fs.FavoriteVotesOnPosts,
+    fs.MaxBadgeClass,
+    fs.TotalBadges,
+    fs.DuplicateQuestionCount,
+    fs.MaxQuestionScore,
+    fs.MaxAnswerScore,
+    case when fs.Reputation > 10000 then 'Top' when fs.Reputation > 1000 then 'Intermediate' else 'Newbie' end as UserLevel,
+    concat_ws(' | ',
+        concat('Q:', fs.QuestionCount),
+        concat('A:', fs.AnswerCount),
+        concat('Badges:', fs.TotalBadges),
+        concat('UpVotes:', fs.UpVotesOnPosts)
+    ) as KeyStats,
+    array_to_string(
+        array(
+            select distinct pt.Name
+            from Posts p2
+            join PostTypes pt on pt.Id = p2.PostTypeId
+            where p2.OwnerUserId = fs.UserId
+            order by pt.Name
+        ), ', ') as PostTypesUsed
+from FinalSelection fs
+where fs.QuestionCount > 5 or fs.AnswerCount > 10
+order by fs.Reputation desc, fs.TotalBadges desc
+limit 50;

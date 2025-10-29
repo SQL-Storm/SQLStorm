@@ -1,0 +1,119 @@
+WITH
+    user_stats AS (
+        SELECT
+            u.id                                   AS user_id,
+            u.displayname                          AS display_name,
+            u.reputation,
+            COUNT(p.id) FILTER (WHERE p.posttypeid = 1) AS question_cnt,
+            COUNT(p.id) FILTER (WHERE p.posttypeid = 2) AS answer_cnt,
+            SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS upvote_given,
+            SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) AS downvote_given,
+            MAX(p.creationdate)                   AS last_post_date
+        FROM users u
+        LEFT JOIN posts  p ON p.owneruserid = u.id
+        LEFT JOIN votes  v ON v.userid = u.id
+        GROUP BY u.id, u.displayname, u.reputation
+    ),
+    badge_rank AS (
+        SELECT
+            b.userid,
+            COUNT(*)                                     AS badge_cnt,
+            SUM(CASE b.class WHEN 1 THEN 3 WHEN 2 THEN 2 ELSE 1 END) AS badge_score,
+            ROW_NUMBER() OVER (PARTITION BY b.userid ORDER BY COUNT(*) DESC) AS rn
+        FROM badges b
+        GROUP BY b.userid
+    ),
+    tag_activity AS (
+        SELECT
+            t.tagname,
+            COUNT(p.id)                                   AS post_cnt,
+            COUNT(DISTINCT p.owneruserid)                AS author_cnt,
+            STRING_AGG(DISTINCT COALESCE(p.ownerdisplayname, ''), ', ' ORDER BY p.ownerdisplayname) 
+                                                          FILTER (WHERE p.ownerdisplayname IS NOT NULL) AS sample_authors
+        FROM tags t
+        JOIN posts p ON p.tags LIKE ('%' || '<' || t.tagname || '>' || '%')
+        WHERE p.posttypeid = 1
+        GROUP BY t.tagname
+        HAVING COUNT(p.id) > 100
+    ),
+    recent_closed AS (
+        SELECT
+            ph.postid,
+            ph.creationdate                              AS closed_date,
+            COALESCE(NULLIF(ph.comment, ''), 'unknown') AS close_reason,
+            p.title
+        FROM posthistory ph
+        JOIN posts p ON p.id = ph.postid
+        WHERE ph.posthistorytypeid = 10
+          AND ph.creationdate >= (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+    ),
+    active_users AS (
+        SELECT *
+        FROM user_stats
+        WHERE reputation > 5000
+          AND (question_cnt + answer_cnt) > 100
+    )
+
+SELECT
+    au.user_id,
+    au.display_name,
+    au.reputation,
+    au.question_cnt,
+    au.answer_cnt,
+    au.upvote_given,
+    au.downvote_given,
+    COALESCE(br.badge_cnt, 0)           AS badge_cnt,
+    COALESCE(br.badge_score, 0)        AS badge_score,
+    au.last_post_date,
+    tn.tagname,
+    tn.post_cnt,
+    tn.author_cnt,
+    tn.sample_authors,
+    rc.title           AS recent_closed_title,
+    rc.closed_date,
+    rc.close_reason
+FROM active_users au
+LEFT JOIN badge_rank br
+       ON br.userid = au.user_id AND br.rn = 1
+LEFT JOIN LATERAL (
+        SELECT ta.tagname, ta.post_cnt, ta.author_cnt, ta.sample_authors
+        FROM tag_activity ta
+        WHERE ta.tagname ILIKE ANY (ARRAY[
+                CASE WHEN au.reputation > 20000 THEN '%java%'   ELSE '%python%'   END,
+                CASE WHEN au.answer_cnt > 1000 THEN '%c#%'      ELSE '%javascript%' END
+            ])
+        ORDER BY ta.post_cnt DESC
+        LIMIT 1
+) tn ON TRUE
+LEFT JOIN recent_closed rc
+       ON rc.postid = au.user_id
+WHERE au.last_post_date IS NOT NULL
+ORDER BY au.reputation DESC, br.badge_score DESC NULLS LAST
+LIMIT 50
+
+EXCEPT
+
+SELECT *
+FROM (
+    SELECT
+        u.id,
+        u.displayname,
+        u.reputation,
+        0 AS question_cnt,
+        0 AS answer_cnt,
+        0 AS upvote_given,
+        0 AS downvote_given,
+        0 AS badge_cnt,
+        0 AS badge_score,
+        CAST(NULL AS timestamp) AS last_post_date,
+        CAST(NULL AS text) AS tagname,
+        CAST(NULL AS integer) AS post_cnt,
+        CAST(NULL AS integer) AS author_cnt,
+        CAST(NULL AS text) AS sample_authors,
+        CAST(NULL AS text) AS recent_closed_title,
+        CAST(NULL AS timestamp) AS closed_date,
+        CAST(NULL AS text) AS close_reason
+    FROM users u
+    LEFT JOIN posts p ON p.owneruserid = u.id
+    WHERE p.id IS NULL
+) x;

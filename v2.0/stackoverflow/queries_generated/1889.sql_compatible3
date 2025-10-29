@@ -1,0 +1,216 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        DATE_TRUNC('month', COALESCE(p.CreationDate, c.CreationDate, b.Date, v.CreationDate)) AS ActivityMonth,
+        COUNT(DISTINCT p.Id) AS PostsCount,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        SUM(COALESCE(p.Score, 0)) AS PostsScoreSum
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, DATE_TRUNC('month', COALESCE(p.CreationDate, c.CreationDate, b.Date, v.CreationDate))
+),
+UserMonthlyMetrics AS (
+    SELECT
+        ue.UserId,
+        ue.ActivityMonth,
+        ue.PostsCount,
+        ue.CommentsCount,
+        ue.UpvotesGiven,
+        ue.DownvotesGiven,
+        ue.BadgesEarned,
+        ue.PostsScoreSum,
+        (ue.PostsCount * 0.5 + ue.CommentsCount * 0.3 + ue.UpvotesGiven * 0.2 - ue.DownvotesGiven * 0.1 + ue.BadgesEarned * 1.0 + ue.PostsScoreSum * 0.1) AS MonthlyEngagementScore,
+        LAG((ue.PostsCount * 0.5 + ue.CommentsCount * 0.3 + ue.UpvotesGiven * 0.2 - ue.DownvotesGiven * 0.1 + ue.BadgesEarned * 1.0 + ue.PostsScoreSum * 0.1), 1, 0) OVER (PARTITION BY ue.UserId ORDER BY ue.ActivityMonth) AS PrevMonthEngagementScore
+    FROM UserEngagement ue
+    WHERE ue.ActivityMonth IS NOT NULL
+),
+UserPeakActivity AS (
+    SELECT
+        umm.UserId,
+        umm.ActivityMonth AS PeakActivityMonth,
+        umm.MonthlyEngagementScore AS PeakMonthlyEngagement,
+        (umm.MonthlyEngagementScore - umm.PrevMonthEngagementScore) AS EngagementGrowth
+    FROM UserMonthlyMetrics umm
+    WHERE umm.MonthlyEngagementScore = (
+        SELECT MAX(MonthlyEngagementScore) FROM UserMonthlyMetrics WHERE UserId = umm.UserId
+    )
+),
+QuestionContext AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.LastActivityDate AS QuestionLastActivityDate,
+        q.ViewCount,
+        q.Score AS QuestionScore,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.Title,
+        q.Tags,
+        q.Body AS QuestionBody,
+        (SELECT AVG(a.Score) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS AvgAnswerScore,
+        (SELECT MIN(a.CreationDate) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS FirstAnswerDate,
+        ph_closed.CreationDate AS ClosedDate,
+        ph_reopened.CreationDate AS ReopenedDate,
+        ph_closed.Comment AS CloseReasonComment,
+        (
+            SELECT COUNT(DISTINCT pl_dupe.RelatedPostId)
+            FROM PostLinks pl_dupe
+            JOIN PostHistory ph_dupe_check ON pl_dupe.RelatedPostId = ph_dupe_check.PostId
+            WHERE pl_dupe.PostId = q.Id
+              AND pl_dupe.LinkTypeId = 3
+              AND ph_dupe_check.PostHistoryTypeId = 10
+              AND ph_dupe_check.Comment LIKE '101%'
+        ) AS DuplicateLinkCount
+    FROM Posts q
+    LEFT JOIN PostHistory ph_closed ON q.Id = ph_closed.PostId AND ph_closed.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory ph_reopened ON q.Id = ph_reopened.PostId AND ph_reopened.PostHistoryTypeId = 11
+    WHERE q.PostTypeId = 1
+),
+InfluentialUsersWithQuestionMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        upa.PeakActivityMonth,
+        upa.PeakMonthlyEngagement,
+        upa.EngagementGrowth,
+        qc.QuestionId,
+        qc.Title AS QuestionTitle,
+        qc.Tags AS QuestionTags,
+        qc.QuestionBody,
+        qc.QuestionScore,
+        qc.ViewCount AS QuestionViewCount,
+        qc.AvgAnswerScore,
+        CASE WHEN qc.QuestionLastActivityDate IS NOT NULL AND qc.QuestionCreationDate IS NOT NULL
+             THEN EXTRACT(EPOCH FROM (qc.QuestionLastActivityDate - qc.QuestionCreationDate)) / 3600
+             ELSE NULL END AS QuestionActiveHours,
+        COALESCE(qc.DuplicateLinkCount, 0) AS UserDuplicateLinkCount,
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadgesCount,
+        (
+            SELECT MAX(ph_tag.CreationDate)
+            FROM PostHistory ph_tag
+            WHERE ph_tag.PostId = qc.QuestionId
+              AND ph_tag.PostHistoryTypeId IN (3, 6)
+              AND ph_tag.UserId = u.Id
+        ) AS LastTagEditDateByOwner
+    FROM Users u
+    JOIN UserPeakActivity upa ON u.Id = upa.UserId
+    LEFT JOIN QuestionContext qc ON u.Id = qc.OwnerUserId
+    WHERE
+        (
+            LOWER(COALESCE(qc.Title, '')) LIKE '%performance%'
+            OR LOWER(COALESCE(qc.QuestionBody, '')) LIKE '%optimization%'
+            OR LOWER(COALESCE(qc.Tags, '')) LIKE '%<sql>%'
+            OR LOWER(COALESCE(qc.Tags, '')) LIKE '%<database>%'
+            OR LOWER(COALESCE(qc.Tags, '')) LIKE '%<benchmark>%'
+        )
+        AND u.Reputation > 5000
+        AND upa.EngagementGrowth > 10
+        AND qc.QuestionScore > 5
+        AND qc.ViewCount > 1000
+)
+SELECT
+    iu.UserId,
+    iu.DisplayName,
+    iu.Reputation,
+    iu.UpVotes,
+    iu.DownVotes,
+    iu.PeakActivityMonth,
+    iu.PeakMonthlyEngagement,
+    iu.EngagementGrowth,
+    iu.GoldBadgesCount,
+    SUM(iu.QuestionScore) AS TotalQuestionScore,
+    SUM(iu.QuestionViewCount) AS TotalQuestionViews,
+    AVG(iu.AvgAnswerScore) AS AverageQuestionAnswerScore,
+    AVG(iu.QuestionActiveHours) AS AverageQuestionActiveHours,
+    SUM(iu.UserDuplicateLinkCount) AS TotalDuplicateLinksAsOwner,
+    MAX(iu.LastTagEditDateByOwner) AS LastOverallTagEditDate,
+    RANK() OVER (ORDER BY iu.Reputation DESC, iu.PeakMonthlyEngagement DESC, SUM(iu.QuestionScore) DESC) AS UserRankByInfluence,
+    NTILE(5) OVER (ORDER BY iu.Reputation DESC, iu.PeakMonthlyEngagement DESC) AS ReputationQuintile,
+    CASE
+        WHEN iu.Reputation > 100000 AND iu.GoldBadgesCount >= 5 THEN 'Legend'
+        WHEN iu.Reputation > 50000 AND iu.PeakMonthlyEngagement > 100 THEN 'Veteran Influencer'
+        WHEN iu.EngagementGrowth > 50 THEN 'Rising Star'
+        ELSE 'Active Contributor'
+    END AS UserCategory,
+    STRING_AGG(DISTINCT tag.cleaned_tag, ', ') AS KeyQuestionTagsSummary
+FROM InfluentialUsersWithQuestionMetrics iu
+LEFT JOIN LATERAL (
+    SELECT DISTINCT TRIM(SUBSTRING(tag FROM 2 FOR CHAR_LENGTH(tag) - 2)) AS cleaned_tag
+    FROM UNNEST(STRING_TO_ARRAY(REPLACE(REPLACE(REPLACE(iu.QuestionTags, '>', ''), '<', ','), ',,', ','), ',')) AS tag
+    WHERE tag IS NOT NULL AND CHAR_LENGTH(tag) > 0 AND CHAR_LENGTH(tag) < 30
+) tag ON iu.QuestionTags IS NOT NULL
+GROUP BY
+    iu.UserId,
+    iu.DisplayName,
+    iu.Reputation,
+    iu.UpVotes,
+    iu.DownVotes,
+    iu.PeakActivityMonth,
+    iu.PeakMonthlyEngagement,
+    iu.EngagementGrowth,
+    iu.GoldBadgesCount
+HAVING
+    COUNT(DISTINCT iu.QuestionId) >= 2
+    AND SUM(iu.UserDuplicateLinkCount) < 5
+
+UNION ALL
+
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    NULL AS PeakActivityMonth,
+    NULL AS PeakMonthlyEngagement,
+    NULL AS EngagementGrowth,
+    (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadgesCount,
+    0 AS TotalQuestionScore,
+    0 AS TotalQuestionViews,
+    AVG(a.Score) AS AverageAnswerScore,
+    AVG(CASE WHEN a.LastActivityDate IS NOT NULL AND a.CreationDate IS NOT NULL THEN EXTRACT(EPOCH FROM (a.LastActivityDate - a.CreationDate)) / 3600 ELSE NULL END) AS AverageAnswerActiveHours,
+    0 AS TotalDuplicateLinksAsOwner,
+    NULL AS LastOverallTagEditDate,
+    RANK() OVER (ORDER BY u.Reputation DESC, SUM(a.Score) DESC) AS UserRankByInfluence,
+    NTILE(5) OVER (ORDER BY u.Reputation DESC, SUM(a.Score) DESC) AS ReputationQuintile,
+    'Answer Specialist' AS UserCategory,
+    STRING_AGG(DISTINCT tag2.cleaned_tag, ', ') AS KeyQuestionTagsSummary
+FROM Users u
+JOIN Posts a ON u.Id = a.OwnerUserId
+JOIN Posts q ON a.ParentId = q.Id
+LEFT JOIN LATERAL (
+    SELECT DISTINCT TRIM(SUBSTRING(tag FROM 2 FOR CHAR_LENGTH(tag) - 2)) AS cleaned_tag
+    FROM UNNEST(STRING_TO_ARRAY(REPLACE(REPLACE(REPLACE(q.Tags, '>', ''), '<', ','), ',,', ','), ',')) AS tag
+    WHERE tag IS NOT NULL AND CHAR_LENGTH(tag) > 0 AND CHAR_LENGTH(tag) < 30
+) tag2 ON q.Tags IS NOT NULL
+WHERE
+    a.PostTypeId = 2
+    AND a.Score > 50
+    AND u.Reputation > 2000
+    AND (
+            LOWER(COALESCE(q.Title, '')) LIKE '%performance%'
+            OR LOWER(COALESCE(q.Body, '')) LIKE '%optimization%'
+            OR LOWER(COALESCE(q.Tags, '')) LIKE '%<sql>%'
+            OR LOWER(COALESCE(q.Tags, '')) LIKE '%<database>%'
+            OR LOWER(COALESCE(q.Tags, '')) LIKE '%<benchmark>%'
+        )
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes
+ORDER BY
+    UserRankByInfluence ASC,
+    Reputation DESC
+LIMIT 50;

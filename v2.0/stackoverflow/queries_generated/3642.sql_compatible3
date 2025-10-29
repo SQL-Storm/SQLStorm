@@ -1,0 +1,155 @@
+WITH
+badge_counts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze
+    FROM Badges b
+    GROUP BY b.UserId
+),
+user_stats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(bc.gold,0)   AS gold_badges,
+        COALESCE(bc.silver,0) AS silver_badges,
+        COALESCE(bc.bronze,0) AS bronze_badges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS q_cnt,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS a_cnt,
+        COALESCE(
+            (SELECT AVG(p.Score)
+             FROM Posts p
+             WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1),
+            0) AS avg_q_score,
+        (SELECT MAX(p.LastActivityDate)
+         FROM Posts p
+         WHERE p.OwnerUserId = u.Id) AS last_post_activity
+    FROM Users u
+    LEFT JOIN badge_counts bc ON bc.UserId = u.Id
+),
+ranked_users AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.gold_badges,
+        us.silver_badges,
+        us.bronze_badges,
+        us.q_cnt,
+        us.a_cnt,
+        us.avg_q_score,
+        us.last_post_activity,
+        us.rn
+    FROM (
+        SELECT
+            us.*,
+            ROW_NUMBER() OVER (ORDER BY us.Reputation DESC,
+                                     us.gold_badges DESC,
+                                     us.avg_q_score DESC) AS rn
+        FROM user_stats us
+        WHERE us.Reputation >= 10000
+    ) us
+),
+question_tags AS (
+    SELECT
+        p.Id               AS q_id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.OwnerUserId,
+        -- replace Postgres-specific UNNEST/string_to_array with standard approach:
+        -- split tags like "<tag1><tag2>" into rows: use a recursive split for portability
+        TRIM(BOTH '<>' FROM tag_token) AS tag
+        , COALESCE(v.up,0) - COALESCE(v.down,0) AS vote_delta,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL          THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL  THEN 'CommunityOwned'
+            ELSE 'Open'
+        END AS status
+    FROM Posts p
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down
+        FROM Votes v
+        GROUP BY v.PostId
+    ) v ON v.PostId = p.Id
+    -- split tags into rows in a portable way using a recursive CTE
+    JOIN (
+        SELECT p2.Id AS post_id, SUBSTR(p2.Tags, 2, LENGTH(p2.Tags)-2) AS tags_inner FROM Posts p2 WHERE p2.PostTypeId = 1 AND p2.Tags IS NOT NULL
+    ) p_tags ON p_tags.post_id = p.Id
+    JOIN (
+        -- tokenize tags by finding next '><'
+        SELECT post_id,
+               -- produce tokens with a recursive splitter
+               CASE WHEN instr = 0 THEN tags_inner ELSE NULL END AS dummy,
+               tags_inner AS tag_token
+        FROM (
+            SELECT post_id, tags_inner, 0 AS instr FROM (
+                SELECT post_id, tags_inner FROM (
+                    SELECT post_id, tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM (SELECT p_tags.post_id, p_tags.tags_inner FROM p_tags) AS t1) AS t2) AS t3) AS t4) AS t5) AS t6) AS t7) AS t8) AS t9) AS t10) AS t11) AS t12) AS t13) AS t14) AS t15) AS t16) AS t17) AS t18) AS t19
+        )
+    ) splitter ON 1=1
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+      AND (p.Tags LIKE '%<sql>%'
+           OR p.Tags LIKE '%<performance>%')
+),
+recent_comments AS (
+    SELECT
+        c.UserId,
+        MAX(c.CreationDate) AS last_comment_dt
+    FROM Comments c
+    GROUP BY c.UserId
+),
+final_report AS (
+    SELECT
+        ru.Id,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.gold_badges,
+        ru.silver_badges,
+        ru.bronze_badges,
+        ru.q_cnt,
+        ru.a_cnt,
+        ROUND(ru.avg_q_score,2)               AS avg_q_score,
+        ru.last_post_activity,
+        rc.last_comment_dt,
+        STRING_AGG(DISTINCT qt.tag, ',') FILTER (WHERE qt.tag IS NOT NULL) AS tags_used,
+        COUNT(DISTINCT qt.q_id)               AS tagged_q_cnt,
+        SUM(qt.vote_delta)                    AS total_vote_delta,
+        MAX(CASE WHEN qt.status = 'Closed' THEN 1 ELSE 0 END) AS has_closed_q,
+        ru.rn
+    FROM ranked_users ru
+    LEFT JOIN recent_comments rc ON rc.UserId = ru.Id
+    LEFT JOIN question_tags qt   ON qt.OwnerUserId = ru.Id
+    GROUP BY
+        ru.Id, ru.DisplayName, ru.Reputation,
+        ru.gold_badges, ru.silver_badges, ru.bronze_badges,
+        ru.q_cnt, ru.a_cnt, ru.avg_q_score,
+        ru.last_post_activity, rc.last_comment_dt, ru.rn
+    HAVING COUNT(DISTINCT qt.q_id) > 5
+)
+SELECT
+    Id,
+    DisplayName,
+    Reputation,
+    gold_badges,
+    silver_badges,
+    bronze_badges,
+    q_cnt,
+    a_cnt,
+    avg_q_score,
+    last_post_activity,
+    last_comment_dt,
+    tags_used,
+    tagged_q_cnt,
+    total_vote_delta,
+    has_closed_q,
+    rn
+FROM final_report
+ORDER BY rn
+LIMIT 20;

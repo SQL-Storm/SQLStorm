@@ -1,0 +1,172 @@
+WITH RECURSIVE RecursiveUserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, b.Class
+
+    UNION ALL
+
+    SELECT
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        CASE WHEN r.Class IS NULL THEN 3 ELSE (r.Class - 1) END AS Class,
+        r.BadgeCount::integer
+    FROM RecursiveUserBadgeCounts r
+    WHERE r.Class > 1
+),
+TopUsers AS (
+    SELECT UserId, DisplayName, Reputation, Class, BadgeCount
+    FROM (
+        SELECT
+            UserId, DisplayName, Reputation, Class, BadgeCount,
+            row_number() OVER (PARTITION BY UserId ORDER BY Class) AS rn
+        FROM RecursiveUserBadgeCounts
+    ) t
+    WHERE rn = 1
+),
+PostRanks AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        dense_rank() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+        row_number() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ASC) AS CreationOrderAsc,
+        row_number() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS CreationOrderDesc
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2) AND p.OwnerUserId IS NOT NULL
+),
+FilteredPosts AS (
+    SELECT
+        pr.Id,
+        pr.OwnerUserId,
+        pr.PostTypeId,
+        pr.Score,
+        pr.ViewCount,
+        pr.CreationDate,
+        u.DisplayName,
+        u.Reputation,
+        tb.Class AS BadgeClass,
+        tb.BadgeCount
+    FROM PostRanks pr
+    JOIN Users u ON pr.OwnerUserId = u.Id
+    LEFT JOIN TopUsers tb ON u.Id = tb.UserId AND tb.Class = 1
+    WHERE pr.ScoreRank <= 100
+),
+CommentsOnTopPosts AS (
+    SELECT
+        c.Id AS CommentId,
+        c.PostId,
+        c.UserId AS CommentUserId,
+        u.DisplayName AS CommentUserName,
+        c.Score AS CommentScore,
+        c.CreationDate AS CommentDate,
+        count(*) OVER (PARTITION BY c.PostId) AS CommentCountPerPost,
+        rank() OVER (PARTITION BY c.PostId ORDER BY c.Score DESC, c.CreationDate ASC) AS CommentRank
+    FROM Comments c
+    LEFT JOIN Users u ON c.UserId = u.Id
+    WHERE c.PostId IN (SELECT Id FROM FilteredPosts)
+),
+LinksSummary AS (
+    SELECT
+        l.PostId,
+        l.LinkTypeId,
+        COUNT(*) AS LinkCount
+    FROM PostLinks l
+    GROUP BY l.PostId, l.LinkTypeId
+),
+PostHistoryAggregates AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        COUNT(*) AS PhCount,
+        MAX(ph.CreationDate) AS LastEdit
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+    GROUP BY ph.PostId, ph.PostHistoryTypeId
+),
+QuestionAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        row_number() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+)
+SELECT
+    fp.Id AS PostId,
+    fp.PostTypeId,
+    fp.Title,
+    substr(fp.Title || ' - ' || coalesce(fp.DisplayName, 'Anonymous'), 1, 100) AS TitleSnippet,
+    fp.Score,
+    fp.ViewCount,
+    fp.Reputation AS OwnerReputation,
+    coalesce(fp.BadgeCount, 0) AS GoldBadges,
+    ca.QAnswerCounts,
+    pha.LastEdit,
+    coalesce(lsLinked.LinkedCount,0) AS LinkedCount,
+    coalesce(lsLinked.DuplicateCount,0) AS DuplicateCount,
+    ca.AnswerCount,
+    ca.TopAnswerId,
+    ca.TopAnswerScore,
+    ctp.CommentCountPerPost,
+    ctp.TopCommentUser,
+    ctp.TopCommentScore
+FROM FilteredPosts fp
+LEFT JOIN (
+    SELECT
+        a.qid AS qid,
+        COUNT(a.Id) AS AnswerCount,
+        MAX(a.Score) AS MaxAnswerScore,
+        MAX(CASE WHEN a.rn = 1 THEN a.Id END) AS TopAnswerId,
+        MAX(CASE WHEN a.rn = 1 THEN a.Score END) AS TopAnswerScore
+    FROM (
+        SELECT
+            q.Id AS qid,
+            a.Id,
+            a.Score,
+            a.CreationDate,
+            row_number() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS rn
+        FROM Posts q
+        LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+        WHERE q.PostTypeId = 1
+    ) a
+    GROUP BY a.qid
+) ca ON fp.Id = ca.qid
+LEFT JOIN (
+    SELECT
+        ph.PostId,
+        MAX(ph.LastEdit) AS LastEdit
+    FROM PostHistoryAggregates ph
+    GROUP BY ph.PostId
+) pha ON fp.Id = pha.PostId
+LEFT JOIN (
+    SELECT
+        l.PostId,
+        SUM(CASE WHEN l.LinkTypeId = 1 THEN l.LinkCount ELSE 0 END) AS LinkedCount,
+        SUM(CASE WHEN l.LinkTypeId = 3 THEN l.LinkCount ELSE 0 END) AS DuplicateCount
+    FROM LinksSummary l
+    GROUP BY l.PostId
+) lsLinked ON fp.Id = lsLinked.PostId
+LEFT JOIN (
+    SELECT
+        c.PostId,
+        MAX(c.CommentCountPerPost) AS CommentCountPerPost,
+        MAX(CASE WHEN c.CommentRank = 1 THEN c.CommentUserName END) AS TopCommentUser,
+        MAX(CASE WHEN c.CommentRank = 1 THEN c.CommentScore END) AS TopCommentScore
+    FROM CommentsOnTopPosts c
+    GROUP BY c.PostId
+) ctp ON fp.Id = ctp.PostId
+ORDER BY fp.Score DESC, fp.ViewCount DESC, fp.CreationDate DESC
+LIMIT 50;

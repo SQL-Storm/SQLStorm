@@ -1,0 +1,199 @@
+WITH RECURSIVE PostHierarchy AS (
+    SELECT 
+        p.Id as PostId,
+        p.ParentId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        0 as Level,
+        CAST(p.Id AS VARCHAR(1000)) AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ParentId IS NULL
+
+    UNION ALL
+
+    SELECT 
+        p.Id as PostId,
+        p.ParentId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        ph.Level + 1,
+        ph.Path || '->' || CAST(p.Id AS VARCHAR(1000)) AS Path
+    FROM Posts p
+    INNER JOIN PostHierarchy ph ON p.ParentId = ph.PostId
+    WHERE ph.Level < 5
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        AVG(p.Score) as AvgScore,
+        MAX(p.ViewCount) as MaxViews,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') as TagUsers
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE t.Count > 0
+    GROUP BY t.TagName, t.Count
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) as QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COALESCE(MAX(p.CreationDate), u.CreationDate) as LastActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.CreationDate
+),
+ComplexCalculations AS (
+    SELECT 
+        qa.PostId,
+        qa.QuestionTitle,
+        MAX(qa.AnswerScore) as MaxAnswerScore,
+        AVG(qa.AnswerScore) as AvgAnswerScore,
+        COUNT(*) as AnswerCount,
+        CASE 
+            WHEN COUNT(*) > 0 THEN 
+                (SELECT AVG(p.Score) FROM Posts p WHERE p.ParentId = qa.PostId AND p.PostTypeId = 2)
+            ELSE 0 
+        END as AvgAnswerScoreWithSubquery,
+        ROW_NUMBER() OVER (ORDER BY SUM(qa.AnswerScore) DESC) as RankByAnswers,
+        DENSE_RANK() OVER (ORDER BY AVG(qa.AnswerScore) DESC) as RankByAvgAnswerScore,
+        PERCENT_RANK() OVER (ORDER BY COUNT(*) ASC) as PercentileAnswerCount,
+        CASE 
+            WHEN (COUNT(*) * 100.0 / NULLIF((SELECT COUNT(*) FROM Posts WHERE ParentId = qa.PostId AND PostTypeId = 2), 0)) >= 95.0 THEN 'High Engagement'
+            WHEN (COUNT(*) * 100.0 / NULLIF((SELECT COUNT(*) FROM Posts WHERE ParentId = qa.PostId AND PostTypeId = 2), 0)) >= 75.0 THEN 'Medium Engagement'
+            ELSE 'Low Engagement'
+        END as EngagementLevel
+    FROM (
+        SELECT 
+            q.Id as PostId,
+            q.Title as QuestionTitle,
+            a.Score as AnswerScore
+        FROM Posts q
+        LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+        WHERE q.PostTypeId = 1
+    ) qa
+    GROUP BY qa.PostId, qa.QuestionTitle
+)
+SELECT DISTINCT
+    ph.PostId,
+    ph.Title as QuestionTitle,
+    ph.Tags,
+    ph.Score as QuestionScore,
+    ph.ViewCount,
+    ph.CreationDate,
+    u.DisplayName as OwnerName,
+    u.Reputation as OwnerReputation,
+    COALESCE(ph2.ReplyCount, 0) as ReplyCount,
+    COALESCE(ph2.AvgReplyScore, 0) as AvgReplyScore,
+    COALESCE(ts.TagCount, 0) as TagCount,
+    ts.AvgScore as TagAvgScore,
+    ts.TagUsers,
+    ua.QuestionCount as UserQuestions,
+    ua.AnswerCount as UserAnswers,
+    ua.TotalScore as UserTotalScore,
+    ua.BadgeCount as UserBadges,
+    cc.MaxAnswerScore,
+    cc.AvgAnswerScore,
+    cc.AnswerCount as TotalAnswers,
+    cc.AvgAnswerScoreWithSubquery,
+    cc.RankByAnswers,
+    cc.RankByAvgAnswerScore,
+    cc.PercentileAnswerCount,
+    cc.EngagementLevel,
+    (SELECT COUNT(*) FROM PostHistory ph2 WHERE ph2.PostId = ph.PostId AND ph2.PostHistoryTypeId = 10) as CloseCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ph.PostId AND v.VoteTypeId = 2) as UpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ph.PostId AND v.VoteTypeId = 3) as DownVotes,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM PostHistory ph2 WHERE ph2.PostId = ph.PostId AND ph2.PostHistoryTypeId = 10) > 0 THEN 'Closed'
+        WHEN (SELECT COUNT(*) FROM PostHistory ph2 WHERE ph2.PostId = ph.PostId AND ph2.PostHistoryTypeId = 11) > 0 THEN 'Reopened'
+        ELSE 'Active'
+    END as PostStatus,
+    CASE 
+        WHEN ph.Score > 0 AND ph.ViewCount > 100 THEN 'Popular'
+        WHEN ph.Score < 0 AND ph.ViewCount < 10 THEN 'Unpopular'
+        ELSE 'Neutral'
+    END as Popularity,
+    'Question-' || ph.PostId || '-by-' || COALESCE(u.DisplayName, '') || '-tags-' || COALESCE(ph.Tags, 'none') as QuestionIdentifier
+FROM PostHierarchy ph
+LEFT JOIN Users u ON ph.OwnerUserId = u.Id
+LEFT JOIN (
+    SELECT 
+        ParentId,
+        COUNT(*) as ReplyCount,
+        AVG(Score) as AvgReplyScore
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+) ph2 ON ph2.ParentId = ph.PostId
+LEFT JOIN TagStats ts ON ts.TagName IN (
+    SELECT TRIM(SUBSTRING(ph.Tags FROM pos + 1 FOR 
+        CASE WHEN pos2 = 0 THEN CHAR_LENGTH(ph.Tags) ELSE pos2 - pos - 1 END))
+    FROM (
+        SELECT 1 pos UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+    ) n
+    CROSS JOIN LATERAL (
+        SELECT (pos) AS p, pos, POSITION('>' IN SUBSTRING(ph.Tags FROM pos + 1)) AS pos2
+    ) calc
+    WHERE pos <= CHAR_LENGTH(ph.Tags)
+    AND SUBSTRING(ph.Tags FROM pos FOR 1) = '<'
+    AND calc.pos2 IS NOT NULL
+)
+LEFT JOIN UserActivity ua ON ua.UserId = ph.OwnerUserId
+LEFT JOIN ComplexCalculations cc ON cc.PostId = ph.PostId
+WHERE 
+    ph.Level < 3 
+    AND (
+        ph.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND Score IS NOT NULL)
+        OR ph.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE ViewCount IS NOT NULL)
+    )
+    AND (
+        ph.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+        OR ph.CreationDate IS NULL
+    )
+    AND (
+        SELECT COUNT(*) FROM Posts p1 
+        WHERE p1.ParentId = ph.PostId AND p1.PostTypeId = 2 AND p1.Score > 0
+    ) > 0
+    AND (
+        EXISTS (
+            SELECT 1 FROM Tags t WHERE t.TagName IN (
+                SELECT TRIM(SUBSTRING(ph.Tags FROM pos + 1 FOR 
+                    CASE WHEN pos2 = 0 THEN CHAR_LENGTH(ph.Tags) ELSE pos2 - pos - 1 END)) 
+                FROM (
+                    SELECT 1 pos UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+                ) n
+                CROSS JOIN LATERAL (
+                    SELECT POSITION('>' IN SUBSTRING(ph.Tags FROM pos + 1)) AS pos2
+                ) calc
+                WHERE pos <= CHAR_LENGTH(ph.Tags)
+                AND SUBSTRING(ph.Tags FROM pos FOR 1) = '<'
+                AND calc.pos2 IS NOT NULL
+            ) AND t.Count > 50
+        )
+        OR EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = ph.OwnerUserId AND b.Class = 1)
+    )
+ORDER BY 
+    ph.Score DESC,
+    ph.ViewCount DESC,
+    cc.AnswerCount DESC,
+    cc.MaxAnswerScore DESC
+LIMIT 5000 OFFSET 1000;

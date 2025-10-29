@@ -1,0 +1,74 @@
+-- {"query": "6899.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 496} 
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.DisplayName,
+        U.Reputation,
+        U.LastAccessDate,
+        ROW_NUMBER() OVER (ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.LastActivityDate >= P.CreationDate
+), 
+BadgeCounts AS (
+    SELECT 
+        B.UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Badges B
+    WHERE 
+        B.Class = 1 AND B.TagBased = FALSE
+    GROUP BY 
+        B.UserId
+), 
+CommentStats AS (
+    SELECT 
+        PCH.PostId,
+        COUNT(C.Id) AS CommentCount,
+        MAX(C.Score) AS MaxCommentScore
+    FROM 
+        PostHistory PCH
+    LEFT JOIN 
+        Comments C ON PCH.PostId = C.PostId
+    WHERE 
+        PCH.PostHistoryTypeId = 10
+    GROUP BY 
+        PCH.PostId
+)
+SELECT 
+    R.Id AS PostId,
+    R.Title,
+    R.Score,
+    R.ViewCount,
+    R.CreationDate,
+    R.LastActivityDate,
+    R.Rank,
+    U.DisplayName,
+    U.Reputation,
+    U.LastAccessDate,
+    B.BadgeCount,
+    CS.CommentCount,
+    COALESCE(CS.MaxCommentScore, 0) AS MaxCommentScore,
+    CASE 
+        WHEN R.Score > 100 THEN 'High'
+        WHEN R.ViewCount > 1000 THEN 'Popular'
+        ELSE 'Normal'
+    END AS PostStatus
+FROM 
+    RankedPosts R
+LEFT JOIN 
+    Users U ON R.OwnerUserId = U.Id
+LEFT JOIN 
+    BadgeCounts B ON R.OwnerUserId = B.UserId
+LEFT JOIN 
+    CommentStats CS ON R.Id = CS.PostId
+ORDER BY 
+    R.Rank;

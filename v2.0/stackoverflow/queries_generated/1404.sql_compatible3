@@ -1,0 +1,190 @@
+WITH UserActivityMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P_Owned.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P_Owned.PostTypeId = 1 THEN P_Owned.Id END) AS QuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P_Owned.PostTypeId = 2 THEN P_Owned.Id END) AS AnswersOwned,
+        SUM(COALESCE(P_Owned.Score, 0)) AS TotalPostScoreOwned,
+        COUNT(DISTINCT C_Owned.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadges
+    FROM Users U
+    LEFT JOIN Posts P_Owned ON U.Id = P_Owned.OwnerUserId
+    LEFT JOIN Comments C_Owned ON U.Id = C_Owned.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes
+),
+PostEngagementMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        P.ClosedDate,
+        GREATEST(
+            P.LastActivityDate,
+            P.LastEditDate,
+            (SELECT MAX(CreationDate) FROM Comments WHERE PostId = P.Id),
+            (SELECT MAX(CreationDate) FROM PostHistory WHERE PostId = P.Id)
+        ) AS TrueLastActivityDate,
+        COUNT(DISTINCT CASE WHEN V.VoteTypeId = 2 THEN V.Id END) AS ReceivedUpVotes,
+        COUNT(DISTINCT CASE WHEN V.VoteTypeId = 3 THEN V.Id END) AS ReceivedDownVotes,
+        COUNT(DISTINCT PH_Editor.UserId) AS UniqueEditors,
+        MAX(CASE WHEN PH_Closed.PostHistoryTypeId = 10 THEN PH_Closed.CreationDate END) AS ClosureDate,
+        MAX(CRT.Name) AS CloseReasonName,
+        CASE
+            WHEN P.ViewCount > (SELECT AVG(ViewCount) * 2 FROM Posts WHERE PostTypeId = P.PostTypeId AND ViewCount IS NOT NULL)
+                 AND P.Score > (SELECT AVG(Score) * 1.5 FROM Posts WHERE PostTypeId = P.PostTypeId AND Score IS NOT NULL)
+                 AND EXISTS (SELECT 1 FROM Comments WHERE PostId = P.Id AND CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'))
+            THEN 'Trending Hot'
+            WHEN P.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = P.PostTypeId AND ViewCount IS NOT NULL)
+                 AND P.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = P.PostTypeId AND Score IS NOT NULL)
+            THEN 'Popular'
+            ELSE 'Standard'
+        END AS PostPopularityStatus,
+        DENSE_RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC, P.CreationDate DESC) AS PostRankByScoreViews
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN PostHistory PH_Editor ON P.Id = PH_Editor.PostId AND PH_Editor.PostHistoryTypeId IN (4, 5, 6, 24)
+    LEFT JOIN PostHistory PH_Closed ON P.Id = PH_Closed.PostId AND PH_Closed.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes CRT ON CAST(PH_Closed.Comment AS SMALLINT) = CRT.Id
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount,
+        P.AnswerCount, P.CommentCount, P.FavoriteCount, P.Title, P.Tags, P.ParentId,
+        P.AcceptedAnswerId, P.ClosedDate, P.LastActivityDate, P.LastEditDate
+),
+AggregatedPostMetricsForUsers AS (
+    SELECT
+        PEM.OwnerUserId AS UserId,
+        AVG(PEM.PostScore) AS AvgOwnedPostScore,
+        SUM(PEM.ViewCount) AS TotalOwnedPostViews,
+        COUNT(CASE WHEN PEM.PostTypeId = 2 AND ParentPost.AcceptedAnswerId = PEM.PostId THEN 1 END) AS AcceptedAnswersByOwner,
+        COUNT(DISTINCT CASE WHEN PEM.PostTypeId = 1 AND PEM.AcceptedAnswerId IS NOT NULL THEN PEM.PostId END) AS QuestionsOwnedWithAcceptedAnswer,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (PEM.ClosureDate - PEM.PostCreationDate))/60) FILTER (WHERE PEM.ClosureDate IS NOT NULL) AS MedianTimeToCloseMinutes,
+        CAST(COUNT(CASE WHEN PEM.ClosedDate IS NOT NULL THEN 1 END) AS DECIMAL) / NULLIF(COUNT(CASE WHEN PEM.PostTypeId = 1 THEN 1 END), 0) AS PctClosedQuestions,
+        MAX(PEM.TrueLastActivityDate) AS LastOwnedPostActivity,
+        COUNT(DISTINCT CASE WHEN PEM.PostPopularityStatus = 'Trending Hot' THEN PEM.PostId END) AS HotPostsOwnedCount,
+        SUM(CASE WHEN PEM.PostTypeId = 1 THEN PEM.AnswerCount ELSE 0 END) AS TotalAnswersToOwnedQuestions
+    FROM PostEngagementMetrics PEM
+    LEFT JOIN Posts ParentPost ON PEM.PostTypeId = 2 AND PEM.ParentId = ParentPost.Id
+    WHERE PEM.OwnerUserId IS NOT NULL
+    GROUP BY PEM.OwnerUserId
+),
+TopUserTag AS (
+    SELECT
+        T.OwnerUserId AS UserId,
+        T.TagName,
+        T.QuestionsCount,
+        T.AverageTagScore,
+        ROW_NUMBER() OVER (PARTITION BY T.OwnerUserId ORDER BY T.QuestionsCount DESC, T.AverageTagScore DESC, T.TagName ASC) AS rn
+    FROM (
+        SELECT
+            PEM.OwnerUserId,
+            TRIM(unnested_tag) AS TagName,
+            COUNT(*) AS QuestionsCount,
+            AVG(PEM.PostScore) AS AverageTagScore
+        FROM PostEngagementMetrics PEM,
+             LATERAL (
+               SELECT UNNEST(string_to_array(SUBSTRING(PEM.Tags FROM 2 FOR (CHAR_LENGTH(PEM.Tags) - 2)), '><')) AS unnested_tag
+             ) AS tag_parse
+        WHERE PEM.PostTypeId = 1 AND PEM.OwnerUserId IS NOT NULL AND PEM.Tags IS NOT NULL AND CHAR_LENGTH(PEM.Tags) > 2
+        GROUP BY PEM.OwnerUserId, TRIM(unnested_tag)
+    ) T
+)
+SELECT
+    UAM.UserId,
+    UAM.DisplayName,
+    UAM.Reputation,
+    UAM.UserCreationDate,
+    UAM.LastAccessDate,
+    UAM.TotalPostsOwned,
+    UAM.QuestionsOwned,
+    UAM.AnswersOwned,
+    UAM.TotalPostScoreOwned,
+    UAM.TotalCommentsMade,
+    UAM.TotalBadges,
+    UAM.UserUpVotesGiven,
+    UAM.UserDownVotesGiven,
+    APM.AvgOwnedPostScore,
+    APM.TotalOwnedPostViews,
+    APM.AcceptedAnswersByOwner,
+    APM.QuestionsOwnedWithAcceptedAnswer,
+    APM.MedianTimeToCloseMinutes,
+    COALESCE(APM.PctClosedQuestions, 0) AS PctClosedQuestions,
+    APM.LastOwnedPostActivity,
+    APM.HotPostsOwnedCount,
+    APM.TotalAnswersToOwnedQuestions,
+    TUT.TagName AS TopAuthoredTag,
+    TUT.QuestionsCount AS TopAuthoredTagUsage,
+    TUT.AverageTagScore AS TopAuthoredTagAvgScore,
+    CAST(
+        (UAM.Reputation * 0.05) +
+        (UAM.TotalPostsOwned * 0.2) +
+        (UAM.TotalCommentsMade * 0.1) +
+        (UAM.TotalBadges * 0.5) +
+        (COALESCE(APM.AvgOwnedPostScore, 0) * 0.15) +
+        (COALESCE(APM.AcceptedAnswersByOwner, 0) * 2) +
+        (COALESCE(APM.QuestionsOwnedWithAcceptedAnswer, 0) * 3) +
+        (COALESCE(APM.TotalOwnedPostViews, 0) * 0.001) +
+        (COALESCE(APM.HotPostsOwnedCount, 0) * 10) -
+        (UAM.UserDownVotesGiven * 0.05) -
+        (COALESCE(APM.PctClosedQuestions, 0) * 20)
+    AS NUMERIC(18, 2)) AS UserInfluenceScore,
+    RANK() OVER (ORDER BY (
+        (UAM.Reputation * 0.05) + (UAM.TotalPostsOwned * 0.2) + (UAM.TotalCommentsMade * 0.1) +
+        (UAM.TotalBadges * 0.5) + (COALESCE(APM.AvgOwnedPostScore, 0) * 0.15) +
+        (COALESCE(APM.AcceptedAnswersByOwner, 0) * 2) +
+        (COALESCE(APM.QuestionsOwnedWithAcceptedAnswer, 0) * 3) +
+        (COALESCE(APM.TotalOwnedPostViews, 0) * 0.001) +
+        (COALESCE(APM.HotPostsOwnedCount, 0) * 10) -
+        (UAM.UserDownVotesGiven * 0.05) -
+        (COALESCE(APM.PctClosedQuestions, 0) * 20)
+    ) DESC) AS OverallUserRank,
+    CASE
+        WHEN UAM.Reputation >= 10000 AND UAM.QuestionsOwned > 50 AND UAM.AnswersOwned > 100 AND COALESCE(APM.AcceptedAnswersByOwner, 0) > 50 THEN 'Veteran Expert'
+        WHEN UAM.Reputation >= 5000 AND COALESCE(APM.PctClosedQuestions, 0) < 0.2 AND COALESCE(APM.HotPostsOwnedCount, 0) >= 1 THEN 'High-Impact Contributor'
+        WHEN UAM.TotalPostsOwned = 0 AND UAM.TotalCommentsMade > 100 AND UAM.UserCreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year') THEN 'Recent Commenter'
+        WHEN UAM.QuestionsOwned > 0 AND UAM.AnswersOwned = 0 AND UAM.TotalBadges = 0 THEN 'Questioner Only, Novice'
+        WHEN UAM.AnswersOwned > 0 AND COALESCE(APM.AcceptedAnswersByOwner, 0) = 0 AND UAM.TotalPostsOwned < 10 THEN 'Aspiring Answerer'
+        WHEN UAM.Reputation <= 100 AND UAM.TotalPostsOwned = 0 AND UAM.TotalCommentsMade = 0 THEN 'New & Inactive User'
+        ELSE 'General Participant'
+    END AS UserContributionProfile,
+    TRIM(BOTH '>' FROM SUBSTRING(REPLACE(REPLACE(COALESCE(UAM.DisplayName, 'N/A'), ' ', ''), '.', ''), 1, 10)) ||
+    TO_CHAR(UAM.UserCreationDate, 'YYYYMMDD') AS DisplayKey,
+    NULLIF(LOWER(U.Location), '') AS CleanedUserLocation,
+    (SELECT AVG(B.Class) FROM Badges B WHERE B.UserId = UAM.UserId) AS AverageBadgeClass,
+    CASE
+        WHEN UAM.QuestionsOwned > 0 AND COALESCE(APM.QuestionsOwnedWithAcceptedAnswer, 0) = 0
+             AND (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - UAM.LastAccessDate) < INTERVAL '90 days' THEN 'Unresolved Questioner'
+        WHEN UAM.QuestionsOwned > 0 AND COALESCE(APM.QuestionsOwnedWithAcceptedAnswer, 0) > 0
+             AND (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - UAM.LastAccessDate) < INTERVAL '90 days' THEN 'Resolved Questioner'
+        ELSE 'Unknown Questioner Status'
+    END AS QuestionAcceptanceStatus
+FROM UserActivityMetrics UAM
+LEFT JOIN Users U ON UAM.UserId = U.Id
+LEFT JOIN AggregatedPostMetricsForUsers APM ON UAM.UserId = APM.UserId
+LEFT JOIN TopUserTag TUT ON UAM.UserId = TUT.UserId AND TUT.rn = 1
+WHERE
+    UAM.Reputation >= 500
+    AND UAM.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    AND (
+        UAM.QuestionsOwned > 0 OR UAM.AnswersOwned > 0 OR UAM.TotalCommentsMade > 10
+    )
+    AND (U.WebsiteUrl IS NOT NULL OR U.AboutMe IS NOT NULL)
+    AND COALESCE(UAM.DisplayName, '') <> ''
+ORDER BY UserInfluenceScore DESC, UAM.Reputation DESC, UAM.LastAccessDate DESC
+LIMIT 100;

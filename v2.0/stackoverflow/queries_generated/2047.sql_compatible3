@@ -1,0 +1,190 @@
+WITH RECURSIVE RecursiveTagParents AS (
+    SELECT t.Id, t.TagName, ARRAY[t.TagName] AS AncestorPath
+    FROM Tags t
+    WHERE t.IsRequired = true
+    UNION ALL
+    SELECT t2.Id, t2.TagName, r.AncestorPath || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagParents r ON array_length(r.AncestorPath, 1) > 0 AND NOT t2.TagName = ANY(r.AncestorPath)
+    WHERE t2.IsRequired = true
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        count(DISTINCT b.Id) AS TotalBadges,
+        count(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        count(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        count(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        bool_or(CAST(b.TagBased AS boolean)) AS HasTagBasedBadges,
+        row_number() OVER (PARTITION BY u.Id ORDER BY b.Date DESC) AS rn
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Title,
+        p.Tags,
+        row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST) AS RankByScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '365 days'
+      AND p.Score IS NOT NULL
+),
+RecentCommentsPerUserPost AS (
+    SELECT
+        c.UserId,
+        c.PostId,
+        c.CreationDate,
+        c.Score,
+        row_number() OVER (PARTITION BY c.UserId, c.PostId ORDER BY c.CreationDate DESC) AS rn
+    FROM Comments c
+),
+UserActivityCTE AS (
+    SELECT
+        u.Id AS UserId,
+        max(CASE WHEN p.PostTypeId = 1 THEN p.CreationDate END) AS LastQuestionDate,
+        max(CASE WHEN p.PostTypeId = 2 THEN p.CreationDate END) AS LastAnswerDate,
+        max(c.CreationDate) AS LastCommentDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id
+),
+AnswerWithScoreRank AS (
+    SELECT
+        a.Id,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        rank() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST) AS ScoreRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+QuestionAnswerAgg AS (
+    SELECT
+        q.Id AS QuestionId,
+        count(a.Id) FILTER (WHERE a.Score >= 5) AS GoodAnswersCount,
+        count(a.Id) FILTER (WHERE a.Score < 0) AS BadAnswersCount,
+        max(a.Score) AS MaxAnswerScore,
+        min(a.Score) AS MinAnswerScore,
+        avg(a.Score) AS AvgAnswerScore
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+),
+DuplicateQuestions AS (
+    SELECT pl.PostId AS DuplicateId, pl.RelatedPostId AS OriginalId
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId AND lt.Name = 'Duplicate'
+),
+QuestionClosureReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        ph.CreationDate
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId AND pht.Name = 'Post Closed'
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer)
+    WHERE ph.PostId IN (SELECT Id FROM Posts WHERE PostTypeId = 1)
+),
+UserCommentStats AS (
+    SELECT
+        c.UserId,
+        count(c.Id) AS CommentsCount,
+        avg(length(c.Text)) AS AvgCommentLength,
+        count(DISTINCT c.PostId) AS DistinctCommentedPosts
+    FROM Comments c
+    GROUP BY c.UserId
+),
+ComplexUserSummary AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        coalesce(b.TotalBadges,0) AS BadgeCount,
+        coalesce(b.GoldBadges,0) AS GoldBadgeCount,
+        coalesce(b.SilverBadges,0) AS SilverBadgeCount,
+        coalesce(b.BronzeBadges,0) AS BronzeBadgeCount,
+        coalesce(s.CommentsCount,0) AS TotalComments,
+        coalesce(s.AvgCommentLength,0) AS AverageCommentLength,
+        coalesce(s.DistinctCommentedPosts,0) AS PostsCommented,
+        ua.LastQuestionDate,
+        ua.LastAnswerDate,
+        ua.LastCommentDate,
+        u.Reputation,
+        count(DISTINCT tq.Id) FILTER (WHERE tq.RankByScore = 1) AS TopScoringQuestions,
+        (SELECT count(*) FROM AnswerWithScoreRank awsr WHERE awsr.OwnerUserId = u.Id AND awsr.ScoreRank = 1) AS TopRankedAnswers
+    FROM Users u
+    LEFT JOIN UserBadgeStats b ON b.UserId = u.Id AND b.rn = 1
+    LEFT JOIN UserCommentStats s ON s.UserId = u.Id
+    LEFT JOIN UserActivityCTE ua ON ua.UserId = u.Id
+    LEFT JOIN TopQuestions tq ON tq.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, b.TotalBadges, b.GoldBadges, b.SilverBadges, b.BronzeBadges,
+             s.CommentsCount, s.AvgCommentLength, s.DistinctCommentedPosts,
+             ua.LastQuestionDate, ua.LastAnswerDate, ua.LastCommentDate, u.Reputation
+)
+SELECT DISTINCT
+    cus.Id AS UserId,
+    cus.DisplayName,
+    cus.Reputation,
+    cus.BadgeCount,
+    cus.GoldBadgeCount,
+    cus.SilverBadgeCount,
+    cus.BronzeBadgeCount,
+    cus.TotalComments,
+    cus.AverageCommentLength,
+    cus.PostsCommented,
+    coalesce(qa.GoodAnswersCount,0) AS GoodAnswersForTheirQuestions,
+    coalesce(qa.BadAnswersCount,0) AS BadAnswersForTheirQuestions,
+    coalesce(qa.MaxAnswerScore,0) AS MaxAnswerScoreOnTheirQuestions,
+    coalesce(qa.MinAnswerScore,0) AS MinAnswerScoreOnTheirQuestions,
+    coalesce(qa.AvgAnswerScore,0) AS AvgAnswerScoreOnTheirQuestions,
+    coalesce(
+        (SELECT count(*) FROM DuplicateQuestions dq JOIN Posts p ON p.Id = dq.DuplicateId WHERE p.OwnerUserId = cus.Id),
+        0
+    ) AS DuplicateQuestionsCount,
+    (SELECT count(1)
+       FROM QuestionClosureReasons qcr
+       JOIN Posts pq ON pq.Id = qcr.PostId AND pq.OwnerUserId = cus.Id
+       WHERE qcr.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '2 years'
+    ) AS ClosureCountLast2Years,
+    (SELECT length(ph.Text)
+     FROM PostHistory ph
+     WHERE ph.PostId = (SELECT min(pq.Id) FROM Posts pq WHERE pq.OwnerUserId = cus.Id AND pq.PostTypeId = 1)
+       AND ph.PostHistoryTypeId = 2
+     FETCH FIRST 1 ROW ONLY
+    ) AS InitialBodyLengthOfFirstQuestion,
+    (SELECT string_agg(p.Title, ' || ' ORDER BY p.Score DESC NULLS LAST)
+     FROM (
+       SELECT p.Title, p.Score
+       FROM Posts p
+       WHERE p.OwnerUserId = cus.Id AND p.PostTypeId = 1
+       ORDER BY p.Score DESC NULLS LAST
+       FETCH FIRST 5 ROWS ONLY
+     ) p
+    ) AS TopQuestionTitles,
+    (SELECT greatest(
+        coalesce(max(p.LastActivityDate), TIMESTAMP '1900-01-01'),
+        coalesce(max(c.CreationDate), TIMESTAMP '1900-01-01')
+    )
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.OwnerUserId = cus.Id
+    ) AS LastActivityDate,
+    rank() OVER (ORDER BY cus.Reputation DESC NULLS LAST, cus.BadgeCount DESC NULLS LAST) AS UserRankByRep,
+    percentile_cont(0.9) WITHIN GROUP (ORDER BY cus.Reputation) OVER () AS Rep90Percentile
+FROM ComplexUserSummary cus
+LEFT JOIN QuestionAnswerAgg qa ON qa.QuestionId = (
+    SELECT min(p.Id) FROM Posts p WHERE p.OwnerUserId = cus.Id AND p.PostTypeId = 1
+)
+WHERE cus.Reputation > 1000
+  AND (cus.BadgeCount >= 10 OR cus.TotalComments > 50)
+ORDER BY cus.Reputation DESC, cus.BadgeCount DESC
+LIMIT 100;

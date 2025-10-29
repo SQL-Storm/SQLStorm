@@ -1,0 +1,158 @@
+WITH PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        pt.Name AS PostTypeName,
+        u.DisplayName AS OwnerDisplayName,
+        COALESCE(u.Reputation, 0) AS OwnerReputation,
+        COUNT(c.Id) AS CommentCountForPost,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS PostRankByActivity,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PreviousPostScoreOfSameType,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS NextPostScoreOfSameType,
+        p.LastActivityDate,
+        p.ClosedDate
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId IN (1, 2)
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, pt.Name, u.DisplayName, u.Reputation, p.LastActivityDate, p.ClosedDate
+),
+UserContributionSummary AS (
+    SELECT
+        pe.OwnerUserId,
+        COUNT(DISTINCT pe.PostId) AS TotalPosts,
+        AVG(pe.PostScore) AS AvgPostScore,
+        SUM(pe.PostViewCount) AS TotalViews,
+        SUM(pe.UpVoteCount) AS TotalUpVotesReceived,
+        SUM(pe.DownVoteCount) AS TotalDownVotesReceived,
+        MAX(pe.OwnerReputation) AS MaxOwnerReputation,
+        -- Use standard STRING_AGG without PostgreSQL-only cast syntax; ensure ordering expression is included in the aggregate argument list for dialects that require it
+        STRING_AGG(DISTINCT pe.PostTypeName, ', ' ORDER BY pe.PostRankByActivity) AS PostTypesContributed
+    FROM PostEngagement pe
+    GROUP BY pe.OwnerUserId
+),
+PostHistoryAnalysis AS (
+    SELECT
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 1 THEN 1 END) AS InitialTitleCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 END) AS EditTitleCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS PostClosedCount,
+        MAX(ph.CreationDate) AS LastPostHistoryDate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+)
+SELECT
+    pe.PostId,
+    pe.PostTypeName,
+    pe.OwnerDisplayName,
+    pe.OwnerReputation,
+    pe.PostCreationDate,
+    pe.PostScore,
+    pe.PostViewCount,
+    pe.AnswerCount,
+    pe.CommentCount AS DirectCommentCount,
+    pe.FavoriteCount,
+    pe.UpVoteCount,
+    pe.DownVoteCount,
+    ucs.TotalPosts AS OwnerTotalPosts,
+    ucs.AvgPostScore AS OwnerAvgPostScore,
+    ucs.TotalViews AS OwnerTotalViews,
+    ucs.TotalUpVotesReceived AS OwnerTotalUpVotesReceived,
+    ucs.TotalDownVotesReceived AS OwnerTotalDownVotesReceived,
+    pha.InitialTitleCount,
+    pha.EditTitleCount,
+    pha.PostClosedCount,
+    pha.LastPostHistoryDate,
+    CASE
+        WHEN pe.PostScore > 50 THEN 'Highly Rated'
+        WHEN pe.PostScore BETWEEN 10 AND 50 THEN 'Moderately Rated'
+        ELSE 'Standard Rated'
+    END AS RatingCategory,
+    CASE
+        WHEN COALESCE(pha.PostClosedCount, 0) > 0 AND pe.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN pe.PostViewCount > 100000 THEN 'High Traffic'
+        ELSE 'Standard Traffic'
+    END AS TrafficAndStatus,
+    pe.PreviousPostScoreOfSameType,
+    pe.NextPostScoreOfSameType,
+    (pe.PostScore * 1.0 / NULLIF(pe.PostViewCount, 0)) * 1000 AS ScorePerKViews,
+    CASE
+        WHEN LOWER(pe.OwnerDisplayName) LIKE '%admin%' OR LOWER(pe.OwnerDisplayName) LIKE '%moderator%' THEN 'Potential Moderator'
+        WHEN ucs.TotalPosts > 5000 THEN 'Power User'
+        ELSE 'Regular User'
+    END AS UserTier,
+    COALESCE(pha.LastPostHistoryDate, pe.PostCreationDate) AS LastRelevantActivityDate,
+    ROW_NUMBER() OVER (ORDER BY pe.PostScore DESC, pe.PostViewCount DESC) AS GlobalRank
+FROM PostEngagement pe
+JOIN UserContributionSummary ucs ON pe.OwnerUserId = ucs.OwnerUserId
+LEFT JOIN PostHistoryAnalysis pha ON pe.PostId = pha.PostId
+WHERE
+    pe.PostTypeName = 'Question'
+    AND pe.OwnerReputation > 1000
+    AND pe.PostCreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+    AND (pha.PostClosedCount IS NULL OR pha.PostClosedCount = 0)
+UNION
+SELECT
+    pe.PostId,
+    pe.PostTypeName,
+    pe.OwnerDisplayName,
+    pe.OwnerReputation,
+    pe.PostCreationDate,
+    pe.PostScore,
+    pe.PostViewCount,
+    pe.AnswerCount,
+    pe.CommentCount AS DirectCommentCount,
+    pe.FavoriteCount,
+    pe.UpVoteCount,
+    pe.DownVoteCount,
+    ucs.TotalPosts AS OwnerTotalPosts,
+    ucs.AvgPostScore AS OwnerAvgPostScore,
+    ucs.TotalViews AS OwnerTotalViews,
+    ucs.TotalUpVotesReceived AS OwnerTotalUpVotesReceived,
+    ucs.TotalDownVotesReceived AS OwnerTotalDownVotesReceived,
+    pha.InitialTitleCount,
+    pha.EditTitleCount,
+    pha.PostClosedCount,
+    pha.LastPostHistoryDate,
+    CASE
+        WHEN pe.PostScore > 50 THEN 'Highly Rated'
+        WHEN pe.PostScore BETWEEN 10 AND 50 THEN 'Moderately Rated'
+        ELSE 'Standard Rated'
+    END AS RatingCategory,
+    CASE
+        WHEN COALESCE(pha.PostClosedCount, 0) > 0 AND pe.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN pe.PostViewCount > 100000 THEN 'High Traffic'
+        ELSE 'Standard Traffic'
+    END AS TrafficAndStatus,
+    pe.PreviousPostScoreOfSameType,
+    pe.NextPostScoreOfSameType,
+    (pe.PostScore * 1.0 / NULLIF(pe.PostViewCount, 0)) * 1000 AS ScorePerKViews,
+    CASE
+        WHEN LOWER(pe.OwnerDisplayName) LIKE '%admin%' OR LOWER(pe.OwnerDisplayName) LIKE '%moderator%' THEN 'Potential Moderator'
+        WHEN ucs.TotalPosts > 5000 THEN 'Power User'
+        ELSE 'Regular User'
+    END AS UserTier,
+    COALESCE(pha.LastPostHistoryDate, pe.PostCreationDate) AS LastRelevantActivityDate,
+    ROW_NUMBER() OVER (ORDER BY pe.PostScore DESC, pe.PostViewCount DESC) AS GlobalRank
+FROM PostEngagement pe
+JOIN UserContributionSummary ucs ON pe.OwnerUserId = ucs.OwnerUserId
+LEFT JOIN PostHistoryAnalysis pha ON pe.PostId = pha.PostId
+WHERE
+    pe.PostTypeName = 'Answer'
+    AND pe.OwnerReputation > 500
+    AND pe.PostCreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+    AND pe.PostScore > 0
+ORDER BY GlobalRank
+LIMIT 1000;

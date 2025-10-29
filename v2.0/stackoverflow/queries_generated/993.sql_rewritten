@@ -1,0 +1,312 @@
+-- {"query": "993.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2976} 
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.location,
+         u.creationdate,
+         u.upvotes,
+         u.downvotes,
+         coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl
+  from users u
+  where u.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from users)
+),
+question_posts as (
+  select p.id,
+         p.owneruserid as user_id,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.commentcount,
+         p.favoritecount,
+         p.closeddate,
+         p.title,
+         p.tags,
+         p.acceptedanswerid
+  from posts p
+  where p.posttypeid = 1
+),
+answer_posts as (
+  select p.id,
+         p.parentid as question_id,
+         p.owneruserid as user_id,
+         p.creationdate,
+         p.score as answer_score
+  from posts p
+  where p.posttypeid = 2
+),
+user_activity as (
+  select ru.user_id,
+         count(q.id) filter (where q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as questions_last_year,
+         count(a.id) filter (where a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as answers_last_year,
+         avg(nullif(q.score,0)) filter (where q.score is not null) as avg_q_score,
+         avg(nullif(a.answer_score,0)) filter (where a.answer_score is not null) as avg_a_score,
+         sum(q.viewcount) as total_q_views,
+         sum(q.favoritecount) as total_q_favs,
+         max(q.creationdate) as last_question_date,
+         max(a.creationdate) as last_answer_date
+  from recent_users ru
+  left join question_posts q on q.user_id = ru.user_id
+  left join answer_posts a on a.user_id = ru.user_id
+  group by ru.user_id
+),
+badges_ranked as (
+  select b.userid as user_id,
+         b.name as badge_name,
+         b.class as badge_class,
+         b.date as badge_date,
+         row_number() over (partition by b.userid order by b.class asc, b.date desc, b.name) as rn
+  from badges b
+),
+latest_badges as (
+  select br.user_id,
+         string_agg(br.badge_name || ':' || br.badge_class::text, ', ' order by br.rn) as top_badges
+  from badges_ranked br
+  where br.rn <= 5
+  group by br.user_id
+),
+post_links_dupes as (
+  select pl.postid as dup_post_id,
+         pl.relatedpostid as canonical_post_id,
+         pl.creationdate as dupe_mark_date
+  from postlinks pl
+  where pl.linktypeid = 3
+),
+closed_reasons as (
+  select ph.postid,
+         max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_closed_date,
+         max(case when ph.posthistorytypeid = 10 then ph.comment end) as last_close_reason_id
+  from posthistory ph
+  group by ph.postid
+),
+votes_agg as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+         sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+         sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+         min(v.creationdate) as first_vote_date,
+         max(v.creationdate) as last_vote_date
+  from votes v
+  group by v.postid
+),
+tag_explode as (
+  select q.id as post_id,
+         unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tag
+  from question_posts q
+  where q.tags is not null and q.tags like '<%>'
+),
+top_tags as (
+  select te.tag,
+         count(*) as tag_count,
+         percentile_cont(0.5) within group (order by q.score) as median_score
+  from tag_explode te
+  join question_posts q on q.id = te.post_id
+  group by te.tag
+  having count(*) >= 10
+),
+user_top_tag as (
+  select te_post.owneruserid as user_id,
+         te.tag,
+         count(*) as uses,
+         row_number() over (partition by te_post.owneruserid order by count(*) desc, te.tag) as rn
+  from tag_explode te
+  join posts te_post on te_post.id = te.post_id
+  group by te_post.owneruserid, te.tag
+),
+accepted_answer_latency as (
+  select q.id as question_id,
+         q.creationdate as question_created,
+         a.id as accepted_answer_id,
+         a.creationdate as accepted_created,
+         extract(epoch from (a.creationdate - q.creationdate)) / 3600.0 as hours_to_accept
+  from question_posts q
+  join posts a on a.id = q.acceptedanswerid
+),
+comments_agg as (
+  select c.postid,
+         count(*) as comment_count,
+         avg(c.score) as avg_comment_score,
+         max(c.creationdate) as last_comment_date,
+         sum(case when c.userdisplayname ilike '%bot%' then 1 else 0 end) as botish_comments
+  from comments c
+  group by c.postid
+),
+questions_scored as (
+  select q.id,
+         q.user_id,
+         q.creationdate,
+         q.score,
+         q.viewcount,
+         q.answercount,
+         q.commentcount,
+         q.favoritecount,
+         q.closeddate,
+         q.title,
+         q.tags,
+         v.upvotes,
+         v.downvotes,
+         v.favorites as votes_favorites,
+         coalesce(v.first_vote_date, q.creationdate) as first_vote_date,
+         v.last_vote_date,
+         coalesce(cr.last_closed_date, q.closeddate) as last_closed_date,
+         cr.last_close_reason_id,
+         d.dupe_mark_date,
+         aa.hours_to_accept,
+         ca.comment_count as total_comments,
+         ca.avg_comment_score,
+         ca.last_comment_date,
+         coalesce(ca.botish_comments,0) as botish_comments
+  from question_posts q
+  left join votes_agg v on v.postid = q.id
+  left join closed_reasons cr on cr.postid = q.id
+  left join post_links_dupes d on d.dup_post_id = q.id
+  left join accepted_answer_latency aa on aa.question_id = q.id
+  left join comments_agg ca on ca.postid = q.id
+),
+ranked_questions as (
+  select qs.*,
+         dense_rank() over (order by coalesce(qs.viewcount,0) desc, coalesce(qs.score, -9999) desc, coalesce(qs.answercount,0) desc) as popularity_rank,
+         avg(coalesce(qs.score,0)) over (partition by date_trunc('month', qs.creationdate)) as monthly_avg_score,
+         sum(coalesce(qs.viewcount,0)) over (partition by date_trunc('month', qs.creationdate) order by qs.creationdate rows between unbounded preceding and current row) as cum_month_views
+  from questions_scored qs
+),
+user_quality as (
+  select ua.user_id,
+         coalesce(ua.avg_q_score, 0) as avg_q_score,
+         coalesce(ua.avg_a_score, 0) as avg_a_score,
+         coalesce(ua.total_q_views, 0) as total_q_views,
+         coalesce(lb.top_badges, '(none)') as top_badges,
+         greatest(coalesce(ua.last_question_date, timestamp 'epoch'), coalesce(ua.last_answer_date, timestamp 'epoch')) as last_activity
+  from user_activity ua
+  left join latest_badges lb on lb.user_id = ua.user_id
+),
+eligible_questions as (
+  select rq.*
+  from ranked_questions rq
+  where rq.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    and (rq.closeddate is null or rq.last_closed_date is null or rq.last_close_reason_id not in ('101','102','103','104','105'))
+    and (rq.dupe_mark_date is null or rq.score >= 0)
+),
+q_enriched as (
+  select eq.*,
+         ut.tag as user_top_tag,
+         tt.tag_count as tag_popularity,
+         tt.median_score as tag_median_score
+  from eligible_questions eq
+  left join user_top_tag utt on utt.user_id = eq.user_id and utt.rn = 1
+  left join top_tags tt on tt.tag = utt.tag
+),
+scoring as (
+  select qe.*,
+         -- composite score with various weights and NULL handling
+         (
+           coalesce(qe.score, 0) * 2.5
+           + ln(1 + coalesce(qe.viewcount,0)) * 1.5
+           + coalesce(qe.answercount,0) * 1.2
+           + coalesce(qe.votes_favorites,0) * 1.0
+           - greatest(coalesce(qe.downvotes,0) - coalesce(qe.upvotes,0), 0) * 0.8
+           - case when qe.botish_comments > 0 then 2 else 0 end
+           + case when qe.hours_to_accept between 0 and 72 then 1.5 when qe.hours_to_accept is null then 0.5 else -0.5 end
+           + coalesce(qe.tag_median_score,0) * 0.2
+         ) as composite_score
+  from q_enriched qe
+),
+user_joined as (
+  select s.*,
+         ru.displayname,
+         ru.reputation,
+         ru.location,
+         ru.creationdate as user_created,
+         ru.websiteurl,
+         uq.avg_q_score as user_avg_q_score,
+         uq.avg_a_score as user_avg_a_score,
+         uq.total_q_views as user_total_q_views,
+         uq.top_badges,
+         uq.last_activity
+  from scoring s
+  left join recent_users ru on ru.user_id = s.user_id
+  left join user_quality uq on uq.user_id = s.user_id
+),
+filtered as (
+  select uj.*,
+         case
+           when uj.title is null or btrim(uj.title) = '' then '(untitled)'
+           else uj.title
+         end as safe_title,
+         case
+           when uj.tags is null then '{}'
+           else uj.tags
+         end as safe_tags
+  from user_joined uj
+  where coalesce(uj.reputation, 0) >= 100
+    and (uj.user_avg_q_score is null or uj.user_avg_q_score >= -5)
+    and (uj.location is null or uj.location !~* '(spam|test|dummy)')
+    and uj.popularity_rank <= 10000
+),
+ranked_final as (
+  select f.*,
+         ntile(10) over (order by composite_score desc nulls last) as decile,
+         row_number() over (partition by f.user_id order by composite_score desc, f.viewcount desc, f.creationdate desc) as rn_user_best,
+         row_number() over (order by composite_score desc, f.viewcount desc, f.creationdate desc) as rn_global
+  from filtered f
+)
+select
+  rf.id as question_id,
+  rf.safe_title,
+  rf.user_id,
+  coalesce(rf.displayname, '(anonymous)') as user_displayname,
+  rf.reputation,
+  rf.location,
+  rf.user_created,
+  rf.top_badges,
+  rf.user_avg_q_score,
+  rf.user_avg_a_score,
+  rf.user_total_q_views,
+  rf.creationdate as question_created,
+  rf.score as question_score,
+  rf.viewcount,
+  rf.answercount,
+  rf.total_comments,
+  rf.votes_favorites as favorites_votes,
+  rf.upvotes,
+  rf.downvotes,
+  rf.hours_to_accept,
+  rf.user_top_tag,
+  rf.tag_popularity,
+  rf.tag_median_score,
+  rf.monthly_avg_score,
+  rf.cum_month_views,
+  rf.popularity_rank,
+  rf.decile,
+  rf.rn_user_best,
+  rf.rn_global,
+  -- Derived health flags
+  (rf.closeddate is not null) as is_closed,
+  (rf.dupe_mark_date is not null) as is_marked_duplicate,
+  (rf.last_activity >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as user_active_recently,
+  -- String munging example
+  upper(left(coalesce(rf.websiteurl, 'N/A'), 20)) as website_snippet,
+  -- Complex predicate-driven label
+  case
+    when rf.composite_score >= (select percentile_cont(0.9) within group (order by composite_score) from ranked_final) then 'top-10%'
+    when rf.composite_score >= (select percentile_cont(0.75) within group (order by composite_score) from ranked_final) then 'top-25%'
+    when rf.composite_score is null then 'unscored'
+    else 'long-tail'
+  end as cohort_label
+from ranked_final rf
+where rf.rn_user_best <= 3
+  and (
+    rf.user_top_tag is null
+    or exists (
+      select 1
+      from tags t
+      where t.tagname = rf.user_top_tag
+        and t.count >= 100
+        and coalesce(t.ismoderatoronly, 0) = 0
+    )
+  )
+order by rf.decile, rf.rn_global
+limit 500;

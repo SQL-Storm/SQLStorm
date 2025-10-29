@@ -1,0 +1,170 @@
+WITH UserContributionSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViews,
+        SUM(COALESCE(P.FavoriteCount, 0)) AS TotalFavoritesReceived,
+        COUNT(DISTINCT PH_Edit.Id) AS TotalEditsMadeByThisUser,
+        COUNT(DISTINCT CASE WHEN PH_Close.PostHistoryTypeId = 10 THEN PH_Close.PostId END) AS PostsClosedByThisUser,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        MAX(C.CreationDate) AS LastCommentActivity
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN PostHistory PH_Edit ON U.Id = PH_Edit.UserId AND PH_Edit.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN PostHistory PH_Close ON U.Id = PH_Close.UserId AND PH_Close.PostHistoryTypeId = 10
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostVersionComplexity AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        COALESCE(P.AnswerCount, 0) AS AnswerCount,
+        COALESCE(P.CommentCount, 0) AS CommentCount,
+        (SELECT COUNT(DISTINCT PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS NumEditsOnPost,
+        (SELECT COUNT(DISTINCT COMM.Id) FROM Comments COMM WHERE COMM.PostId = P.Id) AS NumCommentsOnPost,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 'CommunityWiki'
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 'AcceptedAnswer'
+            ELSE 'Open'
+        END AS PostStatus,
+        COALESCE(
+            (SELECT AVG(LENGTH(TRIM(unnested_tag)))
+             FROM (
+                 SELECT UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')) AS unnested_tag
+             ) AS tag_list
+             WHERE unnested_tag IS NOT NULL AND LENGTH(TRIM(unnested_tag)) > 0
+            ), 0.0
+        ) AS AvgTagLength,
+        CASE
+            WHEN P.Tags LIKE '%<performance>%' OR P.Tags LIKE '%<optimization>%' THEN TRUE
+            ELSE FALSE
+        END AS HasPerformanceTag,
+        EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.PostId = P.Id AND PL.LinkTypeId = 3) AS IsDuplicateSource
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2, 4, 5)
+),
+BadgeMilestones AS (
+    SELECT
+        B.UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesCount,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesCount,
+        SUM(CASE WHEN B.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadgesCount
+    FROM Badges B
+    GROUP BY B.UserId
+),
+TopQuestionTags AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        unnested_tag AS TagName,
+        COUNT(P.Id) AS TagUsageCount,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY COUNT(P.Id) DESC, unnested_tag ASC) AS Rn
+    FROM Posts P,
+         UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')) AS unnested_tag
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(TRIM(unnested_tag)) > 0
+    GROUP BY P.OwnerUserId, unnested_tag
+)
+SELECT
+    UCS.UserId,
+    UCS.DisplayName,
+    UCS.Reputation,
+    UCS.TotalPosts,
+    UCS.TotalQuestions,
+    UCS.TotalAnswers,
+    UCS.TotalPostScore,
+    UCS.TotalFavoritesReceived,
+    UCS.TotalEditsMadeByThisUser,
+    BM.GoldBadgesCount,
+    BM.SilverBadgesCount,
+    BM.BronzeBadgesCount,
+    BM.TagBasedBadgesCount,
+    SUM(CASE WHEN PDS.PostTypeId = 1 AND PDS.HasPerformanceTag THEN 1 ELSE 0 END) AS QuestionsWithPerformanceTag,
+    SUM(CASE WHEN PDS.PostTypeId = 2 AND PDS.HasPerformanceTag THEN 1 ELSE 0 END) AS AnswersWithPerformanceTag,
+    AVG(PDS.NumEditsOnPost) AS AvgEditsPerPost,
+    AVG(PDS.NumCommentsOnPost) AS AvgCommentsPerPost,
+    MAX(PDS.PostScore) AS MaxPostScore,
+    COALESCE(
+        (UCS.TotalPostScore * 0.5) +
+        (UCS.Reputation * 0.01) +
+        (BM.GoldBadgesCount * 100) +
+        (UCS.TotalEditsMadeByThisUser * 5) +
+        (SUM(PDS.FavoriteCount) * 0.2)
+    , 0.0) AS UserContributionScore,
+    RANK() OVER (ORDER BY COALESCE(
+        (UCS.TotalPostScore * 0.5) +
+        (UCS.Reputation * 0.01) +
+        (BM.GoldBadgesCount * 100) +
+        (UCS.TotalEditsMadeByThisUser * 5) +
+        (SUM(PDS.FavoriteCount) * 0.2)
+    , 0.0) DESC) AS ContributionRank,
+    AVG(UCS.Reputation) OVER (PARTITION BY FLOOR(UCS.TotalQuestions / 100) * 100) AS AvgReputationForQuestionRange,
+    (
+        SELECT COALESCE(MAX(P_Ans.Score), 0)
+        FROM Posts P_Ans
+        INNER JOIN Posts P_Ques ON P_Ans.ParentId = P_Ques.Id
+        WHERE P_Ans.OwnerUserId = UCS.UserId
+          AND P_Ans.PostTypeId = 2
+          AND P_Ques.PostTypeId = 1
+          AND P_Ques.Tags LIKE '%<sql>%'
+    ) AS HighestSqlAnswerScore,
+    TQT.TagName AS MostFrequentQuestionTag,
+    TQT.TagUsageCount AS MostFrequentQuestionTagUsage,
+    (SELECT COUNT(PDS_Inner.PostId)
+     FROM PostVersionComplexity PDS_Inner
+     WHERE PDS_Inner.OwnerUserId = UCS.UserId
+       AND PDS_Inner.NumEditsOnPost > 1
+       AND PDS_Inner.PostStatus = 'Open'
+    ) AS PostsWithMultipleEditsAndOpen,
+    UPPER(LEFT(UCS.DisplayName, 1)) || SUBSTRING(UCS.DisplayName FROM 2) ||
+    COALESCE(' (' ||
+        CASE
+            WHEN UCS.Reputation > 100000 THEN 'Legend'
+            WHEN UCS.Reputation > 50000 THEN 'Veteran'
+            WHEN UCS.Reputation > 10000 THEN 'Expert'
+            ELSE 'Contributor'
+        END
+    || ')', '') AS FormattedDisplayNameAndStatus,
+    ABS(EXTRACT(day FROM (TIMESTAMP '2024-10-01 12:34:56' - GREATEST(UCS.LastAccessDate, COALESCE(UCS.LastPostActivity, UCS.LastAccessDate), COALESCE(UCS.LastCommentActivity, UCS.LastAccessDate))))) AS DaysSinceLastActivity,
+    EXTRACT(day FROM (TIMESTAMP '2024-10-01 12:34:56' - UCS.UserCreationDate)) AS DaysSinceCreation,
+    COALESCE(U.AboutMe, 'No "About Me" provided') AS AboutMeSnippet
+FROM UserContributionSummary UCS
+LEFT JOIN BadgeMilestones BM ON UCS.UserId = BM.UserId
+LEFT JOIN PostVersionComplexity PDS ON UCS.UserId = PDS.OwnerUserId
+LEFT JOIN TopQuestionTags TQT ON UCS.UserId = TQT.UserId AND TQT.Rn = 1
+LEFT JOIN Users U ON UCS.UserId = U.Id
+WHERE
+    UCS.Reputation > 5000
+    AND UCS.TotalPosts > 10
+    AND (UCS.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months') OR UCS.LastPostActivity > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months'))
+    AND (COALESCE(BM.GoldBadgesCount,0) >= 1 OR COALESCE(BM.SilverBadgesCount,0) >= 5 OR COALESCE(BM.TagBasedBadgesCount,0) >= 10)
+    AND (PDS.HasPerformanceTag IS NULL OR PDS.HasPerformanceTag = TRUE)
+GROUP BY
+    UCS.UserId, UCS.DisplayName, UCS.Reputation, UCS.UserCreationDate, UCS.LastAccessDate,
+    UCS.TotalPosts, UCS.TotalQuestions, UCS.TotalAnswers, UCS.TotalPostScore,
+    UCS.TotalFavoritesReceived, UCS.TotalEditsMadeByThisUser,
+    BM.GoldBadgesCount, BM.SilverBadgesCount, BM.BronzeBadgesCount, BM.TagBasedBadgesCount,
+    TQT.TagName, TQT.TagUsageCount, U.AboutMe
+HAVING
+    COUNT(CASE WHEN PDS.IsDuplicateSource = TRUE THEN PDS.PostId END) < 5
+    AND SUM(COALESCE(PDS.PostScore,0)) > 50
+ORDER BY
+    UserContributionScore DESC, UCS.Reputation DESC
+LIMIT 100;

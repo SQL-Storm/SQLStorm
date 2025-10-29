@@ -1,0 +1,208 @@
+with
+RecursiveRecentActivity as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Title,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    u.DisplayName as OwnerName,
+    row_number() over (partition by p.PostTypeId order by p.CreationDate desc) as RecentRank
+  from Posts p
+  left join Users u on p.OwnerUserId = u.Id
+  where p.PostTypeId in (1, 2)
+),
+UserBadgeCounts as (
+  select
+    b.UserId,
+    sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+    sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+    sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+  from Badges b
+  group by b.UserId
+),
+TopAnswerScores as (
+  select
+    a.ParentId as QuestionId,
+    avg(a.Score) as AvgAnswerScore,
+    max(a.Score) as MaxAnswerScore,
+    count(*) as AnswerCount
+  from Posts a
+  where a.PostTypeId = 2
+  group by a.ParentId
+),
+DuplicateLinkInfo as (
+  select
+    pl.PostId,
+    count(case when lt.Name = 'Duplicate' then 1 end) as DuplicateCount
+  from PostLinks pl
+  join LinkTypes lt on pl.LinkTypeId = lt.Id
+  group by pl.PostId
+),
+QuestionClosingDetails as (
+  select
+    ph.PostId,
+    max(case when ph.PostHistoryTypeId = 10 then cast(ph.Comment as integer) else null end) as CloseReasonId,
+    max(ph.CreationDate) as LastCloseDate,
+    count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseVoteCount
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10, 11)
+  group by ph.PostId
+),
+QuestionActivitySummary as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.Tags,
+    u.DisplayName as OwnerName,
+    coalesce(ub.GoldBadges,0) as GoldBadges,
+    coalesce(ub.SilverBadges,0) as SilverBadges,
+    coalesce(ub.BronzeBadges,0) as BronzeBadges,
+    tas.AvgAnswerScore,
+    tas.MaxAnswerScore,
+    tas.AnswerCount,
+    dli.DuplicateCount,
+    qcd.CloseReasonId,
+    qcd.LastCloseDate,
+    qcd.CloseVoteCount,
+    row_number() over (partition by u.Id order by q.Score desc) as UserQuestionRank
+  from Posts q
+  left join Users u on q.OwnerUserId = u.Id
+  left join UserBadgeCounts ub on u.Id = ub.UserId
+  left join TopAnswerScores tas on q.Id = tas.QuestionId
+  left join DuplicateLinkInfo dli on q.Id = dli.PostId
+  left join QuestionClosingDetails qcd on q.Id = qcd.PostId
+  where q.PostTypeId = 1
+    and q.CreationDate > (timestamp '2024-10-01 12:34:56' - interval '1 year')
+),
+FlaggedHighImpactQuestions as (
+  select
+    qa.QuestionId,
+    qa.Title,
+    qa.OwnerName,
+    qa.QuestionScore as Score,
+    qa.ViewCount,
+    qa.Tags,
+    qa.GoldBadges,
+    qa.SilverBadges,
+    qa.BronzeBadges,
+    qa.AvgAnswerScore,
+    qa.MaxAnswerScore,
+    qa.AnswerCount,
+    qa.DuplicateCount,
+    qa.CloseReasonId,
+    qa.LastCloseDate,
+    qa.CloseVoteCount,
+    case
+      when qa.QuestionScore > 100 and qa.ViewCount > 10000 then 'Very High Impact'
+      when qa.QuestionScore > 50 and qa.ViewCount > 5000 then 'High Impact'
+      else 'Moderate Impact'
+    end as ImpactLevel
+  from QuestionActivitySummary qa
+  where (qa.QuestionScore >= 50 or qa.ViewCount >= 5000)
+    and (qa.CloseReasonId is null or qa.CloseVoteCount < 3)
+),
+RecursiveUserPosts as (
+  select
+    p.Id,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.ParentId,
+    p.Score,
+    p.CreationDate,
+    1 as DepthPath,
+    cast(p.Title as varchar(1000)) as FullTitlePath
+  from Posts p
+  where p.PostTypeId = 1
+
+  union all
+
+  select
+    c.Id,
+    c.OwnerUserId,
+    c.PostTypeId,
+    c.ParentId,
+    c.Score,
+    c.CreationDate,
+    rp.DepthPath + 1 as DepthPath,
+    rp.FullTitlePath || ' > ' || coalesce(c.Title, substr(c.Body, 1, 30)) as FullTitlePath
+  from Posts c
+  join RecursiveUserPosts rp on c.ParentId = rp.Id
+  where c.PostTypeId = 2 and rp.DepthPath < 5
+),
+RankedUserPosts as (
+  select
+    OwnerUserId,
+    count(*) as TotalPosts,
+    sum(case when PostTypeId=1 then 1 else 0 end) as QuestionCount,
+    sum(case when PostTypeId=2 then 1 else 0 end) as AnswerCount,
+    avg(Score) as AvgPostScore,
+    max(Score) as MaxPostScore,
+    max(CreationDate) as LastPostDate
+  from RecursiveUserPosts
+  group by OwnerUserId
+),
+TopRankedUsers as (
+  select
+    u.Id,
+    u.DisplayName,
+    ru.TotalPosts,
+    ru.QuestionCount,
+    ru.AnswerCount,
+    ru.AvgPostScore,
+    ru.MaxPostScore,
+    ru.LastPostDate,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    rank() over (order by ru.TotalPosts desc, ru.AvgPostScore desc) as UserRank
+  from Users u
+  left join RankedUserPosts ru on u.Id = ru.OwnerUserId
+  left join UserBadgeCounts ub on u.Id = ub.UserId
+  where ru.TotalPosts > 10
+)
+select
+  fhiq.QuestionId,
+  fhiq.Title,
+  fhiq.OwnerName,
+  fhiq.Score,
+  fhiq.ViewCount,
+  case
+    when fhiq.Tags is null or fhiq.Tags = '' then 'untagged'
+    else
+      split_part(substring(fhiq.Tags from 2 for length(fhiq.Tags)-2), '><', 1)
+  end as PrimaryTag,
+  fhiq.GoldBadges,
+  fhiq.SilverBadges,
+  fhiq.BronzeBadges,
+  fhiq.AvgAnswerScore,
+  fhiq.MaxAnswerScore,
+  fhiq.AnswerCount,
+  fhiq.DuplicateCount,
+  fhiq.CloseReasonId,
+  fhiq.LastCloseDate,
+  fhiq.CloseVoteCount,
+  fhiq.ImpactLevel,
+  tru.UserRank,
+  tru.DisplayName as TopUserDisplayName,
+  tru.TotalPosts as TopUserTotalPosts,
+  length(tru.DisplayName) as TopUserNameLength,
+  case when length(tru.DisplayName) % 2 = 0 then 'Even' else 'Odd' end as NameLengthParity,
+  coalesce(tru.GoldBadges,0) + coalesce(tru.SilverBadges,0) + coalesce(tru.BronzeBadges,0) as TotalBadgeCount,
+  fhiq.OwnerName || ' & ' || reverse(coalesce(tru.DisplayName, 'Anonymous')) as OwnerUserCombinedNameReversed,
+  case
+    when fhiq.CloseReasonId is null then 'Open'
+    when fhiq.CloseReasonId in (1,101) then 'DuplicateQuestion'
+    when fhiq.CloseReasonId in (2,102) then 'OffTopic'
+    else 'OtherCloseReason'
+  end as CloseReasonDescription
+from FlaggedHighImpactQuestions fhiq
+left join TopRankedUsers tru on fhiq.OwnerName = tru.DisplayName
+where fhiq.LastCloseDate is null or fhiq.LastCloseDate < (timestamp '2024-10-01 12:34:56' - interval '3 months')
+order by fhiq.Score desc, fhiq.ViewCount desc
+limit 100;

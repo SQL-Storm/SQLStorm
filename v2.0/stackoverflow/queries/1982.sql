@@ -1,0 +1,178 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(CASE WHEN V.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END) AS TotalRecordedVotes,
+        AVG(CASE WHEN V.VoteTypeId = 2 THEN 1.0 WHEN V.VoteTypeId = 3 THEN -1.0 ELSE 0.0 END) AS AvgVoteSentiment,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        MAX(U.LastAccessDate) AS LastUserAccessDate,
+        CAST(EXTRACT(day FROM MAX(U.LastAccessDate) - U.CreationDate) AS INTEGER) AS DaysSinceAccountCreation
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN
+        Votes V ON U.Id = V.UserId
+    LEFT JOIN
+        Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.Views, U.CreationDate
+    HAVING
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) = 1
+        AND SUM(CASE WHEN V.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END) > 50
+),
+PostActivityMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Title,
+        P.Body,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.OwnerUserId,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        (P.Score * 1.0) / NULLIF(P.ViewCount, 0) AS ScorePerView,
+        LENGTH(P.Body) AS BodyLength,
+        COUNT(DISTINCT PH.Id) AS EditCount,
+        ROW_NUMBER() OVER (PARTITION BY P.ParentId ORDER BY P.Score DESC, P.CreationDate ASC) AS RankInAnswers,
+        EXISTS (
+            SELECT 1
+            FROM Comments C_sub
+            INNER JOIN Users U_sub ON C_sub.UserId = U_sub.Id
+            WHERE C_sub.PostId = P.Id
+              AND U_sub.Reputation > 10000
+              AND C_sub.Score > 5
+        ) AS HasHighRepComment,
+        TRIM(SUBSTRING(P.Tags FROM 2 FOR (POSITION('><' IN (P.Tags || '><')) - 2))) AS FirstTag,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            ELSE 'Open'
+        END AS PostStatus,
+        P.Tags,
+        P.FavoriteCount
+    FROM
+        Posts P
+    LEFT JOIN
+        PostHistory PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId IN (4, 5, 6)
+    WHERE
+        P.PostTypeId IN (1, 2)
+        AND P.CreationDate >= CAST('2022-01-01' AS TIMESTAMP)
+    GROUP BY
+        P.Id, P.PostTypeId, P.Title, P.Body, P.Score, P.ViewCount, P.CreationDate, P.LastActivityDate, P.OwnerUserId, P.AcceptedAnswerId, P.ParentId, P.ClosedDate, P.Tags, P.FavoriteCount
+),
+TagPopularity AS (
+    SELECT
+        T.TagName,
+        T.Count AS TagUseCount,
+        SUM(COALESCE(P_Wiki.Score, 0) + COALESCE(P_Excerpt.Score, 0)) AS WikiContentScore,
+        AVG(LENGTH(COALESCE(P_Wiki.Body, '') || COALESCE(P_Excerpt.Body, ''))) AS AvgWikiContentLength
+    FROM
+        Tags T
+    LEFT JOIN
+        Posts P_Wiki ON T.WikiPostId = P_Wiki.Id
+    LEFT JOIN
+        Posts P_Excerpt ON T.ExcerptPostId = P_Excerpt.Id
+    GROUP BY
+        T.TagName, T.Count
+    HAVING
+        T.Count > 1000
+),
+RecentPostClosureEvents AS (
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS ClosureDate,
+        LAG(PH.CreationDate, 1, CAST('1900-01-01' AS TIMESTAMP)) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate ASC) AS PreviousHistoryDate,
+        -- extract first run of digits from PH.Comment in standard SQL using regexp_matches (returns text[])
+        (regexp_matches(COALESCE(PH.Comment, ''), '([0-9]+)'))[1] AS CloseReasonId_str,
+        COALESCE(CR.Name, 'Unknown Reason') AS CloseReasonName,
+        CASE
+            WHEN PH.Comment LIKE '%101%' OR PH.Comment LIKE '%1%' THEN 'Duplicate'
+            WHEN PH.Comment LIKE '%102%' OR PH.Comment LIKE '%2%' THEN 'Off-topic'
+            WHEN PH.Comment LIKE '%103%' THEN 'Needs Details'
+            WHEN PH.Comment LIKE '%104%' THEN 'Needs Focus'
+            WHEN PH.Comment LIKE '%105%' THEN 'Opinion-based'
+            ELSE 'Other'
+        END AS CloseReasonCategory
+    FROM
+        PostHistory PH
+    LEFT JOIN CloseReasonTypes CR ON PH.Comment = CAST(CR.Id AS VARCHAR)
+    WHERE
+        PH.PostHistoryTypeId = 10
+        AND PH.CreationDate >= CAST('2023-01-01' AS TIMESTAMP)
+)
+SELECT
+    UES.DisplayName AS UserDisplayName,
+    UES.Reputation,
+    UES.UserViews,
+    UES.TotalPosts,
+    UES.TotalComments,
+    UES.AvgVoteSentiment,
+    UES.LastUserAccessDate,
+    UES.DaysSinceAccountCreation,
+    PAM.PostId,
+    PAM.PostTypeId,
+    PAM.Title,
+    PAM.PostScore,
+    PAM.ViewCount,
+    PAM.ScorePerView,
+    PAM.BodyLength,
+    PAM.EditCount,
+    PAM.PostStatus,
+    PAM.HasHighRepComment,
+    COALESCE(PAM.FirstTag, 'untagged') AS PrimaryTag,
+    TP.TagUseCount,
+    TP.WikiContentScore,
+    TP.AvgWikiContentLength,
+    RCE.ClosureDate,
+    RCE.CloseReasonName,
+    RCE.CloseReasonCategory,
+    EXTRACT(EPOCH FROM (PAM.LastActivityDate - PAM.PostCreationDate)) / 3600 AS HoursSinceCreationToLastActivity,
+    AVG(PAM.PostScore) OVER (PARTITION BY UES.UserId ORDER BY PAM.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS AvgPrevPostScoreByUser,
+    (LOWER(PAM.Tags) LIKE '%<sql>%' OR LOWER(PAM.Tags) LIKE '%<database>%' OR LOWER(PAM.Tags) LIKE '%<performance>%') AS IsRelevantTechRelated,
+    (SELECT COUNT(DISTINCT V.UserId)
+     FROM Votes V
+     WHERE V.PostId = PAM.PostId
+       AND V.VoteTypeId = 5
+       AND V.CreationDate BETWEEN PAM.PostCreationDate AND PAM.LastActivityDate) AS FavoriteCountDuringActivePeriod,
+    PAM.FavoriteCount AS CurrentFavoriteCount,
+    COALESCE(PAM.PostScore, 0) * 0.5 + COALESCE(PAM.ViewCount, 0) * 0.01 + COALESCE(PAM.FavoriteCount, 0) * 2.0
+    - COALESCE(PAM.EditCount, 0) * 0.1 AS WeightedPostPopularityMetric,
+    UES.UserId,
+    PAM.PostCreationDate,
+    PAM.LastActivityDate,
+    PAM.Tags
+FROM
+    UserEngagementSummary UES
+INNER JOIN
+    PostActivityMetrics PAM ON UES.UserId = PAM.OwnerUserId
+LEFT JOIN
+    TagPopularity TP ON PAM.FirstTag = TP.TagName
+LEFT JOIN
+    RecentPostClosureEvents RCE ON PAM.PostId = RCE.PostId
+WHERE
+    UES.Reputation > 50000
+    AND PAM.PostScore > 100
+    AND PAM.ViewCount > 10000
+    AND PAM.HasHighRepComment = TRUE
+    AND (
+        (PAM.PostTypeId = 1 AND PAM.ScorePerView > 0.05 AND PAM.EditCount >= 2)
+        OR (PAM.PostTypeId = 2 AND PAM.RankInAnswers = 1 AND PAM.BodyLength > 300 AND PAM.LastActivityDate > UES.LastUserAccessDate)
+    )
+    AND PAM.PostStatus IN ('Open', 'Answered')
+    AND RCE.ClosureDate IS NULL
+    AND (PAM.FavoriteCount IS NULL OR PAM.FavoriteCount > 5)
+ORDER BY
+    UES.Reputation DESC,
+    WeightedPostPopularityMetric DESC,
+    HoursSinceCreationToLastActivity ASC
+LIMIT 2500;

@@ -1,0 +1,248 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400 AS INTEGER) AS AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Expert'
+            WHEN u.Reputation >= 1000 THEN 'Advanced'
+            WHEN u.Reputation >= 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS ReputationLevel,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS TotalAnswerScore,
+        AVG(COALESCE(p.Score, 0)) AS AvgPostScore,
+        STRING_AGG(DISTINCT CASE 
+            WHEN t.TagName IS NOT NULL THEN t.TagName || '(' || t.Count || ')' 
+            ELSE NULL 
+        END, ', ') AS TagActivity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p2 ON p2.Id = p.ParentId
+    -- replace correlated IN-subquery on Tags with LEFT JOIN to a derived table that extracts tags per post (standard SQL)
+    LEFT JOIN (
+        SELECT psub.Id AS PostId, TRIM(tag) AS TagName, 1 AS Count
+        FROM Posts psub
+        CROSS JOIN LATERAL (
+            SELECT value AS tag
+            FROM UNNEST(
+                CASE 
+                    WHEN psub.Tags IS NULL THEN ARRAY[]::text[]
+                    ELSE regexp_split_to_array( substring(psub.Tags FROM 2 FOR char_length(psub.Tags)-2), '><' )
+                END
+            ) AS t(value)
+        ) s
+        WHERE psub.PostTypeId = 1
+    ) t ON t.PostId = p2.Id
+    WHERE u.Id > 1000 AND u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostPerformance AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS INTEGER) AS DaysSinceCreation,
+        CASE 
+            WHEN p.Score > 100 THEN 'High Impact'
+            WHEN p.Score > 50 THEN 'Medium Impact'
+            WHEN p.Score > 10 THEN 'Low Impact'
+            ELSE 'Minimal Impact'
+        END AS ImpactLevel,
+        COALESCE(COUNT(v.Id), 0) AS VoteCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END), 0) AS Favorites,
+        COALESCE(COUNT(DISTINCT ph.Id), 0) AS RevisionCount,
+        COALESCE(MAX(ph.CreationDate), p.CreationDate) AS LastEditDate,
+        CASE 
+            WHEN p.AnswerCount > 0 AND p.Score > 0 THEN 
+                COALESCE(p.Score, 0) / COALESCE(NULLIF(p.AnswerCount,0), 1) 
+            ELSE 0 
+        END AS ScorePerAnswer,
+        CASE 
+            WHEN p.ViewCount > 0 THEN 
+                (COALESCE(p.Score, 0) * 100.0) / COALESCE(NULLIF(p.ViewCount,0), 1) 
+            ELSE 0 
+        END AS ScorePerView,
+        COALESCE(SUBSTRING(p.Body FROM 1 FOR 100), '') AS ShortBody,
+        COALESCE(p.Tags, '') AS Tags,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LAG(p.ViewCount, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevViews,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score DESC) AS ScorePercentile,
+        RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+        NTILE(10) OVER (ORDER BY p.Score DESC) AS ScoreDecile
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3, 5)
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.Title, p.PostTypeId, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.CreationDate, p.OwnerUserId, p.LastActivityDate, p.Body, p.Tags
+),
+FilteredPosts AS (
+    SELECT 
+        pp.Id,
+        pp.Title,
+        pp.PostTypeId,
+        pp.Score,
+        pp.ViewCount,
+        pp.AnswerCount,
+        pp.CommentCount,
+        pp.FavoriteCount,
+        pp.DaysSinceCreation,
+        pp.ImpactLevel,
+        pp.VoteCount,
+        pp.UpVotes,
+        pp.DownVotes,
+        pp.Favorites,
+        pp.RevisionCount,
+        pp.ScorePerAnswer,
+        pp.ScorePerView,
+        pp.ShortBody,
+        pp.Tags,
+        pp.PrevScore,
+        pp.PrevViews,
+        pp.UserPostRank,
+        pp.ScorePercentile,
+        pp.ScoreRank,
+        pp.ViewRank,
+        pp.ScoreDecile,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation,
+        u.Views AS OwnerViews,
+        ua.TotalPosts,
+        ua.Questions,
+        ua.Answers,
+        ua.Comments,
+        ua.Badges,
+        ua.LastPostDate,
+        ua.ReputationLevel,
+        ua.TotalQuestionScore,
+        ua.TotalAnswerScore,
+        ua.AvgPostScore,
+        pp.OwnerUserId
+    FROM PostPerformance pp
+    INNER JOIN Users u ON pp.OwnerUserId = u.Id
+    LEFT JOIN UserActivityStats ua ON u.Id = ua.UserId
+    WHERE pp.DaysSinceCreation >= 30 
+      AND (pp.Score > 0 OR pp.ViewCount > 100 OR pp.AnswerCount > 0 OR pp.CommentCount > 0)
+      AND LENGTH(COALESCE(pp.Title, '')) > 10
+      AND COALESCE(pp.Score, 0) >= 0
+      AND COALESCE(pp.ViewCount, 0) >= 0
+),
+PostStats AS (
+    SELECT 
+        OwnerUserId,
+        COUNT(*) AS TotalPosts,
+        AVG(Score) AS AvgScore,
+        MAX(Score) AS MaxScore,
+        MIN(Score) AS MinScore,
+        AVG(ViewCount) AS AvgViews,
+        AVG(DaysSinceCreation) AS AvgAge,
+        COUNT(CASE WHEN ImpactLevel = 'High Impact' THEN 1 END) AS HighImpactCount,
+        COUNT(CASE WHEN ImpactLevel = 'Medium Impact' THEN 1 END) AS MediumImpactCount
+    FROM PostPerformance
+    GROUP BY OwnerUserId
+),
+ComplexAnalysis AS (
+    SELECT 
+        fp.*,
+        CASE 
+            WHEN fp.OwnerReputation > (SELECT AVG(u.Reputation) FROM Users u) THEN 'AboveAvgRep'
+            ELSE 'BelowAvgRep'
+        END AS RepStatus,
+        CASE
+            WHEN fp.Score >= (SELECT percentile_cont(0.75) WITHIN GROUP (ORDER BY p.Score) FROM Posts p WHERE p.PostTypeId = 1) THEN 'TopQuartile'
+            WHEN fp.Score >= (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY p.Score) FROM Posts p WHERE p.PostTypeId = 1) THEN 'MedianQuartile'
+            ELSE 'BottomQuartile'
+        END AS ScoreQuartile,
+        CASE 
+            WHEN fp.ViewCount > (SELECT AVG(p2.ViewCount) FROM Posts p2 WHERE p2.PostTypeId = 1) THEN 'AboveAvgViews'
+            ELSE 'BelowAvgViews'
+        END AS ViewStatus,
+        CASE 
+            WHEN fp.VoteCount > 0 AND fp.RevisionCount = 0 THEN 'NoRevisionsButVoted'
+            WHEN fp.VoteCount = 0 AND fp.RevisionCount > 0 THEN 'RevisedButNotVoted'
+            WHEN fp.VoteCount > 0 AND fp.RevisionCount > 0 THEN 'BothVotedAndRevised'
+            ELSE 'Neither'
+        END AS EngagementStatus,
+        (fp.Score - COALESCE((SELECT AVG(pp2.Score) FROM PostPerformance pp2 WHERE pp2.OwnerUserId = fp.OwnerUserId), 0)) / 
+        COALESCE((SELECT STDDEV(pp3.Score) FROM PostPerformance pp3 WHERE pp3.OwnerUserId = fp.OwnerUserId), 1) AS ZScore,
+        (fp.ViewCount - COALESCE((SELECT AVG(pp4.ViewCount) FROM PostPerformance pp4 WHERE pp4.OwnerUserId = fp.OwnerUserId), 0)) / 
+        COALESCE((SELECT STDDEV(pp5.ViewCount) FROM PostPerformance pp5 WHERE pp5.OwnerUserId = fp.OwnerUserId), 1) AS ViewZScore,
+        CASE 
+            WHEN fp.Tags IS NOT NULL AND LENGTH(fp.Tags) > 10 THEN
+                (SELECT COUNT(*) FROM (
+                    SELECT TRIM(t) AS t FROM UNNEST(
+                        CASE 
+                            WHEN SUBSTRING(fp.Tags FROM 2 FOR CHAR_LENGTH(fp.Tags)-2) = '' THEN ARRAY[]::text[]
+                            ELSE regexp_split_to_array(SUBSTRING(fp.Tags FROM 2 FOR CHAR_LENGTH(fp.Tags)-2), '><')
+                        END
+                    ) AS s(t)
+                ) sub WHERE sub.t <> '')
+            ELSE 0 
+        END AS TagCount,
+        CASE 
+            WHEN fp.ViewCount > 0 AND fp.Score > 0 AND fp.ViewCount > 1000 THEN 
+                (COALESCE(fp.Score, 0) * 100.0) / COALESCE(NULLIF(fp.ViewCount,0), 1)
+            ELSE 0
+        END AS EngagementRatio,
+        ROW_NUMBER() OVER (ORDER BY (fp.ScorePerAnswer * 0.4 + fp.ScorePerView * 0.6) DESC) AS EngagementRank,
+        DENSE_RANK() OVER (PARTITION BY fp.OwnerUserId ORDER BY fp.Score DESC) AS UserScoreRank,
+        RANK() OVER (PARTITION BY fp.PostTypeId ORDER BY fp.Score DESC) AS TypeScoreRank,
+        NTILE(5) OVER (ORDER BY fp.Score) AS ScoreTier,
+        PERCENT_RANK() OVER (PARTITION BY fp.PostTypeId ORDER BY fp.Score DESC) AS TypeScorePercentile,
+        CASE 
+            WHEN fp.DaysSinceCreation BETWEEN 1 AND 30 THEN 'New'
+            WHEN fp.DaysSinceCreation BETWEEN 31 AND 180 THEN 'Medium'
+            WHEN fp.DaysSinceCreation > 180 THEN 'Established'
+            ELSE 'Unknown'
+        END AS PostAgeGroup,
+        CASE 
+            WHEN fp.AnswerCount > 10 THEN 'HighlyAnswered'
+            WHEN fp.AnswerCount > 2 THEN 'ModeratelyAnswered'
+            ELSE 'LowAnswered'
+        END AS AnswerQuality,
+        CASE 
+            WHEN fp.Score > 10 AND fp.ViewCount > 100 THEN 'Popular'
+            WHEN fp.Score > 5 AND fp.ViewCount > 50 THEN 'Moderate'
+            WHEN fp.Score > 0 AND fp.ViewCount > 10 THEN 'Low'
+            ELSE 'Unpopular'
+        END AS PopularityStatus
+    FROM FilteredPosts fp
+    LEFT JOIN PostStats ps ON fp.OwnerUserId = ps.OwnerUserId
+    WHERE fp.Score > -100 AND fp.ViewCount >= 0
+)
+SELECT 
+    *
+FROM ComplexAnalysis
+WHERE (OwnerName IS NOT NULL OR OwnerName <> '' )
+  AND COALESCE(TagCount, 0) >= 0
+  AND (
+      (TotalPosts IS NOT NULL AND TotalPosts > 100)
+      OR TotalPosts IS NULL
+  )
+  AND (RepStatus = 'AboveAvgRep' OR RepStatus = 'BelowAvgRep')
+ORDER BY Score DESC, ViewCount DESC, OwnerReputation DESC
+LIMIT 1000;

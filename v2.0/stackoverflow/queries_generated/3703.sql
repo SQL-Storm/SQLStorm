@@ -1,0 +1,129 @@
+-- {"query": "3703.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2097} 
+
+/*  Elaborate benchmarking query using the StackOverflow schema  */
+WITH 
+/* 1️⃣ User activity aggregates via correlated sub‑queries */
+UserActivity AS (
+    SELECT 
+        u.Id,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id), 0
+        ) AS PostCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id), 0
+        ) AS CommentCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v 
+             WHERE v.UserId = u.Id AND v.VoteTypeId = 2), 0
+        ) AS UpVotesGiven,
+        COALESCE(
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id), 0
+        ) AS BadgeCount
+    FROM Users u
+),
+
+/* 2️⃣ Weighted badge score (Gold=100, Silver=50, Bronze=20) */
+BadgeScore AS (
+    SELECT 
+        b.UserId,
+        SUM(
+            CASE b.Class 
+                WHEN 1 THEN 100   -- Gold
+                WHEN 2 THEN 50    -- Silver
+                ELSE 20           -- Bronze
+            END
+        ) AS WeightedBadgeScore
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/* 3️⃣ Post statistics per user (questions, answers, total score, newest post) */
+PostStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(p.Score) AS TotalScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+
+/* 4️⃣ Combine everything and compute a composite activity weight + ranking */
+Combined AS (
+    SELECT 
+        u.Id,
+        /* Concatenate display name with location, handling NULLs */
+        CONCAT(u.DisplayName, ' (', COALESCE(u.Location, 'N/A'), ')') AS FullDisplayName,
+        u.Reputation,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.UpVotesGiven,
+        ua.BadgeCount,
+        COALESCE(bs.WeightedBadgeScore, 0)        AS BadgeScore,
+        COALESCE(ps.QuestionCount, 0)            AS QuestionCount,
+        COALESCE(ps.AnswerCount, 0)              AS AnswerCount,
+        COALESCE(ps.TotalScore, 0)               AS TotalScore,
+        ps.LastPostDate,
+        /* Composite activity weight – arbitrary formula */
+        (ua.PostCount * 2) 
+        + ua.CommentCount 
+        + ua.UpVotesGiven 
+        + COALESCE(bs.WeightedBadgeScore, 0) 
+        + COALESCE(ps.TotalScore, 0)             AS ActivityWeight,
+        ROW_NUMBER() OVER (ORDER BY 
+            (ua.PostCount * 2) 
+            + ua.CommentCount 
+            + ua.UpVotesGiven 
+            + COALESCE(bs.WeightedBadgeScore, 0) 
+            + COALESCE(ps.TotalScore, 0) DESC
+        )                                        AS ActivityRank
+    FROM Users u
+    LEFT JOIN UserActivity ua   ON ua.Id = u.Id               /* outer join */
+    LEFT JOIN BadgeScore bs    ON bs.UserId = u.Id
+    LEFT JOIN PostStats ps    ON ps.UserId = u.Id
+)
+
+SELECT 
+    Id,
+    FullDisplayName,
+    Reputation,
+    PostCount,
+    CommentCount,
+    UpVotesGiven,
+    BadgeCount,
+    BadgeScore,
+    QuestionCount,
+    AnswerCount,
+    TotalScore,
+    LastPostDate,
+    ActivityWeight,
+    ActivityRank
+FROM Combined
+WHERE ActivityRank <= 100
+
+/* 5️⃣ Union with an aggregate row for the rest of the users */
+UNION ALL
+
+SELECT 
+    NULL                                   AS Id,
+    'Aggregated Rest'                      AS FullDisplayName,
+    NULL                                   AS Reputation,
+    SUM(PostCount)                         AS PostCount,
+    SUM(CommentCount)                      AS CommentCount,
+    SUM(UpVotesGiven)                      AS UpVotesGiven,
+    SUM(BadgeCount)                        AS BadgeCount,
+    SUM(BadgeScore)                        AS BadgeScore,
+    SUM(QuestionCount)                     AS QuestionCount,
+    SUM(AnswerCount)                       AS AnswerCount,
+    SUM(TotalScore)                        AS TotalScore,
+    MAX(LastPostDate)                      AS LastPostDate,
+    NULL                                   AS ActivityWeight,
+    NULL                                   AS ActivityRank
+FROM Combined
+WHERE ActivityRank > 100
+
+ORDER BY 
+    ActivityRank NULLS LAST,
+    Reputation DESC
+OFFSET 0 ROWS FETCH NEXT 200 ROWS ONLY;

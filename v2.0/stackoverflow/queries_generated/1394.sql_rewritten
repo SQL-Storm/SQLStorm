@@ -1,0 +1,202 @@
+-- {"query": "1394.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2896} 
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserViews,
+        U.UpVotes,
+        U.DownVotes,
+        U.Location,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(P.Score) AS TotalPostScore,
+        SUM(C.Score) AS TotalCommentScore,
+        COUNT(DISTINCT V_Up.Id) AS ReceivedUpVotes,
+        COUNT(DISTINCT V_Down.Id) AS ReceivedDownVotes,
+        MAX(COALESCE(P.LastActivityDate, P.CreationDate, C.CreationDate, U.LastAccessDate)) AS LastUserInteractionDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V_Up ON P.Id = V_Up.PostId AND V_Up.VoteTypeId = 2
+    LEFT JOIN Votes V_Down ON P.Id = V_Down.PostId AND V_Down.VoteTypeId = 3
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes, U.Location
+),
+PostDetailedMetrics AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.ViewCount,
+        Q.Score AS QuestionScore,
+        Q.AnswerCount,
+        Q.CommentCount AS QuestionCommentCount,
+        Q.FavoriteCount,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.LastEditDate AS QuestionLastEditDate,
+        Q.LastActivityDate AS QuestionLastActivityDate,
+        Q.ClosedDate,
+        AGE(cast('2024-10-01 12:34:56' as timestamp), Q.CreationDate) AS QuestionAge,
+        (SELECT COUNT(DISTINCT PH.UserId)
+         FROM PostHistory PH
+         WHERE PH.PostId = Q.Id
+           AND PH.PostHistoryTypeId IN (4,5,6,24) -- Edit Title, Body, Tags, Suggested Edit Applied
+           AND PH.UserId IS NOT NULL) AS DistinctEditorsCount,
+        (SELECT
+             CR.Name
+         FROM PostHistory PH_CLOSE
+         LEFT JOIN CloseReasonTypes CR ON CAST(PH_CLOSE.Comment AS smallint) = CR.Id
+         WHERE PH_CLOSE.PostId = Q.Id AND PH_CLOSE.PostHistoryTypeId = 10
+         ORDER BY PH_CLOSE.CreationDate DESC
+         LIMIT 1) AS LatestCloseReasonName,
+        AVG(A.Score) OVER (PARTITION BY Q.Id) AS AvgAnswerScore,
+        SUM(CASE WHEN A.Id = Q.AcceptedAnswerId THEN 1 ELSE 0 END) OVER (PARTITION BY Q.Id) AS HasAcceptedAnswer,
+        ARRAY_LENGTH(string_to_array(COALESCE(SUBSTRING(Q.Tags FROM 2 FOR LENGTH(Q.Tags) - 2), ''), '><'), 1) AS NumberOfTags,
+        (SELECT C.Text FROM Comments C WHERE C.PostId = Q.Id ORDER BY C.CreationDate DESC LIMIT 1) AS LatestCommentText
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id, Q.Title, Q.CreationDate, Q.ViewCount, Q.Score, Q.AnswerCount, Q.CommentCount, Q.FavoriteCount, Q.OwnerUserId, Q.LastEditDate, Q.LastActivityDate, Q.ClosedDate
+),
+TagEngagementSummary AS (
+    SELECT
+        TRIM(UNNEST(string_to_array(COALESCE(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), ''), '><'))) AS TagName,
+        COUNT(DISTINCT P.Id) AS TaggedQuestionCount,
+        SUM(P.ViewCount) AS TotalTagViewCount,
+        SUM(P.Score) AS TotalTagScore,
+        AVG(P.Score) AS AverageTagScore,
+        COUNT(DISTINCT P.OwnerUserId) AS DistinctTagUsers,
+        MAX(P.CreationDate) AS LatestTagUsageDate,
+        RANK() OVER (ORDER BY SUM(P.Score) DESC, COUNT(DISTINCT P.Id) DESC) AS TagScoreRank
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL
+    GROUP BY TRIM(UNNEST(string_to_array(COALESCE(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), ''), '><')))
+    HAVING COUNT(DISTINCT P.Id) > 10
+),
+BadgeAchievementSummary AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadgesAwarded,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        DENSE_RANK() OVER (ORDER BY SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) DESC, COUNT(B.Id) DESC) AS GoldBadgeAchieverRank
+    FROM Badges B
+    GROUP BY B.UserId
+),
+PostLinkSummary AS (
+    SELECT
+        PL.PostId,
+        COUNT(PL.Id) AS TotalLinks,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatePostsCount,
+        AVG(P_Related.Score) AS AvgRelatedPostScore,
+        MAX(P_Related.CreationDate) AS LatestRelatedPostDate,
+        SUBSTRING(
+            STRING_AGG(P_Related.Title, ' | ' ORDER BY P_Related.Score DESC),
+            1, 250
+        ) AS TopRelatedPostTitles
+    FROM PostLinks PL
+    LEFT JOIN Posts P_Related ON PL.RelatedPostId = P_Related.Id
+    GROUP BY PL.PostId
+),
+TrendingPosts AS (
+    SELECT
+        P.Id AS PostId,
+        P.Title,
+        P.CreationDate,
+        P.ViewCount,
+        P.FavoriteCount,
+        'HighlyViewed' AS TrendType
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.ViewCount > 5000 AND P.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+
+    UNION ALL
+
+    SELECT
+        P.Id AS PostId,
+        P.Title,
+        P.CreationDate,
+        P.ViewCount,
+        P.FavoriteCount,
+        'HighlyFavorited' AS TrendType
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.FavoriteCount > 100 AND P.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+)
+SELECT
+    UES.DisplayName AS User_DisplayName,
+    UES.Reputation AS User_Reputation,
+    UES.Location AS User_Location,
+    UES.TotalQuestions AS User_TotalQuestions,
+    UES.TotalAnswers AS User_TotalAnswers,
+    UES.ReceivedUpVotes AS User_ReceivedUpVotes,
+    UES.LastUserInteractionDate AS User_LastInteractionDate,
+    PDM.QuestionTitle,
+    PDM.QuestionCreationDate,
+    PDM.ViewCount AS Question_ViewCount,
+    PDM.QuestionScore,
+    PDM.AnswerCount AS Question_AnswerCount,
+    PDM.FavoriteCount AS Question_FavoriteCount,
+    PDM.QuestionAge,
+    PDM.DistinctEditorsCount AS Question_DistinctEditors,
+    PDM.LatestCloseReasonName AS Question_LatestCloseReason,
+    PDM.AvgAnswerScore,
+    PDM.HasAcceptedAnswer,
+    PDM.NumberOfTags AS Question_NumberOfTags,
+    PDM.LatestCommentText AS Question_LatestCommentSample,
+    TES.TagName AS TopTag_Name,
+    TES.TaggedQuestionCount AS TopTag_QuestionCount,
+    TES.TotalTagViewCount AS TopTag_TotalViewCount,
+    TES.AverageTagScore AS TopTag_AvgScore,
+    TES.TagScoreRank AS TopTag_Rank,
+    COALESCE(BAS.GoldBadges, 0) AS User_GoldBadges,
+    COALESCE(BAS.SilverBadges, 0) AS User_SilverBadges,
+    BAS.GoldBadgeAchieverRank AS User_GoldBadgeRank,
+    COALESCE(PLS.TotalLinks, 0) AS Question_TotalLinks,
+    COALESCE(PLS.DuplicatePostsCount, 0) AS Question_DuplicateLinks,
+    PLS.AvgRelatedPostScore AS Question_AvgRelatedScore,
+    PLS.TopRelatedPostTitles AS Question_TopRelatedTitles,
+    COALESCE(TP.TrendType, 'Normal') AS Question_TrendStatus,
+    CAST(UES.Reputation AS numeric) / NULLIF(UES.TotalPosts + UES.TotalComments, 0)
+        * (1 + (CASE WHEN UES.TotalQuestions > 0 THEN 0.5 ELSE 0 END) + (CASE WHEN COALESCE(BAS.GoldBadges, 0) > 0 THEN 0.75 ELSE 0 END))
+        AS UserEffectivenessScore,
+    (CASE WHEN PDM.ViewCount > 1000 AND PDM.QuestionScore > 10 AND PDM.QuestionAge < INTERVAL '6 months'
+               AND UES.LastUserInteractionDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 months' THEN TRUE ELSE FALSE END) AS IsHotQuestionByActiveUser,
+    CASE WHEN UES.Location IS NULL OR TRIM(UES.Location) = '' THEN 'Unknown' ELSE UES.Location END AS User_Location_Sanitized
+FROM Posts Q_Main
+INNER JOIN UserEngagementSummary UES ON Q_Main.OwnerUserId = UES.UserId
+LEFT JOIN PostDetailedMetrics PDM ON Q_Main.Id = PDM.QuestionId
+LEFT JOIN (
+    SELECT
+        TRIM(UNNEST(string_to_array(COALESCE(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), ''), '><'))) AS TagName,
+        P.Id AS QuestionId,
+        ROW_NUMBER() OVER (PARTITION BY P.Id ORDER BY T.Count DESC, T.TagName) as rn
+    FROM Posts P
+    JOIN Tags T ON TRIM(UNNEST(string_to_array(COALESCE(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), ''), '><'))) = T.TagName
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL
+) AS Q_Tags ON Q_Main.Id = Q_Tags.QuestionId AND Q_Tags.rn = 1
+LEFT JOIN TagEngagementSummary TES ON Q_Tags.TagName = TES.TagName
+LEFT JOIN BadgeAchievementSummary BAS ON UES.UserId = BAS.UserId
+LEFT JOIN PostLinkSummary PLS ON Q_Main.Id = PLS.PostId
+LEFT JOIN TrendingPosts TP ON Q_Main.Id = TP.PostId
+WHERE
+    Q_Main.PostTypeId = 1
+    AND Q_Main.CreationDate BETWEEN cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 year' AND cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 month'
+    AND (PDM.QuestionScore > 5 OR PDM.ViewCount > 500)
+    AND (UES.TotalQuestions + UES.TotalAnswers > 5 OR UES.Reputation > 100)
+    AND (PDM.LatestCloseReasonName IS NULL OR PDM.LatestCloseReasonName NOT LIKE '%Duplicate%')
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Votes V
+        WHERE V.PostId = Q_Main.Id AND V.VoteTypeId IN (4, 12)
+    )
+ORDER BY
+    UserEffectivenessScore DESC NULLS LAST,
+    PDM.QuestionScore DESC,
+    PDM.ViewCount DESC,
+    TES.TagScoreRank ASC NULLS LAST
+LIMIT 1000;

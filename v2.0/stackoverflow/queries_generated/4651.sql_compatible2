@@ -1,0 +1,152 @@
+WITH
+  UserPostInteraction AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      COUNT(DISTINCT v.Id) AS VoteCount,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      MAX(p.CreationDate) AS LastPostCreationDate
+    FROM Posts p
+    LEFT JOIN Comments c
+      ON p.Id = c.PostId
+    LEFT JOIN Votes v
+      ON p.Id = v.PostId
+    WHERE
+      p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  PostQuality AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      CASE
+        WHEN p.PostTypeId = 1 THEN COALESCE(pt.Name, 'Unknown')
+        ELSE COALESCE(pt2.Name, 'Unknown')
+      END AS PostType,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS ScoreRank,
+      AVG(c.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgCommentScore,
+      SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.OwnerUserId) AS DuplicateLinkCount
+    FROM Posts p
+    LEFT JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN PostTypes pt2
+      ON p.PostTypeId = pt2.Id
+    LEFT JOIN PostLinks pl
+      ON p.Id = pl.PostId
+    LEFT JOIN Comments c
+      ON p.Id = c.PostId
+    WHERE
+      p.OwnerUserId IS NOT NULL
+      AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR)
+  ),
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COALESCE(upi.CommentCount, 0) AS TotalComments,
+      COALESCE(upi.VoteCount, 0) AS TotalVotes,
+      COALESCE(upi.QuestionCount, 0) AS TotalQuestions,
+      COALESCE(upi.AnswerCount, 0) AS TotalAnswers,
+      CASE
+        WHEN (CAST('2024-10-01' AS DATE) - CAST(u.LastAccessDate AS DATE)) < INTERVAL '30' DAY THEN 'Active'
+        WHEN (CAST('2024-10-01' AS DATE) - CAST(u.LastAccessDate AS DATE)) BETWEEN INTERVAL '30' DAY AND INTERVAL '180' DAY THEN 'Moderately Active'
+        ELSE 'Inactive'
+      END AS EngagementStatus,
+      (
+        SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1
+      ) AS GoldBadges,
+      (
+        SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2
+      ) AS SilverBadges,
+      (
+        SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3
+      ) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN UserPostInteraction upi
+      ON u.Id = upi.OwnerUserId
+    WHERE
+      u.Id <> -1
+  )
+SELECT
+  ue.UserId,
+  ue.DisplayName,
+  ue.Reputation,
+  ue.EngagementStatus,
+  ue.GoldBadges,
+  ue.SilverBadges,
+  ue.BronzeBadges,
+  pq.PostId,
+  pq.PostType,
+  pq.Score,
+  pq.AnswerCount,
+  pq.CommentCount,
+  pq.FavoriteCount,
+  pq.AvgCommentScore,
+  pq.DuplicateLinkCount,
+  CASE WHEN pq.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+  CASE
+    WHEN pq.ScoreRank <= 5 THEN 'Top 5 Scorer'
+    WHEN pq.ScoreRank <= 20 THEN 'Top 20 Scorer'
+    ELSE 'Other'
+  END AS ScoreTier
+FROM UserEngagement ue
+JOIN PostQuality pq
+  ON ue.UserId = pq.OwnerUserId
+WHERE
+  ue.TotalQuestions > 5
+  AND ue.TotalAnswers > 10
+  AND ue.Reputation > 1000
+  AND pq.Score > 0
+  AND pq.PostType IN ('Question', 'Answer')
+  AND (pq.AvgCommentScore > 5 OR pq.DuplicateLinkCount > 2)
+  AND ue.EngagementStatus <> 'Inactive'
+UNION ALL
+SELECT
+  ue.UserId,
+  ue.DisplayName,
+  ue.Reputation,
+  ue.EngagementStatus,
+  ue.GoldBadges,
+  ue.SilverBadges,
+  ue.BronzeBadges,
+  NULL AS PostId,
+  'Summary' AS PostType,
+  NULL AS Score,
+  SUM(pq.AnswerCount) AS AnswerCount,
+  SUM(pq.CommentCount) AS CommentCount,
+  SUM(pq.FavoriteCount) AS FavoriteCount,
+  AVG(pq.AvgCommentScore) AS AvgCommentScore,
+  SUM(pq.DuplicateLinkCount) AS DuplicateLinkCount,
+  NULL AS PostStatus,
+  'Overall' AS ScoreTier
+FROM UserEngagement ue
+JOIN PostQuality pq
+  ON ue.UserId = pq.OwnerUserId
+WHERE
+  ue.TotalQuestions > 5
+  AND ue.TotalAnswers > 10
+  AND ue.Reputation > 1000
+  AND pq.Score > 0
+  AND pq.PostType IN ('Question', 'Answer')
+  AND (pq.AvgCommentScore > 5 OR pq.DuplicateLinkCount > 2)
+  AND ue.EngagementStatus <> 'Inactive'
+GROUP BY
+  ue.UserId,
+  ue.DisplayName,
+  ue.Reputation,
+  ue.EngagementStatus,
+  ue.GoldBadges,
+  ue.SilverBadges,
+  ue.BronzeBadges
+ORDER BY
+  ue.Reputation DESC,
+  ue.TotalAnswers DESC;

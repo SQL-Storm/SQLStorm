@@ -1,0 +1,173 @@
+WITH
+  AggregatedPostStats AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.FavoriteCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.ClosedDate,
+      pt.Name AS PostTypeName,
+      (
+        SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.CreationDate > p.CreationDate
+      ) AS CommentCountAfterCreation,
+      CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostNumberForUser,
+      AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScoreForUser,
+      SUM(p.ViewCount) OVER (PARTITION BY p.OwnerUserId) AS TotalViewCountForUser,
+      COUNT(ph.Id) OVER (PARTITION BY p.OwnerUserId, ph.PostHistoryTypeId) AS HistoryCountForUserByType,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN EXTRACT(day FROM (CAST(p.ClosedDate AS timestamp) - CAST(p.CreationDate AS timestamp))) ELSE NULL END AS DaysToClose
+    FROM
+      Posts p
+      JOIN PostTypes pt ON p.PostTypeId = pt.Id
+      LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE
+      p.OwnerUserId IS NOT NULL
+      AND p.OwnerUserId > 0
+      AND p.PostTypeId IN (1, 2)
+  ),
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.Views AS UserViews,
+      u.UpVotes AS UserUpVotes,
+      u.DownVotes AS UserDownVotes,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceived,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceived,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      MAX(c.CreationDate) AS LastCommentDate,
+      COUNT(DISTINCT p.PostId) AS PostCount,
+      AVG(p.Score) AS AvgPostScore,
+      SUM(p.ViewCount) AS TotalPostViewCount,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      AVG(p.DaysToClose) AS AvgDaysToClose,
+      (
+        SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = u.Id
+      ) AS PostLinkCount
+    FROM
+      Users u
+      LEFT JOIN Badges b ON u.Id = b.UserId
+      LEFT JOIN Votes v ON u.Id = v.UserId
+      LEFT JOIN Comments c ON u.Id = c.UserId
+      LEFT JOIN AggregatedPostStats p ON u.Id = p.OwnerUserId
+    WHERE
+      u.Reputation > 1000
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes
+  )
+SELECT
+  aps.PostId,
+  aps.PostTypeName,
+  aps.CreationDate AS PostCreationDate,
+  aps.Score AS PostScore,
+  aps.ViewCount AS PostViewCount,
+  aps.FavoriteCount AS PostFavoriteCount,
+  aps.CommentCount AS PostCommentCount,
+  aps.CommentCountAfterCreation,
+  aps.HasAcceptedAnswer,
+  aps.DaysToClose,
+  ue.UserId,
+  ue.DisplayName AS UserDisplayName,
+  ue.Reputation AS UserReputation,
+  ue.UserCreationDate,
+  ue.BadgeCount,
+  ue.TotalUpVotesReceived,
+  ue.TotalDownVotesReceived,
+  ue.CommentCount AS UserCommentCount,
+  ue.LastCommentDate,
+  ue.PostCount,
+  ue.AvgPostScore,
+  ue.TotalPostViewCount,
+  ue.QuestionCount,
+  ue.AnswerCount,
+  ue.AvgDaysToClose,
+  (
+    SELECT MAX(ph.CreationDate)
+    FROM PostHistory ph
+    WHERE ph.PostId = aps.PostId
+      AND ph.PostHistoryTypeId = 5
+  ) AS LastBodyEditDate,
+  (
+    SELECT COUNT(*)
+    FROM PostLinks pl
+    WHERE pl.PostId = aps.PostId
+      AND pl.LinkTypeId = 1
+  ) AS LinkedPostCount,
+  COALESCE(aps.Score, 0) + COALESCE(aps.FavoriteCount, 0) AS ScorePlusFavorite,
+  CASE
+    WHEN aps.PostTypeName = 'Question' AND aps.AnswerCount > 10 THEN 'High Answer Volume'
+    WHEN aps.PostTypeName = 'Answer' AND aps.Score > 50 THEN 'High Score Answer'
+    WHEN aps.PostTypeName = 'Question' AND aps.ClosedDate IS NOT NULL THEN 'Closed Question'
+    ELSE 'Standard Post'
+  END AS PostStatusCategory,
+  CASE
+    WHEN ue.Reputation > 100000 THEN 'High Reputation User'
+    WHEN ue.Reputation BETWEEN 10000 AND 100000 THEN 'Medium Reputation User'
+    ELSE 'Low Reputation User'
+  END AS UserReputationCategory,
+  (
+    SELECT COUNT(c.Id)
+    FROM Comments c
+    WHERE c.UserId = aps.OwnerUserId
+      AND c.CreationDate BETWEEN aps.CreationDate AND (aps.CreationDate + INTERVAL '7' DAY)
+  ) AS CommentsInFirstWeek,
+  (ue.DisplayName || ' (' || ue.Reputation || ')') AS UserIdentifier,
+  CASE
+    WHEN aps.PostTypeId = 1 THEN (
+      SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = aps.PostId AND ph.PostHistoryTypeId IN (1,4,7)
+    )
+    ELSE 0
+  END AS TitleEditCount,
+  CASE
+    WHEN aps.PostTypeId = 2 THEN (
+      SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = aps.PostId AND ph.PostHistoryTypeId IN (2,5,8)
+    )
+    ELSE 0
+  END AS BodyEditCount,
+  COALESCE(ue.UserUpVotes, 0) * 1.5 - COALESCE(ue.UserDownVotes, 0) * 0.8 AS NetUserVoteImpact,
+  (
+    SELECT COUNT(*)
+    FROM Tags t
+    WHERE t.TagName IN (
+      SELECT TRIM(SPLIT_PART(SPLIT_PART(p.Tags, '><', n.n), '><', -1))
+      FROM (
+        SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+      ) n
+      WHERE n.n <= CHAR_LENGTH(p.Tags) - CHAR_LENGTH(REPLACE(p.Tags, '><', '')) + 1
+    )
+  ) AS TagCountForPost,
+  CASE
+    WHEN aps.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN aps.Score > 100 THEN 'High Score'
+    WHEN aps.FavoriteCount > 50 THEN 'Highly Favorited'
+    ELSE 'Normal'
+  END AS PostEngagementLevel
+FROM
+  AggregatedPostStats aps
+  JOIN UserEngagement ue ON aps.OwnerUserId = ue.UserId
+WHERE
+  aps.PostNumberForUser <= 100
+  AND aps.AvgScoreForUser > 0
+  AND aps.PostTypeName IS NOT NULL
+  AND ue.DisplayName IS NOT NULL
+  AND aps.CreationDate > DATE '2023-01-01'
+UNION ALL
+SELECT
+  NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+FROM Users
+LIMIT 1;

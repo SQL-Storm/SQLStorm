@@ -1,0 +1,170 @@
+-- {"query": "4232.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1586} 
+
+WITH RECURSIVE UserContribution AS (
+  SELECT
+    p.OwnerUserId,
+    COUNT(p.Id) AS PostCount,
+    SUM(p.Score) AS TotalScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    'Post' AS ContributionType
+  FROM Posts AS p
+  WHERE
+    p.OwnerUserId IS NOT NULL
+  GROUP BY
+    p.OwnerUserId
+  UNION ALL
+  SELECT
+    c.UserId,
+    COUNT(c.Id) AS PostCount,
+    SUM(c.Score) AS TotalScore,
+    MAX(c.CreationDate) AS LastPostDate,
+    'Comment' AS ContributionType
+  FROM Comments AS c
+  WHERE
+    c.UserId IS NOT NULL
+  GROUP BY
+    c.UserId
+), RankedUserContributions AS (
+  SELECT
+    uc.OwnerUserId,
+    uc.PostCount,
+    uc.TotalScore,
+    uc.LastPostDate,
+    uc.ContributionType,
+    ROW_NUMBER() OVER (PARTITION BY uc.OwnerUserId ORDER BY uc.LastPostDate DESC) AS rn
+  FROM UserContribution AS uc
+), UserEngagement AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount,
+    COALESCE(p.CommentCount, 0) AS CommentCount,
+    (
+      SELECT
+        COUNT(*)
+      FROM Votes AS v
+      WHERE
+        v.UserId = u.Id AND v.VoteTypeId = 2 /* UpMod */
+    ) AS UpVotesGiven,
+    (
+      SELECT
+        COUNT(*)
+      FROM Votes AS v
+      WHERE
+        v.UserId = u.Id AND v.VoteTypeId = 3 /* DownMod */
+    ) AS DownVotesGiven,
+    CASE WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 0 ELSE 1 END AS HasWebsite,
+    CASE WHEN u.AboutMe IS NULL OR u.AboutMe = '' THEN 0 ELSE 1 END AS HasAboutMe,
+    DATEDIFF(day, u.CreationDate, GETDATE()) AS DaysSinceCreation
+  FROM Users AS u
+  LEFT JOIN (
+    SELECT
+      OwnerUserId,
+      SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      SUM(CommentCount) AS CommentCount
+    FROM Posts
+    WHERE
+      OwnerUserId IS NOT NULL
+    GROUP BY
+      OwnerUserId
+  ) AS p
+    ON u.Id = p.OwnerUserId
+), TagPopularity AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount,
+    COUNT(pt.PostId) AS PostsWithTag
+  FROM Tags AS t
+  LEFT JOIN Posts AS pt
+    ON pt.Tags LIKE '%' || t.TagName || '%'
+  WHERE
+    t.TagName NOT LIKE '%-%' /* Exclude non-English tags for this example */
+  GROUP BY
+    t.TagName,
+    t.Count
+), RecentPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS RecentRank
+  FROM Posts AS p
+  WHERE
+    p.PostTypeId = 1 /* Questions */
+    AND p.CreationDate > DATEADD(month, -6, GETDATE())
+), UserActivitySummary AS (
+  SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.DaysSinceCreation,
+    ue.UpVotesGiven,
+    ue.DownVotesGiven,
+    ue.HasWebsite,
+    ue.HasAboutMe,
+    COALESCE(ruc_post.PostCount, 0) AS PostHistoryCount,
+    COALESCE(ruc_comment.PostCount, 0) AS CommentHistoryCount,
+    CAST(COALESCE(ruc_post.TotalScore, 0) AS REAL) / NULLIF(COALESCE(ruc_post.PostCount, 0), 0) AS AvgPostScore,
+    CASE
+      WHEN ue.DaysSinceCreation > 0 THEN CAST(ue.Reputation AS REAL) / ue.DaysSinceCreation ELSE ue.Reputation
+    END AS ReputationPerDay
+  FROM UserEngagement AS ue
+  LEFT JOIN RankedUserContributions AS ruc_post
+    ON ue.UserId = ruc_post.OwnerUserId AND ruc_post.ContributionType = 'Post' AND ruc_post.rn = 1
+  LEFT JOIN RankedUserContributions AS ruc_comment
+    ON ue.UserId = ruc_comment.OwnerUserId AND ruc_comment.ContributionType = 'Comment' AND ruc_comment.rn = 1
+)
+SELECT
+  rp.Title AS RecentQuestionTitle,
+  uas.DisplayName AS TopContributor,
+  uas.Reputation,
+  uas.ReputationPerDay,
+  tp.TagName AS PopularTag,
+  tp.PostsWithTag,
+  CASE
+    WHEN uas.AvgPostScore > 10 THEN 'High Quality Contributor'
+    WHEN uas.AvgPostScore > 5 THEN 'Good Contributor'
+    ELSE 'Developing Contributor'
+  END AS ContributorQuality,
+  CASE
+    WHEN uas.UpVotesGiven > uas.DownVotesGiven * 2 THEN 'Positive Voter'
+    WHEN uas.DownVotesGiven > uas.UpVotesGiven * 2 THEN 'Negative Voter'
+    ELSE 'Neutral Voter'
+  END AS VotingPattern,
+  ue.Id AS UserIDForEngagement,
+  ue.CreationDate,
+  ue.AnswerCount,
+  ue.CommentCount,
+  ue.HasWebsite,
+  ue.HasAboutMe,
+  ph.Comment AS LastPostHistoryComment,
+  pht.Name AS LastPostHistoryType,
+  p.Title AS PostTitleForHistory
+FROM RecentPosts AS rp
+JOIN UserActivitySummary AS uas
+  ON rp.OwnerUserId = uas.UserId
+LEFT JOIN TagPopularity AS tp
+  ON tp.TagCount > 10000 AND tp.TagName IN (
+    SELECT
+      value
+    FROM STRING_SPLIT(REPLACE(REPLACE(rp.Tags, '<', ''), '>', ''), '')
+  )
+LEFT JOIN PostsHistory AS ph
+  ON rp.Id = ph.PostId
+LEFT JOIN PostHistoryTypes AS pht
+  ON ph.PostHistoryTypeId = pht.Id
+LEFT JOIN Posts AS p
+  ON ph.PostId = p.Id
+LEFT JOIN UserEngagement AS ue
+  ON uas.UserId = ue.UserId
+WHERE
+  uas.DaysSinceCreation > 30
+  AND uas.Reputation > 1000
+  AND rp.RecentRank <= 10
+ORDER BY
+  uas.Reputation DESC,
+  tp.PostsWithTag DESC,
+  uas.AvgPostScore DESC;

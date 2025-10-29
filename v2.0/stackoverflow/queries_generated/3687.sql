@@ -1,0 +1,99 @@
+-- {"query": "3687.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1775} 
+
+WITH TagQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+      AND EXISTS (
+          SELECT 1
+          FROM unnest(
+                 string_to_array(
+                     substring(p.Tags, 2, length(p.Tags) - 2),
+                     '><'
+                 )
+               ) AS t(tag)
+          WHERE t.tag = 'postgresql'
+      )
+),
+UserStats AS (
+    SELECT
+        u.Id                                    AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT q.Id) FILTER (WHERE q.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswersGiven,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)        AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)        AS DownVotesReceived,
+        MAX(p.LastActivityDate)                                 AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts q ON q.OwnerUserId = u.Id AND q.PostTypeId = 1
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN Votes v ON v.PostId = COALESCE(q.Id, a.Id)
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentActivity AS (
+    SELECT
+        u.Id                         AS UserId,
+        MAX(ph.CreationDate)         AS LastEdit
+    FROM Users u
+    LEFT JOIN PostHistory ph
+        ON ph.UserId = u.Id
+       AND ph.PostHistoryTypeId IN (4,5,6)   -- edits to title, body, tags
+    GROUP BY u.Id
+)
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.QuestionsAsked,
+    us.AnswersGiven,
+    us.UpVotesReceived,
+    us.DownVotesReceived,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges,
+    COALESCE(ra.LastEdit, us.LastActivity)               AS MostRecentContribution,
+    RANK() OVER (ORDER BY us.Reputation DESC,
+                        us.AnswersGiven DESC)        AS ReputationRank,
+    CASE
+        WHEN us.Reputation > 20000                     THEN 'Legendary'
+        WHEN us.Reputation BETWEEN 10000 AND 20000      THEN 'Expert'
+        WHEN us.Reputation BETWEEN 5000  AND 9999       THEN 'Experienced'
+        ELSE                                            'Novice'
+    END                                                AS ReputationTier
+FROM UserStats us
+LEFT JOIN BadgeCounts bc   ON bc.UserId = us.UserId
+LEFT JOIN RecentActivity ra ON ra.UserId = us.UserId
+WHERE COALESCE(us.AnswersGiven,0) > 0
+  AND us.Reputation IS NOT NULL
+  AND us.DisplayName IS NOT NULL
+  AND us.DisplayName <> ''
+UNION ALL
+SELECT
+    NULL AS UserId,
+    '---' AS DisplayName,
+    NULL AS Reputation,
+    NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL,
+    NULL,
+    NULL,
+    NULL
+FROM (SELECT 1) dummy
+ORDER BY ReputationRank NULLS LAST, UserId
+LIMIT 100;

@@ -1,0 +1,224 @@
+-- {"query": "7482.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2057} 
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(DISTINCT p.Tags, '; ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostWithRanking AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS TypeRank,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS NewestPost,
+        NTILE(10) OVER (ORDER BY p.Score DESC) AS ScoreQuintile,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) AS PrevScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.Score DESC) AS NextScore,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts) THEN 'AboveAverage'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts) THEN 'BelowAverage'
+            ELSE 'Average'
+        END AS ScoreCategory,
+        COALESCE(p.LastActivityDate, p.CreationDate) AS EffectiveActivityDate
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivityAnalysis AS (
+    SELECT 
+        up.UserId,
+        up.DisplayName,
+        up.Reputation,
+        up.TotalPosts,
+        up.Questions,
+        up.Answers,
+        up.TotalQuestionScore,
+        up.TotalAnswerScore,
+        up.AvgQuestionScore,
+        up.AvgAnswerScore,
+        DATEDIFF(day, up.LastPostDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceLastPost,
+        CASE 
+            WHEN up.TotalPosts > 100 THEN 'HighlyActive'
+            WHEN up.TotalPosts > 50 THEN 'Active'
+            WHEN up.TotalPosts > 10 THEN 'Moderate'
+            ELSE 'Low'
+        END AS ActivityLevel,
+        CASE 
+            WHEN up.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 'AboveReputation'
+            WHEN up.Reputation < (SELECT AVG(Reputation) FROM Users) THEN 'BelowReputation'
+            ELSE 'AverageReputation'
+        END AS ReputationLevel,
+        STRING_AGG(CASE WHEN up.AllTags IS NOT NULL THEN TRIM(BOTH '<>' FROM up.AllTags) END, ', ') AS TagSummary
+    FROM UserPostStats up
+    WHERE up.TotalPosts > 0
+    GROUP BY up.UserId, up.DisplayName, up.Reputation, up.TotalPosts, up.Questions, up.Answers, 
+             up.TotalQuestionScore, up.TotalAnswerScore, up.AvgQuestionScore, up.AvgAnswerScore, up.LastPostDate
+),
+HighScorePosts AS (
+    SELECT 
+        pws.PostId,
+        pws.Title,
+        pws.Score,
+        pws.ViewCount,
+        pws.CreationDate,
+        pws.OwnerUserId,
+        pws.PostTypeId,
+        pws.Tags,
+        pws.ScoreRank,
+        pws.TypeRank,
+        pws.ScoreQuintile,
+        pws.PrevScore,
+        pws.NextScore,
+        CASE 
+            WHEN pws.Score - COALESCE(pws.PrevScore, 0) > 100 THEN 'LargeIncrease'
+            WHEN pws.Score - COALESCE(pws.PrevScore, 0) > 50 THEN 'MediumIncrease'
+            WHEN pws.Score - COALESCE(pws.PrevScore, 0) > 0 THEN 'SmallIncrease'
+            ELSE 'NoIncrease'
+        END AS ScoreChange,
+        DATEDIFF(day, pws.CreationDate, pws.EffectiveActivityDate) AS DaysActive,
+        CASE 
+            WHEN pws.ViewCount > 10000 THEN 'Viral'
+            WHEN pws.ViewCount > 1000 THEN 'Popular'
+            WHEN pws.ViewCount > 100 THEN 'Moderate'
+            ELSE 'Low'
+        END AS ViewPopularity
+    FROM PostWithRanking pws
+    WHERE pws.ScoreRank <= 100
+),
+CombinedAnalysis AS (
+    SELECT 
+        uaa.UserId,
+        uaa.DisplayName,
+        uaa.Reputation,
+        uaa.TotalPosts,
+        uaa.Questions,
+        uaa.Answers,
+        uaa.TotalQuestionScore,
+        uaa.TotalAnswerScore,
+        uaa.AvgQuestionScore,
+        uaa.AvgAnswerScore,
+        uaa.DaysSinceLastPost,
+        uaa.ActivityLevel,
+        uaa.ReputationLevel,
+        uaa.TagSummary,
+        hsp.PostId,
+        hsp.Title,
+        hsp.Score,
+        hsp.ViewCount,
+        hsp.CreationDate,
+        hsp.PostTypeId,
+        hsp.Tags,
+        hsp.ScoreRank,
+        hsp.TypeRank,
+        hsp.ScoreQuintile,
+        hsp.ScoreChange,
+        hsp.DaysActive,
+        hsp.ViewPopularity,
+        CASE 
+            WHEN hsp.Score > 100 AND hsp.ViewCount > 1000 THEN 'HighImpact'
+            WHEN hsp.Score > 50 AND hsp.ViewCount > 200 THEN 'MediumImpact'
+            ELSE 'LowImpact'
+        END AS PostImpact,
+        ROW_NUMBER() OVER (PARTITION BY uaa.UserId ORDER BY hsp.Score DESC) AS UserTopPostRank
+    FROM UserActivityAnalysis uaa
+    INNER JOIN HighScorePosts hsp ON uaa.UserId = hsp.OwnerUserId
+    WHERE uaa.DaysSinceLastPost <= 30
+)
+SELECT
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.TotalPosts,
+    ca.Questions,
+    ca.Answers,
+    ca.TotalQuestionScore,
+    ca.TotalAnswerScore,
+    ca.AvgQuestionScore,
+    ca.AvgAnswerScore,
+    ca.DaysSinceLastPost,
+    ca.ActivityLevel,
+    ca.ReputationLevel,
+    ca.TagSummary,
+    ca.PostId,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.CreationDate,
+    ca.PostTypeId,
+    ca.Tags,
+    ca.ScoreRank,
+    ca.TypeRank,
+    ca.ScoreQuintile,
+    ca.ScoreChange,
+    ca.DaysActive,
+    ca.ViewPopularity,
+    ca.PostImpact,
+    ca.UserTopPostRank,
+    CASE 
+        WHEN ca.DaysSinceLastPost <= 7 THEN 'VeryRecent'
+        WHEN ca.DaysSinceLastPost <= 30 THEN 'Recent'
+        WHEN ca.DaysSinceLastPost <= 90 THEN 'Moderate'
+        ELSE 'Inactive'
+    END AS RecentActivity,
+    CASE 
+        WHEN ca.ScoreQuintile = 1 THEN 'TopQuintile'
+        WHEN ca.ScoreQuintile = 2 THEN 'SecondQuintile'
+        WHEN ca.ScoreQuintile = 3 THEN 'ThirdQuintile'
+        WHEN ca.ScoreQuintile = 4 THEN 'FourthQuintile'
+        ELSE 'BottomQuintile'
+    END AS ScoreDistribution,
+    CASE 
+        WHEN ca.UserTopPostRank = 1 THEN 'TopPost'
+        WHEN ca.UserTopPostRank = 2 THEN 'SecondPost'
+        WHEN ca.UserTopPostRank = 3 THEN 'ThirdPost'
+        ELSE 'RegularPost'
+    END AS PostPriority,
+    COALESCE(
+        CASE WHEN ca.UserTopPostRank = 1 THEN 'HighestScoring' END,
+        CASE WHEN ca.Score >= 500 THEN 'HighScoring' END,
+        CASE WHEN ca.Score >= 100 THEN 'MediumScoring' END,
+        'LowScoring'
+    ) AS ScoringTier,
+    CONCAT(
+        'User: ', ca.DisplayName, ' | ',
+        'Reputation: ', ca.Reputation, ' | ',
+        'Posts: ', ca.TotalPosts, ' | ',
+        'Score: ', ca.Score, ' | ',
+        'Views: ', ca.ViewCount, ' | ',
+        'PostType: ', CASE WHEN ca.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END, ' | ',
+        'Impact: ', ca.PostImpact
+    ) AS SummaryDescription
+FROM CombinedAnalysis ca
+WHERE EXISTS (
+    SELECT 1 
+    FROM Users u 
+    WHERE u.Id = ca.UserId 
+    AND u.Reputation > (SELECT AVG(Reputation) FROM Users)
+)
+AND ca.Score > (SELECT AVG(Score) FROM Posts)
+AND ca.ViewCount > 0
+AND ca.DaysActive < 365
+ORDER BY 
+    ca.Score DESC,
+    ca.DaysSinceLastPost ASC,
+    ca.UserTopPostRank ASC
+LIMIT 1000;

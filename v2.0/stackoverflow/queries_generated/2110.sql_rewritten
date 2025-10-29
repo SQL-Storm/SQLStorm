@@ -1,0 +1,212 @@
+-- {"query": "2110.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1870} 
+with recursive RecursiveTagPath as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || ' > ' || t2.TagName
+    from Tags t2
+    join RecursiveTagPath r on position(t2.TagName in r.Path) = 0 and t2.IsRequired = 1
+    where r.Level < 3
+),
+PostScoresWithWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank,
+        rank() over (partition by p.OwnerUserId order by p.Score desc nulls last) as UserScoreRank
+    from Posts p
+    where p.PostTypeId in (1, 2) -- questions and answers
+),
+UserBadgeAggregates as (
+    select
+        b.UserId,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        max(b.Date) as LatestBadgeDate
+    from Badges b
+    group by b.UserId
+),
+UserActivity as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        coalesce(u.WebsiteUrl, 'N/A') as WebsiteUrl,
+        coalesce(substring(u.AboutMe, 1, 50), 'No AboutMe') as AboutSnippet,
+        coalesce(u.Views, 0) as Views,
+        coalesce(u.UpVotes,0) as UpVotes,
+        coalesce(u.DownVotes, 0) as DownVotes,
+        coalesce(b.GoldBadges, 0) as GoldBadges,
+        coalesce(b.SilverBadges, 0) as SilverBadges,
+        coalesce(b.BronzeBadges, 0) as BronzeBadges,
+        b.LatestBadgeDate,
+        case 
+            when u.LastAccessDate::date = cast('2024-10-01' as date) then 'Active Today'
+            when u.LastAccessDate::date >= cast('2024-10-01' as date) - interval '7 days' then 'Active This Week'
+            else 'Inactive >1 week'
+        end as ActivityStatus,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId in (10,11)) as CloseReopenCount
+    from Users u
+    left join UserBadgeAggregates b on b.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.WebsiteUrl, u.AboutMe, u.Views, u.UpVotes, u.DownVotes, b.GoldBadges, b.SilverBadges, b.BronzeBadges, b.LatestBadgeDate
+),
+TopPostsWithComments as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        c.CommentCount,
+        coalesce(c.CommentTopText, '') as TopCommentText,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        pl.LinkCount,
+        pl.DuplicateCount
+    from Posts p
+    left join (
+        select 
+            PostId,
+            count(*) as CommentCount,
+            max(Text) as CommentTopText
+        from Comments
+        group by PostId
+    ) c on c.PostId = p.Id
+    left join (
+        select 
+            PostId,
+            count(*) filter (where LinkTypeId = 1) as LinkCount,
+            count(*) filter (where LinkTypeId = 3) as DuplicateCount
+        from PostLinks
+        group by PostId
+    ) pl on pl.PostId = p.Id
+    where p.Score > 10
+),
+ComplexJoinAndFilters as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        b.Name as BadgeName,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as EditDate,
+        ph.Comment as CloseReason,
+        l.Name as LinkTypeName,
+        vt.Name as VoteTypeName,
+        case when v.VoteTypeId = 2 then 'UpVote' else 'OtherVote' end as VoteCategory,
+        row_number() over (partition by u.Id order by ph.CreationDate desc) as RecentEditRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id and b.Date > cast('2024-10-01' as date) - interval '90 days'
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (4,5,6,10,11)
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes l on l.Id = pl.LinkTypeId
+    left join Votes v on v.PostId = p.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    where u.Reputation > 1000
+      and (ph.PostHistoryTypeId is null or ph.CreationDate > p.CreationDate)
+      and (p.Tags is not null and length(p.Tags) > 0)
+),
+CorrelatedSubqueries as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        (select count(*) from Comments c where c.PostId = p.Id and c.Score > 0) as PositiveCommentsCount,
+        (select max(Score) from Votes v where v.PostId = p.Id) as MaxVoteScore,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as UpVoteCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVoteCount
+    from Posts p
+    where p.PostTypeId = 1
+),
+FinalResult as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.ActivityStatus,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        tp.PostId,
+        tp.PostTypeId,
+        tp.Title,
+        tp.Score,
+        tp.ViewCount,
+        tp.CommentCount,
+        tp.IsClosed,
+        cj.BadgeName,
+        cj.PostHistoryTypeId,
+        cj.CloseReason,
+        cj.LinkTypeName,
+        cj.VoteCategory,
+        cs.PositiveCommentsCount,
+        cs.UpVoteCount,
+        cs.DownVoteCount,
+        rtp.Level as TagLevel,
+        rtp.Path as TagHierarchy
+    from UserActivity ua
+    join TopPostsWithComments tp on tp.OwnerUserId = ua.Id
+    left join ComplexJoinAndFilters cj on cj.UserId = ua.Id and cj.PostId = tp.PostId
+    left join CorrelatedSubqueries cs on cs.PostId = tp.PostId
+    left join RecursiveTagPath rtp on position(rtp.TagName in tp.Tags) > 0
+    where ua.GoldBadges + ua.SilverBadges + ua.BronzeBadges > 0
+      and (tp.Score > 50 or tp.ViewCount > 500)
+)
+select 
+    UserId,
+    DisplayName,
+    Reputation,
+    ActivityStatus,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    PostId,
+    PostTypeId,
+    substring(Title, 1, 80) as TitleSnippet,
+    Score,
+    ViewCount,
+    CommentCount,
+    IsClosed,
+    coalesce(BadgeName, 'No recent badge') as RecentBadge,
+    PostHistoryTypeId,
+    CloseReason,
+    LinkTypeName,
+    VoteCategory,
+    PositiveCommentsCount,
+    UpVoteCount,
+    DownVoteCount,
+    TagLevel,
+    TagHierarchy
+from FinalResult
+order by Reputation desc, Score desc nulls last, ViewCount desc nulls last
+limit 100;

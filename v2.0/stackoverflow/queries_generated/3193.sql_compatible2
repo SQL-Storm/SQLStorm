@@ -1,0 +1,152 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.CreationDate, TIMESTAMP '1970-01-01') AS Created,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScoreSum,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScoreSum,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b      ON b.UserId = u.Id
+    LEFT JOIN Posts  p      ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+RankedUsers AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.Created,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.QuestionScoreSum,
+        us.AnswerScoreSum,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.GoldBadges DESC, us.SilverBadges DESC) AS ReputationRank,
+        CASE
+            WHEN us.QuestionCount = 0 THEN NULL
+            ELSE CAST(us.AnswerCount AS DECIMAL) / us.QuestionCount
+        END AS AnswerRatio
+    FROM UserStats us
+),
+RecentActivity AS (
+    SELECT
+        u.Id,
+        MAX(v.CreationDate) FILTER (WHERE v.VoteTypeId = 2)               AS LastUpvoteDate,
+        MAX(c.CreationDate) FILTER (WHERE c.Score >= 5)                  AS LastHighScoreCommentDate
+    FROM Users u
+    LEFT JOIN Votes    v ON v.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id
+),
+PostTags AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        NULLIF(TRIM(BOTH '<>' FROM p.Tags), '') AS Tags
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.Tags IS NOT NULL
+),
+SplitTags AS (
+    -- recursive split on '><' boundaries originally produced by tags like '<tag1><tag2>'
+    SELECT
+        UserId,
+        CASE
+            WHEN Tags LIKE '<%>' AND POSITION('><' IN Tags) > 0 THEN SUBSTRING(Tags FROM 2 FOR POSITION('><' IN Tags) - 2)
+            WHEN Tags LIKE '<%>' THEN SUBSTRING(Tags FROM 2 FOR CHAR_LENGTH(Tags)-2)
+            ELSE TRIM(BOTH '<>' FROM Tags)
+        END AS tag,
+        CASE
+            WHEN POSITION('><' IN Tags) > 0 THEN SUBSTRING(Tags FROM POSITION('><' IN Tags) + 2)
+            ELSE NULL
+        END AS rest
+    FROM PostTags
+    WHERE Tags IS NOT NULL
+    UNION ALL
+    SELECT
+        st.UserId,
+        CASE
+            WHEN st.rest LIKE '<%>' AND POSITION('><' IN st.rest) > 0 THEN SUBSTRING(st.rest FROM 2 FOR POSITION('><' IN st.rest) - 2)
+            WHEN st.rest LIKE '<%>' THEN SUBSTRING(st.rest FROM 2 FOR CHAR_LENGTH(st.rest)-2)
+            ELSE TRIM(BOTH '<>' FROM st.rest)
+        END AS tag,
+        CASE
+            WHEN POSITION('><' IN st.rest) > 0 THEN SUBSTRING(st.rest FROM POSITION('><' IN st.rest) + 2)
+            ELSE NULL
+        END AS rest
+    FROM SplitTags st
+    WHERE st.rest IS NOT NULL AND st.rest <> ''
+),
+TopTags AS (
+    SELECT
+        s.UserId,
+        STRING_AGG(DISTINCT t.TagName, ',') AS TopTagList
+    FROM SplitTags s
+    JOIN Tags t ON t.TagName = s.tag
+    GROUP BY s.UserId
+)
+SELECT
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.ReputationRank,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.QuestionScoreSum,
+    ru.AnswerScoreSum,
+    ru.AnswerRatio,
+    COALESCE(tt.TopTagList, '(none)')                     AS TopTags,
+    ra.LastUpvoteDate,
+    ra.LastHighScoreCommentDate,
+    (SELECT p.Title
+        FROM Posts p
+        WHERE p.OwnerUserId = ru.Id
+          AND p.PostTypeId = 1
+        ORDER BY p.CreationDate DESC
+        LIMIT 1)                                         AS LatestQuestionTitle,
+    CASE
+        WHEN ru.LastPostDate IS NULL                      THEN 'Never posted'
+        WHEN ru.LastPostDate < (CAST('2024-10-01' AS DATE) - INTERVAL '1 year') THEN 'Inactive >1y'
+        ELSE 'Active'
+    END                                                AS ActivityStatus
+FROM RankedUsers ru
+LEFT JOIN RecentActivity ra ON ra.Id = ru.Id
+LEFT JOIN TopTags tt       ON tt.UserId = ru.Id
+WHERE ru.ReputationRank <= 1000
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    NULL AS ReputationRank,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0 AS QuestionScoreSum,
+    0 AS AnswerScoreSum,
+    NULL AS AnswerRatio,
+    NULL AS TopTags,
+    NULL AS LastUpvoteDate,
+    NULL AS LastHighScoreCommentDate,
+    NULL AS LatestQuestionTitle,
+    CASE
+        WHEN u.Reputation < 100 THEN 'LowRep'
+        ELSE 'MidRep'
+    END                                            AS ActivityStatus
+FROM Users u
+WHERE u.Reputation BETWEEN 10 AND 50
+  AND NOT EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id)
+
+ORDER BY Reputation DESC NULLS LAST, GoldBadges DESC, SilverBadges DESC
+LIMIT 200;

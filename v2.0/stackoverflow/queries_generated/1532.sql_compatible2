@@ -1,0 +1,212 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS TotalQuestionsPosted,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalAnswersPosted,
+        COALESCE(COUNT(DISTINCT P.Id), 0) AS TotalPostsCreated,
+        COALESCE(COUNT(DISTINCT C.Id), 0) AS TotalCommentsMade,
+        COALESCE(SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        MAX(U.LastAccessDate) AS LastRecordedActivityDate,
+        DENSE_RANK() OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS ReputationRank
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostEngagementMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS InitialScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS OriginalCommentCount,
+        P.FavoriteCount,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        LENGTH(P.Body) AS BodyLength,
+        NULLIF(LENGTH(P.Title), 0) AS TitleLength,
+        CASE
+            WHEN P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+            THEN (
+                -- split tags like "<tag1><tag2>" into array of tag strings in a portable way
+                -- useregexp to replace leading/trailing angle brackets then split on "><" where supported
+                -- fallback to NULL if split function is not available in target dialects
+                regexp_split_to_array(substring(P.Tags FROM 2 FOR (char_length(P.Tags) - 2)), '><')
+            )
+            ELSE NULL
+        END AS PostTagsArray,
+        COALESCE(COUNT(DISTINCT C.Id), 0) AS TotalCommentsOnPost,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 WHEN V.VoteTypeId = 3 THEN -1 ELSE 0 END), 0) AS NetVotesReceived,
+        AVG(C.Score) FILTER (WHERE C.Id IS NOT NULL) AS AverageCommentScoreOnPost,
+        MAX(C.CreationDate) FILTER (WHERE C.Id IS NOT NULL) AS LastCommentDate,
+        NTILE(5) OVER (PARTITION BY P.PostTypeId ORDER BY P.ViewCount DESC) AS ViewCountQuintile,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate DESC) AS UserPostSequence
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId IN (2,3)
+    GROUP BY P.Id, P.PostTypeId, PT.Name, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount,
+             P.AnswerCount, P.CommentCount, P.FavoriteCount, P.LastEditDate, P.LastActivityDate,
+             P.ClosedDate, P.Body, P.Title, P.Tags
+),
+PostHistoryDetails AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditRevisions,
+        MAX(PH.CreationDate) AS LastHistoryUpdate,
+        MIN(PH.CreationDate) AS FirstHistoryUpdate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN (
+                SELECT CR.Name FROM CloseReasonTypes CR WHERE CR.Id = CAST(PH.Comment AS INTEGER)
+            ) ELSE NULL END) AS ActualCloseReasonName,
+        COALESCE(MAX(CASE WHEN PH.PostHistoryTypeId IN (10,12) THEN 1 ELSE 0 END), 0) AS WasClosedOrDeletedFlag,
+        COALESCE(MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END), 0) AS WasClosed,
+        COALESCE(MAX(CASE WHEN PH.PostHistoryTypeId = 12 THEN 1 ELSE 0 END), 0) AS WasDeleted
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+PostHistoryPrevious AS (
+    SELECT
+        ph1.PostId,
+        ph1.Id AS HistoryId,
+        ph1.CreationDate,
+        LAG(ph1.CreationDate) OVER (PARTITION BY ph1.PostId ORDER BY ph1.CreationDate) AS PreviousHistoryEntryDate
+    FROM PostHistory ph1
+),
+PostHistoryPrevLatest AS (
+    SELECT
+        php.PostId,
+        MAX(php.PreviousHistoryEntryDate) AS PreviousHistoryEntryDate
+    FROM PostHistoryPrevious php
+    GROUP BY php.PostId
+),
+DailyEngagementSnapshot AS (
+    SELECT
+        date_trunc('day', P.CreationDate) AS SnapshotDate,
+        P.PostTypeId,
+        COUNT(P.Id) AS PostsCreatedDaily,
+        SUM(P.Score) AS TotalDailyScore,
+        AVG(P.ViewCount) FILTER (WHERE P.ViewCount IS NOT NULL) AS AvgDailyViewCount,
+        SUM(COALESCE(P.AnswerCount, 0)) AS TotalDailyAnswersOnQuestions,
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY COUNT(P.Id) DESC) AS DailyPostCreationRank
+    FROM Posts P
+    WHERE P.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 year')
+    GROUP BY date_trunc('day', P.CreationDate), P.PostTypeId
+    HAVING COUNT(P.Id) > 10
+),
+RelevantLinkedPosts AS (
+    SELECT
+        PL.PostId,
+        COUNT(DISTINCT PL.RelatedPostId) AS LinkedRelatedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinksCount,
+        MAX(RLP.Score) AS MaxRelatedPostScore,
+        AVG(RLP.Score) AS AvgRelatedPostScore
+    FROM PostLinks PL
+    JOIN Posts RLP ON PL.RelatedPostId = RLP.Id
+    WHERE PL.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months')
+    GROUP BY PL.PostId
+),
+TopTagsSummary AS (
+    SELECT
+        t.tag AS TagName,
+        COUNT(P.Id) AS TaggedPostsCount,
+        SUM(P.ViewCount) AS TotalTagViews,
+        AVG(P.Score) AS AvgTagScore,
+        SUM(P.AnswerCount) AS TotalAnswersInTag,
+        DENSE_RANK() OVER (ORDER BY COUNT(P.Id) DESC, SUM(P.ViewCount) DESC) AS TagPopularityRank
+    FROM Posts P,
+         LATERAL (
+           SELECT unnest(regexp_split_to_array(substring(P.Tags FROM 2 FOR (char_length(P.Tags) - 2)), '><')) AS tag
+         ) AS t
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY t.tag
+    HAVING COUNT(P.Id) > 500
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.TotalPostsCreated,
+    UAS.TotalQuestionsPosted,
+    UAS.TotalAnswersPosted,
+    UAS.GoldBadges,
+    UAS.SilverBadges,
+    UAS.BronzeBadges,
+    UAS.ReputationRank,
+    PEG.PostId,
+    PEG.PostTypeName,
+    PEG.PostCreationDate,
+    PEG.InitialScore,
+    PEG.NetVotesReceived,
+    PEG.TotalCommentsOnPost,
+    PEG.BodyLength,
+    PEG.TitleLength,
+    PEG.FavoriteCount,
+    PEG.AverageCommentScoreOnPost,
+    PEG.ViewCountQuintile,
+    PEG.UserPostSequence,
+    PHD.TotalEditRevisions,
+    PHD.ActualCloseReasonName,
+    PHD.WasClosed,
+    PHD.WasDeleted,
+    -- AGE may not be available in all dialects; compute interval as timestamp subtraction where supported
+    (CAST('2024-10-01 12:34:56' AS timestamp) - PHD.LastHistoryUpdate) AS TimeSinceLastHistoryUpdate,
+    EXTRACT(EPOCH FROM (PEG.LastCommentDate - PEG.PostCreationDate))/3600.0 AS HoursUntilFirstComment,
+    DPA.SnapshotDate AS DailyActivityDate,
+    DPA.PostsCreatedDaily,
+    DPA.AvgDailyViewCount,
+    RLP.LinkedRelatedPostsCount,
+    RLP.DuplicateLinksCount,
+    RLP.MaxRelatedPostScore,
+    TTS.TagName AS TopRelevantTag,
+    TTS.TaggedPostsCount AS TopTagPostCount,
+    TTS.TagPopularityRank,
+    (UAS.Reputation * 0.1 + UAS.TotalPostsCreated * 0.5 + UAS.GoldBadges * 10 + UAS.SilverBadges * 5 + UAS.BronzeBadges) AS UserActivityWeightedScore,
+    COALESCE(NULLIF(PEG.ViewCount, 0) / NULLIF(PEG.TotalCommentsOnPost, 0), 0.0) AS ViewToCommentRatio,
+    CASE
+        WHEN UAS.Reputation > 50000 AND UAS.GoldBadges >= 10 AND PEG.NetVotesReceived > 100 THEN 'Legendary Contributor'
+        WHEN UAS.Reputation > 10000 AND UAS.TotalPostsCreated > 100 AND PEG.PostTypeName = 'Question' AND PEG.NetVotesReceived > 50 THEN 'High-Impact Questioner'
+        WHEN UAS.Reputation > 5000 AND PEG.TotalCommentsOnPost > 20 THEN 'Engaged Commenter'
+        WHEN UAS.Reputation IS NULL OR UAS.Reputation <= 100 OR UAS.TotalPostsCreated < 5 THEN 'Newcomer/Lurker'
+        ELSE 'Regular Participant'
+    END AS UserRoleClassification
+FROM UserActivitySummary UAS
+LEFT JOIN PostEngagementMetrics PEG ON UAS.UserId = PEG.OwnerUserId
+LEFT JOIN PostHistoryDetails PHD ON PEG.PostId = PHD.PostId
+LEFT JOIN PostHistoryPrevLatest PHPL ON PEG.PostId = PHPL.PostId
+LEFT JOIN DailyEngagementSnapshot DPA ON date_trunc('day', PEG.PostCreationDate) = DPA.SnapshotDate AND PEG.PostTypeId = DPA.PostTypeId
+LEFT JOIN RelevantLinkedPosts RLP ON PEG.PostId = RLP.PostId
+LEFT JOIN TopTagsSummary TTS ON EXISTS (
+    SELECT 1
+    FROM unnest(COALESCE(PEG.PostTagsArray, array[]::text[])) AS pt(tag)
+    WHERE pt.tag = TTS.TagName
+)
+WHERE
+    UAS.Reputation >= 1000
+    AND UAS.LastRecordedActivityDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months')
+    AND PEG.PostTypeId IS NOT NULL
+    AND (PEG.BodyLength > 100 OR PEG.PostTypeName = 'Answer')
+    AND NOT (PHD.WasClosed = 1 AND PHD.WasDeleted = 1)
+    AND (PEG.AverageCommentScoreOnPost IS NULL OR PEG.AverageCommentScoreOnPost > -2)
+    AND PEG.ViewCount > 50
+ORDER BY
+    UAS.Reputation DESC,
+    UserActivityWeightedScore DESC,
+    PEG.NetVotesReceived DESC NULLS LAST,
+    PHD.LastHistoryUpdate DESC
+LIMIT 5000;

@@ -1,0 +1,47 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(ph.CreationDate) AS LatestPostEdit,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate,
+    MAX(p.LastActivityDate) AS LastPostActivity,
+    STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.TagName DESC) AS Tags,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.UserId ELSE NULL END) AS UpVotesCount,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.UserId ELSE NULL END) AS DownVotesCount,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId ELSE NULL END) AS DuplicatePostsCount,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.TagName ELSE NULL END) AS TagBasedBadges,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 0 THEN b.TagName ELSE NULL END) AS NamedBadges
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+WHERE 
+    u.Reputation > 1000
+    AND u.LastAccessDate > (DATE '2024-10-01' - INTERVAL '6' MONTH)
+    AND p.CreationDate > (DATE '2024-10-01' - INTERVAL '1' YEAR)
+    AND ph.PostHistoryTypeId IN (1, 2, 4, 5, 6, 10, 11, 12)
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.CreationDate
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC;

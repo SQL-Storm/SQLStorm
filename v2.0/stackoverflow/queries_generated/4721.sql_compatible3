@@ -1,0 +1,105 @@
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn,
+        LAG(ph.CreationDate, 1, ph.CreationDate) OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate) AS PreviousEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(u.LastAccessDate) AS LastSeen,
+        MAX(u.CreationDate) AS CreationDate,
+        MAX(u.Location) AS Location
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+        COUNT(DISTINCT c.Id) AS CommentCountPerPost,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        p.OwnerUserId
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY p.Id, p.Title, p.Score, p.CommentCount, p.FavoriteCount, p.AnswerCount, p.ClosedDate, p.OwnerUserId
+)
+SELECT
+    uas.DisplayName AS UserDisplayName,
+    uas.Reputation,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    uas.TotalBadges,
+    uas.LastSeen,
+    pe.Title AS LatestQuestionTitle,
+    pe.Score AS LatestQuestionScore,
+    pe.CommentCountPerPost,
+    pe.UpVoteCount,
+    pe.DownVoteCount,
+    pe.PostStatus,
+    rpe.CreationDate AS LatestEditDate,
+    rpe.rn AS EditSequenceNumber,
+    CASE
+        WHEN rpe.rn > 1 THEN
+            CAST(EXTRACT(EPOCH FROM (rpe.CreationDate - rpe.PreviousEditDate)) AS NUMERIC)
+        ELSE
+            NULL
+    END AS TimeSincePreviousEditSeconds,
+    CASE
+        WHEN uas.DisplayName IS NULL THEN 'Anonymous'
+        WHEN uas.Reputation > 10000 THEN UPPER(SUBSTRING(uas.DisplayName FROM 1 FOR 3)) || '...' || LOWER(SUBSTRING(uas.DisplayName FROM (CHAR_LENGTH(uas.DisplayName) - 2) FOR 3))
+        WHEN uas.Reputation BETWEEN 1000 AND 10000 THEN 'User-' || CAST(uas.UserId AS VARCHAR)
+        ELSE 'New User'
+    END AS UserIdentifier,
+    RANK() OVER(PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRankByScore
+FROM UserActivitySummary uas
+JOIN PostEngagement pe ON uas.UserId = pe.OwnerUserId
+LEFT JOIN RankedPostEdits rpe ON uas.UserId = rpe.UserId AND pe.PostId = rpe.PostId AND rpe.rn = 1
+LEFT JOIN Posts p ON uas.UserId = p.OwnerUserId
+WHERE uas.CreationDate < DATE '2023-01-01'
+  AND uas.Location IS NOT NULL
+  AND pe.Score > 0
+  AND EXISTS (SELECT 1 FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 2)
+UNION
+SELECT
+    NULL AS UserDisplayName,
+    NULL AS Reputation,
+    NULL AS TotalQuestions,
+    NULL AS TotalAnswers,
+    NULL AS TotalBadges,
+    NULL AS LastSeen,
+    'Community Owned Question' AS LatestQuestionTitle,
+    NULL AS LatestQuestionScore,
+    NULL AS CommentCountPerPost,
+    NULL AS UpVoteCount,
+    NULL AS DownVoteCount,
+    'Open' AS PostStatus,
+    NULL AS LatestEditDate,
+    NULL AS EditSequenceNumber,
+    NULL AS TimeSincePreviousEditSeconds,
+    'Community' AS UserIdentifier,
+    NULL AS PostRankByScore
+FROM Posts p
+WHERE p.OwnerUserId = -1
+  AND p.PostTypeId = 1
+  AND p.CreationDate > DATE '2022-01-01'
+ORDER BY UserDisplayName, LatestEditDate DESC;

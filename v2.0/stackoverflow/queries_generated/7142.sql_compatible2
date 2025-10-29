@@ -1,0 +1,250 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(DISTINCT CAST(p.PostTypeId AS varchar), ',') AS PostTypes,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) AS PositiveScoredPosts,
+        COUNT(DISTINCT CASE WHEN p.Score < 0 THEN p.Id END) AS NegativeScoredPosts
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        LastCommentDate,
+        PostTypes,
+        QuestionCount,
+        AnswerCount,
+        AvgPostScore,
+        TotalViews,
+        PositiveScoredPosts,
+        NegativeScoredPosts,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) AS RepRank,
+        DENSE_RANK() OVER (ORDER BY PostCount DESC) AS PostRank,
+        DENSE_RANK() OVER (ORDER BY BadgeCount DESC) AS BadgeRank
+    FROM UserActivityStats
+    WHERE PostCount > 0 OR CommentCount > 0 OR BadgeCount > 0
+),
+PostDetails AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        CASE WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+            CARDINALITY(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><'))
+        ELSE 0 END AS TagCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+            WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+            WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+            ELSE 'Unknown'
+        END AS PostTypeDesc,
+        CASE 
+            WHEN p.Score >= 100 THEN 'High'
+            WHEN p.Score >= 20 THEN 'Medium'
+            WHEN p.Score >= 0 THEN 'Low'
+            ELSE 'Negative'
+        END AS ScoreCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS UserPostSequence,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScorePerUser,
+        MAX(p.CreationDate) OVER (PARTITION BY p.OwnerUserId) AS LastPostByUser,
+        MIN(p.CreationDate) OVER (PARTITION BY p.OwnerUserId) AS FirstPostByUser
+    FROM Posts p
+    WHERE p.CreationDate >= DATE '2018-01-01'
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        pd.PostId,
+        pd.Title,
+        pd.Body,
+        pd.Score,
+        pd.ViewCount,
+        pd.AnswerCount,
+        pd.CommentCount,
+        pd.FavoriteCount,
+        pd.CreationDate,
+        pd.OwnerUserId,
+        pd.PostTypeId,
+        pd.Tags,
+        pd.ParentId,
+        pd.AcceptedAnswerId,
+        pd.LastEditDate,
+        pd.LastActivityDate,
+        pd.TagCount,
+        pd.PostTypeDesc,
+        pd.ScoreCategory,
+        pd.UserPostSequence,
+        pd.PrevScore,
+        pd.NextScore,
+        pd.AvgScorePerUser,
+        pd.LastPostByUser,
+        pd.FirstPostByUser,
+        CASE 
+            WHEN pd.Score > 0 AND pd.CommentCount > 0 THEN 'Highly Engaged'
+            WHEN pd.Score > 0 AND pd.CommentCount = 0 THEN 'Popular but Quiet'
+            WHEN pd.Score <= 0 AND pd.CommentCount > 0 THEN 'Controversial but Discussed'
+            WHEN pd.Score <= 0 AND pd.CommentCount = 0 THEN 'Unpopular and Silent'
+            ELSE 'Unknown'
+        END AS EngagementCategory,
+        CASE 
+            WHEN pd.LastActivityDate >= DATE '2023-01-01' THEN 'Active'
+            WHEN pd.LastActivityDate >= DATE '2022-01-01' THEN 'Recently Active'
+            WHEN pd.LastActivityDate >= DATE '2021-01-01' THEN 'Inactive'
+            ELSE 'Very Inactive'
+        END AS ActivityStatus,
+        CASE 
+            WHEN pd.ParentId IS NOT NULL THEN 
+                'Answer to Question: ' || (
+                    SELECT p2.Title 
+                    FROM Posts p2 
+                    WHERE p2.Id = pd.ParentId 
+                      AND p2.PostTypeId = 1
+                    LIMIT 1
+                )
+            WHEN pd.AcceptedAnswerId IS NOT NULL THEN 
+                'Question with Accepted Answer'
+            ELSE 'Standalone Question'
+        END AS PostRelationship,
+        STRING_AGG(
+            CASE 
+                WHEN pd.Tags IS NOT NULL AND pd.Tags <> '' THEN 
+                    SUBSTRING(p2.TagName FROM 1 FOR 15)
+                ELSE NULL
+            END, 
+            ', '
+        ) AS TagNames
+    FROM PostDetails pd
+    LEFT JOIN Tags p2 ON 
+        pd.Tags IS NOT NULL 
+        AND pd.Tags <> '' 
+        AND p2.TagName = ANY(string_to_array(substring(pd.Tags FROM 2 FOR char_length(pd.Tags)-2), '><'))
+    GROUP BY 
+        pd.PostId,
+        pd.Title,
+        pd.Body,
+        pd.Score,
+        pd.ViewCount,
+        pd.AnswerCount,
+        pd.CommentCount,
+        pd.FavoriteCount,
+        pd.CreationDate,
+        pd.OwnerUserId,
+        pd.PostTypeId,
+        pd.Tags,
+        pd.ParentId,
+        pd.AcceptedAnswerId,
+        pd.LastEditDate,
+        pd.LastActivityDate,
+        pd.TagCount,
+        pd.PostTypeDesc,
+        pd.ScoreCategory,
+        pd.UserPostSequence,
+        pd.PrevScore,
+        pd.NextScore,
+        pd.AvgScorePerUser,
+        pd.LastPostByUser,
+        pd.FirstPostByUser
+)
+SELECT 
+    'Performance Benchmark Query Results' AS QueryTitle,
+    COUNT(*) AS TotalPosts,
+    COUNT(DISTINCT ca.OwnerUserId) AS ActiveUsers,
+    AVG(ca.Score) AS AverageScore,
+    AVG(ca.ViewCount) AS AverageViews,
+    MAX(ca.ViewCount) AS MaxViews,
+    MIN(ca.ViewCount) AS MinViews,
+    SUM(CASE WHEN ca.Score > 0 THEN ca.ViewCount ELSE 0 END) AS PositiveScoreViewTotal,
+    SUM(CASE WHEN ca.Score <= 0 THEN ca.ViewCount ELSE 0 END) AS NegativeScoreViewTotal,
+    AVG(CASE WHEN ca.TagCount > 0 THEN ca.TagCount ELSE NULL END) AS AverageTagCount,
+    STRING_AGG(
+        CASE 
+            WHEN ca.ActivityStatus = 'Active' THEN ca.PostTypeDesc || '(' || CAST(ca.Score AS varchar) || ')'
+            ELSE NULL
+        END, 
+        ', '
+    ) AS ActivePostDetails,
+    COUNT(CASE WHEN ca.PostRelationship LIKE '%Answer%' THEN 1 END) AS AnswerCount,
+    COUNT(CASE WHEN ca.PostRelationship LIKE '%Question%' THEN 1 END) AS QuestionCount,
+    COUNT(CASE WHEN ca.Score >= 100 THEN 1 END) AS HighScorePosts,
+    COUNT(CASE WHEN ca.ScoreCategory = 'High' THEN 1 END) AS HighScoreCategoryPosts,
+    COUNT(CASE WHEN ca.EngagementCategory = 'Highly Engaged' THEN 1 END) AS HighlyEngagedPosts,
+    (
+        SELECT COUNT(*) 
+        FROM TopUsers tu 
+        WHERE tu.RepRank <= 5
+    ) AS Top5ReputationUsers,
+    (
+        SELECT COUNT(*) 
+        FROM TopUsers tu 
+        WHERE tu.PostRank <= 10
+    ) AS Top10PostUsers,
+    (
+        SELECT AVG(RepRank)
+        FROM TopUsers tu
+    ) AS AverageUserRepRank,
+    (
+        SELECT AVG(PostRank)
+        FROM TopUsers tu
+    ) AS AverageUserPostRank,
+    COUNT(*) OVER () AS DatasetSize
+FROM ComplexPostAnalysis ca
+WHERE ca.CreationDate >= DATE '2020-01-01'
+    AND (
+        ca.Score >= 10 
+        OR ca.ViewCount >= 100 
+        OR ca.AnswerCount >= 1 
+        OR ca.CommentCount >= 1
+    )
+GROUP BY 
+    ca.Score,
+    ca.ViewCount,
+    ca.PostTypeDesc,
+    ca.ActivityStatus,
+    ca.PostRelationship,
+    ca.ScoreCategory,
+    ca.EngagementCategory
+HAVING COUNT(*) > 0
+ORDER BY 
+    COUNT(*) DESC,
+    AVG(ca.Score) DESC
+LIMIT 100;

@@ -1,0 +1,115 @@
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           /* badge counts per class */
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+           /* post counts */
+           (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+           (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+-- Split tags using a generic method: cross join a generated numbers sequence to extract tags between <>.
+PostTags AS (
+    SELECT p.OwnerUserId AS UserId,
+           -- remove leading/trailing <> then extract nth tag using regexp_extract (pattern group 1)
+           REGEXP_EXTRACT(TRIM(BOTH '<>' FROM p.Tags), '([^><]+)', seq.n) AS Tag
+    FROM Posts p
+    JOIN (
+        -- generate a sequence 1..50 (adjust if posts can have more than 50 tags)
+        SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+        UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+        UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+        UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19 UNION ALL SELECT 20
+        UNION ALL SELECT 21 UNION ALL SELECT 22 UNION ALL SELECT 23 UNION ALL SELECT 24 UNION ALL SELECT 25
+        UNION ALL SELECT 26 UNION ALL SELECT 27 UNION ALL SELECT 28 UNION ALL SELECT 29 UNION ALL SELECT 30
+        UNION ALL SELECT 31 UNION ALL SELECT 32 UNION ALL SELECT 33 UNION ALL SELECT 34 UNION ALL SELECT 35
+        UNION ALL SELECT 36 UNION ALL SELECT 37 UNION ALL SELECT 38 UNION ALL SELECT 39 UNION ALL SELECT 40
+        UNION ALL SELECT 41 UNION ALL SELECT 42 UNION ALL SELECT 43 UNION ALL SELECT 44 UNION ALL SELECT 45
+        UNION ALL SELECT 46 UNION ALL SELECT 47 UNION ALL SELECT 48 UNION ALL SELECT 49 UNION ALL SELECT 50
+    ) AS seq
+    ON TRIM(BOTH '<>' FROM p.Tags) <> '' -- ensure tags exist
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+      AND REGEXP_EXTRACT(TRIM(BOTH '<>' FROM p.Tags), '([^><]+)', seq.n) IS NOT NULL
+),
+TagUsage AS (
+    SELECT pt.UserId,
+           pt.Tag,
+           COUNT(*) AS TagCount
+    FROM PostTags pt
+    GROUP BY pt.UserId, pt.Tag
+),
+RecentPosts AS (
+    SELECT p.Id,
+           p.OwnerUserId,
+           p.Title,
+           p.CreationDate,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+VoteAgg AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes,
+           SUM(CASE WHEN vt.Id = 5 THEN 1 ELSE 0 END) AS Favorites
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+)
+SELECT us.Id                                 AS UserId,
+       us.DisplayName,
+       us.Reputation,
+       us.GoldBadges,
+       us.SilverBadges,
+       us.BronzeBadges,
+       us.QuestionCount,
+       us.AnswerCount,
+       COALESCE(rp.Title, 'No recent post')  AS RecentPostTitle,
+       COALESCE(rp.CreationDate,
+                TIMESTAMP '1970-01-01')      AS RecentPostDate,
+       COALESCE(va.UpVotes, 0)               AS RecentPostUpVotes,
+       COALESCE(va.DownVotes, 0)             AS RecentPostDownVotes,
+       COALESCE(va.Favorites, 0)             AS RecentPostFavorites,
+       tu.Tag,
+       tu.TagCount
+FROM UserStats us
+LEFT JOIN RecentPosts rp
+       ON rp.OwnerUserId = us.Id AND rp.rn = 1
+LEFT JOIN VoteAgg va
+       ON va.PostId = rp.Id
+LEFT JOIN (
+    SELECT t.UserId,
+           t.Tag,
+           t.TagCount,
+           ROW_NUMBER() OVER (PARTITION BY t.UserId ORDER BY t.TagCount DESC, t.Tag) AS rn_tag
+    FROM TagUsage t
+) tu
+       ON tu.UserId = us.Id AND tu.rn_tag = 1
+WHERE (us.Reputation IS NOT NULL AND us.Reputation > 0)
+  AND (us.GoldBadges + us.SilverBadges + us.BronzeBadges) > 5
+
+UNION ALL
+
+SELECT CAST(NULL AS BIGINT) AS UserId,
+       'Aggregate Summary' AS DisplayName,
+       CAST(NULL AS NUMERIC) AS Reputation,
+       SUM(GoldBadges) AS GoldBadges,
+       SUM(SilverBadges) AS SilverBadges,
+       SUM(BronzeBadges) AS BronzeBadges,
+       SUM(QuestionCount) AS QuestionCount,
+       SUM(AnswerCount) AS AnswerCount,
+       CAST(NULL AS TEXT) AS RecentPostTitle,
+       CAST(NULL AS TIMESTAMP) AS RecentPostDate,
+       CAST(NULL AS BIGINT) AS RecentPostUpVotes,
+       CAST(NULL AS BIGINT) AS RecentPostDownVotes,
+       CAST(NULL AS BIGINT) AS RecentPostFavorites,
+       CAST(NULL AS TEXT) AS Tag,
+       CAST(NULL AS BIGINT) AS TagCount
+FROM UserStats
+ORDER BY Reputation DESC NULLS LAST
+LIMIT 100;

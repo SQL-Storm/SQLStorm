@@ -1,0 +1,246 @@
+-- {"query": "1801.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3445} 
+
+WITH UserPostStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore,
+        COUNT(DISTINCT t.Tag) AS DistinctTagsContributed,
+        MAX(p.LastActivityDate) AS LastPostActivityDate,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoriteCount,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedPostsCount,
+        MAX(p.CreationDate) AS LatestPostCreationDate
+    FROM
+        Posts p
+    LEFT JOIN LATERAL UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS t(Tag)
+        ON p.PostTypeId = 1 -- Only questions have tags in this format
+    WHERE
+        p.OwnerUserId IS NOT NULL
+    GROUP BY
+        p.OwnerUserId
+),
+UserCommentStats AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS TotalComments,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate,
+        SUM(CASE WHEN c.Text ILIKE '%thank you%' THEN 1 ELSE 0 END) AS ThanksCommentsCount
+    FROM
+        Comments c
+    WHERE
+        c.UserId IS NOT NULL
+    GROUP BY
+        c.UserId
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadges,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+MonthlyActivityBase AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        DATE_TRUNC('month', p.CreationDate) AS ActivityMonth,
+        COUNT(p.Id) AS MonthlyPosts,
+        SUM(p.Score) AS MonthlyScore
+    FROM
+        Posts p
+    WHERE
+        p.OwnerUserId IS NOT NULL
+    GROUP BY
+        p.OwnerUserId,
+        DATE_TRUNC('month', p.CreationDate)
+),
+MonthlyActivityTrend AS (
+    SELECT
+        UserId,
+        ActivityMonth,
+        MonthlyPosts,
+        MonthlyScore,
+        LAG(MonthlyPosts, 1, 0) OVER (PARTITION BY UserId ORDER BY ActivityMonth) AS PrevMonthlyPosts
+    FROM MonthlyActivityBase
+),
+UserMonthlySummary AS (
+    SELECT
+        UserId,
+        MAX(MonthlyPosts) AS MaxMonthlyPosts,
+        SUM(MonthlyPosts) AS TotalHistoricalMonthlyPosts,
+        -- Calculate average monthly post growth rate, ignoring the first month or months with no previous activity
+        AVG(
+            CASE
+                WHEN PrevMonthlyPosts IS NOT NULL AND PrevMonthlyPosts > 0
+                THEN (MonthlyPosts - PrevMonthlyPosts)::DECIMAL / PrevMonthlyPosts
+                ELSE NULL -- Exclude from average if no previous posts or first month
+            END
+        ) AS AvgMonthlyPostGrowthRate
+    FROM MonthlyActivityTrend
+    GROUP BY UserId
+    HAVING COUNT(ActivityMonth) > 1 -- Ensure at least two months of activity for a meaningful trend calculation
+),
+PopularTagContribution AS (
+    SELECT DISTINCT
+        p.OwnerUserId AS UserId,
+        'SQL_Related' AS TagCategory
+    FROM
+        Posts p
+    LEFT JOIN LATERAL UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS t(Tag)
+        ON p.PostTypeId = 1
+    WHERE
+        p.OwnerUserId IS NOT NULL AND p.PostTypeId = 1
+        AND LOWER(t.Tag) LIKE '%sql%'
+    UNION ALL
+    SELECT DISTINCT
+        p.OwnerUserId AS UserId,
+        'Popular_Tech' AS TagCategory
+    FROM
+        Posts p
+    LEFT JOIN LATERAL UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS t(Tag)
+        ON p.PostTypeId = 1
+    WHERE
+        p.OwnerUserId IS NOT NULL AND p.PostTypeId = 1
+        AND (LOWER(t.Tag) LIKE '%python%' OR LOWER(t.Tag) LIKE '%javascript%' OR LOWER(t.Tag) LIKE '%java%')
+),
+ComplexPostHistoryAnalysis AS (
+    SELECT
+        ph.UserId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.PostId END) AS EditedPostsCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL THEN ph.PostId END) AS PostsClosedAsVoter,
+        -- Sum up parsed CloseReasonIds from comment field, handling non-numeric comments with NULL
+        SUM(
+            CASE
+                WHEN ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS INT)
+                ELSE NULL
+            END
+        ) AS TotalCloseReasonIdsSum,
+        MAX(ph.CreationDate) AS LastHistoryActivityDate,
+        -- Count specific history types
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 1 THEN ph.PostId END) AS InitialTitleCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 16 THEN ph.PostId END) AS CommunityOwnedCount
+    FROM
+        PostHistory ph
+    WHERE
+        ph.UserId IS NOT NULL
+    GROUP BY
+        ph.UserId
+)
+SELECT
+    u.Id AS UserID,
+    COALESCE(u.DisplayName, 'Deleted User #' || u.Id) AS DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    AGE(CURRENT_DATE, u.CreationDate) AS UserAge,
+    u.Views AS UserProfileViews,
+    COALESCE(u.Location, 'Unknown') AS UserLocation,
+    us.TotalPosts,
+    us.TotalQuestions,
+    us.TotalAnswers,
+    us.AvgQuestionScore,
+    us.AvgAnswerScore,
+    us.DistinctTagsContributed,
+    us.TotalFavoriteCount,
+    us.ClosedPostsCount,
+    us.LatestPostCreationDate,
+    uc.TotalComments,
+    uc.AvgCommentScore,
+    uc.ThanksCommentsCount,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBasedBadges,
+    ub.LatestBadgeDate,
+    -- Complicated User Engagement Score Calculation with NULL handling
+    (u.Reputation * 0.5 + COALESCE(us.TotalPosts, 0) * 0.2 + COALESCE(uc.TotalComments, 0) * 0.1 + COALESCE(us.TotalFavoriteCount, 0) * 0.1 + COALESCE(ub.TotalBadges, 0) * 0.1 + COALESCE(us.ClosedPostsCount, 0) * -0.05) AS UserEngagementScore,
+    -- Window function: Rank users by Engagement Score
+    RANK() OVER (ORDER BY (u.Reputation * 0.5 + COALESCE(us.TotalPosts, 0) * 0.2 + COALESCE(uc.TotalComments, 0) * 0.1 + COALESCE(us.TotalFavoriteCount, 0) * 0.1 + COALESCE(ub.TotalBadges, 0) * 0.1 + COALESCE(us.ClosedPostsCount, 0) * -0.05) DESC) AS EngagementRank,
+    -- Correlated Subquery: Check if user has posts with 'bigdata' tag and high score
+    EXISTS (
+        SELECT 1
+        FROM Posts p_sub
+        LEFT JOIN LATERAL UNNEST(string_to_array(SUBSTRING(p_sub.Tags, 2, LENGTH(p_sub.Tags)-2), '><')) AS t_sub(Tag)
+            ON p_sub.PostTypeId = 1
+        WHERE p_sub.OwnerUserId = u.Id
+          AND LOWER(t_sub.Tag) = 'bigdata'
+          AND p_sub.Score > 50
+    ) AS HasHighScoreBigDataPosts,
+    -- Complicated calculation with NULL handling for division
+    NULLIF(CAST(COALESCE(us.TotalQuestions, 0) AS DECIMAL) / NULLIF(COALESCE(us.TotalAnswers, 0), 0), 0) AS QuestionToAnswerRatio,
+    -- String expressions: Concatenate and format user identifier
+    LOWER(LEFT(u.DisplayName, 3)) || LPAD(CAST(u.Id % 1000 AS VARCHAR), 3, '0') || '_' || TO_CHAR(u.CreationDate, 'YYYYMMDD') AS UserComplexCode,
+    -- Subquery in SELECT for recent moderation actions
+    (SELECT COUNT(DISTINCT ph_inner.PostId)
+     FROM PostHistory ph_inner
+     WHERE ph_inner.UserId = u.Id
+       AND ph_inner.PostHistoryTypeId IN (10, 12, 14) -- Post Closed, Deleted, or Locked
+       AND ph_inner.CreationDate > (CURRENT_DATE - INTERVAL '1 year')) AS RecentModerationActionsCount,
+    ums.MaxMonthlyPosts,
+    ums.TotalHistoricalMonthlyPosts,
+    ums.AvgMonthlyPostGrowthRate,
+    -- Check if user contributed to SQL-related tags using the Set Operator CTE
+    EXISTS (SELECT 1 FROM PopularTagContribution ptc WHERE ptc.UserId = u.Id AND ptc.TagCategory = 'SQL_Related') AS ContributedToSQLTag,
+    EXISTS (SELECT 1 FROM PopularTagContribution ptc WHERE ptc.UserId = u.Id AND ptc.TagCategory = 'Popular_Tech') AS ContributedToPopularTechTag,
+    cha.EditedPostsCount,
+    cha.PostsClosedAsVoter,
+    cha.TotalCloseReasonIdsSum,
+    cha.InitialTitleCount,
+    cha.CommunityOwnedCount,
+    cha.LastHistoryActivityDate,
+    -- Using NULLIF and COALESCE with TO_CHAR for ratio display
+    COALESCE(TO_CHAR(NULLIF(CAST(COALESCE(ub.GoldBadges, 0) AS DECIMAL) / NULLIF(COALESCE(ub.TotalBadges, 0), 0), 0) * 100, 'FM99.00') || '%', 'N/A') AS GoldBadgeRatio,
+    -- Nested CASE for user activity level based on multiple factors
+    CASE
+        WHEN u.Reputation >= 20000 AND COALESCE(us.TotalQuestions,0) + COALESCE(us.TotalAnswers,0) > 500 THEN 'Very High Contributor'
+        WHEN u.Reputation >= 5000 AND COALESCE(us.TotalQuestions,0) + COALESCE(us.TotalAnswers,0) > 100 THEN 'High Contributor'
+        WHEN u.Reputation >= 1000 AND COALESCE(us.TotalQuestions,0) + COALESCE(us.TotalAnswers,0) > 20 THEN 'Moderate Contributor'
+        ELSE 'Low Contributor'
+    END AS ContributionLevel
+FROM
+    Users u
+LEFT JOIN UserPostStats us ON u.Id = us.UserId
+LEFT JOIN UserCommentStats uc ON u.Id = uc.UserId
+LEFT JOIN UserBadgeSummary ub ON u.Id = ub.UserId
+LEFT JOIN ComplexPostHistoryAnalysis cha ON u.Id = cha.UserId
+LEFT JOIN UserMonthlySummary ums ON u.Id = ums.UserId
+WHERE
+    u.Reputation >= 500 -- Filter for reasonably active users
+    AND u.Views > 0
+    AND u.CreationDate <= (CURRENT_DATE - INTERVAL '1 year') -- Only consider users older than 1 year for meaningful historical data
+    -- Predicate with OR logic and correlated EXISTS subquery
+    AND (EXISTS (SELECT 1 FROM Badges b_sub WHERE b_sub.UserId = u.Id AND b_sub.Name = 'Editor' AND b_sub.Class = 2) OR u.UpVotes > 5000)
+    -- Correlated Subquery in WHERE: filter users who have at least one post with a score above 100 AND more than 50 comments
+    AND (
+        SELECT COUNT(p_filter.Id)
+        FROM Posts p_filter
+        WHERE p_filter.OwnerUserId = u.Id AND p_filter.Score > 100
+    ) >= 1
+    AND (
+        SELECT COUNT(c_filter.Id)
+        FROM Comments c_filter
+        WHERE c_filter.UserId = u.Id
+    ) > 50
+    AND u.AboutMe IS NOT NULL -- Users with a populated 'About Me' section
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.Location, u.UpVotes, u.AboutMe,
+    us.TotalPosts, us.TotalQuestions, us.TotalAnswers, us.AvgQuestionScore, us.AvgAnswerScore, us.DistinctTagsContributed, us.TotalFavoriteCount, us.ClosedPostsCount, us.LatestPostCreationDate,
+    uc.TotalComments, uc.AvgCommentScore, uc.ThanksCommentsCount,
+    ub.TotalBadges, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TagBasedBadges, ub.LatestBadgeDate,
+    cha.EditedPostsCount, cha.PostsClosedAsVoter, cha.TotalCloseReasonIdsSum, cha.InitialTitleCount, cha.CommunityOwnedCount, cha.LastHistoryActivityDate,
+    ums.MaxMonthlyPosts, ums.TotalHistoricalMonthlyPosts, ums.AvgMonthlyPostGrowthRate
+HAVING
+    ums.AvgMonthlyPostGrowthRate IS NOT NULL AND ums.AvgMonthlyPostGrowthRate > 0.05 -- Filter for users with a positive average monthly post growth rate
+ORDER BY
+    EngagementRank ASC, u.Reputation DESC, ums.AvgMonthlyPostGrowthRate DESC
+LIMIT 200;

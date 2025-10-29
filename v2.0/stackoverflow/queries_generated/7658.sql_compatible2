@@ -1,0 +1,273 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= CAST('2010-01-01' AS TIMESTAMP)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        us.*,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.PostCount DESC) AS RankByReputation,
+        DENSE_RANK() OVER (ORDER BY us.AvgPostScore DESC) AS RankByAvgScore,
+        NTILE(100) OVER (ORDER BY us.Views DESC) AS PercentileByViews
+    FROM UserStats us
+),
+TopPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        COALESCE(p.Tags, '') AS CleanTags,
+        CASE 
+            WHEN p.Tags LIKE '%<c++>%'
+              OR p.Tags LIKE '%<c>%'
+              OR p.Tags LIKE '%<java>%'
+              OR p.Tags LIKE '%<python>%'
+            THEN 'Programming'
+            WHEN p.Tags LIKE '%<sql>%'
+              OR p.Tags LIKE '%<database>%'
+            THEN 'Database'
+            WHEN p.Tags LIKE '%<javascript>%'
+              OR p.Tags LIKE '%<html>%'
+              OR p.Tags LIKE '%<css>%'
+            THEN 'Web Development'
+            ELSE 'Other'
+        END AS TopicCategory,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostDate
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2020-01-01' AS TIMESTAMP)
+      AND p.Score >= 0
+),
+UserPostActivity AS (
+    SELECT 
+        up.UserId,
+        up.DisplayName,
+        up.Reputation,
+        up.PostCount,
+        up.CommentCount,
+        up.BadgeCount,
+        up.AvgPostScore,
+        up.LastPostDate,
+        COUNT(tp.PostId) AS RecentPosts,
+        SUM(CASE WHEN tp.PostType = 'Question' THEN 1 ELSE 0 END) AS RecentQuestions,
+        SUM(CASE WHEN tp.PostType = 'Answer' THEN 1 ELSE 0 END) AS RecentAnswers,
+        AVG(tp.Score) AS AvgRecentScore,
+        STRING_AGG(tp.Title, '; ') AS RecentTitles,
+        MIN(tp.CreationDate) AS FirstRecentPost,
+        MAX(tp.CreationDate) AS LastRecentPost
+    FROM RankedUsers up
+    JOIN TopPosts tp ON up.UserId = tp.OwnerUserId
+    WHERE tp.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months')
+    GROUP BY up.UserId, up.DisplayName, up.Reputation, up.PostCount, up.CommentCount, up.BadgeCount, up.AvgPostScore, up.LastPostDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.IsRequired = TRUE THEN 'Required' ELSE 'Optional' END AS TagType,
+        CASE WHEN t.IsModeratorOnly = TRUE THEN 'Moderator Only' ELSE 'Public' END AS TagAccess,
+        (LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) - t.Count) AS CountDifference,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS RankByPopularity
+    FROM Tags t
+    WHERE t.Count > 100
+),
+PostTrends AS (
+    SELECT 
+        CAST(EXTRACT(YEAR FROM p.CreationDate) AS INTEGER) AS PostYear,
+        CAST(EXTRACT(MONTH FROM p.CreationDate) AS INTEGER) AS PostMonth,
+        COUNT(p.Id) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE NULL END) AS AvgAnswersPerQuestion,
+        STRING_AGG(CASE WHEN p.PostTypeId = 1 THEN p.Title ELSE NULL END, '; ' ORDER BY p.CreationDate) AS RecentQuestions
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2015-01-01' AS TIMESTAMP)
+    GROUP BY EXTRACT(YEAR FROM p.CreationDate), EXTRACT(MONTH FROM p.CreationDate)
+),
+EngagementMetrics AS (
+    SELECT 
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.PostCount,
+        upa.CommentCount,
+        upa.BadgeCount,
+        upa.RecentPosts,
+        upa.RecentQuestions,
+        upa.RecentAnswers,
+        upa.AvgRecentScore,
+        CASE 
+            WHEN upa.RecentPosts > 0 THEN (upa.RecentQuestions * 100.0 / upa.RecentPosts)
+            ELSE 0
+        END AS QuestionPercentage,
+        CASE 
+            WHEN upa.RecentPosts > 0 THEN (upa.RecentAnswers * 100.0 / upa.RecentPosts)
+            ELSE 0
+        END AS AnswerPercentage,
+        CASE 
+            WHEN upa.BadgeCount > 0 THEN (upa.RecentPosts * 100.0 / upa.BadgeCount)
+            ELSE 0
+        END AS PostsPerBadge,
+        CASE 
+            WHEN upa.CommentCount > 0 THEN (upa.RecentPosts * 100.0 / upa.CommentCount)
+            ELSE 0
+        END AS PostsPerComment
+    FROM UserPostActivity upa
+    WHERE upa.RecentPosts >= 5
+),
+CombinedMetrics AS (
+    SELECT 
+        em.UserId,
+        em.DisplayName,
+        em.Reputation,
+        em.PostCount,
+        em.CommentCount,
+        em.BadgeCount,
+        em.RecentPosts,
+        em.RecentQuestions,
+        em.RecentAnswers,
+        em.AvgRecentScore,
+        em.QuestionPercentage,
+        em.AnswerPercentage,
+        em.PostsPerBadge,
+        em.PostsPerComment,
+        pa.PostYear,
+        pa.PostMonth,
+        pa.PostCount,
+        pa.AvgScore,
+        pa.TotalViews,
+        pa.QuestionCount,
+        pa.AnswerCount,
+        pa.AvgAnswersPerQuestion,
+        ROW_NUMBER() OVER (PARTITION BY em.UserId ORDER BY pa.PostYear, pa.PostMonth) AS TrendRank,
+        LAG(pa.AvgScore, 1) OVER (PARTITION BY em.UserId ORDER BY pa.PostYear, pa.PostMonth) AS PrevMonthAvgScore,
+        CASE 
+            WHEN LAG(pa.AvgScore, 1) OVER (PARTITION BY em.UserId ORDER BY pa.PostYear, pa.PostMonth) IS NOT NULL
+             AND pa.AvgScore > LAG(pa.AvgScore, 1) OVER (PARTITION BY em.UserId ORDER BY pa.PostYear, pa.PostMonth)
+            THEN 'Improving'
+            WHEN LAG(pa.AvgScore, 1) OVER (PARTITION BY em.UserId ORDER BY pa.PostYear, pa.PostMonth) IS NOT NULL
+             AND pa.AvgScore < LAG(pa.AvgScore, 1) OVER (PARTITION BY em.UserId ORDER BY pa.PostYear, pa.PostMonth)
+            THEN 'Declining'
+            ELSE 'Stable'
+        END AS PerformanceTrend
+    FROM EngagementMetrics em
+    JOIN PostTrends pa ON EXISTS (
+        SELECT 1
+        FROM Users u 
+        INNER JOIN Posts p ON u.Id = p.OwnerUserId 
+        WHERE u.Id = em.UserId
+          AND p.CreationDate >= CAST('2020-01-01' AS TIMESTAMP)
+          AND p.PostTypeId = 1
+    )
+)
+SELECT 
+    cm.UserId,
+    cm.DisplayName,
+    cm.Reputation,
+    cm.PostCount,
+    cm.CommentCount,
+    cm.BadgeCount,
+    cm.RecentPosts,
+    cm.RecentQuestions,
+    cm.RecentAnswers,
+    cm.AvgRecentScore,
+    cm.QuestionPercentage,
+    cm.AnswerPercentage,
+    cm.PostsPerBadge,
+    cm.PostsPerComment,
+    cm.PostYear,
+    cm.PostMonth,
+    cm.PostCount AS MonthlyPostCount,
+    cm.AvgScore AS MonthlyAvgScore,
+    cm.TotalViews AS MonthlyTotalViews,
+    cm.QuestionCount AS MonthlyQuestionCount,
+    cm.AnswerCount AS MonthlyAnswerCount,
+    cm.AvgAnswersPerQuestion,
+    cm.TrendRank,
+    cm.PrevMonthAvgScore,
+    cm.PerformanceTrend,
+    ta.TagName,
+    ta.Count AS TagCount,
+    ta.RankByPopularity,
+    CASE 
+        WHEN ta.RankByPopularity <= 10 THEN 'Most Popular'
+        WHEN ta.RankByPopularity <= 50 THEN 'Popular'
+        WHEN ta.RankByPopularity <= 100 THEN 'Moderate'
+        ELSE 'Less Popular'
+    END AS PopularityLevel,
+    STRING_AGG(CASE WHEN cm.RecentPosts > 0 THEN cm.DisplayName ELSE NULL END, ', ') AS ActiveUsers
+FROM CombinedMetrics cm
+LEFT JOIN TagAnalysis ta ON ta.RankByPopularity BETWEEN 1 AND 100
+WHERE cm.Reputation > 1000
+  AND cm.PostCount >= 10
+  AND cm.RecentPosts >= 5
+  AND EXISTS (
+      SELECT 1 FROM Posts p WHERE p.OwnerUserId = cm.UserId AND EXTRACT(YEAR FROM p.CreationDate) >= 2018
+  )
+GROUP BY 
+    cm.UserId,
+    cm.DisplayName,
+    cm.Reputation,
+    cm.PostCount,
+    cm.CommentCount,
+    cm.BadgeCount,
+    cm.RecentPosts,
+    cm.RecentQuestions,
+    cm.RecentAnswers,
+    cm.AvgRecentScore,
+    cm.QuestionPercentage,
+    cm.AnswerPercentage,
+    cm.PostsPerBadge,
+    cm.PostsPerComment,
+    cm.PostYear,
+    cm.PostMonth,
+    cm.PostCount,
+    cm.AvgScore,
+    cm.TotalViews,
+    cm.QuestionCount,
+    cm.AnswerCount,
+    cm.AvgAnswersPerQuestion,
+    cm.TrendRank,
+    cm.PrevMonthAvgScore,
+    cm.PerformanceTrend,
+    ta.TagName,
+    ta.Count,
+    ta.RankByPopularity
+HAVING 
+    COUNT(CASE WHEN cm.RecentPosts > 0 THEN 1 END) > 0
+ORDER BY 
+    cm.Reputation DESC,
+    cm.AvgRecentScore DESC,
+    cm.RecentPosts DESC,
+    ta.RankByPopularity ASC;

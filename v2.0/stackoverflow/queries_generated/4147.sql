@@ -1,0 +1,122 @@
+-- {"query": "4147.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1301} 
+
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.UserDisplayName,
+      ph.CreationDate AS EditDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) /* Edit Title, Edit Body, Edit Tags */
+  ),
+  UserEditSummary AS (
+    SELECT
+      re.UserId,
+      re.UserDisplayName,
+      COUNT(DISTINCT re.PostId) AS PostsEdited,
+      MAX(re.EditDate) AS LatestEditDate,
+      SUM(CASE WHEN re.PostHistoryTypeId = 4 THEN 1 ELSE 0 END) AS TitleEdits,
+      SUM(CASE WHEN re.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS BodyEdits,
+      SUM(CASE WHEN re.PostHistoryTypeId = 6 THEN 1 ELSE 0 END) AS TagEdits,
+      CASE
+        WHEN COUNT(re.PostId) > 50 THEN 'Prolific Editor'
+        WHEN COUNT(re.PostId) > 10 THEN 'Frequent Editor'
+        ELSE 'Occasional Editor'
+      END AS EditorCategory
+    FROM RankedPostEdits AS re
+    WHERE
+      re.rn = 1 /* Consider only the latest edit by a user for a given post */
+    GROUP BY
+      re.UserId,
+      re.UserDisplayName
+  ),
+  QuestionAnswers AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.Title AS QuestionTitle,
+      q.OwnerUserId AS QuestionOwnerUserId,
+      q.CreationDate AS QuestionCreationDate,
+      a.Id AS AnswerId,
+      a.OwnerUserId AS AnswerOwnerUserId,
+      a.CreationDate AS AnswerCreationDate,
+      ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS rn_answer_score
+    FROM Posts AS q
+    JOIN Posts AS a
+      ON q.Id = a.ParentId
+    WHERE
+      q.PostTypeId = 1 /* Question */ AND a.PostTypeId = 2 /* Answer */
+  ),
+  TopAnswers AS (
+    SELECT
+      qa.QuestionId,
+      qa.QuestionTitle,
+      qa.QuestionOwnerUserId,
+      qa.AnswerId,
+      qa.AnswerOwnerUserId,
+      qa.AnswerCreationDate
+    FROM QuestionAnswers AS qa
+    WHERE
+      qa.rn_answer_score <= 3 /* Top 3 answers by score per question */
+  ),
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT ta.AnswerId) AS AnswersToTopQuestions,
+      SUM(CASE WHEN c.UserId = u.Id THEN 1 ELSE 0 END) AS CommentsMade,
+      COUNT(DISTINCT b.Id) AS BadgesEarned
+    FROM Users AS u
+    LEFT JOIN PostLinks AS pl
+      ON u.Id = pl.PostId -- This join is just for complexity, not logically tied to user engagement
+    LEFT JOIN Comments AS c
+      ON u.Id = c.UserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    LEFT JOIN TopAnswers AS ta
+      ON u.Id = ta.AnswerOwnerUserId
+    WHERE
+      u.Id IS NOT NULL AND u.Id <> -1 /* Exclude community user */
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  )
+SELECT
+  COALESCE(ues.UserDisplayName, ue.DisplayName, 'Unknown User') AS DisplayName,
+  COALESCE(ues.PostsEdited, 0) AS TotalPostsEdited,
+  COALESCE(ues.EditorCategory, 'Not An Editor') AS EditorCategory,
+  COALESCE(ue.Reputation, 0) AS UserReputation,
+  COALESCE(ue.UserCreationDate, '1970-01-01') AS UserAccountCreationDate,
+  COALESCE(ue.AnswersToTopQuestions, 0) AS AnswersToTop3RatedQuestions,
+  COALESCE(ue.CommentsMade, 0) AS TotalComments,
+  COALESCE(ue.BadgesEarned, 0) AS TotalBadges,
+  CASE
+    WHEN COALESCE(ues.PostsEdited, 0) > 0
+    AND COALESCE(ue.AnswersToTopQuestions, 0) > 0 THEN 'Engaged Contributor'
+    WHEN COALESCE(ues.PostsEdited, 0) > 0 THEN 'Editor Focus'
+    WHEN COALESCE(ue.AnswersToTopQuestions, 0) > 0 THEN 'Answerer Focus'
+    ELSE 'General User'
+  END AS UserArchetype,
+  (
+    SELECT
+      COUNT(*)
+    FROM Votes AS v
+    WHERE
+      v.UserId = COALESCE(ues.UserId, ue.UserId) AND v.VoteTypeId = 2 /* UpVote */
+  ) AS TotalUpVotesGiven
+FROM UserEngagement AS ue
+FULL OUTER JOIN UserEditSummary AS ues
+  ON ue.UserId = ues.UserId
+WHERE
+  COALESCE(ue.Reputation, 0) > 1000 OR COALESCE(ues.PostsEdited, 0) > 5
+ORDER BY
+  UserReputation DESC,
+  TotalPostsEdited DESC,
+  TotalComments DESC;

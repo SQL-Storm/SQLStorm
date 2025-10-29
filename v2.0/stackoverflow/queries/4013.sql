@@ -1,0 +1,106 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.ViewCount,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER(PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) as rn_by_type,
+        AVG(CAST(c.Score AS DOUBLE PRECISION)) OVER(PARTITION BY p.Id) AS AvgCommentScore,
+        COUNT(ph.Id) OVER(PARTITION BY p.Id) AS PostHistoryCount,
+        LAG(p.Score, 1, 0) OVER(ORDER BY p.CreationDate) AS PreviousPostScore
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(CASE WHEN rp.PostTypeId = 1 THEN rp.PostId ELSE NULL END) AS QuestionCount,
+        COUNT(CASE WHEN rp.PostTypeId = 2 THEN rp.PostId ELSE NULL END) AS AnswerCount,
+        SUM(CASE WHEN rp.PostTypeId = 1 THEN rp.PostScore ELSE 0 END) AS TotalQuestionScore,
+        AVG(CASE WHEN rp.PostTypeId = 2 THEN CAST(rp.PostScore AS DOUBLE PRECISION) ELSE NULL END) AS AvgAnswerScore,
+        MAX(rp.PostCreationDate) AS LastPostDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+RecentHighReputationUsers AS (
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        UserCreationDate,
+        QuestionCount,
+        AnswerCount,
+        TotalQuestionScore,
+        AvgAnswerScore,
+        LastPostDate,
+        BadgeCount,
+        ROW_NUMBER() OVER(ORDER BY Reputation DESC, LastPostDate DESC) as user_rank
+    FROM UserPostStats
+    WHERE UserCreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365' DAY
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.PostCreationDate,
+    rp.PostScore,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.ViewCount,
+    rp.AvgCommentScore,
+    rp.PostHistoryCount,
+    rp.PreviousPostScore,
+    CASE
+        WHEN rp.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN rp.PostScore > 1000 THEN 'High Score'
+        WHEN rp.CommentCount > 50 THEN 'High Comment'
+        WHEN rp.FavoriteCount > 10 THEN 'High Favorite'
+        ELSE 'Regular'
+    END AS PostCategory,
+    (CASE WHEN rhr.DisplayName IS NOT NULL THEN SUBSTRING(rhr.DisplayName FROM 1 FOR 3) ELSE 'N/A' END) || '-' || COALESCE(CAST(rhr.Reputation AS VARCHAR), '0') AS UserSignature,
+    CASE
+        WHEN rhr.BadgeCount >= 5 THEN 'Distinguished'
+        WHEN rhr.BadgeCount BETWEEN 2 AND 4 THEN 'Accomplished'
+        ELSE 'Novice'
+    END AS UserBadgeTier,
+    CASE
+        WHEN rp.PostScore < 0 THEN 'Negative Score'
+        WHEN rp.PostScore BETWEEN 0 AND 10 THEN 'Low Score'
+        WHEN rp.PostScore > 10 THEN 'Medium to High Score'
+        ELSE 'Zero Score'
+    END AS ScoreBand,
+    rp.PostScore * (rp.AnswerCount + 1) AS WeightedScore,
+    CASE
+        WHEN rp.PostTypeName = 'Question' AND rp.PostScore > 50 AND rp.AnswerCount > 5 AND rp.ViewCount > 10000 AND rp.CommentCount > 10 THEN TRUE
+        ELSE FALSE
+    END AS IsPopularQuestion,
+    CASE
+        WHEN rp.rn_by_type <= 10 THEN 'Top 10 Recent'
+        ELSE 'Older'
+    END AS RecencyRank,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = rp.PostId AND pl.LinkTypeId = 3) AS DuplicateLinkCount,
+    COALESCE(rp.AvgCommentScore, 0) AS NormalizedAvgCommentScore
+FROM RankedPosts rp
+LEFT JOIN RecentHighReputationUsers rhr ON rp.OwnerUserId = rhr.UserId
+WHERE rp.PostTypeId IN (1, 2)
+  AND rp.PostCreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY
+  AND rp.PostScore > -10
+  AND (rp.PostTypeName = 'Question' OR rp.AnswerCount > 0)
+ORDER BY rp.PostCreationDate DESC, rp.PostScore DESC
+FETCH FIRST 100 ROWS ONLY;

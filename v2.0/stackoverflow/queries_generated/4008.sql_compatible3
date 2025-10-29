@@ -1,0 +1,203 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      u.DisplayName AS EditorDisplayName,
+      ph.CreationDate AS EditDate,
+      ph.PostHistoryTypeId,
+      pht.Name AS EditType,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht
+      ON ph.PostHistoryTypeId = pht.Id
+    JOIN Users u
+      ON ph.UserId = u.Id
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) AND ph.UserId IS NOT NULL
+  ),
+  LatestEdits AS (
+    SELECT
+      PostId,
+      UserId,
+      EditorDisplayName,
+      EditDate,
+      PostHistoryTypeId,
+      EditType,
+      rn
+    FROM RankedPostEdits
+    WHERE
+      rn = 1
+  ),
+  PostEditCounts AS (
+    SELECT
+      ph.PostId,
+      COUNT(DISTINCT ph.UserId) AS DistinctEditors,
+      COUNT(*) AS TotalEdits
+    FROM PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+    GROUP BY
+      ph.PostId
+  ),
+  UserEditSummary AS (
+    SELECT
+      ph.UserId,
+      COUNT(*) AS UserTotalEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS UserContentEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (7, 8, 9) THEN 1 ELSE 0 END) AS UserRollbacks
+    FROM PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+    GROUP BY
+      ph.UserId
+  ),
+  QuestionAnswers AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title AS QuestionTitle,
+      p.CreationDate AS QuestionDate,
+      p.OwnerUserId AS QuestionOwnerId,
+      COUNT(a.Id) AS AnswerCount,
+      SUM(CASE WHEN COALESCE(a.IsAccepted, 0) = 1 THEN 1 ELSE 0 END) AS AcceptedAnswerCount,
+      AVG(a.Score) AS AvgAnswerScore,
+      MAX(a.Score) AS MaxAnswerScore,
+      MIN(a.Score) AS MinAnswerScore,
+      SUM(CASE WHEN a.OwnerUserId = p.OwnerUserId THEN 1 ELSE 0 END) AS OwnerAnswers
+    FROM Posts p
+    LEFT JOIN Posts a
+      ON p.Id = a.ParentId
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.CreationDate,
+      p.OwnerUserId
+  )
+SELECT
+  q.QuestionId,
+  q.QuestionTitle,
+  q.QuestionDate,
+  q.QuestionOwnerId,
+  u.DisplayName AS QuestionOwnerDisplayName,
+  q.AnswerCount,
+  q.AcceptedAnswerCount,
+  q.AvgAnswerScore,
+  q.MaxAnswerScore,
+  q.MinAnswerScore,
+  q.OwnerAnswers,
+  le.EditType AS LatestEditType,
+  le.EditDate AS LatestEditDate,
+  pec.DistinctEditors,
+  pec.TotalEdits,
+  ues.UserTotalEdits,
+  ues.UserContentEdits,
+  ues.UserRollbacks,
+  CASE
+    WHEN q.AcceptedAnswerCount > 0 AND q.AnswerCount > 0
+    THEN CAST(q.AcceptedAnswerCount AS DOUBLE PRECISION) / CAST(q.AnswerCount AS DOUBLE PRECISION)
+    ELSE 0
+  END AS AcceptanceRate,
+  CASE
+    WHEN q.QuestionDate < (CAST('2024-10-01' AS DATE) - INTERVAL '1 year') AND q.AnswerCount > 10 AND q.AvgAnswerScore > 5
+    THEN 'Popular & Old'
+    WHEN q.QuestionDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '7 days') AND q.AnswerCount > 0
+    THEN 'Recent & Active'
+    WHEN q.AcceptedAnswerCount = 0 AND q.AnswerCount > 0
+    THEN 'No Accepted Answer'
+    ELSE 'Standard'
+  END AS QuestionStatus,
+  ('User ' || u.DisplayName || ' (' || COALESCE(CAST(u.Reputation AS VARCHAR), '0') || ' Rep) last accessed on ' || TO_CHAR(u.LastAccessDate, 'YYYY-MM-DD')) AS UserAccessInfo,
+  CASE
+    WHEN EXISTS (
+      SELECT 1 FROM Badges b WHERE b.UserId = q.QuestionOwnerId AND b.Name LIKE '%Top%'
+    )
+    THEN 'Has Top Badge'
+    ELSE 'No Top Badge'
+  END AS UserBadgeStatus,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostHistory ph_sub
+    WHERE
+      ph_sub.PostId = q.QuestionId
+      AND ph_sub.PostHistoryTypeId = 10
+      AND ph_sub.Comment IN ('101', '102')
+  ) AS DuplicateOrOffTopicCloseCount
+FROM Posts p_outer
+RIGHT JOIN QuestionAnswers q
+  ON p_outer.Id = q.QuestionId
+LEFT JOIN Users u
+  ON q.QuestionOwnerId = u.Id
+LEFT JOIN LatestEdits le
+  ON q.QuestionId = le.PostId
+LEFT JOIN PostEditCounts pec
+  ON q.QuestionId = pec.PostId
+LEFT JOIN UserEditSummary ues
+  ON q.QuestionOwnerId = ues.UserId
+WHERE
+  q.QuestionDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30 days')
+  AND q.AnswerCount > 0
+  AND COALESCE(u.Reputation, 0) > 1000
+  AND (
+    q.QuestionTitle LIKE '%performance%'
+    OR EXISTS (
+      SELECT 1
+      FROM Tags t
+      WHERE
+        t.TagName IN ('sql', 'performance', 'database')
+        AND EXISTS (
+          SELECT 1
+          FROM Posts p_tags
+          WHERE
+            p_tags.Id = q.QuestionId
+            AND (',' || REPLACE(COALESCE(p_tags.Tags, ''), '><', ',') || ',') LIKE ('%,' || t.TagName || ',%')
+        )
+    )
+  )
+UNION ALL
+SELECT
+  NULL AS QuestionId,
+  NULL AS QuestionTitle,
+  NULL AS QuestionDate,
+  NULL AS QuestionOwnerId,
+  NULL AS QuestionOwnerDisplayName,
+  NULL AS AnswerCount,
+  NULL AS AcceptedAnswerCount,
+  NULL AS AvgAnswerScore,
+  NULL AS MaxAnswerScore,
+  NULL AS MinAnswerScore,
+  NULL AS OwnerAnswers,
+  le.EditType AS LatestEditType,
+  le.EditDate AS LatestEditDate,
+  pec.DistinctEditors,
+  pec.TotalEdits,
+  ues.UserTotalEdits,
+  ues.UserContentEdits,
+  ues.UserRollbacks,
+  NULL AS AcceptanceRate,
+  'High Reputation User Edits' AS QuestionStatus,
+  ('User ' || u.DisplayName || ' (' || COALESCE(CAST(u.Reputation AS VARCHAR), '0') || ' Rep) last accessed on ' || TO_CHAR(u.LastAccessDate, 'YYYY-MM-DD')) AS UserAccessInfo,
+  CASE
+    WHEN EXISTS (
+      SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Name LIKE '%Expert%'
+    )
+    THEN 'Has Expert Badge'
+    ELSE 'No Expert Badge'
+  END AS UserBadgeStatus,
+  NULL AS DuplicateOrOffTopicCloseCount
+FROM Users u
+JOIN UserEditSummary ues
+  ON u.Id = ues.UserId
+LEFT JOIN LatestEdits le
+  ON u.Id = le.UserId
+LEFT JOIN PostEditCounts pec
+  ON le.PostId = pec.PostId
+WHERE
+  u.Reputation > 50000
+  AND ues.UserContentEdits > 20
+  AND ues.UserRollbacks < 5
+ORDER BY
+  QuestionDate DESC,
+  DistinctEditors DESC;

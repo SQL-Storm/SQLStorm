@@ -1,0 +1,37 @@
+-- {"query": "6733.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 403} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN p.Id END) AS TotalDuplicates,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedPost,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.ViewCount) AS MaxViews,
+    MIN(p.LastEditDate) AS EarliestEditedPost,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS MostCommonTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35)
+LEFT JOIN 
+    Tags t ON t.Id IN (SELECT unnest(string_to_array(p.Tags, '><')) WHERE p.PostTypeId = 1)
+WHERE 
+    u.Reputation > 1000
+    AND u.LastAccessDate > NOW() - INTERVAL '1 month'
+GROUP BY 
+    u.Id
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    AvgScore DESC, 
+    TotalPosts DESC
+LIMIT 100;

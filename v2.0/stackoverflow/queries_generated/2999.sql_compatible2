@@ -1,0 +1,203 @@
+WITH RecursiveUserBadges AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        b.TagBased,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date DESC, b.Class ASC) AS RN
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+), LatestBadges AS (
+    SELECT UserId, BadgeName, Class, TagBased
+    FROM RecursiveUserBadges
+    WHERE RN <= 5
+), PostStats AS (
+    SELECT
+        p.OwnerUserId,
+        p.PostTypeId,
+        COUNT(*) AS TotalPosts,
+        SUM(COALESCE(p.Score,0)) AS TotalScore,
+        AVG(COALESCE(p.ViewCount,0)) AS AvgViews,
+        MAX(p.CreationDate) AS LastPostDate,
+        SUM(CASE WHEN p.Title IS NOT NULL AND p.PostTypeId = 1 THEN LENGTH(p.Title) ELSE 0 END) AS TotalTitleLength,
+        STRING_AGG(DISTINCT COALESCE(NULLIF(p.Tags, ''), '<no-tag>'), ',') AS DistinctTags
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, p.PostTypeId
+), UserRankings AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate,
+        u.LastAccessDate,
+        lb.BadgeName,
+        lb.Class AS BadgeClass,
+        lb.TagBased,
+        ps.PostTypeId,
+        ps.TotalPosts,
+        ps.TotalScore,
+        ps.AvgViews,
+        ps.LastPostDate,
+        ps.TotalTitleLength,
+        ps.DistinctTags,
+        ROW_NUMBER() OVER (PARTITION BY ps.PostTypeId ORDER BY ps.TotalScore DESC, ps.TotalPosts DESC) AS RankWithinType
+    FROM Users u
+    LEFT JOIN LatestBadges lb ON lb.UserId = u.Id
+    LEFT JOIN PostStats ps ON ps.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000
+),
+TopPostsWithLinks AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        lt.Name AS LinkTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY pl.CreationDate DESC) AS LinkRank
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE p.PostTypeId IN (1,2)
+),
+AnswerStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(COALESCE(a.Score,0)) AS AvgAnswerScore,
+        MAX(a.CreationDate) AS LatestAnswerDate,
+        SUM(CASE WHEN a.OwnerUserId IS NULL THEN 1 ELSE 0 END) AS AnonymousAnswers
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+),
+CloseReasonAggregates AS (
+    SELECT
+        cht.Name AS CloseReasonName,
+        COUNT(DISTINCT ph.PostId) AS ClosedPostsCount,
+        AVG(EXTRACT(EPOCH FROM (ph2.CreationDate - ph.CreationDate))/3600.0) AS AvgHoursToReopen
+    FROM PostHistory ph
+    INNER JOIN CloseReasonTypes cht ON cht.Id = CAST(ph.Comment AS INTEGER)
+    LEFT JOIN PostHistory ph2 ON ph2.PostId = ph.PostId AND ph2.PostHistoryTypeId = 11 AND ph2.CreationDate > ph.CreationDate
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY cht.Name
+    HAVING COUNT(DISTINCT ph.PostId) > 10
+),
+CorrelatedVotes AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        COUNT(*) AS VoteCount,
+        AVG(u.Reputation) AS AvgVoterReputation
+    FROM Votes v
+    LEFT JOIN Users u ON u.Id = v.UserId
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.PostId, v.VoteTypeId
+),
+FinalSelection AS (
+    SELECT
+        ur.Id AS UserId,
+        ur.DisplayName,
+        ur.Reputation,
+        ur.Location,
+        ur.CreationDate,
+        ur.LastAccessDate,
+        ur.BadgeName,
+        ur.BadgeClass,
+        ur.TagBased,
+        ur.PostTypeId,
+        ur.TotalPosts,
+        ur.TotalScore,
+        ur.AvgViews,
+        ur.LastPostDate,
+        ur.TotalTitleLength,
+        ur.DistinctTags,
+        ap.AnswerCount,
+        ap.AvgAnswerScore,
+        ap.LatestAnswerDate,
+        ap.AnonymousAnswers,
+        cr.CloseReasonName,
+        cr.ClosedPostsCount,
+        cr.AvgHoursToReopen,
+        v.VoteTypeId,
+        v.VoteCount,
+        v.AvgVoterReputation
+    FROM UserRankings ur
+    LEFT JOIN AnswerStats ap ON ap.QuestionId = ur.Id AND ur.PostTypeId = 1
+    LEFT JOIN CloseReasonAggregates cr ON cr.CloseReasonName IS NOT NULL
+    LEFT JOIN CorrelatedVotes v ON v.PostId = ur.Id
+    WHERE ur.RankWithinType <= 10
+)
+SELECT
+    fs.UserId,
+    COALESCE(fs.DisplayName, '<Anonymous>') AS UserDisplayName,
+    fs.Reputation,
+    COALESCE(NULLIF(fs.Location, ''), '<Unknown>') AS UserLocation,
+    fs.CreationDate,
+    fs.LastAccessDate,
+    ('Badge: ' || COALESCE(fs.BadgeName, 'None')
+        || CASE WHEN fs.TagBased = 1 THEN ' (Tag-Based)' ELSE '' END
+        || ' [Class:' || COALESCE(CAST(fs.BadgeClass AS VARCHAR), '?') || ']'
+    ) AS BadgeInfo,
+    CASE fs.PostTypeId
+        WHEN 1 THEN 'Question'
+        WHEN 2 THEN 'Answer'
+        ELSE 'Other'
+    END AS PostTypeDescription,
+    fs.TotalPosts,
+    fs.TotalScore,
+    ROUND(CAST(fs.AvgViews AS NUMERIC),2) AS AvgViews,
+    fs.LastPostDate,
+    fs.TotalTitleLength,
+    CASE WHEN fs.DistinctTags IS NULL THEN NULL
+         WHEN LENGTH(fs.DistinctTags) <= 100 THEN fs.DistinctTags
+         ELSE SUBSTRING(fs.DistinctTags FROM 1 FOR 100) || '...' END AS SampleTags,
+    fs.AnswerCount,
+    ROUND(CAST(fs.AvgAnswerScore AS NUMERIC),2) AS AvgAnswerScore,
+    fs.LatestAnswerDate,
+    fs.AnonymousAnswers,
+    fs.CloseReasonName,
+    fs.ClosedPostsCount,
+    ROUND(CAST(fs.AvgHoursToReopen AS NUMERIC),2) AS AvgHoursToReopen,
+    vt.Name AS VoteTypeName,
+    fs.VoteCount,
+    ROUND(CAST(fs.AvgVoterReputation AS NUMERIC),2) AS AvgVoterReputation
+FROM FinalSelection fs
+LEFT JOIN VoteTypes vt ON vt.Id = fs.VoteTypeId
+GROUP BY
+    fs.UserId,
+    fs.DisplayName,
+    fs.Reputation,
+    fs.Location,
+    fs.CreationDate,
+    fs.LastAccessDate,
+    fs.BadgeName,
+    fs.BadgeClass,
+    fs.TagBased,
+    fs.PostTypeId,
+    fs.TotalPosts,
+    fs.TotalScore,
+    fs.AvgViews,
+    fs.LastPostDate,
+    fs.TotalTitleLength,
+    fs.DistinctTags,
+    fs.AnswerCount,
+    fs.AvgAnswerScore,
+    fs.LatestAnswerDate,
+    fs.AnonymousAnswers,
+    fs.CloseReasonName,
+    fs.ClosedPostsCount,
+    fs.AvgHoursToReopen,
+    vt.Name,
+    fs.VoteCount,
+    fs.AvgVoterReputation
+ORDER BY fs.PostTypeId, fs.TotalScore DESC, fs.TotalPosts DESC, fs.UserId
+LIMIT 50;

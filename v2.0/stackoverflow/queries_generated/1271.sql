@@ -1,0 +1,290 @@
+-- {"query": "1271.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3834} 
+
+WITH UserEngagement AS (
+    -- CTE 1: Calculates various engagement metrics for users
+    -- Includes user metadata, post counts, comment counts, average scores, and badge value.
+    SELECT
+        u.Id AS UserId,
+        COALESCE(u.DisplayName, 'Anonymous User') AS UserName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId IN (1, 2) THEN p.Score ELSE 0 END) AS TotalPostScore,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        AVG(CASE WHEN p.PostTypeId IN (1, 2) THEN p.Score ELSE NULL END) AS AvgPostScore,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC, u.Id) AS ReputationRank,
+        (EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / 86400.0) AS DaysActive, -- Convert difference to days
+        SUM(CASE WHEN b.Class = 1 THEN 3 WHEN b.Class = 2 THEN 2 WHEN b.Class = 3 THEN 1 ELSE 0 END) AS TotalBadgeValue -- Assign higher value to Gold badges
+    FROM
+        Users AS u
+    LEFT JOIN
+        Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments AS c ON u.Id = c.UserId
+    LEFT JOIN
+        Badges AS b ON u.Id = b.UserId
+    WHERE
+        u.Reputation >= 100 -- Filter out very low-rep users for analysis
+        AND u.Views > 10 -- Only users with some profile views
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostHistoricalAnalysis AS (
+    -- CTE 2: Analyzes post history, extracts tags, and identifies specific post states.
+    -- Uses a correlated subquery for the first close reason and window functions for ranking/sequencing.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        COALESCE(p.Title, SUBSTRING(p.Body, 1, 50) || '...') AS PostTitlePreview, -- Use body preview if title is NULL
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.ViewCount,
+        p.Score AS CurrentScore,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        LOWER(TRIM(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2))) AS RawTagsString, -- Extract tags string, remove delimiters
+        -- Correlated subquery: Get the comment of the first post closing event
+        (SELECT phc.Comment FROM PostHistory AS phc WHERE phc.PostId = p.Id AND phc.PostHistoryTypeId = 10 ORDER BY phc.CreationDate ASC LIMIT 1) AS FirstCloseReason,
+        -- Check if post was reopened AFTER being closed
+        EXISTS (SELECT 1 FROM PostHistory AS phx WHERE phx.PostId = p.Id AND phx.PostHistoryTypeId = 11 AND phx.CreationDate >= p.ClosedDate) AS WasReopenedAfterClose,
+        -- Check if post was ever migrated
+        EXISTS (SELECT 1 FROM PostHistory AS phx WHERE phx.PostId = p.Id AND phx.PostHistoryTypeId IN (35, 36)) AS WasMigrated,
+        LENGTH(p.Body) - LENGTH(REPLACE(p.Body, ' ', '')) + 1 AS BodyWordCount, -- Approximate word count
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId, EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.Score DESC, p.Id) AS RankInTypeByYear, -- Rank within post type and creation year
+        LAG(p.LastEditDate, 1, p.CreationDate) OVER (PARTITION BY p.Id ORDER BY p.LastEditDate) AS PreviousEditDate -- Date of the previous edit
+    FROM
+        Posts AS p
+    WHERE
+        p.OwnerUserId IS NOT NULL
+        AND p.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+        AND p.CreationDate >= '2020-01-01' -- Only recent posts
+        AND p.Body IS NOT NULL AND LENGTH(p.Body) > 100 -- Ensure substantial content
+),
+PostTaggingInfo AS (
+    -- CTE 3: Explodes tags for posts and links them to global tag statistics.
+    -- Uses UNNEST and string_to_array (PostgreSQL-specific for tag parsing).
+    SELECT
+        pha.PostId,
+        pha.OwnerUserId,
+        pha.PostTitlePreview,
+        TRIM(tag_str) AS TagName,
+        t.Count AS GlobalTagCount,
+        t.IsModeratorOnly,
+        pha.PostCreationDate,
+        pha.CurrentScore,
+        pha.ViewCount
+    FROM
+        PostHistoricalAnalysis AS pha,
+        -- Converts the '<tag1><tag2>' string into an array of tags.
+        UNNEST(string_to_array(pha.RawTagsString, '><')) AS tag_str
+    JOIN
+        Tags AS t ON TRIM(tag_str) = t.TagName
+    WHERE
+        TRIM(tag_str) IS NOT NULL AND TRIM(tag_str) <> '' -- Filter out empty tag strings
+),
+UserPostInteractionSummary AS (
+    -- CTE 4: Aggregates user-post interaction data, including vote ratios and linked post counts.
+    -- Features a window function for moving average score and complex NULL-safe division.
+    SELECT
+        ue.UserId,
+        ue.UserName,
+        ue.Reputation,
+        ue.TotalPosts,
+        ue.TotalQuestions,
+        ue.TotalAnswers,
+        ue.TotalPostScore,
+        ue.TotalComments,
+        ue.AvgPostScore,
+        ue.DaysActive,
+        ue.TotalBadgeValue,
+        SUM(CASE WHEN ph.PostTypeId = 1 THEN ph.CurrentScore ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN ph.PostTypeId = 2 THEN ph.CurrentScore ELSE 0 END) AS TotalAnswerScore,
+        COUNT(DISTINCT ph.PostId) AS TotalPostsAnalyzed,
+        MAX(ph.LastActivityDate) AS LastActivityOnUserPosts,
+        -- Window function: Moving average of post scores for a user
+        AVG(ph.CurrentScore) OVER (PARTITION BY ue.UserId ORDER BY ph.CreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS MovingAvgPostScore,
+        COUNT(DISTINCT pli.RelatedPostId) AS LinkedPostsCount,
+        COUNT(DISTINCT CASE WHEN pli.LinkTypeId = 3 THEN pli.RelatedPostId ELSE NULL END) AS DuplicatePostsCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceived,
+        -- Complicated calculation: Upvote ratio, handling division by zero using NULLIF and COALESCE
+        COALESCE(
+            CAST(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS NUMERIC) /
+            NULLIF(SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END), 0),
+            0.0
+        ) AS UpvoteRatio
+    FROM
+        UserEngagement AS ue
+    JOIN
+        PostHistoricalAnalysis AS ph ON ue.UserId = ph.OwnerUserId
+    LEFT JOIN
+        PostLinks AS pli ON ph.PostId = pli.PostId
+    LEFT JOIN
+        Votes AS v ON ph.PostId = v.PostId
+    GROUP BY
+        ue.UserId, ue.UserName, ue.Reputation, ue.TotalPosts, ue.TotalQuestions, ue.TotalAnswers,
+        ue.TotalPostScore, ue.TotalComments, ue.AvgPostScore, ue.DaysActive, ue.TotalBadgeValue,
+        ph.CreationDate -- Required for window function ordering context
+),
+ProblematicPosts AS (
+    -- CTE 5: Identifies posts that have been closed and later reopened, or migrated.
+    SELECT
+        pha.PostId,
+        pha.OwnerUserId,
+        pha.PostTitlePreview,
+        pha.PostCreationDate,
+        pha.ClosedDate,
+        pha.WasReopenedAfterClose,
+        pha.WasMigrated
+    FROM
+        PostHistoricalAnalysis AS pha
+    WHERE
+        (pha.ClosedDate IS NOT NULL AND pha.WasReopenedAfterClose = TRUE) -- Closed AND reopened
+        OR pha.WasMigrated = TRUE -- Or was migrated
+),
+HighImpactUserPosts AS (
+    -- CTE 6: Identifies posts from users with very high reputation and good upvote ratios.
+    SELECT
+        pha.PostId,
+        pha.OwnerUserId,
+        pha.PostTitlePreview,
+        pha.PostCreationDate,
+        upsi.UpvoteRatio,
+        upsi.Reputation
+    FROM
+        PostHistoricalAnalysis AS pha
+    JOIN
+        UserPostInteractionSummary AS upsi ON pha.OwnerUserId = upsi.UserId
+    WHERE
+        upsi.Reputation >= 10000 -- Threshold for 'very high' reputation
+        AND upsi.UpvoteRatio >= 0.7
+),
+UsersWithReopenedOrMigratedPosts AS (
+    -- CTE 7: Aggregates information for users involved in problematic posts (closed/reopened or migrated).
+    SELECT
+        upsi.UserId,
+        upsi.UserName,
+        upsi.Reputation,
+        upsi.UpvoteRatio,
+        COUNT(DISTINCT pp.PostId) AS ProblematicPostCount,
+        STRING_AGG(pp.PostTitlePreview, ' || ' ORDER BY pp.PostCreationDate DESC) AS SampleProblematicPosts
+    FROM
+        UserPostInteractionSummary AS upsi
+    JOIN
+        ProblematicPosts AS pp ON upsi.UserId = pp.OwnerUserId
+    GROUP BY
+        upsi.UserId, upsi.UserName, upsi.Reputation, upsi.UpvoteRatio
+)
+-- Final Select Statement: Combines all CTEs, applies further logic, and demonstrates set operators.
+SELECT
+    upsi.UserId,
+    upsi.UserName,
+    upsi.Reputation,
+    upsi.TotalPostsAnalyzed,
+    upsi.TotalQuestions,
+    upsi.TotalAnswers,
+    upsi.TotalUpvotesReceived,
+    upsi.TotalDownvotesReceived,
+    upsi.UpvoteRatio,
+    upsi.MovingAvgPostScore,
+    upsi.LastActivityOnUserPosts,
+    upsi.DaysActive,
+    upsi.TotalBadgeValue,
+    -- Correlated subquery: String aggregation of top 3 tags by post count for the user
+    (
+        SELECT STRING_AGG(pti_inner.TagName, ', ' ORDER BY tag_count DESC)
+        FROM (
+            SELECT pti_inner2.TagName, COUNT(pti_inner2.PostId) AS tag_count
+            FROM PostTaggingInfo AS pti_inner2
+            WHERE pti_inner2.OwnerUserId = upsi.UserId
+            GROUP BY pti_inner2.TagName
+            ORDER BY tag_count DESC, MAX(pti_inner2.GlobalTagCount) DESC
+            LIMIT 3
+        ) AS top_tags
+    ) AS Top3TagsByPostCount,
+    -- Correlated subquery: Average score of posts associated with the user's top tags
+    (
+        SELECT AVG(pti_avg.CurrentScore)
+        FROM PostTaggingInfo AS pti_avg
+        WHERE pti_avg.OwnerUserId = upsi.UserId
+          AND pti_avg.TagName IN (
+            SELECT pti_inner3.TagName
+            FROM PostTaggingInfo AS pti_inner3
+            WHERE pti_inner3.OwnerUserId = upsi.UserId
+            GROUP BY pti_inner3.TagName
+            ORDER BY COUNT(pti_inner3.PostId) DESC
+            LIMIT 3
+          )
+    ) AS AvgScoreOnTopTags,
+    -- Complex CASE WHEN: Categorizes users based on impact metrics
+    CASE
+        WHEN upsi.UpvoteRatio >= 0.8 AND upsi.TotalPostsAnalyzed > 100 AND upsi.Reputation >= 5000 THEN 'High Impact Author'
+        WHEN upsi.UpvoteRatio BETWEEN 0.5 AND 0.8 AND upsi.TotalPostsAnalyzed > 50 THEN 'Engaged Contributor'
+        WHEN upsi.DaysActive IS NULL OR upsi.DaysActive < 30 OR upsi.TotalPostsAnalyzed < 5 THEN 'New/Infrequent User'
+        ELSE 'Regular User'
+    END AS UserCategory,
+    ph.PostId AS SamplePostId,
+    ph.PostTitlePreview,
+    ph.BodyWordCount,
+    ph.CurrentScore AS SamplePostScore,
+    ph.ViewCount AS SamplePostViews,
+    ph.RankInTypeByYear,
+    ph.FirstCloseReason,
+    ph.WasReopenedAfterClose,
+    ph.WasMigrated,
+    ph.PreviousEditDate,
+    t.TagName AS MostPopularTagOnSamplePost,
+    ph.PostCreationDate,
+    ph.LastEditDate,
+    ph.ClosedDate,
+    COALESCE(ph.ClosedDate, ph.LastEditDate, ph.PostCreationDate) AS LastSignificantPostEventDate, -- NULL logic example
+    -- Correlated subquery: Count comments made by the post owner on their own post
+    (SELECT COUNT(DISTINCT co.Id) FROM Comments AS co WHERE co.PostId = ph.PostId AND co.UserId = upsi.UserId AND co.CreationDate BETWEEN ph.CreationDate AND ph.LastActivityDate) AS CommentsByOwnerOnTheirPost,
+    -- Set operator usage: Categorize users based on intersection of HighImpact and Problematic Posts
+    CASE
+        -- Users who are high impact AND have posts that were problematic
+        WHEN upsi.UserId IN (SELECT hip.OwnerUserId FROM HighImpactUserPosts AS hip INTERSECT SELECT pp.OwnerUserId FROM ProblematicPosts AS pp) THEN 'HighImpactWithProblematicPosts'
+        -- Users who have at least one problematic post (closed/reopened or migrated)
+        WHEN upsi.UserId IN (SELECT UserId FROM UsersWithReopenedOrMigratedPosts) THEN 'InvolvedInProblematicPosts'
+        -- Users who are high impact but without problematic posts
+        WHEN upsi.UserId IN (SELECT hip.OwnerUserId FROM HighImpactUserPosts AS hip EXCEPT SELECT pp.OwnerUserId FROM ProblematicPosts AS pp) THEN 'HighImpactNoProblematicPosts'
+        ELSE 'StandardUser'
+    END AS UserProblematicEngagementStatus
+FROM
+    UserPostInteractionSummary AS upsi
+-- LEFT JOIN LATERAL to get a single, most recent sample post for each user, adding complex join behavior
+LEFT JOIN LATERAL (
+    SELECT pha_inner.*
+    FROM PostHistoricalAnalysis AS pha_inner
+    WHERE pha_inner.OwnerUserId = upsi.UserId
+    ORDER BY pha_inner.CreationDate DESC
+    LIMIT 1
+) AS ph ON TRUE
+LEFT JOIN
+    PostTaggingInfo AS t ON ph.PostId = t.PostId AND t.TagName = (
+        -- Correlated subquery to find the single most popular tag for the sample post
+        SELECT pti_max.TagName
+        FROM PostTaggingInfo AS pti_max
+        WHERE pti_max.PostId = ph.PostId
+        ORDER BY pti_max.GlobalTagCount DESC
+        LIMIT 1
+    )
+WHERE
+    upsi.Reputation >= 500
+    AND upsi.TotalPostsAnalyzed >= 5
+    AND upsi.UpvoteRatio > 0.1
+    AND (upsi.TotalQuestions > 0 OR upsi.TotalAnswers > 0)
+    AND ph.PostId IS NOT NULL -- Ensure we only get users with at least one analyzed sample post
+    AND ph.RankInTypeByYear <= 100 -- Limit to top posts for relevance and performance
+ORDER BY
+    upsi.Reputation DESC,
+    upsi.UpvoteRatio DESC,
+    upsi.LastActivityOnUserPosts DESC
+LIMIT 1000;

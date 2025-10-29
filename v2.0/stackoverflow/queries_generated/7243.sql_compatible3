@@ -1,0 +1,196 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT v.Id) AS Votes,
+        COALESCE(MAX(p.CreationDate), u.CreationDate) AS LastActivity,
+        (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate) AS AccountAgeInterval,
+        EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate))/86400.0 AS AccountAgeDays,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'High'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Medium'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Low'
+            ELSE 'Very Low'
+        END AS ActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName
+),
+RankedUsers AS (
+    SELECT 
+        uas.UserId,
+        uas.Reputation,
+        uas.CreationDate,
+        uas.DisplayName,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Badges,
+        uas.Comments,
+        uas.Votes,
+        uas.LastActivity,
+        uas.AccountAgeInterval,
+        uas.AccountAgeDays,
+        uas.ActivityLevel,
+        ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC, uas.TotalPosts DESC) AS RankByReputation,
+        ROW_NUMBER() OVER (ORDER BY uas.TotalPosts DESC, uas.Reputation DESC) AS RankByActivity,
+        PERCENT_RANK() OVER (ORDER BY uas.Reputation) AS ReputationPercentile,
+        NTILE(10) OVER (ORDER BY uas.Reputation) AS ReputationDecile
+    FROM UserActivityStats uas
+),
+TopQuestionTags AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        AVG(p.Score) AS AvgScore,
+        AVG(p.ViewCount) AS AvgViews,
+        COUNT(DISTINCT p.OwnerUserId) AS ActiveUsers,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') AS ActiveUserNames
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.Score > 0
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.OwnerUserId) >= 5
+),
+PostComplexityAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        CASE 
+            WHEN LENGTH(p.Body) > 1000 THEN 'Long'
+            WHEN LENGTH(p.Body) > 500 THEN 'Medium'
+            ELSE 'Short'
+        END AS BodyLengthCategory,
+        CASE 
+            WHEN p.CommentCount > 10 THEN 'High'
+            WHEN p.CommentCount > 5 THEN 'Medium'
+            ELSE 'Low'
+        END AS CommentLevel,
+        CASE 
+            WHEN p.Score > 50 THEN 'Very Popular'
+            WHEN p.Score > 20 THEN 'Popular'
+            WHEN p.Score > 5 THEN 'Moderate'
+            ELSE 'Low'
+        END AS PopularityCategory,
+        (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate) AS AgeInterval,
+        EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate))/86400.0 AS DaysOld
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score IS NOT NULL
+),
+EngagementMetrics AS (
+    SELECT 
+        p.PostId,
+        p.Title,
+        p.OwnerUserId,
+        u.DisplayName AS AuthorName,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.PopularityCategory,
+        p.DaysOld,
+        CASE 
+            WHEN p.AnswerCount > 0 AND p.Score > 0 THEN 
+                CAST(p.CommentCount AS numeric) / NULLIF(CAST(p.AnswerCount AS numeric), 0)
+            ELSE NULL 
+        END AS CommentsPerAnswer,
+        CASE 
+            WHEN p.Score > 0 THEN 
+                CAST(p.ViewCount AS numeric) / NULLIF(CAST(p.Score AS numeric), 0)
+            ELSE NULL 
+        END AS ViewsPerScore,
+        CASE 
+            WHEN p.FavoriteCount > 0 THEN 
+                CAST(p.Score AS numeric) / NULLIF(CAST(p.FavoriteCount AS numeric), 0)
+            ELSE NULL 
+        END AS ScorePerFavorite
+    FROM PostComplexityAnalysis p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+)
+SELECT 
+    'User Performance Analysis' AS AnalysisType,
+    COUNT(*) AS TotalUsers,
+    AVG(u.Reputation) AS AvgReputation,
+    MAX(u.Reputation) AS MaxReputation,
+    COUNT(DISTINCT CASE WHEN u.Reputation > 10000 THEN u.UserId END) AS HighReputationUsers,
+    COUNT(DISTINCT CASE WHEN u.RankByReputation <= 100 THEN u.UserId END) AS Top100Users,
+    ROUND(AVG(u.AccountAgeDays), 2) AS AvgAccountAgeDays,
+    STRING_AGG(DISTINCT u.ActivityLevel, ', ') AS ActivityLevels,
+    'Post Metrics Analysis' AS AnalysisType2,
+    AVG(p.Score) AS AvgPostScore,
+    AVG(p.ViewCount) AS AvgPostViews,
+    COUNT(DISTINCT p.PostId) AS TotalPosts,
+    AVG(p.AnswerCount) AS AvgAnswersPerPost,
+    AVG(p.CommentCount) AS AvgCommentsPerPost,
+    AVG(p.FavoriteCount) AS AvgFavoritesPerPost,
+    'Tag Analysis' AS AnalysisType3,
+    COUNT(DISTINCT t.TagName) AS TotalTags,
+    AVG(t.Count) AS AvgTagUsage,
+    MAX(t.Count) AS MaxTagUsage,
+    STRING_AGG(DISTINCT p.PopularityCategory, ', ') AS PostPopularityCategories,
+    'Combined Metrics' AS AnalysisType4,
+    COUNT(DISTINCT u.UserId) AS UniqueUsers,
+    COUNT(DISTINCT p.PostId) AS TotalPostsProcessed,
+    COUNT(DISTINCT t.TagName) AS UniqueTags,
+    AVG(epm.ViewsPerScore) AS AvgViewsPerScore,
+    AVG(epm.ScorePerFavorite) AS AvgScorePerFavorite,
+    COUNT(DISTINCT CASE WHEN epm.CommentsPerAnswer IS NOT NULL THEN epm.PostId END) AS PostsWithCommentsPerAnswer,
+    CASE 
+        WHEN COUNT(*) > 0 THEN 
+            ROUND((COUNT(DISTINCT CASE WHEN epm.CommentsPerAnswer > 1 THEN epm.PostId END) * 100.0) / COUNT(*), 2)
+        ELSE 0 
+    END AS PercentageHighCommentPosts
+FROM RankedUsers u
+LEFT JOIN EngagementMetrics epm ON u.UserId = epm.OwnerUserId
+LEFT JOIN Posts p ON u.UserId = p.OwnerUserId
+LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+WHERE u.UserId IN (
+    SELECT UserId 
+    FROM (
+        SELECT UserId, 
+               COUNT(*) AS PostCount,
+               RANK() OVER (ORDER BY COUNT(*) DESC) AS PostRank
+        FROM Posts 
+        WHERE PostTypeId = 1
+        GROUP BY UserId
+    ) ranked_posts
+    WHERE PostRank <= 50
+)
+AND u.UserId NOT IN (
+    SELECT UserId 
+    FROM Badges 
+    WHERE Name IN ('Autobiographer', 'Organizer', 'Editor', 'Strunk & White', 'Copy Editor')
+    GROUP BY UserId
+    HAVING COUNT(*) >= 3
+)
+GROUP BY 
+    'User Performance Analysis',
+    'Post Metrics Analysis',
+    'Tag Analysis',
+    'Combined Metrics'
+HAVING 
+    COUNT(*) > 0
+ORDER BY 
+    COUNT(*) DESC;

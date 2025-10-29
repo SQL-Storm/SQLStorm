@@ -1,0 +1,115 @@
+-- {"query": "3925.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1967} 
+
+WITH RecentAnswers AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.ParentId AS QuestionId,
+        p.Score,
+        p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 2                              -- answers only
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+),
+
+UserAnswerStats AS (
+    SELECT
+        a.OwnerUserId,
+        COUNT(*)                                           AS AnswerCount,
+        AVG(a.Score)::numeric(10,2)                        AS AvgScore,
+        SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END)       AS PositiveScoreCount,
+        SUM(CASE WHEN a.Score < 0 THEN 1 ELSE 0 END)       AS NegativeScoreCount,
+        MAX(a.CreationDate)                                AS LastAnswerDate
+    FROM RecentAnswers a
+    GROUP BY a.OwnerUserId
+    HAVING COUNT(*) >= 5
+),
+
+TagBadgeCounts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END)   AS TagBadgeCount,
+        SUM(CASE WHEN b.TagBased = 0 THEN 1 ELSE 0 END)   AS NamedBadgeCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+UserLatestActivity AS (
+    SELECT
+        u.Id                                            AS UserId,
+        GREATEST(
+            u.LastAccessDate,
+            COALESCE(
+                (SELECT MAX(c.CreationDate)
+                 FROM Comments c
+                 WHERE c.UserId = u.Id),
+                TIMESTAMP '1970-01-01')
+        )                                                AS LatestActivity
+    FROM Users u
+),
+
+Combined AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        uas.AnswerCount,
+        uas.AvgScore,
+        tb.TagBadgeCount,
+        tb.NamedBadgeCount,
+        COALESCE(uas.PositiveScoreCount,0)::float
+            / NULLIF(COALESCE(uas.NegativeScoreCount,0),0) AS PosNegRatio,
+        u.LastAccessDate,
+        ua.LatestActivity,
+        /* distinct tags across all questions asked by the user */
+        (SELECT COUNT(DISTINCT tag)
+         FROM (
+               SELECT regexp_split_to_table(p.Tags, '[><]') AS tag
+               FROM Posts p
+               WHERE p.OwnerUserId = u.Id
+                 AND p.PostTypeId = 1               -- only questions
+         ) AS t)                                          AS DistinctQuestionTags,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY uas.AvgScore DESC) AS RankByAvgScore
+    FROM Users u
+    LEFT JOIN UserAnswerStats uas ON uas.OwnerUserId = u.Id
+    LEFT JOIN TagBadgeCounts tb   ON tb.UserId = u.Id
+    LEFT JOIN UserLatestActivity ua ON ua.UserId = u.Id
+    WHERE u.Reputation >= 1000
+      AND (uas.AnswerCount IS NOT NULL OR tb.TagBadgeCount > 0)
+)
+
+SELECT
+    Id,
+    DisplayName,
+    Reputation,
+    AnswerCount,
+    AvgScore,
+    TagBadgeCount,
+    NamedBadgeCount,
+    PosNegRatio,
+    LastAccessDate,
+    LatestActivity,
+    DistinctQuestionTags,
+    RankByAvgScore
+FROM Combined
+WHERE RankByAvgScore = 1
+ORDER BY Reputation DESC, AvgScore DESC
+LIMIT 10
+
+UNION ALL
+
+SELECT
+    NULL                                            AS Id,
+    'Aggregate Summary'                             AS DisplayName,
+    NULL                                            AS Reputation,
+    SUM(AnswerCount)                                AS AnswerCount,
+    AVG(AvgScore)                                   AS AvgScore,
+    SUM(TagBadgeCount)                              AS TagBadgeCount,
+    SUM(NamedBadgeCount)                            AS NamedBadgeCount,
+    NULL                                            AS PosNegRatio,
+    NULL                                            AS LastAccessDate,
+    MAX(LatestActivity)                             AS LatestActivity,
+    NULL                                            AS DistinctQuestionTags,
+    NULL                                            AS RankByAvgScore
+FROM Combined
+WHERE AnswerCount IS NOT NULL;

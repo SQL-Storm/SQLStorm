@@ -1,0 +1,217 @@
+-- {"query": "1454.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3162} 
+
+WITH UserActivity AS (
+    -- CTE 1: Aggregates basic user statistics, reputation, and badge counts.
+    -- Includes a calculation for days since last access and correlated subqueries for badge types.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserTotalUpVotes,
+        U.DownVotes AS UserTotalDownVotes,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - U.LastAccessDate)) / (60 * 60 * 24) AS DaysSinceLastAccess,
+        (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) AS GoldBadges,
+        (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = U.Id AND B.TagBased = TRUE) AS TagBasedBadges
+    FROM Users U
+    WHERE U.Reputation >= 100 -- Focus on more established users
+),
+PostMetrics AS (
+    -- CTE 2: Analyzes individual post performance, vote counts, and flags for historical edits/closures.
+    -- Includes a correlated subquery for average comment score.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.LastEditDate,
+        P.ClosedDate,
+        COALESCE(P.Title, SUBSTRING(P.Body, 1, 100)) AS DisplayTitle, -- Uses first 100 chars of body if title is NULL
+        P.Tags,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount,
+        COUNT(DISTINCT PH.Id) AS HistoryEntryCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 24) THEN 1 ELSE 0 END) AS HasBeenEdited,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS HasBeenClosed,
+        (SELECT AVG(C.Score) FROM Comments C WHERE C.PostId = P.Id AND C.Score IS NOT NULL) AS AvgCommentScore
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount,
+        P.CommentCount, P.FavoriteCount, P.LastEditDate, P.ClosedDate, P.Title, P.Body, P.Tags
+),
+TagUsage AS (
+    -- CTE 3: Ranks tags by their global usage count.
+    SELECT
+        T.TagName,
+        T.Id AS TagId,
+        T.Count AS GlobalTagCount,
+        RANK() OVER (ORDER BY T.Count DESC, T.TagName) AS TagPopularityRank
+    FROM Tags T
+    WHERE T.TagName IS NOT NULL
+),
+LastHistoryPerPost AS (
+    -- CTE 4: Identifies the latest significant history event for each post, including close reasons.
+    -- Uses a subquery with ROW_NUMBER to get the most recent entry.
+    SELECT
+        PostId, HistoryDate, HistoryTypeName, HistoryEditorUserId, Comment, CloseReasonName, HistoryCategory
+    FROM (
+        SELECT
+            PH.PostId,
+            PH.CreationDate AS HistoryDate,
+            PHT.Name AS HistoryTypeName,
+            PH.UserId AS HistoryEditorUserId,
+            PH.Comment,
+            CR.Name AS CloseReasonName,
+            CASE
+                WHEN PH.PostHistoryTypeId IN (1, 2, 3) THEN 'Initial'
+                WHEN PH.PostHistoryTypeId IN (4, 5, 6, 24) THEN 'Edit'
+                WHEN PH.PostHistoryTypeId IN (10, 12, 14, 35) THEN 'Moderation Action'
+                WHEN PH.PostHistoryTypeId IN (11, 13, 15, 36) THEN 'Moderation Reversal'
+                ELSE 'Other'
+            END AS HistoryCategory,
+            ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC, PH.Id DESC) AS rn
+        FROM PostHistory PH
+        JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+        LEFT JOIN CloseReasonTypes CR ON PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND PH.Comment ~ '^[0-9]+$' AND PH.Comment::smallint = CR.Id
+        WHERE PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15, 24, 35, 36)
+    ) AS RankedHistory
+    WHERE rn = 1
+),
+UserPostTagBase AS (
+    -- CTE 5: Combines user and post metrics, identifying the most popular tag for each post.
+    -- Calculates a complex 'PostInfluenceScore' and includes correlated subqueries for linked/duplicate posts.
+    SELECT
+        UA.UserId,
+        UA.DisplayName,
+        UA.Reputation,
+        UA.GoldBadges,
+        UA.DaysSinceLastAccess,
+        PM.PostId,
+        PM.PostTypeId,
+        PM.CreationDate AS PostCreationDate,
+        PM.Score AS PostScore,
+        PM.ViewCount AS PostViewCount,
+        PM.FavoriteCount,
+        PM.UpvoteCount,
+        PM.DownvoteCount,
+        PM.HistoryEntryCount,
+        PM.HasBeenClosed,
+        PM.AvgCommentScore,
+        COALESCE(T.TagName, 'No Tag') AS MostPopularTagOnPost,
+        COALESCE(T.TagPopularityRank, 999999) AS MostPopularTagRank,
+        -- Complex Post Influence Score: Weighted sum of various post metrics
+        (PM.Score * 0.5 + COALESCE(PM.ViewCount, 0) * 0.01 + COALESCE(PM.FavoriteCount, 0) * 2
+         + PM.UpvoteCount * 0.7 - PM.DownvoteCount * 1.5
+         + (CASE WHEN PM.PostTypeId = 1 THEN COALESCE(PM.AnswerCount,0) * 0.8 ELSE 0 END) ) AS PostInfluenceScore,
+        (SELECT COUNT(PL.Id) FROM PostLinks PL WHERE PL.PostId = PM.PostId AND PL.LinkTypeId = 1) AS SourceLinkedPostCount,
+        (SELECT COUNT(PL.Id) FROM PostLinks PL WHERE PL.RelatedPostId = PM.PostId AND PL.LinkTypeId = 3) AS DuplicatedByPostCount
+    FROM UserActivity UA
+    INNER JOIN PostMetrics PM ON UA.UserId = PM.OwnerUserId
+    LEFT JOIN LATERAL ( -- PostgreSQL-specific LATERAL JOIN to find the single most popular tag
+        SELECT TU.TagName, TU.TagPopularityRank
+        FROM TagUsage TU
+        WHERE PM.Tags LIKE '%<' || TU.TagName || '>%'
+        ORDER BY TU.TagPopularityRank ASC
+        LIMIT 1
+    ) T ON TRUE
+),
+UserOverallStats AS (
+    -- CTE 6: Aggregates post-level influence to a user level and calculates overall user engagement and rank.
+    SELECT
+        UPTB.UserId,
+        UPTB.DisplayName,
+        UPTB.Reputation,
+        UPTB.GoldBadges,
+        UPTB.DaysSinceLastAccess,
+        SUM(UPTB.PostInfluenceScore) AS TotalUserInfluenceScore,
+        COUNT(DISTINCT UPTB.PostId) AS TotalPostsByThisUser,
+        AVG(UPTB.PostScore) AS AvgPostScoreByUser,
+        -- Complex User Engagement Score: Incorporates influence, reputation, badges, and recent activity
+        (SUM(UPTB.PostInfluenceScore) * 0.6 + UPTB.Reputation * 0.1 + UPTB.GoldBadges * 50
+         + (100 - LEAST(UPTB.DaysSinceLastAccess, 100)) * 0.05) AS UserEngagementScore,
+        RANK() OVER (ORDER BY SUM(UPTB.PostInfluenceScore) DESC, UPTB.Reputation DESC, UPTB.DisplayName ASC) AS OverallUserRank
+    FROM UserPostTagBase UPTB
+    GROUP BY
+        UPTB.UserId, UPTB.DisplayName, UPTB.Reputation, UPTB.GoldBadges, UPTB.DaysSinceLastAccess
+)
+-- Final Query: Selects detailed user and post information, enriched with rankings, classifications, and complex metrics.
+SELECT
+    UOS.OverallUserRank,
+    UOS.DisplayName,
+    UOS.Reputation,
+    UOS.GoldBadges,
+    UOS.DaysSinceLastAccess,
+    UOS.TotalUserInfluenceScore,
+    UOS.TotalPostsByThisUser,
+    UOS.AvgPostScoreByUser,
+    UOS.UserEngagementScore,
+    UPTB.PostId,
+    UPTB.PostTypeId,
+    UPTB.PostCreationDate,
+    UPTB.PostScore,
+    UPTB.PostViewCount,
+    UPTB.FavoriteCount,
+    UPTB.UpvoteCount,
+    UPTB.DownvoteCount,
+    UPTB.HistoryEntryCount,
+    UPTB.SourceLinkedPostCount,
+    UPTB.DuplicatedByPostCount,
+    UPTB.HasBeenClosed,
+    UPTB.AvgCommentScore,
+    UPTB.MostPopularTagOnPost,
+    UPTB.MostPopularTagRank,
+    UPTB.PostInfluenceScore,
+    LHPP.HistoryCategory AS LatestPostHistoryCategory,
+    LHPP.HistoryDate AS LatestPostHistoryDate,
+    LHPP.CloseReasonName,
+    -- Elaborate Post Classification string expression using CASE WHEN
+    CASE
+        WHEN UPTB.PostTypeId = 1 AND UPTB.HasBeenClosed = 1 AND LHPP.CloseReasonName IS NOT NULL
+            THEN 'Closed Question: ' || LHPP.CloseReasonName
+        WHEN UPTB.PostTypeId = 1 AND UPTB.HasBeenClosed = 1
+            THEN 'Closed Question (Reason Unknown)'
+        WHEN UPTB.PostTypeId = 1 AND UPTB.PostScore >= 10 AND UPTB.PostViewCount > 1000
+            THEN 'High-Visibility Question'
+        WHEN UPTB.PostTypeId = 1
+            THEN 'Standard Question'
+        WHEN UPTB.PostTypeId = 2 AND UPTB.PostScore >= 5 AND UPTB.MostPopularTagRank <= 100
+            THEN 'Highly Rated Answer on Popular Tag'
+        WHEN UPTB.PostTypeId = 2 AND UPTB.PostScore >= 5
+            THEN 'Highly Rated Answer'
+        WHEN UPTB.PostTypeId = 2 AND UPTB.PostScore < 0
+            THEN 'Controversial Answer'
+        ELSE 'Other Post Type or Low Impact'
+    END AS PostClassification,
+    -- Complex mathematical expression for Comprehensive Post Quality Metric, including NULL handling
+    SQRT(
+        POWER(UPTB.PostInfluenceScore, 2) +
+        POWER(COALESCE(UPTB.AvgCommentScore, 0.0) * 10, 2) + -- Amplify comment score impact
+        POWER(UPTB.SourceLinkedPostCount * 5.0, 2) + -- Amplify linked post count impact
+        POWER(UPTB.DuplicatedByPostCount * -3.0, 2) -- Penalize posts marked as duplicates
+    ) AS ComprehensivePostQualityMetric,
+    -- String operations: combines year of post creation with a truncated/uppercased display name
+    EXTRACT(YEAR FROM UPTB.PostCreationDate) || '-' || UPPER(SUBSTRING(UOS.DisplayName, 1, LEAST(LENGTH(UOS.DisplayName), 5))) AS UserPostIdentifierPrefix,
+    -- Window function: Average score of posts by this user created in the same year
+    AVG(UPTB.PostScore) OVER (PARTITION BY UPTB.UserId, EXTRACT(YEAR FROM UPTB.PostCreationDate)) AS AvgUserPostScoreInYear,
+    -- Window function: Difference in reputation from the user with the next higher rank
+    COALESCE(UOS.Reputation - LEAD(UOS.Reputation, 1) OVER (ORDER BY UOS.OverallUserRank), 0) AS RepDiffToNextRank
+FROM UserPostTagBase UPTB
+INNER JOIN UserOverallStats UOS ON UPTB.UserId = UOS.UserId
+LEFT JOIN LastHistoryPerPost LHPP ON UPTB.PostId = LHPP.PostId
+WHERE UOS.TotalUserInfluenceScore > 0 -- Exclude users with zero or negative total influence
+  AND UPTB.PostCreationDate >= '2020-01-01' -- Filter for more recent post activity
+ORDER BY
+    UOS.OverallUserRank ASC,
+    UPTB.PostInfluenceScore DESC,
+    UPTB.PostCreationDate DESC
+LIMIT 500;

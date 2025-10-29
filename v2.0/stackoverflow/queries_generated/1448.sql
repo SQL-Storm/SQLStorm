@@ -1,0 +1,234 @@
+-- {"query": "1448.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3465} 
+
+WITH UserActivity AS (
+    -- Summarize core user activity and post statistics, aggregating across all posts/comments/votes owned/made by the user.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViews, -- Handle NULL ViewCount for non-question posts gracefully
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        -- Aggregate vote counts by user for votes they *cast*
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpvotesGiven, -- UpMod
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownvotesGiven, -- DownMod
+        MAX(P.Score) AS MaxPostScore,
+        MIN(P.CreationDate) AS FirstPostDate,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - U.CreationDate)) / (60*60*24) AS DaysSinceUserCreation -- Complex calculation
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Votes AS V ON U.Id = V.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+UserBadgeSummary AS (
+    -- Summarize user badge statistics, including a classification of badge types.
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MIN(B.Date) AS FirstBadgeAwardDate,
+        MAX(B.Date) AS LastBadgeAwardDate
+    FROM Badges AS B
+    GROUP BY B.UserId
+),
+PostHistoricalAnalysis AS (
+    -- Analyze post history for edits, closes, and reopens. Includes a correlated subquery.
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS EditCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 END) AS CloseCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 END) AS ReopenCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 2 THEN PH.CreationDate END) AS InitialBodyCreationDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 5 THEN PH.CreationDate END) AS LastBodyEditDate,
+        -- Correlated subquery: retrieve the DisplayName of the user who made the most recent body edit for this post.
+        (
+            SELECT U2.DisplayName
+            FROM PostHistory AS PH2
+            JOIN Users AS U2 ON PH2.UserId = U2.Id
+            WHERE PH2.PostId = PH.PostId
+              AND PH2.PostHistoryTypeId = 5 -- Body edit
+              AND U2.DisplayName IS NOT NULL -- Exclude deleted users or community
+            ORDER BY PH2.CreationDate DESC
+            LIMIT 1
+        ) AS MostRecentBodyEditor
+    FROM PostHistory AS PH
+    GROUP BY PH.PostId
+),
+PostCommentScores AS (
+    -- Aggregate comment scores for each post and count specific comment phrases.
+    SELECT
+        C.PostId,
+        AVG(C.Score) AS AverageCommentScore,
+        SUM(CASE WHEN LOWER(C.Text) LIKE '%thank you%' THEN 1 ELSE 0 END) AS ThankYouComments, -- Case-insensitive search
+        SUM(CASE WHEN C.UserId IS NULL THEN 1 ELSE 0 END) AS AnonymousComments -- NULL logic
+    FROM Comments AS C
+    GROUP BY C.PostId
+),
+RankedUserPosts AS (
+    -- Rank each user's questions and answers by score (descending), breaking ties by view count and creation date.
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId AS UserId,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.Title,
+        P.Body,
+        P.Tags,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId, P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC, P.CreationDate DESC) AS rn
+    FROM Posts AS P
+    WHERE P.OwnerUserId IS NOT NULL
+),
+TopUserPost AS (
+    -- Select the single highest-scoring question and highest-scoring answer for each user.
+    SELECT
+        UserId,
+        MAX(CASE WHEN PostTypeId = 1 AND rn = 1 THEN PostId END) AS TopQuestionId,
+        MAX(CASE WHEN PostTypeId = 1 AND rn = 1 THEN Score END) AS TopQuestionScore,
+        MAX(CASE WHEN PostTypeId = 1 AND rn = 1 THEN Title END) AS TopQuestionTitle,
+        MAX(CASE WHEN PostTypeId = 1 AND rn = 1 THEN Body END) AS TopQuestionBody,
+        MAX(CASE WHEN PostTypeId = 1 AND rn = 1 THEN Tags END) AS TopQuestionTags,
+        MAX(CASE WHEN PostTypeId = 2 AND rn = 1 THEN PostId END) AS TopAnswerId,
+        MAX(CASE WHEN PostTypeId = 2 AND rn = 1 THEN Score END) AS TopAnswerScore,
+        MAX(CASE WHEN PostTypeId = 2 AND rn = 1 THEN Body END) AS TopAnswerBody
+    FROM RankedUserPosts
+    WHERE rn = 1
+    GROUP BY UserId
+),
+ClosedOrReopenedPosts AS (
+    -- Example of a set operator: combine all post closure and re-opening events.
+    SELECT PostId, 'Closed' AS EventType, CreationDate, Comment AS EventReason, UserId AS EventUserId
+    FROM PostHistory
+    WHERE PostHistoryTypeId = 10 -- Post Closed
+    UNION ALL
+    SELECT PostId, 'Reopened' AS EventType, CreationDate, NULL AS EventReason, UserId AS EventUserId
+    FROM PostHistory
+    WHERE PostHistoryTypeId = 11 -- Post Reopened
+),
+PostTagAnalysis AS (
+    -- De-normalize tags from the Posts table using string functions (PostgreSQL specific).
+    -- Tags are expected in '<tag1><tag2>' format, needing replacement of HTML entities.
+    SELECT
+        P.Id AS PostId,
+        TRIM(UNNEST(string_to_array(REPLACE(REPLACE(P.Tags, '&lt;', '<'), '&gt;', '>'), '><'))) AS TagName,
+        P.PostTypeId
+    FROM Posts AS P
+    WHERE P.Tags IS NOT NULL AND LENGTH(TRIM(P.Tags)) > 0 AND P.Tags LIKE '<%>'
+),
+AggregatedTagStats AS (
+    -- Aggregate statistics for each unique tag found in posts.
+    SELECT
+        PTA.TagName,
+        COUNT(DISTINCT PTA.PostId) AS TaggedPostsCount,
+        SUM(P.Score) AS TotalTagScore,
+        AVG(P.Score) AS AvgTagScore,
+        COUNT(CASE WHEN P.PostTypeId = 1 THEN 1 END) AS QuestionsWithTag,
+        COUNT(CASE WHEN P.PostTypeId = 2 THEN 1 END) AS AnswersWithTag
+    FROM PostTagAnalysis AS PTA
+    JOIN Posts AS P ON PTA.PostId = P.Id
+    GROUP BY PTA.TagName
+)
+SELECT
+    UA.UserId,
+    UA.DisplayName,
+    UA.Reputation,
+    UA.TotalPosts,
+    UA.TotalQuestions,
+    UA.TotalAnswers,
+    COALESCE(UBS.TotalBadges, 0) AS UserTotalBadges,
+    COALESCE(UBS.GoldBadges, 0) AS UserGoldBadges,
+    COALESCE(UBS.SilverBadges, 0) AS UserSilverBadges,
+    COALESCE(UBS.BronzeBadges, 0) AS UserBronzeBadges,
+    UA.DaysSinceUserCreation,
+    TUP.TopQuestionTitle,
+    TUP.TopQuestionScore,
+    -- Correlated subquery: retrieve the most recent editor for the user's top question.
+    (
+        SELECT U3.DisplayName
+        FROM PostHistory AS PH3
+        JOIN Users AS U3 ON PH3.UserId = U3.Id
+        WHERE PH3.PostId = TUP.TopQuestionId
+          AND PH3.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+          AND U3.DisplayName IS NOT NULL
+        ORDER BY PH3.CreationDate DESC
+        LIMIT 1
+    ) AS TopQuestionMostRecentEditor,
+    TUP.TopAnswerScore,
+    P_TopAnswer.Title AS TopAnswerParentQuestionTitle, -- Get the title of the question the top answer belongs to
+    P_TopAnswer.ViewCount AS TopAnswerViewCount,
+    P_TopAnswer.FavoriteCount AS TopAnswerFavoriteCount,
+    PHA_Answer.EditCount AS TopAnswerEditCount,
+    PHA_Answer.CloseCount AS TopAnswerCloseCount,
+    PHA_Answer.ReopenCount AS TopAnswerReopenCount,
+    PHA_Answer.MostRecentBodyEditor AS TopAnswerMostRecentEditor,
+    PCS_Answer.AverageCommentScore AS TopAnswerAvgCommentScore,
+    PCS_Answer.ThankYouComments AS TopAnswerThankYouComments,
+    -- Complicated calculation with NULL logic for division by zero.
+    (PHA_Answer.CloseCount::NUMERIC / NULLIF(PHA_Answer.EditCount + PHA_Answer.CloseCount + PHA_Answer.ReopenCount, 0)) AS CloseRatioOfTopAnswer,
+    -- Window functions for ranking and cohort analysis.
+    RANK() OVER (ORDER BY UA.Reputation DESC, UA.TotalPosts DESC) AS GlobalReputationRank,
+    NTILE(10) OVER (ORDER BY UA.Reputation DESC) AS ReputationDecile,
+    LAG(UA.Reputation, 1, 0) OVER (ORDER BY UA.UserCreationDate) AS PrevUserReputationByCreationOrder, -- Demonstrates LAG for sequence analysis
+    AVG(UA.TotalPostScore) OVER (PARTITION BY DATE_TRUNC('month', UA.UserCreationDate)) AS AvgMonthlyPostScoreForCohort, -- Rolling average within creation month
+    -- Complex CASE statement with multiple conditions and NULL logic for user engagement classification.
+    CASE
+        WHEN UA.Reputation >= 10000 AND COALESCE(UBS.GoldBadges, 0) > 0 AND UA.TotalQuestions > 50 THEN 'Elite Contributor Developer'
+        WHEN UA.Reputation >= 5000 AND UA.TotalQuestions >= 100 THEN 'Prolific Questioner Guru'
+        WHEN UA.TotalAnswers >= 200 AND COALESCE(UBS.SilverBadges, 0) > 2 THEN 'Veteran Answerer Expert'
+        WHEN UA.Reputation > 1000 AND UA.TotalPosts > 50 AND UA.LastAccessDate > CURRENT_TIMESTAMP - INTERVAL '6 months' THEN 'Active Engaged Member'
+        WHEN UA.TotalPosts IS NULL OR UA.TotalPosts = 0 AND UA.TotalCommentsMade = 0 THEN 'Lurker/Newbie No Contribution'
+        ELSE 'Casual User Participant'
+    END AS UserEngagementLevel,
+    -- String expressions: extract first code snippet from top question or answer body.
+    COALESCE(
+        SUBSTRING(TUP.TopQuestionBody FROM '<code>([^<>]*)</code>'),
+        SUBSTRING(TUP.TopAnswerBody FROM '<code>([^<>]*)</code>'),
+        'NoCodeSnippetFound'
+    ) AS FirstCodeSnippet,
+    LENGTH(COALESCE(TUP.TopQuestionTitle, '')) AS TopQuestionTitleLength,
+    -- More complex string logic: check for specific keywords in Top Answer's body (if available).
+    CASE
+        WHEN TUP.TopAnswerBody IS NOT NULL AND (LOWER(TUP.TopAnswerBody) LIKE '%performance%' OR LOWER(TUP.TopAnswerBody) LIKE '%optimization%')
+        THEN 'Performance Related Answer'
+        ELSE 'General Answer'
+    END AS TopAnswerTopicCategory,
+    -- Correlated subquery: Count links to the user's top answer.
+    (
+        SELECT COUNT(PL.Id)
+        FROM PostLinks AS PL
+        WHERE PL.RelatedPostId = TUP.TopAnswerId AND PL.LinkTypeId = 1 -- Linked
+    ) AS LinksToTopAnswer,
+    -- Aggregate tag information for the user's top question's tags using STRING_AGG.
+    (
+        SELECT STRING_AGG(DISTINCT ATS.TagName || ' (' || ATS.TaggedPostsCount || ')', ', ')
+        FROM PostTagAnalysis AS PTA
+        JOIN AggregatedTagStats AS ATS ON PTA.TagName = ATS.TagName
+        WHERE PTA.PostId = TUP.TopQuestionId
+        ORDER BY ATS.TaggedPostsCount DESC
+        LIMIT 3
+    ) AS TopQuestionMostPopularTagsWithCount,
+    -- Correlated subquery with COALESCE for NULL logic: retrieve the last close reason if the top question was closed.
+    COALESCE(
+        (SELECT EventReason FROM ClosedOrReopenedPosts WHERE PostId = TUP.TopQuestionId AND EventType = 'Closed' ORDER BY CreationDate DESC LIMIT 1),
+        'Not Closed Recently'
+    ) AS LastCloseReasonIfAny
+FROM UserActivity AS UA
+LEFT JOIN UserBadgeSummary AS UBS ON UA.UserId = UBS.UserId
+LEFT JOIN TopUserPost AS TUP ON UA.UserId = TUP.UserId
+LEFT JOIN Posts AS P_TopAnswer ON TUP.TopAnswerId = P_TopAnswer.Id -- Details about the parent question of the user's top answer
+LEFT JOIN PostHistoricalAnalysis AS PHA_Answer ON P_TopAnswer.Id = PHA_Answer.PostId
+LEFT JOIN PostCommentScores AS PCS_Answer ON P_TopAnswer.Id = PCS_Answer.PostId
+WHERE UA.Reputation IS NOT NULL
+  AND (UA.TotalPosts > 0 OR COALESCE(UBS.TotalBadges, 0) > 0 OR UA.TotalCommentsMade > 0 OR UA.Reputation > 100) -- Filter for more engaged users
+ORDER BY GlobalReputationRank ASC, UserTotalBadges DESC, UA.LastAccessDate DESC
+LIMIT 1000;

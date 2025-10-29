@@ -1,0 +1,97 @@
+-- {"query": "4316.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 899} 
+
+WITH RankedUserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceived,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceived,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC) AS RankByReputation,
+    DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY u.Reputation DESC) AS RankByPostTypeReputation
+  FROM Users AS u
+  LEFT JOIN Posts AS p
+    ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments AS c
+    ON u.Id = c.UserId
+  LEFT JOIN Votes AS v
+    ON u.Id = v.UserId
+  WHERE
+    u.CreationDate < DATE('now', '-1 year') AND u.Views > 1000
+  GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation
+), RecentPostEdits AS (
+  SELECT
+    ph.PostId,
+    p.Title,
+    p.PostTypeId,
+    ph.UserId AS EditorUserId,
+    u.DisplayName AS EditorDisplayName,
+    ph.CreationDate AS EditDate,
+    ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS EditRank
+  FROM PostHistory AS ph
+  JOIN Posts AS p
+    ON ph.PostId = p.Id
+  JOIN Users AS u
+    ON ph.UserId = u.Id
+  WHERE
+    ph.PostHistoryTypeId IN (4, 5, 7, 8, 9) AND ph.CreationDate > DATE('now', '-90 days')
+)
+SELECT
+  r.UserId,
+  r.DisplayName,
+  r.Reputation,
+  r.TotalPosts,
+  r.TotalComments,
+  r.TotalUpVotesReceived,
+  r.TotalDownVotesReceived,
+  r.RankByReputation,
+  CASE
+    WHEN r.RankByPostTypeReputation <= 5 THEN 'Top Contributor for Post Type'
+    ELSE 'Regular Contributor'
+  END AS ReputationTier,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = (
+        SELECT
+          p2.Id
+        FROM Posts AS p2
+        WHERE
+          p2.OwnerUserId = r.UserId AND p2.PostTypeId = 1
+        ORDER BY
+          p2.CreationDate ASC
+        LIMIT 1
+      ) AND pl.LinkTypeId = 3
+  ) AS DuplicateLinksCreated,
+  CASE
+    WHEN r.DisplayName LIKE '%John%' THEN 'Contains John'
+    WHEN r.DisplayName LIKE '%Doe%' THEN 'Contains Doe'
+    ELSE 'Other Name'
+  END AS NameCategory,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM Badges AS b
+      WHERE
+        b.UserId = r.UserId AND b.Name = 'Famous Question'
+    ) THEN 'Has Famous Question Badge'
+    ELSE 'No Famous Question Badge'
+  END AS BadgeStatus,
+  COALESCE(rpe.EditorDisplayName, 'No Recent Edits') AS MostRecentEditor,
+  rpe.EditDate AS LastEditTimestamp
+FROM RankedUserActivity AS r
+LEFT JOIN RecentPostEdits AS rpe
+  ON r.UserId = rpe.EditorUserId AND rpe.EditRank = 1
+WHERE
+  r.TotalPosts > 10 AND r.TotalComments > 5 OR r.Reputation > 50000
+ORDER BY
+  r.RankByReputation
+LIMIT 100;

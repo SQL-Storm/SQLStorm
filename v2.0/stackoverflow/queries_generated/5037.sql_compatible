@@ -1,0 +1,108 @@
+WITH TopQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS rn_owner
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.ViewCount > 0
+),
+OwnerStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT t.PostId) AS QuestionsViewed,
+    SUM(t.ViewCount) AS TotalViewsByUser,
+    MAX(t.CreationDate) AS LastQuestionDate
+  FROM TopQuestions t
+  JOIN Users u ON u.Id = t.OwnerUserId
+  WHERE t.rn_owner = 1
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    v.VoteTypeId,
+    v.UserId AS VoterId,
+    v.CreationDate AS VoteDate
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.PostTypeId = 1
+    AND p.LastActivityDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '60 minutes'
+),
+TagLinkage AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagUseCount
+  FROM Tags t
+  GROUP BY t.TagName
+  HAVING COUNT(*) > 5
+),
+ComplexComposition AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    CASE WHEN EXISTS (
+      SELECT 1
+      FROM Posts p
+      WHERE p.OwnerUserId = u.Id
+        AND p.PostTypeId = 1
+        AND p.Title IS NOT NULL
+        AND p.Title <> ''
+    ) THEN TRUE ELSE FALSE END AS HasQuestionWithTitle
+  FROM Users u
+  WHERE u.AccountId IS NOT NULL
+),
+MostActivePerOwner AS (
+  SELECT
+    p.OwnerUserId,
+    p.Id AS Id,
+    p.Title,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn_owner_last
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+)
+SELECT
+  cc.UserId,
+  cc.DisplayName,
+  cc.HasQuestionWithTitle,
+  os.Reputation,
+  os.QuestionsViewed,
+  os.TotalViewsByUser,
+  os.LastQuestionDate,
+  ra.Id AS MostActiveQuestionId,
+  ra.Title AS MostActiveQuestionTitle,
+  ra.LastActivityDate AS MostActiveDate,
+  tc.TagName AS PredominantTag,
+  tc.TagUseCount AS TagFrequency
+FROM ComplexComposition cc
+JOIN OwnerStats os ON os.UserId = cc.UserId
+LEFT JOIN (
+  SELECT OwnerUserId, Id, Title, LastActivityDate
+  FROM MostActivePerOwner
+  WHERE rn_owner_last = 1
+) ra ON ra.OwnerUserId = cc.UserId
+LEFT JOIN (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagCount
+  FROM Tags t
+  GROUP BY t.TagName
+) tc ON 1=1
+ORDER BY os.TotalViewsByUser DESC
+OFFSET 0 LIMIT 100;

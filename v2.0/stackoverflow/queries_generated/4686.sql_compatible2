@@ -1,0 +1,164 @@
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.Title,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+      DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+      ROW_NUMBER() OVER (ORDER BY p.FavoriteCount DESC) AS FavoriteRank,
+      COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCountPerPost
+    FROM
+      Posts AS p
+    LEFT JOIN
+      Comments AS c
+      ON p.Id = c.PostId
+    WHERE
+      p.OwnerUserId IS NOT NULL
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '365' DAY)
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.Title,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount
+  ),
+  UserPostActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      AVG(p.Score) AS AverageScore,
+      MAX(p.CreationDate) AS LastPostDate,
+      COUNT(DISTINCT ph.Id) AS PostHistoryEntries
+    FROM
+      Users AS u
+    JOIN
+      Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN
+      PostHistory AS ph
+      ON p.Id = ph.PostId
+    WHERE
+      u.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '730' DAY)
+      AND p.Score > 5
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+    HAVING
+      COUNT(p.Id) > 10
+  ),
+  PostWithCommentsAndVotes AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.Score,
+      COUNT(DISTINCT c.Id) AS NumComments,
+      COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS Upvotes,
+      COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS Downvotes,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+      END AS PostStatus
+    FROM
+      Posts AS p
+    LEFT JOIN
+      Comments AS c
+      ON p.Id = c.PostId
+    LEFT JOIN
+      Votes AS v
+      ON p.Id = v.PostId
+    WHERE
+      p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '180' DAY)
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.Score,
+      p.ClosedDate,
+      p.CommunityOwnedDate
+  )
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.Score,
+  rp.ViewCount,
+  rp.FavoriteRank,
+  upa.DisplayName AS OwnerDisplayName,
+  upa.Reputation,
+  upa.QuestionCount,
+  upa.AnswerCount,
+  upa.AverageScore,
+  pwcv.NumComments,
+  pwcv.Upvotes,
+  pwcv.Downvotes,
+  pwcv.PostStatus,
+  COALESCE(pht.Name, 'Unknown') AS LastPostHistoryAction,
+  CASE
+    WHEN rp.ScoreRank <= 10 AND rp.ViewRank <= 100 THEN 'Top Scorer & High Viewer'
+    WHEN rp.FavoriteRank <= 5 THEN 'Highly Favorited'
+    WHEN upa.TotalPosts > 1000 AND upa.AverageScore > 10 THEN 'Power User'
+    ELSE 'Standard User'
+  END AS UserEngagementLevel,
+  LENGTH(rp.Title) AS TitleLength,
+  CASE WHEN rp.Title LIKE '%?%' THEN 'HasQuestionMark' ELSE 'NoQuestionMark' END AS TitleHasQuestionMark,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      PostLinks AS pl
+    WHERE
+      pl.PostId = rp.PostId
+      AND pl.LinkTypeId = 3
+  ) AS DuplicateLinkCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.PostId = rp.PostId
+      AND ph.PostHistoryTypeId IN (10, 11, 12, 13)
+  ) AS ModerationActions,
+  rp.CommentCountPerPost
+FROM
+  RankedPosts AS rp
+JOIN
+  UserPostActivity AS upa
+  ON rp.OwnerUserId = upa.UserId
+JOIN
+  PostWithCommentsAndVotes AS pwcv
+  ON rp.PostId = pwcv.PostId
+LEFT JOIN
+  PostHistory AS ph_last
+  ON rp.PostId = ph_last.PostId
+LEFT JOIN
+  PostHistoryTypes AS pht
+  ON ph_last.PostHistoryTypeId = pht.Id
+  AND ph_last.CreationDate = (
+    SELECT MAX(ph_inner.CreationDate)
+    FROM PostHistory AS ph_inner
+    WHERE ph_inner.PostId = rp.PostId
+  )
+WHERE
+  rp.ScoreRank <= 100
+  AND rp.ViewRank <= 500
+  AND upa.TotalPosts > 50
+ORDER BY
+  rp.Score DESC,
+  upa.Reputation DESC,
+  rp.FavoriteRank;

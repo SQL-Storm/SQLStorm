@@ -1,0 +1,101 @@
+WITH recent_user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.AboutMe,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+top_tags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC, t.TagName) AS rn
+  FROM Tags t
+  WHERE COALESCE(t.IsModeratorOnly, 0) = 0
+),
+hot_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.AnswerCount,
+    p.CommentCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+tag_explode AS (
+  SELECT
+    p.Id AS PostId,
+    TRIM(BOTH '<>' FROM tag) AS TagName
+  FROM Posts p,
+  LATERAL (
+    SELECT UNNEST(string_to_array(p.Tags, '>')) AS tag
+  ) t
+),
+aggregated AS (
+  SELECT
+    uq.UserId,
+    uq.DisplayName,
+    uq.Reputation,
+    t.TagName,
+    COUNT(DISTINCT a.Id) AS AnswerCountByUser,
+    SUM(a.Score) AS ScoreFromAnswers,
+    AVG(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate))) AS AvgActivitySpanSeconds
+  FROM hot_questions h
+  LEFT JOIN Posts p ON p.OwnerUserId = h.OwnerUserId
+  LEFT JOIN Posts a ON a.ParentId = h.PostId AND a.PostTypeId = 2
+  LEFT JOIN Users uq ON uq.Id = h.OwnerUserId
+  LEFT JOIN tag_explode t ON t.PostId = h.PostId
+  GROUP BY uq.UserId, uq.DisplayName, uq.Reputation, t.TagName
+)
+SELECT
+  rua.UserId,
+  rua.DisplayName,
+  rua.Reputation,
+  rua.LastAccessDate,
+  rup.TagName,
+  COALESCE(agg.AnswerCountByUser, 0) AS AnswerCountByUser,
+  COALESCE(agg.ScoreFromAnswers, 0) AS ScoreFromAnswers,
+  COALESCE(agg.AvgActivitySpanSeconds, 0) AS AvgActivitySpanSeconds,
+  CASE WHEN rua.Location IS NOT NULL THEN rua.Location ELSE 'Unknown' END AS UserLocation,
+  CASE WHEN rua.AboutMe IS NOT NULL THEN SUBSTRING(rua.AboutMe FROM 1 FOR 200) ELSE NULL END AS ShortBio
+FROM recent_user_activity rua
+LEFT JOIN aggregated agg ON agg.UserId = rua.UserId
+LEFT JOIN (
+  SELECT DISTINCT TagName
+  FROM Tags
+  WHERE COALESCE(IsModeratorOnly, 0) = 0
+) rup ON rup.TagName IS NOT NULL
+WHERE rua.rn = 1
+GROUP BY
+  rua.UserId,
+  rua.DisplayName,
+  rua.Reputation,
+  rua.LastAccessDate,
+  rup.TagName,
+  agg.AnswerCountByUser,
+  agg.ScoreFromAnswers,
+  agg.AvgActivitySpanSeconds,
+  rua.Location,
+  rua.AboutMe
+ORDER BY rua.Reputation DESC, rua.LastAccessDate DESC
+FETCH FIRST 100 ROWS ONLY;

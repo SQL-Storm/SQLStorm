@@ -1,0 +1,115 @@
+WITH QuestionScores AS (
+    SELECT
+        p.Id AS QuestionId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS Upvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS Downvotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS NetScore
+    FROM Posts p
+    JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+),
+AnswerMetrics AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(COALESCE(a.Score, 0)) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        MIN(a.Score) AS MinAnswerScore,
+        SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswerCount
+    FROM Posts a
+    LEFT JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 END) AS Edits,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN 1 END) AS ModActions,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN 1 ELSE 0 END) AS TotalModActions
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS QuestionCount,
+        SUM(COALESCE(qs.NetScore, 0)) AS TotalTagScore,
+        AVG(COALESCE(qs.NetScore, 0)) AS AvgTagScore
+    FROM Tags t
+    LEFT JOIN Posts p ON (',' || REPLACE(REPLACE(p.Tags, '<', ''), '>', ',') || ',') LIKE '%,' || t.TagName || ',' AND p.PostTypeId = 1
+    LEFT JOIN QuestionScores qs ON p.Id = qs.QuestionId
+    GROUP BY t.TagName
+),
+TagExtractor AS (
+    -- Split tags stored like "<tag1><tag2>" into rows in a dialect-neutral way
+    SELECT DISTINCT p.Id AS PostId,
+           TRIM(tag) AS TagName
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(
+            REPLACE(REPLACE(p.Tags, '<', ''), '>', ','), ','
+        ) AS tag
+    ) AS split_tags
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate AS QuestionCreationDate,
+    COALESCE(qs.NetScore, 0) AS QuestionNetScore,
+    COALESCE(am.AnswerCount, 0) AS TotalAnswers,
+    COALESCE(am.AcceptedAnswerCount, 0) AS AcceptedAnswers,
+    COALESCE(am.AvgAnswerScore, 0) AS AverageAnswerScore,
+    COALESCE(u.Reputation, 0) AS OwnerReputation,
+    u.DisplayName AS OwnerDisplayName,
+    COALESCE(ua.Edits, 0) AS OwnerEdits,
+    COALESCE(ua.ModActions, 0) AS OwnerModActions,
+    CASE WHEN q.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+    DATE_PART('day', COALESCE(q.ClosedDate, q.CreationDate) - q.CreationDate) AS DaysToClose,
+    tp.TagName,
+    tp.QuestionCount AS TagQuestionCount,
+    tp.AvgTagScore AS TagAverageScore,
+    -- Reformatted tags: take first and rest after first '>' in a safe way
+    (CASE
+        WHEN POSITION('>' IN q.Tags) > 0 THEN
+            SUBSTRING(q.Tags FROM 2 FOR POSITION('>' IN q.Tags) - 2) || '|' ||
+            SUBSTRING(q.Tags FROM POSITION('>' IN q.Tags) + 1 FOR CHAR_LENGTH(q.Tags) - POSITION('>' IN q.Tags) - 1)
+        ELSE q.Tags
+     END) AS FormattedTags
+FROM Posts q
+LEFT JOIN QuestionScores qs ON q.Id = qs.QuestionId
+LEFT JOIN AnswerMetrics am ON q.Id = am.QuestionId
+LEFT JOIN Users u ON q.OwnerUserId = u.Id
+LEFT JOIN UserActivity ua ON q.OwnerUserId = ua.UserId
+LEFT JOIN TagExtractor te ON q.Id = te.PostId
+LEFT JOIN TagPopularity tp ON te.TagName = tp.TagName
+WHERE q.PostTypeId = 1
+  AND q.CreationDate >= (cast('2024-10-01' as date) + INTERVAL '-1 year') + (CAST('12:34:56' AS time) + (DATE '2024-10-01' - DATE '2024-10-01'))
+  AND COALESCE(q.ViewCount, 0) > 1000
+  AND COALESCE(qs.NetScore, 0) > 50
+  AND COALESCE(am.AnswerCount, 0) BETWEEN 5 AND 50
+GROUP BY
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    qs.NetScore,
+    am.AnswerCount,
+    am.AcceptedAnswerCount,
+    am.AvgAnswerScore,
+    u.Reputation,
+    u.DisplayName,
+    ua.Edits,
+    ua.ModActions,
+    q.ClosedDate,
+    q.Tags,
+    tp.TagName,
+    tp.QuestionCount,
+    tp.AvgTagScore,
+    q.LastActivityDate
+ORDER BY
+    q.LastActivityDate DESC,
+    tp.AvgTagScore DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

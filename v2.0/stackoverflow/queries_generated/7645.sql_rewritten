@@ -1,0 +1,254 @@
+-- {"query": "7645.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1931} 
+WITH UserPostStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) as TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        MAX(p.Score) as MaxScore,
+        AVG(p.Score) as AvgScore,
+        STRING_AGG(p.Tags, '; ') as AllTags,
+        COUNT(DISTINCT p.ParentId) as AnsweredQuestions,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        CASE 
+            WHEN COUNT(p.Id) > 0 THEN 
+                ROUND(COUNT(p.Id) * 100.0 / NULLIF((SELECT COUNT(*) FROM Posts), 0), 2)
+            ELSE 0 
+        END as PostPercentage,
+        ROW_NUMBER() OVER (ORDER BY COUNT(p.Id) DESC) as UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        QuestionCount,
+        AnswerCount,
+        MaxScore,
+        AvgScore,
+        AllTags,
+        AnsweredQuestions,
+        CommentCount,
+        BadgeCount,
+        PostPercentage,
+        UserRank,
+        CASE 
+            WHEN UserRank <= 100 THEN 'Top 100'
+            WHEN UserRank <= 1000 THEN 'Top 1000'
+            ELSE 'Others'
+        END as UserTier
+    FROM UserPostStats
+    WHERE TotalPosts > 0
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score >= 100 THEN 'High'
+            WHEN p.Score >= 50 THEN 'Medium'
+            WHEN p.Score >= 10 THEN 'Low'
+            ELSE 'Very Low'
+        END as ScoreTier,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) as AvgScoreByType
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+DetailedPostAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Body,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.Tags,
+        pa.OwnerUserId,
+        pa.PostTypeId,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.PostType,
+        pa.ScoreTier,
+        pa.ScoreRank,
+        pa.AvgScoreByType,
+        CASE 
+            WHEN pa.Score > pa.AvgScoreByType THEN 'Above Average'
+            WHEN pa.Score = pa.AvgScoreByType THEN 'Average'
+            ELSE 'Below Average'
+        END as ScorePerformance,
+        DATEDIFF('day', pa.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysSinceCreation,
+        CASE 
+            WHEN pa.ViewCount > 1000 THEN 'Popular'
+            WHEN pa.ViewCount > 100 THEN 'Moderately Popular'
+            WHEN pa.ViewCount > 10 THEN 'Less Popular'
+            ELSE 'Rarely Viewed'
+        END as Popularity,
+        STRING_TO_ARRAY(pa.Tags, '<') as TagArray,
+        COALESCE(pa.AnswerCount, 0) as FinalAnswerCount,
+        NULLIF(pa.CommentCount, 0) as FinalCommentCount
+    FROM PostAnalysis pa
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as PostsCreated,
+        COUNT(DISTINCT c.Id) as CommentsMade,
+        COUNT(DISTINCT v.Id) as VotesGiven,
+        COUNT(DISTINCT b.Id) as BadgesEarned,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(v.CreationDate) as LastVoteDate,
+        MAX(b.Date) as LastBadgeDate,
+        CASE 
+            WHEN MAX(p.CreationDate) > DATEADD('month', -3, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Active'
+            WHEN MAX(p.CreationDate) > DATEADD('month', -6, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Moderately Active'
+            WHEN MAX(p.CreationDate) > DATEADD('month', -12, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Inactive'
+            ELSE 'Very Inactive'
+        END as ActivityStatus
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName
+),
+ComplexQueryResults AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalPosts,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.MaxScore,
+        tu.AvgScore,
+        tu.AllTags,
+        tu.AnsweredQuestions,
+        tu.CommentCount,
+        tu.BadgeCount,
+        tu.PostPercentage,
+        tu.UserTier,
+        dpa.PostId,
+        dpa.Title,
+        dpa.Body,
+        dpa.Score,
+        dpa.ViewCount,
+        dpa.CreationDate,
+        dpa.Tags,
+        dpa.PostType,
+        dpa.ScoreTier,
+        dpa.ScoreRank,
+        dpa.AvgScoreByType,
+        dpa.ScorePerformance,
+        dpa.DaysSinceCreation,
+        dpa.Popularity,
+        dpa.FinalAnswerCount,
+        dpa.FinalCommentCount,
+        ua.PostsCreated,
+        ua.CommentsMade,
+        ua.VotesGiven,
+        ua.BadgesEarned,
+        ua.LastPostDate,
+        ua.LastCommentDate,
+        ua.LastVoteDate,
+        ua.LastBadgeDate,
+        ua.ActivityStatus,
+        CASE 
+            WHEN dpa.Score > 100 AND tu.PostPercentage > 5.0 THEN 'High Impact'
+            WHEN tu.TotalPosts > 100 AND tu.Reputation > 10000 THEN 'Established Contributor'
+            WHEN tu.BadgeCount > 50 THEN 'Awarded Contributor'
+            ELSE 'Regular User'
+        END as UserCategory,
+        ROW_NUMBER() OVER (ORDER BY dpa.Score DESC, tu.Reputation DESC) as CombinedRank,
+        LAG(dpa.Score, 1) OVER (ORDER BY dpa.Score DESC) as PrevScore,
+        LEAD(dpa.Score, 1) OVER (ORDER BY dpa.Score DESC) as NextScore,
+        PERCENT_RANK() OVER (ORDER BY dpa.Score) as ScorePercentile,
+        NTILE(10) OVER (ORDER BY dpa.Score) as ScoreDecile
+    FROM TopUsers tu
+    INNER JOIN DetailedPostAnalysis dpa ON tu.UserId = dpa.OwnerUserId
+    LEFT JOIN UserActivity ua ON tu.UserId = ua.UserId
+    WHERE dpa.Score > 0
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    TotalPosts,
+    QuestionCount,
+    AnswerCount,
+    MaxScore,
+    AvgScore,
+    AllTags,
+    AnsweredQuestions,
+    CommentCount,
+    BadgeCount,
+    PostPercentage,
+    UserTier,
+    PostId,
+    Title,
+    Body,
+    Score,
+    ViewCount,
+    CreationDate,
+    Tags,
+    PostType,
+    ScoreTier,
+    ScoreRank,
+    AvgScoreByType,
+    ScorePerformance,
+    DaysSinceCreation,
+    Popularity,
+    FinalAnswerCount,
+    FinalCommentCount,
+    PostsCreated,
+    CommentsMade,
+    VotesGiven,
+    BadgesEarned,
+    LastPostDate,
+    LastCommentDate,
+    LastVoteDate,
+    LastBadgeDate,
+    ActivityStatus,
+    UserCategory,
+    CombinedRank,
+    PrevScore,
+    NextScore,
+    ScorePercentile,
+    ScoreDecile
+FROM ComplexQueryResults
+WHERE 
+    ScorePercentile >= 0.95 
+    AND (UserTier = 'Top 100' OR UserTier = 'Top 1000')
+    AND DaysSinceCreation <= 365
+    AND Popularity IN ('Popular', 'Moderately Popular')
+    AND UserCategory IN ('High Impact', 'Established Contributor', 'Awarded Contributor')
+ORDER BY Score DESC, Reputation DESC
+LIMIT 1000;

@@ -1,0 +1,134 @@
+-- {"query": "3496.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2335} 
+WITH
+    /* 1️⃣ Aggregate user activity */
+    user_activity AS (
+        SELECT
+            u.id                              AS user_id,
+            u.displayname                     AS user_name,
+            u.reputation,
+            COUNT(p.id) FILTER (WHERE p.posttypeid = 1)               AS question_cnt,
+            COUNT(p.id) FILTER (WHERE p.posttypeid = 2)               AS answer_cnt,
+            COALESCE(SUM(p.score),0)                                 AS total_score,
+            MAX(p.creationdate)                                     AS last_post_dt,
+            ROW_NUMBER() OVER (ORDER BY u.reputation DESC)          AS rn_rep
+        FROM users u
+        LEFT JOIN posts p
+               ON p.owneruserid = u.id
+        GROUP BY u.id, u.displayname, u.reputation
+    ),
+
+    /* 2️⃣ Badge breakdown per user */
+    badge_counts AS (
+        SELECT
+            b.userid                                              AS user_id,
+            COUNT(*) FILTER (WHERE b.class = 1)                  AS gold_cnt,
+            COUNT(*) FILTER (WHERE b.class = 2)                  AS silver_cnt,
+            COUNT(*) FILTER (WHERE b.class = 3)                  AS bronze_cnt,
+            STRING_AGG(DISTINCT b.name, ', ') FILTER (WHERE b.class = 1)
+                                                                AS gold_list
+        FROM badges b
+        GROUP BY b.userid
+    ),
+
+    /* 3️⃣ Tag popularity (only tags used on ≥100 questions) */
+    tag_popularity AS (
+        SELECT
+            t.tagname,
+            SUM(p.answercount)            AS total_answers,
+            COUNT(p.id)                   AS question_cnt,
+            ROW_NUMBER() OVER (ORDER BY SUM(p.answercount) DESC) AS tag_rk
+        FROM tags t
+        JOIN posts p
+          ON p.tags IS NOT NULL
+         AND POSITION('<' || t.tagname || '>' IN p.tags) > 0
+         AND p.posttypeid = 1                       -- only questions
+        GROUP BY t.tagname
+        HAVING COUNT(p.id) >= 100
+    ),
+
+    /* 4️⃣ Recent voting activity per post (last 30 days) */
+    recent_votes AS (
+        SELECT
+            v.postid,
+            MAX(v.creationdate)                                   AS last_vote_dt,
+            SUM(CASE vt.id
+                    WHEN 2 THEN  1    -- upvote
+                    WHEN 3 THEN -1    -- downvote
+                    ELSE 0
+                END)                                            AS vote_score
+        FROM votes v
+        JOIN votetypes vt ON vt.id = v.votetypeid
+        WHERE v.creationdate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+        GROUP BY v.postid
+    )
+
+SELECT
+    ua.user_id,
+    ua.user_name,
+    ua.reputation,
+    ua.question_cnt,
+    ua.answer_cnt,
+    ua.total_score,
+    COALESCE(bc.gold_cnt,0)      AS gold_badges,
+    COALESCE(bc.silver_cnt,0)    AS silver_badges,
+    COALESCE(bc.bronze_cnt,0)    AS bronze_badges,
+    bc.gold_list,
+    CASE
+        WHEN ua.total_score >= 15000 THEN 'Legendary'
+        WHEN ua.total_score >= 8000  THEN 'Elite'
+        WHEN ua.total_score >= 3000  THEN 'Pro'
+        ELSE 'Rising'
+    END                          AS tier,
+    COALESCE(rv.vote_score,0)    AS recent_post_vote_score,
+    rv.last_vote_dt,
+    ARRAY_AGG(DISTINCT tp.tagname) FILTER (WHERE tp.tag_rk <= 5) AS top_tags_used
+FROM user_activity ua
+LEFT JOIN badge_counts bc
+       ON bc.user_id = ua.user_id
+LEFT JOIN LATERAL (
+        /* correlated sub‑query: most recent post of the user */
+        SELECT p.id
+        FROM posts p
+        WHERE p.owneruserid = ua.user_id
+        ORDER BY p.creationdate DESC
+        LIMIT 1
+) latest_post ON TRUE
+LEFT JOIN recent_votes rv
+       ON rv.postid = latest_post.id
+LEFT JOIN LATERAL (
+        /* correlated sub‑query: tags that belong to the user’s recent post */
+        SELECT tp.tagname, tp.tag_rk
+        FROM tag_popularity tp
+        WHERE POSITION('<' || tp.tagname || '>' IN (
+                SELECT p.tags
+                FROM posts p
+                WHERE p.id = latest_post.id
+              )) > 0
+) tp ON TRUE
+WHERE ua.rn_rep <= 100                         -- limit to top‑100 users by reputation
+GROUP BY ua.user_id, ua.user_name, ua.reputation,
+         ua.question_cnt, ua.answer_cnt, ua.total_score,
+         bc.gold_cnt, bc.silver_cnt, bc.bronze_cnt, bc.gold_list,
+         rv.vote_score, rv.last_vote_dt
+ORDER BY ua.reputation DESC
+LIMIT 100
+
+UNION ALL
+
+/* Dummy row – useful for set‑operator performance testing */
+SELECT
+    NULL::int      AS user_id,
+    NULL::varchar  AS user_name,
+    NULL::int      AS reputation,
+    NULL::int      AS question_cnt,
+    NULL::int      AS answer_cnt,
+    NULL::int      AS total_score,
+    NULL::int      AS gold_badges,
+    NULL::int      AS silver_badges,
+    NULL::int      AS bronze_badges,
+    NULL::varchar  AS gold_list,
+    NULL::varchar  AS tier,
+    NULL::int      AS recent_post_vote_score,
+    NULL::timestamp AS last_vote_dt,
+    NULL::varchar[] AS top_tags_used
+WHERE FALSE;

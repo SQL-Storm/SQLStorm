@@ -1,0 +1,210 @@
+-- {"query": "1628.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2564} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostsScore,
+        AVG(P.Score) AS AveragePostScore,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT V.Id) AS TotalVotesGivenByThisUser,
+        MAX(P.CreationDate) AS LastPostCreationDate,
+        MAX(COALESCE(P.LastActivityDate, P.CreationDate)) AS LastPostActivityDate,
+        -- Correlated subquery: Check if user has received a gold badge
+        EXISTS (SELECT 1 FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) AS HasGoldBadge
+    FROM
+        Users AS U
+    LEFT JOIN
+        Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments AS C ON U.Id = C.UserId
+    LEFT JOIN
+        Votes AS V ON U.Id = V.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes
+),
+PostHistoryAggregates AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEdits,
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate END) AS FirstEditDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate END) AS LastEditDate,
+        MAX(PH.CreationDate) AS LastHistoryEventDate,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditors,
+        SUM(CASE WHEN PH.Comment IS NOT NULL AND LENGTH(TRIM(PH.Comment)) > 0 THEN 1 ELSE 0 END) AS EditsWithComments,
+        -- Conditional aggregation for specific post history types
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS PostClosedDateFromHistory,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS PostReopenedDateFromHistory
+    FROM
+        PostHistory AS PH
+    GROUP BY
+        PH.PostId
+),
+QuestionDetailedMetrics AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.ViewCount,
+        Q.Score AS QuestionScore,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        COALESCE(Q.ClosedDate, PH.PostClosedDateFromHistory) AS ActualClosedDate,
+        COALESCE(Q.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        (
+            SELECT
+                STRING_AGG(T.TagName, ';')
+            FROM
+                Tags AS T
+            WHERE
+                T.TagName IN (SELECT UNNEST(string_to_array(SUBSTRING(Q.Tags, 2, LENGTH(Q.Tags) - 2), '><')))
+        ) AS TagListAggregated,
+        (
+            SELECT
+                COUNT(DISTINCT C.UserId)
+            FROM
+                Comments AS C
+            WHERE
+                C.PostId = Q.Id AND C.Score > 0
+        ) AS PositiveCommentersCount,
+        -- Correlated subquery to find the most recent comment text above average score
+        (
+            SELECT
+                C.Text
+            FROM
+                Comments AS C
+            WHERE
+                C.PostId = Q.Id
+                AND C.Score >= (SELECT AVG(C2.Score) FROM Comments AS C2 WHERE C2.PostId = Q.Id)
+            ORDER BY C.CreationDate DESC, C.Id DESC
+            LIMIT 1
+        ) AS LatestHighScoreCommentText,
+        -- Window function: Rank question's view count within user's questions
+        RANK() OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.ViewCount DESC) AS UserQuestionViewRank
+    FROM
+        Posts AS Q
+    LEFT JOIN
+        PostHistoryAggregates AS PH ON Q.Id = PH.PostId
+    WHERE
+        Q.PostTypeId = 1
+),
+AnswerAggregates AS (
+    SELECT
+        A.Id AS AnswerId,
+        A.ParentId AS QuestionId,
+        A.OwnerUserId AS AnswerOwnerUserId,
+        A.CreationDate AS AnswerCreationDate,
+        A.Score AS AnswerScore,
+        -- Window function: Time difference from previous answer for the same question
+        EXTRACT(EPOCH FROM (A.CreationDate - LAG(A.CreationDate, 1) OVER (PARTITION BY A.ParentId ORDER BY A.CreationDate ASC))) / 60.0 AS MinutesSincePreviousAnswer,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS AnswerUpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS AnswerDownVotes
+    FROM
+        Posts AS A
+    LEFT JOIN
+        Votes AS V ON A.Id = V.PostId
+    WHERE
+        A.PostTypeId = 2
+    GROUP BY
+        A.Id, A.ParentId, A.OwnerUserId, A.CreationDate, A.Score
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.AveragePostScore,
+    UAS.UpVotes AS UserUpVotes,
+    UAS.DownVotes AS UserDownVotes,
+    (UAS.UpVotes - UAS.DownVotes) AS UserNetVotes,
+    UAS.HasGoldBadge,
+    EXTRACT(DAY FROM (NOW() - UAS.LastAccessDate)) AS DaysSinceUserLastAccessed,
+    QDM.QuestionId,
+    QDM.QuestionCreationDate,
+    QDM.QuestionScore,
+    QDM.ViewCount,
+    QDM.AnswerCount AS QuestionAnswerCount,
+    QDM.FavoriteCount,
+    QDM.ActualClosedDate AS QuestionClosedDate,
+    PH.TotalEdits AS QuestionTotalEdits,
+    PH.DistinctEditors AS QuestionDistinctEditors,
+    EXTRACT(HOUR FROM (PH.FirstEditDate - QDM.QuestionCreationDate)) AS HoursToFirstEdit,
+    COALESCE(
+        EXTRACT(DAY FROM (QDM.ActualClosedDate - QDM.QuestionCreationDate)),
+        -1 -- Indicates not closed or NULL
+    ) AS DaysUntilQuestionClosed,
+    AA.AnswerId AS AcceptedAnswerId,
+    AA.AnswerOwnerUserId AS AcceptedAnswerOwnerUserId,
+    AA.AnswerScore AS AcceptedAnswerScore,
+    EXTRACT(MINUTE FROM (AA.AnswerCreationDate - QDM.QuestionCreationDate)) AS MinsToAcceptedAnswer,
+    AA.AnswerUpVotes AS AcceptedAnswerUpVotes,
+    AA.AnswerDownVotes AS AcceptedAnswerDownVotes,
+    AA.MinutesSincePreviousAnswer AS TimeGapBeforeAcceptedAnswer,
+    PL.LinkedPostCount,
+    PL.DuplicatePostCount,
+    QDM.TagListAggregated,
+    QDM.LatestHighScoreCommentText,
+    COALESCE(PHT.Name, 'No Recent History') AS LastPostHistoryTypeName,
+    -- Complex boolean logic
+    (
+        UAS.Reputation > 20000
+        AND UAS.TotalQuestions > 100
+        AND QDM.QuestionScore > 50
+        AND QDM.ViewCount > 5000
+        AND QDM.QuestionAnswerCount > 5
+        AND QDM.ActualClosedDate IS NULL
+        AND (PH.TotalEdits < 10 OR PH.TotalEdits IS NULL)
+        AND QDM.FavoriteCount > 10
+        AND QDM.HasGoldBadge
+        AND QDM.PositiveCommentersCount > 3
+    ) AS IsHighlyImpactfulQuestionByVeteranUser,
+    -- NULL logic with COALESCE and conditional expressions
+    NULLIF(UAS.UpVotes, 0)::NUMERIC / NULLIF(UAS.DownVotes, 0) AS UserUpDownVoteRatio,
+    UPPER(LEFT(COALESCE(P_Question.Title, 'NO_TITLE_AVAILABLE'), 20)) AS QuestionTitlePrefixUpper,
+    -- Correlated subquery: Has the owner of this question ever answered one of their own questions?
+    (SELECT COUNT(P_SelfAns.Id) > 0 FROM Posts P_SelfAns WHERE P_SelfAns.ParentId = QDM.QuestionId AND P_SelfAns.OwnerUserId = QDM.OwnerUserId AND P_SelfAns.PostTypeId = 2) AS HasSelfAnsweredThisSpecificQuestion,
+    QDM.UserQuestionViewRank
+FROM
+    UserActivitySummary AS UAS
+JOIN
+    QuestionDetailedMetrics AS QDM ON UAS.UserId = QDM.OwnerUserId
+LEFT JOIN
+    PostHistoryAggregates AS PH ON QDM.QuestionId = PH.PostId
+LEFT JOIN
+    AnswerAggregates AS AA ON QDM.AcceptedAnswerId = AA.AnswerId AND QDM.QuestionId = AA.QuestionId
+LEFT JOIN LATERAL ( -- Lateral join for post link counts
+    SELECT
+        COUNT(CASE WHEN PL.LinkTypeId = 1 THEN 1 END) AS LinkedPostCount,
+        COUNT(CASE WHEN PL.LinkTypeId = 3 THEN 1 END) AS DuplicatePostCount
+    FROM
+        PostLinks AS PL
+    WHERE
+        PL.PostId = QDM.QuestionId
+) AS PL ON TRUE
+LEFT JOIN PostHistory AS PH_LastEvent ON PH_LastEvent.PostId = QDM.QuestionId
+    AND PH_LastEvent.CreationDate = (SELECT MAX(PH_Inner.CreationDate) FROM PostHistory AS PH_Inner WHERE PH_Inner.PostId = QDM.QuestionId)
+LEFT JOIN PostHistoryTypes AS PHT ON PH_LastEvent.PostHistoryTypeId = PHT.Id
+LEFT JOIN Posts AS P_Question ON QDM.QuestionId = P_Question.Id
+WHERE
+    UAS.Reputation >= 5000 -- Filter for more experienced users
+    AND QDM.QuestionScore > 10 -- Only questions with decent scores
+    AND QDM.ViewCount > 500 -- Only popular questions
+    AND (
+        QDM.ActualClosedDate IS NULL
+        OR QDM.QuestionCreationDate > (NOW() - INTERVAL '2 year') -- Include recently closed but not very old ones
+    )
+ORDER BY
+    UAS.Reputation DESC,
+    QDM.QuestionScore DESC,
+    QDM.QuestionCreationDate DESC
+LIMIT 500;

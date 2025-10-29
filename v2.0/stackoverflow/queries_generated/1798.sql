@@ -1,0 +1,181 @@
+-- {"query": "1798.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2434} 
+
+WITH UserEngagementSummary AS (
+    -- CTE 1: Aggregates user-level metrics, filters for active users, and includes some initial calculations.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes,
+        U.DownVotes,
+        COALESCE(U.Location, 'Unknown Region') AS UserLocation, -- NULL logic
+        COUNT(DISTINCT P.Id) AS TotalPostsContributed,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostsScore,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostsViewCount,
+        MAX(P.CreationDate) AS LatestPostDate,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        -- Complex calculation: User's account age in days
+        EXTRACT(DAY FROM (CURRENT_TIMESTAMP - U.CreationDate)) AS AccountAgeDays,
+        -- Conditional aggregation for badge classes
+        COUNT(CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadgesCount,
+        COUNT(CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadgesCount,
+        COUNT(CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadgesCount
+    FROM
+        Users AS U
+    LEFT JOIN
+        Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments AS C ON U.Id = C.UserId
+    LEFT JOIN
+        Badges AS B ON U.Id = B.UserId
+    WHERE
+        U.Reputation > 1000
+        AND U.LastAccessDate >= (CURRENT_TIMESTAMP - INTERVAL '6 months') -- Active users in last 6 months
+        AND U.DisplayName IS NOT NULL -- Exclude users without display names
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes, U.Location
+),
+PostPerformanceMetrics AS (
+    -- CTE 2: Analyzes individual post performance, includes window functions, and a correlated subquery.
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        COALESCE(P.Title, SUBSTRING(P.Body, 1, 75) || '...') AS PostDisplayTitle, -- String expression and NULL logic
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate AS PostLastEditDate,
+        P.Tags,
+        P.AcceptedAnswerId,
+        P.ClosedDate,
+        -- Window function: Rank posts by score within each user, descending.
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate DESC) AS UserPostRankByScore,
+        -- Window function: Lag to find the score of the previous post by the same user.
+        LAG(P.Score, 1, 0) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostScore,
+        -- String expression and complicated predicate: Check for specific "hot" tags
+        (P.Tags ILIKE '%<python>%' OR P.Tags ILIKE '%<javascript>%' OR P.Tags ILIKE '%<java>%') AS ContainsHotTags,
+        -- Correlated subquery: Calculates average score of questions by users from the same location around the post's creation date.
+        (
+            SELECT AVG(SqP.Score)
+            FROM Posts AS SqP
+            JOIN Users AS SqU ON SqP.OwnerUserId = SqU.Id
+            WHERE SqP.PostTypeId = 1 -- Only consider questions
+            AND SqU.Location = UES.UserLocation -- Correlated on user's location
+            AND SqP.CreationDate BETWEEN P.CreationDate - INTERVAL '3 months' AND P.CreationDate + INTERVAL '3 months'
+        ) AS AvgLocalQuestionsScoreAroundPost,
+        -- Complicated expression: Post Age Category
+        CASE
+            WHEN P.CreationDate >= (CURRENT_TIMESTAMP - INTERVAL '3 months') THEN 'Recent'
+            WHEN P.CreationDate >= (CURRENT_TIMESTAMP - INTERVAL '1 year') THEN 'Last Year'
+            ELSE 'Older'
+        END AS PostAgeCategory
+    FROM
+        Posts AS P
+    JOIN
+        UserEngagementSummary AS UES ON P.OwnerUserId = UES.UserId -- Only analyze posts from engaged users
+    WHERE
+        P.PostTypeId IN (1, 2, 4, 5) -- Questions, Answers, TagWikiExcerpt, TagWiki
+        AND P.CreationDate >= (CURRENT_TIMESTAMP - INTERVAL '2 year') -- Posts from last 2 years
+        AND P.Score IS NOT NULL -- Ensure score exists for ranking
+),
+PostEditHistory AS (
+    -- CTE 3: Summarizes post edit activity, distinguishing owner edits from others.
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.UserId = P.OwnerUserId THEN 1 END) AS OwnerEditCount,
+        COUNT(CASE WHEN PH.UserId <> P.OwnerUserId THEN 1 END) AS OtherUserEditCount,
+        MAX(PH.CreationDate) AS LastEditHistoryEntryDate,
+        -- Correlated subquery: Check if the post ever had a major rollback (Body or Tags)
+        EXISTS (
+            SELECT 1
+            FROM PostHistory AS RollbackPH
+            WHERE RollbackPH.PostId = PH.PostId
+            AND RollbackPH.PostHistoryTypeId IN (8, 9) -- Rollback Body or Rollback Tags
+        ) AS HasRollback
+    FROM
+        PostHistory AS PH
+    JOIN
+        Posts AS P ON PH.PostId = P.Id
+    WHERE
+        PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) -- Edit or Rollback actions
+    GROUP BY
+        PH.PostId, P.OwnerUserId
+),
+HighReputationContributors AS (
+    -- CTE 4: Identifies users based on high reputation OR significant recent answer contributions using a set operator.
+    SELECT UserId FROM UserEngagementSummary
+    WHERE Reputation >= 50000
+    UNION ALL
+    SELECT UES.UserId FROM UserEngagementSummary AS UES
+    JOIN Posts AS P ON UES.UserId = P.OwnerUserId
+    WHERE P.PostTypeId = 2 -- Answers
+    AND P.CreationDate >= (CURRENT_TIMESTAMP - INTERVAL '1 year')
+    GROUP BY UES.UserId
+    HAVING COUNT(P.Id) >= 50 -- At least 50 answers in the last year
+)
+-- Final Select Statement: Combines all CTEs, applies complex filters, calculations, and window functions.
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.AccountAgeDays,
+    UES.QuestionsAsked,
+    UES.AnswersProvided,
+    UES.TotalPostsScore,
+    UES.TotalPostsViewCount,
+    UES.GoldBadgesCount,
+    UES.SilverBadgesCount,
+    UES.BronzeBadgesCount,
+    PPM.PostDisplayTitle AS TopScoringPostTitle,
+    PPM.PostScore AS TopScoringPostScore,
+    PPM.PostViewCount AS TopScoringPostViews,
+    PPM.PostCreationDate AS TopScoringPostDate,
+    PPM.PreviousPostScore,
+    PPM.ContainsHotTags,
+    PPM.AvgLocalQuestionsScoreAroundPost,
+    PPM.PostAgeCategory,
+    PEH.OwnerEditCount AS TopPostOwnerEditCount,
+    PEH.OtherUserEditCount AS TopPostOtherUserEditCount,
+    PEH.HasRollback AS TopPostHasRollback,
+    -- Complicated calculation: Upvote to Downvote ratio, handling division by zero with NULLIF and COALESCE
+    COALESCE(ROUND(CAST(UES.UpVotes AS NUMERIC) / NULLIF(UES.DownVotes, 0), 2), 0) AS UpvoteToDownvoteRatio,
+    -- Window function: Calculate the percentile rank of user's reputation among engaged users
+    NTILE(10) OVER (ORDER BY UES.Reputation DESC) AS ReputationDecile,
+    -- Conditional expression for user's engagement level based on multiple factors
+    CASE
+        WHEN UES.TotalPostsContributed > 500 AND UES.TotalPostsScore > 10000 THEN 'Very High Engagement'
+        WHEN UES.TotalPostsContributed > 100 AND UES.TotalPostsScore > 2000 THEN 'High Engagement'
+        WHEN UES.TotalPostsContributed > 20 AND UES.TotalPostsScore > 200 THEN 'Moderate Engagement'
+        ELSE 'Low Engagement'
+    END AS UserEngagementLevel,
+    -- NULL logic: Check if a post was ever closed
+    CASE WHEN PPM.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+    -- Set operator inclusion: Check if user is a 'High Reputation Contributor'
+    (HRC.UserId IS NOT NULL) AS IsHighReputationContributor,
+    -- Further filtering based on complex conditions
+    (UES.QuestionsAsked + UES.AnswersProvided) AS TotalQuestionsAndAnswers
+FROM
+    UserEngagementSummary AS UES
+JOIN
+    PostPerformanceMetrics AS PPM ON UES.UserId = PPM.OwnerUserId
+LEFT JOIN
+    PostEditHistory AS PEH ON PPM.PostId = PEH.PostId
+LEFT JOIN
+    HighReputationContributors AS HRC ON UES.UserId = HRC.UserId
+WHERE
+    PPM.UserPostRankByScore = 1 -- Select only the top-scoring post for each user
+    AND (
+        (PPM.ContainsHotTags = TRUE AND PPM.PostScore > 50) -- Top post relates to hot tags and is high scoring
+        OR
+        (UES.TotalPostsViewCount > 50000 AND UES.AccountAgeDays > 365) -- Or user has high overall views and is mature
+    )
+    AND UES.TotalCommentsMade > 5 -- Users with at least some comments
+ORDER BY
+    UES.Reputation DESC, UES.LatestPostDate DESC, PPM.PostScore DESC
+LIMIT 1000;

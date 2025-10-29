@@ -1,0 +1,240 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        CASE
+            WHEN u.CreationDate <= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5' YEAR) AND u.Reputation >= 10000 THEN 'Veteran_HighRep'
+            WHEN u.CreationDate <= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3' YEAR) AND u.Reputation >= 1000 THEN 'Established_ModRep'
+            WHEN u.CreationDate <= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR) THEN 'Active_LowRep'
+            ELSE 'Newbie'
+        END AS UserCategory,
+        (u.UpVotes * 0.7 + u.DownVotes * -0.3 + COUNT(DISTINCT p.Id) * 1.5 + COUNT(DISTINCT c.Id) * 0.5 + u.Views * 0.01) AS ActivityScore,
+        CASE
+            WHEN u.DownVotes > u.UpVotes * 2 THEN TRUE
+            WHEN COUNT(DISTINCT c.Id) > 100 AND COUNT(DISTINCT p.Id) < 10 THEN TRUE
+            ELSE FALSE
+        END AS HasPotentialNegativeEngagement
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostEngagementMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - p.CreationDate)) / 3600) AS PostAgeHours,
+        CASE
+            WHEN p.Score >= 100 AND p.CommentCount >= 20 AND p.ViewCount >= 50000 AND p.FavoriteCount >= 50 THEN 'Viral'
+            WHEN p.Score >= 30 AND p.CommentCount >= 10 AND p.ViewCount >= 10000 AND p.FavoriteCount >= 10 THEN 'Highly_Engaged'
+            WHEN p.Score >= 5 AND p.CommentCount >= 3 AND p.ViewCount >= 1000 THEN 'Moderately_Engaged'
+            ELSE 'Low_Engagement'
+        END AS EngagementLevel,
+        COALESCE(
+            (
+                SELECT LISTAGG(tag_val, ' | ') FROM (
+                    SELECT TRIM(SUBSTR(t, 2, LENGTH(t) - 2)) AS tag_val
+                    FROM (
+                        SELECT token AS t FROM (
+                            SELECT UNNEST(STRING_SPLIT(SUBSTR(p.Tags, 2, CASE WHEN LENGTH(p.Tags) >= 2 THEN LENGTH(p.Tags) - 2 ELSE 0 END), '><')) AS token
+                        )
+                    )
+                    FETCH FIRST 2 ROWS ONLY
+                )
+            ), 'No_Tags'
+        ) AS TopTwoTags,
+        (SELECT COUNT(DISTINCT v.UserId) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2 AND v.UserId IS NOT NULL) AS UniqueUpvoters,
+        (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.PostId = p.Id) AS LastCommentDate
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '4' YEAR)
+),
+HistoricalPostChangesDetailed AS (
+    SELECT
+        ph.PostId,
+        ph.Id AS PostHistoryEntryId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryCreationDate,
+        LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousHistoryDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn_history_desc
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13)
+),
+AggregatedPostHistory AS (
+    SELECT
+        hpc.PostId,
+        COUNT(hpc.PostHistoryEntryId) AS TotalHistoryEntries,
+        SUM(CASE WHEN hpc.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditEvents,
+        SUM(CASE WHEN hpc.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS TotalCloseEvents,
+        SUM(CASE WHEN hpc.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS TotalReopenEvents,
+        SUM(CASE WHEN hpc.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS TotalDeleteEvents,
+        MAX(hpc.HistoryCreationDate) AS LastHistoryEventDate,
+        MIN(hpc.HistoryCreationDate) AS FirstHistoryEventDate,
+        AVG(EXTRACT(EPOCH FROM (hpc.HistoryCreationDate - hpc.PreviousHistoryDate)) / (60 * 60 * 24)) AS AvgDaysBetweenHistoryChanges
+    FROM HistoricalPostChangesDetailed hpc
+    GROUP BY hpc.PostId
+),
+BadgeAchievementSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadgesAwarded,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesCount,
+        STRING_AGG(CASE WHEN b.Class = 1 THEN b.Name ELSE NULL END, '; ') AS GoldBadgeNamesConcatenated,
+        STRING_AGG(b.Name, '; ') FILTER (WHERE b.TagBased = TRUE AND b.Class IN (1,2)) AS TopTagBasedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+QuestionAnswerAnalysis AS (
+    SELECT
+        q.PostId AS QuestionId,
+        q.PostCreationDate AS QuestionCreationDate,
+        q.Title AS QuestionTitle,
+        q.OwnerUserId AS QuestionOwnerUserId,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        q.CommentCount AS QuestionCommentCount,
+        q.FavoriteCount AS QuestionFavoriteCount,
+        q.EngagementLevel AS QuestionEngagementLevel,
+        q.PostAgeHours AS QuestionAgeHours,
+        q.TopTwoTags AS QuestionTopTwoTags,
+        q.UniqueUpvoters AS QuestionUniqueUpvoters,
+        q.LastCommentDate AS QuestionLastCommentDate,
+        COUNT(ans.Id) AS TotalAnswers,
+        MAX(ans.Score) AS BestAnswerScore,
+        MIN(ans.Score) AS WorstAnswerScore,
+        AVG(ans.Score) AS AvgAnswerScore,
+        MAX(ans.CreationDate) AS LastAnswerDate,
+        MAX(CASE WHEN ans.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAcceptedAnswer,
+        (
+            SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a_sub.Score)
+            FROM Posts a_sub
+            WHERE a_sub.ParentId = q.PostId AND a_sub.PostTypeId = 2
+        ) AS MedianAnswerScore
+    FROM PostEngagementMetrics q
+    LEFT JOIN Posts ans ON q.PostId = ans.ParentId AND ans.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY
+        q.PostId, q.PostCreationDate, q.Title, q.OwnerUserId, q.Score, q.ViewCount, q.CommentCount, q.FavoriteCount, q.EngagementLevel, q.PostAgeHours, q.TopTwoTags, q.UniqueUpvoters, q.LastCommentDate, q.AcceptedAnswerId
+),
+UnifiedPostAndUserData AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.UserCategory,
+        uas.ActivityScore,
+        uas.HasPotentialNegativeEngagement,
+        bas.GoldBadgesCount,
+        bas.SilverBadgesCount,
+        bas.BronzeBadgesCount,
+        bas.GoldBadgeNamesConcatenated,
+        bas.TopTagBasedBadges,
+        qa.QuestionId,
+        qa.QuestionTitle,
+        qa.QuestionCreationDate,
+        qa.QuestionScore,
+        qa.QuestionViewCount,
+        qa.QuestionEngagementLevel,
+        qa.TotalAnswers,
+        qa.BestAnswerScore,
+        qa.HasAcceptedAnswer,
+        aph.TotalEditEvents AS QuestionEditEvents,
+        aph.TotalCloseEvents AS QuestionCloseEvents,
+        aph.TotalReopenEvents AS QuestionReopenEvents,
+        aph.AvgDaysBetweenHistoryChanges AS QuestionAvgHistoryIntervalDays,
+        pm.TopTwoTags AS QuestionTags,
+        pm.LastCommentDate AS QuestionLastCommentDate,
+        COALESCE(qa.QuestionScore * 1.0 / NULLIF(qa.QuestionViewCount, 0), 0.0) AS ScorePerViewRatio,
+        COALESCE(qa.QuestionCommentCount * 1.0 / NULLIF(qa.QuestionViewCount, 0), 0.0) AS CommentPerViewRatio,
+        COALESCE(
+            CASE
+                WHEN LOWER(qa.QuestionTitle) LIKE '%sql%' OR LOWER(qa.QuestionTitle) LIKE '%database%' THEN 'Database_SQL'
+                WHEN LOWER(qa.QuestionTitle) LIKE '%python%' OR LOWER(qa.QuestionTitle) LIKE '%django%' THEN 'Python_Dev'
+                WHEN LOWER(qa.QuestionTitle) LIKE '%java%' OR LOWER(qa.QuestionTitle) LIKE '%spring%' THEN 'Java_Dev'
+                WHEN LOWER(qa.QuestionTitle) LIKE '%javascript%' OR LOWER(qa.QuestionTitle) LIKE '%react%' THEN 'Frontend_Web'
+                WHEN LOWER(qa.QuestionTitle) LIKE '%c#%' OR LOWER(qa.QuestionTitle) LIKE '%asp.net%' THEN 'DotNet_Dev'
+                ELSE 'General_Tech'
+            END,
+            'Untitiled_Or_Unknown'
+        ) AS DerivedQuestionTopic
+    FROM UserActivitySummary uas
+    LEFT JOIN QuestionAnswerAnalysis qa ON uas.UserId = qa.QuestionOwnerUserId
+    LEFT JOIN AggregatedPostHistory aph ON qa.QuestionId = aph.PostId
+    LEFT JOIN BadgeAchievementSummary bas ON uas.UserId = bas.UserId
+    LEFT JOIN PostEngagementMetrics pm ON qa.QuestionId = pm.PostId
+    WHERE qa.QuestionId IS NOT NULL
+)
+SELECT
+    upd.UserId,
+    upd.DisplayName,
+    upd.Reputation,
+    upd.UserCategory,
+    upd.ActivityScore,
+    upd.GoldBadgesCount,
+    upd.GoldBadgeNamesConcatenated,
+    upd.QuestionId,
+    upd.QuestionTitle,
+    upd.QuestionCreationDate,
+    upd.QuestionScore,
+    upd.QuestionViewCount,
+    upd.QuestionEngagementLevel,
+    upd.TotalAnswers,
+    upd.BestAnswerScore,
+    upd.HasAcceptedAnswer,
+    upd.QuestionEditEvents,
+    upd.QuestionCloseEvents,
+    upd.QuestionReopenEvents,
+    upd.QuestionAvgHistoryIntervalDays,
+    upd.DerivedQuestionTopic,
+    upd.ScorePerViewRatio,
+    upd.CommentPerViewRatio,
+    RANK() OVER (PARTITION BY upd.UserCategory ORDER BY upd.ActivityScore DESC, upd.Reputation DESC) AS RankWithinCategory,
+    AVG(upd.QuestionScore) OVER (PARTITION BY upd.DerivedQuestionTopic) AS AvgScoreForTopic,
+    COUNT(upd.QuestionId) OVER (PARTITION BY upd.UserCategory, upd.UserId) * 100.0 / NULLIF(COUNT(upd.QuestionId) OVER (PARTITION BY upd.UserCategory), 0) AS UserQuestionShareInCategory,
+    SUM(upd.QuestionScore) OVER (PARTITION BY upd.UserId ORDER BY upd.QuestionCreationDate ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeQuestionScoreByUser,
+    NTILE(4) OVER (PARTITION BY upd.DerivedQuestionTopic ORDER BY upd.QuestionViewCount DESC) AS ViewCountQuartileByTopic,
+    COALESCE(
+        CASE
+            WHEN upd.QuestionCloseEvents > 0 AND upd.QuestionReopenEvents = 0 AND upd.QuestionScore < 0 THEN 'Closed_NegativeScore'
+            WHEN upd.QuestionEditEvents >= 5 AND upd.QuestionEngagementLevel = 'Low_Engagement' THEN 'FrequentlyEdited_LowEng'
+            WHEN upd.HasPotentialNegativeEngagement = TRUE AND upd.TotalAnswers < 1 THEN 'ProblematicUser_UnansweredQ'
+            ELSE NULL
+        END,
+        'No_Major_Issue'
+    ) AS PostHealthFlag,
+    EXTRACT(EPOCH FROM (upd.QuestionLastCommentDate - upd.QuestionCreationDate)) / (60 * 60 * 24) AS DaysUntilFirstComment
+FROM UnifiedPostAndUserData upd
+WHERE
+    upd.Reputation >= 500
+    AND upd.TotalAnswers >= 1
+    AND upd.QuestionViewCount >= 1000
+    AND (upd.DerivedQuestionTopic = 'Database_SQL' OR upd.DerivedQuestionTopic = 'Python_Dev')
+    AND upd.ScorePerViewRatio > 0.01
+ORDER BY
+    RankWithinCategory ASC,
+    upd.QuestionScore DESC,
+    upd.QuestionCreationDate DESC
+LIMIT 15000;

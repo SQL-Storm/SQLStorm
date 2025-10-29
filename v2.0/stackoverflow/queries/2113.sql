@@ -1,0 +1,199 @@
+WITH RECURSIVE RecursiveCTE AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        1 AS Level,
+        CAST(p.Tags AS VARCHAR(4000)) AS AggregatedTags
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+
+    UNION ALL
+
+    SELECT 
+        p2.Id,
+        p2.PostTypeId,
+        p2.OwnerUserId,
+        p2.Title,
+        p2.Score,
+        p2.ViewCount,
+        p2.Tags,
+        p2.CreationDate,
+        r.Level + 1,
+        CAST(r.AggregatedTags || '|' || COALESCE(p2.Tags, '') AS VARCHAR(4000)) AS AggregatedTags
+    FROM RecursiveCTE r
+    JOIN Posts p2 ON p2.ParentId = r.Id
+    JOIN Comments c ON c.PostId = p2.Id
+    WHERE r.Level < 3
+),
+UserBadgeAgg AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostScoreStats AS (
+    SELECT 
+        p.OwnerUserId,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScore,
+        MAX(p.Score) OVER (PARTITION BY p.OwnerUserId) AS MaxScore,
+        MIN(p.Score) OVER (PARTITION BY p.OwnerUserId) AS MinScore,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS PostCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+TaggedPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        u.Id AS OwnerUserId,
+        u.DisplayName,
+        u.Reputation,
+        regexp_split_to_array(substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)), '><') AS TagArray
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+ExplodedTags AS (
+    SELECT
+        tp.Id AS PostId,
+        t AS Tag,
+        tp.Score,
+        tp.CreationDate,
+        tp.OwnerUserId,
+        tp.DisplayName,
+        tp.Reputation
+    FROM TaggedPosts tp,
+    unnest(tp.TagArray) AS t
+),
+RankedPosts AS (
+    SELECT
+        et.PostId,
+        et.Tag,
+        et.Score,
+        et.CreationDate,
+        et.OwnerUserId,
+        et.DisplayName,
+        et.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY et.OwnerUserId ORDER BY et.Score DESC, et.CreationDate DESC) AS UserTagRank
+    FROM ExplodedTags et
+),
+HighRankPosts AS (
+    SELECT * FROM RankedPosts WHERE UserTagRank <= 5
+),
+LinkedDuplicates AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle,
+        pl.CreationDate AS LinkCreated,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE lt.Name = 'Duplicate'
+),
+AggregatedComments AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(COALESCE(c.UserDisplayName,'[deleted]'), ', ' ORDER BY c.CreationDate DESC) AS CommentUsers
+    FROM Comments c
+    GROUP BY c.PostId
+),
+PostHistoryCloseInfo AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LastReopenedDate,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS ClosedCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) AS ReopenedCount
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+)
+
+SELECT 
+    p.Id AS QuestionId,
+    p.Title,
+    u.DisplayName AS OwnerName,
+    u.Reputation,
+    ub.BadgeCount,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ps.AvgScore,
+    ps.MaxScore,
+    ps.MinScore,
+    ps.PostCount,
+    ac.CommentCount,
+    ac.LastCommentDate,
+    ac.CommentUsers,
+    phc.LastClosedDate,
+    phc.LastReopenedDate,
+    phc.ClosedCount,
+    phc.ReopenedCount,
+    ld.CountOfDuplicates,
+    STRING_AGG(DISTINCT lt.Name, ',' ORDER BY lt.Name) FILTER (WHERE lt.Name IS NOT NULL) AS LinkedTypes,
+    MAX(r.Level) AS MaxRecursionLevel,
+    ARRAY_AGG(DISTINCT rt.Tag) FILTER (WHERE rt.Tag IS NOT NULL) AS UniqueTags,
+    CONCAT_WS(' / ', 
+        COALESCE(NULLIF(p.Title,''),'[No Title]'), 
+        COALESCE(u.DisplayName, '[Anon]'), 
+        COALESCE(CAST(ps.AvgScore AS VARCHAR), '0'), 
+        COALESCE(CAST(ub.BadgeCount AS VARCHAR), '0')) AS CompositeSignature,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+        ELSE 'Open'
+    END AS Status,
+    CASE 
+        WHEN p.ViewCount > 100000 THEN 'Highly Viewed'
+        WHEN p.ViewCount BETWEEN 10000 AND 100000 THEN 'Moderately Viewed'
+        ELSE 'Low Viewed'
+    END AS ViewCategory
+FROM Posts p
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+LEFT JOIN UserBadgeAgg ub ON ub.UserId = u.Id
+LEFT JOIN PostScoreStats ps ON ps.OwnerUserId = u.Id
+LEFT JOIN AggregatedComments ac ON ac.PostId = p.Id
+LEFT JOIN PostHistoryCloseInfo phc ON phc.PostId = p.Id
+LEFT JOIN (
+    SELECT 
+        PostId,
+        COUNT(*) AS CountOfDuplicates
+    FROM LinkedDuplicates
+    GROUP BY PostId
+) ld ON ld.PostId = p.Id
+LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+LEFT JOIN RecursiveCTE r ON r.Id = p.Id
+LEFT JOIN RankedPosts rt ON rt.PostId = p.Id
+WHERE p.PostTypeId = 1
+GROUP BY 
+    p.Id, p.Title, u.DisplayName, u.Reputation, ub.BadgeCount, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, 
+    ps.AvgScore, ps.MaxScore, ps.MinScore, ps.PostCount, ac.CommentCount, ac.LastCommentDate, ac.CommentUsers,
+    phc.LastClosedDate, phc.LastReopenedDate, phc.ClosedCount, phc.ReopenedCount, ld.CountOfDuplicates, p.ClosedDate, p.AcceptedAnswerId, p.ViewCount
+ORDER BY 
+    ps.AvgScore DESC NULLS LAST, 
+    ps.PostCount DESC NULLS LAST, 
+    p.ViewCount DESC NULLS LAST
+LIMIT 100;

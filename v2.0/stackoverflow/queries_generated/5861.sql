@@ -1,0 +1,99 @@
+-- {"query": "5861.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 743} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+TagUsage AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS NumQuestions,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.ViewCount) AS TotalViews
+  FROM Posts p
+  JOIN LATERAL (
+    SELECT UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+  ) t ON TRUE
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+UserInfluence AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.UpVotes - u.DownVotes AS NetVotes,
+    MAX(p.LastActivityDate) AS LastActivePostDate,
+    COUNT(*) AS PostCount
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.NumQuestions,
+    t.AvgScore,
+    t.TotalViews,
+    ROW_NUMBER() OVER (ORDER BY t.TotalViews DESC, t.NumQuestions DESC) AS rn
+  FROM TagUsage t
+)
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.Tags,
+  rp.CreationDate,
+  rp.LastActivityDate,
+  rp.OwnerUserId,
+  ui.UserId AS InfluencerUserId,
+  ui.DisplayName AS InfluencerName,
+  ui.Reputation,
+  ui.NetVotes,
+  ui.PostCount,
+  tu.TagName,
+  tu.NumQuestions,
+  tu.AvgScore,
+  tu.TotalViews,
+  (CASE
+     WHEN rp.PostTypeId = 1 THEN 'Question'
+     WHEN rp.PostTypeId = 2 THEN 'Answer'
+     ELSE 'Other'
+   END) AS PostKind,
+  (SELECT COALESCE(MAX(v.CreationDate), rp.CreationDate)
+     FROM Votes v
+     WHERE v.PostId = rp.PostId
+       AND v.VoteTypeId IN (2, 3)
+  ) AS LastEngagementDate,
+  (SELECT JSON_AGG(JSON_BUILD_OBJECT('VoteType', v2.VoteTypeId, 'User', v2.UserId))
+     FROM Votes v2
+     WHERE v2.PostId = rp.PostId
+       AND v2.VoteTypeId IN (2,3)
+  ) AS RecentVotesJson,
+  (SELECT ARRAY_AGG(l.LinkTypeId)
+     FROM PostLinks pl
+     JOIN Posts l ON pl.RelatedPostId = l.Id
+     WHERE pl.PostId = rp.PostId
+  ) AS LinkedPostTypes
+FROM RecentActivePosts rp
+LEFT JOIN UserInfluence ui ON rp.OwnerUserId = ui.UserId
+LEFT JOIN TopTags tu ON TRUE
+WHERE rp.Score > 0
+  AND rp.ViewCount > 100
+  AND rp.Tags LIKE '%<sql>%'
+ORDER BY rp.LastActivityDate DESC
+LIMIT 200;

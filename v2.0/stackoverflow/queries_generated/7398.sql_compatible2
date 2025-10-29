@@ -1,0 +1,270 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate) AS AccountAgeInterval,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / 86400 AS AccountAgeDays,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN AVG(p.Score) 
+            ELSE 0 
+        END AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') AS AllTags,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title ELSE NULL END, '; ') AS QuestionTitles,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Body ELSE NULL END, ' | ') AS AnswerBodies
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostTypeDesc,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) + COALESCE(p.FavoriteCount, 0) AS EngagementScore,
+        CASE 
+            WHEN p.Score >= 100 THEN 'High'
+            WHEN p.Score >= 10 THEN 'Medium'
+            WHEN p.Score >= 0 THEN 'Low'
+            ELSE 'Negative'
+        END AS ScoreTier,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) AS GlobalScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) AS ScorePercentile,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) AS NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+        CASE 
+            WHEN p.Score > LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) THEN 'Increased'
+            WHEN p.Score < LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) THEN 'Decreased'
+            ELSE 'Same'
+        END AS ScoreChange,
+        SUBSTRING(p.Body FROM 1 FOR 50) AS BodyPreview,
+        COALESCE(
+            SUBSTRING(
+                p.Tags FROM 2 FOR (CASE WHEN CHAR_LENGTH(p.Tags) > 2 THEN CHAR_LENGTH(p.Tags) - 2 ELSE 0 END)
+            ), 
+            ''
+        ) AS CleanTags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                (CASE WHEN POSITION('><' IN p.Tags)=0 THEN 1 ELSE CARDINALITY(string_to_array(p.Tags, '><')) END)
+            ELSE 0 
+        END AS TagCount
+    FROM Posts p
+    WHERE p.CreationDate >= DATE '2015-01-01'
+    AND p.PostTypeId IN (1, 2, 3)
+),
+TagMetrics AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END AS PopularityLevel,
+        COALESCE(t.Count, 0) AS EffectiveCount
+    FROM Tags t
+    WHERE t.Count > 0
+),
+UserTagAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.LastPostDate,
+        uas.AccountAgeDays,
+        uas.TotalPostScore,
+        uas.TotalViews,
+        uas.AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') AS UserTagSummary,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS UserQuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS UserAnswerCount
+    FROM UserActivityStats uas
+    JOIN Posts p ON uas.UserId = p.OwnerUserId
+    WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    GROUP BY 
+        uas.UserId, 
+        uas.DisplayName, 
+        uas.Reputation, 
+        uas.PostCount, 
+        uas.CommentCount, 
+        uas.BadgeCount, 
+        uas.LastPostDate, 
+        uas.AccountAgeDays, 
+        uas.TotalPostScore, 
+        uas.TotalViews, 
+        uas.AvgPostScore
+)
+SELECT 
+    uata.UserId,
+    uata.DisplayName,
+    uata.Reputation,
+    uata.PostCount,
+    uata.CommentCount,
+    uata.BadgeCount,
+    uata.LastPostDate,
+    uata.AccountAgeDays,
+    uata.TotalPostScore,
+    uata.TotalViews,
+    uata.AvgPostScore,
+    uata.UserTagSummary,
+    uata.UserQuestionCount,
+    uata.UserAnswerCount,
+    COALESCE(pa.PostId, -1) AS RecentPostId,
+    COALESCE(pa.Title, 'No Title') AS RecentTitle,
+    COALESCE(pa.BodyPreview, 'No Body') AS RecentBodyPreview,
+    COALESCE(pa.Score, -1) AS RecentScore,
+    COALESCE(pa.ViewCount, -1) AS RecentViews,
+    COALESCE(pa.PostTypeDesc, 'Unknown') AS RecentPostType,
+    COALESCE(pa.TagCount, 0) AS RecentTagCount,
+    CASE 
+        WHEN pa.Score IS NOT NULL THEN 
+            CASE 
+                WHEN pa.Score >= 0 THEN 'Not Negative'
+                ELSE 'Negative Score'
+            END
+        ELSE 'No Recent Score'
+    END AS ScoreStatus,
+    CASE 
+        WHEN pa.EngagementScore > 100 THEN 'High Engagement'
+        WHEN pa.EngagementScore > 50 THEN 'Medium Engagement'
+        WHEN pa.EngagementScore > 0 THEN 'Low Engagement'
+        ELSE 'No Engagement'
+    END AS EngagementLevel,
+    COALESCE(ta.TagName, 'No Tags') AS TopTag,
+    COALESCE(ta.TagCount, 0) AS TopTagCount,
+    COALESCE(ta.PopularityLevel, 'Unknown') AS TagPopularity,
+    CASE 
+        WHEN uata.PostCount > 100 THEN 'Veteran'
+        WHEN uata.PostCount > 10 THEN 'Regular'
+        WHEN uata.PostCount > 0 THEN 'Newcomer'
+        ELSE 'Inactive'
+    END AS UserStatus,
+    CASE 
+        WHEN uata.Reputation > 10000 THEN 'Expert'
+        WHEN uata.Reputation > 1000 THEN 'Intermediate'
+        WHEN uata.Reputation > 100 THEN 'Beginner'
+        ELSE 'Newbie'
+    END AS ReputationLevel,
+    CASE 
+        WHEN (uata.TotalPostScore + uata.TotalViews) > 10000 THEN 'High Impact'
+        WHEN (uata.TotalPostScore + uata.TotalViews) > 5000 THEN 'Medium Impact'
+        WHEN (uata.TotalPostScore + uata.TotalViews) > 0 THEN 'Low Impact'
+        ELSE 'None'
+    END AS ImpactLevel,
+    CASE 
+        WHEN pa.UserPostRank = 1 THEN 'Most Recent Post'
+        WHEN pa.UserPostRank <= 5 THEN 'Recent Posts'
+        ELSE 'Older Posts'
+    END AS PostRecency,
+    ROW_NUMBER() OVER (ORDER BY uata.TotalPostScore DESC, uata.Reputation DESC) AS UserRank,
+    CASE 
+        WHEN uata.Reputation > (SELECT AVG(Reputation) FROM Users WHERE CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')) 
+        THEN 'Above Average'
+        ELSE 'Below Average'
+    END AS ReputationComparison,
+    CASE 
+        WHEN pa.ScoreChange = 'Increased' THEN 1
+        WHEN pa.ScoreChange = 'Decreased' THEN -1
+        ELSE 0
+    END AS ScoreChangeTrend,
+    COALESCE(
+        CASE WHEN uata.CommentCount > 0 THEN ROUND(uata.CommentCount * 100.0 / NULLIF(uata.PostCount,0), 2) ELSE 0 END,
+        0
+    ) AS CommentToPostRatio,
+    CASE 
+        WHEN pa.GlobalScoreRank <= 100 THEN 'Top 100 Global'
+        WHEN pa.GlobalScoreRank <= 1000 THEN 'Top 1000 Global'
+        ELSE 'Below Top 1000'
+    END AS GlobalRankStatus,
+    STRING_AGG(
+        CASE 
+            WHEN pa.ScoreTier = 'High' THEN pa.Title ELSE NULL 
+        END, 
+        ' | '
+    ) AS HighScoreTitles
+FROM UserTagAnalysis uata
+LEFT JOIN PostAnalysis pa ON uata.UserId = pa.OwnerUserId 
+    AND pa.UserPostRank = 1
+LEFT JOIN TagMetrics ta ON (
+    (CASE 
+        WHEN pa.Tags IS NOT NULL THEN SUBSTRING(pa.Tags FROM 2 FOR (CHAR_LENGTH(pa.Tags)-2))
+        ELSE ''
+    END) LIKE ('%' || ta.TagName || '%')
+    AND ta.TagCount = (
+        SELECT MAX(ta2.TagCount) 
+        FROM TagMetrics ta2 
+        WHERE ((CASE 
+                    WHEN pa.Tags IS NOT NULL THEN SUBSTRING(pa.Tags FROM 2 FOR (CHAR_LENGTH(pa.Tags)-2))
+                    ELSE ''
+                END) LIKE ('%' || ta2.TagName || '%'))
+    )
+)
+WHERE uata.PostCount > 0
+GROUP BY 
+    uata.UserId,
+    uata.DisplayName,
+    uata.Reputation,
+    uata.PostCount,
+    uata.CommentCount,
+    uata.BadgeCount,
+    uata.LastPostDate,
+    uata.AccountAgeDays,
+    uata.TotalPostScore,
+    uata.TotalViews,
+    uata.AvgPostScore,
+    uata.UserTagSummary,
+    uata.UserQuestionCount,
+    uata.UserAnswerCount,
+    pa.PostId,
+    pa.Title,
+    pa.BodyPreview,
+    pa.Score,
+    pa.ViewCount,
+    pa.PostTypeDesc,
+    pa.TagCount,
+    pa.ScoreChange,
+    pa.EngagementScore,
+    pa.UserPostRank,
+    pa.GlobalScoreRank,
+    pa.ScoreTier,
+    ta.TagName,
+    ta.TagCount,
+    ta.PopularityLevel
+HAVING COUNT(*) > 0
+ORDER BY uata.TotalPostScore DESC, uata.Reputation DESC
+LIMIT 1000 OFFSET 100;

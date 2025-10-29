@@ -1,0 +1,138 @@
+WITH TopUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(COALESCE(v.score,0)) AS TotalPostScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCountForHaving
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) > 0
+),
+RecentClosedQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.ClosedDate,
+        COALESCE(ph.Comment, '') AS CloseReasonJson,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn
+    FROM Posts p
+    LEFT JOIN PostHistory ph 
+        ON ph.PostId = p.Id 
+       AND ph.PostHistoryTypeId = 10
+    WHERE p.PostTypeId = 1
+      AND p.ClosedDate IS NOT NULL
+),
+TagStats AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagUseCount,
+        COALESCE(pv.TotalViews,0) AS TotalViews,
+        SUM(COALESCE(p.Score,0)) AS TotalScore,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.Id IS NOT NULL) AS TopContributors
+    FROM Tags t
+    LEFT JOIN PostLinks pl 
+        ON pl.RelatedPostId = t.Id 
+        OR pl.PostId = t.Id
+    LEFT JOIN Posts p 
+        ON p.Id = pl.PostId 
+       AND p.PostTypeId = 1
+    LEFT JOIN Users u 
+        ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT Id AS PostId, SUM(ViewCount) AS TotalViews
+        FROM Posts
+        GROUP BY Id
+    ) pv ON pv.PostId = p.Id
+    GROUP BY t.TagName, t.Count, pv.TotalViews
+    HAVING COUNT(p.Id) > 5
+),
+UserQuestionStats AS (
+    SELECT 
+        u.Id,
+        COUNT(q.Id) AS QuestionCount,
+        AVG(COALESCE(q.Score,0)) AS AvgScore,
+        MAX(q.CreationDate) AS MostRecentQuestion,
+        SUM(CASE WHEN q.FavoriteCount > 0 THEN 1 ELSE 0 END) AS FavoritedCount
+    FROM Users u
+    JOIN Posts q 
+        ON q.OwnerUserId = u.Id 
+       AND q.PostTypeId = 1
+    GROUP BY u.Id
+)
+SELECT 
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.TotalPostScore,
+    tu.RepRank,
+    uq.QuestionCount,
+    uq.AvgScore,
+    uq.MostRecentQuestion,
+    uq.FavoritedCount,
+    rcq.Title,
+    rcq.ClosedDate,
+    rcq.CloseReasonJson,
+    ts.TagName,
+    ts.TagUseCount,
+    ts.TotalViews,
+    ts.TotalScore,
+    ts.TopContributors
+FROM TopUsers tu
+LEFT JOIN UserQuestionStats uq 
+       ON uq.Id = tu.Id
+LEFT JOIN LATERAL (
+    SELECT rcq.Title, rcq.ClosedDate, rcq.CloseReasonJson
+    FROM RecentClosedQuestions rcq
+    WHERE rcq.rn = 1
+    ORDER BY rcq.ClosedDate DESC
+    LIMIT 1
+) rcq ON TRUE
+LEFT JOIN LATERAL (
+    SELECT ts.TagName, ts.TagUseCount, ts.TotalViews, ts.TotalScore, ts.TopContributors
+    FROM TagStats ts
+    WHERE ts.TagName ILIKE '%' || COALESCE(tu.DisplayName, '') || '%'
+    ORDER BY ts.TagUseCount DESC
+    LIMIT 3
+) ts ON TRUE
+WHERE tu.RepRank <= 100
+
+UNION ALL
+
+SELECT 
+    NULL AS Id,
+    'Aggregated Stats' AS DisplayName,
+    NULL AS Reputation,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    SUM(tu.TotalPostScore) AS TotalPostScore,
+    NULL AS RepRank,
+    SUM(uq.QuestionCount) AS QuestionCount,
+    AVG(uq.AvgScore) AS AvgScore,
+    MAX(uq.MostRecentQuestion) AS MostRecentQuestion,
+    SUM(uq.FavoritedCount) AS FavoritedCount,
+    NULL AS Title,
+    NULL AS ClosedDate,
+    NULL AS CloseReasonJson,
+    NULL AS TagName,
+    NULL AS TagUseCount,
+    NULL AS TotalViews,
+    NULL AS TotalScore,
+    NULL AS TopContributors
+FROM TopUsers tu
+JOIN UserQuestionStats uq 
+     ON uq.Id = tu.Id
+WHERE tu.RepRank <= 100;

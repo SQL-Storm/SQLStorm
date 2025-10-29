@@ -1,0 +1,152 @@
+-- {"query": "3229.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2237} 
+
+WITH
+/* 1️⃣ Aggregate basic user activity */
+UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1)      AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2)      AS AnswerCount,
+        SUM(COALESCE(p.Score,0))                     AS TotalPostScore,
+        MAX(p.CreationDate)                         AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p
+        ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+/* 2️⃣ Badge summary per user */
+BadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(*)                                        AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)    AS Gold,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)    AS Silver,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)    AS Bronze
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/* 3️⃣ Most used tag per user (requires tag splitting) */
+TopTagUsage AS (
+    SELECT
+        u.Id                                        AS UserId,
+        t.TagName,
+        COUNT(*)                                    AS TagUses,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COUNT(*) DESC) AS rn
+    FROM Users u
+    JOIN Posts p
+        ON p.OwnerUserId = u.Id
+        AND p.PostTypeId = 1                         -- only questions
+    CROSS JOIN LATERAL
+        regexp_split_to_table(trim(both '<>' FROM p.Tags), '><') AS tag
+    JOIN Tags t
+        ON t.TagName = tag
+    GROUP BY u.Id, t.TagName
+),
+
+/* 4️⃣ Votes on posts in the last 30 days */
+RecentVotes AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END)   AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END)   AS DownVotes,
+        MAX(v.CreationDate)                          AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt
+        ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY v.PostId
+),
+
+/* 5️⃣ Global ranking of questions by score */
+PostScoreRank AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        RANK() OVER (ORDER BY p.Score DESC)                         AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS RecentRow
+    FROM Posts p
+    WHERE p.PostTypeId = 1                      -- only questions
+),
+
+/* 6️⃣ Latest post per user (correlated sub‑query) */
+LatestPostPerUser AS (
+    SELECT
+        u.Id                                           AS UserId,
+        (SELECT p.Id
+         FROM Posts p
+         WHERE p.OwnerUserId = u.Id
+         ORDER BY p.CreationDate DESC
+         LIMIT 1)                                      AS LatestPostId
+    FROM Users u
+)
+
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.TotalPostScore,
+    COALESCE(ba.TotalBadges,0)     AS TotalBadges,
+    COALESCE(ba.Gold,0)            AS GoldBadges,
+    COALESCE(ba.Silver,0)          AS SilverBadges,
+    COALESCE(ba.Bronze,0)          AS BronzeBadges,
+    tt.TagName                     AS TopTag,
+    tt.TagUses,
+    psr.Title                      AS TopScoringQuestion,
+    psr.Score                      AS TopScore,
+    psr.ScoreRank,
+    rv.UpVotes,
+    rv.DownVotes,
+    CASE
+        WHEN us.LastPostDate IS NULL THEN 'Never posted'
+        ELSE TO_CHAR(us.LastPostDate, 'YYYY-MM-DD')
+    END                           AS LastPostDateStr
+FROM UserStats us
+LEFT JOIN BadgeAgg ba
+    ON ba.UserId = us.Id
+LEFT JOIN (
+    SELECT UserId, TagName, TagUses
+    FROM TopTagUsage
+    WHERE rn = 1
+) tt
+    ON tt.UserId = us.Id
+LEFT JOIN PostScoreRank psr
+    ON psr.ScoreRank = 1                      -- global #1 question
+LEFT JOIN LatestPostPerUser lpu
+    ON lpu.UserId = us.Id
+LEFT JOIN RecentVotes rv
+    ON rv.PostId = lpu.LatestPostId
+WHERE us.Reputation > 10000
+ORDER BY us.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+/* 7️⃣ Simple separator row for visual benchmarking */
+SELECT
+    NULL,
+    '--- Summary ---',
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM (SELECT 1) AS dummy
+LIMIT 1;

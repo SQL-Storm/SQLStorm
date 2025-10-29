@@ -1,0 +1,244 @@
+-- {"query": "1767.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3726} 
+
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.WebsiteUrl,
+        U.Location,
+        U.AboutMe,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersOwned,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScoreOwned,
+        AVG(COALESCE(P.ViewCount, 0)) AS AvgPostViewCountOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScoreMade,
+        COUNT(DISTINCT AcceptedAnswers.Id) AS TotalAcceptedAnswersProvided,
+        -- Correlated subquery example: Average score of accepted answers provided by this user
+        (
+            SELECT AVG(ans.Score)
+            FROM Posts ans
+            WHERE ans.OwnerUserId = U.Id
+              AND ans.PostTypeId = 2 -- Is an answer
+              AND EXISTS (SELECT 1 FROM Posts q_inner WHERE q_inner.AcceptedAnswerId = ans.Id AND q_inner.PostTypeId = 1) -- Is an accepted answer for a question
+        ) AS AvgAcceptedAnswerScore
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Posts AcceptedAnswers ON U.Id = AcceptedAnswers.OwnerUserId AND AcceptedAnswers.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Posts q WHERE q.AcceptedAnswerId = AcceptedAnswers.Id)
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.WebsiteUrl, U.Location, U.AboutMe
+),
+PostHistoricalReview AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate AS PostLastEditDate,
+        P.LastActivityDate AS PostLastActivityDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edits/rollbacks
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosedAtSomePoint,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopenedAtSomePoint,
+        MIN(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS FirstEditDate,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS LatestEditDate,
+        -- String expression and NULL logic for latest close reason comment
+        COALESCE(
+            (SELECT CR.Name FROM CloseReasonTypes CR WHERE CR.Id = CAST(PH_Close.Comment AS SMALLINT) LIMIT 1),
+            'N/A'
+        ) AS LastCloseReason
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN PostHistory PH_Close ON P.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10
+        AND PH_Close.CreationDate = (SELECT MAX(ph_sub.CreationDate) FROM PostHistory ph_sub WHERE ph_sub.PostId = P.Id AND ph_sub.PostHistoryTypeId = 10) -- Latest close event
+    GROUP BY
+        P.Id, P.PostTypeId, P.CreationDate, P.LastEditDate, P.LastActivityDate, P.ClosedDate, P.CommunityOwnedDate, PH_Close.Comment
+),
+TopTagsByPostInfluence AS (
+    SELECT
+        T.TagName,
+        SUM(P.Score) AS TotalTagScore,
+        COUNT(DISTINCT P.Id) AS TotalPostsWithTag,
+        AVG(P.ViewCount) AS AvgViewsForTag,
+        -- Window function: Rank tags by their total score
+        RANK() OVER (ORDER BY SUM(P.Score) DESC) AS TagScoreRank
+    FROM Posts P
+    LEFT JOIN LATERAL (
+        SELECT REPLACE(unnested_tag, '>', '') AS tag_name
+        FROM unnest(string_to_array(TRIM(REPLACE(REPLACE(P.Tags, '><', ','), '<', '')), ',')) AS unnested_tag
+        WHERE unnested_tag <> ''
+    ) AS TagSplitter ON TRUE
+    LEFT JOIN Tags T ON TagSplitter.tag_name = T.TagName
+    WHERE P.PostTypeId = 1 -- Only questions contribute to tag influence here
+      AND P.CreationDate >= '2020-01-01' -- Filter for recent activity
+      AND T.TagName IS NOT NULL -- Ensure we have a valid tag
+    GROUP BY T.TagName
+    HAVING COUNT(DISTINCT P.Id) > 10 -- Only consider tags with significant usage
+),
+UserBadgeAchievements AS (
+    SELECT
+        B.UserId,
+        B.Name AS BadgeName,
+        B.Date AS BadgeDate,
+        B.Class AS BadgeClass,
+        -- Window function: Get the most recent gold badge for each user
+        ROW_NUMBER() OVER (PARTITION BY B.UserId ORDER BY B.Date DESC) AS rn
+    FROM Badges B
+    WHERE B.Class = 1 -- Gold badges
+),
+PostVoteSummary AS (
+    SELECT
+        PostId,
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites
+    FROM Votes
+    GROUP BY PostId
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName AS UserDisplayName,
+    UE.Reputation,
+    UE.TotalPostsOwned,
+    UE.TotalQuestionsOwned,
+    UE.TotalAnswersOwned,
+    UE.TotalCommentsMade,
+    UE.AvgAcceptedAnswerScore,
+    -- User's age on the platform in years
+    EXTRACT(YEAR FROM AGE(NOW(), UE.UserCreationDate)) AS UserAgeYears,
+    -- Complicated predicate/expression for 'UserInfluenceTier' using CASE statement
+    CASE
+        WHEN UE.Reputation > 50000 AND UE.TotalQuestionsOwned > 100 AND UE.TotalAnswersOwned > 200 THEN 'Legendary'
+        WHEN UE.Reputation > 10000 AND UE.TotalPostsOwned > 150 AND UE.AvgPostViewCountOwned > 1000 THEN 'Influencer'
+        WHEN UE.Reputation > 1000 OR UE.TotalPostsOwned > 50 THEN 'Contributor'
+        ELSE 'Novice'
+    END AS UserInfluenceTier,
+    UBA.BadgeName AS RecentGoldBadge,
+    UBA.BadgeDate AS RecentGoldBadgeDate,
+    P.Id AS PostId,
+    P.PostTypeId,
+    PT.Name AS PostTypeName,
+    P.Title AS PostTitle,
+    P.Score AS PostScore,
+    P.ViewCount AS PostViewCount,
+    P.AnswerCount AS QuestionAnswerCount, -- Specific to questions
+    PR.EditCount AS PostEditCount,
+    PR.WasClosedAtSomePoint,
+    PR.LastCloseReason,
+    -- Window function: Rank user's posts by score within their owned questions/answers
+    ROW_NUMBER() OVER (PARTITION BY UE.UserId, P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS UserPostRank,
+    -- Window function: Average score of all posts of the same type created within the same year
+    AVG(P.Score) OVER (PARTITION BY P.PostTypeId, EXTRACT(YEAR FROM P.CreationDate)) AS AvgPostScoreInTypePerYear,
+    -- Check for NULLs and provide alternative text
+    COALESCE(UE.Location, 'Unknown Location') AS UserLocation,
+    -- String expression: Extract first 100 chars of AboutMe, or 'No description' if NULL
+    COALESCE(SUBSTRING(UE.AboutMe, 1, 100), 'No description provided') AS AboutMeExcerpt,
+    -- Calculation: Ratio of accepted answers to total answers for the owner, with NULLIF for division by zero
+    CAST(UE.TotalAcceptedAnswersProvided AS NUMERIC) / NULLIF(UE.TotalAnswersOwned, 0) AS AcceptedAnswerRatio,
+    -- Tags string processed (replace < and > with commas, remove empty parts)
+    TRIM(REPLACE(REPLACE(P.Tags, '><', ', '), '<', ''), ',') AS ProcessedTags,
+    TTP.TotalTagScore,
+    TTP.TagScoreRank,
+    PVotes.Upvotes,
+    PVotes.Downvotes,
+    PVotes.Favorites,
+    -- Use a LEAD function to compare the current post's score with the next post's score by the same user, ordered by creation date
+    LEAD(P.Score, 1, 0) OVER (PARTITION BY UE.UserId ORDER BY P.CreationDate) AS NextPostScoreBySameUser,
+    -- Boolean calculation: Check if the post was edited significantly after creation
+    (PR.LatestEditDate IS NOT NULL AND PR.LatestEditDate - PR.PostCreationDate > INTERVAL '30 days') AS HasMajorLateEdit
+FROM UserEngagement UE
+INNER JOIN Posts P ON UE.UserId = P.OwnerUserId
+INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+LEFT JOIN PostHistoricalReview PR ON P.Id = PR.PostId
+LEFT JOIN UserBadgeAchievements UBA ON UE.UserId = UBA.UserId AND UBA.rn = 1 -- Only the most recent gold badge
+LEFT JOIN LATERAL (
+    SELECT TOP_TAGS.TagName, TOP_TAGS.TotalTagScore, TOP_TAGS.TagScoreRank
+    FROM TopTagsByPostInfluence TOP_TAGS
+    WHERE P.Tags LIKE '%' || '<' || TOP_TAGS.TagName || '>' || '%'
+    ORDER BY TOP_TAGS.TagScoreRank
+    LIMIT 1 -- Get the most influential tag associated with the post
+) AS TTP ON P.PostTypeId = 1 -- Tags are primarily on questions, so only join for questions
+LEFT JOIN PostVoteSummary PVotes ON P.Id = PVotes.PostId
+WHERE
+    UE.Reputation > 5000 -- Only consider reasonably reputable users
+    AND P.CreationDate BETWEEN '2021-01-01' AND '2023-12-31' -- Specific date range for posts
+    AND P.Score >= 10 -- Only relevant questions with higher scores
+    AND P.PostTypeId = 1 -- Only questions for the first part of the UNION
+    AND (
+        (UE.WebsiteUrl IS NOT NULL AND UE.Location ILIKE '%usa%') OR -- Users with website and US location
+        (UE.Location IS NOT NULL AND UE.AboutMe ILIKE '%developer%') OR -- Users in a location with 'developer' in AboutMe
+        (P.Tags ILIKE '%<sql>%') -- Posts tagged with 'sql'
+    )
+    -- Exclude questions that were permanently closed and not community-owned
+    AND NOT (P.PostTypeId = 1 AND PR.WasClosedAtSomePoint = 1 AND PR.WasReopenedAtSomePoint = 0 AND P.ClosedDate IS NOT NULL AND P.CommunityOwnedDate IS NULL)
+
+UNION ALL
+
+-- Second part of UNION ALL for highly-rated answers
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.TotalPostsOwned,
+    UE.TotalQuestionsOwned,
+    UE.TotalAnswersOwned,
+    UE.TotalCommentsMade,
+    UE.AvgAcceptedAnswerScore,
+    EXTRACT(YEAR FROM AGE(NOW(), UE.UserCreationDate)) AS UserAgeYears,
+    CASE
+        WHEN UE.Reputation > 50000 AND UE.TotalQuestionsOwned > 100 AND UE.TotalAnswersOwned > 200 THEN 'Legendary'
+        WHEN UE.Reputation > 10000 AND UE.TotalPostsOwned > 150 AND UE.AvgPostViewCountOwned > 1000 THEN 'Influencer'
+        WHEN UE.Reputation > 1000 OR UE.TotalPostsOwned > 50 THEN 'Contributor'
+        ELSE 'Novice'
+    END AS UserInfluenceTier,
+    UBA.BadgeName,
+    UBA.BadgeDate,
+    P.Id,
+    P.PostTypeId,
+    PT.Name,
+    P.Title, -- Title will be NULL for answers, but kept for column consistency
+    P.Score,
+    P.ViewCount,
+    NULL AS QuestionAnswerCount, -- Not applicable for answers
+    PR.EditCount,
+    PR.WasClosedAtSomePoint,
+    PR.LastCloseReason,
+    ROW_NUMBER() OVER (PARTITION BY UE.UserId, P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS UserPostRank,
+    AVG(P.Score) OVER (PARTITION BY P.PostTypeId, EXTRACT(YEAR FROM P.CreationDate)) AS AvgPostScoreInTypePerYear,
+    COALESCE(UE.Location, 'Unknown Location') AS UserLocation,
+    COALESCE(SUBSTRING(UE.AboutMe, 1, 100), 'No description provided') AS AboutMeExcerpt,
+    CAST(UE.TotalAcceptedAnswersProvided AS NUMERIC) / NULLIF(UE.TotalAnswersOwned, 0) AS AcceptedAnswerRatio,
+    TRIM(REPLACE(REPLACE(P.Tags, '><', ', '), '<', ''), ',') AS ProcessedTags,
+    NULL AS TotalTagScore, -- Not directly applicable for answers
+    NULL AS TagScoreRank, -- Not directly applicable for answers
+    PVotes.Upvotes,
+    PVotes.Downvotes,
+    PVotes.Favorites,
+    LEAD(P.Score, 1, 0) OVER (PARTITION BY UE.UserId ORDER BY P.CreationDate) AS NextPostScoreBySameUser,
+    (PR.LatestEditDate IS NOT NULL AND PR.LatestEditDate - PR.PostCreationDate > INTERVAL '30 days') AS HasMajorLateEdit
+FROM UserEngagement UE
+INNER JOIN Posts P ON UE.UserId = P.OwnerUserId
+INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+LEFT JOIN PostHistoricalReview PR ON P.Id = PR.PostId
+LEFT JOIN UserBadgeAchievements UBA ON UE.UserId = UBA.UserId AND UBA.rn = 1
+LEFT JOIN PostVoteSummary PVotes ON P.Id = PVotes.PostId
+WHERE
+    UE.Reputation > 2000 -- Slightly lower reputation threshold for answers
+    AND P.CreationDate BETWEEN '2021-01-01' AND '2023-12-31'
+    AND P.Score >= 5 -- Only relevant answers
+    AND P.PostTypeId = 2 -- Only answers for the second part of the UNION
+    AND P.ParentId IS NOT NULL -- Ensure it's a valid answer to a question
+    AND (
+        (UE.WebsiteUrl IS NOT NULL AND UE.Location ILIKE '%europe%') OR -- Users with website and European location
+        (UE.Location IS NOT NULL AND UE.AboutMe ILIKE '%architect%') OR -- Users in a location with 'architect' in AboutMe
+        (P.Body ILIKE '%<code class="language-c#">%' OR P.Body ILIKE '%<code class="language-java">%' ) -- Answers containing specific code language snippets
+    )
+ORDER BY
+    UserDisplayName, PostId
+LIMIT 2000;

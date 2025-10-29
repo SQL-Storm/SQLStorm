@@ -1,0 +1,339 @@
+-- {"query": "946.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3063} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl,
+           row_number() over (order by u.creationdate desc, u.id) as rn
+    from users u
+),
+ranked_questions as (
+    select p.id as question_id,
+           p.owneruserid,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.title,
+           p.tags,
+           p.answercount,
+           p.favoritecount,
+           p.closeddate,
+           row_number() over (partition by p.owneruserid order by p.score desc nulls last, p.viewcount desc nulls last, p.creationdate desc nulls last, p.id desc) as rn_owner_top
+    from posts p
+    where p.posttypeid = 1
+),
+accepted_answers as (
+    select q.id as question_id,
+           a.id as accepted_answer_id,
+           a.owneruserid as accepted_owner_id,
+           a.score as accepted_score,
+           a.creationdate as accepted_creation
+    from posts q
+    left join posts a
+      on a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+),
+comment_stats as (
+    select c.postid,
+           count(*) as comment_count,
+           sum(case when c.score > 0 then 1 else 0 end) as pos_comment_count,
+           max(c.creationdate) as last_comment_date
+    from comments c
+    group by c.postid
+),
+vote_agg as (
+    select v.postid,
+           sum(case when vt.name = 'UpMod' then 1 else 0 end) as upvotes,
+           sum(case when vt.name = 'DownMod' then 1 else 0 end) as downvotes,
+           sum(case when vt.name = 'Favorite' then 1 else 0 end) as favorites_votes,
+           sum(case when vt.name in ('BountyStart','BountyClose') then coalesce(v.bountyamount,0) else 0 end) as total_bounty_amount,
+           min(v.creationdate) as first_vote_at,
+           max(v.creationdate) as last_vote_at
+    from votes v
+    join votetypes vt on vt.id = v.votetypeid
+    group by v.postid
+),
+tag_exploded as (
+    select p.id as question_id,
+           lower(trim(tg)) as tag
+    from posts p
+    cross join lateral (
+        select unnest(
+            case
+                when p.tags is null then array[]::varchar[]
+                when length(p.tags) <= 2 then array[]::varchar[]
+                else string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+            end
+        )
+    ) as x(tg)
+    where p.posttypeid = 1
+),
+user_badge_rank as (
+    select b.userid,
+           sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+           sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+           sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+           count(*) as total_badges,
+           max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+close_reasons as (
+    select ph.postid,
+           max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as closed_at,
+           max(crt.name) filter (
+               where ph.posthistorytypeid = 10
+                 and ph.comment ~ '^[0-9]+$'
+           ) as close_reason_name,
+           max(ph.text) filter (where ph.posthistorytypeid = 35) as migrated_away_payload
+    from posthistory ph
+    left join closereasontypes crt
+      on crt.id::varchar = ph.comment
+    group by ph.postid
+),
+linked_dupes as (
+    select pl.postid as duplicate_id,
+           count(*) filter (where pl.linktypeid = 3) as dup_count,
+           max(pl.creationdate) filter (where pl.linktypeid = 3) as last_dup_link
+    from postlinks pl
+    group by pl.postid
+),
+user_activity as (
+    select p.owneruserid as user_id,
+           count(*) filter (where p.posttypeid = 1) as q_cnt,
+           count(*) filter (where p.posttypeid = 2) as a_cnt,
+           sum(coalesce(p.score,0)) as total_post_score,
+           max(p.lastactivitydate) as last_activity
+    from posts p
+    group by p.owneruserid
+),
+eligible_questions as (
+    select q.*
+    from ranked_questions q
+    where q.rn_owner_top <= 5
+),
+question_quality as (
+    select q.question_id,
+           q.owneruserid,
+           q.score,
+           q.viewcount,
+           q.answercount,
+           q.favoritecount,
+           coalesce(v.upvotes,0) as upvotes,
+           coalesce(v.downvotes,0) as downvotes,
+           coalesce(v.favorites_votes,0) as favorite_votes,
+           coalesce(v.total_bounty_amount,0) as bounty_total,
+           coalesce(cs.comment_count,0) as comment_count,
+           coalesce(cs.pos_comment_count,0) as positive_comments,
+           case
+             when q.viewcount is null or q.viewcount = 0 then null
+             else round((q.score::numeric + coalesce(v.upvotes,0) - coalesce(v.downvotes,0) + coalesce(v.favorites_votes,0)) / nullif(q.viewcount,0) * 1000, 4)
+           end as engagement_per_1k_views,
+           case
+             when q.answercount is null or q.answercount = 0 then 0
+             else round((coalesce(v.upvotes,0)::numeric) / q.answercount, 3)
+           end as upvotes_per_answer,
+           cs.last_comment_date,
+           v.first_vote_at,
+           v.last_vote_at
+    from eligible_questions q
+    left join vote_agg v on v.postid = q.question_id
+    left join comment_stats cs on cs.postid = q.question_id
+),
+owner_enriched as (
+    select qq.*,
+           u.displayname,
+           u.reputation,
+           ub.total_badges,
+           ub.gold_badges,
+           ub.silver_badges,
+           ub.bronze_badges,
+           ua.q_cnt,
+           ua.a_cnt,
+           ua.last_activity
+    from question_quality qq
+    left join users u on u.id = qq.owneruserid
+    left join user_badge_rank ub on ub.userid = qq.owneruserid
+    left join user_activity ua on ua.user_id = qq.owneruserid
+),
+answer_latency as (
+    select q.id as question_id,
+           min(a.creationdate) as first_answer_at,
+           count(a.id) as total_answers
+    from posts q
+    left join posts a
+      on a.parentid = q.id
+     and a.posttypeid = 2
+    where q.posttypeid = 1
+    group by q.id
+),
+tag_popularity as (
+    select te.tag,
+           sum(t.count) as global_tag_count,
+           max(t.isrequired::int) as any_required,
+           max(t.ismoderatoronly::int) as any_mod_only
+    from tag_exploded te
+    left join tags t on t.tagname = te.tag
+    group by te.tag
+),
+question_tag_stats as (
+    select te.question_id,
+           count(*) as tag_count,
+           sum(tp.global_tag_count) as sum_global_tag_count,
+           sum(case when tp.any_required = 1 then 1 else 0 end) as required_tag_hits,
+           sum(case when tp.any_mod_only = 1 then 1 else 0 end) as modonly_tag_hits,
+           string_agg(te.tag, ',' order by te.tag) as tags_csv
+    from tag_exploded te
+    left join tag_popularity tp on tp.tag = te.tag
+    group by te.question_id
+),
+final_scored as (
+    select oe.question_id,
+           oe.owneruserid,
+           oe.displayname,
+           oe.reputation,
+           oe.total_badges,
+           oe.gold_badges,
+           oe.silver_badges,
+           oe.bronze_badges,
+           oe.q_cnt,
+           oe.a_cnt,
+           oe.score,
+           oe.viewcount,
+           oe.answercount,
+           oe.favoritecount,
+           oe.upvotes,
+           oe.downvotes,
+           oe.favorite_votes,
+           oe.bounty_total,
+           oe.comment_count,
+           oe.positive_comments,
+           oe.engagement_per_1k_views,
+           oe.upvotes_per_answer,
+           al.first_answer_at,
+           al.total_answers,
+           qs.tag_count,
+           qs.sum_global_tag_count,
+           qs.required_tag_hits,
+           qs.modonly_tag_hits,
+           qs.tags_csv,
+           cr.closed_at,
+           cr.close_reason_name,
+           ld.dup_count,
+           ld.last_dup_link,
+           aa.accepted_answer_id,
+           aa.accepted_score,
+           case
+             when cr.closed_at is not null then 0
+             when coalesce(oe.downvotes,0) > coalesce(oe.upvotes,0) then 0.25
+             when coalesce(ld.dup_count,0) > 0 then 0.5
+             else 1
+           end as penalty_factor,
+           round(
+             (
+               coalesce(oe.engagement_per_1k_views, 0)
+               + coalesce(oe.upvotes,0) * 0.75
+               - coalesce(oe.downvotes,0) * 0.9
+               + coalesce(oe.favorite_votes,0) * 0.5
+               + coalesce(oe.bounty_total,0) * 0.01
+               + coalesce(oe.positive_comments,0) * 0.2
+               + coalesce(oe.answercount,0) * 0.3
+               + coalesce(aa.accepted_score,0) * 0.4
+               + coalesce(qs.required_tag_hits,0) * 2
+               - coalesce(qs.modonly_tag_hits,0) * 1.5
+               + least(coalesce(oe.reputation,0)::numeric / 1000, 10) -- cap rep influence
+             ) * case
+                   when coalesce(oe.viewcount,0) >= 100000 then 1.1
+                   when coalesce(oe.viewcount,0) >= 10000 then 1.05
+                   else 1
+                 end
+               * penalty_factor
+           , 4) as composite_score
+    from owner_enriched oe
+    left join answer_latency al on al.question_id = oe.question_id
+    left join question_tag_stats qs on qs.question_id = oe.question_id
+    left join close_reasons cr on cr.postid = oe.question_id
+    left join linked_dupes ld on ld.duplicate_id = oe.question_id
+    left join accepted_answers aa on aa.question_id = oe.question_id
+),
+user_percentiles as (
+    select owneruserid,
+           percentile_cont(0.5) within group (order by composite_score) as p50_score,
+           percentile_cont(0.9) within group (order by composite_score) as p90_score,
+           count(*) as sample_count
+    from final_scored
+    group by owneruserid
+),
+anomalies as (
+    select f.*,
+           u.location,
+           u.websiteurl,
+           up.p50_score,
+           up.p90_score,
+           up.sample_count,
+           case
+             when f.composite_score >= up.p90_score then 'high'
+             when f.composite_score <= up.p50_score then 'low'
+             else 'mid'
+           end as score_bucket
+    from final_scored f
+    left join users u on u.id = f.owneruserid
+    left join user_percentiles up on up.owneruserid = f.owneruserid
+),
+recent_edge as (
+    select a.*,
+           row_number() over (
+             partition by a.owneruserid
+             order by coalesce(a.closed_at, a.last_dup_link, a.first_answer_at, cast('2024-10-01 12:34:56' as timestamp)) desc nulls last
+           ) as recency_rank
+    from anomalies a
+)
+select
+    re.owneruserid,
+    coalesce(re.displayname, '(unknown)') as owner_displayname,
+    coalesce(re.location, '(unspecified)') as owner_location,
+    coalesce(re.websiteurl, 'n/a') as owner_website,
+    re.question_id,
+    left(coalesce(re.tags_csv,''), 200) as tags_preview,
+    coalesce(re.title, (select p2.title from posts p2 where p2.id = re.question_id)) as title_fallback,
+    re.score,
+    re.viewcount,
+    re.answercount,
+    re.favoritecount,
+    re.upvotes,
+    re.downvotes,
+    re.favorite_votes,
+    re.bounty_total,
+    re.comment_count,
+    re.positive_comments,
+    re.engagement_per_1k_views,
+    re.upvotes_per_answer,
+    re.first_answer_at,
+    re.total_answers,
+    re.closed_at,
+    re.close_reason_name,
+    re.dup_count,
+    re.last_dup_link,
+    re.accepted_answer_id,
+    re.accepted_score,
+    re.reputation,
+    re.gold_badges,
+    re.silver_badges,
+    re.bronze_badges,
+    re.q_cnt,
+    re.a_cnt,
+    re.last_activity,
+    re.p50_score,
+    re.p90_score,
+    re.sample_count,
+    re.score_bucket,
+    re.composite_score,
+    dense_rank() over (order by re.composite_score desc, re.viewcount desc nulls last, re.score desc nulls last) as global_rank,
+    dense_rank() over (partition by re.owneruserid order by re.composite_score desc, re.viewcount desc nulls last, re.score desc nulls last) as user_rank
+from recent_edge re
+where (re.score_bucket in ('high','low') or re.penalty_factor < 1)
+  and (re.recency_rank <= 10 or coalesce(re.viewcount,0) > 50000)
+order by re.composite_score desc nulls last, re.viewcount desc nulls last, re.question_id
+limit 500;

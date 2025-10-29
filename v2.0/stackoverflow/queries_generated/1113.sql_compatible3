@@ -1,0 +1,209 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COALESCE(u.Views, 0) AS TotalProfileViews,
+        u.UpVotes AS TotalUpVotesReceived,
+        u.DownVotes AS TotalDownVotesReceived,
+        COUNT(DISTINCT p_own.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p_own.PostTypeId = 2 THEN p_own.Id END) AS TotalAnswersOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN v_given.VoteTypeId IN (2, 8) THEN 1 ELSE 0 END) AS TotalPositiveVotesGiven,
+        SUM(CASE WHEN v_given.VoteTypeId IN (3, 10, 12) THEN 1 ELSE 0 END) AS TotalNegativeVotesGiven,
+        MAX(u.LastAccessDate) AS LastUserAccessDate,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.LastAccessDate)) / 3600 AS numeric(10,2)) AS HoursSinceLastAccess
+    FROM
+        Users u
+    LEFT JOIN Posts p_own ON u.Id = p_own.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v_given ON u.Id = v_given.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes, u.LastAccessDate
+),
+PostEngagementMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CreationDate AS PostCreationDate,
+        COALESCE(p.Score, 0) AS PostScore,
+        COALESCE(p.ViewCount, 0) AS PostViewCount,
+        p.OwnerUserId,
+        p.LastEditorUserId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title AS PostTitle,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) AS PostAnswerCount,
+        COALESCE(p.CommentCount, 0) AS PostCommentCount,
+        COALESCE(p.FavoriteCount, 0) AS PostFavoriteCount,
+        p.ClosedDate,
+        (SELECT COUNT(ph.Id)
+         FROM PostHistory ph
+         WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6)) AS TotalEditHistoryCount,
+        (SELECT COUNT(DISTINCT ph.UserId)
+         FROM PostHistory ph
+         WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6) AND ph.UserId IS NOT NULL) AS DistinctEditorCount,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / (24 * 3600) AS numeric(10,2)) AS DaysSinceCreation,
+        LENGTH(p.Body) AS BodyLength,
+        LENGTH(p.Title) AS TitleLength
+    FROM
+        Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+),
+TagPerformance AS (
+    SELECT
+        unnested_tag AS TagName,
+        COUNT(p.Id) AS TotalPostsWithTag,
+        AVG(p.Score) AS AvgScoreOfTaggedPosts,
+        SUM(p.ViewCount) AS TotalViewsOfTaggedPosts,
+        SUM(p.AnswerCount) AS TotalAnswersOfTaggedPosts,
+        AVG(LENGTH(p.Body)) AS AvgBodyLengthForTag,
+        MAX(p.CreationDate) AS LatestPostWithTag
+    FROM
+        Posts p,
+        UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS unnested_tag
+    WHERE
+        p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 2
+        AND p.PostTypeId = 1
+    GROUP BY
+        unnested_tag
+),
+CombinedPostMetrics AS (
+    SELECT
+        pem.PostId,
+        pem.PostTitle,
+        pem.PostTypeName,
+        pem.PostTypeId,
+        pem.PostCreationDate,
+        pem.PostScore,
+        pem.PostViewCount,
+        pem.PostAnswerCount,
+        pem.PostCommentCount,
+        pem.PostFavoriteCount,
+        pem.OwnerUserId,
+        pem.ParentId,
+        uas.DisplayName AS OwnerDisplayName,
+        uas.Reputation AS OwnerReputation,
+        pem.TotalEditHistoryCount,
+        pem.DistinctEditorCount,
+        pem.DaysSinceCreation,
+        pem.BodyLength,
+        pem.TitleLength,
+        unnested_tag.tag AS TagName,
+        tp.AvgScoreOfTaggedPosts,
+        tp.TotalPostsWithTag,
+        tp.TotalViewsOfTaggedPosts,
+        COALESCE(tp.AvgBodyLengthForTag, 0) AS TagAvgBodyLength,
+        ROW_NUMBER() OVER (PARTITION BY pem.PostTypeId ORDER BY pem.PostScore DESC, pem.PostViewCount DESC) AS RankOverallByPostType,
+        RANK() OVER (PARTITION BY unnested_tag.tag ORDER BY pem.PostScore DESC) AS RankByTagScore,
+        AVG(pem.PostScore) OVER (
+            PARTITION BY pem.PostTypeId
+            ORDER BY pem.PostCreationDate
+            RANGE BETWEEN INTERVAL '2592000 seconds' PRECEDING AND CURRENT ROW
+        ) AS MovingAvgScore30Days,
+        SUM(pem.PostViewCount) OVER (PARTITION BY pem.OwnerUserId ORDER BY pem.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningTotalViewsByOwner,
+        NTH_VALUE(pem.PostTitle, 1) OVER (PARTITION BY unnested_tag.tag ORDER BY pem.PostScore DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS TopPostInTag,
+        LAG(pem.PostScore, 1, 0) OVER (PARTITION BY pem.OwnerUserId ORDER BY pem.PostCreationDate) AS PreviousPostScoreByOwner
+    FROM
+        PostEngagementMetrics pem
+    LEFT JOIN
+        UserActivitySummary uas ON pem.OwnerUserId = uas.UserId
+    LEFT JOIN LATERAL (
+        SELECT tag
+        FROM UNNEST(string_to_array(SUBSTRING(pem.Tags, 2, LENGTH(pem.Tags) - 2), '><')) AS tag
+    ) AS unnested_tag ON pem.Tags IS NOT NULL AND LENGTH(TRIM(pem.Tags)) > 2
+    LEFT JOIN
+        TagPerformance tp ON unnested_tag.tag = tp.TagName
+    WHERE
+        pem.PostCreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 year')
+        AND pem.PostTypeId IN (1, 2)
+        AND pem.PostScore IS NOT NULL
+)
+SELECT
+    'High Impact Questions' AS AnalysisCategory,
+    cpm.PostId,
+    cpm.PostTitle,
+    cpm.PostTypeName,
+    cpm.PostCreationDate,
+    cpm.PostScore,
+    cpm.PostViewCount,
+    cpm.PostFavoriteCount,
+    cpm.OwnerDisplayName,
+    cpm.OwnerReputation,
+    cpm.TagName,
+    cpm.RankOverallByPostType,
+    cpm.MovingAvgScore30Days,
+    cpm.RunningTotalViewsByOwner,
+    cpm.TopPostInTag,
+    cpm.PreviousPostScoreByOwner,
+    'Questions with significant view count, high score, and positive reputation from active users.' AS Insights,
+    CASE
+        WHEN cpm.PostFavoriteCount > 0 AND cpm.PostScore > cpm.MovingAvgScore30Days THEN 'Trending & Highly Rated'
+        WHEN cpm.PostFavoriteCount > 0 THEN 'Frequently Favorited'
+        ELSE 'High Score'
+    END AS DetailedInsightType,
+    (SELECT COUNT(c.Id) FROM Comments c WHERE c.PostId = cpm.PostId AND c.CreationDate > cpm.PostCreationDate + INTERVAL '1 week') AS CommentsAfterFirstWeek
+FROM
+    CombinedPostMetrics cpm
+WHERE
+    cpm.PostTypeId = 1
+    AND cpm.RankOverallByPostType <= 500
+    AND cpm.PostScore >= 50
+    AND cpm.PostViewCount > (SELECT AVG(p_inner.ViewCount) * 2 FROM Posts p_inner WHERE p_inner.PostTypeId = cpm.PostTypeId)
+    AND cpm.OwnerReputation > 1000
+    AND LOWER(cpm.PostTitle) LIKE '%sql%'
+    AND cpm.TagName IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1 FROM PostLinks pl WHERE pl.PostId = cpm.PostId AND pl.LinkTypeId = 3
+    )
+    AND cpm.DaysSinceCreation BETWEEN 30 AND 365
+    AND cpm.PostCommentCount > 0
+UNION ALL
+SELECT
+    'Underperforming Answers' AS AnalysisCategory,
+    cpm.PostId,
+    cpm.PostTitle,
+    cpm.PostTypeName,
+    cpm.PostCreationDate,
+    cpm.PostScore,
+    cpm.PostViewCount,
+    cpm.PostFavoriteCount,
+    COALESCE(cpm.OwnerDisplayName, 'Community') AS OwnerDisplayName,
+    cpm.OwnerReputation,
+    cpm.TagName,
+    cpm.RankOverallByPostType,
+    cpm.MovingAvgScore30Days,
+    cpm.RunningTotalViewsByOwner,
+    cpm.TopPostInTag,
+    cpm.PreviousPostScoreByOwner,
+    'Answers from active users with low scores relative to their parent question and lacking engagement.' AS Insights,
+    CASE
+        WHEN cpm.PostScore < cpm.PreviousPostScoreByOwner / 2 THEN 'Score significantly lower than previous post'
+        WHEN cpm.PostScore < cpm.AvgScoreOfTaggedPosts THEN 'Below Tag Average Score'
+        WHEN cpm.TotalEditHistoryCount < 2 THEN 'Infrequently Edited'
+        ELSE 'General Underperformance'
+    END AS DetailedInsightType,
+    (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = cpm.PostId AND v.VoteTypeId = 5) AS SavedCount
+FROM
+    CombinedPostMetrics cpm
+WHERE
+    cpm.PostTypeId = 2
+    AND cpm.PostScore < (SELECT AVG(p_parent.Score) * 0.2 FROM Posts p_parent WHERE p_parent.Id = cpm.ParentId AND p_parent.PostTypeId = 1)
+    AND cpm.PostCreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    AND cpm.TotalEditHistoryCount < 3
+    AND cpm.OwnerUserId IS NOT NULL
+    AND cpm.RunningTotalViewsByOwner > 1000
+    AND cpm.TagName IS NOT NULL
+    AND (cpm.PostFavoriteCount IS NULL OR cpm.PostFavoriteCount = 0)
+    AND cpm.PostScore < cpm.PreviousPostScoreByOwner
+    AND cpm.BodyLength > 100
+ORDER BY
+    AnalysisCategory, PostScore ASC, PostViewCount DESC
+LIMIT 1000;

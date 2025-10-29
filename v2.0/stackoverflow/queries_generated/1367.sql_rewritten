@@ -1,0 +1,193 @@
+-- {"query": "1367.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2785} 
+WITH UserEngagementSummary AS (
+    -- CTE 1: Aggregates user activity, reputation tiers, and badge summaries
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName AS UserName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Location,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadgeCount,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadgeCount,
+        SUM(P.Score) AS SumPostScore,
+        COALESCE(AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END), 0) AS AvgQuestionScore,
+        COALESCE(AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score END), 0) AS AvgAnswerScore,
+        CASE
+            WHEN U.Reputation >= 100000 THEN 'Legendary'
+            WHEN U.Reputation >= 25000 THEN 'Expert'
+            WHEN U.Reputation >= 5000 THEN 'Seasoned'
+            WHEN U.Reputation >= 1000 THEN 'Contributor'
+            ELSE 'Apprentice'
+        END AS ReputationTier,
+        -- Correlated Subquery: Check if user has specific "long-term" badges
+        (SELECT COUNT(*) FROM Badges SB WHERE SB.UserId = U.Id AND SB.Name IN ('Mortarboard', 'Epic', 'Legendary', 'Guru')) > 0 AS HasHighAchievementBadges
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE U.Reputation > 100
+      AND U.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 year' -- Active users in last 2 years
+      AND U.Location IS NOT NULL
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location, U.Views, U.UpVotes, U.DownVotes
+),
+DetailedPostAnalysis AS (
+    -- CTE 2: Detailed post attributes, including tag parsing and advanced metrics
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.Title,
+        P.Body,
+        P.Tags,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount AS PostFavoriteCount,
+        LENGTH(P.Body) AS BodyLength,
+        -- String expression: Extract and normalize tags
+        (
+            SELECT array_agg(TRIM(t))
+            FROM UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')) AS t
+            WHERE LENGTH(TRIM(t)) > 0
+        ) AS ParsedTags,
+        -- Check for common "performance" related tags
+        (P.Tags LIKE '%<performance>%' OR P.Tags LIKE '%<optimization>%' OR P.Tags LIKE '%<scalability>%') AS IsPerformanceRelated,
+        -- Correlated Subquery: Count of unique users who marked this post as favorite
+        (SELECT COUNT(DISTINCT V.UserId) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 5) AS UniqueFavoriters,
+        -- Nested subquery: Determine if the post has a highly scored comment
+        EXISTS (
+            SELECT 1 FROM Comments SC WHERE SC.PostId = P.Id AND SC.Score > 5
+        ) AS HasHighScoredComment
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE P.OwnerUserId IS NOT NULL
+      AND P.CreationDate BETWEEN cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 year' AND cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 month' -- Focus on recent, but not brand-new, posts
+      AND P.Score > 2
+),
+PostVersionHistory AS (
+    -- CTE 3: Analyzes post revision history for edit frequency and type
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalRevisions,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS EditCount, -- Title, Body, Tags edits
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Id END) AS CloseEventCount,
+        MAX(PH.CreationDate) AS LastRevisionDate,
+        MIN(PH.CreationDate) AS FirstRevisionDate,
+        -- NULL logic: Coalesce the actual close reason name
+        COALESCE(MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN CRT.Name END), 'N/A') AS MostRecentCloseReason,
+        -- String expression: Check for specific comments in history
+        (MAX(CASE WHEN LOWER(PH.Comment) LIKE '%duplicate%' THEN 1 ELSE 0 END) = 1) AS HasDuplicateCommentInHistory
+    FROM PostHistory PH
+    LEFT JOIN CloseReasonTypes CRT ON PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND PH.Comment ~ '^[0-9]+$' AND PH.Comment::smallint = CRT.Id
+    GROUP BY PH.PostId
+),
+VoteActivity AS (
+    -- CTE 4: Aggregated vote counts for each post
+    SELECT
+        V.PostId,
+        COUNT(V.Id) AS TotalVotes,
+        COUNT(CASE WHEN V.VoteTypeId = 2 THEN V.Id END) AS UpVoteCount,
+        COUNT(CASE WHEN V.VoteTypeId = 3 THEN V.Id END) AS DownVoteCount,
+        COUNT(CASE WHEN V.VoteTypeId = 8 THEN V.Id END) AS BountyStartCount,
+        SUM(V.BountyAmount) AS TotalBountyAmount
+    FROM Votes V
+    WHERE V.VoteTypeId IN (2, 3, 5, 8, 9, 10, 11, 12) -- Relevant vote types
+    GROUP BY V.PostId
+)
+-- Main Query: Joins all CTEs and applies complex logic, window functions, and final filtering
+SELECT
+    UES.UserId,
+    UES.UserName,
+    UES.Reputation,
+    UES.ReputationTier,
+    UES.TotalPosts,
+    DPA.PostId,
+    DPA.PostTypeName,
+    DPA.Title,
+    DPA.PostScore,
+    DPA.ViewCount,
+    DPA.BodyLength,
+    DPA.ParsedTags,
+    DPA.IsPerformanceRelated,
+    DPA.UniqueFavoriters,
+    DPA.HasHighScoredComment,
+    PVH.TotalRevisions,
+    PVH.EditCount,
+    PVH.CloseEventCount,
+    PVH.MostRecentCloseReason,
+    PVH.HasDuplicateCommentInHistory,
+    VA.TotalVotes,
+    VA.UpVoteCount,
+    VA.DownVoteCount,
+    VA.TotalBountyAmount,
+    -- Window Function 1: Rank posts by score within each post type, for users in the 'Expert' tier
+    RANK() OVER (
+        PARTITION BY DPA.PostTypeId, UES.ReputationTier
+        ORDER BY DPA.PostScore DESC, DPA.PostId ASC
+    ) AS PostRankInTypeAndTier,
+    -- Window Function 2: Calculate the moving average of a user's post scores over their last 3 posts
+    AVG(DPA.PostScore) OVER (
+        PARTITION BY UES.UserId
+        ORDER BY DPA.PostCreationDate ASC
+        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ) AS UserRollingAvgPostScore,
+    -- Window Function 3: Find the creation date of the previous post by the same user
+    LAG(DPA.PostCreationDate, 1, '1970-01-01 00:00:00'::timestamp) OVER (
+        PARTITION BY UES.UserId
+        ORDER BY DPA.PostCreationDate ASC
+    ) AS PreviousPostCreationDate,
+    -- Window Function 4: NTILE to categorize users into 5 groups based on their total post count
+    NTILE(5) OVER (ORDER BY UES.TotalPosts DESC) AS UserPostCountQuintile,
+    -- Complex Expression / Calculation: Ratio of UpVotes to DownVotes, handling division by zero
+    CASE
+        WHEN VA.DownVoteCount > 0 THEN ROUND(VA.UpVoteCount::numeric / VA.DownVoteCount::numeric, 2)
+        WHEN VA.UpVoteCount > 0 THEN 999.99 -- Effectively infinite
+        ELSE 0
+    END AS UpToDownVoteRatio,
+    -- Complex Predicate / NULL Logic: Categorize posts based on closure, activity, and score
+    CASE
+        WHEN DPA.ClosedDate IS NOT NULL AND DPA.LastActivityDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' THEN 'StaleClosed'
+        WHEN DPA.ClosedDate IS NULL AND DPA.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 month' AND DPA.PostScore > 100 THEN 'ActiveHighScoreOpen'
+        WHEN DPA.AcceptedAnswerId IS NOT NULL AND DPA.ParentId IS NOT NULL THEN 'AcceptedAnswer' -- It's an answer that was accepted
+        WHEN DPA.AcceptedAnswerId IS NOT NULL AND DPA.PostTypeId = 1 THEN 'QuestionWithAcceptedAnswer' -- It's a question with an accepted answer
+        ELSE 'Other'
+    END AS PostStatusCategory,
+    -- String Expression: Check if the post body mentions "bug" or "error" (case-insensitive)
+    (LOWER(DPA.Body) LIKE '%bug%' OR LOWER(DPA.Body) LIKE '%error%') AS MentionsBugOrError,
+    -- NULL Logic: Coalesce display names for owner if not available
+    COALESCE(UES.UserName, 'Community User ' || DPA.OwnerUserId::text) AS EffectivePostOwnerDisplayName
+FROM UserEngagementSummary UES
+INNER JOIN DetailedPostAnalysis DPA ON UES.UserId = DPA.OwnerUserId
+LEFT JOIN PostVersionHistory PVH ON DPA.PostId = PVH.PostId
+LEFT JOIN VoteActivity VA ON DPA.PostId = VA.PostId
+-- FULL OUTER JOIN: To find posts that exist but have no associated history, or history records that somehow exist without a post (unlikely but demonstrates join type)
+-- This specific FULL OUTER JOIN is strategically placed to capture posts that might not have historical edits
+-- or posts with historical records that are no longer in the DetailedPostAnalysis set due to filters.
+-- In this case, we're joining back to `Posts` to cover potentially missed historical records or posts with minimal data.
+FULL OUTER JOIN Posts OrphanPosts ON DPA.PostId IS NULL AND OrphanPosts.Id = PVH.PostId AND OrphanPosts.OwnerUserId = UES.UserId
+WHERE
+    UES.TotalPosts >= 5 -- Only consider users with a minimum number of posts
+    AND DPA.BodyLength > 100 -- Filter for more substantial posts
+    AND (
+        DPA.IsPerformanceRelated = TRUE
+        OR DPA.UniqueFavoriters > 2 -- Posts with at least 3 unique favoriters
+        OR (UES.HasHighAchievementBadges = TRUE AND DPA.PostScore > 50) -- High achievement users with high-scored posts
+    )
+ORDER BY
+    UES.ReputationTier DESC,
+    UES.SumPostScore DESC,
+    DPA.PostCreationDate DESC
+LIMIT 5000;

@@ -1,0 +1,401 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as primary_location,
+        date_trunc('month', u.creationdate) as signup_month,
+        dense_rank() over (order by u.creationdate desc, u.id desc) as recency_rank
+    from users u
+),
+tagged_questions as (
+    select
+        p.id as question_id,
+        p.owneruserid as owner_id,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.favoritecount,
+        p.closeddate,
+        p.tags,
+        case
+            when p.tags is null then array[]::varchar[]  -- leave array literal as-is; will be handled by dialect
+            else string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+        end as tag_list
+    from posts p
+    where p.posttypeid = 1
+),
+answers as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        a.owneruserid as owner_id,
+        a.score,
+        a.creationdate
+    from posts a
+    where a.posttypeid = 2
+),
+question_activity as (
+    select
+        q.question_id,
+        q.owner_id,
+        q.creationdate as q_created,
+        q.score as q_score,
+        q.viewcount,
+        q.answercount,
+        q.favoritecount,
+        q.closeddate,
+        q.tag_list,
+        count(ans.answer_id) as total_answers,
+        sum(case when ans.score > 0 then 1 else 0 end) as pos_answers,
+        max(ans.score) as best_answer_score,
+        min(ans.creationdate) as first_answer_time
+    from tagged_questions q
+    left join answers ans on ans.question_id = q.question_id
+    group by q.question_id, q.owner_id, q.creationdate, q.score, q.viewcount, q.answercount, q.favoritecount, q.closeddate, q.tag_list
+),
+votes_agg as (
+    select
+        v.postid as post_id,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+        min(v.creationdate) filter (where v.votetypeid in (2,3)) as first_vote_time,
+        max(v.creationdate) filter (where v.votetypeid in (2,3)) as last_vote_time
+    from votes v
+    group by v.postid
+),
+post_links_dups as (
+    select
+        pl.postid as dup_post_id,
+        pl.relatedpostid as canonical_post_id,
+        pl.creationdate as dup_link_time
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+closed_reasons as (
+    select
+        ph.postid,
+        min(ph.creationdate) as first_close_time,
+        min(
+            cast(
+                nullif(
+                    regexp_replace(coalesce(ph.comment,''), '[^0-9]', '', 'g'),
+                    ''
+                ) as integer
+            )
+        ) as first_close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid = 10
+    group by ph.postid
+),
+question_enriched as (
+    select
+        qa.question_id,
+        qa.owner_id,
+        qa.q_created,
+        qa.q_score,
+        qa.viewcount,
+        qa.answercount,
+        qa.favoritecount,
+        qa.closeddate,
+        qa.tag_list,
+        qa.total_answers,
+        qa.pos_answers,
+        qa.best_answer_score,
+        qa.first_answer_time,
+        va.upvotes,
+        va.downvotes,
+        va.bounty_started,
+        va.bounty_awarded,
+        va.first_vote_time,
+        va.last_vote_time,
+        cd.first_close_time,
+        cd.first_close_reason_id,
+        d.canonical_post_id,
+        d.dup_link_time
+    from question_activity qa
+    left join votes_agg va on va.post_id = qa.question_id
+    left join closed_reasons cd on cd.postid = qa.question_id
+    left join post_links_dups d on d.dup_post_id = qa.question_id
+),
+user_badges as (
+    select
+        b.userid,
+        count(*) as badge_count,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+tag_expansion as (
+    select
+        qe.question_id,
+        lower(u_t.t) as tag,
+        u_t.rn as tag_pos
+    from question_enriched qe
+    cross join lateral (
+        select t, row_number() over () as rn
+        from unnest(qe.tag_list) as u(t)
+    ) u_t
+),
+tag_rank as (
+    select
+        tag,
+        count(*) as tag_q_count,
+        rank() over (order by count(*) desc, tag asc) as tag_pop_rank
+    from tag_expansion
+    group by tag
+),
+user_activity as (
+    select
+        u.user_id,
+        u.displayname,
+        u.reputation,
+        u.primary_location,
+        u.signup_month,
+        u.recency_rank,
+        coalesce(ub.badge_count, 0) as badge_count,
+        coalesce(ub.gold_badges, 0) as gold_badges,
+        coalesce(ub.silver_badges, 0) as silver_badges,
+        coalesce(ub.bronze_badges, 0) as bronze_badges,
+        ub.last_badge_date,
+        qs.total_questions,
+        qs.total_answers_authored,
+        qs.avg_q_score,
+        qs.avg_a_score
+    from recent_users u
+    left join user_badges ub on ub.userid = u.user_id
+    left join lateral (
+        select
+            count(*) filter (where p.posttypeid = 1) as total_questions,
+            count(*) filter (where p.posttypeid = 2) as total_answers_authored,
+            avg(nullif(p.score, 0)) filter (where p.posttypeid = 1) as avg_q_score,
+            avg(nullif(p.score, 0)) filter (where p.posttypeid = 2) as avg_a_score
+        from posts p
+        where p.owneruserid = u.user_id
+    ) qs on true
+),
+question_scoring as (
+    select
+        qe.question_id,
+        qe.owner_id,
+        qe.q_created,
+        qe.q_score,
+        qe.viewcount,
+        qe.answercount,
+        qe.favoritecount,
+        qe.closeddate,
+        qe.total_answers,
+        qe.pos_answers,
+        qe.best_answer_score,
+        qe.first_answer_time,
+        qe.upvotes,
+        qe.downvotes,
+        qe.bounty_started,
+        qe.bounty_awarded,
+        qe.first_close_time,
+        qe.first_close_reason_id,
+        qe.canonical_post_id,
+        qe.dup_link_time,
+        (
+            coalesce(qe.q_score,0) * 2
+            + coalesce(qe.upvotes,0) * 1.0
+            - coalesce(qe.downvotes,0) * 1.5
+            + power(coalesce(qe.viewcount,0), 0.3)
+            + coalesce(qe.favoritecount,0) * 1.2
+            + coalesce(qe.total_answers,0) * 0.8
+            + coalesce(qe.pos_answers,0) * 0.5
+            + greatest(coalesce(qe.best_answer_score,0), 0) * 0.7
+            + least(coalesce(qe.bounty_awarded,0), 500) * 0.2
+            - case when qe.first_close_time is not null then 10 else 0 end
+            - case when qe.canonical_post_id is not null then 8 else 0 end
+            - case when qe.closeddate is not null then 5 else 0 end
+        )
+        * exp(-extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(qe.first_vote_time, qe.q_created))) / 86400 / 365.0) as composite_score,
+        case
+            when qe.first_close_reason_id in (101) then 'Duplicate'
+            when qe.first_close_reason_id in (102) then 'Off-topic'
+            when qe.first_close_reason_id in (103) then 'Needs details or clarity'
+            when qe.first_close_reason_id in (104) then 'Needs more focus'
+            when qe.first_close_reason_id in (105) then 'Opinion-based'
+            when qe.first_close_reason_id is null then 'Open'
+            else 'Closed-Other'
+        end as close_reason_group
+    from question_enriched qe
+),
+question_tags_ranked as (
+    select
+        te.question_id,
+        array_agg(te.tag order by tr.tag_pop_rank nulls last) as tags_by_popularity,
+        min(tr.tag_pop_rank) as best_tag_rank
+    from tag_expansion te
+    left join tag_rank tr on tr.tag = te.tag
+    group by te.question_id
+),
+final_questions as (
+    select
+        qs.question_id,
+        qs.owner_id,
+        qs.q_created,
+        qs.q_score,
+        qs.viewcount,
+        qs.answercount,
+        qs.favoritecount,
+        qs.closeddate,
+        qs.total_answers,
+        qs.pos_answers,
+        qs.best_answer_score,
+        qs.first_answer_time,
+        qs.upvotes,
+        qs.downvotes,
+        qs.bounty_started,
+        qs.bounty_awarded,
+        qs.first_close_time,
+        qs.close_reason_group,
+        qs.canonical_post_id,
+        qs.dup_link_time,
+        qt.tags_by_popularity,
+        qt.best_tag_rank,
+        qs.composite_score,
+        row_number() over (
+            partition by qs.owner_id
+            order by qs.composite_score desc nulls last, qs.q_created desc
+        ) as rn_per_user
+    from question_scoring qs
+    left join question_tags_ranked qt on qt.question_id = qs.question_id
+),
+user_top_questions as (
+    select
+        fq.*
+    from final_questions fq
+    where fq.rn_per_user <= 3
+),
+location_stats as (
+    select
+        ua.primary_location,
+        count(*) as users_in_location,
+        avg(coalesce(ua.reputation,0)) as avg_rep,
+        percentile_cont(0.9) within group (order by coalesce(ua.reputation,0)) as p90_rep
+    from user_activity ua
+    group by ua.primary_location
+),
+ranked_users as (
+    select
+        ua.user_id,
+        ua.displayname,
+        ua.reputation,
+        ua.primary_location,
+        ua.signup_month,
+        ua.recency_rank,
+        ua.badge_count,
+        ua.gold_badges,
+        ua.silver_badges,
+        ua.bronze_badges,
+        ua.last_badge_date,
+        ua.total_questions,
+        ua.total_answers_authored,
+        ua.avg_q_score,
+        ua.avg_a_score,
+        ls.users_in_location,
+        ls.avg_rep,
+        ls.p90_rep,
+        rank() over (order by coalesce(ua.reputation,0) desc, ua.user_id) as rep_rank_global,
+        row_number() over (partition by ua.primary_location order by coalesce(ua.reputation,0) desc, ua.user_id) as rep_rank_by_location
+    from user_activity ua
+    left join location_stats ls on ls.primary_location = ua.primary_location
+),
+dupe_clusters as (
+    select
+        coalesce(d.canonical_post_id, d.dup_post_id) as cluster_root,
+        count(*) as cluster_size,
+        min(d.dup_link_time) as first_cluster_time
+    from (
+        select dup_post_id, canonical_post_id, dup_link_time from post_links_dups
+        union all
+        select canonical_post_id as dup_post_id, canonical_post_id, dup_link_time from post_links_dups
+    ) d
+    group by coalesce(d.canonical_post_id, d.dup_post_id)
+),
+final as (
+    select
+        ru.user_id,
+        coalesce(ru.displayname, concat('User-', cast(ru.user_id as varchar))) as displayname,
+        ru.primary_location,
+        ru.reputation,
+        ru.badge_count,
+        ru.gold_badges,
+        ru.silver_badges,
+        ru.bronze_badges,
+        ru.total_questions,
+        ru.total_answers_authored,
+        ru.avg_q_score,
+        ru.avg_a_score,
+        ru.rep_rank_global,
+        ru.rep_rank_by_location,
+        ru.users_in_location,
+        ru.avg_rep as location_avg_rep,
+        ru.p90_rep as location_p90_rep,
+        tq.question_id,
+        tq.q_score,
+        tq.viewcount,
+        tq.answercount,
+        tq.favoritecount,
+        tq.total_answers,
+        tq.pos_answers,
+        tq.best_answer_score,
+        tq.upvotes,
+        tq.downvotes,
+        tq.bounty_started,
+        tq.bounty_awarded,
+        tq.close_reason_group,
+        tq.tags_by_popularity,
+        tq.best_tag_rank,
+        round(coalesce(tq.composite_score, 0)::numeric, 3) as composite_score,
+        dc.cluster_size as duplicate_cluster_size,
+        case
+            when tq.canonical_post_id is not null then 'Duplicate'
+            when tq.first_close_time is not null then 'Closed'
+            when tq.closeddate is not null then 'HistoricallyClosed'
+            else 'Open'
+        end as question_state
+    from ranked_users ru
+    left join user_top_questions tq on tq.owner_id = ru.user_id
+    left join dupe_clusters dc on dc.cluster_root = coalesce(tq.canonical_post_id, tq.question_id)
+)
+select *
+from final
+where
+    coalesce(reputation, 0) >= 0
+    and (badge_count is null or badge_count >= 0)
+    and (
+        question_id is null
+        or (
+            composite_score >= 0
+            and (
+                best_tag_rank is null
+                or best_tag_rank <= 100
+                or (best_tag_rank between 101 and 500 and favoritecount > 0)
+            )
+            and (
+                (upvotes - downvotes) is null
+                or (upvotes - downvotes) >= -5
+            )
+        )
+    )
+    and (
+        primary_location <> 'Unknown'
+        or rep_rank_global <= 1000
+        or (users_in_location >= 10 and rep_rank_by_location <= 3)
+    )
+order by
+    rep_rank_global,
+    user_id,
+    composite_score desc nulls last,
+    question_id nulls last
+limit 500;

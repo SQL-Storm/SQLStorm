@@ -1,0 +1,193 @@
+WITH UserAggregateStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.WebsiteUrl,
+        U.Location,
+        U.AboutMe,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersCreated,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotesGiven,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotesGiven,
+        COALESCE(SUM(CASE WHEN PV.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalPostsUpVotedReceived,
+        COALESCE(SUM(CASE WHEN PV.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalPostsDownVotedReceived,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        MAX(CASE WHEN B.Class = 1 THEN B.Date END) AS LastGoldBadgeDate,
+        EXTRACT(YEAR FROM AGE(CAST('2024-10-01' AS date), U.CreationDate)) AS UserTenureYears,
+        RANK() OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS ReputationRank
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Votes PV ON P.Id = PV.PostId AND PV.VoteTypeId IN (2,3)
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.Views, U.CreationDate, U.LastAccessDate, U.WebsiteUrl, U.Location, U.AboutMe
+),
+PostEngagementMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        COALESCE(P.ViewCount, 0) AS ViewCount,
+        COALESCE(P.AnswerCount, 0) AS AnswerCount,
+        COALESCE(P.CommentCount, 0) AS CommentCount,
+        COALESCE(P.FavoriteCount, 0) AS FavoriteCount,
+        P.LastActivityDate,
+        P.Title,
+        P.Tags,
+        COALESCE(
+            (SELECT STRING_AGG(DISTINCT Tag.TagName, ';')
+             FROM (SELECT UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><')) AS TagName) AS Tag
+             WHERE EXISTS (SELECT 1 FROM Tags T WHERE T.TagName = Tag.TagName)),
+            'untagged'
+        ) AS FormattedTags,
+        (P.Score * 5 + COALESCE(P.ViewCount, 0) * 0.05 + COALESCE(P.AnswerCount, 0) * 8 + COALESCE(P.CommentCount, 0) * 4 + COALESCE(P.FavoriteCount, 0) * 10) AS PostImpactScore,
+        CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer,
+        (SELECT A.Score FROM Posts A WHERE A.Id = P.AcceptedAnswerId AND A.PostTypeId = 2) AS AcceptedAnswerScore,
+        COALESCE((SELECT AVG(C.Score) FROM Comments C WHERE C.PostId = P.Id), 0.0) AS AvgCommentScore,
+        (SELECT COUNT(DISTINCT C.UserId) FROM Comments C WHERE C.PostId = P.Id AND C.UserId IS NOT NULL) AS UniqueCommenters,
+        CASE
+            WHEN P.Score < 0 AND P.CommentCount > 5 THEN 'Potentially Controversial'
+            WHEN P.PostTypeId = 1 AND P.ViewCount > 50000 AND COALESCE(P.AnswerCount, 0) = 0 THEN 'High Traffic, No Answers'
+            WHEN P.ClosedDate IS NOT NULL AND P.PostTypeId = 1 THEN 'Closed Question'
+            ELSE 'Standard'
+        END AS PostStatusCategory
+    FROM Posts P
+    LEFT JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE P.PostTypeId IN (1, 2)
+),
+PostHistoryDetails AS (
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.UserId) FILTER (WHERE PH.PostHistoryTypeId IN (4,5,6)) AS NumDistinctEditors,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS TotalEditRevisions,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS TotalCloseEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS TotalReopenEvents,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS LatestCloseDate,
+        STRING_AGG(DISTINCT CRT.Name, '; ') FILTER (WHERE PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND PH.Comment ~ '^[0-9]+$') AS AllCloseReasonNames
+    FROM PostHistory PH
+    LEFT JOIN CloseReasonTypes CRT ON PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND PH.Comment ~ '^[0-9]+$' AND CAST(PH.Comment AS smallint) = CRT.Id
+    GROUP BY PH.PostId
+),
+UserPostPerformance AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.UserTenureYears,
+        UAS.TotalPostsCreated,
+        UAS.TotalQuestionsCreated,
+        UAS.TotalAnswersCreated,
+        UAS.TotalCommentsMade,
+        UAS.TotalBadgesEarned,
+        UAS.TotalPostsUpVotedReceived,
+        PEM.PostId,
+        PEM.PostTypeId,
+        PEM.PostTypeName,
+        PEM.PostCreationDate,
+        PEM.Score,
+        PEM.ViewCount,
+        PEM.AnswerCount,
+        PEM.CommentCount,
+        PEM.FavoriteCount,
+        PEM.PostImpactScore,
+        PEM.FormattedTags,
+        PEM.HasAcceptedAnswer,
+        PEM.AcceptedAnswerScore,
+        PEM.AvgCommentScore,
+        PEM.UniqueCommenters,
+        PEM.PostStatusCategory,
+        PHD.NumDistinctEditors,
+        PHD.TotalEditRevisions,
+        PHD.TotalCloseEvents,
+        PHD.TotalReopenEvents,
+        PHD.AllCloseReasonNames,
+        EXTRACT(DAY FROM (CAST('2024-10-01' AS date) - PEM.PostCreationDate)) AS PostAgeDays,
+        NTILE(4) OVER (ORDER BY UAS.Reputation DESC) AS UserReputationTier,
+        ROW_NUMBER() OVER (PARTITION BY UAS.UserId ORDER BY PEM.PostImpactScore DESC, PEM.PostCreationDate DESC) AS PostRankByOwnerImpact,
+        SUM(PEM.PostImpactScore) OVER (PARTITION BY UAS.UserId ORDER BY PEM.PostCreationDate) AS CumulativeUserPostImpact
+    FROM UserAggregateStats UAS
+    INNER JOIN PostEngagementMetrics PEM ON UAS.UserId = PEM.OwnerUserId
+    LEFT JOIN PostHistoryDetails PHD ON PEM.PostId = PHD.PostId
+    WHERE UAS.TotalPostsCreated > 0 AND PEM.Score > -5
+),
+TagUsageDiversity AS (
+    SELECT
+        UPP.UserId,
+        UPP.DisplayName,
+        TRIM(tag) AS TagName,
+        COUNT(DISTINCT UPP.PostId) AS PostsWithTag,
+        AVG(UPP.PostImpactScore) AS AvgTagPostImpact
+    FROM (
+        SELECT UPP.*, UNNEST(string_to_array(UPP.FormattedTags, ';')) AS tag
+        FROM UserPostPerformance UPP
+        WHERE UPP.PostTypeId = 1 AND UPP.FormattedTags IS NOT NULL AND UPP.FormattedTags <> 'untagged'
+    ) UPP
+    GROUP BY UPP.UserId, UPP.DisplayName, TRIM(tag)
+    HAVING TRIM(tag) IS NOT NULL AND TRIM(tag) <> ''
+),
+TopTagsByImpact AS (
+    SELECT
+        T.TagName,
+        COUNT(DISTINCT PEM.PostId) AS TotalQuestionsForTag,
+        AVG(PEM.PostImpactScore) AS AvgImpactScorePerTag,
+        AVG(PEM.ViewCount) AS AvgViewsPerTag,
+        RANK() OVER (ORDER BY AVG(PEM.PostImpactScore) DESC) AS TagImpactRank
+    FROM PostEngagementMetrics PEM
+    JOIN LATERAL (SELECT UNNEST(string_to_array(SUBSTRING(PEM.Tags FROM 2 FOR LENGTH(PEM.Tags)-2), '><')) AS TagName) AS TagList ON PEM.Tags IS NOT NULL AND PEM.Tags <> ''
+    JOIN Tags T ON TagList.TagName = T.TagName
+    WHERE PEM.PostTypeId = 1
+    GROUP BY T.TagName
+),
+FinalAnalysis AS (
+    SELECT
+        UPP.UserId,
+        UPP.DisplayName,
+        UPP.Reputation,
+        UPP.UserTenureYears,
+        UPP.TotalPostsCreated,
+        UPP.TotalBadgesEarned,
+        UPP.TotalPostsUpVotedReceived,
+        UPP.PostId,
+        UPP.PostTypeName,
+        UPP.PostCreationDate,
+        UPP.Score,
+        UPP.ViewCount,
+        UPP.AnswerCount,
+        UPP.CommentCount,
+        UPP.FavoriteCount,
+        UPP.PostImpactScore,
+        UPP.FormattedTags,
+        UPP.PostStatusCategory,
+        UPP.NumDistinctEditors,
+        UPP.TotalEditRevisions,
+        UPP.TotalCloseEvents,
+        UPP.TotalReopenEvents,
+        UPP.AllCloseReasonNames,
+        UPP.PostAgeDays,
+        UPP.UserReputationTier,
+        UPP.PostRankByOwnerImpact,
+        UPP.CumulativeUserPostImpact,
+        TUD.TagName AS PrimaryTagUsedByUser,
+        TUD.PostsWithTag AS UserPostsWithPrimaryTag,
+        TUD.AvgTagPostImpact AS UserAvgTagImpact,
+        TTI.AvgImpactScorePerTag AS GlobalAvgTagImpact,
+        TTI.TagImpactRank AS GlobalTagImpactRank,
+        (UPP.Reputation * 0.1 + UPP.TotalPostsCreated * 2 + UPP.TotalBadgesEarned * 5 + UPP.TotalPostsUpVotedReceived * 0.5 + UPP.PostImpactScore * 0.7) AS OverallEngagementScore,
+        COALESCE(UPP.DisplayName, 'Anonymous User') || ' (Rep: ' || CAST(UPP.Reputation AS text) || ') created a ' || LOWER(UPP.PostTypeName) || ' titled "' || COALESCE(UPP.Title, 'No Title') || '" (' || COALESCE(UPP.FormattedTags, 'Untagged') || '). It has ' || CAST(UPP.PostImpactScore AS text) || ' impact points and is ' AS PostSummary
+    FROM UserPostPerformance UPP
+    LEFT JOIN TagUsageDiversity TUD ON UPP.UserId = TUD.UserId
+    LEFT JOIN TopTagsByImpact TTI ON TUD.TagName = TTI.TagName
+)
+SELECT *
+FROM FinalAnalysis;

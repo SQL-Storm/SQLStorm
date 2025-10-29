@@ -1,0 +1,341 @@
+with recent_users as (
+    select u.id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm,
+           date_trunc('month', u.creationdate) as cohort_month
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+badge_rollup as (
+    select b.userid,
+           count(*) as badge_count,
+           sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+           sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+           sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+           max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+post_activity as (
+    select p.owneruserid as userid,
+           count(*) filter (where p.posttypeid = 1) as q_count,
+           count(*) filter (where p.posttypeid = 2) as a_count,
+           sum(coalesce(p.score,0)) as total_score,
+           sum(coalesce(p.viewcount,0)) as total_views,
+           max(p.lastactivitydate) as last_post_activity
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+comment_activity as (
+    select c.userid as userid,
+           count(*) as comment_count,
+           sum(coalesce(c.score,0)) as comment_score,
+           max(c.creationdate) as last_comment_date
+    from comments c
+    where c.userid is not null
+    group by c.userid
+),
+vote_activity as (
+    select v.userid as userid,
+           count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+           count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+           count(*) filter (where v.votetypeid in (8,9)) as bounties_interactions,
+           sum(coalesce(case when v.votetypeid in (8,9) then v.bountyamount end, 0)) as bounty_amount_total,
+           max(v.creationdate) as last_vote_date
+    from votes v
+    where v.userid is not null
+    group by v.userid
+),
+q_quality as (
+    select p.id as postid,
+           p.owneruserid as userid,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.answercount,
+           p.favoritecount,
+           p.closeddate,
+           p.acceptedanswerid,
+           cast(
+             ( coalesce(p.score,0)*2
+               + least(coalesce(p.viewcount,0)/100, 100)
+               + coalesce(p.answercount,0)*3
+               + case when p.acceptedanswerid is not null then 10 else 0 end
+               - case when p.closeddate is not null then 15 else 0 end
+             ) as numeric
+           ) as quality_score
+    from posts p
+    where p.posttypeid = 1
+),
+dupe_graph as (
+    select p.owneruserid as userid,
+           count(*) filter (where pl.linktypeid = 3) as dupes_as_target,
+           count(*) filter (where pl.linktypeid = 1) as links_as_target,
+           max(pl.creationdate) as last_link_event
+    from postlinks pl
+    join posts p on p.id = pl.relatedpostid
+    group by p.owneruserid
+),
+tag_agg as (
+    select q.owneruserid as userid,
+           lower(trim(t.tag)) as tagname,
+           count(*) as tag_use_count
+    from posts q
+         cross join lateral (
+            select unnest(
+              case when q.posttypeid = 1 and q.tags is not null and length(q.tags) >= 2
+                   then string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')
+                   else array[]::varchar[]
+              end
+            ) as tag
+         ) t
+    where q.posttypeid = 1
+    group by q.owneruserid, lower(trim(t.tag))
+),
+top_tag as (
+    select userid, tagname, tag_use_count,
+           row_number() over (partition by userid order by tag_use_count desc, tagname) as rn
+    from tag_agg
+),
+user_last_actions as (
+    select u.id as userid,
+           greatest(
+             coalesce(pa.last_post_activity, timestamp 'epoch'),
+             coalesce(ca.last_comment_date, timestamp 'epoch'),
+             coalesce(va.last_vote_date, timestamp 'epoch'),
+             coalesce(br.last_badge_date, timestamp 'epoch'),
+             coalesce(dg.last_link_event, timestamp 'epoch')
+           ) as last_overall_activity
+    from users u
+    left join post_activity pa on pa.userid = u.id
+    left join comment_activity ca on ca.userid = u.id
+    left join vote_activity va on va.userid = u.id
+    left join badge_rollup br on br.userid = u.id
+    left join dupe_graph dg on dg.userid = u.id
+),
+question_ranks as (
+    select qq.userid,
+           qq.postid,
+           qq.quality_score,
+           dense_rank() over (partition by qq.userid order by qq.quality_score desc nulls last, qq.creationdate desc) as dr_quality_desc,
+           dense_rank() over (partition by qq.userid order by qq.creationdate desc) as dr_recent
+    from q_quality qq
+),
+best_and_recent as (
+    select qr.userid,
+           max(postid) filter (where dr_quality_desc = 1) as best_qid,
+           max(quality_score) filter (where dr_quality_desc = 1) as best_quality_score,
+           max(postid) filter (where dr_recent = 1) as recent_qid
+    from question_ranks qr
+    group by qr.userid
+),
+edit_events as (
+    select ph.postid,
+           count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_count,
+           count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35,36,37,38)) as mod_event_count,
+           max(ph.creationdate) as last_ph_date,
+           bool_or(ph.posthistorytypeid = 52) as was_hot
+    from posthistory ph
+    group by ph.postid
+),
+closure_info as (
+    select p.id as postid,
+           min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed,
+           min(case when ph.posthistorytypeid = 10 and ph.comment ~ '^[0-9]+' then cast(ph.comment as integer) end) as first_close_reason_raw
+    from posts p
+    left join posthistory ph on ph.postid = p.id
+    where p.posttypeid = 1
+    group by p.id
+),
+close_reasons_map as (
+    select crt.id as reason_id, crt.name as reason_name
+    from closereasontypes crt
+),
+user_quality_summary as (
+    select ru.id as userid,
+           ru.displayname,
+           ru.reputation,
+           ru.cohort_month,
+           pa.q_count,
+           pa.a_count,
+           pa.total_score,
+           pa.total_views,
+           ca.comment_count,
+           ca.comment_score,
+           va.upvotes_cast,
+           va.downvotes_cast,
+           va.bounties_interactions,
+           va.bounty_amount_total,
+           br.badge_count,
+           br.gold_count,
+           br.silver_count,
+           br.bronze_count,
+           coalesce(dg.dupes_as_target,0) as dupes_as_target,
+           coalesce(dg.links_as_target,0) as links_as_target
+    from recent_users ru
+    left join post_activity pa on pa.userid = ru.id
+    left join comment_activity ca on ca.userid = ru.id
+    left join vote_activity va on va.userid = ru.id
+    left join badge_rollup br on br.userid = ru.id
+    left join dupe_graph dg on dg.userid = ru.id
+),
+cohort_stats as (
+    select uqs.cohort_month,
+           count(*) as users_in_cohort,
+           avg(coalesce(uqs.q_count,0)) as avg_q_per_user,
+           avg(coalesce(uqs.a_count,0)) as avg_a_per_user,
+           percentile_cont(0.9) within group (order by coalesce(uqs.total_score,0)) as p90_total_score
+    from user_quality_summary uqs
+    group by uqs.cohort_month
+)
+select
+    uqs.userid,
+    uqs.displayname,
+    uqs.reputation,
+    uqs.cohort_month,
+    uqs.q_count,
+    uqs.a_count,
+    uqs.total_score,
+    uqs.total_views,
+    uqs.comment_count,
+    uqs.comment_score,
+    uqs.upvotes_cast,
+    uqs.downvotes_cast,
+    uqs.bounties_interactions,
+    uqs.bounty_amount_total,
+    uqs.badge_count,
+    uqs.gold_count,
+    uqs.silver_count,
+    uqs.bronze_count,
+    uqs.dupes_as_target,
+    uqs.links_as_target,
+    tt.tagname as top_tag,
+    tt.tag_use_count as top_tag_use_count,
+    ba.best_qid,
+    ba.best_quality_score,
+    ba.recent_qid,
+    ee.edit_count as best_q_edit_count,
+    ee.mod_event_count as best_q_mod_events,
+    ee.was_hot as best_q_was_hot,
+    cl.first_closed as best_q_first_closed,
+    coalesce(crm.reason_name, case when cl.first_close_reason_raw is not null then 'ReasonId:' || cast(cl.first_close_reason_raw as text) else null end) as best_q_close_reason_name,
+    ula.last_overall_activity,
+    cs.users_in_cohort,
+    cs.avg_q_per_user,
+    cs.avg_a_per_user,
+    cs.p90_total_score,
+    (
+      select round(cast(avg(qq.quality_score) as numeric), 2)
+      from q_quality qq
+      where qq.userid = uqs.userid
+    ) as avg_quality_score,
+    (
+      select count(*) from posts px
+      where px.owneruserid = uqs.userid
+        and px.posttypeid = 1
+        and px.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+        and exists (
+            select 1 from comments cx
+            where cx.postid = px.id
+              and cx.creationdate >= px.creationdate
+              and cx.score >= 1
+        )
+    ) as recent_q_with_pos_comments,
+    greatest(0,
+      coalesce((
+        select count(distinct lower(trim(t2.tag)))
+        from posts p2
+        cross join lateral (
+          select unnest(
+            case when p2.posttypeid = 1 and p2.tags is not null and length(p2.tags) >= 2
+                 then string_to_array(substring(p2.tags, 2, length(p2.tags)-2), '><')
+                 else array[]::varchar[]
+            end
+          ) as tag
+        ) t2
+        where p2.owneruserid = uqs.userid
+      ),0)
+      -
+      coalesce((
+        select count(distinct lower(trim(t3.tag)))
+        from posts pb
+        cross join lateral (
+          select unnest(
+            case when pb.tags is not null and length(pb.tags) >= 2
+                 then string_to_array(substring(pb.tags, 2, length(pb.tags)-2), '><')
+                 else array[]::varchar[]
+            end
+          ) as tag
+        ) t3
+        where pb.id = ba.best_qid
+      ),0)
+    ) as distinct_tags_minus_bestq_tags,
+    cast(
+      (
+      coalesce(uqs.total_score,0)
+      + coalesce(uqs.badge_count,0) * 0.5
+      + greatest(0, coalesce(uqs.q_count,0) - coalesce(uqs.dupes_as_target,0)) * 1.5
+      - coalesce(uqs.downvotes_cast,0) * 0.25
+      + case when extract(year from cast('2024-10-01 12:34:56' as timestamp)) = extract(year from ula.last_overall_activity) then 5 else 0 end
+      ) as numeric
+    ) as engagement_index
+from user_quality_summary uqs
+left join top_tag tt on tt.userid = uqs.userid and tt.rn = 1
+left join best_and_recent ba on ba.userid = uqs.userid
+left join edit_events ee on ee.postid = ba.best_qid
+left join closure_info cl on cl.postid = ba.best_qid
+left join close_reasons_map crm on crm.reason_id = cl.first_close_reason_raw
+left join user_last_actions ula on ula.userid = uqs.userid
+left join cohort_stats cs on cs.cohort_month = uqs.cohort_month
+where
+    (
+      uqs.reputation >= 1000
+      or (uqs.badge_count is not null and uqs.badge_count >= 25)
+      or (tt.tagname is not null and (tt.tagname like 'sql%' or tt.tagname like 'postgres%' or tt.tagname like 'performance%'))
+    )
+    and coalesce(uqs.q_count,0) + coalesce(uqs.a_count,0) > 0
+    and (uqs.total_views is null or uqs.total_views >= 0)
+    and (uqs.displayname is null or lower(uqs.displayname) not like '%bot%')
+group by
+  uqs.userid,
+  uqs.displayname,
+  uqs.reputation,
+  uqs.cohort_month,
+  uqs.q_count,
+  uqs.a_count,
+  uqs.total_score,
+  uqs.total_views,
+  uqs.comment_count,
+  uqs.comment_score,
+  uqs.upvotes_cast,
+  uqs.downvotes_cast,
+  uqs.bounties_interactions,
+  uqs.bounty_amount_total,
+  uqs.badge_count,
+  uqs.gold_count,
+  uqs.silver_count,
+  uqs.bronze_count,
+  uqs.dupes_as_target,
+  uqs.links_as_target,
+  tt.tagname,
+  tt.tag_use_count,
+  ba.best_qid,
+  ba.best_quality_score,
+  ba.recent_qid,
+  ee.edit_count,
+  ee.mod_event_count,
+  ee.was_hot,
+  cl.first_closed,
+  cl.first_close_reason_raw,
+  crm.reason_name,
+  ula.last_overall_activity,
+  cs.users_in_cohort,
+  cs.avg_q_per_user,
+  cs.avg_a_per_user,
+  cs.p90_total_score
+order by engagement_index desc nulls last, uqs.reputation desc, uqs.userid
+limit 200;

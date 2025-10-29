@@ -1,0 +1,316 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as PostRank,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) as AvgScoreWindow,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as TotalPostsByUser,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'LowVoted'
+            ELSE 'NoVotes'
+        END as VoteCategory,
+        COALESCE(p.Title, 'No Title') as SafeTitle,
+        COALESCE(p.Tags, '') as SafeTags,
+        CASE 
+            WHEN p.Tags IS NULL OR p.Tags = '' THEN 0
+            ELSE (LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '>', '')) + 1)
+        END as TagCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+PostStats AS (
+    SELECT 
+        rp.PostId,
+        rp.PostTypeId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.OwnerUserId,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.PostRank,
+        rp.PrevScore,
+        rp.NextScore,
+        rp.AvgScoreWindow,
+        rp.TotalPostsByUser,
+        rp.VoteCategory,
+        rp.SafeTitle,
+        rp.SafeTags,
+        rp.TagCount,
+        DENSE_RANK() OVER (ORDER BY rp.Score DESC) as ScoreRank,
+        PERCENT_RANK() OVER (ORDER BY rp.Score) as ScorePercentile,
+        NTILE(10) OVER (ORDER BY rp.ViewCount DESC) as ViewQuartile,
+        CASE 
+            WHEN rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+                 AND rp.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) 
+            THEN 'Popular'
+            ELSE 'NotPopular'
+        END as PopularityStatus,
+        CASE 
+            WHEN rp.CommentCount > 0 AND rp.AnswerCount > 0 THEN 'Active'
+            WHEN rp.CommentCount > 0 OR rp.AnswerCount > 0 THEN 'Engaged'
+            ELSE 'Inactive'
+        END as EngagementLevel,
+        CASE 
+            WHEN rp.AnswerCount > 0 AND rp.Score >= 10 THEN 'AnsweredHighScore'
+            WHEN rp.AnswerCount > 0 THEN 'AnsweredLowScore'
+            WHEN rp.AnswerCount = 0 THEN 'Unanswered'
+            ELSE 'Unknown'
+        END as AnswerStatus,
+        (
+            SELECT COUNT(*) 
+            FROM Comments c 
+            WHERE c.PostId = rp.PostId 
+            AND c.CreationDate > rp.CreationDate
+        ) as PostCommentsAfterCreation,
+        (  
+            SELECT COUNT(*) 
+            FROM Votes v 
+            WHERE v.PostId = rp.PostId 
+            AND v.VoteTypeId IN (2, 3)
+        ) as TotalVotes
+    FROM RankedPosts rp
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        u.DisplayName,
+        COALESCE(u.Views, 0) as TotalViews,
+        COALESCE(u.UpVotes, 0) as TotalUpVotes,
+        COALESCE(u.DownVotes, 0) as TotalDownVotes,
+        COUNT(p.Id) as TotalPosts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) as QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) as AnswerCount,
+        AVG(p.Score) as AvgScore,
+        MAX(p.CreationDate) as LastPostDate,
+        CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate) AS INTEGER) as UserAgeDays,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 1000 THEN 'Expert'
+            WHEN u.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationLevel,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(t.Count, 0) as SafeCount,
+        CASE 
+            WHEN t.Count >= 1000 THEN 'VeryPopular'
+            WHEN t.Count >= 500 THEN 'Popular'
+            WHEN t.Count >= 100 THEN 'Moderate'
+            WHEN t.Count >= 10 THEN 'Low'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') as PostsWithTag,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') as AvgScoreWithTag,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank
+    FROM Tags t
+)
+SELECT 
+    ps.PostId,
+    ps.PostTypeId,
+    ps.Score,
+    ps.ViewCount,
+    ps.CreationDate,
+    ps.OwnerUserId,
+    ps.Title,
+    ps.Tags,
+    ps.AnswerCount,
+    ps.CommentCount,
+    ps.FavoriteCount,
+    ps.PostRank,
+    ps.PrevScore,
+    ps.NextScore,
+    ps.AvgScoreWindow,
+    ps.TotalPostsByUser,
+    ps.VoteCategory,
+    ps.SafeTitle,
+    ps.SafeTags,
+    ps.TagCount,
+    ps.ScoreRank,
+    ps.ScorePercentile,
+    ps.ViewQuartile,
+    ps.PopularityStatus,
+    ps.EngagementLevel,
+    ps.AnswerStatus,
+    ps.PostCommentsAfterCreation,
+    ps.TotalVotes,
+    ua.UserRank,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.DisplayName,
+    ua.TotalPosts,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.AvgScore,
+    ua.LastPostDate,
+    ua.UserAgeDays,
+    ua.ReputationLevel,
+    ta.TagRank,
+    ta.TagName,
+    ta.PopularityLevel,
+    ta.PostsWithTag,
+    ta.AvgScoreWithTag,
+    CASE 
+        WHEN ps.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 1 
+        ELSE 0 
+    END as AboveAvgScore,
+    CASE 
+        WHEN ps.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) THEN 1 
+        ELSE 0 
+    END as AboveAvgViews,
+    CASE 
+        WHEN ps.AnswerCount > 0 THEN 
+            ps.Score * (1.0 + (ps.AnswerCount * 0.1))
+        ELSE ps.Score
+    END as AdjustedScore,
+    COALESCE(ps.Score, 0) + COALESCE(ps.ViewCount, 0) - COALESCE(ps.CommentCount, 0) as ModifiedScore,
+    CASE 
+        WHEN ps.Score > 0 AND ps.Score < 10 THEN 'Low'
+        WHEN ps.Score >= 10 AND ps.Score < 100 THEN 'Medium'
+        WHEN ps.Score >= 100 THEN 'High'
+        ELSE 'Unknown'
+    END as ScoreRange,
+    (ps.CreationDate + INTERVAL '1 month') as OneMonthLater,
+    ABS(ps.Score - ps.PrevScore) as ScoreChange,
+    CASE 
+        WHEN ps.TagCount > 3 THEN 'ManyTags'
+        WHEN ps.TagCount = 3 THEN 'ThreeTags'
+        WHEN ps.TagCount < 3 THEN 'FewTags'
+        ELSE 'NoTags'
+    END as TagComplexity,
+    ps.SafeTitle || ' ' || ps.SafeTags as TitleAndTags,
+    'Post-' || CAST(ps.PostId AS VARCHAR(10)) || '-Owner-' || CAST(ps.OwnerUserId AS VARCHAR(10)) as PostIdentifier,
+    CASE 
+        WHEN ps.TotalVotes > 10 THEN 'HighlyVoted'
+        WHEN ps.TotalVotes > 5 THEN 'ModeratelyVoted'
+        ELSE 'LowVoted'
+    END as VoteIntensity
+FROM PostStats ps
+FULL OUTER JOIN UserActivity ua ON ps.OwnerUserId = ua.UserId
+LEFT JOIN TagAnalysis ta ON ps.SafeTags LIKE '%' || ta.TagName || '%'
+WHERE ps.PostTypeId IS NOT NULL
+AND (ps.Score IS NULL OR ps.Score > 0)
+AND (ua.UserId IS NULL OR ua.Reputation > 100)
+AND ps.ScorePercentile > 0.1
+AND ps.ScorePercentile < 0.9
+AND ps.ViewQuartile IN (1, 2, 3, 4)
+
+UNION
+
+SELECT 
+    ps.PostId,
+    ps.PostTypeId,
+    ps.Score,
+    ps.ViewCount,
+    ps.CreationDate,
+    ps.OwnerUserId,
+    ps.Title,
+    ps.Tags,
+    ps.AnswerCount,
+    ps.CommentCount,
+    ps.FavoriteCount,
+    ps.PostRank,
+    ps.PrevScore,
+    ps.NextScore,
+    ps.AvgScoreWindow,
+    ps.TotalPostsByUser,
+    ps.VoteCategory,
+    ps.SafeTitle,
+    ps.SafeTags,
+    ps.TagCount,
+    ps.ScoreRank,
+    ps.ScorePercentile,
+    ps.ViewQuartile,
+    ps.PopularityStatus,
+    ps.EngagementLevel,
+    ps.AnswerStatus,
+    ps.PostCommentsAfterCreation,
+    ps.TotalVotes,
+    ua.UserRank,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.DisplayName,
+    ua.TotalPosts,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.AvgScore,
+    ua.LastPostDate,
+    ua.UserAgeDays,
+    ua.ReputationLevel,
+    ta.TagRank,
+    ta.TagName,
+    ta.PopularityLevel,
+    ta.PostsWithTag,
+    ta.AvgScoreWithTag,
+    CASE 
+        WHEN ps.Score > 100 THEN 1 
+        ELSE 0 
+    END as AboveAvgScore,
+    CASE 
+        WHEN ps.ViewCount > 1000 THEN 1 
+        ELSE 0 
+    END as AboveAvgViews,
+    CASE 
+        WHEN ps.AnswerCount > 0 THEN 
+            ps.Score * (1.0 + (ps.AnswerCount * 0.1))
+        ELSE ps.Score
+    END as AdjustedScore,
+    COALESCE(ps.Score, 0) + COALESCE(ps.ViewCount, 0) - COALESCE(ps.CommentCount, 0) as ModifiedScore,
+    CASE 
+        WHEN ps.Score > 100 THEN 'High'
+        WHEN ps.Score > 10 THEN 'Medium'
+        ELSE 'Low'
+    END as ScoreRange,
+    (ps.CreationDate + INTERVAL '1 month') as OneMonthLater,
+    ABS(ps.Score - ps.PrevScore) as ScoreChange,
+    CASE 
+        WHEN ps.TagCount > 5 THEN 'ManyTags'
+        WHEN ps.TagCount = 5 THEN 'FiveTags'
+        WHEN ps.TagCount < 5 THEN 'FewTags'
+        ELSE 'NoTags'
+    END as TagComplexity,
+    ps.SafeTitle || ' ' || ps.SafeTags as TitleAndTags,
+    'Post-' || CAST(ps.PostId AS VARCHAR(10)) || '-Owner-' || CAST(ps.OwnerUserId AS VARCHAR(10)) as PostIdentifier,
+    CASE 
+        WHEN ps.TotalVotes > 25 THEN 'HighlyVoted'
+        WHEN ps.TotalVotes > 15 THEN 'ModeratelyVoted'
+        ELSE 'LowVoted'
+    END as VoteIntensity
+FROM PostStats ps
+INNER JOIN UserActivity ua ON ps.OwnerUserId = ua.UserId
+LEFT JOIN TagAnalysis ta ON ps.SafeTags LIKE '%' || ta.TagName || '%'
+WHERE ps.Score IS NOT NULL 
+AND ua.Reputation BETWEEN 100 AND 10000
+AND ps.ScorePercentile BETWEEN 0.2 AND 0.8
+AND ps.ViewQuartile IN (2, 3, 4)
+AND ps.TotalPostsByUser > 1
+ORDER BY Score DESC, ViewCount DESC, UserRank ASC;

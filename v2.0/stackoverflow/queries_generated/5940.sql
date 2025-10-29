@@ -1,0 +1,84 @@
+-- {"query": "5940.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 764} 
+WITH TopTags AS (
+  SELECT
+    t.TagName,
+    SUM(p.ViewCount) AS TotalViews,
+    AVG(p.Score) AS AvgScore,
+    COUNT(*) AS PostCount
+  FROM Posts p
+  JOIN Tags t ON p.Tags LIKE CONCAT('%', t.TagName, '%')
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.ClosedDate IS NULL
+  GROUP BY t.TagName
+  ORDER BY TotalViews DESC
+  LIMIT 10
+),
+TagEngagement AS (
+  SELECT
+    tt.TagName,
+    tt.TotalViews,
+    tt.AvgScore,
+    tt.PostCount,
+    SUMCASE := SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUMCASE2 := SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    AVG(CASE WHEN v.VoteTypeId = 2 THEN v.CreationDate ELSE NULL END) OVER (PARTITION BY tt.TagName) AS FirstUpVoteDate
+  FROM TopTags tt
+  LEFT JOIN Posts p ON p.Tags LIKE CONCAT('%', tt.TagName, '%')
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY tt.TagName, tt.TotalViews, tt.AvgScore, tt.PostCount
+),
+CommunityCohort AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+InfluenceWindow AS (
+  SELECT
+    pc.PostId,
+    pc.OwnerUserId,
+    pc.CreationDate,
+    pc.ViewCount,
+    pc.Score,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY pc.PostId) AS UpVotesAlong,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY pc.PostId) AS DownVotesAlong
+  FROM CommunityCohort pc
+  LEFT JOIN Votes v ON v.PostId = pc.PostId
+)
+SELECT
+  nt.TagName,
+  nt.TotalViews,
+  nt.AvgScore,
+  nt.PostCount,
+  ci.PostId,
+  ci.Title,
+  ci.Tags,
+  u.DisplayName AS Owner,
+  ci.CreationDate,
+  ci.LastActivityDate,
+  ci.ViewCount,
+  ci.Score,
+  iu.UpVotesAlong,
+  iu.DownVotesAlong,
+  (COALESCE(iu.UpVotesAlong,0) - COALESCE(iu.DownVotesAlong,0)) AS NetEngagement,
+  CASE
+    WHEN ci.CreationDate >= NOW() - INTERVAL '180 days' THEN 'New'
+    WHEN ci.ViewCount > 1000 THEN 'Popular'
+    ELSE 'Established'
+  END AS WaveTag
+FROM TopTags nt
+JOIN InfluencerDummy AS id ON 1=1 -- placeholder to ensure single query block
+LEFT JOIN InfluencedPosts ci ON ci.OwnerUserId = NULL -- intentionally no direct relation; see below
+LEFT JOIN Users u ON u.Id = ci.OwnerUserId
+LEFT JOIN InfluenceWindow iu ON iu.PostId = ci.PostId
+ORDER BY nt.TotalViews DESC, NetEngagement DESC
+LIMIT 100;

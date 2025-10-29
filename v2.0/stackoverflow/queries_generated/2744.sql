@@ -1,0 +1,169 @@
+-- {"query": "2744.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1492} 
+with RecursiveUserPosts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        row_number() over(partition by u.Id order by p.CreationDate desc) as PostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 500
+),
+RecentUserBadges as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        dense_rank() over(partition by b.UserId order by b.Date desc) as BadgeRank
+    from Badges b
+    where b.Date > now() - interval '2 year'
+),
+TopTags as (
+    select
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag,
+        count(*) as TagCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by Tag
+    having count(*) > 100
+),
+UserVoteSummary as (
+    select
+        v.UserId,
+        vt.Name as VoteType,
+        count(*) as VoteCount
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    where v.UserId is not null
+    group by v.UserId, vt.Name
+),
+PostCommentsSummary as (
+    select
+        c.PostId,
+        count(c.Id) as TotalComments,
+        max(c.CreationDate) as LastCommentDate,
+        string_agg(distinct coalesce(c.UserDisplayName,'Anonymous'), ', ' order by c.CreationDate desc) as RecentCommenters
+    from Comments c
+    group by c.PostId
+),
+PostLinkDuplicates as (
+    select
+        pl.PostId,
+        count(case when lt.Name = 'Duplicate' then 1 end) as DuplicateLinks,
+        count(distinct pl.RelatedPostId) as RelatedPostsCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId=1) over w as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId=2) over w as AnswersCount,
+        count(distinct b.Id) over w as BadgesCount,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end) over w,0) as UpVotesGiven
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    window w as (partition by u.Id order by u.CreationDate rows between unbounded preceding and current row)
+    where u.Reputation > 1000
+),
+QuestionsWithStats as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        coalesce(phc.CloseCount,0) as CloseVotesCount,
+        coalesce(p.FavoriteCount,0) as Favorites,
+        coalesce(pld.DuplicateLinks,0) as DuplicateLinkCount,
+        p.Tags,
+        us.QuestionsCount,
+        us.AnswersCount,
+        us.BadgesCount,
+        us.UpVotesGiven,
+        (p.Score::float / nullif(p.ViewCount,0)) as ScoreViewRatio
+    from Posts p
+    left join (
+        select PostId, count(*) as CloseCount
+        from PostHistory
+        where PostHistoryTypeId = 10
+        group by PostId
+    ) phc on phc.PostId = p.Id
+    left join PostLinkDuplicates pld on pld.PostId = p.Id
+    left join UserActivityWindow us on us.UserId = p.OwnerUserId
+    where p.PostTypeId = 1
+),
+HighEngagementQuestions as (
+    select *
+    from QuestionsWithStats
+    where ScoreViewRatio > 0.05 and CloseVotesCount = 0
+),
+AnswersRanking as (
+    select
+        a.Id,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        rank() over(partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+)
+select distinct
+    q.Id as QuestionId,
+    q.Title as QuestionTitle,
+    q.CreationDate as QuestionCreationDate,
+    q.Score as QuestionScore,
+    q.ViewCount as QuestionViews,
+    q.Favorites as QuestionFavorites,
+    q.DuplicateLinkCount,
+    q.Tags,
+    q.QuestionsCount as OwnerQuestionsCount,
+    q.AnswersCount as OwnerAnswersCount,
+    q.BadgesCount as OwnerBadgesCount,
+    q.UpVotesGiven as OwnerUpVotesGiven,
+    a.Id as TopAnswerId,
+    a.OwnerUserId as TopAnswerUserId,
+    u.DisplayName as TopAnswerUserName,
+    a.Score as TopAnswerScore,
+    ph.Comment as LastCloseComment,
+    ph.CreationDate as LastCloseDate,
+    pcs.TotalComments,
+    pcs.RecentCommenters,
+    concat_ws(' | ', 
+        'QScore/ViewRatio: ' || round(q.ScoreViewRatio::numeric,4),
+        'TopAnswerRank: 1',
+        'OwnerRep: ' || coalesce(u2.Reputation,0),
+        'BadgesLast2Y: ' || coalesce(bc.BadgesCount,0)
+    ) as PerformanceTags
+from HighEngagementQuestions q
+left join AnswersRanking a on a.QuestionId = q.Id and a.AnswerRank = 1
+left join Users u on u.Id = a.OwnerUserId
+left join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId = 10 
+    and ph.CreationDate = (select max(ph2.CreationDate) from PostHistory ph2 where ph2.PostId = q.Id and ph2.PostHistoryTypeId = 10)
+left join PostCommentsSummary pcs on pcs.PostId = q.Id
+left join Users u2 on u2.Id = q.OwnerUserId
+left join (
+    select UserId, count(*) as BadgesCount
+    from Badges
+    where Date > now() - interval '2 year'
+    group by UserId
+) bc on bc.UserId = q.OwnerUserId
+where q.Tags is not null
+  and exists (
+    select 1
+    from TopTags tt
+    where position(tt.Tag in q.Tags) > 0
+  )
+order by q.Score desc, a.Score desc, q.ViewCount desc
+limit 100;

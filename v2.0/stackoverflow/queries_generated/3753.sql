@@ -1,0 +1,126 @@
+-- {"query": "3753.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2545} 
+
+WITH
+    recent_questions AS (
+        SELECT
+            p.Id,
+            p.Title,
+            p.OwnerUserId,
+            p.CreationDate,
+            p.Score,
+            p.ViewCount,
+            p.Tags,
+            p.AnswerCount,
+            p.FavoriteCount,
+            p.ClosedDate,
+            p.CommunityOwnedDate
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.CreationDate >= CURRENT_DATE - INTERVAL '180 days'
+    ),
+
+    question_tags AS (
+        SELECT
+            q.Id,
+            UNNEST(string_to_array(substr(q.Tags, 2, length(q.Tags) - 2), '><')) AS tag
+        FROM recent_questions q
+    ),
+
+    tag_stats AS (
+        SELECT
+            t.tag,
+            COUNT(DISTINCT t.Id)                               AS question_cnt,
+            AVG(q.Score) FILTER (WHERE q.Score IS NOT NULL)   AS avg_score,
+            SUM(q.ViewCount)                                   AS total_views,
+            MAX(q.CreationDate)                                AS latest_question_date
+        FROM question_tags t
+        JOIN Posts q ON q.Id = t.Id
+        GROUP BY t.tag
+    ),
+
+    top_tags AS (
+        SELECT
+            ts.*,
+            ROW_NUMBER() OVER (ORDER BY ts.question_cnt DESC) AS tag_rank,
+            tg.Count                                          AS global_tag_count,
+            tg.IsModeratorOnly
+        FROM tag_stats ts
+        LEFT JOIN Tags tg ON tg.TagName = ts.tag
+        WHERE tg.IsModeratorOnly = 0 OR tg.IsModeratorOnly IS NULL
+    ),
+
+    user_activity AS (
+        SELECT
+            u.Id                                     AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate                           AS user_since,
+            COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 END),0) AS up_votes_given,
+            COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 END),0) AS down_votes_given
+        FROM Users u
+        LEFT JOIN Votes v ON v.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    ),
+
+    best_answerer_per_tag AS (
+        SELECT
+            tt.tag,
+            a.OwnerUserId                               AS user_id,
+            ROW_NUMBER() OVER (PARTITION BY tt.tag ORDER BY a.Score DESC NULLS LAST) AS rn
+        FROM top_tags tt
+        JOIN question_tags qt ON qt.tag = tt.tag
+        JOIN Posts q ON q.Id = qt.Id
+        JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+        WHERE a.Score IS NOT NULL
+    )
+
+SELECT
+    tt.tag_rank,
+    tt.tag,
+    tt.question_cnt,
+    ROUND(tt.avg_score, 2)                     AS avg_score,
+    tt.total_views,
+    tt.global_tag_count,
+    ua.DisplayName                             AS top_answerer,
+    ua.Reputation                              AS top_answerer_rep,
+    ua.up_votes_given,
+    ua.down_votes_given,
+    CASE
+        WHEN tt.closeddate        IS NOT NULL THEN 'Closed'
+        WHEN tt.communityowneddate IS NOT NULL THEN 'CommunityOwned'
+        ELSE 'Open'
+    END                                        AS status,
+    /* correlated sub‑query: up‑votes received on the most recent question of this tag */
+    (SELECT COUNT(*)
+     FROM Votes v
+     WHERE v.PostId = (
+           SELECT q2.Id
+           FROM Posts q2
+           WHERE q2.PostTypeId = 1
+             AND q2.Tags LIKE '%<'||tt.tag||'>%'
+           ORDER BY q2.CreationDate DESC
+           LIMIT 1)
+       AND v.VoteTypeId = 2)                 AS recent_question_upvotes
+FROM top_tags tt
+LEFT JOIN best_answerer_per_tag ba ON ba.tag = tt.tag AND ba.rn = 1
+LEFT JOIN user_activity ua ON ua.user_id = ba.user_id
+WHERE tt.tag_rank <= 15
+
+UNION ALL
+
+SELECT
+    NULL,
+    '---',
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM (SELECT 1) s
+
+ORDER BY tag_rank NULLS LAST;

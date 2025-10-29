@@ -1,0 +1,167 @@
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(u.Location, 'Unknown') AS UserLocation,
+        SUM(CASE WHEN p.Id IS NOT NULL THEN 1 ELSE 0 END) AS TotalPostsCreated,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsCreated,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersCreated,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesCast,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesCast,
+        MAX(b.Date) AS LatestBadgeDate,
+        COUNT(DISTINCT b.Id) AS UniqueBadgesCount
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Votes AS v ON u.Id = v.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    WHERE u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+),
+QuestionPerformance AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        COALESCE(q.AnswerCount, 0) AS AnswerCount,
+        COALESCE(q.FavoriteCount, 0) AS FavoriteCount,
+        q.ClosedDate,
+        LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(q.Tags, 2, LENGTH(q.Tags) - 2), '><')))) AS TagName,
+        (
+            SELECT MIN(a.CreationDate)
+            FROM Posts AS a
+            WHERE a.ParentId = q.Id AND a.PostTypeId = 2
+        ) AS FirstAnswerCreationDate
+    FROM Posts AS q
+    WHERE q.PostTypeId = 1
+),
+PostHistoryAggregates AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditRevisions,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) AS TimeSincePreviousHistoryEntrySeconds,
+        STRING_AGG(DISTINCT pht.Name, '; ') AS DistinctHistoryTypes,
+        STRING_AGG(DISTINCT crt.Name, '; ') FILTER (
+            WHERE pht.Id = 10 AND ph.Comment IS NOT NULL AND ph.Comment SIMILAR TO '[0-9]+'
+        ) AS DistinctCloseReasons,
+        ph.CreationDate,
+        pht.Id AS PostHistoryTypeId,
+        ph.Comment
+    FROM PostHistory AS ph
+    JOIN PostHistoryTypes AS pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN CloseReasonTypes AS crt ON
+        pht.Id = 10 AND ph.Comment SIMILAR TO '[0-9]+' AND CAST(ph.Comment AS integer) = crt.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13)
+    GROUP BY ph.PostId, ph.CreationDate, pht.Id, ph.Comment
+),
+TagPerformanceRank AS (
+    SELECT
+        TagName,
+        COUNT(DISTINCT QuestionId) AS TaggedQuestionsCount,
+        AVG(QuestionScore) AS AverageQuestionScore,
+        SUM(ViewCount) AS TotalTagViews,
+        RANK() OVER (ORDER BY AVG(QuestionScore) DESC, SUM(ViewCount) DESC) AS TagPerformanceRank
+    FROM QuestionPerformance
+    GROUP BY TagName
+)
+SELECT
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.UserLocation,
+    au.TotalPostsCreated,
+    au.TotalQuestionsCreated,
+    qp.QuestionId,
+    qp.QuestionScore,
+    qp.ViewCount,
+    qp.AnswerCount,
+    qp.FavoriteCount AS ActualFavoriteCount,
+    qp.TagName,
+    tpr.AverageQuestionScore AS TagAvgScore,
+    tpr.TagPerformanceRank,
+    pha.TotalEditRevisions,
+    pha.DistinctCloseReasons,
+    COALESCE(EXTRACT(EPOCH FROM (qp.FirstAnswerCreationDate - qp.QuestionCreationDate)) / 60.0, -1.0) AS TimeToFirstAnswerMinutes,
+    CASE
+        WHEN qp.QuestionScore > 100 AND qp.ViewCount > 50000 AND qp.FavoriteCount > 50 THEN 'Superstar Engagement'
+        WHEN qp.QuestionScore > 50 AND qp.ViewCount > 10000 AND qp.FavoriteCount > 10 THEN 'High Engagement'
+        WHEN qp.QuestionScore > 10 AND qp.ViewCount > 1000 THEN 'Moderate Engagement'
+        ELSE 'Lower Engagement'
+    END AS EngagementCategory,
+    AVG(qp.QuestionScore) OVER (PARTITION BY au.UserId) AS AvgUserQuestionScore,
+    ROW_NUMBER() OVER (PARTITION BY qp.TagName ORDER BY qp.QuestionScore DESC, qp.ViewCount DESC) AS QuestionRankInTag
+FROM ActiveUsers AS au
+INNER JOIN QuestionPerformance AS qp ON au.UserId = qp.OwnerUserId
+LEFT JOIN (
+    SELECT PostId, TotalEditRevisions, STRING_AGG(DistinctHistoryTypes, '') AS DistinctHistoryTypes, STRING_AGG(DistinctCloseReasons, '') AS DistinctCloseReasons
+    FROM PostHistoryAggregates
+    GROUP BY PostId, TotalEditRevisions
+) AS pha ON qp.QuestionId = pha.PostId
+LEFT JOIN TagPerformanceRank AS tpr ON qp.TagName = tpr.TagName
+WHERE
+    au.Reputation > 5000
+    AND qp.QuestionScore > 15
+    AND qp.ViewCount > 500
+    AND (
+        qp.TagName LIKE 'java%' OR qp.TagName LIKE '%script%' OR qp.TagName IN ('python', 'c#', 'c++', 'javascript')
+    )
+    AND qp.ClosedDate IS NULL
+    AND COALESCE(pha.TotalEditRevisions, 0) >= 1
+    AND LOWER(au.UserLocation) NOT LIKE '%europe%'
+    AND (
+        SELECT COUNT(b2.Id)
+        FROM Badges AS b2
+        WHERE b2.UserId = au.UserId AND b2.Class = 1
+    ) >= 1
+    AND au.LatestBadgeDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+
+UNION ALL
+
+SELECT
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.UserLocation,
+    au.TotalPostsCreated,
+    au.TotalQuestionsCreated,
+    qp.QuestionId,
+    qp.QuestionScore,
+    qp.ViewCount,
+    qp.AnswerCount,
+    qp.FavoriteCount AS ActualFavoriteCount,
+    qp.TagName,
+    tpr.AverageQuestionScore AS TagAvgScore,
+    tpr.TagPerformanceRank,
+    pha.TotalEditRevisions,
+    pha.DistinctCloseReasons,
+    COALESCE(EXTRACT(EPOCH FROM (qp.FirstAnswerCreationDate - qp.QuestionCreationDate)) / 60.0, -1.0) AS TimeToFirstAnswerMinutes,
+    'High History Activity & Contributions' AS EngagementCategory,
+    AVG(qp.QuestionScore) OVER (PARTITION BY au.UserId) AS AvgUserQuestionScore,
+    ROW_NUMBER() OVER (PARTITION BY qp.TagName ORDER BY qp.QuestionScore DESC, qp.ViewCount DESC) AS QuestionRankInTag
+FROM ActiveUsers AS au
+INNER JOIN QuestionPerformance AS qp ON au.UserId = qp.OwnerUserId
+INNER JOIN (
+    SELECT PostId, TotalEditRevisions, STRING_AGG(DistinctHistoryTypes, '') AS DistinctHistoryTypes, STRING_AGG(DistinctCloseReasons, '') AS DistinctCloseReasons
+    FROM PostHistoryAggregates
+    GROUP BY PostId, TotalEditRevisions
+) AS pha ON qp.QuestionId = pha.PostId
+LEFT JOIN TagPerformanceRank AS tpr ON qp.TagName = tpr.TagName
+WHERE
+    pha.TotalEditRevisions >= 5
+    AND (pha.DistinctCloseReasons IS NOT NULL OR qp.ClosedDate IS NOT NULL)
+    AND au.TotalCommentsMade > 150
+    AND au.TotalUpvotesCast > 1000
+    AND au.Reputation > 15000
+    AND qp.QuestionScore < 75
+    AND qp.QuestionCreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+ORDER BY Reputation DESC, QuestionScore DESC
+LIMIT 5000;

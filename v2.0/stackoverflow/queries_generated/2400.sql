@@ -1,0 +1,129 @@
+-- {"query": "2400.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1440} 
+with RecentActiveUsers as (
+    select u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+           row_number() over (partition by u.Location order by u.Reputation desc nulls last) as rn
+      from Users u
+     where u.LastAccessDate > current_date - interval '180 days'
+       and u.Reputation > 1000
+),
+UserBadgeStats as (
+    select b.UserId,
+           count(*) filter (where b.Class = 1) as GoldBadges,
+           count(*) filter (where b.Class = 2) as SilverBadges,
+           count(*) filter (where b.Class = 3) as BronzeBadges,
+           count(*) as TotalBadges,
+           bool_or(b.TagBased) as HasTagBasedBadge
+      from Badges b
+     group by b.UserId
+),
+TopQuestions as (
+    select p.Id, p.OwnerUserId, p.Title, p.Score, p.ViewCount, p.CreationDate,
+           regexp_replace(coalesce(p.Tags, ''), '[<>]', '', 'g') as CleanTags,
+           dense_rank() over (order by p.Score desc nulls last, p.ViewCount desc nulls last) as RankByScore
+      from Posts p
+     where p.PostTypeId = 1
+       and p.CreationDate > current_date - interval '1 year'
+),
+QuestionAnswerStats as (
+    select q.Id as QuestionId,
+           count(a.Id) as AnswerCount,
+           max(a.Score) as MaxAnswerScore,
+           avg(a.Score) filter (where a.Score is not null) as AvgAnswerScore
+      from Posts q
+      left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+     where q.PostTypeId = 1
+     group by q.Id
+),
+UserActivityWindow as (
+    select u.Id, u.DisplayName, u.Reputation, 
+           count(distinct p.Id) filter (where p.PostTypeId=1) as QuestionCount,
+           count(distinct p.Id) filter (where p.PostTypeId=2) as AnswerCount,
+           count(distinct c.Id) as CommentsCount,
+           sum(vt2.UpVotes) over (partition by u.Id order by u.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as CumulativeUpVotes,
+           sum(vt2.DownVotes) over (partition by u.Id order by u.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as CumulativeDownVotes
+      from Users u
+      left join Posts p on p.OwnerUserId = u.Id and p.CreationDate > u.CreationDate and p.CreationDate <= current_date
+      left join Comments c on c.UserId = u.Id and c.CreationDate > u.CreationDate and c.CreationDate <= current_date
+      left join (
+          select p.OwnerUserId,
+                 sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+                 sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+            from Votes v
+            join Posts p on v.PostId = p.Id
+            join VoteTypes vt on v.VoteTypeId = vt.Id
+           group by p.OwnerUserId
+      ) vt2 on vt2.OwnerUserId = u.Id
+     where u.Reputation > 500
+     group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+DuplicateQuestionPairs as (
+    select pl.PostId as DuplicateQuestionId,
+           pl.RelatedPostId as OriginalQuestionId,
+           pl.CreationDate,
+           pl.LinkTypeId
+      from PostLinks pl
+     where pl.LinkTypeId = 3
+),
+ClaimedCloseReasons as (
+    select pht.PostId, crt.Name as CloseReasonName, max(pht.CreationDate) as LastCloseVoteDate,
+           count(*) as CloseVotesCount
+      from PostHistory pht
+      join CloseReasonTypes crt on try_cast(pht.Comment as int) = crt.Id
+     where pht.PostHistoryTypeId = 10
+     group by pht.PostId, crt.Name
+),
+QuestionAggregate as (
+    select tq.Id as QuestionId, tq.Title, tq.Score, tq.ViewCount, tq.CleanTags,
+           qat.AnswerCount, qat.MaxAnswerScore, qat.AvgAnswerScore,
+           coalesce(ccr.CloseReasonName, 'Open') as CloseReasonName,
+           coalesce(ccr.CloseVotesCount, 0) as CloseVotesCount
+      from TopQuestions tq
+      left join QuestionAnswerStats qat on qat.QuestionId = tq.Id
+      left join ClaimedCloseReasons ccr on ccr.PostId = tq.Id
+),
+FinalOutput as (
+    select rau.Id as UserId,
+           rau.DisplayName,
+           rau.Location,
+           us.BadgesSummary,
+           ua.QuestionCount,
+           ua.AnswerCount,
+           ua.CommentsCount,
+           ua.CumulativeUpVotes,
+           ua.CumulativeDownVotes,
+           qa.QuestionId,
+           qa.Title,
+           qa.Score as QuestionScore,
+           qa.ViewCount as QuestionViewCount,
+           qa.AnswerCount as QuestionAnswerCount,
+           qa.MaxAnswerScore,
+           qa.AvgAnswerScore,
+           qa.CloseReasonName,
+           qa.CloseVotesCount,
+           case 
+               when qa.Score > 10 and qa.ViewCount > 1000 and ua.CumulativeUpVotes > ua.CumulativeDownVotes then 'High Impact'
+               when qa.CloseReasonName != 'Open' then 'Needs Review'
+               else 'Normal'
+           end as QuestionStatus,
+           concat_ws(' | ', 
+               coalesce(qa.CleanTags, ''),
+               coalesce(rau.DisplayName, 'Unknown User'),
+               coalesce(cast(qa.Score as varchar), ''),
+               coalesce(cast(ua.QuestionCount as varchar), ''),
+               coalesce(cast(ua.AnswerCount as varchar), '')
+           ) as CompositeStringInfo
+      from RecentActiveUsers rau
+      left join UserBadgeStats us on us.UserId = rau.Id
+      left join UserActivityWindow ua on ua.Id = rau.Id
+      left join QuestionAggregate qa on qa.QuestionId = (
+          select p.Id from Posts p
+          where p.PostTypeId = 1 and p.OwnerUserId = rau.Id
+          order by p.Score desc nulls last, p.CreationDate desc
+          limit 1
+      )
+     where rau.rn = 1
+)
+select * from FinalOutput
+union
+select null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null
+order by QuestionScore desc nulls last, UserId nulls last, QuestionId nulls last;

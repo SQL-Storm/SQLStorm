@@ -1,0 +1,216 @@
+-- {"query": "7607.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1923} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as score_category,
+        COALESCE(p.Tags, '') as normalized_tags,
+        LENGTH(p.Title) as title_length,
+        DATEDIFF(CURRENT_TIMESTAMP, p.CreationDate) as days_since_creation,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'QuestionWithAnswers'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as post_type_category
+    FROM Posts p
+    WHERE p.CreationDate >= DATEADD(YEAR, -2, CURRENT_TIMESTAMP)
+),
+UserActivity AS (
+    SELECT 
+        u.Id as user_id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as answer_count,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        MAX(p.CreationDate) as last_activity,
+        STRING_AGG(p.Title, '; ') as recent_titles,
+        COUNT(DISTINCT c.Id) as comment_count,
+        COUNT(DISTINCT b.Id) as badge_count,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) as total_question_views
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATEADD(YEAR, -3, CURRENT_TIMESTAMP)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as tag_count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.IsRequired = 1 THEN 'Required' ELSE 'Optional' END as tag_type,
+        COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'), 0) as posts_with_tag,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as tag_popularity
+    FROM Tags t
+    WHERE t.Count > 10
+),
+ComplexPosts AS (
+    SELECT 
+        rp.Id as post_id,
+        rp.Title,
+        rp.score,
+        rp.score_category,
+        rp.days_since_creation,
+        rp.post_type_category,
+        rp.normalized_tags,
+        rp.title_length,
+        ua.user_id,
+        ua.DisplayName as author_name,
+        ua.total_posts,
+        ua.question_count,
+        ua.answer_count,
+        ua.avg_score as user_avg_score,
+        (rp.Score - ua.avg_score) as score_deviation,
+        CASE 
+            WHEN (rp.Score - ua.avg_score) > 50 THEN 'AboveAverage'
+            WHEN (rp.Score - ua.avg_score) < -50 THEN 'BelowAverage'
+            ELSE 'Normal'
+        END as score_status,
+        ta.tag_popularity,
+        ta.tag_count,
+        CASE 
+            WHEN rp.TagCount > 10 THEN 'HighlyTagged'
+            WHEN rp.TagCount > 5 THEN 'ModeratelyTagged'
+            ELSE 'SparseTagged'
+        END as tagging_frequency,
+        (rp.AnswerCount + rp.CommentCount) as engagement_measure,
+        CASE 
+            WHEN (rp.AnswerCount + rp.CommentCount) > 100 THEN 'HighEngagement'
+            WHEN (rp.AnswerCount + rp.CommentCount) > 50 THEN 'MediumEngagement'
+            ELSE 'LowEngagement'
+        END as engagement_level
+    FROM RankedPosts rp
+    INNER JOIN UserActivity ua ON rp.OwnerUserId = ua.user_id
+    LEFT JOIN (
+        SELECT 
+            t.TagName,
+            t.Count as tag_count,
+            CASE 
+                WHEN t.Count > 1000 THEN 'Popular'
+                WHEN t.Count > 100 THEN 'Moderate'
+                ELSE 'Niche'
+            END as tag_popularity
+        FROM Tags t
+        WHERE t.Count > 10
+    ) ta ON rp.normalized_tags LIKE '%' || ta.TagName || '%'
+    WHERE rp.rn = 1
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) as history_count,
+        MAX(ph.CreationDate) as last_history_entry,
+        COUNT(DISTINCT ph.PostHistoryTypeId) as distinct_history_types,
+        STRING_AGG(ph.Comment, ', ') as comments_summary,
+        CASE 
+            WHEN COUNT(*) > 50 THEN 'ExtremelyActive'
+            WHEN COUNT(*) > 20 THEN 'Active'
+            WHEN COUNT(*) > 5 THEN 'ModeratelyActive'
+            ELSE 'Inactive'
+        END as activity_level
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.CreationDate >= DATEADD(MONTH, -6, CURRENT_TIMESTAMP)
+    GROUP BY ph.PostId
+),
+FinalAnalysis AS (
+    SELECT 
+        cp.*,
+        pha.activity_level,
+        pha.history_count,
+        pha.last_history_entry,
+        COALESCE(
+            CASE 
+                WHEN cp.score_status = 'AboveAverage' AND cp.engagement_level = 'HighEngagement' THEN 'Elite'
+                WHEN cp.score_status = 'AboveAverage' AND cp.engagement_level = 'MediumEngagement' THEN 'HighValue'
+                WHEN cp.score_status = 'Normal' AND cp.engagement_level = 'HighEngagement' THEN 'Valuable'
+                WHEN cp.score_status = 'BelowAverage' AND cp.engagement_level = 'HighEngagement' THEN 'Promising'
+                ELSE 'Standard'
+            END, 
+            'Standard'
+        ) as content_quality,
+        CASE 
+            WHEN cp.score_category = 'High' AND cp.days_since_creation < 30 THEN 'RecentHighImpact'
+            WHEN cp.score_category = 'Medium' AND cp.days_since_creation > 30 THEN 'EstablishedMedium'
+            ELSE 'Other'
+        END as temporal_impact,
+        CASE 
+            WHEN cp.total_question_views > 10000 THEN 'Viral'
+            WHEN cp.total_question_views > 5000 THEN 'WellKnown'
+            WHEN cp.total_question_views > 1000 THEN 'Recognized'
+            ELSE 'Normal'
+        END as visibility_level,
+        ROW_NUMBER() OVER (ORDER BY cp.Score DESC, cp.engagement_measure DESC) as rank_by_score_and_engagement,
+        CASE 
+            WHEN cp.user_avg_score > 100 THEN 'ExpertAuthor'
+            WHEN cp.user_avg_score > 50 THEN 'ExperiencedAuthor'
+            ELSE 'NoviceAuthor'
+        END as author_experience,
+        CONCAT(
+            cp.title, 
+            ' | ', 
+            'Score:', cp.score, 
+            ' | ', 
+            'Tags:', REGEXP_REPLACE(cp.normalized_tags, '<|>', ' ')
+        ) as title_score_tag_summary
+    FROM ComplexPosts cp
+    LEFT JOIN PostHistoryAnalysis pha ON cp.post_id = pha.PostId
+)
+SELECT 
+    fa.post_id,
+    fa.title,
+    fa.score,
+    fa.author_name,
+    fa.total_posts,
+    fa.user_avg_score,
+    fa.tag_popularity,
+    fa.engagement_level,
+    fa.content_quality,
+    fa.temporal_impact,
+    fa.visibility_level,
+    fa.rank_by_score_and_engagement,
+    fa.author_experience,
+    fa.title_score_tag_summary,
+    fa.history_count,
+    fa.last_history_entry,
+    fa.activity_level
+FROM FinalAnalysis fa
+WHERE fa.content_quality IN ('Elite', 'HighValue', 'Valuable')
+  AND fa.author_experience IN ('ExpertAuthor', 'ExperiencedAuthor')
+  AND fa.visibility_level IN ('Viral', 'WellKnown', 'Recognized')
+  AND (fa.days_since_creation <= 365 OR fa.days_since_creation IS NULL)
+  AND fa.score > 0
+ORDER BY 
+    fa.score DESC,
+    fa.engagement_measure DESC,
+    fa.rank_by_score_and_engagement ASC
+OFFSET 100 ROWS
+FETCH NEXT 100 ROWS ONLY;

@@ -1,0 +1,315 @@
+-- {"query": "917.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3017} 
+with
+-- Parameter-like seeds
+params as (
+  select
+    365 as days_back,
+    0.75 as high_reputation_quantile,
+    25 as min_question_views,
+    3 as min_answers_per_question
+),
+recent_activity as (
+  select
+    p.Id as PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Title,
+    p.Tags,
+    u.Reputation,
+    u.DisplayName,
+    u.Location,
+    (p.ViewCount / nullif(extract(epoch from (coalesce(p.LastActivityDate, now()) - p.CreationDate)) / 86400.0, 0)) as views_per_day
+  from Posts p
+  left join Users u on u.Id = p.OwnerUserId
+  cross join params
+  where p.CreationDate >= now() - (params.days_back || ' days')::interval
+    and (p.PostTypeId in (1,2))
+),
+-- Compute user reputation thresholds with window functions
+user_rep_stats as (
+  select
+    OwnerUserId,
+    Reputation,
+    ntile(100) over(order by coalesce(Reputation,0)) as rep_percentile
+  from (select distinct OwnerUserId, Reputation from recent_activity) d
+),
+-- Questions core with tag parsing and complexity metrics
+questions as (
+  select
+    q.PostId,
+    q.OwnerUserId,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.LastActivityDate,
+    q.Reputation,
+    q.DisplayName,
+    q.Location,
+    q.views_per_day,
+    array_length(string_to_array(coalesce(nullif(trim(both ' ' from substring(q.Tags, 2, greatest(length(q.Tags)-2,0))), ''), ''), '><'), 1) as tag_count,
+    lower(coalesce(q.Title,'')) like any (array[
+      '%how to%',
+      '%best way%',
+      '%why does%',
+      '%what is%',
+      '%error%',
+      '%exception%',
+      '%performance%'
+    ]) as title_is_common_pattern
+  from recent_activity q
+  where q.PostTypeId = 1
+),
+-- Answers linked to their questions
+answers as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId as AnswererId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreation,
+    a.LastActivityDate as AnswerLastActivity
+  from Posts a
+  join params on true
+  where a.PostTypeId = 2
+    and a.CreationDate >= now() - (params.days_back || ' days')::interval
+),
+-- Aggregate answers per question with window metrics
+answer_aggs as (
+  select
+    QuestionId,
+    count(*) as answers_count,
+    max(AnswerScore) as max_answer_score,
+    avg(AnswerScore)::numeric(18,4) as avg_answer_score,
+    min(AnswerCreation) as first_answer_time,
+    max(AnswerCreation) as last_answer_time,
+    count(*) filter (where AnswerScore > 0) as positive_answers,
+    count(*) filter (where AnswerScore < 0) as negative_answers
+  from answers
+  group by QuestionId
+),
+-- Votes breakdown for questions
+question_votes as (
+  select
+    v.PostId as QuestionId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites
+  from Votes v
+  join Posts p on p.Id = v.PostId and p.PostTypeId = 1
+  group by v.PostId
+),
+-- PostHistory derived signals (closures, migrations, protections)
+question_events as (
+  select
+    ph.PostId as QuestionId,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as last_closed_date,
+    count(*) filter (where ph.PostHistoryTypeId = 10) as close_events,
+    count(*) filter (where ph.PostHistoryTypeId = 11) as reopen_events,
+    count(*) filter (where ph.PostHistoryTypeId = 19) as protect_events,
+    count(*) filter (where ph.PostHistoryTypeId = 52) as hot_events,
+    bool_or(ph.PostHistoryTypeId = 35) as migrated_away,
+    bool_or(ph.PostHistoryTypeId = 36) as migrated_here
+  from PostHistory ph
+  join Posts p on p.Id = ph.PostId and p.PostTypeId = 1
+  group by ph.PostId
+),
+-- Duplicates via PostLinks
+duplicates as (
+  select
+    pl.PostId as QuestionId,
+    count(*) filter (where pl.LinkTypeId = 3) as dup_links_count,
+    count(*) filter (where pl.LinkTypeId = 1) as linked_count
+  from PostLinks pl
+  join Posts p on p.Id = pl.PostId and p.PostTypeId = 1
+  group by pl.PostId
+),
+-- Null-safe joins and derived metrics
+question_enriched as (
+  select
+    q.*,
+    coalesce(aa.answers_count, 0) as answers_count,
+    coalesce(aa.max_answer_score, 0) as max_answer_score,
+    coalesce(aa.avg_answer_score, 0)::float as avg_answer_score,
+    aa.first_answer_time,
+    aa.last_answer_time,
+    coalesce(qv.upvotes, 0) as upvotes,
+    coalesce(qv.downvotes, 0) as downvotes,
+    coalesce(qv.favorites, 0) as favorites,
+    coalesce(qe.close_events,0) as close_events,
+    coalesce(qe.reopen_events,0) as reopen_events,
+    coalesce(qe.protect_events,0) as protect_events,
+    coalesce(qe.hot_events,0) as hot_events,
+    qe.last_closed_date,
+    coalesce(d.dup_links_count,0) as dup_links_count,
+    coalesce(d.linked_count,0) as linked_count,
+    (case when q.ViewCount > 0 then (q.Score::numeric / q.ViewCount) else null end) as score_per_view,
+    (q.Score - coalesce(qv.downvotes,0) + coalesce(qv.upvotes,0)) as net_score_adjusted,
+    (coalesce(qv.upvotes,0) - coalesce(qv.downvotes,0)) as vote_delta
+  from questions q
+  left join answer_aggs aa on aa.QuestionId = q.PostId
+  left join question_votes qv on qv.QuestionId = q.PostId
+  left join question_events qe on qe.QuestionId = q.PostId
+  left join duplicates d on d.QuestionId = q.PostId
+),
+-- Correlated subquery to compute time-to-first-accepted-answer
+accepted_answer_latency as (
+  select
+    q.PostId,
+    (select min(a.CreationDate) - q.CreationDate
+     from Posts a
+     where a.PostTypeId = 2
+       and a.ParentId = q.PostId
+       and a.Id = (select p.AcceptedAnswerId from Posts p where p.Id = q.PostId)
+    ) as time_to_accept
+  from question_enriched q
+),
+-- Rank questions by multi-factor scoring
+ranked_questions as (
+  select
+    q.*,
+    aal.time_to_accept,
+    -- Composite score with weights and null handling
+    (
+      coalesce(q.Score,0)*1.0
+      + coalesce(q.upvotes,0)*0.5
+      - coalesce(q.downvotes,0)*0.7
+      + least(coalesce(q.ViewCount,0)/100.0, 50)
+      + coalesce(q.answers_count,0)*0.8
+      + case when q.hot_events > 0 then 25 else 0 end
+      - least(coalesce(q.dup_links_count,0)*5, 30)
+      + case when q.tag_count >= 5 then -5 when q.tag_count between 3 and 4 then 2 else 0 end
+      + case when q.title_is_common_pattern then -3 else 1 end
+      + case when q.views_per_day is not null then ln(1 + greatest(q.views_per_day,0)) else 0 end
+      + case when q.last_closed_date is not null then -10 else 0 end
+    ) as composite_score
+  from question_enriched q
+  left join accepted_answer_latency aal on aal.PostId = q.PostId
+),
+-- Filter to "high rep" owners using window percentile, but keep NULL with left join and predicate with null logic
+hi_rep_questions as (
+  select rq.*
+  from ranked_questions rq
+  left join user_rep_stats urs on urs.OwnerUserId = rq.OwnerUserId
+  cross join params
+  where (urs.rep_percentile >= (params.high_reputation_quantile*100)) is not false
+),
+-- Compute rolling ranks and percentiles across multiple dimensions
+final_rank as (
+  select
+    rq.*,
+    row_number() over(order by composite_score desc nulls last, ViewCount desc) as rn_overall,
+    dense_rank() over(order by coalesce(answers_count,0) desc, coalesce(ViewCount,0) desc) as dr_by_answers,
+    percent_rank() over(order by coalesce(ViewCount,0)) as pct_views,
+    ntile(10) over(order by coalesce(vote_delta,0) desc) as decile_vote_delta
+  from hi_rep_questions rq
+  where coalesce(ViewCount,0) >= (select min_question_views from params)
+    and coalesce(answers_count,0) >= (select min_answers_per_question from params)
+),
+-- Join with comments to get recent comment signal via lateral-like correlated aggregation
+comment_signal as (
+  select
+    c.PostId as QuestionId,
+    max(c.CreationDate) as last_comment_time,
+    sum(case when c.Score > 0 then 1 else 0 end) as positive_comments,
+    count(*) filter (where c.Text ilike any (array['%thanks%','%clarify%','%duplicate%','%off-topic%'])) as keyword_comments
+  from Comments c
+  join Posts p on p.Id = c.PostId and p.PostTypeId = 1
+  group by c.PostId
+),
+-- Integrate comment signal
+final_enriched as (
+  select
+    fr.*,
+    cs.last_comment_time,
+    cs.positive_comments,
+    cs.keyword_comments,
+    case
+      when fr.last_activitydate is not null and cs.last_comment_time is not null
+        then greatest(fr.last_activitydate, cs.last_comment_time)
+      else coalesce(fr.last_activitydate, cs.last_comment_time)
+    end as max_recent_activity
+  from final_rank fr
+  left join comment_signal cs on cs.QuestionId = fr.PostId
+),
+-- Build a tiny tag dimension join via regex split and count overlap with top tags
+top_tags as (
+  select t.TagName, t.Count, row_number() over(order by t.Count desc) as rn
+  from Tags t
+),
+question_tag_hits as (
+  select
+    fe.PostId,
+    count(*) filter (where tt.rn <= 50) as hits_top50_tags,
+    count(*) filter (where tt.rn between 51 and 200) as hits_51_200
+  from final_enriched fe
+  left join lateral (
+    select unnest(
+      case
+        when fe.Tags is null or length(fe.Tags) < 2 then array[]::varchar[]
+        else string_to_array(substring(fe.Tags, 2, greatest(length(fe.Tags)-2,0)), '><')
+      end
+    ) as tag
+  ) ut on true
+  left join top_tags tt on tt.TagName = ut.tag
+  group by fe.PostId
+),
+-- Assemble final scoring
+scored as (
+  select
+    fe.*,
+    qth.hits_top50_tags,
+    qth.hits_51_200,
+    (
+      fe.composite_score
+      + coalesce(qth.hits_top50_tags,0) * 0.5
+      + coalesce(qth.hits_51_200,0) * 0.2
+      + case when fe.time_to_accept is not null then -extract(epoch from fe.time_to_accept)/86400.0 else 0 end
+    ) as final_score
+  from final_enriched fe
+  left join question_tag_hits qth on qth.PostId = fe.PostId
+)
+select
+  s.PostId,
+  coalesce(s.Title, '[no title]') as Title,
+  s.DisplayName as OwnerDisplayName,
+  s.Reputation as OwnerReputation,
+  s.Location,
+  s.ViewCount,
+  s.AnswerCount,
+  s.upvotes,
+  s.downvotes,
+  s.favorites,
+  s.Score as QuestionScore,
+  round(coalesce(s.avg_answer_score,0)::numeric, 2) as AvgAnswerScore,
+  s.max_answer_score as MaxAnswerScore,
+  s.vote_delta,
+  s.views_per_day,
+  s.tag_count,
+  s.hits_top50_tags,
+  s.hits_51_200,
+  s.dup_links_count,
+  s.close_events,
+  s.reopen_events,
+  s.protect_events,
+  s.hot_events,
+  s.last_closed_date,
+  s.time_to_accept,
+  s.last_activitydate,
+  s.last_comment_time,
+  s.max_recent_activity,
+  s.rn_overall,
+  s.dr_by_answers,
+  s.pct_views,
+  s.decile_vote_delta,
+  round(s.final_score::numeric, 3) as FinalScore
+from scored s
+where s.rn_overall <= 200
+order by s.final_score desc nulls last, s.ViewCount desc, s.AnswerCount desc;

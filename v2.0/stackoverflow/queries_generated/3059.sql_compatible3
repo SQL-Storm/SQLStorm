@@ -1,0 +1,113 @@
+WITH
+UserBadgeCounts AS (
+    SELECT
+        u.Id                                 AS UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END)  AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END)  AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END)  AS BronzeBadges,
+        COUNT(b.Id)                             AS TotalBadges,
+        SUM(CASE WHEN b.TagBased = TRUE OR b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+UserPostAggregates AS (
+    SELECT
+        p.OwnerUserId                         AS UserId,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        SUM(COALESCE(p.ViewCount,0))          AS TotalViews,
+        SUM(COALESCE(p.Score,0))              AS TotalScore,
+        MAX(p.CreationDate)                   AS LastPostDate,
+        MIN(p.CreationDate)                   AS FirstPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserVoteStats AS (
+    SELECT
+        v.UserId                                            AS UserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END)            AS UpVotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END)            AS DownVotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END)            AS FavoritesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 8 THEN 1 END)            AS BountiesStarted,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS BountyAmountSpent
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+UserTagActivity AS (
+    SELECT
+        ph.UserId,
+        COUNT(DISTINCT tag) 
+            FILTER (WHERE ph.PostHistoryTypeId IN (3,6,9))   AS DistinctTagsEdited,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 3 THEN 1 END)    AS TagAdds,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 6 THEN 1 END)    AS TagEdits
+    FROM (
+        SELECT ph.*, unnest(string_to_array(ph.Text, ',')) AS tag
+        FROM PostHistory ph
+    ) ph
+    GROUP BY ph.UserId
+),
+Combined AS (
+    SELECT
+        u.Id                                         AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(bc.TotalBadges,0)                   AS TotalBadges,
+        COALESCE(pa.Questions,0)                     AS Questions,
+        COALESCE(pa.Answers,0)                       AS Answers,
+        COALESCE(pa.TotalViews,0)                    AS TotalViews,
+        COALESCE(vs.UpVotesGiven,0) - COALESCE(vs.DownVotesGiven,0) AS NetVotesGiven,
+        COALESCE(ta.DistinctTagsEdited,0)            AS DistinctTagsEdited,
+        CASE
+            WHEN u.CreationDate < DATE '2010-01-01' THEN 'Veteran'
+            WHEN u.CreationDate BETWEEN DATE '2010-01-01' AND DATE '2015-01-01' THEN 'Established'
+            ELSE 'Newcomer'
+        END                                          AS UserEra,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC)            AS ReputationRank,
+        DENSE_RANK() OVER (
+            PARTITION BY COALESCE(u.Location,'Unknown')
+            ORDER BY u.Reputation DESC
+        )                                            AS LocationRepRank,
+        (SELECT COUNT(*) FROM Posts p2
+         WHERE p2.OwnerUserId = u.Id
+           AND p2.PostTypeId = 1
+           AND p2.Score > 0)                     AS PositiveScoreQuestions,
+        (SELECT MAX(p3.CreationDate) FROM Posts p3
+         WHERE p3.OwnerUserId = u.Id)                AS MostRecentPost
+    FROM Users u
+    LEFT JOIN UserBadgeCounts bc      ON bc.UserId = u.Id
+    LEFT JOIN UserPostAggregates pa   ON pa.UserId = u.Id
+    LEFT JOIN UserVoteStats vs        ON vs.UserId = u.Id
+    LEFT JOIN UserTagActivity ta      ON ta.UserId = u.Id
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        bc.TotalBadges,
+        pa.Questions,
+        pa.Answers,
+        pa.TotalViews,
+        vs.UpVotesGiven,
+        vs.DownVotesGiven,
+        ta.DistinctTagsEdited,
+        u.CreationDate,
+        u.Location
+),
+FinalSet AS (
+    SELECT *
+    FROM Combined
+    WHERE ReputationRank <= 1000
+
+    UNION ALL
+
+    SELECT *
+    FROM Combined
+    WHERE TotalBadges >= 10
+      AND DistinctTagsEdited > 5
+      AND ReputationRank > 1000
+)
+SELECT *
+FROM FinalSet
+ORDER BY ReputationRank ASC, TotalBadges DESC;

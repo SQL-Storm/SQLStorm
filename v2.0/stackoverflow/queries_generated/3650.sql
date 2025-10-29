@@ -1,0 +1,116 @@
+-- {"query": "3650.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2280} 
+
+/*  Complex performance‑benchmark query using the StackOverflow schema  */
+WITH
+    /* Aggregate posts per user, distinguishing questions and answers */
+    UserPostAgg AS (
+        SELECT
+            u.Id                               AS UserId,
+            u.DisplayName,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+            SUM(p.Score)                         AS TotalScore,
+            AVG(p.Score)                         AS AvgScore,
+            MAX(p.CreationDate)                  AS LastPostDate
+        FROM Users u
+        LEFT JOIN Posts p
+               ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName
+    ),
+
+    /* Votes given by each user, split by type */
+    UserVoteAgg AS (
+        SELECT
+            v.UserId,
+            COUNT(*) FILTER (WHERE vt.Name = 'UpMod')      AS UpVotesGiven,
+            COUNT(*) FILTER (WHERE vt.Name = 'DownMod')    AS DownVotesGiven,
+            COUNT(*) FILTER (WHERE vt.Name = 'Favorite')   AS FavoritesGiven
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        WHERE v.UserId IS NOT NULL
+        GROUP BY v.UserId
+    ),
+
+    /* Tag usage per user – includes a window function for ranking */
+    UserTagStats AS (
+        SELECT
+            u.Id                                    AS UserId,
+            t.TagName,
+            COUNT(*)                                 AS TagUsage,
+            ROW_NUMBER() OVER (PARTITION BY u.Id
+                               ORDER BY COUNT(*) DESC) AS TagRank
+        FROM Users u
+        JOIN Posts p ON p.OwnerUserId = u.Id
+        /* explode the <tag1><tag2> list into rows */
+        CROSS JOIN LATERAL (
+            SELECT unnest(string_to_array(
+                     regexp_replace(p.Tags, '^<|>$', '', 'g'), '><')) AS tag
+        ) AS taglist
+        JOIN Tags t ON t.TagName = taglist.tag
+        GROUP BY u.Id, t.TagName
+    ),
+
+    /* Badges earned in the last 90 days, aggregated as CSV strings */
+    RecentBadges AS (
+        SELECT
+            b.UserId,
+            STRING_AGG(b.Name, ', ') FILTER (WHERE b.Class = 1) AS GoldBadges,
+            STRING_AGG(b.Name, ', ') FILTER (WHERE b.Class = 2) AS SilverBadges,
+            STRING_AGG(b.Name, ', ') FILTER (WHERE b.Class = 3) AS BronzeBadges
+        FROM Badges b
+        WHERE b.Date >= CURRENT_DATE - INTERVAL '90 days'
+        GROUP BY b.UserId
+    )
+
+SELECT
+    upa.UserId,
+    upa.DisplayName,
+    upa.QuestionCount,
+    upa.AnswerCount,
+    upa.TotalScore,
+    upa.AvgScore,
+    upa.LastPostDate,
+    COALESCE(uva.UpVotesGiven, 0)      AS UpVotesGiven,
+    COALESCE(uva.DownVotesGiven, 0)    AS DownVotesGiven,
+    COALESCE(uva.FavoritesGiven, 0)   AS FavoritesGiven,
+    rb.GoldBadges,
+    rb.SilverBadges,
+    rb.BronzeBadges,
+    STRING_AGG(uts.TagName, ', ') FILTER (WHERE uts.TagRank <= 3) AS Top3Tags,
+    CASE
+        WHEN upa.TotalScore IS NULL       THEN 'NoPosts'
+        WHEN upa.TotalScore > 1000        THEN 'HighScorer'
+        ELSE                                   'Regular'
+    END                                 AS ScoreCategory
+FROM UserPostAgg upa
+LEFT JOIN UserVoteAgg uva      ON uva.UserId = upa.UserId
+LEFT JOIN RecentBadges rb      ON rb.UserId = upa.UserId
+LEFT JOIN UserTagStats uts     ON uts.UserId = upa.UserId
+GROUP BY
+    upa.UserId, upa.DisplayName, upa.QuestionCount, upa.AnswerCount,
+    upa.TotalScore, upa.AvgScore, upa.LastPostDate,
+    uva.UpVotesGiven, uva.DownVotesGiven, uva.FavoritesGiven,
+    rb.GoldBadges, rb.SilverBadges, rb.BronzeBadges
+HAVING COUNT(*) > 0
+
+UNION ALL
+
+/*  Grand total row (set operator)  */
+SELECT
+    NULL                                 AS UserId,
+    'TOTAL'                              AS DisplayName,
+    SUM(upa.QuestionCount)               AS QuestionCount,
+    SUM(upa.AnswerCount)                 AS AnswerCount,
+    SUM(upa.TotalScore)                  AS TotalScore,
+    AVG(upa.AvgScore)                    AS AvgScore,
+    MAX(upa.LastPostDate)                AS LastPostDate,
+    SUM(COALESCE(uva.UpVotesGiven,0))    AS UpVotesGiven,
+    SUM(COALESCE(uva.DownVotesGiven,0))  AS DownVotesGiven,
+    SUM(COALESCE(uva.FavoritesGiven,0))  AS FavoritesGiven,
+    NULL                                 AS GoldBadges,
+    NULL                                 AS SilverBadges,
+    NULL                                 AS BronzeBadges,
+    NULL                                 AS Top3Tags,
+    NULL                                 AS ScoreCategory
+FROM UserPostAgg upa
+LEFT JOIN UserVoteAgg uva ON uva.UserId = upa.UserId;

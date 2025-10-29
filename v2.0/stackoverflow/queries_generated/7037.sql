@@ -1,0 +1,299 @@
+-- {"query": "7037.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2776} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(p.Score) as MaxPostScore,
+        AVG(p.Score) as AvgPostScore,
+        SUM(p.ViewCount) as TotalViews,
+        COUNT(DISTINCT CASE WHEN p.OwnerUserId IS NOT NULL AND p.OwnerUserId = u.Id THEN p.Id END) as OwnedPosts,
+        COUNT(DISTINCT CASE WHEN p.OwnerUserId IS NULL OR p.OwnerUserId != u.Id THEN p.Id END) as NonOwnedPosts
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        Reputation,
+        DisplayName,
+        TotalPosts,
+        QuestionCount,
+        AnswerCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        LastCommentDate,
+        MaxPostScore,
+        AvgPostScore,
+        TotalViews,
+        OwnedPosts,
+        NonOwnedPosts,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalPosts DESC) as RankByReputation,
+        ROW_NUMBER() OVER (ORDER BY TotalPosts DESC, Reputation DESC) as RankByPosts,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) as DenseRankByReputation,
+        NTILE(100) OVER (ORDER BY Reputation) as PercentileByReputation
+    FROM UserActivityStats
+    WHERE TotalPosts > 0
+),
+PostPerformance AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        DATEDIFF(day, p.CreationDate, p.LastActivityDate) as AgeInDays,
+        CASE WHEN p.Score > 0 THEN p.Score ELSE 1 END as ScoreForCalculation,
+        CAST(p.ViewCount AS FLOAT) / NULLIF(CAST(p.ScoreForCalculation AS FLOAT), 0) as ViewsPerScore,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 
+                COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) OVER (PARTITION BY p.Id)
+            ELSE 0 
+        END as AnswerCountForQuestion,
+        COALESCE(SUBSTRING(p.Tags, 2, LEN(p.Tags) - 2), '') as CleanedTags,
+        STRING_AGG(SUBSTRING(p.Tags, 2, LEN(p.Tags) - 2), ', ') OVER (PARTITION BY p.OwnerUserId) as UserTags,
+        CASE WHEN EXISTS (SELECT 1 FROM Posts p2 WHERE p2.ParentId = p.Id AND p2.PostTypeId = 2) THEN 1 ELSE 0 END as HasAnswers
+    FROM Posts p
+),
+UserPostAnalytics AS (
+    SELECT 
+        t.UserId,
+        t.Reputation,
+        t.DisplayName,
+        t.TotalPosts,
+        t.QuestionCount,
+        t.AnswerCount,
+        t.CommentCount,
+        t.BadgeCount,
+        t.LastPostDate,
+        t.LastCommentDate,
+        t.MaxPostScore,
+        t.AvgPostScore,
+        t.TotalViews,
+        t.OwnedPosts,
+        t.NonOwnedPosts,
+        t.RankByReputation,
+        t.RankByPosts,
+        t.DenseRankByReputation,
+        t.PercentileByReputation,
+        -- Calculated fields with complex expressions
+        CASE 
+            WHEN t.TotalPosts > 0 AND t.Reputation > 0 THEN 
+                (CAST(t.TotalPosts AS FLOAT) * CAST(t.Reputation AS FLOAT)) / NULLIF(CAST(t.TotalPosts AS FLOAT), 0)
+            ELSE 0 
+        END as PostReputationRatio,
+        CASE 
+            WHEN t.QuestionCount > 0 THEN 
+                CAST(t.AnswerCount AS FLOAT) / NULLIF(CAST(t.QuestionCount AS FLOAT), 0)
+            ELSE 0 
+        END as AnswerPerQuestionRatio,
+        CASE 
+            WHEN t.TotalPosts > 0 THEN 
+                CAST(t.CommentCount AS FLOAT) / NULLIF(CAST(t.TotalPosts AS FLOAT), 0)
+            ELSE 0 
+        END as CommentsPerPostRatio,
+        CASE 
+            WHEN t.BadgeCount > 0 THEN 
+                CAST(t.Reputation AS FLOAT) / NULLIF(CAST(t.BadgeCount AS FLOAT), 0)
+            ELSE 0 
+        END as ReputationPerBadge,
+        CASE 
+            WHEN t.AvgPostScore > 0 THEN 
+                (CAST(t.MaxPostScore AS FLOAT) - CAST(t.AvgPostScore AS FLOAT)) / NULLIF(CAST(t.AvgPostScore AS FLOAT), 0)
+            ELSE 0 
+        END as ScoreDeviationFromAverage,
+        CASE 
+            WHEN t.TotalViews > 0 THEN 
+                CAST(t.TotalViews AS FLOAT) / NULLIF(CAST(t.TotalPosts AS FLOAT), 0)
+            ELSE 0 
+        END as ViewsPerPost
+    FROM TopUsers t
+    WHERE t.RankByReputation <= 1000 AND t.RankByPosts <= 1000
+),
+ComplexCalculations AS (
+    SELECT 
+        upa.UserId,
+        upa.Reputation,
+        upa.DisplayName,
+        upa.TotalPosts,
+        upa.QuestionCount,
+        upa.AnswerCount,
+        upa.CommentCount,
+        upa.BadgeCount,
+        upa.LastPostDate,
+        upa.LastCommentDate,
+        upa.MaxPostScore,
+        upa.AvgPostScore,
+        upa.TotalViews,
+        upa.OwnedPosts,
+        upa.NonOwnedPosts,
+        upa.RankByReputation,
+        upa.RankByPosts,
+        upa.DenseRankByReputation,
+        upa.PercentileByReputation,
+        upa.PostReputationRatio,
+        upa.AnswerPerQuestionRatio,
+        upa.CommentsPerPostRatio,
+        upa.ReputationPerBadge,
+        upa.ScoreDeviationFromAverage,
+        upa.ViewsPerPost,
+        -- Complex set operations and joins
+        (SELECT TOP 1 t.TagName 
+         FROM Tags t 
+         WHERE CHARINDEX('<' + t.TagName + '>', ps.Tags) > 0 
+         ORDER BY t.Count DESC) AS MostFrequentTag,
+        (SELECT COUNT(*) 
+         FROM PostHistory ph 
+         WHERE ph.PostId = ps.Id AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) as EditCount,
+        CASE 
+            WHEN upa.Reputation >= 1000000 THEN CONCAT('Millionaire ', upa.DisplayName)
+            WHEN upa.Reputation >= 100000 THEN CONCAT('HundredK ', upa.DisplayName)
+            WHEN upa.Reputation >= 10000 THEN CONCAT('TenK ', upa.DisplayName)
+            ELSE upa.DisplayName
+        END as ReputationDisplayName,
+        DATEDIFF(day, upa.LastPostDate, GETDATE()) as DaysSinceLastPost,
+        DATEDIFF(day, upa.CreationDate, GETDATE()) as AccountAgeDays
+    FROM UserPostAnalytics upa
+    CROSS JOIN (
+        SELECT TOP 1000 * 
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+        ORDER BY p.CreationDate DESC
+    ) ps
+),
+FinalAnalytics AS (
+    SELECT 
+        cc.UserId,
+        cc.Reputation,
+        cc.DisplayName,
+        cc.TotalPosts,
+        cc.QuestionCount,
+        cc.AnswerCount,
+        cc.CommentCount,
+        cc.BadgeCount,
+        cc.LastPostDate,
+        cc.LastCommentDate,
+        cc.MaxPostScore,
+        cc.AvgPostScore,
+        cc.TotalViews,
+        cc.OwnedPosts,
+        cc.NonOwnedPosts,
+        cc.RankByReputation,
+        cc.RankByPosts,
+        cc.DenseRankByReputation,
+        cc.PercentileByReputation,
+        cc.PostReputationRatio,
+        cc.AnswerPerQuestionRatio,
+        cc.CommentsPerPostRatio,
+        cc.ReputationPerBadge,
+        cc.ScoreDeviationFromAverage,
+        cc.ViewsPerPost,
+        cc.MostFrequentTag,
+        cc.EditCount,
+        cc.ReputationDisplayName,
+        cc.DaysSinceLastPost,
+        cc.AccountAgeDays,
+        -- Complex window functions and aggregations
+        ROW_NUMBER() OVER (ORDER BY cc.Reputation DESC) as RowNum,
+        AVG(cc.Reputation) OVER (ORDER BY cc.Reputation ROWS BETWEEN 4 PRECEDING AND 4 FOLLOWING) as ReputationMovingAvg,
+        PERCENT_RANK() OVER (ORDER BY cc.Reputation) as ReputationPercentRank,
+        CUME_DIST() OVER (ORDER BY cc.Reputation) as ReputationCumulativeDist,
+        -- Subquery and correlated subquery combinations
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = cc.UserId AND PostTypeId = 1) as UserQuestions,
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = cc.UserId AND PostTypeId = 2) as UserAnswers,
+        (SELECT COUNT(*) FROM Comments WHERE UserId = cc.UserId) as UserComments,
+        -- Set operations to simulate complex unions and intersections
+        CASE 
+            WHEN cc.AnswerPerQuestionRatio >= 1.0 AND cc.ViewsPerPost >= 100 THEN 'High Engagement'
+            WHEN cc.AnswerPerQuestionRatio >= 0.5 AND cc.ViewsPerPost >= 50 THEN 'Moderate Engagement'
+            WHEN cc.AnswerPerQuestionRatio < 0.5 OR cc.ViewsPerPost < 50 THEN 'Low Engagement'
+            ELSE 'Neutral'
+        END as EngagementStatus,
+        -- Complex predicates involving NULL handling 
+        COALESCE(
+            CASE WHEN cc.Reputation > 10000 THEN 'Expert' END,
+            CASE WHEN cc.Reputation > 1000 THEN 'Intermediate' END,
+            CASE WHEN cc.Reputation > 100 THEN 'Beginner' END,
+            'Novice'
+        ) as SkillLevel,
+        -- String operations and date arithmetic
+        CONCAT(
+            'Created ', 
+            CAST(DATEDIFF(year, cc.CreationDate, GETDATE()) AS VARCHAR(10)), 
+            ' years ago, last active ', 
+            CAST(cc.DaysSinceLastPost AS VARCHAR(10)), 
+            ' days ago'
+        ) as UserStatusString
+    FROM ComplexCalculations cc
+    WHERE cc.Reputation IS NOT NULL AND cc.Reputation > 0
+)
+
+SELECT TOP 1000 
+    fa.UserId,
+    fa.Reputation,
+    fa.DisplayName,
+    fa.TotalPosts,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.CommentCount,
+    fa.BadgeCount,
+    fa.LastPostDate,
+    fa.LastCommentDate,
+    fa.MaxPostScore,
+    fa.AvgPostScore,
+    fa.TotalViews,
+    fa.OwnedPosts,
+    fa.NonOwnedPosts,
+    fa.RankByReputation,
+    fa.RankByPosts,
+    fa.DenseRankByReputation,
+    fa.PercentileByReputation,
+    fa.PostReputationRatio,
+    fa.AnswerPerQuestionRatio,
+    fa.CommentsPerPostRatio,
+    fa.ReputationPerBadge,
+    fa.ScoreDeviationFromAverage,
+    fa.ViewsPerPost,
+    fa.MostFrequentTag,
+    fa.EditCount,
+    fa.ReputationDisplayName,
+    fa.DaysSinceLastPost,
+    fa.AccountAgeDays,
+    fa.RowNum,
+    fa.ReputationMovingAvg,
+    fa.ReputationPercentRank,
+    fa.ReputationCumulativeDist,
+    fa.UserQuestions,
+    fa.UserAnswers,
+    fa.UserComments,
+    fa.EngagementStatus,
+    fa.SkillLevel,
+    fa.UserStatusString
+FROM FinalAnalytics fa
+-- Complex JOIN with NULL handling and complicated predicates
+WHERE 
+    (fa.Reputation >= 1000 OR fa.TotalPosts >= 100 OR fa.BadgeCount >= 50)
+    AND (fa.DaysSinceLastPost <= 365 OR fa.DaysSinceLastPost IS NULL)
+    AND (fa.AnswerPerQuestionRatio IS NOT NULL AND fa.AnswerPerQuestionRatio >= 0)
+    AND (fa.ViewsPerPost IS NOT NULL AND fa.ViewsPerPost >= 0)
+ORDER BY fa.Reputation DESC, fa.TotalPosts DESC, fa.BadgeCount DESC
+OPTION (RECOMPILE, MAXDOP 8)

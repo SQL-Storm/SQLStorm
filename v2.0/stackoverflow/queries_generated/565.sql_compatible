@@ -1,0 +1,349 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl,
+        date_trunc('month', u.creationdate) as cohort_month,
+        row_number() over (order by u.creationdate) as rn_global
+    from users u
+    where u.creationdate >= (select coalesce(max(creationdate), timestamp '1900-01-01') - interval '5 years' from users)
+),
+tagged_questions as (
+    select
+        p.id as question_id,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.owneruserid,
+        p.title,
+        p.tags,
+        array_length(string_to_array(substring(p.tags from 2 for length(p.tags)-2), '><'), 1) as tag_count,
+        string_to_array(coalesce(substring(p.tags from 2 for length(p.tags)-2), ''), '><') as tag_array
+    from posts p
+    where p.posttypeid = 1
+),
+answers as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        a.owneruserid as answerer_id,
+        a.creationdate as answer_date,
+        a.score as answer_score
+    from posts a
+    where a.posttypeid = 2
+),
+question_activity as (
+    select
+        q.question_id,
+        count(distinct a.answer_id) as answer_count,
+        max(a.answer_score) as max_answer_score,
+        min(a.answer_date) as first_answer_date,
+        count(distinct c.id) filter (where c.score >= 0) as nonneg_comment_count,
+        count(distinct c.id) filter (where c.score < 0) as neg_comment_count
+    from tagged_questions q
+    left join answers a on a.question_id = q.question_id
+    left join comments c on c.postid = q.question_id
+    group by q.question_id
+),
+badge_summary as (
+    select
+        b.userid,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+        sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges
+    from badges b
+    group by b.userid
+),
+vote_agg as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+    from votes v
+    group by v.postid
+),
+dupe_links as (
+    select
+        pl.postid as dupe_post_id,
+        pl.relatedpostid as canonical_post_id,
+        count(*) as dupe_link_count,
+        min(pl.creationdate) as first_dupe_link_date
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+post_closures as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_closed_at,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_at,
+        count(*) filter (where ph.posthistorytypeid = 19) as protected_events
+    from posthistory ph
+    group by ph.postid
+),
+q_enriched as (
+    select
+        q.question_id,
+        q.creationdate,
+        q.score,
+        q.viewcount,
+        q.title,
+        q.tags,
+        q.tag_count,
+        qa.answer_count,
+        qa.max_answer_score,
+        qa.first_answer_date,
+        qa.nonneg_comment_count,
+        qa.neg_comment_count,
+        va.upvotes,
+        va.downvotes,
+        va.favorites,
+        va.bounty_total,
+        pc.close_events,
+        pc.last_closed_at,
+        pc.reopen_events,
+        pc.last_reopened_at,
+        pc.protected_events,
+        greatest(coalesce(qa.answer_count,0), 0) + coalesce(va.upvotes,0) + coalesce(va.favorites,0) - coalesce(va.downvotes,0) as engagement_score
+    from tagged_questions q
+    left join question_activity qa on qa.question_id = q.question_id
+    left join vote_agg va on va.postid = q.question_id
+    left join post_closures pc on pc.postid = q.question_id
+),
+user_post_stats as (
+    select
+        u.user_id,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        sum(case when p.posttypeid = 1 then coalesce(p.score,0) else 0 end) as q_score_sum,
+        sum(case when p.posttypeid = 2 then coalesce(p.score,0) else 0 end) as a_score_sum,
+        max(p.creationdate) as last_post_date
+    from recent_users u
+    left join posts p on p.owneruserid = u.user_id
+    group by u.user_id
+),
+question_tag_expansion as (
+    select
+        qe.question_id,
+        lower(trim(t)) as tag
+    from q_enriched qe,
+    lateral unnest(case when qe.tag_count > 0 then qe.tags end) as t
+),
+top_tags as (
+    select
+        tag,
+        count(*) as tag_usage
+    from question_tag_expansion
+    group by tag
+    having count(*) > 10
+),
+user_quality as (
+    select
+        u.user_id,
+        u.displayname,
+        u.reputation,
+        u.cohort_month,
+        ups.q_count,
+        ups.a_count,
+        ups.q_score_sum,
+        ups.a_score_sum,
+        coalesce(bs.gold_count,0) as gold,
+        coalesce(bs.silver_count,0) as silver,
+        coalesce(bs.bronze_count,0) as bronze,
+        coalesce(bs.tag_badges,0) as tag_badges,
+        case
+            when ups.a_count = 0 then null
+            else round( (ups.a_score_sum * 1.0) / nullif(ups.a_count,0), 3)
+        end as avg_answer_score,
+        case
+            when ups.q_count = 0 then null
+            else round( (ups.q_score_sum * 1.0) / nullif(ups.q_count,0), 3)
+        end as avg_question_score,
+        row_number() over (partition by date_trunc('year', u.cohort_month) order by u.reputation desc, coalesce(bs.gold_count,0) desc) as rank_in_year
+    from recent_users u
+    left join user_post_stats ups on ups.user_id = u.user_id
+    left join badge_summary bs on bs.userid = u.user_id
+),
+question_rollups as (
+    select
+        qe.question_id,
+        qe.creationdate,
+        qe.score,
+        qe.viewcount,
+        qe.engagement_score,
+        qe.answer_count,
+        qe.max_answer_score,
+        qe.first_answer_date,
+        qe.close_events,
+        qe.reopen_events,
+        qe.protected_events,
+        count(distinct dl.canonical_post_id) as canonical_targets,
+        min(dl.first_dupe_link_date) as first_dupe_link_date
+    from q_enriched qe
+    left join dupe_links dl on dl.dupe_post_id = qe.question_id
+    group by qe.question_id, qe.creationdate, qe.score, qe.viewcount, qe.engagement_score, qe.answer_count, qe.max_answer_score, qe.first_answer_date, qe.close_events, qe.reopen_events, qe.protected_events
+),
+question_bins as (
+    select
+        qr.*,
+        width_bucket(coalesce(qr.engagement_score,0), -10, 200, 20) as engagement_bucket,
+        case
+            when qr.viewcount is null then 'unknown'
+            when qr.viewcount < 100 then 'low'
+            when qr.viewcount < 1000 then 'medium'
+            when qr.viewcount < 10000 then 'high'
+            else 'very_high'
+        end as view_band
+    from question_rollups qr
+),
+cohort_perf as (
+    select
+        date_trunc('month', qb.creationdate) as month,
+        qb.engagement_bucket,
+        qb.view_band,
+        count(*) as q_cnt,
+        avg(qb.score) as avg_q_score,
+        avg(qb.viewcount) as avg_views,
+        avg(qb.answer_count) as avg_answers,
+        sum(case when qb.close_events > 0 then 1 else 0 end) as closed_cnt
+    from question_bins qb
+    group by date_trunc('month', qb.creationdate), qb.engagement_bucket, qb.view_band
+),
+question_tta as (
+    select
+        qe.question_id,
+        extract(epoch from (qe.first_answer_date - qe.creationdate)) / 3600.0 as hours_to_first_answer
+    from q_enriched qe
+    where qe.first_answer_date is not null
+),
+tta_percentiles as (
+    select
+        date_trunc('month', p.creationdate) as month,
+        percentile_disc(0.5) within group (order by qta.hours_to_first_answer) as p50_hours_tta,
+        percentile_disc(0.9) within group (order by qta.hours_to_first_answer) as p90_hours_tta
+    from posts p
+    join question_tta qta on qta.question_id = p.id
+    group by date_trunc('month', p.creationdate)
+),
+user_tag_focus as (
+    select
+        a.owneruserid as user_id,
+        lower(trim(t)) as tag,
+        count(*) as answers_in_tag
+    from posts a
+    join posts q on q.id = a.parentid and q.posttypeid = 1
+    cross join lateral unnest(string_to_array(coalesce(substring(q.tags from 2 for length(q.tags)-2), ''), '><')) as t
+    where a.posttypeid = 2
+    group by a.owneruserid, lower(trim(t))
+),
+user_top_tag as (
+    select distinct on (utf.user_id)
+        utf.user_id,
+        utf.tag,
+        utf.answers_in_tag
+    from user_tag_focus utf
+    order by utf.user_id, utf.answers_in_tag desc, utf.tag
+),
+final_users as (
+    select
+        uq.user_id,
+        uq.displayname,
+        uq.reputation,
+        uq.cohort_month,
+        uq.q_count,
+        uq.a_count,
+        uq.avg_answer_score,
+        uq.avg_question_score,
+        uq.gold, uq.silver, uq.bronze, uq.tag_badges,
+        utt.tag as top_answer_tag,
+        utt.answers_in_tag as top_tag_answers,
+        case
+            when uq.reputation >= 20000 then 'legend'
+            when uq.reputation >= 10000 then 'expert'
+            when uq.reputation >= 2000 then 'regular'
+            when uq.reputation >= 200 then 'novice'
+            else 'newbie'
+        end as user_tier,
+        uq.rank_in_year
+    from user_quality uq
+    left join user_top_tag utt on utt.user_id = uq.user_id
+),
+interesting_questions as (
+    select
+        qb.question_id,
+        qb.creationdate,
+        qb.engagement_score,
+        qb.viewcount,
+        qb.answer_count,
+        qb.close_events,
+        qb.reopen_events,
+        qb.protected_events,
+        qb.view_band,
+        qb.engagement_bucket
+    from question_bins qb
+    where
+        (
+            qb.engagement_score > 20
+            or (qb.view_band in ('high','very_high') and qb.answer_count >= 2)
+            or (qb.close_events > 0 and qb.reopen_events > 0)
+        )
+        and coalesce(qb.protected_events,0) = 0
+)
+select
+    to_char(cp.month, 'YYYY-MM') as month,
+    cp.engagement_bucket,
+    cp.view_band,
+    cp.q_cnt,
+    round(cp.avg_q_score * 1.0, 2) as avg_q_score,
+    round(cp.avg_views * 1.0, 2) as avg_views,
+    round(cp.avg_answers * 1.0, 2) as avg_answers,
+    cp.closed_cnt,
+    coalesce(tp.p50_hours_tta, null) as p50_hours_to_first_answer,
+    coalesce(tp.p90_hours_tta, null) as p90_hours_to_first_answer,
+    (
+        select count(*)
+        from interesting_questions iq
+        where date_trunc('month', iq.creationdate) = cp.month
+        intersect
+        select count(*) from (select 1) as one
+    ) as interesting_q_guard,
+    (
+        select string_agg(tt.tag || ':' || cast(tt.tag_usage as varchar), ', ' order by tt.tag_usage desc)
+        from (
+            select qt.tag, count(*) as tag_usage
+            from question_tag_expansion qt
+            join posts p on p.id = qt.question_id
+            where date_trunc('month', p.creationdate) = cp.month
+            group by qt.tag
+            order by tag_usage desc
+            limit 3
+        ) tt
+    ) as top3_tags_in_month,
+    round(
+        100.0 * cp.q_cnt
+        / nullif(sum(cp.q_cnt) over (partition by cp.month), 0)
+        , 2
+    ) as pct_of_month_in_view_band,
+    fu.displayname as sample_user_displayname,
+    fu.user_tier as sample_user_tier,
+    coalesce(fu.top_answer_tag, 'n/a') as sample_user_top_tag
+from cohort_perf cp
+left join tta_percentiles tp on tp.month = cp.month
+left join lateral (
+    select fu.displayname, fu.user_tier, fu.top_answer_tag
+    from final_users fu
+    where date_trunc('month', fu.cohort_month) <= cp.month
+      and fu.rank_in_year <= 3
+    order by fu.reputation desc nulls last, fu.gold desc, fu.silver desc
+    limit 1
+) fu on true
+where cp.month >= (select min(date_trunc('month', creationdate)) from posts)
+order by cp.month desc, cp.engagement_bucket, cp.view_band;

@@ -1,0 +1,158 @@
+-- {"query": "2529.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1524} 
+with recursive UserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        -- calculate reputation age ratio with null-safe logic
+        case when extract(epoch from (current_timestamp - u.CreationDate))/86400 > 0 
+            then u.Reputation / (extract(epoch from (current_timestamp - u.CreationDate))/86400) 
+            else null end as RepPerDay,
+        row_number() over (order by u.Reputation desc nulls last) as RepRank
+    from Users u
+),
+TopUsers as (
+    select UserId, DisplayName, Reputation, RepPerDay, RepRank
+    from UserActivity
+    where RepRank <= 100
+),
+PostStats as (
+    select 
+        p.OwnerUserId as UserId,
+        count(*) filter (where p.PostTypeId = 1) as TotalQuestions,
+        count(*) filter (where p.PostTypeId = 2) as TotalAnswers,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgScore,
+        sum(case when p.AcceptedAnswerId is not null then 1 else 0 end) filter (where p.PostTypeId = 1) as QuestionsWithAcceptedAnswer,
+        count(distinct p.Id) as TotalPosts
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId != -1
+    group by p.OwnerUserId
+),
+UserBadges as (
+    select 
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges
+    from Badges b
+    group by b.UserId
+),
+UserComments as (
+    select 
+        c.UserId,
+        count(*) as TotalComments,
+        avg(c.Score) as AvgCommentScore,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+PostLinkInfo as (
+    select
+        p.OwnerUserId as UserId,
+        count(pl.Id) filter (where pl.LinkTypeId = 1) as LinkedPostsCount,
+        count(pl.Id) filter (where pl.LinkTypeId = 3) as DuplicatePostsCount
+    from PostLinks pl
+    join Posts p on pl.PostId = p.Id
+    where p.OwnerUserId is not null and p.OwnerUserId != -1
+    group by p.OwnerUserId
+),
+AggregatedUserData as (
+    select 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        coalesce(ps.TotalQuestions,0) as Questions,
+        coalesce(ps.TotalAnswers,0) as Answers,
+        coalesce(ps.AvgScore,0) as AveragePostScore,
+        coalesce(ps.QuestionsWithAcceptedAnswer,0) as AcceptedAnswers,
+        coalesce(ub.GoldBadges,0) as GoldBadges,
+        coalesce(ub.SilverBadges,0) as SilverBadges,
+        coalesce(ub.BronzeBadges,0) as BronzeBadges,
+        coalesce(uc.TotalComments,0) as Comments,
+        coalesce(pl.LinkedPostsCount,0) as LinkedPosts,
+        coalesce(pl.DuplicatePostsCount,0) as DuplicatePosts,
+        tu.RepPerDay,
+        tu.RepRank,
+        -- ratio calculations with NULL safety
+        case when ps.TotalQuestions > 0 then ps.QuestionsWithAcceptedAnswer::decimal / ps.TotalQuestions else null end as AcceptRate,
+        case when ub.GoldBadges + ub.SilverBadges + ub.BronzeBadges > 0 then 
+            round((ub.GoldBadges * 3 + ub.SilverBadges * 2 + ub.BronzeBadges) * 1.0 / 
+            (ub.GoldBadges + ub.SilverBadges + ub.BronzeBadges), 2)
+        else null end as WeightedBadgeScore
+    from TopUsers tu
+    left join PostStats ps on ps.UserId = tu.UserId
+    left join UserBadges ub on ub.UserId = tu.UserId
+    left join UserComments uc on uc.UserId = tu.UserId
+    left join PostLinkInfo pl on pl.UserId = tu.UserId
+),
+FinalRanking as (
+    select
+        Aud.*,
+        rank() over (order by Aud.Reputation desc, Aud.WeightedBadgeScore desc nulls last, Aud.Comments desc nulls last) as FinalRank,
+        -- string concatenations and conditional expressions
+        case 
+            when Aud.AcceptRate is not null and Aud.AcceptRate > 0.8 then 'Excellent'
+            when Aud.AcceptRate >= 0.5 then 'Good'
+            else 'Needs Improvement'
+        end as AcceptRateCategory,
+        'User: ' || coalesce(Aud.DisplayName, 'Unknown') || ', ' ||
+        'Reputation: ' || Aud.Reputation || ', ' ||
+        'Q: ' || Aud.Questions || ', ' ||
+        'A: ' || Aud.Answers || ', ' ||
+        'Badges (G/S/B): ' || Aud.GoldBadges || '/' || Aud.SilverBadges || '/' || Aud.BronzeBadges as UserSummary
+    from AggregatedUserData Aud
+)
+select 
+    f.FinalRank,
+    f.UserId,
+    f.DisplayName,
+    f.Reputation,
+    round(f.RepPerDay,2) as ReputationPerDay,
+    f.Questions,
+    f.Answers,
+    round(f.AveragePostScore,2) as AveragePostScore,
+    f.AcceptedAnswers,
+    round(f.AcceptRate*100,2) as AcceptRatePercent,
+    f.AcceptRateCategory,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    round(f.WeightedBadgeScore,2) as BadgeScore,
+    f.Comments,
+    f.LinkedPosts,
+    f.DuplicatePosts,
+    f.UserSummary
+from FinalRanking f
+where f.FinalRank <= 20
+order by f.FinalRank
+union
+select 
+    null as FinalRank,
+    u.Id as UserId,
+    'Anonymous' as DisplayName,
+    0 as Reputation,
+    null as ReputationPerDay,
+    0 as Questions,
+    0 as Answers,
+    null as AveragePostScore,
+    0 as AcceptedAnswers,
+    null as AcceptRatePercent,
+    'NoData' as AcceptRateCategory,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    null as BadgeScore,
+    0 as Comments,
+    0 as LinkedPosts,
+    0 as DuplicatePosts,
+    'Anonymous user with no data' as UserSummary
+from Users u
+where u.Id not in (select UserId from TopUsers)
+order by FinalRank nulls last, UserId
+limit 25;

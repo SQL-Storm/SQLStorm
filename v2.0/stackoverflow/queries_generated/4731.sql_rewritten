@@ -1,0 +1,215 @@
+-- {"query": "4731.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2253} 
+WITH
+  QuestionMetrics AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount AS QuestionViewCount,
+      p.ClosedDate,
+      DATEDIFF(day, p.CreationDate, COALESCE(p.ClosedDate, cast('2024-10-01 12:34:56' as timestamp))) AS DaysSinceCreationOrClose,
+      LEN(p.Tags) AS TagLength,
+      CASE
+        WHEN p.FavoriteCount > 100 THEN 'Very Popular'
+        WHEN p.FavoriteCount > 50 THEN 'Popular'
+        ELSE 'Standard'
+      END AS PopularityBucket,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS QuestionSequenceForUser,
+      AVG(CAST(c.Score AS FLOAT)) OVER (PARTITION BY p.Id) AS AvgCommentScoreOnQuestion,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 1 THEN 1 ELSE 0 END) AS InitialTitleEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 ELSE 0 END) AS TitleEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS BodyEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 6 THEN 1 ELSE 0 END) AS TagEdits,
+      COUNT(DISTINCT c.Id) AS CommentCountOnQuestion
+    FROM Posts AS p
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    LEFT JOIN PostHistory AS ph
+      ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (1, 4, 5, 6)
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount,
+      p.ClosedDate,
+      LEN(p.Tags)
+  ),
+  AnswerMetrics AS (
+    SELECT
+      a.Id AS AnswerId,
+      a.ParentId AS QuestionId,
+      a.OwnerUserId,
+      a.CreationDate AS AnswerCreationDate,
+      a.Score AS AnswerScore,
+      a.CommentCount AS AnswerCommentCount,
+      ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRankForQuestion,
+      CASE
+        WHEN a.Score > 10 THEN 'Highly Rated'
+        WHEN a.Score > 0 THEN 'Rated'
+        ELSE 'Unrated'
+      END AS AnswerRating,
+      COUNT(DISTINCT ac.Id) AS CommentCountOnAnswer
+    FROM Posts AS a
+    LEFT JOIN Comments AS ac
+      ON a.Id = ac.PostId
+    WHERE
+      a.PostTypeId = 2
+    GROUP BY
+      a.Id,
+      a.ParentId,
+      a.OwnerUserId,
+      a.CreationDate,
+      a.Score,
+      a.CommentCount
+  ),
+  UserContribution AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT qm.QuestionId) AS QuestionsAsked,
+      SUM(qm.AnswerCount) AS TotalAnswersOnQuestions,
+      COUNT(DISTINCT am.AnswerId) AS AnswersGiven,
+      SUM(CASE WHEN am.AnswerScore > 0 THEN 1 ELSE 0 END) AS PositiveScoreAnswers,
+      SUM(CASE WHEN am.AnswerScore < 0 THEN 1 ELSE 0 END) AS NegativeScoreAnswers,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      MAX(CASE WHEN b.Name LIKE '%gold%' THEN 1 ELSE 0 END) AS HasGoldBadge,
+      MAX(CASE WHEN b.Name LIKE '%silver%' THEN 1 ELSE 0 END) AS HasSilverBadge,
+      MAX(CASE WHEN b.Name LIKE '%bronze%' THEN 1 ELSE 0 END) AS HasBronzeBadge
+    FROM Users AS u
+    LEFT JOIN QuestionMetrics AS qm
+      ON u.Id = qm.OwnerUserId
+    LEFT JOIN AnswerMetrics AS am
+      ON u.Id = am.OwnerUserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  PostLinkAnalysis AS (
+    SELECT
+      pl.PostId,
+      pl.RelatedPostId,
+      lt.Name AS LinkType,
+      DATEDIFF(day, pl.CreationDate, COALESCE(p.ClosedDate, cast('2024-10-01 12:34:56' as timestamp))) AS DaysSinceLinkCreationOrPostClose
+    FROM PostLinks AS pl
+    JOIN LinkTypes AS lt
+      ON pl.LinkTypeId = lt.Id
+    LEFT JOIN Posts AS p
+      ON pl.PostId = p.Id
+    WHERE
+      lt.Name = 'Duplicate'
+  )
+SELECT
+  qm.QuestionId,
+  qm.Title,
+  qm.QuestionCreationDate,
+  qm.QuestionScore,
+  qm.AnswerCount,
+  qm.FavoriteCount,
+  qm.QuestionViewCount,
+  qm.ClosedDate,
+  qm.DaysSinceCreationOrClose,
+  qm.PopularityBucket,
+  qm.AvgCommentScoreOnQuestion,
+  qm.CommentCountOnQuestion,
+  qm.InitialTitleEdits,
+  qm.TitleEdits,
+  qm.BodyEdits,
+  qm.TagEdits,
+  am.AnswerId,
+  am.AnswerScore,
+  am.AnswerRankForQuestion,
+  am.AnswerRating,
+  am.CommentCountOnAnswer,
+  uc.DisplayName AS QuestionOwnerDisplayName,
+  uc.Reputation AS QuestionOwnerReputation,
+  uc.UserCreationDate AS QuestionOwnerCreationDate,
+  uc.QuestionsAsked AS QuestionOwnerTotalQuestions,
+  uc.AnswersGiven AS QuestionOwnerTotalAnswers,
+  uc.BadgeCount AS QuestionOwnerTotalBadges,
+  CASE
+    WHEN qm.AnswerCount > 0 AND am.AnswerScore >= qm.QuestionScore THEN 'Accepted Answer High Score'
+    WHEN qm.AnswerCount > 0 AND am.AnswerId = p_accepted.AcceptedAnswerId THEN 'Is Accepted Answer'
+    WHEN am.AnswerScore < 0 THEN 'Negative Score Answer'
+    ELSE 'Other Answer'
+  END AS AnswerStatus,
+  ploa.LinkType AS DuplicateLinkType,
+  ploa.DaysSinceLinkCreationOrPostClose AS DaysSinceDuplicateLink,
+  CASE WHEN qm.Title LIKE '%[?]' THEN 'Ends with Question Mark' ELSE 'Does not end with Question Mark' END AS TitleEndsWithQuestionMark,
+  COALESCE(qm.QuestionScore, 0) + COALESCE(qm.AnswerCount, 0) * 5 AS WeightedScore,
+  NULLIF(qm.QuestionViewCount, 0) AS NonZeroViewCount,
+  CASE WHEN qm.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus
+FROM QuestionMetrics AS qm
+LEFT JOIN AnswerMetrics AS am
+  ON qm.QuestionId = am.QuestionId
+LEFT JOIN UserContribution AS uc
+  ON qm.OwnerUserId = uc.UserId
+LEFT JOIN Posts AS p_accepted
+  ON qm.QuestionId = p_accepted.Id
+LEFT JOIN PostLinkAnalysis AS ploa
+  ON qm.QuestionId = ploa.PostId
+WHERE
+  qm.QuestionSequenceForUser <= 5 -- Consider top 5 questions per user
+  AND qm.QuestionScore > -5 -- Filter out very poorly scored questions
+  AND (
+    qm.AnswerCount IS NULL OR qm.AnswerCount < 20
+  ) -- Limit questions with high answer counts for performance
+  AND qm.QuestionOwnerReputation > 100 -- Filter for users with some reputation
+  AND qm.Title NOT LIKE '%SQL%' -- Exclude posts containing 'SQL' in title for demonstration
+UNION
+SELECT
+  NULL AS QuestionId,
+  NULL AS Title,
+  NULL AS QuestionCreationDate,
+  NULL AS QuestionScore,
+  NULL AS AnswerCount,
+  NULL AS FavoriteCount,
+  NULL AS QuestionViewCount,
+  NULL AS ClosedDate,
+  NULL AS DaysSinceCreationOrClose,
+  NULL AS PopularityBucket,
+  NULL AS AvgCommentScoreOnQuestion,
+  NULL AS CommentCountOnQuestion,
+  NULL AS InitialTitleEdits,
+  NULL AS TitleEdits,
+  NULL AS BodyEdits,
+  NULL AS TagEdits,
+  am.AnswerId,
+  am.AnswerScore,
+  am.AnswerRankForQuestion,
+  am.AnswerRating,
+  am.CommentCountOnAnswer,
+  uc.DisplayName AS QuestionOwnerDisplayName,
+  uc.Reputation AS QuestionOwnerReputation,
+  uc.UserCreationDate AS QuestionOwnerCreationDate,
+  uc.QuestionsAsked AS QuestionOwnerTotalQuestions,
+  uc.AnswersGiven AS QuestionOwnerTotalAnswers,
+  uc.BadgeCount AS QuestionOwnerTotalBadges,
+  'Orphan Answer' AS AnswerStatus,
+  NULL AS DuplicateLinkType,
+  NULL AS DaysSinceDuplicateLink,
+  NULL AS TitleEndsWithQuestionMark,
+  am.AnswerScore AS WeightedScore,
+  NULL AS NonZeroViewCount,
+  'N/A' AS PostStatus
+FROM AnswerMetrics AS am
+LEFT JOIN UserContribution AS uc
+  ON am.OwnerUserId = uc.UserId
+WHERE
+  am.QuestionId IS NULL -- Answers without a corresponding question
+  AND am.AnswerScore > 5;

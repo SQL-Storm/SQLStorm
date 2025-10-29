@@ -1,0 +1,111 @@
+-- {"query": "3570.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1766} 
+
+/*  Benchmark query:  rich analytics on Users, Posts, Badges, and Tags */
+WITH
+/* 1️⃣ Aggregate per‑user statistics */
+user_stats AS (
+    SELECT
+        u.id                                     AS user_id,
+        u.displayname                            AS display_name,
+        u.reputation,
+        COALESCE(bc.total_badges,0)               AS total_badges,
+        COALESCE(qc.question_cnt,0)               AS question_cnt,
+        COALESCE(ac.answer_cnt,0)                 AS answer_cnt,
+        COALESCE(sc.avg_score,0)                  AS avg_score,
+        ROW_NUMBER() OVER (ORDER BY u.reputation DESC) AS rank
+    FROM users u
+    LEFT JOIN (
+        SELECT userid, COUNT(*) AS total_badges
+        FROM badges
+        GROUP BY userid
+    ) bc ON bc.userid = u.id
+    LEFT JOIN (
+        SELECT owneruserid, COUNT(*) AS question_cnt
+        FROM posts
+        WHERE posttypeid = 1               -- questions
+        GROUP BY owneruserid
+    ) qc ON qc.owneruserid = u.id
+    LEFT JOIN (
+        SELECT owneruserid, COUNT(*) AS answer_cnt
+        FROM posts
+        WHERE posttypeid = 2               -- answers
+        GROUP BY owneruserid
+    ) ac ON ac.owneruserid = u.id
+    LEFT JOIN (
+        SELECT owneruserid, AVG(score)::numeric AS avg_score
+        FROM posts
+        WHERE score IS NOT NULL
+        GROUP BY owneruserid
+    ) sc ON sc.owneruserid = u.id
+    WHERE u.reputation IS NOT NULL
+),
+
+/* 2️⃣ Most recent post (question or answer) per user */
+recent_post AS (
+    SELECT
+        p.owneruserid,
+        p.id               AS post_id,
+        p.title,
+        p.creationdate,
+        ROW_NUMBER() OVER (PARTITION BY p.owneruserid ORDER BY p.creationdate DESC) AS rn
+    FROM posts p
+    WHERE p.posttypeid IN (1,2)           -- Q or A
+),
+
+/* 3️⃣ Tag popularity – only tags used on ≥ 10 posts */
+tag_pop AS (
+    SELECT
+        t.tagname,
+        COUNT(p.id)                               AS post_cnt,
+        SUM(p.score)                              AS total_score,
+        MAX(p.creationdate)                       AS latest_use,
+        ROW_NUMBER() OVER (ORDER BY COUNT(p.id) DESC) AS tag_rank
+    FROM tags t
+    JOIN LATERAL (
+        SELECT id, score, creationdate
+        FROM posts
+        WHERE tags LIKE CONCAT('%<', t.tagname, '>%')
+    ) p ON true
+    GROUP BY t.tagname
+    HAVING COUNT(p.id) >= 10
+),
+
+/* 4️⃣ Union of two derived sets to stress set operators */
+set_union AS (
+    SELECT user_id, display_name, reputation, total_badges,
+           question_cnt, answer_cnt, avg_score, rank,
+           NULL::int          AS post_id,
+           NULL::varchar(300)::text AS recent_title,
+           NULL::timestamp   AS recent_date,
+           NULL::varchar(35) AS top_tag,
+           NULL::int         AS tag_post_cnt,
+           NULL::bigint      AS tag_total_score
+    FROM user_stats
+    WHERE rank <= 50
+
+    UNION ALL
+
+    SELECT
+        NULL::int,
+        NULL::varchar(40),
+        NULL::int,
+        NULL::int,
+        NULL::int,
+        NULL::int,
+        NULL::numeric,
+        NULL::int,
+        NULL::int,
+        NULL::text,
+        NULL::timestamp,
+        tp.tagname,
+        tp.post_cnt,
+        tp.total_score
+    FROM tag_pop tp
+    WHERE tp.tag_rank <= 50
+)
+
+SELECT *
+FROM set_union
+ORDER BY
+    COALESCE(rank, 999999),            -- users first, then tags
+    COALESCE(tag_rank, 999999);

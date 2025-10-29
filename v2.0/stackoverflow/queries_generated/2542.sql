@@ -1,0 +1,169 @@
+-- {"query": "2542.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1555} 
+with RecursiveUserActivity AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        row_number() over (partition by u.Id order by p.CreationDate desc nulls last) as RecentPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+),
+FilteredPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        u.Reputation as OwnerReputation
+    from Posts p
+    join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1,2) and p.Score >= 5
+),
+AnswerCounts as (
+    select
+        ParentId,
+        count(*) as AnswerCount,
+        sum(case when Score >= 10 then 1 else 0 end) as HighScoreAnswers
+    from Posts
+    where PostTypeId = 2
+    group by ParentId
+),
+BadgeSummary as (
+    select
+        UserId,
+        count(*) as TotalBadges,
+        count(case when Class = 1 then 1 else null end) as GoldBadges,
+        count(case when Class = 2 then 1 else null end) as SilverBadges,
+        count(case when Class = 3 then 1 else null end) as BronzeBadges
+    from Badges
+    group by UserId
+),
+PostLinksSummary as (
+    select
+        pl.PostId,
+        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId else null end) as DuplicateLinks,
+        count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId else null end) as LinkedPosts
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+CloseReasonCounts as (
+    select
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseEvents,
+        count(distinct ph.Comment) filter (where ph.PostHistoryTypeId = 10) as DistinctCloseReasons
+    from PostHistory ph
+    group by ph.PostId
+),
+UserActivityRanked as (
+    select
+        aua.UserId,
+        aua.DisplayName,
+        aua.Reputation,
+        aua.PostId,
+        aua.PostTypeId,
+        aua.Score,
+        aua.ViewCount,
+        aua.Tags,
+        aua.RecentPostRank,
+        row_number() over (partition by aua.UserId order by aua.Score desc, aua.ViewCount desc nulls last) as PostScoreRank
+    from RecursiveUserActivity aua
+    where aua.RecentPostRank <= 5
+),
+PostWithCloseReason as (
+    select
+        fp.*,
+        crc.CloseEvents,
+        crc.DistinctCloseReasons,
+        coalesce(pls.DuplicateLinks, 0) as DuplicateLinks,
+        coalesce(pls.LinkedPosts, 0) as LinkedPosts,
+        coalesce(ac.AnswerCount, 0) as AnswerCount,
+        coalesce(ac.HighScoreAnswers, 0) as HighScoreAnswers,
+        coalesce(bs.TotalBadges, 0) as UserBadges,
+        coalesce(bs.GoldBadges, 0) as GoldBadges,
+        coalesce(bs.SilverBadges, 0) as SilverBadges,
+        coalesce(bs.BronzeBadges, 0) as BronzeBadges
+    from FilteredPosts fp
+    left join CloseReasonCounts crc on crc.PostId = fp.Id
+    left join PostLinksSummary pls on pls.PostId = fp.Id
+    left join AnswerCounts ac on ac.ParentId = fp.Id
+    left join BadgeSummary bs on bs.UserId = fp.OwnerUserId
+)
+select
+    p.Id as QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    u.DisplayName as OwnerDisplayName,
+    p.Reputation as OwnerReputation,
+    p.Score as QuestionScore,
+    p.ViewCount,
+    p.AnswerCount,
+    p.HighScoreAnswers,
+    p.DuplicateLinks,
+    p.LinkedPosts,
+    p.CloseEvents,
+    p.DistinctCloseReasons,
+    p.UserBadges,
+    p.GoldBadges,
+    p.SilverBadges,
+    p.BronzeBadges,
+    string_agg(distinct regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'), ',' order by 1) as TagList,
+    max(case when v.VoteTypeId = 2 then 1 else 0 end) as HasUpVotes,
+    (select count(*) from Comments c where c.PostId = p.Id and c.Score > 0) as PositiveCommentCount,
+    row_number() over (order by p.Score desc, p.ViewCount desc nulls last) as RankByScoreView,
+    percentile_cont(0.5) within group (order by p.Score) over () as MedianScore,
+    bool_or(p.AcceptedAnswerId is not null) over () as HasAcceptedAnswerAny,
+    case
+        when p.Score > percentile_cont(0.9) within group (order by p.Score) over () then 'Top 10%'
+        else 'Others'
+    end as ScorePercentileCategory
+from PostWithCloseReason p
+join Users u on u.Id = p.OwnerUserId
+left join Votes v on v.PostId = p.Id
+where p.AnswerCount > 0
+group by p.Id, p.Title, p.OwnerUserId, u.DisplayName, p.Reputation, p.Score, p.ViewCount, p.AnswerCount, p.HighScoreAnswers,
+    p.DuplicateLinks, p.LinkedPosts, p.CloseEvents, p.DistinctCloseReasons, p.UserBadges, p.GoldBadges, p.SilverBadges, p.BronzeBadges, p.AcceptedAnswerId
+having p.CloseEvents is null or p.CloseEvents = 0
+union
+select
+    u.Id as QuestionId,
+    null::varchar(300) as Title,
+    u.Id as OwnerUserId,
+    u.DisplayName,
+    u.Reputation,
+    0 as QuestionScore,
+    0 as ViewCount,
+    0 as AnswerCount,
+    0 as HighScoreAnswers,
+    0 as DuplicateLinks,
+    0 as LinkedPosts,
+    0 as CloseEvents,
+    0 as DistinctCloseReasons,
+    0 as UserBadges,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    null::text as TagList,
+    0 as HasUpVotes,
+    0 as PositiveCommentCount,
+    null::int as RankByScoreView,
+    null::double precision as MedianScore,
+    false as HasAcceptedAnswerAny,
+    'UserOnly' as ScorePercentileCategory
+from Users u
+where not exists (
+    select 1 from Posts p where p.OwnerUserId = u.Id
+)
+order by RankByScoreView nulls last, OwnerReputation desc, QuestionId limit 100;

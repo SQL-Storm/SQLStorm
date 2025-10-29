@@ -1,0 +1,89 @@
+WITH RankedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+UserAnswerStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(a.Id) AS TotalAnswers,
+        AVG(a.Score) AS AverageAnswerScore,
+        SUM(CASE WHEN a.Score > 10 THEN 1 ELSE 0 END) AS HighScoreAnswers
+    FROM Users u
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    GROUP BY u.Id, u.DisplayName
+),
+RecentEdits AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY ph.PostId
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT
+    rq.QuestionId,
+    rq.Title AS QuestionTitle,
+    u.DisplayName AS QuestionOwnerDisplayName,
+    uas.TotalAnswers,
+    uas.AverageAnswerScore,
+    COALESCE(ubc.GoldBadges, 0) AS UserGoldBadges,
+    COALESCE(ubc.SilverBadges, 0) AS UserSilverBadges,
+    COALESCE(ubc.BronzeBadges, 0) AS UserBronzeBadges,
+    CASE
+        WHEN rq.rn = 1 THEN 'Most Recent Question'
+        ELSE 'Other Question'
+    END AS QuestionRecency,
+    REPLACE(REPLACE(p.Tags, '><', '|'), '<', '') AS FormattedTags,
+    REPLACE(REPLACE(p.Title, '?', '!'), '&', 'and') AS ModifiedTitle,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Score AS QuestionScore,
+    CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+    END AS PostStatus,
+    re.EditCount,
+    re.LastEditDate,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score < 0) AS NegativeScoreComments,
+    (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+    CASE
+        WHEN p.OwnerUserId = -1 THEN 'Community User'
+        ELSE LOWER(u.DisplayName)
+    END AS OwnerIdentifier,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) THEN 'Is Duplicate'
+        ELSE 'Not A Duplicate'
+    END AS DuplicateStatus,
+    p.CreationDate
+FROM RankedQuestions rq
+JOIN Posts p ON rq.QuestionId = p.Id
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN UserAnswerStats uas ON u.Id = uas.UserId
+LEFT JOIN UserBadgeCounts ubc ON u.Id = ubc.UserId
+LEFT JOIN RecentEdits re ON p.Id = re.PostId
+WHERE rq.rn <= 5
+  AND p.CreationDate > (cast('2024-10-01' as date) - INTERVAL '1 year')
+  AND p.Score > 5
+ORDER BY p.CreationDate DESC, p.Score DESC
+LIMIT 100;

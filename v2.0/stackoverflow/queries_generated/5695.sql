@@ -1,0 +1,140 @@
+-- {"query": "5695.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1009} 
+WITH RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.Views,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.PostTypeId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.CommentCount,
+    p.FavoriteCount,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.Location,
+    u.Views AS UserViews,
+    u.UpVotes,
+    u.DownVotes,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY
+        p.Score DESC,
+        p.ViewCount DESC NULLS LAST,
+        p.CreationDate ASC
+    ) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId IN (1,2) -- Questions and Answers
+    AND p.CreationDate >= NOW() - INTERVAL '2 years'
+),
+Filtered AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.Tags,
+    rp.CreationDate,
+    rp.Score,
+    rp.Views,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    rp.Reputation,
+    rp.Location,
+    rp.UserViews,
+    rp.UpVotes,
+    rp.DownVotes,
+    rp.ParentId,
+    rp.AcceptedAnswerId,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.LastActivityDate,
+    rp.PostTypeId,
+    CASE
+      WHEN rp.PostTypeId = 1 THEN 'Question'
+      WHEN rp.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END AS PostKind
+  FROM RankedPosts rp
+  WHERE rp.rn = 1
+    OR (rp.Score > 0 AND rp.Views > 100)
+),
+Aggregates AS (
+  SELECT
+    f.PostId,
+    f.Title,
+    f.PostKind,
+    f.CreationDate,
+    f.LastActivityDate,
+    f.Score,
+    f.Views,
+    f.CommentCount,
+    f.FavoriteCount,
+    f.OwnerUserId,
+    f.OwnerDisplayName,
+    f.Reputation,
+    f.Location,
+    f.UserViews,
+    f.UpVotes,
+    f.DownVotes,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = f.PostId) AS CommentCountFromComments,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = f.PostId AND v.VoteTypeId = 2) AS UpvotesFromVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = f.PostId AND v.VoteTypeId = 3) AS DownvotesFromVotes,
+    (SELECT STRING_AGG(CONCAT('User:', u1.DisplayName, '->', v1.VoteTypeId), ';')
+     FROM Votes v1
+     JOIN Users u1 ON v1.UserId = u1.Id
+     WHERE v1.PostId = f.PostId) AS VotesSummary
+  FROM Filtered f
+),
+Windowed AS (
+  SELECT
+    a.*,
+    MIN(a.Score) OVER (PARTITION BY a.OwnerUserId) AS MinScoreForAuthor,
+    MAX(a.LastActivityDate) OVER (PARTITION BY a.OwnerUserId) AS LastActivityForAuthor,
+    SUM(a.Views) OVER (PARTITION BY a.OwnerUserId) AS CumulativeViewsByAuthor
+  FROM Aggregates a
+),
+Complex AS (
+  SELECT
+    w.PostId,
+    w.Title,
+    w.PostKind,
+    w.CreationDate,
+    w.LastActivityDate,
+    w.Score,
+    w.Views,
+    w.CommentCount,
+    w.FavoriteCount,
+    w.OwnerUserId,
+    w.OwnerDisplayName,
+    w.Reputation,
+    w.Location,
+    w.UserViews,
+    w.UpVotes,
+    w.DownVotes,
+    w.CommentCountFromComments,
+    w.UpvotesFromVotes,
+    w.DownvotesFromVotes,
+    w.VotesSummary,
+    w.MinScoreForAuthor,
+    w.LastActivityForAuthor,
+    w.CumulativeViewsByAuthor,
+    CASE
+      WHEN w.Views > 1000 THEN 'HeavyTraffic'
+      WHEN w.Views BETWEEN 100 AND 1000 THEN 'ModerateTraffic'
+      ELSE 'LightTraffic'
+    END AS TrafficBand,
+    SUBSTRING(w.Title FROM 1 FOR 50) AS TitleSnippet,
+    CONCAT_WS(' | ', w.OwnerDisplayName, w.Reputation, w.Location) AS OwnerMeta,
+    -- Example complex numeric expression
+    (w.Score * 2 + w.Views / NULLIF(w.CommentCount + 1, 0))::bigint AS ScoreWeight
+  FROM Windowed w
+)
+SELECT
+  *
+FROM Complex
+ORDER BY LastActivityDate DESC
+LIMIT 100;

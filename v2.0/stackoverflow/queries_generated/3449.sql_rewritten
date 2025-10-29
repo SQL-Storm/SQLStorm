@@ -1,0 +1,173 @@
+-- {"query": "3449.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2947} 
+WITH
+    /*  Basic per‑user aggregates  */
+    user_stats AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate,
+            u.LastAccessDate,
+            COALESCE(u.Views,0)                     AS total_views,
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id)                AS total_posts,
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id
+                                         AND p.PostTypeId = 1)                       AS question_count,
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id
+                                         AND p.PostTypeId = 2)                       AS answer_count,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1)    AS gold_badges,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2)    AS silver_badges,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3)    AS bronze_badges,
+            (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id
+                                         AND v.VoteTypeId = 2)                       AS upvotes_given,
+            (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id
+                                         AND v.VoteTypeId = 3)                       AS downvotes_given
+        FROM Users u
+    ),
+
+    /*  Net score per user calculated from votes on his/her posts  */
+    post_scores AS (
+        SELECT
+            p.OwnerUserId                               AS user_id,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+                     WHEN v.VoteTypeId = 3 THEN -1
+                     ELSE 0 END)                         AS net_score,
+            COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS favorites_received,
+            MAX(p.CreationDate)                         AS latest_post_date
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+
+    /*  Tag usage per user (questions only)  */
+    tag_activity AS (
+        SELECT
+            q.OwnerUserId                                   AS user_id,
+            STRING_AGG(DISTINCT t.TagName, ',')
+                FILTER (WHERE t.TagName IS NOT NULL)        AS tags_used,
+            COUNT(DISTINCT t.Id)                           AS distinct_tags
+        FROM Posts q
+        JOIN LATERAL
+            unnest(string_to_array(
+                substring(q.Tags, 2, length(q.Tags)-2), '><')) AS tag(tagname)
+            ON TRUE
+        JOIN Tags t ON t.TagName = tag.tagname
+        WHERE q.PostTypeId = 1               -- only questions
+          AND q.OwnerUserId IS NOT NULL
+        GROUP BY q.OwnerUserId
+    ),
+
+    /*  Votes cast by the user in the last 30 days  */
+    recent_votes AS (
+        SELECT
+            v.UserId                                         AS user_id,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 2
+                              AND v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')
+                                                            AS upvotes_last_30d,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 3
+                              AND v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')
+                                                            AS downvotes_last_30d
+        FROM Votes v
+        WHERE v.UserId IS NOT NULL
+        GROUP BY v.UserId
+    ),
+
+    /*  Combine everything and add window functions / derived columns  */
+    combined AS (
+        SELECT
+            us.Id,
+            us.DisplayName,
+            us.Reputation,
+            us.total_views,
+            us.total_posts,
+            us.question_count,
+            us.answer_count,
+            us.gold_badges,
+            us.silver_badges,
+            us.bronze_badges,
+            COALESCE(ps.net_score,0)                AS net_score,
+            COALESCE(ps.favorites_received,0)       AS favorites_received,
+            COALESCE(ps.latest_post_date, us.CreationDate) AS last_activity,
+            COALESCE(ta.tags_used,'')               AS tags_used,
+            COALESCE(ta.distinct_tags,0)            AS distinct_tags,
+            COALESCE(rv.upvotes_last_30d,0)         AS upvotes_last_30d,
+            COALESCE(rv.downvotes_last_30d,0)       AS downvotes_last_30d,
+            ROW_NUMBER() OVER (ORDER BY us.Reputation DESC,
+                                          ps.net_score DESC NULLS LAST) AS reputation_rank,
+            CASE
+                WHEN us.Reputation > 20000 THEN 'Elite'
+                WHEN us.Reputation > 10000 THEN 'Pro'
+                WHEN us.Reputation > 5000  THEN 'Advanced'
+                ELSE 'Member'
+            END                                     AS reputation_tier,
+            /*  Complex expression mixing strings, null‑logic and arithmetic  */
+            CASE
+                WHEN us.gold_badges + us.silver_badges + us.bronze_badges = 0
+                     THEN NULL
+                ELSE CONCAT('B:', us.gold_badges,
+                            '|S:', us.silver_badges,
+                            '|B:', us.bronze_badges)
+            END                                     AS badge_summary
+        FROM user_stats us
+        LEFT JOIN post_scores ps  ON ps.user_id = us.Id
+        LEFT JOIN tag_activity ta ON ta.user_id = us.Id
+        LEFT JOIN recent_votes rv ON rv.user_id = us.Id
+    )
+
+/*  Final result set: elite & pro users plus a summary row using UNION ALL  */
+SELECT
+    Id,
+    DisplayName,
+    Reputation,
+    total_views,
+    total_posts,
+    question_count,
+    answer_count,
+    gold_badges,
+    silver_badges,
+    bronze_badges,
+    net_score,
+    favorites_received,
+    last_activity,
+    tags_used,
+    distinct_tags,
+    upvotes_last_30d,
+    downvotes_last_30d,
+    reputation_rank,
+    reputation_tier,
+    badge_summary
+FROM combined
+WHERE reputation_tier IN ('Elite','Pro')
+  AND (upvotes_last_30d + downvotes_last_30d) > 0
+  AND (tags_used <> '' OR distinct_tags > 0)
+ORDER BY reputation_rank
+LIMIT 100
+
+UNION ALL
+
+/*  Aggregated summary row (uses window functions again) */
+SELECT
+    NULL                                 AS Id,
+    '--- Summary ---'                    AS DisplayName,
+    NULL                                 AS Reputation,
+    SUM(total_views) OVER ()             AS total_views,
+    SUM(total_posts) OVER ()             AS total_posts,
+    SUM(question_count) OVER ()          AS question_count,
+    SUM(answer_count) OVER ()            AS answer_count,
+    SUM(gold_badges) OVER ()             AS gold_badges,
+    SUM(silver_badges) OVER ()           AS silver_badges,
+    SUM(bronze_badges) OVER ()           AS bronze_badges,
+    SUM(net_score) OVER ()               AS net_score,
+    SUM(favorites_received) OVER ()      AS favorites_received,
+    NULL                                 AS last_activity,
+    NULL                                 AS tags_used,
+    SUM(distinct_tags) OVER ()           AS distinct_tags,
+    SUM(upvotes_last_30d) OVER ()        AS upvotes_last_30d,
+    SUM(downvotes_last_30d) OVER ()      AS downvotes_last_30d,
+    NULL                                 AS reputation_rank,
+    NULL                                 AS reputation_tier,
+    NULL                                 AS badge_summary
+FROM combined
+WHERE reputation_tier IN ('Elite','Pro')
+HAVING COUNT(*) > 0
+ORDER BY reputation_rank DESC;

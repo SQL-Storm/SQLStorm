@@ -1,0 +1,343 @@
+-- {"query": "7704.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3283} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        CASE 
+            WHEN u.Reputation >= 1000000 THEN 'Millionaire'
+            WHEN u.Reputation >= 100000 THEN 'Superuser'
+            WHEN u.Reputation >= 10000 THEN 'Expert'
+            WHEN u.Reputation >= 1000 THEN 'Advanced'
+            WHEN u.Reputation >= 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationTier,
+        AVG(p.Score) as AvgPostScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) as WikiCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        p.Tags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                (SELECT STRING_AGG(tag, ', ') FROM UNNEST(string_to_array(trim(trim(p.Tags, '<'), '>'), '><')) as tag)
+            ELSE NULL 
+        END as ExtractedTags,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.OwnerDisplayName,
+        p.LastEditorUserId,
+        p.LastEditDate,
+        p.LastEditorDisplayName,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END as IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END as IsCommunityOwned,
+        DATEDIFF('day', p.CreationDate, COALESCE(p.ClosedDate, p.LastActivityDate, CURRENT_TIMESTAMP)) as DaysActive,
+        RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as TypeScoreRank
+    FROM Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.Id IS NOT NULL
+    AND (p.Score >= 0 OR p.Score IS NULL)
+),
+TagActivity AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE WHEN t.WikiPostId IS NOT NULL THEN 
+            (SELECT COUNT(*) FROM Posts WHERE Id = t.WikiPostId AND Score > 0)
+        ELSE 0 END as WikiPostScore,
+        CASE WHEN t.ExcerptPostId IS NOT NULL THEN 
+            (SELECT COUNT(*) FROM Posts WHERE Id = t.ExcerptPostId AND Score > 0)
+        ELSE 0 END as ExcerptPostScore,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank,
+        AVG(CASE WHEN t.Count > 0 THEN t.Count ELSE 1 END) OVER () as AvgTagCount
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+ComplexActivity AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.ReputationTier,
+        uas.AvgPostScore,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.WikiCount,
+        pa.PostId,
+        pa.Title,
+        pa.Score as PostScore,
+        pa.ViewCount,
+        pa.AnswerCount as PostAnswerCount,
+        pa.CommentCount as PostCommentCount,
+        pa.FavoriteCount,
+        pa.CreationDate as PostCreationDate,
+        pa.LastActivityDate,
+        pa.PostTypeName,
+        pa.ExtractedTags,
+        pa.IsClosed,
+        pa.IsCommunityOwned,
+        pa.DaysActive,
+        pa.ScoreRank,
+        pa.TypeScoreRank,
+        ta.TagName,
+        ta.TagCount,
+        ta.WikiPostScore,
+        ta.ExcerptPostScore,
+        ta.TagRank,
+        CASE 
+            WHEN uas.PostCount > 0 AND uas.QuestionCount > 0 AND uas.AnswerCount > 0 THEN
+                (uas.QuestionCount * 100.0 / uas.PostCount) as QuestionPercentage
+            ELSE 0
+        END,
+        CASE 
+            WHEN uas.AnswerCount > 0 AND pa.Score > 0 THEN 
+                (pa.Score * 100.0 / (CASE WHEN uas.AvgPostScore > 0 THEN uas.AvgPostScore ELSE 1 END))
+            ELSE 0
+        END as ScoreDeviationPercentage,
+        CASE 
+            WHEN pa.Score > 100 THEN 'HighlyVoted'
+            WHEN pa.Score > 50 THEN 'ModeratelyVoted'
+            WHEN pa.Score > 10 THEN 'LowVoted'
+            ELSE 'MinimalVoted'
+        END as VoteCategory,
+        CASE 
+            WHEN pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts) THEN 'AboveAverageViews'
+            WHEN pa.ViewCount > 0 THEN 'BelowAverageViews'
+            ELSE 'NoViews'
+        END as ViewCategory,
+        CASE 
+            WHEN pa.DaysActive > 365 THEN 'LongTermActive'
+            WHEN pa.DaysActive > 30 THEN 'MidTermActive'
+            WHEN pa.DaysActive > 0 THEN 'ShortTermActive'
+            ELSE 'Inactive'
+        END as ActivityLevel,
+        CASE 
+            WHEN ta.TagCount > 1000 THEN 'PopularTag'
+            WHEN ta.TagCount > 100 THEN 'ModerateTag'
+            WHEN ta.TagCount > 10 THEN 'SmallTag'
+            ELSE 'TinyTag'
+        END as TagPopularity,
+        CASE 
+            WHEN pa.PostType = 'Question' AND pa.AnswerCount > 0 THEN 'AnsweredQuestion' 
+            WHEN pa.PostType = 'Question' AND pa.AnswerCount = 0 THEN 'UnansweredQuestion'
+            WHEN pa.PostType = 'Answer' THEN 'Answer'
+            ELSE 'Other'
+        END as PostCategory,
+        COALESCE(pa.ExtractedTags, 'NoTags') as ProcessedTags,
+        (SELECT COUNT(*) FROM PostHistory ph 
+         WHERE ph.PostId = pa.PostId AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) as EditCount,
+        (SELECT COUNT(*) FROM Comments c 
+         WHERE c.PostId = pa.PostId AND c.Score > 0) as PositiveCommentCount,
+        (SELECT COUNT(*) FROM Votes v 
+         WHERE v.PostId = pa.PostId AND v.VoteTypeId IN (2, 3)) as VoteCount,
+        CASE 
+            WHEN uas.Reputation < 100 AND pa.Score < 0 THEN 'UserLowRepNegativeScore'
+            WHEN uas.Reputation < 100 AND pa.Score >= 0 THEN 'UserLowRepPositiveScore'
+            WHEN uas.Reputation >= 100 AND pa.Score < 0 THEN 'UserHighRepNegativeScore'
+            ELSE 'UserHighRepPositiveScore'
+        END as RepScoreCategory,
+        LAG(pa.Score) OVER (ORDER BY pa.CreationDate) as PreviousScore,
+        LEAD(pa.Score) OVER (ORDER BY pa.CreationDate) as NextScore,
+        ABS(pa.Score - AVG(pa.Score) OVER ()) as ScoreVariance,
+        NTILE(4) OVER (ORDER BY pa.Score) as ScoreQuartile,
+        (SELECT MIN(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = pa.PostId) as FirstEditDate,
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = pa.PostId) as LastEditDate
+    FROM UserActivityStats uas
+    INNER JOIN PostAnalysis pa ON uas.UserId = pa.OwnerUserId
+    LEFT JOIN TagActivity ta ON STRING_TO_ARRAY(UPPER(pa.ExtractedTags), ',') && 
+        ARRAY(SELECT UPPER(ta.TagName) FROM TagActivity ta WHERE ta.TagCount > 0)
+    WHERE uas.UserId IS NOT NULL
+),
+FinalAggregation AS (
+    SELECT 
+        ComplexActivity.UserId,
+        ComplexActivity.DisplayName,
+        ComplexActivity.Reputation,
+        ComplexActivity.PostCount,
+        ComplexActivity.CommentCount,
+        ComplexActivity.BadgeCount,
+        ComplexActivity.ReputationTier,
+        ComplexActivity.AvgPostScore,
+        ComplexActivity.QuestionCount,
+        ComplexActivity.AnswerCount,
+        ComplexActivity.WikiCount,
+        ComplexActivity.PostId,
+        ComplexActivity.Title,
+        ComplexActivity.PostScore,
+        ComplexActivity.ViewCount,
+        ComplexActivity.PostAnswerCount,
+        ComplexActivity.PostCommentCount,
+        ComplexActivity.FavoriteCount,
+        ComplexActivity.PostCreationDate,
+        ComplexActivity.LastActivityDate,
+        ComplexActivity.PostTypeName,
+        ComplexActivity.ExtractedTags,
+        ComplexActivity.IsClosed,
+        ComplexActivity.IsCommunityOwned,
+        ComplexActivity.DaysActive,
+        ComplexActivity.ScoreRank,
+        ComplexActivity.TypeScoreRank,
+        ComplexActivity.TagName,
+        ComplexActivity.TagCount,
+        ComplexActivity.WikiPostScore,
+        ComplexActivity.ExcerptPostScore,
+        ComplexActivity.TagRank,
+        ComplexActivity.QuestionPercentage,
+        ComplexActivity.ScoreDeviationPercentage,
+        ComplexActivity.VoteCategory,
+        ComplexActivity.ViewCategory,
+        ComplexActivity.ActivityLevel,
+        ComplexActivity.TagPopularity,
+        ComplexActivity.PostCategory,
+        ComplexActivity.ProcessedTags,
+        ComplexActivity.EditCount,
+        ComplexActivity.PositiveCommentCount,
+        ComplexActivity.VoteCount,
+        ComplexActivity.RepScoreCategory,
+        ComplexActivity.PreviousScore,
+        ComplexActivity.NextScore,
+        ComplexActivity.ScoreVariance,
+        ComplexActivity.ScoreQuartile,
+        ComplexActivity.FirstEditDate,
+        ComplexActivity.LastEditDate,
+        ROW_NUMBER() OVER (ORDER BY ComplexActivity.Reputation DESC, ComplexActivity.PostScore DESC) as CombinedRank
+    FROM ComplexActivity
+    WHERE ComplexActivity.UserId IS NOT NULL
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.PostCount,
+    fa.CommentCount,
+    fa.BadgeCount,
+    fa.ReputationTier,
+    fa.AvgPostScore,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.WikiCount,
+    fa.PostId,
+    REPLACE(REPLACE(fa.Title, '<', ''), '>', '') as CleanTitle,
+    fa.PostScore,
+    fa.ViewCount,
+    fa.PostAnswerCount,
+    fa.PostCommentCount,
+    fa.FavoriteCount,
+    fa.PostCreationDate,
+    fa.LastActivityDate,
+    fa.PostTypeName,
+    fa.ExtractedTags,
+    fa.IsClosed,
+    fa.IsCommunityOwned,
+    fa.DaysActive,
+    fa.ScoreRank,
+    fa.TypeScoreRank,
+    fa.TagName,
+    fa.TagCount,
+    fa.WikiPostScore,
+    fa.ExcerptPostScore,
+    fa.TagRank,
+    fa.QuestionPercentage,
+    fa.ScoreDeviationPercentage,
+    fa.VoteCategory,
+    fa.ViewCategory,
+    fa.ActivityLevel,
+    fa.TagPopularity,
+    fa.PostCategory,
+    fa.ProcessedTags,
+    fa.EditCount,
+    fa.PositiveCommentCount,
+    fa.VoteCount,
+    fa.RepScoreCategory,
+    fa.PreviousScore,
+    fa.NextScore,
+    fa.ScoreVariance,
+    fa.ScoreQuartile,
+    fa.FirstEditDate,
+    fa.LastEditDate,
+    ('User_' || CAST(fa.UserId AS VARCHAR) || '_Post_' || CAST(fa.PostId AS VARCHAR)) as UserPostIdentifier,
+    CASE 
+        WHEN fa.PostScore > 0 AND fa.ViewCount > 0 THEN 
+            ROUND((fa.PostScore::DECIMAL / fa.ViewCount::DECIMAL) * 1000, 2)
+        ELSE 0 
+    END as ScorePerView,
+    CASE 
+        WHEN fa.PostCommentCount > 0 THEN 
+            ROUND((fa.PostScore::DECIMAL / fa.PostCommentCount::DECIMAL) * 10, 2)
+        ELSE 0 
+    END as ScorePerComment,
+    CASE 
+        WHEN fa.FavoriteCount > 0 THEN 
+            ROUND((fa.PostScore::DECIMAL / fa.FavoriteCount::DECIMAL), 2)
+        ELSE 0 
+    END as ScorePerFavorite,
+    CONCAT('RepTier:', fa.ReputationTier, '|PostType:', fa.PostTypeName, '|TagPop:', fa.TagPopularity) as MetadataTag,
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT UserId FROM Posts WHERE OwnerUserId = fa.UserId
+        UNION
+        SELECT DISTINCT UserId FROM Comments WHERE UserId = fa.UserId
+        UNION 
+        SELECT DISTINCT UserId FROM Badges WHERE UserId = fa.UserId
+    ) unioned) as TotalUserActivity,
+    CASE 
+        WHEN fa.DaysActive > 90 AND fa.PostCount > 5 AND fa.Reputation > 1000 THEN 'ActiveContributor'
+        WHEN fa.DaysActive > 30 AND fa.PostCount > 2 THEN 'RegularContributor'
+        WHEN fa.DaysActive > 7 AND fa.PostCount > 0 THEN 'OccasionalContributor'
+        ELSE 'InactiveContributor'
+    END as ContributorStatus,
+    ABS(fa.Reputation - (SELECT AVG(Reputation) FROM Users)) as ReputationDeviation,
+    CASE 
+        WHEN fa.PostScore > (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = fa.UserId) THEN 'AboveUserAverage'
+        WHEN fa.PostScore < (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = fa.UserId) THEN 'BelowUserAverage'
+        ELSE 'AtUserAverage'
+    END as UserScoreComparison,
+    CASE 
+        WHEN fa.TagCount > (SELECT AVG(TagCount) FROM TagActivity) THEN 'AboveTagAverage'
+        WHEN fa.TagCount < (SELECT AVG(TagCount) FROM TagActivity) THEN 'BelowTagAverage'
+        ELSE 'AtTagAverage'
+    END as TagCountComparison,
+    (SELECT COUNT(*) FROM PostHistory WHERE PostId = fa.PostId AND PostHistoryTypeId IN (1, 2, 3)) as InitialContentCount,
+    (SELECT STRING_AGG(CAST(VoteId AS VARCHAR), ',') FROM (
+        SELECT Id AS VoteId FROM Votes WHERE PostId = fa.PostId LIMIT 10
+    ) limit_votes) as SampleVoteIds
+FROM FinalAggregation fa
+WHERE fa.UserId IS NOT NULL
+ORDER BY fa.Reputation DESC, fa.PostScore DESC, fa.ViewCount DESC
+LIMIT 5000;

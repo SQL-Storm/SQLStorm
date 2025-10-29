@@ -1,0 +1,222 @@
+-- {"query": "2931.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1905} 
+with recursive TagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as level,
+        array[t.Id] as path
+    from Tags t
+    where t.IsModeratorOnly = 0
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        th.level + 1,
+        th.path || t2.Id
+    from Tags t2
+    join TagHierarchy th on t2.Id <> all(th.path)
+        and t2.Count < th.Count
+        and t2.IsModeratorOnly = 0
+        and t2.Id % 10 = th.level % 10  -- arbitrary condition to generate hierarchy
+),
+UserQuestionStats as (
+    select
+        u.Id as UserId,
+        coalesce(count(distinct p.Id),0) as TotalQuestions,
+        coalesce(sum(p.Score),0) as TotalQuestionScore,
+        coalesce(avg(p.Score),0) as AvgQuestionScore,
+        coalesce(max(p.Score),0) as MaxQuestionScore,
+        coalesce(count(distinct b.Id),0) as TotalBadges,
+        sum(case when b.Class=1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class=2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class=3 then 1 else 0 end) as BronzeBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1 -- questions only
+    left join Badges b on b.UserId = u.Id
+    group by u.Id
+),
+PostWithHistory as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryDate,
+        ph.UserId as EditorUserId,
+        ph.UserDisplayName as EditorDisplayName,
+        ph.Comment,
+        row_number() over(partition by p.Id order by ph.CreationDate desc) as HistOrderDesc
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id
+),
+RecentEdits as (
+    select
+        pwh.PostId,
+        pwh.PostTypeId,
+        pwh.OwnerUserId,
+        pwh.Title,
+        pwh.CreationDate,
+        pwh.PostHistoryTypeId,
+        pwh.HistoryDate,
+        pwh.EditorUserId,
+        pwh.EditorDisplayName,
+        pwh.Comment
+    from PostWithHistory pwh
+    where pwh.HistOrderDesc = 1
+),
+AnswersWithAcceptedFlag as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerOwner,
+        case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAccepted,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate
+    from Posts a
+    join Posts q on q.Id = a.ParentId
+    where a.PostTypeId = 2
+),
+UserAnswerStats as (
+    select
+        u.Id as UserId,
+        count(a.AnswerId) as TotalAnswers,
+        sum(a.AnswerScore) as TotalAnswerScore,
+        sum(a.IsAccepted) as AcceptedAnswersCount,
+        avg(a.AnswerScore) as AvgAnswerScore,
+        max(a.AnswerScore) as MaxAnswerScore
+    from Users u
+    left join AnswersWithAcceptedFlag a on a.AnswerOwner = u.Id
+    group by u.Id
+),
+CombinedUserStats as (
+    select
+        us.UserId,
+        us.TotalQuestions,
+        us.TotalQuestionScore,
+        us.AvgQuestionScore,
+        us.MaxQuestionScore,
+        ua.TotalAnswers,
+        ua.TotalAnswerScore,
+        ua.AcceptedAnswersCount,
+        ua.AvgAnswerScore,
+        ua.MaxAnswerScore,
+        us.TotalBadges,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        case when u.Location is null or trim(u.Location) = '' then 'Unknown' else u.Location end as UserLocation,
+        substring(u.AboutMe from 1 for 100) as AboutSnippet,
+        row_number() over(order by u.Reputation desc) as RepRank
+    from UserQuestionStats us
+    join UserAnswerStats ua on ua.UserId = us.UserId
+    join Users u on u.Id = us.UserId
+),
+TopUsersCTE as (
+    select *
+    from CombinedUserStats
+    where RepRank <= 100
+),
+FilterPostsByTags as (
+    select p.*
+    from Posts p
+    where p.PostTypeId = 1
+      and exists (
+          select 1
+          from Tags t
+          where p.Tags like '%' || '<' || t.TagName || '>' || '%'
+            and t.Count > 1000
+      )
+),
+LinkedDuplicates as (
+    select pl.PostId as OriginalPostId, pl.RelatedPostId as DuplicatePostId, pl.CreationDate as LinkDate
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+),
+DuplicateRankings as (
+    select
+        ld.OriginalPostId,
+        ld.DuplicatePostId,
+        pl2.CreationDate as DuplicateCreationDate,
+        row_number() over(partition by ld.OriginalPostId order by pl2.CreationDate) as DuplicateOrder
+    from LinkedDuplicates ld
+    join Posts pl2 on pl2.Id = ld.DuplicatePostId
+),
+RankedDuplicates as (
+    select * from DuplicateRankings where DuplicateOrder <= 3
+),
+UserCommentsOnQuestions as (
+    select
+        u.Id as UserId,
+        count(distinct c.Id) as CommentCount,
+        count(distinct c.PostId) as CommentedQuestionsCount
+    from Users u
+    left join Comments c on c.UserId = u.Id
+    left join Posts p on p.Id = c.PostId and p.PostTypeId = 1
+    group by u.Id
+)
+select
+    tu.UserId,
+    tu.Reputation,
+    tu.TotalQuestions,
+    tu.TotalQuestionScore,
+    round(tu.AvgQuestionScore,2) as AvgQuestionScore,
+    tu.MaxQuestionScore,
+    tu.TotalAnswers,
+    tu.TotalAnswerScore,
+    tu.AcceptedAnswersCount,
+    round(tu.AvgAnswerScore,2) as AvgAnswerScore,
+    tu.MaxAnswerScore,
+    tu.TotalBadges,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.UserLocation,
+    tu.AboutSnippet,
+    uc.CommentCount,
+    uc.CommentedQuestionsCount,
+    concat_ws(' / ',
+        'Joined: ', to_char(tu.CreationDate, 'YYYY-MM-DD'),
+        'LastSeen: ', to_char(tu.LastAccessDate, 'YYYY-MM-DD')
+    ) as UserDates,
+    string_agg(distinct substring(t.TagName from 1 for 15), ', ') as PopularTagsUsed,
+    coalesce(dd.DuplicateCount, 0) as UserDuplicateLinksCount
+from TopUsersCTE tu
+left join UserCommentsOnQuestions uc on uc.UserId = tu.UserId
+left join LATERAL (
+    select t.TagName
+    from Posts p
+    cross join lateral (
+        select unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as TagName
+    ) as taglist
+    join Tags t on t.TagName = taglist.TagName
+    where p.OwnerUserId = tu.UserId
+      and t.Count > 5000
+    group by t.TagName
+    order by max(p.Score) desc
+    limit 5
+) t on true
+left join LATERAL (
+    select count(*) as DuplicateCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    where pl.PostId in (
+        select Id from Posts where OwnerUserId = tu.UserId and PostTypeId = 1
+    )
+) dd on true
+group by
+    tu.UserId, tu.Reputation, tu.TotalQuestions, tu.TotalQuestionScore, tu.AvgQuestionScore, tu.MaxQuestionScore,
+    tu.TotalAnswers, tu.TotalAnswerScore, tu.AcceptedAnswersCount, tu.AvgAnswerScore, tu.MaxAnswerScore,
+    tu.TotalBadges, tu.GoldBadges, tu.SilverBadges, tu.BronzeBadges,
+    tu.UserLocation, tu.AboutSnippet, uc.CommentCount, uc.CommentedQuestionsCount,
+    tu.CreationDate, tu.LastAccessDate, dd.DuplicateCount
+order by tu.Reputation desc, tu.TotalQuestions desc
+limit 100;

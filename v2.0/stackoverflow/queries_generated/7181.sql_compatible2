@@ -1,0 +1,230 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            WHEN u.Reputation >= 100 THEN 'Novice'
+            ELSE 'Beginner'
+        END AS ReputationTier,
+        (SELECT COUNT(*) 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = u.Id 
+           AND p2.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) 
+         FROM Posts p3 
+         WHERE p3.OwnerUserId = u.Id 
+           AND p3.PostTypeId = 2) AS AnswerCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        COALESCE(p.Tags, '') AS CleanTags,
+        COALESCE(p.AcceptedAnswerId, 0) AS HasAcceptedAnswer,
+        CAST(
+          EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400
+        AS INTEGER) AS AgeInDays,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS RankByScore,
+        RANK() OVER (ORDER BY p.Score DESC) AS GlobalRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS DenseRank,
+        NTILE(100) OVER (ORDER BY p.Score DESC) AS Percentile,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) AS NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScorePerUser,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId) AS TotalScorePerUser,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS PostCountPerUser,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'AboveAverage'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'BelowAverage'
+            ELSE 'Average'
+        END AS ScoreStatus
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS Popularity,
+        STRING_AGG(
+            CASE 
+                WHEN p.PostTypeId = 1 THEN p.Title
+                ELSE NULL
+            END, 
+            '; '
+        ) AS SampleQuestions,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgScore
+    FROM Tags t
+    LEFT JOIN Posts p ON t.TagName = SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2)
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    us.AvgPostScore,
+    us.ReputationTier,
+    us.QuestionCount,
+    us.AnswerCount,
+    pa.PostId,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.PostType,
+    pa.CleanTags,
+    pa.AgeInDays,
+    pa.RankByScore,
+    pa.GlobalRank,
+    pa.Percentile,
+    pa.ScoreStatus,
+    pa.PreviousScore,
+    pa.NextScore,
+    pa.AvgScorePerUser,
+    ta.TagName,
+    ta.Popularity,
+    ta.QuestionCount,
+    ta.AvgScore,
+    CASE 
+        WHEN pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+             AND us.Reputation > 1000 
+             AND us.PostCount > 10 
+        THEN 'HighValue'
+        WHEN pa.Score < 0 
+             AND pa.AgeInDays > 365 
+             AND pa.ScoreStatus = 'BelowAverage' 
+        THEN 'LowQuality'
+        ELSE 'Standard'
+    END AS ContentQuality,
+    COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 2), 0) AS Upvotes,
+    COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 3), 0) AS Downvotes,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = pa.PostId) AS CommentCount,
+    (SELECT COUNT(DISTINCT v2.UserId) FROM Votes v2 WHERE v2.PostId = pa.PostId AND v2.VoteTypeId = 5) AS FavoriteCount,
+    (SELECT STRING_AGG(CAST(v.UserId AS VARCHAR), ',') 
+     FROM Votes v 
+     WHERE v.PostId = pa.PostId AND v.VoteTypeId = 8) AS BountyUsers,
+    CASE 
+        WHEN pa.CreationDate = (SELECT MIN(CreationDate) FROM Posts WHERE OwnerUserId = us.UserId) 
+        THEN 'FirstPost'
+        WHEN pa.CreationDate = (SELECT MAX(CreationDate) FROM Posts WHERE OwnerUserId = us.UserId) 
+        THEN 'LatestPost'
+        ELSE 'Regular'
+    END AS PostTimeline,
+    COALESCE(pa.AnswerCount, 0) AS AnswerCount,
+    COALESCE(pa.CommentCount, 0) AS CommentCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = pa.PostId AND ph.PostHistoryTypeId IN (10, 11, 12, 13)) AS EditCount,
+    CASE 
+        WHEN pa.HasAcceptedAnswer > 0 THEN 'Accepted'
+        ELSE 'NotAccepted'
+    END AS AcceptanceStatus,
+    CASE 
+        WHEN pa.AgeInDays > 365 THEN 'Legacy'
+        WHEN pa.AgeInDays > 30 THEN 'Recent'
+        ELSE 'Fresh'
+    END AS TimeCategory,
+    ((CAST(us.PostCount AS NUMERIC) * 100.0) / 
+     NULLIF((SELECT COUNT(*) FROM Posts WHERE OwnerUserId = us.UserId), 0)) AS RelativePostCount,
+    NULLIF((pa.Score * 100.0) / NULLIF((SELECT MAX(Score) FROM Posts), 0), 0) AS ScorePercentage,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = pa.PostId 
+       AND ph.UserId = us.UserId) AS SelfEdits,
+    CASE 
+        WHEN us.PostCount = 0 THEN 0
+        ELSE (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = us.UserId)
+    END AS AvgUserScore,
+    CASE 
+        WHEN pa.AgeInDays > 365 AND pa.Score > 100 AND pa.ViewCount > 1000 THEN 'Trending'
+        ELSE 'Stable'
+    END AS TrendState,
+    (SELECT STRING_AGG(p2.Title, ' | ') 
+     FROM Posts p2 
+     WHERE p2.ParentId = pa.PostId OR p2.Id = pa.PostId) AS TitleChain,
+    'User_' || CAST(us.UserId AS VARCHAR(10)) || '_Post_' || CAST(pa.PostId AS VARCHAR(10)) AS CombinedKey,
+    ABS(pa.Score - pa.AvgScorePerUser) AS ScoreDeviation,
+    (SELECT COUNT(*) 
+     FROM PostLinks pl 
+     WHERE pl.PostId = pa.PostId OR pl.RelatedPostId = pa.PostId) AS LinkCount,
+    CASE 
+        WHEN pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 1.5 THEN 'HighlyVoted'
+        WHEN pa.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 0.5 THEN 'LowVoted'
+        ELSE 'NormalVoted'
+    END AS VotingCategory,
+    (SELECT ph2.Text 
+     FROM PostHistory ph2 
+     WHERE ph2.PostId = pa.PostId 
+       AND ph2.PostHistoryTypeId = 2 
+     ORDER BY ph2.CreationDate DESC
+     FETCH FIRST 1 ROW ONLY) AS RecentBody,
+    (SELECT COUNT(*) 
+     FROM Badges b2 
+     WHERE b2.UserId = us.UserId 
+       AND b2.Name LIKE '%Tag%') AS TagBadgeCount,
+    (SELECT COUNT(*) 
+     FROM Posts p4 
+     WHERE p4.OwnerUserId = us.UserId 
+       AND p4.PostTypeId = 1 
+       AND p4.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')) AS RecentQuestions,
+    (SELECT COUNT(*) 
+     FROM Posts p5 
+     WHERE p5.OwnerUserId = us.UserId 
+       AND p5.PostTypeId = 2 
+       AND p5.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')) AS RecentAnswers,
+    CASE 
+        WHEN us.PostCount > 0 THEN (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = us.UserId AND Score > 0) * 100.0 / us.PostCount
+        ELSE NULL
+    END AS PositiveScoreRatio
+FROM UserStats us
+INNER JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+LEFT JOIN TagAnalysis ta ON pa.CleanTags LIKE '%' || ta.TagName || '%'
+WHERE us.PostCount > 0
+  AND pa.Score IS NOT NULL
+  AND (
+    (pa.Percentile <= 10 AND pa.ScoreStatus = 'AboveAverage') 
+    OR 
+    (pa.AgeInDays > 365 AND pa.Score < 0 AND pa.ScoreStatus = 'BelowAverage')
+  )
+  AND us.ReputationTier IN ('Elite', 'Expert')
+ORDER BY pa.Score DESC, us.Reputation DESC, pa.CreationDate DESC
+OFFSET 0 ROWS
+FETCH FIRST 1000 ROWS ONLY;

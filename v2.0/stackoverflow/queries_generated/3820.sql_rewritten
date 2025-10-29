@@ -1,0 +1,175 @@
+-- {"query": "3820.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2423} 
+WITH
+/* --------------------------------------------------------------
+   1. Basic per‑user aggregates (reputation, badge count, post stats)
+   -------------------------------------------------------------- */
+UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(b.BadgeCnt,0)          AS BadgeCnt,
+        COALESCE(p.PostCnt,0)           AS PostCnt,
+        COALESCE(p.AnswerCnt,0)         AS AnswerCnt,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS BadgeCnt
+        FROM Badges
+        GROUP BY UserId
+    ) b ON u.Id = b.UserId
+    LEFT JOIN (
+        SELECT OwnerUserId,
+               COUNT(*)                              AS PostCnt,
+               SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCnt
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation IS NOT NULL
+),
+
+/* --------------------------------------------------------------
+   2. Restrict to the top‑N users for the benchmark
+   -------------------------------------------------------------- */
+TopUsers AS (
+    SELECT *
+    FROM UserStats
+    WHERE RepRank <= 100
+),
+
+/* --------------------------------------------------------------
+   3. Tag‑level statistics (questions per tag, scores, contributors)
+   -------------------------------------------------------------- */
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id)                                 AS QuestionCnt,
+        SUM(p.Score)                                AS TotalScore,
+        MAX(p.CreationDate)                         AS LatestQDate,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') 
+            FILTER (WHERE u.Id IS NOT NULL)        AS TopContributors
+    FROM Tags t
+    JOIN Posts p
+          ON p.Tags LIKE ('%<'||t.TagName||'>%')
+         AND p.PostTypeId = 1               -- only questions
+    LEFT JOIN Users u
+          ON p.OwnerUserId = u.Id
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 10
+),
+
+/* --------------------------------------------------------------
+   4. Most recent activity per user (questions, comments, votes)
+   -------------------------------------------------------------- */
+UserRecentActivity AS (
+    SELECT
+        u.Id,
+        MAX(p.CreationDate)   AS LastQDate,
+        MAX(c.CreationDate)   AS LastCmtDate,
+        MAX(v.CreationDate)   AS LastVoteDate
+    FROM Users u
+    LEFT JOIN Posts   p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes    v ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+
+/* --------------------------------------------------------------
+   5. Combine user aggregates with recent activity
+   -------------------------------------------------------------- */
+Combined AS (
+    SELECT
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.BadgeCnt,
+        tu.PostCnt,
+        tu.AnswerCnt,
+        ur.LastQDate,
+        ur.LastCmtDate,
+        ur.LastVoteDate,
+        tu.RepRank
+    FROM TopUsers tu
+    LEFT JOIN UserRecentActivity ur ON tu.Id = ur.Id
+),
+
+/* --------------------------------------------------------------
+   6. Final ranking + tier classification
+   -------------------------------------------------------------- */
+FinalResult AS (
+    SELECT
+        c.Id,
+        c.DisplayName,
+        c.Reputation,
+        c.BadgeCnt,
+        c.PostCnt,
+        c.AnswerCnt,
+        COALESCE(c.LastQDate,   TIMESTAMP '1970-01-01') AS LastQDate,
+        COALESCE(c.LastCmtDate, TIMESTAMP '1970-01-01') AS LastCmtDate,
+        COALESCE(c.LastVoteDate,TIMESTAMP '1970-01-01') AS LastVoteDate,
+        ROW_NUMBER() OVER (ORDER BY c.Reputation DESC, c.BadgeCnt DESC) AS GlobalRank,
+        CASE
+            WHEN c.Reputation > 20000 THEN 'Elite'
+            WHEN c.Reputation BETWEEN 10000 AND 20000 THEN 'Pro'
+            WHEN c.Reputation BETWEEN 5000  AND  9999 THEN 'Experienced'
+            ELSE 'Novice'
+        END AS RepTier
+    FROM Combined c
+)
+
+-- ==============================================================
+-- 7. Produce the benchmark result set
+--    • Full outer join pulls the single most popular tag (by question count)
+--    • UNION ALL adds a separator row plus a filtered tag list
+-- ==============================================================
+
+SELECT
+    fr.Id,
+    fr.DisplayName,
+    fr.Reputation,
+    fr.BadgeCnt,
+    fr.PostCnt,
+    fr.AnswerCnt,
+    fr.LastQDate,
+    fr.LastCmtDate,
+    fr.LastVoteDate,
+    fr.GlobalRank,
+    fr.RepTier,
+    ts.TagName,
+    ts.QuestionCnt,
+    ts.TotalScore,
+    ts.LatestQDate,
+    ts.TopContributors
+FROM FinalResult fr
+FULL OUTER JOIN TagStats ts
+       ON ts.QuestionCnt = (SELECT MAX(QuestionCnt) FROM TagStats)   -- the hottest tag
+WHERE fr.GlobalRank <= 50
+
+UNION ALL
+
+SELECT
+    NULL AS Id,
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    NULL AS BadgeCnt,
+    NULL AS PostCnt,
+    NULL AS AnswerCnt,
+    NULL AS LastQDate,
+    NULL AS LastCmtDate,
+    NULL AS LastVoteDate,
+    NULL AS GlobalRank,
+    'Separator' AS RepTier,
+    t.TagName,
+    t.QuestionCnt,
+    t.TotalScore,
+    t.LatestQDate,
+    t.TopContributors
+FROM TagStats t
+WHERE t.TotalScore > (SELECT AVG(TotalScore) FROM TagStats)
+
+ORDER BY
+    GlobalRank NULLS LAST,
+    RepTier DESC,
+    QuestionCnt DESC;

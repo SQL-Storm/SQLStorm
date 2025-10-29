@@ -1,0 +1,94 @@
+WITH UserPostInteractions AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        pt.Name AS PostType,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        u.Reputation AS OwnerReputation,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        MAX(ph.CreationDate) AS LastEditDate,
+        -- compute days difference using standard SQL: DATE_PART('day', last - first) for Postgres,
+        -- and for more generic SQL use CAST((JulianDay replacement) as integer). Here use DATE_PART for day difference when timestamps are supported.
+        CAST(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400 AS INTEGER) AS DaysSinceLastActivity,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1 AND p.PostTypeId IN (1, 2)
+    GROUP BY
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        pt.Name,
+        p.CommentCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        u.Reputation,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.LastActivityDate
+),
+RankedUserInteractions AS (
+    SELECT
+        upi.*,
+        ROW_NUMBER() OVER (PARTITION BY upi.OwnerUserId ORDER BY upi.PostCreationDate DESC) AS PostRank,
+        AVG(upi.TotalVotes) OVER (PARTITION BY upi.OwnerUserId) AS AvgUserVotes,
+        SUM(upi.TotalVotes) OVER (PARTITION BY upi.OwnerUserId) AS TotalUserVotes,
+        RANK() OVER (ORDER BY upi.OwnerReputation DESC, SUM(upi.TotalVotes) OVER (PARTITION BY upi.OwnerUserId) DESC) AS UserReputationRank
+    FROM UserPostInteractions upi
+),
+UserAnswersWithBadges AS (
+    SELECT
+        r.OwnerUserId,
+        COUNT(DISTINCT CASE WHEN r.PostType = 'Answer' THEN r.PostId ELSE NULL END) AS AnswerCountWithRanks,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM RankedUserInteractions r
+    LEFT JOIN Badges b ON r.OwnerUserId = b.UserId
+    WHERE r.PostRank <= 10
+    GROUP BY r.OwnerUserId
+)
+SELECT
+    r.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    r.OwnerReputation,
+    r.UserReputationRank,
+    COUNT(DISTINCT r.PostId) AS TotalPostsConsidered,
+    SUM(r.CommentCount) AS TotalComments,
+    SUM(r.AnswerCount) AS TotalAnswers,
+    SUM(r.FavoriteCount) AS TotalFavorites,
+    SUM(r.TotalVotes) AS TotalVotesOnPosts,
+    AVG(r.DaysSinceLastActivity) AS AvgDaysSinceLastActivity,
+    SUM(r.IsClosed) AS TotalClosedPosts,
+    SUM(r.IsCommunityOwned) AS TotalCommunityOwnedPosts,
+    COALESCE(uab.AnswerCountWithRanks, 0) AS AnswersWithRank,
+    COALESCE(uab.BadgeCount, 0) AS TotalBadges,
+    CASE
+        WHEN u.CreationDate < (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 year') THEN 'Veteran'
+        WHEN u.CreationDate < (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year') THEN 'Experienced'
+        ELSE 'New'
+    END AS UserTenure,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = r.PostId AND pl.LinkTypeId = 3) AS DuplicateLinks
+FROM RankedUserInteractions r
+JOIN Users u ON r.OwnerUserId = u.Id
+LEFT JOIN UserAnswersWithBadges uab ON r.OwnerUserId = uab.OwnerUserId
+WHERE r.PostRank <= 20
+GROUP BY
+    r.OwnerUserId,
+    u.DisplayName,
+    r.OwnerReputation,
+    r.UserReputationRank,
+    uab.AnswerCountWithRanks,
+    uab.BadgeCount,
+    u.CreationDate,
+    r.PostId
+HAVING SUM(r.TotalVotes) > 10
+ORDER BY r.UserReputationRank;

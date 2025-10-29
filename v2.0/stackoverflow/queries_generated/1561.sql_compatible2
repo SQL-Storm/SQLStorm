@@ -1,0 +1,198 @@
+WITH UserEngagementAndBadges AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        CAST((SUM(COALESCE(P.Score, 0)) * 0.5 + COUNT(DISTINCT C.Id) * 1.5 + U.UpVotes * 0.2 - U.DownVotes * 0.1) AS NUMERIC) AS ActivityScore,
+        MAX(B.Date) AS LastBadgeDate,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE U.Reputation > 5000 AND U.LastAccessDate >= TIMESTAMP '2022-01-01'
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostHistoryWithLag AS (
+    SELECT
+        PH.*,
+        LAG(PH.PostHistoryTypeId, 1, 0) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PrevPostHistoryTypeId
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 10, 11)
+),
+PostHistoryDetails AS (
+    SELECT
+        PHL.PostId,
+        COUNT(DISTINCT CASE WHEN PHL.PostHistoryTypeId IN (4, 5, 6) THEN PHL.Id END) AS TotalMajorEdits,
+        MAX(CASE WHEN PHL.PostHistoryTypeId = 10 THEN PHL.CreationDate ELSE NULL END) AS ClosureDateInHistory,
+        (SELECT CRS.Name FROM CloseReasonTypes CRS WHERE CRS.Id = CAST(PHL.Comment AS SMALLINT) LIMIT 1) AS CloseReasonName,
+        MAX(PHL.CreationDate) AS LastHistoryActivityDate,
+        SUM(CASE WHEN PHL.PostHistoryTypeId = 8 AND PHL.PrevPostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS BodyRollbackCount,
+        PHL.Comment
+    FROM PostHistoryWithLag PHL
+    GROUP BY PHL.PostId, PHL.Comment
+),
+QuestionAnswerDetails AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.Tags AS QuestionTags,
+        Q.AcceptedAnswerId,
+        Q.ClosedDate AS ActualClosedDate,
+        Q.CommunityOwnedDate,
+        PHT.TotalMajorEdits AS QuestionEditCount,
+        PHT.BodyRollbackCount AS QuestionBodyRollbackCount,
+        PHT.LastHistoryActivityDate AS QuestionLastEditOrActivity,
+        PHT.CloseReasonName,
+        A.Id AS AnswerId,
+        A.Score AS AnswerScore,
+        A.CreationDate AS AnswerCreationDate,
+        A.OwnerUserId AS AnswerOwnerId,
+        PHT_A.TotalMajorEdits AS AnswerEditCount,
+        (SELECT COUNT(C.Id) FROM Comments C WHERE C.PostId = Q.Id) AS QuestionCommentCount,
+        (SELECT COUNT(C.Id) FROM Comments C WHERE C.PostId = A.Id) AS AnswerCommentCount,
+        EXTRACT(DAY FROM (COALESCE(Q.ClosedDate, TIMESTAMP '2024-10-01 12:34:56') - Q.CreationDate)) AS QuestionAgeDays,
+        LOWER(SUBSTRING(Q.Tags FROM 2 FOR COALESCE(NULLIF(POSITION('><' IN Q.Tags), 0), LENGTH(Q.Tags)+1) - 2)) AS PrimaryTag,
+        ARRAY_LENGTH(string_to_array(substring(Q.Tags, 2, length(Q.Tags)-2), '><'), 1) AS NumberOfTags,
+        EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.PostId = Q.Id AND PL.LinkTypeId = 3) AS IsDuplicateFlagged
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN PostHistoryDetails PHT ON Q.Id = PHT.PostId
+    LEFT JOIN PostHistoryDetails PHT_A ON A.Id = PHT_A.PostId
+    WHERE Q.PostTypeId = 1
+      AND Q.CreationDate >= TIMESTAMP '2021-01-01'
+      AND Q.Score >= 0
+),
+RankedAnswersByQuestion AS (
+    SELECT
+        QAD.QuestionId,
+        QAD.AnswerId,
+        QAD.AnswerScore,
+        QAD.AnswerOwnerId,
+        QAD.AnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY QAD.QuestionId ORDER BY QAD.AnswerScore DESC, QAD.AnswerCreationDate ASC) AS AnswerRankByScoreDate,
+        AVG(QAD.AnswerScore) OVER (PARTITION BY QAD.QuestionId) AS AvgAnswerScoreForQuestion
+    FROM QuestionAnswerDetails QAD
+    WHERE QAD.AnswerId IS NOT NULL AND QAD.AnswerOwnerId IS NOT NULL
+),
+TagMetrics AS (
+    SELECT
+        tag AS TagName,
+        COUNT(P.Id) AS TaggedPostCount,
+        AVG(P.Score) AS AvgScoreForTag,
+        SUM(P.ViewCount) AS TotalViewsForTag
+    FROM Posts P,
+         unnest(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS tag
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL
+    GROUP BY tag
+    HAVING COUNT(P.Id) > 500
+),
+ControversialOrHighlyEditedPosts AS (
+    SELECT
+        P.Id AS PostId,
+        'LowScoreHighViews' AS IssueType,
+        P.Score,
+        P.ViewCount,
+        PHD.TotalMajorEdits
+    FROM Posts P
+    INNER JOIN PostHistoryDetails PHD ON P.Id = PHD.PostId
+    WHERE P.PostTypeId IN (1, 2)
+      AND P.Score < 0
+      AND P.ViewCount > 1000
+    UNION ALL
+    SELECT
+        P.Id AS PostId,
+        'HeavilyEdited' AS IssueType,
+        P.Score,
+        P.ViewCount,
+        PHD.TotalMajorEdits
+    FROM Posts P
+    INNER JOIN PostHistoryDetails PHD ON P.Id = PHD.PostId
+    WHERE P.PostTypeId IN (1, 2)
+      AND PHD.TotalMajorEdits > 10
+      AND P.CreationDate >= TIMESTAMP '2021-01-01'
+    UNION ALL
+    SELECT
+        P.Id AS PostId,
+        'HasSpamOrOffensiveVote' AS IssueType,
+        P.Score,
+        P.ViewCount,
+        PHD.TotalMajorEdits
+    FROM Posts P
+    INNER JOIN Votes V ON P.Id = V.PostId
+    INNER JOIN PostHistoryDetails PHD ON P.Id = PHD.PostId
+    WHERE V.VoteTypeId IN (4, 12)
+      AND P.CreationDate >= TIMESTAMP '2021-01-01'
+)
+SELECT
+    UEAB.UserId,
+    UEAB.DisplayName AS UserDisplayName,
+    UEAB.Reputation,
+    UEAB.TotalQuestionsOwned,
+    UEAB.TotalAnswersOwned,
+    UEAB.ActivityScore,
+    UEAB.LastBadgeDate,
+    QAD.QuestionId,
+    QAD.QuestionTitle,
+    QAD.QuestionCreationDate,
+    QAD.QuestionScore,
+    QAD.QuestionViewCount,
+    QAD.AnswerCount,
+    QAD.FavoriteCount,
+    QAD.QuestionCommentCount,
+    QAD.QuestionEditCount,
+    QAD.QuestionBodyRollbackCount,
+    QAD.QuestionAgeDays,
+    QAD.ActualClosedDate,
+    QAD.CloseReasonName,
+    QAD.IsDuplicateFlagged,
+    QAD.PrimaryTag,
+    QAD.NumberOfTags,
+    RA.AnswerId AS TopAnswerId,
+    RA.AnswerScore AS TopAnswerScore,
+    RA.AnswerOwnerId AS TopAnswerOwnerId,
+    RA.AnswerCreationDate AS TopAnswerCreationDate,
+    RA.AvgAnswerScoreForQuestion,
+    COALESCE((RA.AnswerId = QAD.AcceptedAnswerId), FALSE) AS IsTopAnswerAccepted,
+    TM.AvgScoreForTag AS PrimaryTagAvgScore,
+    TM.TaggedPostCount AS PrimaryTagPostCount,
+    RANK() OVER (ORDER BY UEAB.TotalQuestionsOwned DESC, UEAB.Reputation DESC) AS UserQuestionRank,
+    NTILE(10) OVER (ORDER BY QAD.QuestionScore DESC) AS QuestionScoreDecile,
+    CAST((QAD.QuestionScore * 0.7 + QAD.QuestionViewCount * 0.005 + QAD.QuestionCommentCount * 0.5 + QAD.FavoriteCount * 1.0 - QAD.QuestionEditCount * 0.2 - QAD.QuestionBodyRollbackCount * 0.5) AS NUMERIC) AS QuestionQualityIndex,
+    (QAD.QuestionTitle ILIKE '%performance%' OR QAD.QuestionTitle ILIKE '%security%' OR QAD.QuestionTitle ILIKE '%optimization%' OR QAD.QuestionTitle ILIKE '%scaling%') AS HighImpactKeywordsPresent,
+    CASE WHEN COHP.IssueType IS NOT NULL THEN TRUE ELSE FALSE END AS IsControversialOrHighlyEdited,
+    COHP.IssueType AS ControversialIssueType,
+    (QAD.QuestionOwnerId IS NULL OR QAD.QuestionTitle IS NULL OR QAD.QuestionTags IS NULL OR QAD.QuestionBodyRollbackCount IS NULL) AS HasMissingQuestionOrHistoryData
+FROM UserEngagementAndBadges UEAB
+INNER JOIN QuestionAnswerDetails QAD ON UEAB.UserId = QAD.QuestionOwnerId
+LEFT JOIN RankedAnswersByQuestion RA ON QAD.QuestionId = RA.QuestionId AND RA.AnswerRankByScoreDate = 1
+LEFT JOIN TagMetrics TM ON QAD.PrimaryTag = TM.TagName
+LEFT JOIN ControversialOrHighlyEditedPosts COHP ON QAD.QuestionId = COHP.PostId
+WHERE
+    QAD.QuestionScore >= 10
+    AND QAD.QuestionViewCount > 500
+    AND QAD.QuestionCommentCount >= 1
+    AND QAD.QuestionEditCount <= 7
+    AND UEAB.Reputation >= 10000
+    AND QAD.QuestionTitle IS NOT NULL
+ORDER BY
+    QuestionQualityIndex DESC,
+    UEAB.Reputation DESC,
+    QAD.QuestionCreationDate DESC
+LIMIT 5000;

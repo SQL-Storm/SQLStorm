@@ -1,0 +1,254 @@
+WITH UserActivityCTE AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationDenseRank,
+        NTILE(100) OVER (ORDER BY u.Reputation DESC) AS ReputationPercentile,
+        LAG(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation DESC) AS PrevReputation,
+        LEAD(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation DESC) AS NextReputation,
+        AVG(u.Reputation) OVER () AS AvgReputation,
+        SUM(u.Reputation) OVER (ORDER BY u.Reputation ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeReputation,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Advanced'
+            WHEN u.Reputation >= 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS UserTier,
+        CASE 
+            WHEN u.Views > 10000 THEN 'High View'
+            WHEN u.Views > 5000 THEN 'Medium View'
+            WHEN u.Views > 1000 THEN 'Low View'
+            ELSE 'Minimal View'
+        END AS ViewLevel,
+        CASE WHEN u.Reputation > 0 THEN (u.UpVotes * 100.0 / NULLIF(u.Reputation, 0)) ELSE 0 END AS UpVoteRatio,
+        CASE WHEN u.Reputation > 0 THEN (u.DownVotes * 100.0 / NULLIF(u.Reputation, 0)) ELSE 0 END AS DownVoteRatio
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01 00:00:00'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalytics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'Tag Wiki Excerpt'
+            WHEN p.PostTypeId = 5 THEN 'Tag Wiki'
+            ELSE 'Other'
+        END AS PostTypeName,
+        LENGTH(p.Body) AS BodyLength,
+        POSITION('code' IN LOWER(p.Body)) AS CodeTagPosition,
+        (
+            SELECT COUNT(*) 
+            FROM Comments c 
+            WHERE c.PostId = p.Id
+        ) AS CommentCountSubquery,
+        (
+            SELECT COUNT(*) 
+            FROM Votes v 
+            WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3)
+        ) AS VoteCountSubquery
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2010-01-01 00:00:00'
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        LENGTH(t.TagName) AS TagNameLength,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Low'
+            ELSE 'Rare'
+        END AS PopularityLevel,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.Tags LIKE '%' || t.TagName || '%'
+        ) AS PostsWithTag,
+        RANK() OVER (ORDER BY t.Count DESC) AS PopularRank,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS PopularDenseRank
+    FROM Tags t
+    WHERE t.Count > 0
+),
+UserPerformance AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        ua.ReputationRank,
+        ua.ReputationDenseRank,
+        ua.ReputationPercentile,
+        ua.UserTier,
+        ua.ViewLevel,
+        ua.UpVoteRatio,
+        ua.DownVoteRatio,
+        CASE 
+            WHEN ua.PostCount > 100 AND ua.Reputation > 5000 THEN 'Active Contributor'
+            WHEN ua.PostCount > 50 AND ua.Reputation > 2000 THEN 'Regular Contributor'
+            WHEN ua.PostCount > 10 AND ua.Reputation > 500 THEN 'Occasional Contributor'
+            ELSE 'New Contributor'
+        END AS ContributionLevel,
+        CASE 
+            WHEN ua.Reputation > 100000 THEN 10
+            WHEN ua.Reputation > 50000 THEN 9
+            WHEN ua.Reputation > 10000 THEN 8
+            WHEN ua.Reputation > 5000 THEN 7
+            WHEN ua.Reputation > 1000 THEN 6
+            WHEN ua.Reputation > 500 THEN 5
+            WHEN ua.Reputation > 100 THEN 4
+            WHEN ua.Reputation > 50 THEN 3
+            WHEN ua.Reputation > 10 THEN 2
+            ELSE 1
+        END AS ReputationLevel
+    FROM UserActivityCTE ua
+)
+SELECT 
+    up.UserId,
+    up.DisplayName,
+    up.Reputation,
+    up.PostCount,
+    up.CommentCount,
+    up.BadgeCount,
+    up.ReputationRank,
+    up.ReputationDenseRank,
+    up.ReputationPercentile,
+    up.UserTier,
+    up.ViewLevel,
+    up.UpVoteRatio,
+    up.DownVoteRatio,
+    up.ContributionLevel,
+    up.ReputationLevel,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.UserId = up.UserId 
+        AND ph.CreationDate BETWEEN DATE '2010-01-01' AND DATE '2023-12-31'
+        AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+    ) AS EditCount,
+    (
+        SELECT STRING_AGG(DISTINCT t.TagName, ', ')
+        FROM Posts p
+        JOIN Tags t ON POSITION(t.TagName IN p.Tags) > 0
+        WHERE p.OwnerUserId = up.UserId
+        AND p.CreationDate >= DATE '2010-01-01'
+        AND p.PostTypeId = 1
+    ) AS UserTags,
+    (
+        SELECT STRING_AGG(CAST(ph.PostHistoryTypeId AS TEXT), ', ')
+        FROM PostHistory ph
+        WHERE ph.UserId = up.UserId 
+        AND ph.CreationDate BETWEEN DATE '2010-01-01' AND DATE '2023-12-31'
+        AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15)
+    ) AS UserActivityHistory,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.UserId = up.UserId 
+        AND v.CreationDate BETWEEN DATE '2010-01-01' AND DATE '2023-12-31'
+        AND v.VoteTypeId IN (1, 2, 3)
+    ) AS VotingActivity,
+    (
+        SELECT COUNT(DISTINCT ph.PostId) 
+        FROM PostHistory ph 
+        WHERE ph.UserId = up.UserId 
+        AND ph.CreationDate BETWEEN DATE '2010-01-01' AND DATE '2023-12-31'
+        AND ph.PostHistoryTypeId IN (1, 2, 3)
+    ) AS UniqueEditedPosts,
+    (
+        SELECT AVG(p.Score) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = up.UserId 
+        AND p.Score IS NOT NULL
+    ) AS AvgPostScore,
+    (
+        SELECT MAX(p.CreationDate) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = up.UserId
+    ) AS LastPostActivity,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = up.UserId 
+        AND b.Date BETWEEN DATE '2010-01-01' AND DATE '2023-12-31'
+    ) AS RecentBadges,
+    (
+        SELECT STRING_AGG(b.Name, ', ')
+        FROM Badges b 
+        WHERE b.UserId = up.UserId 
+        AND b.Date BETWEEN DATE '2010-01-01' AND DATE '2023-12-31'
+        AND b.Class = 1
+    ) AS GoldBadges,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = up.UserId 
+        AND p.AnswerCount > 0
+        AND p.CreationDate BETWEEN DATE '2010-01-01' AND DATE '2023-12-31'
+    ) AS QuestionWithAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = up.UserId 
+        AND (p.ViewCount IS NULL OR p.ViewCount < 100)
+        AND p.CreationDate BETWEEN DATE '2010-01-01' AND DATE '2023-12-31'
+    ) AS LowViewPosts,
+    (
+        SELECT MIN(p.CreationDate) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = up.UserId
+    ) AS FirstPostDate,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = up.UserId 
+        AND p.OwnerUserId IS NOT NULL
+    ) AS TotalPostsByUser,
+    (
+        SELECT STRING_AGG(ph.Comment, ' | ')
+        FROM PostHistory ph 
+        WHERE ph.UserId = up.UserId 
+        AND ph.Comment IS NOT NULL 
+        AND LENGTH(ph.Comment) > 10
+    ) AS RecentComments
+FROM UserPerformance up
+INNER JOIN (
+    SELECT UserId 
+    FROM UserPerformance 
+    WHERE PostCount > 0 AND Reputation > 0
+) filtered ON up.UserId = filtered.UserId
+WHERE up.Reputation > 0
+AND up.PostCount >= 10
+AND up.ReputationPercentile > 10
+ORDER BY up.Reputation DESC, up.PostCount DESC
+LIMIT 10000;

@@ -1,0 +1,157 @@
+WITH RECURSIVE PostHierarchy AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.OwnerUserId,
+        CAST(p.Title AS VARCHAR(1000)) AS Path,
+        0 AS Level
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ParentId IS NULL
+
+    UNION ALL
+
+    SELECT
+        a.Id AS PostId,
+        a.Title,
+        a.CreationDate,
+        a.Score,
+        NULL AS AnswerCount,
+        a.OwnerUserId,
+        CAST(ph.Path || ' -> ' || a.Title AS VARCHAR(1000)) AS Path,
+        ph.Level + 1 AS Level
+    FROM Posts a
+    JOIN PostHierarchy ph ON a.ParentId = ph.PostId
+    WHERE a.PostTypeId = 2
+),
+UserPostInteractions AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId ELSE NULL END) AS UpvotesGiven,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId ELSE NULL END) AS DownvotesGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        SUM(CASE WHEN c.Score > 0 THEN c.Score ELSE 0 END) AS CommentScoreSum,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1, 3, 4, 5, 6) THEN ph.PostId ELSE NULL END) AS PostEdits,
+        MAX(COALESCE(u.Reputation, 0)) OVER (PARTITION BY u.Id) AS MaxReputationForUser
+    FROM Users u
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagCount,
+        COUNT(DISTINCT p.Id) AS PostsWithTag,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS RankByCount,
+        AVG(CAST(p.Score AS DECIMAL(10,2))) AS AvgPostScoreForTag,
+        t.Count
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+),
+UserActivity AS (
+    SELECT
+        OwnerUserId,
+        COUNT(Id) AS PostsOwned,
+        SUM(Score) AS TotalScoreEarned,
+        AVG(CAST(Score AS DECIMAL(10,2))) AS AvgScorePerPost,
+        COUNT(DISTINCT CASE WHEN ClosedDate IS NOT NULL THEN Id ELSE NULL END) AS ClosedPosts,
+        COUNT(DISTINCT CASE WHEN CommunityOwnedDate IS NOT NULL THEN Id ELSE NULL END) AS CommunityOwnedPosts
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL AND OwnerUserId <> -1
+    GROUP BY OwnerUserId
+)
+SELECT
+    ph.PostId,
+    ph.Title AS QuestionTitle,
+    ph.Level AS QuestionDepth,
+    ph.Score AS QuestionScore,
+    ph.AnswerCount AS QuestionAnswerCount,
+    u.DisplayName AS QuestionOwner,
+    COALESCE(up.UpvotesGiven, 0) AS UpvotesGivenByOwner,
+    COALESCE(up.DownvotesGiven, 0) AS DownvotesGivenByOwner,
+    COALESCE(up.CommentsMade, 0) AS CommentsMadeByOwner,
+    COALESCE(up.CommentScoreSum, 0) AS TotalCommentScoreByOwner,
+    COALESCE(up.PostEdits, 0) AS PostEditsByOwner,
+    up.MaxReputationForUser AS OwnerMaxReputation,
+    ua.PostsOwned AS OwnerTotalPosts,
+    ua.TotalScoreEarned AS OwnerTotalScore,
+    ua.AvgScorePerPost AS OwnerAvgScore,
+    ua.ClosedPosts AS OwnerClosedPosts,
+    ua.CommunityOwnedPosts AS OwnerCommunityOwnedPosts,
+    tp.TagName,
+    tp.TagCount,
+    tp.PostsWithTag,
+    tp.RankByCount,
+    tp.AvgPostScoreForTag,
+    CASE
+        WHEN ph.Score > 100 AND COALESCE(ph.AnswerCount, 0) > 10 THEN 'High Engagement'
+        WHEN ph.Score < 0 THEN 'Low Score'
+        WHEN COALESCE(ph.AnswerCount, 0) = 0 AND ph.Score > 0 THEN 'Unanswered Question'
+        ELSE 'Standard'
+    END AS PostEngagementCategory,
+    CASE
+        WHEN u.CreationDate < (cast('2024-10-01' as date) - INTERVAL '5 years') AND u.Reputation > 10000 THEN 'Veteran High Rep'
+        WHEN u.CreationDate > (cast('2024-10-01' as date) - INTERVAL '1 year') AND u.Reputation < 1000 THEN 'New Low Rep'
+        ELSE 'Typical User'
+    END AS UserStatusCategory,
+    ph.Path AS FullHierarchyPath
+FROM PostHierarchy ph
+JOIN Users u ON ph.OwnerUserId = u.Id
+LEFT JOIN UserPostInteractions up ON u.Id = up.UserId
+LEFT JOIN UserActivity ua ON u.Id = ua.OwnerUserId
+LEFT JOIN Posts p_tags ON ph.PostId = p_tags.Id
+LEFT JOIN LATERAL (
+    SELECT tp2.TagName, tp2.TagCount, tp2.PostsWithTag, tp2.RankByCount, tp2.AvgPostScoreForTag
+    FROM TagPopularity tp2
+    WHERE p_tags.Tags LIKE '%' || tp2.TagName || '%'
+    ORDER BY tp2.TagCount DESC
+    LIMIT 1
+) tp ON TRUE
+WHERE ph.Level < 5
+  AND LENGTH(ph.Title) > 10
+  AND u.DisplayName IS NOT NULL
+  AND u.DisplayName <> ''
+  AND ph.CreationDate BETWEEN DATE '2020-01-01' AND DATE '2023-12-31'
+GROUP BY
+    ph.PostId,
+    ph.Title,
+    ph.CreationDate,
+    ph.Score,
+    ph.AnswerCount,
+    ph.OwnerUserId,
+    ph.Path,
+    ph.Level,
+    u.Id,
+    u.DisplayName,
+    u.CreationDate,
+    u.Reputation,
+    up.UpvotesGiven,
+    up.DownvotesGiven,
+    up.CommentsMade,
+    up.CommentScoreSum,
+    up.PostEdits,
+    up.MaxReputationForUser,
+    ua.PostsOwned,
+    ua.TotalScoreEarned,
+    ua.AvgScorePerPost,
+    ua.ClosedPosts,
+    ua.CommunityOwnedPosts,
+    tp.TagName,
+    tp.TagCount,
+    tp.PostsWithTag,
+    tp.RankByCount,
+    tp.AvgPostScoreForTag,
+    tp.TagName,
+    tp.TagCount,
+    tp.PostsWithTag,
+    tp.RankByCount,
+    tp.AvgPostScoreForTag
+ORDER BY ph.CreationDate DESC
+LIMIT 1000;

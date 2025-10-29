@@ -1,0 +1,125 @@
+-- {"query": "4441.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1228} 
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate AS EditDate,
+      ph.Comment AS EditComment,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) AND ph.UserId IS NOT NULL
+  ),
+  UserContribution AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(p.Id) AS PostsCreated,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersPosted,
+      COUNT(DISTINCT b.Id) AS BadgesEarned,
+      MAX(u.CreationDate) AS FirstPostDate,
+      DATEDIFF(day, MAX(u.CreationDate), cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceFirstPost,
+      AVG(CASE WHEN c.Score > 0 THEN c.Score ELSE 0 END) AS AvgCommentScore,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceived,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceived
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    LEFT JOIN Comments AS c
+      ON u.Id = c.UserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  ),
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.ViewCount AS PostViewCount,
+      u.DisplayName AS OwnerDisplayName,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpvoteCount,
+      COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownvoteCount,
+      COUNT(DISTINCT pa.Id) FILTER (WHERE pa.LinkTypeId = 3) AS DuplicateLinkCount
+    FROM Posts AS p
+    JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    LEFT JOIN Votes AS v
+      ON p.Id = v.PostId
+    LEFT JOIN PostLinks AS pa
+      ON p.Id = pa.PostId
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      u.DisplayName
+  )
+SELECT
+  pe.PostId,
+  pe.Title AS QuestionTitle,
+  pe.OwnerDisplayName AS QuestionOwner,
+  pe.PostCreationDate,
+  pe.PostScore,
+  pe.PostViewCount,
+  pe.CommentCount,
+  pe.UpvoteCount,
+  pe.DownvoteCount,
+  pe.DuplicateLinkCount,
+  rpe.EditDate AS LastEditDate,
+  rpe.EditComment AS LastEditComment,
+  uc.DisplayName AS TopContributorDisplayName,
+  uc.Reputation AS TopContributorReputation,
+  uc.QuestionsAsked,
+  uc.AnswersPosted,
+  uc.BadgesEarned,
+  uc.DaysSinceFirstPost,
+  uc.AvgCommentScore,
+  uc.TotalUpvotesReceived,
+  uc.TotalDownvotesReceived,
+  CASE
+    WHEN pe.PostScore > 100 AND pe.UpvoteCount > 50 THEN 'Highly Valued'
+    WHEN pe.PostScore < 0 AND pe.DownvoteCount > 10 THEN 'Controversial'
+    WHEN pe.DuplicateLinkCount > 0 THEN 'Has Duplicates'
+    WHEN pe.CommentCount > 20 THEN 'Active Discussion'
+    WHEN pe.PostViewCount > 10000 THEN 'Popular'
+    ELSE 'Standard'
+  END AS PostStatusCategory,
+  COALESCE(pht.Name, 'Unknown') AS LastEditType
+FROM PostEngagement AS pe
+LEFT JOIN RankedPostEdits AS rpe
+  ON pe.PostId = rpe.PostId AND rpe.rn = 1
+LEFT JOIN UserContribution AS uc
+  ON pe.PostId = (
+    SELECT
+      p_inner.Id
+    FROM Posts AS p_inner
+    WHERE
+      p_inner.OwnerUserId = uc.UserId
+      AND p_inner.PostTypeId = 1
+    ORDER BY
+      p_inner.Score DESC
+    LIMIT 1
+  )
+LEFT JOIN PostHistoryTypes AS pht
+  ON rpe.PostHistoryTypeId = pht.Id
+ORDER BY
+  pe.PostScore DESC,
+  pe.PostViewCount DESC
+LIMIT 100;

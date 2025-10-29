@@ -1,0 +1,129 @@
+with RecursiveUserScores as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        coalesce(
+            (select sum(v.BountyAmount) 
+             from Votes v
+             join Posts p on v.PostId = p.Id 
+             where v.UserId = u.Id and v.VoteTypeId = 8), 0) as TotalBountyStarted,
+        row_number() over (order by u.Reputation desc, u.Views desc) as Rank
+    from Users u
+    where u.Reputation > 1000
+), BadgeCounts as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+), LatestActivityPerPost as (
+    select
+        p.Id as PostId,
+        p.OwnerUserId,
+        coalesce(p.LastActivityDate, p.CreationDate) as LastActivity,
+        row_number() over (partition by p.OwnerUserId order by coalesce(p.LastActivityDate, p.CreationDate) desc) as ActivityRank
+    from Posts p
+    where p.OwnerUserId is not null
+), QuestionAnswerRatio as (
+    select 
+        u.Id as UserId,
+        cast(sum(case when p.PostTypeId = 1 then 1 else 0 end) as float) as Questions,
+        cast(sum(case when p.PostTypeId = 2 then 1 else 0 end) as float) as Answers,
+        case when sum(case when p.PostTypeId = 1 then 1 else 0 end) = 0 
+            then null 
+            else round(cast(sum(case when p.PostTypeId = 2 then 1 else 0 end) as numeric) / nullif(sum(case when p.PostTypeId = 1 then 1 else 0 end),0),4) end as AnswerQuestionRatio
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+), TopTags as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        ts.OwnerUserId,
+        ts.PostCount,
+        row_number() over (partition by ts.OwnerUserId order by ts.PostCount desc) as TagRank
+    from Tags t
+    join (
+        select 
+            p.OwnerUserId,
+            unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as TagName,
+            count(*) as PostCount
+        from Posts p
+        where p.Tags is not null and p.OwnerUserId is not null and p.PostTypeId = 1
+        group by p.OwnerUserId, p.Tags, TagName
+    ) ts on ts.TagName = t.TagName
+), DuplicatePostLinks as (
+    select pl.PostId, pl.RelatedPostId, pl.CreationDate, p1.Score as PostScore, p2.Score as RelatedPostScore
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+), UserRecentComments as (
+    select 
+        c.UserId,
+        c.PostId,
+        c.CreationDate,
+        c.Score as CommentScore,
+        row_number() over (partition by c.UserId order by c.CreationDate desc) as CommentRank
+    from Comments c
+    where c.UserId is not null and c.Score is not null
+), UserCommentStats as (
+    select 
+        urc.UserId,
+        count(*) as TotalComments,
+        avg(nullif(urc.CommentScore,0)) as AvgCommentScore,
+        max(urc.CreationDate) as MostRecentCommentDate
+    from UserRecentComments urc
+    group by urc.UserId
+)
+select 
+    rus.UserId,
+    rus.DisplayName,
+    rus.Reputation,
+    rus.Location,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges,
+    rus.Views,
+    rus.UpVotes,
+    rus.DownVotes,
+    rus.TotalBountyStarted,
+    qar.Questions,
+    qar.Answers,
+    qar.AnswerQuestionRatio,
+    coalesce(ucs.TotalComments,0) as TotalComments,
+    coalesce(round(ucs.AvgCommentScore,2),0) as AvgCommentScore,
+    uct.TagName as TopTag,
+    uct.PostCount as TopTagPostCount,
+    dup.DuplicateCount,
+    dup.AvgDuplicatePostScore
+from RecursiveUserScores rus
+left join BadgeCounts bc on bc.UserId = rus.UserId
+left join QuestionAnswerRatio qar on qar.UserId = rus.UserId
+left join UserCommentStats ucs on ucs.UserId = rus.UserId
+left join (
+    select OwnerUserId, TagName, PostCount
+    from TopTags
+    where TagRank = 1
+) uct on uct.OwnerUserId = rus.UserId
+left join (
+    select
+        p.OwnerUserId,
+        count(pl.PostId) as DuplicateCount,
+        avg(coalesce(p.Score,0)) as AvgDuplicatePostScore
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id and pl.LinkTypeId = 3
+    group by p.OwnerUserId
+) dup on dup.OwnerUserId = rus.UserId
+where rus.Rank <= 50
+order by rus.Reputation desc, rus.Views desc
+limit 50;

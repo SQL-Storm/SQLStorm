@@ -1,0 +1,113 @@
+WITH 
+UserStats AS (
+    SELECT 
+        u.Id                              AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score END),0) AS QuestionScoreSum,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score END),0) AS AnswerScoreSum,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1)                     AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2)                     AS AnswerCount,
+        MAX(p.CreationDate)                                         AS LastPostDate,
+        COUNT(b.Id)                                                 AS BadgeCount,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1)                      AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2)                      AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3)                      AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts   p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges  b ON b.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+UserTagActivity AS (
+    SELECT 
+        u.Id                            AS UserId,
+        tt.TagName,
+        COUNT(DISTINCT ph.PostId)       AS PostsEditedWithTag,
+        COUNT(*)                        AS TotalPostsWithTag
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag
+    ) AS pt
+    JOIN Tags tt ON tt.TagName = pt.Tag
+    LEFT JOIN PostHistory ph 
+        ON ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId IN (2,5)
+    WHERE u.Reputation > 10000
+    GROUP BY u.Id, tt.TagName
+    HAVING COUNT(DISTINCT ph.Id) > 5
+),
+AggregatedUserTag AS (
+    SELECT 
+        uta.UserId,
+        STRING_AGG(uta.TagName, ', ') 
+            FILTER (WHERE uta.TotalPostsWithTag > 10)   AS ActiveTags,
+        MAX(uta.TotalPostsWithTag)                     AS MaxPostsPerTag
+    FROM UserTagActivity uta
+    GROUP BY uta.UserId
+),
+RecentVotes AS (
+    SELECT 
+        v.UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven30d,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven30d
+    FROM Votes v
+    WHERE v.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '30 days'
+    GROUP BY v.UserId
+),
+BountySinceLastPost AS (
+    SELECT 
+        us.UserId,
+        COALESCE((
+            SELECT SUM(v.BountyAmount)
+            FROM Votes v
+            WHERE v.UserId = us.UserId
+              AND v.VoteTypeId = 8
+              AND v.CreationDate >= us.LastPostDate
+        ),0) AS BountyTotal
+    FROM UserStats us
+)
+
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.QuestionScoreSum,
+    us.AnswerScoreSum,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.LastPostDate,
+    us.BadgeCount,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    agg.ActiveTags,
+    agg.MaxPostsPerTag,
+    CASE 
+        WHEN us.Reputation > 50000 THEN 'Superstar'
+        WHEN us.Reputation BETWEEN 20000 AND 50000 THEN 'Expert'
+        WHEN us.Reputation BETWEEN 10000 AND 19999 THEN 'Contributor'
+        ELSE 'Rising'
+    END AS ReputationTier,
+    rv.UpVotesGiven30d,
+    rv.DownVotesGiven30d,
+    bsp.BountyTotal
+FROM UserStats us
+LEFT JOIN AggregatedUserTag agg   ON agg.UserId = us.UserId
+LEFT JOIN RecentVotes rv          ON rv.UserId = us.UserId
+LEFT JOIN BountySinceLastPost bsp ON bsp.UserId = us.UserId
+WHERE (us.QuestionCount + us.AnswerCount) > 0
+  AND (us.Reputation IS NOT NULL AND us.Reputation > 0)
+ORDER BY us.Reputation DESC, (us.QuestionScoreSum + us.AnswerScoreSum) DESC
+LIMIT 100
+UNION ALL
+SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE FALSE;

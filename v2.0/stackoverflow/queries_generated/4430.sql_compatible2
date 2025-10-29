@@ -1,0 +1,227 @@
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.CreationDate AS AnswerCreationDate,
+      p.Score AS AnswerScore,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS RankByScore,
+      LAG(p.Score, 1, 0) OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS PreviousScore,
+      LEAD(p.Score, 1, 0) OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS NextScore,
+      COUNT(*) OVER (PARTITION BY p.ParentId) AS TotalAnswersForQuestion
+    FROM Posts p
+    WHERE
+      p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+  ),
+  QuestionDetails AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.OwnerUserId AS QuestionOwnerUserId,
+      q.CreationDate AS QuestionCreationDate,
+      q.Title AS QuestionTitle,
+      q.Tags AS QuestionTags,
+      q.AnswerCount,
+      q.FavoriteCount,
+      q.Score AS QuestionScore,
+      q.ViewCount AS QuestionViewCount,
+      u.DisplayName AS QuestionOwnerDisplayName,
+      CASE
+        WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN q.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Open'
+      END AS QuestionStatus
+    FROM Posts q
+    LEFT JOIN Users u
+      ON q.OwnerUserId = u.Id
+    WHERE
+      q.PostTypeId = 1
+  ),
+  UserActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS PostsOwned,
+      SUM(p.Score) AS TotalScoreOnPosts,
+      COUNT(c.Id) AS CommentsMade
+    FROM Posts p
+    LEFT JOIN Comments c
+      ON p.Id = c.PostId AND p.OwnerUserId = c.UserId
+    WHERE
+      p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  HotQuestions AS (
+    SELECT
+      PostId,
+      MAX(CreationDate) AS HotDate
+    FROM PostHistory
+    WHERE
+      PostHistoryTypeId = 52
+    GROUP BY
+      PostId
+  )
+SELECT
+  qd.QuestionId,
+  qd.QuestionTitle,
+  qd.QuestionOwnerDisplayName,
+  qd.QuestionCreationDate,
+  qd.QuestionTags,
+  qd.QuestionScore,
+  qd.QuestionViewCount,
+  qd.FavoriteCount,
+  qd.AnswerCount AS TotalAnswers,
+  qd.QuestionStatus,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments c
+    WHERE
+      c.PostId = qd.QuestionId AND c.UserId IS NOT NULL
+  ) AS UserCommentsOnQuestion,
+  (
+    SELECT
+      COUNT(*)
+    FROM Votes v
+    WHERE
+      v.PostId = qd.QuestionId AND v.VoteTypeId = 2
+  ) AS UpVotesOnQuestion,
+  (
+    SELECT
+      COUNT(*)
+    FROM Votes v
+    WHERE
+      v.PostId = qd.QuestionId AND v.VoteTypeId = 3
+  ) AS DownVotesOnQuestion,
+  ra.RankByScore AS BestAnswerRank,
+  ra.TotalAnswersForQuestion,
+  ua.PostsOwned AS QuestionOwnerPostsOwned,
+  ua.TotalScoreOnPosts AS QuestionOwnerTotalScore,
+  ua.CommentsMade AS QuestionOwnerCommentsMade,
+  CASE
+    WHEN hq.PostId IS NOT NULL THEN 'Yes'
+    ELSE 'No'
+  END AS WasHotNetworkQuestion,
+  CASE
+    WHEN qd.QuestionOwnerUserId IS NOT NULL AND ua.PostsOwned > 1000 AND qd.QuestionScore > 500 THEN 'HighReputation'
+    WHEN qd.QuestionOwnerUserId IS NOT NULL AND ua.PostsOwned IS NULL THEN 'NewUser'
+    ELSE 'Standard'
+  END AS OwnerProfileCategory,
+  ROUND(
+    CAST(
+      (
+        (ra.TotalAnswersForQuestion * COALESCE(ra.AnswerScore, 0)) + (qd.QuestionScore * COALESCE(qd.QuestionViewCount, 0))
+      )::numeric
+      / CAST((1 + COALESCE(qd.AnswerCount,0)) AS numeric)
+      * LOG(COALESCE(qd.FavoriteCount, 1) + 1)
+    AS numeric)
+    , 2
+  ) AS PerformanceScore
+FROM QuestionDetails qd
+LEFT JOIN RankedAnswers ra
+  ON qd.QuestionId = ra.QuestionId AND ra.RankByScore = 1
+LEFT JOIN UserActivity ua
+  ON qd.QuestionOwnerUserId = ua.OwnerUserId
+LEFT JOIN HotQuestions hq
+  ON qd.QuestionId = hq.PostId
+WHERE
+  qd.QuestionCreationDate >= DATE '2023-01-01' AND qd.QuestionScore > 0 AND qd.AnswerCount > 0
+  AND qd.QuestionTags LIKE '%<sql>%'
+  AND COALESCE(qd.QuestionOwnerDisplayName, 'Anonymous') <> 'Community'
+UNION
+SELECT
+  NULL AS QuestionId,
+  NULL AS QuestionTitle,
+  NULL AS QuestionOwnerDisplayName,
+  NULL AS QuestionCreationDate,
+  NULL AS QuestionTags,
+  NULL AS QuestionScore,
+  NULL AS QuestionViewCount,
+  NULL AS FavoriteCount,
+  NULL AS TotalAnswers,
+  NULL AS QuestionStatus,
+  NULL AS UserCommentsOnQuestion,
+  NULL AS UpVotesOnQuestion,
+  NULL AS DownVotesOnQuestion,
+  NULL AS BestAnswerRank,
+  NULL AS TotalAnswersForQuestion,
+  NULL AS QuestionOwnerPostsOwned,
+  NULL AS QuestionOwnerTotalScore,
+  NULL AS QuestionOwnerCommentsMade,
+  NULL AS WasHotNetworkQuestion,
+  NULL AS OwnerProfileCategory,
+  NULL AS PerformanceScore
+FROM PostHistoryTypes pht
+WHERE
+  pht.Name = 'NonExistentType'
+UNION ALL
+SELECT
+  qd.QuestionId,
+  qd.QuestionTitle,
+  qd.QuestionOwnerDisplayName,
+  qd.QuestionCreationDate,
+  qd.QuestionTags,
+  qd.QuestionScore,
+  qd.QuestionViewCount,
+  qd.FavoriteCount,
+  qd.AnswerCount AS TotalAnswers,
+  qd.QuestionStatus,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments c
+    WHERE
+      c.PostId = qd.QuestionId AND c.UserId IS NOT NULL
+  ) AS UserCommentsOnQuestion,
+  (
+    SELECT
+      COUNT(*)
+    FROM Votes v
+    WHERE
+      v.PostId = qd.QuestionId AND v.VoteTypeId = 2
+  ) AS UpVotesOnQuestion,
+  (
+    SELECT
+      COUNT(*)
+    FROM Votes v
+    WHERE
+      v.PostId = qd.QuestionId AND v.VoteTypeId = 3
+  ) AS DownVotesOnQuestion,
+  ra.RankByScore AS BestAnswerRank,
+  ra.TotalAnswersForQuestion,
+  ua.PostsOwned AS QuestionOwnerPostsOwned,
+  ua.TotalScoreOnPosts AS QuestionOwnerTotalScore,
+  ua.CommentsMade AS QuestionOwnerCommentsMade,
+  CASE
+    WHEN hq.PostId IS NOT NULL THEN 'Yes'
+    ELSE 'No'
+  END AS WasHotNetworkQuestion,
+  CASE
+    WHEN qd.QuestionOwnerUserId IS NOT NULL AND ua.PostsOwned > 1000 AND qd.QuestionScore > 500 THEN 'HighReputation'
+    WHEN qd.QuestionOwnerUserId IS NOT NULL AND ua.PostsOwned IS NULL THEN 'NewUser'
+    ELSE 'Standard'
+  END AS OwnerProfileCategory,
+  ROUND(
+    CAST(
+      (
+        (ra.TotalAnswersForQuestion * COALESCE(ra.AnswerScore, 0)) + (qd.QuestionScore * COALESCE(qd.QuestionViewCount, 0))
+      )::numeric
+      / CAST((1 + COALESCE(qd.AnswerCount,0)) AS numeric)
+      * LOG(COALESCE(qd.FavoriteCount, 1) + 1)
+    AS numeric)
+    , 2
+  ) AS PerformanceScore
+FROM QuestionDetails qd
+LEFT JOIN RankedAnswers ra
+  ON qd.QuestionId = ra.QuestionId AND ra.RankByScore = 1
+LEFT JOIN UserActivity ua
+  ON qd.QuestionOwnerUserId = ua.OwnerUserId
+LEFT JOIN HotQuestions hq
+  ON qd.QuestionId = hq.PostId
+WHERE
+  qd.QuestionCreationDate >= DATE '2023-06-01' AND qd.QuestionScore < 0 AND qd.AnswerCount < 5
+  AND qd.QuestionTags LIKE '%<performance>%'
+  AND qd.QuestionStatus = 'Open'
+ORDER BY
+  PerformanceScore DESC
+LIMIT 100;

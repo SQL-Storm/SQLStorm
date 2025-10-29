@@ -1,0 +1,351 @@
+-- {"query": "662.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3868} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           coalesce(nullif(trim(split_part(coalesce(u.location,''), ',', 1)), ''), 'Unknown') as region_hint,
+           count(*) filter (where b.class = 1) as gold_badges,
+           count(*) filter (where b.class = 2) as silver_badges,
+           count(*) filter (where b.class = 3) as bronze_badges,
+           max(b.date) as last_badge_date
+    from users u
+    left join badges b
+      on b.userid = u.id
+    where u.creationdate >= now() - interval '1825 days'
+    group by u.id, u.displayname, u.reputation, u.creationdate, region_hint
+),
+user_activity as (
+    select
+        p.owneruserid as user_id,
+        min(p.creationdate) as first_post_date,
+        max(p.lastactivitydate) as last_activity_date,
+        count(*) filter (where p.posttypeid = 1) as questions,
+        count(*) filter (where p.posttypeid = 2) as answers,
+        sum(coalesce(p.viewcount,0)) as total_views,
+        sum(coalesce(p.score,0)) as total_post_score,
+        avg(nullif(p.score,0)) as avg_nonzero_score,
+        count(distinct p.id) filter (where p.communityowneddate is not null) as community_owned_posts
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+question_metrics as (
+    select
+        q.owneruserid as user_id,
+        count(*) as q_count,
+        avg(q.viewcount) as avg_q_views,
+        avg(q.score) as avg_q_score,
+        percentile_cont(0.5) within group (order by q.viewcount) as med_q_views,
+        count(*) filter (where q.acceptedanswerid is not null) as accepted_count,
+        count(*) filter (where q.closeddate is not null) as closed_count,
+        avg(coalesce(q.answercount,0)) as avg_answers_per_q
+    from posts q
+    where q.posttypeid = 1
+    group by q.owneruserid
+),
+answer_metrics as (
+    select
+        a.owneruserid as user_id,
+        count(*) as a_count,
+        avg(a.score) as avg_a_score,
+        percentile_cont(0.5) within group (order by a.score) as med_a_score,
+        count(*) filter (where a.score > 0) as pos_answers,
+        count(*) filter (where a.score < 0) as neg_answers
+    from posts a
+    where a.posttypeid = 2
+    group by a.owneruserid
+),
+comment_metrics as (
+    select
+        c.userid as user_id,
+        count(*) as c_count,
+        avg(c.score) as avg_c_score,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    where c.userid is not null
+    group by c.userid
+),
+hotness as (
+    select
+        p.owneruserid as user_id,
+        sum(
+            case
+                when p.posttypeid = 1 then greatest(0, coalesce(p.viewcount,0)) * 0.002 + coalesce(p.score,0) * 1.5 + coalesce(p.commentcount,0) * 0.3
+                when p.posttypeid = 2 then coalesce(p.score,0) * 1.2 + coalesce(p.commentcount,0) * 0.25
+                else coalesce(p.score,0) * 0.5
+            end
+        ) as raw_hotness,
+        sum(
+            case when p.lastactivitydate >= now() - interval '30 days' then 1 else 0 end
+        ) as recent_active_posts
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+dup_closure as (
+    select
+        ph.postid as post_id,
+        min(ph.creationdate) as first_close_date,
+        max(ph.creationdate) as last_close_date,
+        count(*) as close_events,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+        sum(
+            case
+                when ph.posthistorytypeid = 10 and ph.comment ~ '(^|[,[:space:]]|{)"?(1|101)"?([,[:space:]]|}|$)'
+                    then 1 else 0
+            end
+        ) as duplicate_flags
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+postlink_dupes as (
+    select pl.postid as dup_post_id,
+           pl.relatedpostid as canonical_post_id,
+           count(*) as link_dup_count
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+tag_explosion as (
+    select
+        q.id as question_id,
+        q.owneruserid as user_id,
+        cardinality(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tag_count,
+        coalesce(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><'), array[]::varchar[]) as tag_array
+    from posts q
+    where q.posttypeid = 1
+),
+user_tag_focus as (
+    select
+        te.user_id,
+        lower(t.tagname) as tagname,
+        count(*) as q_in_tag
+    from tag_explosion te
+    join tags t
+      on lower(t.tagname) = any (select lower(x) from unnest(te.tag_array) as x)
+    group by te.user_id, lower(t.tagname)
+),
+top_tag_per_user as (
+    select user_id, tagname, q_in_tag,
+           row_number() over (partition by user_id order by q_in_tag desc, tagname) as rn
+    from user_tag_focus
+),
+vote_agg as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_closed
+    from votes v
+    group by v.postid
+),
+owner_vote_rollup as (
+    select
+        p.owneruserid as user_id,
+        sum(va.upvotes) as total_upvotes_on_owned,
+        sum(va.downvotes) as total_downvotes_on_owned,
+        sum(va.bounty_started) as bounty_started_sum,
+        sum(va.bounty_closed) as bounty_closed_sum
+    from posts p
+    left join vote_agg va
+      on va.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+user_quality as (
+    select
+        u.user_id,
+        coalesce(qa.avg_q_score, 0) as avg_q_score,
+        coalesce(am.avg_a_score, 0) as avg_a_score,
+        coalesce(ua.total_post_score, 0) as total_post_score,
+        coalesce(ua.total_views, 0) as total_views,
+        coalesce(cm.avg_c_score, 0) as avg_c_score,
+        coalesce(ua.answers,0) as answers,
+        coalesce(ua.questions,0) as questions,
+        coalesce(qa.accepted_count,0) as accepted_count,
+        coalesce(qa.closed_count,0) as closed_count
+    from recent_users u
+    left join question_metrics qa on qa.user_id = u.user_id
+    left join answer_metrics am on am.user_id = u.user_id
+    left join user_activity ua on ua.user_id = u.user_id
+    left join comment_metrics cm on cm.user_id = u.user_id
+),
+scored_users as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.region_hint,
+        ru.creationdate,
+        ru.gold_badges, ru.silver_badges, ru.bronze_badges,
+        ua.first_post_date,
+        ua.last_activity_date,
+        ua.questions, ua.answers, ua.total_views, ua.total_post_score, ua.avg_nonzero_score,
+        uq.avg_q_score, uq.avg_a_score, uq.avg_c_score,
+        uq.accepted_count, uq.closed_count,
+        coalesce(qa.med_q_views, 0) as med_q_views,
+        coalesce(am.med_a_score, 0) as med_a_score,
+        coalesce(h.raw_hotness, 0) as raw_hotness,
+        coalesce(h.recent_active_posts, 0) as recent_active_posts,
+        coalesce(ov.total_upvotes_on_owned,0) as total_upvotes_on_owned,
+        coalesce(ov.total_downvotes_on_owned,0) as total_downvotes_on_owned,
+        coalesce(ov.bounty_started_sum,0) as bounty_started_sum,
+        coalesce(ov.bounty_closed_sum,0) as bounty_closed_sum,
+        -- Composite benchmark score with mixed types and NULL logic
+        (
+            coalesce(ru.reputation,0) * 0.35
+          + coalesce(uq.total_post_score,0) * 2.0
+          + coalesce(uq.total_views,0) * 0.01
+          + coalesce(qa.accepted_count,0) * 5.0
+          - coalesce(qa.closed_count,0) * 3.0
+          + coalesce(h.raw_hotness,0) * 0.75
+          + least(100.0, greatest(0.0, coalesce(ua.avg_nonzero_score,0))) * 1.5
+          + (coalesce(ru.gold_badges,0) * 15 + coalesce(ru.silver_badges,0) * 5 + coalesce(ru.bronze_badges,0) * 2)
+          + (case when ua.answers > ua.questions then 20 else 0 end)
+          + (case when ru.last_badge_date >= now() - interval '90 days' then 10 else 0 end)
+          + (coalesce(ov.bounty_closed_sum,0) - coalesce(ov.bounty_started_sum,0)) * 0.1
+        ) as benchmark_score
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join question_metrics qa on qa.user_id = ru.user_id
+    left join answer_metrics am on am.user_id = ru.user_id
+    left join hotness h on h.user_id = ru.user_id
+    left join owner_vote_rollup ov on ov.user_id = ru.user_id
+    left join user_quality uq on uq.user_id = ru.user_id
+),
+dupe_impact as (
+    select
+        q.owneruserid as user_id,
+        count(distinct d.post_id) as dup_closed_posts,
+        sum(d.duplicate_flags) as duplicate_flags,
+        avg(extract(epoch from (coalesce(d.last_close_date, d.first_close_date) - d.first_close_date))) as avg_close_window_secs
+    from posts q
+    join dup_closure d on d.post_id = q.id
+    where q.posttypeid = 1
+    group by q.owneruserid
+),
+post_summary as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid in (1,2)) as qa_posts,
+        count(*) filter (where p.posttypeid not in (1,2)) as wiki_or_other,
+        max(p.viewcount) as max_views_on_post,
+        max(p.score) as max_score_on_post,
+        min(p.score) as min_score_on_post
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+top_tag as (
+    select t.user_id, t.tagname, t.q_in_tag
+    from top_tag_per_user t
+    where t.rn = 1
+),
+activity_ranked as (
+    select
+        su.*,
+        coalesce(di.dup_closed_posts,0) as dup_closed_posts,
+        coalesce(di.duplicate_flags,0) as duplicate_flags,
+        coalesce(di.avg_close_window_secs,0) as avg_close_window_secs,
+        coalesce(ps.qa_posts,0) as qa_posts,
+        coalesce(ps.wiki_or_other,0) as wiki_or_other,
+        coalesce(ps.max_views_on_post,0) as max_views_on_post,
+        coalesce(ps.max_score_on_post,0) as max_score_on_post,
+        coalesce(ps.min_score_on_post,0) as min_score_on_post,
+        coalesce(tt.tagname, 'unfocused') as top_tag,
+        coalesce(tt.q_in_tag,0) as top_tag_q_count,
+        row_number() over (order by su.benchmark_score desc, su.reputation desc, su.total_post_score desc, su.total_views desc) as rn_global,
+        dense_rank() over (partition by su.region_hint order by su.benchmark_score desc) as rn_region,
+        ntile(10) over (order by su.benchmark_score desc) as decile
+    from scored_users su
+    left join dupe_impact di on di.user_id = su.user_id
+    left join post_summary ps on ps.user_id = su.user_id
+    left join top_tag tt on tt.user_id = su.user_id
+),
+recent_vs_historical as (
+    select
+        p.owneruserid as user_id,
+        avg(case when p.creationdate >= now() - interval '365 days' then coalesce(p.score,0) end) as avg_score_recent,
+        avg(case when p.creationdate <  now() - interval '365 days' then coalesce(p.score,0) end) as avg_score_old,
+        count(*) filter (where p.creationdate >= now() - interval '365 days') as posts_recent,
+        count(*) filter (where p.creationdate <  now() - interval '365 days') as posts_old
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+finalized as (
+    select
+        a.*,
+        r.avg_score_recent,
+        r.avg_score_old,
+        r.posts_recent,
+        r.posts_old,
+        (coalesce(r.avg_score_recent,0) - coalesce(r.avg_score_old,0)) as score_trend,
+        case
+            when coalesce(r.posts_recent,0) = 0 and coalesce(r.posts_old,0) = 0 then 'inactive'
+            when coalesce(r.posts_recent,0) = 0 then 'dormant'
+            when coalesce(r.avg_score_recent,0) >= coalesce(r.avg_score_old,0) then 'improving'
+            else 'declining'
+        end as momentum
+    from activity_ranked a
+    left join recent_vs_historical r on r.user_id = a.user_id
+)
+select
+    f.user_id,
+    f.displayname,
+    f.region_hint,
+    f.reputation,
+    f.gold_badges || '/' || f.silver_badges || '/' || f.bronze_badges as badge_mix,
+    f.questions,
+    f.answers,
+    f.total_views,
+    f.total_post_score,
+    round(f.avg_nonzero_score::numeric, 2) as avg_nonzero_score,
+    round(f.avg_q_score::numeric, 2) as avg_q_score,
+    round(f.avg_a_score::numeric, 2) as avg_a_score,
+    round(f.avg_c_score::numeric, 2) as avg_c_score,
+    f.accepted_count,
+    f.closed_count,
+    f.med_q_views,
+    f.med_a_score,
+    f.raw_hotness,
+    f.recent_active_posts,
+    f.total_upvotes_on_owned,
+    f.total_downvotes_on_owned,
+    f.bounty_started_sum,
+    f.bounty_closed_sum,
+    f.dup_closed_posts,
+    f.duplicate_flags,
+    round(coalesce(f.avg_close_window_secs,0)::numeric, 2) as avg_close_window_secs,
+    f.qa_posts,
+    f.wiki_or_other,
+    f.max_views_on_post,
+    f.max_score_on_post,
+    f.min_score_on_post,
+    f.top_tag,
+    f.top_tag_q_count,
+    round(f.benchmark_score::numeric, 2) as benchmark_score,
+    f.rn_global,
+    f.rn_region,
+    f.decile,
+    f.momentum,
+    round(coalesce(f.avg_score_recent,0)::numeric, 2) as avg_score_recent,
+    round(coalesce(f.avg_score_old,0)::numeric, 2) as avg_score_old,
+    round(coalesce(f.score_trend,0)::numeric, 2) as score_trend,
+    to_char(f.creationdate, 'YYYY-MM-DD') as user_created,
+    coalesce(to_char(f.first_post_date, 'YYYY-MM-DD'), 'n/a') as first_post,
+    coalesce(to_char(f.last_activity_date, 'YYYY-MM-DD'), 'n/a') as last_activity
+from finalized f
+where
+    -- complex predicate blending numeric, string, and null-safe conditions
+    f.decile in (1,2,3)
+    and (f.benchmark_score > 0 or (f.questions + f.answers) > 0)
+    and (f.top_tag is not null and length(f.top_tag) > 0)
+    and (f.closed_count is null or f.closed_count <= f.questions)
+    and (f.region_hint not ilike any (array['%antarctica%', '%nowhere%']) or f.region_hint = 'Unknown')
+    and (f.avg_score_recent is null or f.avg_score_recent >= -5)
+order by f.benchmark_score desc, f.reputation desc, f.total_views desc
+limit 200;

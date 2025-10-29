@@ -1,0 +1,191 @@
+-- {"query": "7011.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2233} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        COALESCE(MAX(p.CreationDate), u.CreationDate) as LastActivity,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as ActivityRank,
+        NTILE(10) OVER (ORDER BY u.Reputation DESC) as ReputationDecile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId OR u.Id = p.LastEditorUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+QuestionAnalysis AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.LastActivityDate,
+        DATEDIFF(day, p.CreationDate, p.LastActivityDate) as DaysSinceCreation,
+        (p.Score * 1.0 / NULLIF(p.ViewCount, 0)) as ScorePerView,
+        CASE 
+            WHEN p.AnswerCount = 0 THEN 'No Answers'
+            WHEN p.AnswerCount = 1 THEN 'One Answer'
+            WHEN p.AnswerCount > 1 AND p.AnswerCount <= 5 THEN 'Few Answers'
+            ELSE 'Many Answers'
+        END as AnswerQuantity,
+        CASE 
+            WHEN p.Tags LIKE '%<c>%' OR p.Tags LIKE '%<java>%' OR p.Tags LIKE '%<python>%' THEN 'Programming'
+            WHEN p.Tags LIKE '%<sql>%' THEN 'Database'
+            WHEN p.Tags LIKE '%<javascript>%' OR p.Tags LIKE '%<js>%' THEN 'Web Development'
+            ELSE 'Other'
+        END as TopicCategory,
+        DENSE_RANK() OVER (PARTITION BY CASE 
+            WHEN p.Tags LIKE '%<c>%' OR p.Tags LIKE '%<java>%' OR p.Tags LIKE '%<python>%' THEN 'Programming'
+            WHEN p.Tags LIKE '%<sql>%' THEN 'Database'
+            WHEN p.Tags LIKE '%<javascript>%' OR p.Tags LIKE '%<js>%' THEN 'Web Development'
+            ELSE 'Other'
+        END ORDER BY p.Score DESC) as CategoryRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ParentId IS NULL
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) as EditCount,
+        COUNT(DISTINCT ph.UserId) as EditorCount,
+        MAX(ph.CreationDate) as LastEdit,
+        MIN(ph.CreationDate) as FirstEdit,
+        DATEDIFF(day, MIN(ph.CreationDate), MAX(ph.CreationDate)) as EditDurationDays,
+        STRING_AGG(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1,2,3) THEN 'Initial' ELSE 'Edit' END, ', ') as EditTypes,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) as CloseCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) as ReopenCount
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+UserPostPerformance AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.ActivityRank,
+        ua.ReputationDecile,
+        ISNULL(uas.EditCount, 0) as TotalEdits,
+        ISNULL(uas.EditorCount, 0) as EditorCount,
+        uas.LastEdit,
+        uas.FirstEdit,
+        uas.EditDurationDays,
+        uas.EditTypes,
+        CASE 
+            WHEN ua.ActivityRank <= 10 THEN 'Top Performer'
+            WHEN ua.ActivityRank <= 50 THEN 'High Performer'
+            WHEN ua.ActivityRank <= 100 THEN 'Medium Performer'
+            ELSE 'Regular User'
+        END as PerformanceTier,
+        CASE 
+            WHEN uas.EditDurationDays > 365 AND uas.EditorCount > 10 THEN 'Long Term Active Editor'
+            WHEN uas.EditDurationDays <= 30 AND uas.EditorCount > 5 THEN 'Recent Active Editor'
+            ELSE 'Occasional Editor'
+        END as EditorStatus
+    FROM UserActivityStats ua
+    LEFT JOIN PostHistorySummary uas ON ua.UserId = uas.PostId
+),
+TopQuestionsByCategory AS (
+    SELECT 
+        qa.QuestionId,
+        qa.Title,
+        qa.Score,
+        qa.ViewCount,
+        qa.TopicCategory,
+        qa.CategoryRank,
+        RANK() OVER (PARTITION BY qa.TopicCategory ORDER BY qa.Score DESC) as ScoreRankByCategory,
+        DENSE_RANK() OVER (ORDER BY qa.Score DESC) as OverallScoreRank,
+        DATEDIFF(day, qa.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysSincePosted,
+        CASE 
+            WHEN qa.Score > 100 THEN 'Hot Question'
+            WHEN qa.Score > 50 THEN 'Popular Question'
+            WHEN qa.Score > 10 THEN 'Good Question'
+            ELSE 'Regular Question'
+        END as QualityRating
+    FROM QuestionAnalysis qa
+),
+BadgeDistribution AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) as TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) as GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) as SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) as BronzeBadges,
+        STRING_AGG(b.Name, ', ') WITHIN GROUP (ORDER BY b.Date DESC) as BadgeList,
+        MAX(b.Date) as LastBadgeAwarded,
+        (COUNT(*) * 100.0 / NULLIF((SELECT COUNT(*) FROM Badges b2), 0)) as PercentOfAllBadges
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT 
+    upp.UserId,
+    upp.DisplayName,
+    upp.Reputation,
+    upp.PerformanceTier,
+    upp.EditorStatus,
+    upp.TotalEdits,
+    upp.EditorCount,
+    upp.EditTypes,
+    upp.LastEdit,
+    upp.FirstEdit,
+    upp.EditDurationDays,
+    COALESCE(bd.TotalBadges, 0) as TotalBadges,
+    COALESCE(bd.GoldBadges, 0) as GoldBadges,
+    COALESCE(bd.SilverBadges, 0) as SilverBadges,
+    COALESCE(bd.BronzeBadges, 0) as BronzeBadges,
+    COALESCE(bd.BadgeList, 'None') as BadgeList,
+    (SELECT STRING_AGG(CONCAT(q.Title, ' (Score:', q.Score, ')'), '; ')
+     FROM TopQuestionsByCategory q 
+     WHERE q.ScoreRankByCategory <= 3 AND q.TopicCategory = 'Programming'
+    ) as TopProgrammingQuestions,
+    CASE 
+        WHEN upp.TotalEdits = 0 THEN 'No Edits'
+        WHEN upp.TotalEdits BETWEEN 1 AND 10 THEN 'Beginner Editor'
+        WHEN upp.TotalEdits BETWEEN 11 AND 50 THEN 'Intermediate Editor'
+        WHEN upp.TotalEdits > 50 THEN 'Expert Editor'
+    END as EditExpertise,
+    (SELECT COUNT(*) FROM TopQuestionsByCategory tq WHERE tq.TopicCategory = 'Database' AND tq.Score > 20) as HighValueDatabaseQuestions,
+    ISNULL((SELECT AVG(q.Score) FROM TopQuestionsByCategory q WHERE q.TopicCategory = 'Web Development'), 0) as AvgWebDevQuestionScore,
+    (SELECT TOP 1 u2.DisplayName FROM Users u2 WHERE u2.Id = upp.UserId AND u2.ViewCount > 10000) as HighViewUser,
+    CASE 
+        WHEN upp.Reputation >= 10000 THEN 'Elite'
+        WHEN upp.Reputation >= 5000 THEN 'Master'
+        WHEN upp.Reputation >= 1000 THEN 'Expert'
+        WHEN upp.Reputation >= 100 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END as UserReputationLevel,
+    CAST((ISNULL(bd.TotalBadges, 0) * 100.0 / NULLIF((SELECT COUNT(*) FROM Users), 0)) as DECIMAL(5,2)) as BadgePercentageOfUsers,
+    COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = upp.UserId AND p.PostTypeId = 1), 0) as QuestionCount,
+    COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = upp.UserId AND p.PostTypeId = 2), 0) as AnswerCount,
+    (SELECT CAST(DATEPART(YEAR, MAX(ph.CreationDate)) as VARCHAR(4)) + '-' + CAST(DATEPART(MONTH, MAX(ph.CreationDate)) as VARCHAR(2)) as LastEditPeriod
+     FROM PostHistory ph WHERE ph.UserId = upp.UserId
+    ) as LastEditPeriod,
+    CASE 
+        WHEN upp.EditDurationDays > 180 THEN 'Long Term Editor'
+        WHEN upp.EditDurationDays > 30 THEN 'Short Term Editor'
+        ELSE 'New Editor'
+    END as EditDurationCategory
+FROM UserPostPerformance upp
+LEFT JOIN BadgeDistribution bd ON upp.UserId = bd.UserId
+WHERE upp.Reputation > 1000
+  AND (upp.TotalEdits > 5 OR bd.TotalBadges > 2)
+  AND (upp.UserId IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE PostTypeId = 1))
+  AND upp.UserId NOT IN (
+    SELECT UserId FROM Votes WHERE VoteTypeId = 4 AND CreationDate > DATEADD(DAY, -30, cast('2024-10-01 12:34:56' as timestamp))
+  )
+ORDER BY upp.Reputation DESC, upp.ActivityRank ASC, upp.TotalEdits DESC
+OFFSET 10 ROWS
+FETCH NEXT 50 ROWS ONLY;

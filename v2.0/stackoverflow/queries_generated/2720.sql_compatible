@@ -1,0 +1,140 @@
+WITH RECURSIVE RecursiveBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, b.Class
+
+    UNION ALL
+
+    SELECT
+        rbc.UserId,
+        rbc.DisplayName,
+        rbc.Class,
+        rbc.BadgeCount + 1
+    FROM RecursiveBadgeCounts rbc
+    WHERE rbc.BadgeCount < 100
+),
+UserPostStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionsAsked,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswersGiven,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1, 2)) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+TopTags AS (
+    SELECT
+        unnest(string_to_array(trim(both '<>' FROM t.Tags), '><')) AS Tag,
+        COUNT(*) AS TagCount
+    FROM Posts t
+    WHERE t.PostTypeId = 1
+    GROUP BY Tag
+    HAVING COUNT(*) > 1000
+),
+UserTagActivity AS (
+    SELECT
+        ups.UserId,
+        tt.Tag,
+        COUNT(*) AS PostsWithTag
+    FROM UserPostStats ups
+    JOIN Posts p ON ups.UserId = p.OwnerUserId AND p.PostTypeId = 1
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS Tag
+    ) tt ON true
+    GROUP BY ups.UserId, tt.Tag
+),
+RankedUserTags AS (
+    SELECT
+        uta.UserId,
+        uta.Tag,
+        uta.PostsWithTag,
+        row_number() OVER (PARTITION BY uta.UserId ORDER BY uta.PostsWithTag DESC) AS TagRank
+    FROM UserTagActivity uta
+),
+RecentQuestionsWithComments AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        c.Id AS CommentId,
+        c.Text AS CommentText,
+        row_number() OVER (PARTITION BY q.Id ORDER BY c.Score DESC NULLS LAST, c.CreationDate DESC) AS CommentRank
+    FROM Posts q
+    LEFT JOIN Comments c ON q.Id = c.PostId
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '30 days'
+),
+PostLinkDuplicates AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateCount,
+        MAX(pl.CreationDate) AS LastDuplicateLinkDate
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COALESCE(ups.QuestionsAsked, 0) AS QuestionsAsked,
+        COALESCE(ups.AnswersGiven, 0) AS AnswersGiven,
+        COALESCE(ups.AvgPostScore, 0) AS AvgPostScore,
+        COALESCE(rbc.BadgeCount, 0) AS TotalBadges,
+        COALESCE(pld.DuplicateCount, 0) AS TotalDuplicatesLinked,
+        u.Reputation,
+        u.CreationDate
+    FROM Users u
+    LEFT JOIN UserPostStats ups ON ups.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, SUM(BadgeCount) AS BadgeCount
+        FROM RecursiveBadgeCounts
+        GROUP BY UserId
+    ) rbc ON rbc.UserId = u.Id
+    LEFT JOIN (
+        SELECT p.OwnerUserId, SUM(COALESCE(pl.DuplicateCount, 0)) AS DuplicateCount
+        FROM Posts p
+        LEFT JOIN PostLinkDuplicates pl ON p.Id = pl.PostId
+        WHERE p.PostTypeId = 1
+        GROUP BY p.OwnerUserId
+    ) pld ON pld.OwnerUserId = u.Id
+)
+SELECT
+    uas.DisplayName,
+    uas.Reputation,
+    uas.QuestionsAsked,
+    uas.AnswersGiven,
+    uas.AvgPostScore,
+    uas.TotalBadges,
+    uas.TotalDuplicatesLinked,
+    t.Tag AS TopUserTag,
+    tagRank.PostsWithTag AS PostsWithTopTag,
+    rq.CommentText AS MostPopularRecentComment,
+    rq.CommentRank AS CommentRank,
+    CASE
+        WHEN uas.Reputation > 100000 THEN 'Legendary'
+        WHEN uas.Reputation BETWEEN 50000 AND 100000 THEN 'Expert'
+        WHEN uas.Reputation < 10000 THEN 'Newbie'
+        ELSE 'Intermediate'
+    END AS ReputationCategory
+FROM UserActivitySummary uas
+LEFT JOIN RankedUserTags tagRank ON uas.Id = tagRank.UserId AND tagRank.TagRank = 1
+LEFT JOIN TopTags t ON t.Tag = tagRank.Tag
+LEFT JOIN LATERAL (
+    SELECT rq2.CommentText, rq2.CommentRank
+    FROM RecentQuestionsWithComments rq2
+    WHERE rq2.OwnerUserId = uas.Id
+    ORDER BY rq2.CommentRank
+    LIMIT 1
+) rq ON true
+WHERE uas.QuestionsAsked > 5
+  AND (uas.AvgPostScore > 5 OR uas.TotalBadges > 10)
+ORDER BY uas.Reputation DESC, uas.TotalBadges DESC, uas.AnswersGiven DESC
+LIMIT 100;

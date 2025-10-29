@@ -1,0 +1,64 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) AS TotalWikis,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId ELSE NULL END) AS TotalUpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId ELSE NULL END) AS TotalDownVotes,
+    MAX(p.Score) AS HighestScore,
+    MIN(p.Score) AS LowestScore,
+    AVG(p.Score) AS AverageScore,
+    SUM(p.ViewCount) AS TotalViews,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) AS TotalAnswersToQuestions,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS TagList,
+    MAX(p.LastActivityDate) AS LastActivityDate,
+    MIN(p.CreationDate) AS EarliestPostDate,
+    MAX(p.CreationDate) AS LatestPostDate,
+    COALESCE(SUM(b.Class), 0) AS TotalBadges,
+    CASE 
+        WHEN u.AccountId IS NOT NULL THEN 'Deleted'
+        ELSE 'Active'
+    END AS AccountStatus
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    -- convert tag string like '<tag1><tag2>' into rows: remove leading/trailing '<' and split by '><'
+    -- implementation using standard functions: replace start/end angle brackets, then split; use a derived table for tags
+    (
+      SELECT
+        pt.PostId,
+        TRIM(tag) AS TagName
+      FROM (
+        SELECT
+          p2.Id AS PostId,
+          -- remove leading/trailing angle brackets then split
+          regexp_split_to_table(
+            regexp_replace(COALESCE(p2.Tags, ''), '^<|>$', '', 'g'),
+            '><'
+          ) AS tag
+        FROM Posts p2
+      ) pt
+    ) t ON p.Id = t.PostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+WHERE 
+    u.Reputation > 1000
+    AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    AND p.CreationDate >= DATE '2020-01-01'
+    AND p.LastActivityDate <= DATE '2024-10-01'
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.AccountId
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC;

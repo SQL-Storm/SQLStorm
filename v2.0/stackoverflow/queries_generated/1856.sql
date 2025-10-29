@@ -1,0 +1,239 @@
+-- {"query": "1856.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3558} 
+
+WITH UserEngagement AS (
+    -- Calculate detailed engagement metrics and reputation tiers for users
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(AVG(p.Score), 0.0) AS AvgPostScore,
+        MAX(GREATEST(u.LastAccessDate, COALESCE(p.LastActivityDate, u.LastAccessDate), COALESCE(c.CreationDate, u.LastAccessDate))) AS LastKnownActivity,
+        NTILE(4) OVER (ORDER BY u.Reputation DESC) AS ReputationTier, -- Divide users into 4 reputation tiers
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.PostId END) AS PostsEditedCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+HighViewQuestions AS (
+    -- Select questions created within the last 3 years with significant view counts
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate AS PostCreationDate,
+        p.OwnerUserId,
+        COALESCE(p.OwnerDisplayName, 'Community User') AS PostOwnerDisplayName,
+        p.Title,
+        p.Body,
+        p.Tags,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        'HighViewQuestion' AS SourceCategory -- Categorize for set operator
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.PostTypeId = 1 AND p.ViewCount > 5000 AND p.CreationDate > NOW() - INTERVAL '3 year'
+),
+HighScoreAnswers AS (
+    -- Select answers created within the last 3 years with high scores
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate AS PostCreationDate,
+        p.OwnerUserId,
+        COALESCE(p.OwnerDisplayName, 'Community User') AS PostOwnerDisplayName,
+        p.Title, -- Title is typically NULL for answers, but column needed for UNION ALL
+        p.Body,
+        p.Tags, -- Tags are typically NULL for answers
+        p.ViewCount, -- ViewCount is typically NULL for answers
+        p.Score,
+        p.AnswerCount, -- AnswerCount is typically NULL for answers
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        'HighScoreAnswer' AS SourceCategory -- Categorize for set operator
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.PostTypeId = 2 AND p.Score > 50 AND p.CreationDate > NOW() - INTERVAL '3 year'
+),
+CombinedPosts AS (
+    -- Combine highly viewed questions and highly scored answers using UNION ALL
+    SELECT * FROM HighViewQuestions
+    UNION ALL
+    SELECT * FROM HighScoreAnswers
+),
+PostDetailsAggregated AS (
+    -- Aggregate votes and comments for the combined set of posts and apply window functions
+    SELECT
+        cp.PostId,
+        cp.PostTypeId,
+        cp.PostTypeName,
+        cp.PostCreationDate,
+        cp.OwnerUserId,
+        cp.PostOwnerDisplayName,
+        cp.Title,
+        cp.Body,
+        cp.Tags,
+        cp.ViewCount,
+        cp.Score,
+        cp.AnswerCount,
+        cp.CommentCount,
+        cp.FavoriteCount,
+        cp.ClosedDate,
+        cp.SourceCategory,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCount,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswerVotesCount,
+        AVG(COALESCE(com.Score, 0)) AS AvgCommentScore,
+        MAX(CASE WHEN cp.Body LIKE '%<pre><code>%' THEN TRUE ELSE FALSE END) AS HasCodeSnippet,
+        DATE_PART('day', NOW() - cp.PostCreationDate) AS DaysSincePostCreation,
+        LAG(cp.PostCreationDate, 1, cp.PostCreationDate) OVER (PARTITION BY cp.OwnerUserId ORDER BY cp.PostCreationDate) AS PreviousPostCreationDate, -- Time since previous post by same owner
+        ROW_NUMBER() OVER (PARTITION BY cp.PostTypeId ORDER BY cp.PostCreationDate DESC) AS LatestPostOfTypeRank, -- Rank posts within their type
+        AVG(cp.Score) OVER (PARTITION BY cp.PostTypeId ORDER BY cp.PostCreationDate ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS RollingAvgScoreForPostType -- Rolling average score
+    FROM CombinedPosts cp
+    LEFT JOIN Votes v ON cp.PostId = v.PostId
+    LEFT JOIN Comments com ON cp.PostId = com.PostId
+    GROUP BY
+        cp.PostId, cp.PostTypeId, cp.PostTypeName, cp.PostCreationDate, cp.OwnerUserId,
+        cp.PostOwnerDisplayName, cp.Title, cp.Body, cp.Tags, cp.ViewCount, cp.Score,
+        cp.AnswerCount, cp.CommentCount, cp.FavoriteCount, cp.ClosedDate, cp.SourceCategory
+),
+PostHistoryAggregates AS (
+    -- Aggregate post history data, focusing on edit counts and close/reopen events
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS EditCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LastReopenedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS LastCloseReasonId, -- CloseReasonId is stored in the Comment field for type 10
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS LastEditDateByHistory
+    FROM PostHistory ph
+    WHERE ph.PostId IN (SELECT PostId FROM CombinedPosts)
+    GROUP BY ph.PostId
+),
+TagAnalysis AS (
+    -- Analyze tag usage, average scores, and activity by tag
+    SELECT
+        TRIM(REPLACE(REPLACE(LOWER(t.tag), '<', ''), '>', '')) AS TagName, -- Clean and normalize tag names
+        COUNT(pda.PostId) AS TotalPostsWithTag,
+        AVG(pda.Score) AS AvgScoreForTag,
+        MAX(pda.PostCreationDate) AS MostRecentPostDateForTag,
+        SUM(CASE WHEN pda.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsWithTag,
+        SUM(CASE WHEN pda.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersWithTag
+    FROM PostDetailsAggregated pda
+    -- Lateral join to unnest tags from the string column
+    JOIN LATERAL UNNEST(string_to_array(SUBSTRING(pda.Tags, 2, LENGTH(pda.Tags) - 2), '><')) AS t(tag) ON TRUE
+    WHERE pda.Tags IS NOT NULL AND LENGTH(pda.Tags) > 2 -- Filter out posts without valid tags
+    GROUP BY TRIM(REPLACE(REPLACE(LOWER(t.tag), '<', ''), '>', ''))
+),
+PotentialDuplicates AS (
+    -- Identify posts explicitly marked as duplicates in PostLinks
+    SELECT
+        pl.PostId AS SourcePostId,
+        pl.RelatedPostId AS DuplicatePostId,
+        MAX(p.Title) AS SourcePostTitle,
+        MAX(pr.Title) AS DuplicatePostTitle
+    FROM PostLinks pl
+    JOIN Posts p ON pl.PostId = p.Id
+    JOIN Posts pr ON pl.RelatedPostId = pr.Id
+    WHERE pl.LinkTypeId = 3 AND pl.PostId IN (SELECT PostId FROM CombinedPosts)
+    GROUP BY pl.PostId, pl.RelatedPostId
+)
+-- Main Query: Orchestrate data from all CTEs to provide a comprehensive view
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.ReputationTier,
+    ue.TotalPosts,
+    ue.TotalComments,
+    ue.TotalBadges,
+    ue.AvgPostScore AS UserAvgPostScore,
+    ue.LastKnownActivity,
+    NOW() - ue.LastKnownActivity AS TimeSinceUserActivity, -- Complex date calculation
+    pda.PostId,
+    pda.PostTypeName,
+    pda.PostCreationDate,
+    pda.PostOwnerDisplayName,
+    pda.Title AS PostTitle,
+    pda.ViewCount AS PostViewCount,
+    pda.Score AS PostScore,
+    pda.UpVotesCount,
+    pda.DownVotesCount,
+    pda.FavoriteCount,
+    pda.HasCodeSnippet,
+    pda.DaysSincePostCreation,
+    (pda.UpVotesCount - pda.DownVotesCount) AS NetVotes, -- Custom vote metric
+    (CASE WHEN pda.PreviousPostCreationDate < pda.PostCreationDate THEN DATE_PART('hour', pda.PostCreationDate - pda.PreviousPostCreationDate) ELSE 0 END) AS HoursSincePreviousPost,
+    pda.RollingAvgScoreForPostType,
+    COALESCE(pha.EditCount, 0) AS TotalEditCount,
+    COALESCE(pha.LastEditDateByHistory, pda.PostCreationDate) AS EffectiveLastEditDate, -- NULL logic with COALESCE
+    crt.Name AS CloseReasonName,
+    (SELECT EXISTS ( -- Correlated subquery: check if the user has ever accepted an answer they wrote for one of their own questions
+        SELECT 1 FROM Posts q_user
+        WHERE q_user.OwnerUserId = ue.UserId
+        AND q_user.PostTypeId = 1
+        AND q_user.AcceptedAnswerId IS NOT NULL
+        AND EXISTS (SELECT 1 FROM Posts a_accepted WHERE a_accepted.Id = q_user.AcceptedAnswerId AND a_accepted.OwnerUserId = ue.UserId)
+    )) AS HasAcceptedOwnAnswer,
+    ta.TagName,
+    ta.TotalPostsWithTag,
+    ta.AvgScoreForTag,
+    ta.MostRecentPostDateForTag,
+    (SELECT COUNT(DISTINCT l.RelatedPostId) FROM PostLinks l WHERE l.PostId = pda.PostId AND l.LinkTypeId = 1) AS LinkedPostsCount, -- Non-correlated subquery
+    dp.DuplicatePostTitle, -- Will be NULL if not a duplicate
+    (SELECT AVG(v2.BountyAmount) FROM Votes v2 WHERE v2.PostId = pda.PostId AND v2.VoteTypeId = 8 AND v2.BountyAmount > 0) AS AvgBountyAmount, -- Another non-correlated subquery
+    pda.LatestPostOfTypeRank,
+    CASE -- Complex conditional logic for post status classification
+        WHEN pda.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN pda.DaysSincePostCreation > 730 AND COALESCE(pda.AnswerCount, 0) = 0 THEN 'Stale-NoAnswers'
+        WHEN pda.Score < -5 AND pda.PostTypeId = 1 THEN 'HighlyDownvoted-Question'
+        ELSE 'Active'
+    END AS PostStatusClassification,
+    -- String expressions: extract first paragraph and search keywords
+    SUBSTRING(pda.Body, POSITION('<p>' IN pda.Body) + 3, POSITION('</p>' IN pda.Body) - (POSITION('<p>' IN pda.Body) + 3)) AS FirstParagraph,
+    (LOWER(pda.Title) LIKE '%performance%' OR LOWER(pda.Body) LIKE '%benchmark%' OR LOWER(pda.Body) LIKE '%optimization%') AS MentionsPerformanceBenchmark,
+    REGEXP_REPLACE(pda.Body, '<[^>]+>', '', 'g') AS BodyPlainText -- Strips HTML tags from body
+FROM UserEngagement ue
+LEFT JOIN PostDetailsAggregated pda ON ue.UserId = pda.OwnerUserId
+LEFT JOIN PostHistoryAggregates pha ON pda.PostId = pha.PostId
+LEFT JOIN CloseReasonTypes crt ON CAST(pha.LastCloseReasonId AS smallint) = crt.Id -- Explicit CAST for type safety
+-- Lateral join for tags for each post in PostDetailsAggregated
+LEFT JOIN LATERAL UNNEST(string_to_array(SUBSTRING(pda.Tags, 2, LENGTH(pda.Tags) - 2), '><')) AS t_unnest(tag) ON pda.Tags IS NOT NULL AND LENGTH(pda.Tags) > 2
+LEFT JOIN TagAnalysis ta ON TRIM(REPLACE(REPLACE(LOWER(t_unnest.tag), '<', ''), '>', '')) = ta.TagName
+LEFT JOIN PotentialDuplicates dp ON pda.PostId = dp.SourcePostId
+WHERE
+    ue.TotalPosts > 0
+    AND (ue.ReputationTier = 1 OR ue.ReputationTier = 2) -- Filter for top two reputation tiers
+    AND pda.PostId IS NOT NULL -- Ensure only posts from CombinedPosts are included
+    AND NOT EXISTS ( -- Correlated subquery in WHERE: filter out posts with excessive early edits by others
+        SELECT 1 FROM PostHistory ph_check
+        WHERE ph_check.PostId = pda.PostId
+        AND ph_check.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, Tags
+        AND ph_check.UserId <> pda.OwnerUserId -- Edited by someone other than the owner
+        AND ph_check.CreationDate BETWEEN pda.PostCreationDate AND pda.PostCreationDate + INTERVAL '2 hour'
+        GROUP BY ph_check.PostId
+        HAVING COUNT(ph_check.Id) > 3 -- More than 3 edits by others within 2 hours of creation
+    )
+ORDER BY
+    ue.Reputation DESC,
+    pda.PostScore DESC NULLS LAST,
+    pda.PostCreationDate DESC,
+    ue.UserId,
+    pda.PostId
+LIMIT 1000;

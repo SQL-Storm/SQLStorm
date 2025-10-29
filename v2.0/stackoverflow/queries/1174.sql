@@ -1,0 +1,205 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.Views,
+        U.UpVotes AS UserUpVotesReceived,
+        U.DownVotes AS UserDownVotesReceived,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN P.PostTypeId = 3 THEN 1 ELSE 0 END) AS TotalWikis,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN UV.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN UV.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        SUM(CASE WHEN UV.VoteTypeId = 5 THEN 1 ELSE 0 END) AS TotalFavoritesGiven
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Votes AS UV ON U.Id = UV.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        P.ClosedDate,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 8) THEN 1 ELSE 0 END) AS EditCount,
+        MAX(PH.CreationDate) AS LastEditHistoryDate,
+        COUNT(DISTINCT PL.RelatedPostId) AS LinkedPostCount,
+        SUM(CASE WHEN PV.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostUpvotesReceived,
+        SUM(CASE WHEN PV.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostDownvotesReceived,
+        (SELECT COUNT(DISTINCT Id) FROM Badges WHERE UserId = P.OwnerUserId AND Class = 1) AS OwnerGoldBadges_Correlated,
+        CASE
+            WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            ELSE 'Open'
+        END AS PostStatus,
+        LAG(P.Score, 1, 0) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostScore,
+        LEAD(P.Score, 1, 0) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS NextPostScore,
+        AVG(P.Score) OVER (
+            PARTITION BY P.PostTypeId
+            ORDER BY P.CreationDate
+            RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS AvgPostScoreLast30DaysOfType
+    FROM Posts AS P
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    LEFT JOIN PostLinks AS PL ON P.Id = PL.PostId AND PL.LinkTypeId = 1
+    LEFT JOIN Votes AS PV ON P.Id = PV.PostId AND PV.VoteTypeId IN (2, 3)
+    GROUP BY P.Id, P.OwnerUserId, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.Title, P.Tags, P.ClosedDate, P.AcceptedAnswerId, P.CommunityOwnedDate
+),
+TagAnalysis AS (
+    SELECT
+        PM.PostId,
+        PM.OwnerUserId,
+        UNNEST(string_to_array(SUBSTRING(PM.Tags, 2, LENGTH(PM.Tags) - 2), '><')) AS TagName
+    FROM PostMetrics AS PM
+    WHERE PM.Tags IS NOT NULL AND LENGTH(PM.Tags) > 2
+),
+UserTagContributions AS (
+    SELECT
+        TA.OwnerUserId,
+        TA.TagName,
+        COUNT(TA.PostId) AS TagPostCount,
+        ROW_NUMBER() OVER (PARTITION BY TA.OwnerUserId ORDER BY COUNT(TA.PostId) DESC, TA.TagName ASC) AS TagRankForUser
+    FROM TagAnalysis AS TA
+    GROUP BY TA.OwnerUserId, TA.TagName
+),
+UserBadgeStats AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeDate
+    FROM Badges AS B
+    GROUP BY B.UserId
+),
+GlobalAverages AS (
+    SELECT
+        AVG(U.Reputation) AS AvgReputation,
+        AVG(UE.TotalPosts) AS AvgUserPosts,
+        AVG(PM.Score) AS AvgPostScore,
+        AVG(PM.ViewCount) AS AvgPostViewCount,
+        AVG(PM.CommentCount) AS AvgPostCommentCount,
+        AVG(PM.EditCount) AS AvgPostEditCount
+    FROM Users AS U
+    LEFT JOIN UserEngagement AS UE ON U.Id = UE.UserId
+    LEFT JOIN PostMetrics AS PM ON U.Id = PM.OwnerUserId
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    UE.TotalCommentsMade,
+    UE.TotalUpvotesGiven,
+    UE.TotalDownvotesGiven,
+    UE.TotalFavoritesGiven,
+    PM.PostId,
+    PM.PostTypeId,
+    PM.PostCreationDate,
+    PM.Score AS PostScore,
+    PM.ViewCount AS PostViewCount,
+    PM.EditCount AS PostEditCount,
+    PM.PostStatus,
+    PM.OwnerGoldBadges_Correlated,
+    PM.PreviousPostScore,
+    PM.NextPostScore,
+    PM.AvgPostScoreLast30DaysOfType,
+    B.GoldBadges,
+    UTC.TagName AS TopTagName,
+    UTC.TagPostCount AS TopTagPosts,
+    1.0 * COALESCE(PM.PostUpvotesReceived, 0) / NULLIF(COALESCE(PM.PostUpvotesReceived, 0) + COALESCE(PM.PostDownvotesReceived, 0), 0) AS PostUpvoteRatio,
+    AGE(CAST('2024-10-01 12:34:56' AS timestamp), UE.LastAccessDate) AS TimeSinceLastAccess,
+    'High-Activity-Questioner' AS UserSegment,
+    (SELECT AvgReputation FROM GlobalAverages) AS GlobalAvgReputation,
+    (SELECT AvgPostScore FROM GlobalAverages) AS GlobalAvgPostScoreOverall,
+    LOWER(SUBSTRING(COALESCE(PM.Title, 'No Title'), 1, CASE WHEN LENGTH(COALESCE(PM.Title, 'No Title')) > 50 THEN 50 ELSE LENGTH(COALESCE(PM.Title, 'No Title')) END)) AS PartialTitleLowerCase
+FROM UserEngagement AS UE
+LEFT JOIN PostMetrics AS PM ON UE.UserId = PM.OwnerUserId
+LEFT JOIN UserBadgeStats AS B ON UE.UserId = B.UserId
+LEFT JOIN UserTagContributions AS UTC ON UE.UserId = UTC.OwnerUserId AND UTC.TagRankForUser = 1
+WHERE UE.Reputation > (SELECT AvgReputation FROM GlobalAverages) * 2
+  AND UE.TotalPosts > (SELECT AvgUserPosts FROM GlobalAverages) * 1.5
+  AND PM.PostTypeId = 1
+  AND PM.Score >= 10
+  AND PM.ClosedDate IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM Posts AS A
+      WHERE A.ParentId = PM.PostId
+        AND A.Score > 5
+        AND A.OwnerUserId IS NOT NULL
+  )
+UNION ALL
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    UE.TotalCommentsMade,
+    UE.TotalUpvotesGiven,
+    UE.TotalDownvotesGiven,
+    UE.TotalFavoritesGiven,
+    PM.PostId,
+    PM.PostTypeId,
+    PM.PostCreationDate,
+    PM.Score AS PostScore,
+    PM.ViewCount AS PostViewCount,
+    PM.EditCount AS PostEditCount,
+    PM.PostStatus,
+    PM.OwnerGoldBadges_Correlated,
+    PM.PreviousPostScore,
+    PM.NextPostScore,
+    PM.AvgPostScoreLast30DaysOfType,
+    B.GoldBadges,
+    UTC.TagName AS TopTagName,
+    UTC.TagPostCount AS TopTagPosts,
+    1.0 * COALESCE(PM.PostUpvotesReceived, 0) / NULLIF(COALESCE(PM.PostUpvotesReceived, 0) + COALESCE(PM.PostDownvotesReceived, 0), 0) AS PostUpvoteRatio,
+    AGE(CAST('2024-10-01 12:34:56' AS timestamp), UE.LastAccessDate) AS TimeSinceLastAccess,
+    'Answer-Focused/Edited-RecentlyActive' AS UserSegment,
+    (SELECT AvgReputation FROM GlobalAverages) AS GlobalAvgReputation,
+    (SELECT AvgPostScore FROM GlobalAverages) AS GlobalAvgPostScoreOverall,
+    LOWER(SUBSTRING(COALESCE(PM.Title, 'No Title'), 1, CASE WHEN LENGTH(COALESCE(PM.Title, 'No Title')) > 50 THEN 50 ELSE LENGTH(COALESCE(PM.Title, 'No Title')) END)) AS PartialTitleLowerCase
+FROM UserEngagement AS UE
+LEFT JOIN PostMetrics AS PM ON UE.UserId = PM.OwnerUserId
+LEFT JOIN UserBadgeStats AS B ON UE.UserId = B.UserId
+LEFT JOIN UserTagContributions AS UTC ON UE.UserId = UTC.OwnerUserId AND UTC.TagRankForUser = 1
+WHERE (
+        UE.TotalAnswers > UE.TotalQuestions * 2
+        AND PM.PostTypeId = 2
+        AND PM.PostCreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+      )
+  OR (
+        PM.EditCount > (SELECT AvgPostEditCount FROM GlobalAverages) * 2
+        AND PM.TotalHistoryEntries > 5
+        AND PM.LastEditHistoryDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+     )
+  AND UE.Reputation > 500
+  AND NOT EXISTS (
+      SELECT 1
+      FROM PostHistory AS PH_inner
+      WHERE PH_inner.PostId = PM.PostId
+        AND PH_inner.PostHistoryTypeId = 10
+        AND PH_inner.CreationDate > PM.PostCreationDate
+  )
+ORDER BY UserSegment DESC, Reputation DESC, PostScore DESC
+LIMIT 2000;

@@ -1,0 +1,192 @@
+WITH RecentPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 2 THEN 1 ELSE 0 END) AS BodyEdits,
+        MAX(ph.CreationDate) AS LastPostHistoryDate
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+HighReputationUsers AS (
+    SELECT Id
+    FROM Users
+    WHERE Reputation > 50000
+),
+TagCounts AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagPopularity,
+        COUNT(DISTINCT p.Id) AS PostsWithTag
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%' AND p.PostTypeId = 1
+    WHERE t.TagName NOT LIKE '%[^a-zA-Z0-9-]%'
+    GROUP BY t.TagName, t.Count
+    HAVING t.Count > 1000
+),
+UserPostAnalysis AS (
+    SELECT
+        rp.OwnerUserId,
+        rp.PostTypeName,
+        COUNT(rp.PostId) AS PostCount,
+        AVG(CASE WHEN rp.PostTypeName = 'Question' THEN rp.rn ELSE NULL END) AS AvgQuestionRank,
+        CASE
+            WHEN SUM(CASE WHEN rp.PostTypeName = 'Answer' THEN 1 ELSE 0 END) > 0 THEN
+                CAST(SUM(CASE WHEN rp.PostTypeName = 'Answer' THEN 1 ELSE 0 END) AS DOUBLE PRECISION) / COUNT(rp.PostId)
+            ELSE 0
+        END AS AnswerRatio
+    FROM RecentPosts rp
+    WHERE rp.rn <= 10
+    GROUP BY rp.OwnerUserId, rp.PostTypeName
+),
+AggregatedUserData AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.UserCreationDate,
+        ua.PostHistoryCount,
+        ua.BodyEdits,
+        ua.LastPostHistoryDate,
+        COALESCE(up.PostCount, 0) AS RecentPostCount,
+        COALESCE(up_q.PostCount, 0) AS RecentQuestionCount,
+        COALESCE(up_a.PostCount, 0) AS RecentAnswerCount,
+        COALESCE(up_q.AnswerRatio, 0) AS RecentAnswerRatio,
+        CASE WHEN hr.Id IS NOT NULL THEN 1 ELSE 0 END AS IsHighReputation
+    FROM UserActivity ua
+    LEFT JOIN UserPostAnalysis up ON ua.UserId = up.OwnerUserId
+    LEFT JOIN UserPostAnalysis up_q ON ua.UserId = up_q.OwnerUserId AND up_q.PostTypeName = 'Question'
+    LEFT JOIN UserPostAnalysis up_a ON ua.UserId = up_a.OwnerUserId AND up_a.PostTypeName = 'Answer'
+    LEFT JOIN HighReputationUsers hr ON ua.UserId = hr.Id
+)
+SELECT
+    A.UserId,
+    A.DisplayName,
+    A.Reputation,
+    A.UserCreationDate,
+    A.PostHistoryCount,
+    A.BodyEdits,
+    A.LastPostHistoryDate,
+    A.RecentPostCount,
+    A.RecentQuestionCount,
+    A.RecentAnswerCount,
+    A.RecentAnswerRatio,
+    A.IsHighReputation,
+    COALESCE(T.TagName, 'N/A') AS TopTag,
+    COALESCE(T.TagPopularity, 0) AS TopTagPopularity,
+    COALESCE(T.PostsWithTag, 0) AS PostsWithTopTag,
+    CASE
+        WHEN A.RecentAnswerCount > 0 AND A.RecentQuestionCount > 0 THEN
+            CAST(A.RecentAnswerCount AS DOUBLE PRECISION) / A.RecentQuestionCount
+        ELSE NULL
+    END AS AnswerToQuestionRatio,
+    CHAR_LENGTH(A.DisplayName) AS DisplayNameLength,
+    CASE
+        WHEN A.Reputation BETWEEN 0 AND 1000 THEN 'Novice'
+        WHEN A.Reputation BETWEEN 1001 AND 10000 THEN 'Intermediate'
+        WHEN A.Reputation BETWEEN 10001 AND 50000 THEN 'Advanced'
+        ELSE 'Expert'
+    END AS ReputationLevel,
+    UPPER(SUBSTRING(A.DisplayName FROM 1 FOR 3)) AS DisplayNamePrefix,
+    CASE
+        WHEN A.LastPostHistoryDate IS NULL THEN 'Never'
+        ELSE TO_CHAR(CAST(A.LastPostHistoryDate AS timestamp), 'YYYY-MM-DD')
+    END AS LastActivityDateFormatted,
+    CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM Comments c
+            JOIN Posts p ON c.PostId = p.Id
+            WHERE c.UserId = A.UserId
+            AND p.OwnerUserId = A.UserId
+            AND c.Score > 5
+        ) THEN 'Active Commenter on Own Posts'
+        ELSE 'Standard User'
+    END AS EngagementStatus,
+    CASE
+        WHEN A.IsHighReputation = 1 AND A.RecentAnswerCount > 50 THEN 'High Impact User'
+        ELSE 'Standard User'
+    END AS UserImpactCategory,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = A.UserId AND b.Class = 1) AS GoldBadgeCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = A.UserId AND b.Class = 2) AS SilverBadgeCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = A.UserId AND b.Class = 3) AS BronzeBadgeCount,
+    COALESCE(PA.PostCount, 0) AS TotalPostsEver,
+    CASE
+        WHEN PA.PostCount > 1000 THEN 'Prolific Poster'
+        ELSE 'Moderate Poster'
+    END AS PostingHabit,
+    COALESCE(UP.Id, 0) AS LinkedPostId,
+    COALESCE(L.Name, 'No Link') AS LinkType
+FROM AggregatedUserData A
+LEFT JOIN (
+    SELECT
+        TagName,
+        TagPopularity,
+        PostsWithTag,
+        OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY TagPopularity DESC) as rn
+    FROM (
+        SELECT
+            t.TagName,
+            t.Count AS TagPopularity,
+            COUNT(DISTINCT p.Id) AS PostsWithTag,
+            p.OwnerUserId
+        FROM Tags t
+        JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%' AND p.PostTypeId = 1
+        WHERE t.TagName NOT LIKE '%[^a-zA-Z0-9-]%'
+        GROUP BY t.TagName, t.Count, p.OwnerUserId
+        HAVING t.Count > 500
+    ) UserTagCounts
+) T ON A.UserId = T.OwnerUserId AND T.rn = 1
+LEFT JOIN (
+    SELECT
+        OwnerUserId,
+        COUNT(Id) AS PostCount
+    FROM Posts
+    GROUP BY OwnerUserId
+) PA ON A.UserId = PA.OwnerUserId
+LEFT JOIN PostLinks UP ON A.UserId = UP.PostId
+LEFT JOIN LinkTypes L ON UP.LinkTypeId = L.Id
+WHERE A.DisplayName IS NOT NULL
+AND A.Reputation > 100
+GROUP BY
+    A.UserId,
+    A.DisplayName,
+    A.Reputation,
+    A.UserCreationDate,
+    A.PostHistoryCount,
+    A.BodyEdits,
+    A.LastPostHistoryDate,
+    A.RecentPostCount,
+    A.RecentQuestionCount,
+    A.RecentAnswerCount,
+    A.RecentAnswerRatio,
+    A.IsHighReputation,
+    T.TagName,
+    T.TagPopularity,
+    T.PostsWithTag,
+    A.RecentAnswerCount,
+    A.RecentQuestionCount,
+    A.DisplayName,
+    PA.PostCount,
+    UP.Id,
+    L.Name
+ORDER BY A.Reputation DESC, A.RecentPostCount DESC
+LIMIT 1000;

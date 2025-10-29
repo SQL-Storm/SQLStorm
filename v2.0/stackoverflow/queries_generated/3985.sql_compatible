@@ -1,0 +1,131 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.CreationDate, TIMESTAMP '1970-01-01') AS UserSince,
+        (SELECT MAX(p.CreationDate)
+         FROM Posts p
+         WHERE p.OwnerUserId = u.Id) AS LastPostDate,
+        (SELECT COUNT(*)
+         FROM Posts q
+         WHERE q.OwnerUserId = u.Id AND q.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*)
+         FROM Posts a
+         WHERE a.OwnerUserId = u.Id AND a.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*)
+         FROM Posts a
+         WHERE a.OwnerUserId = u.Id
+           AND a.PostTypeId = 2
+           AND EXISTS (SELECT 1
+                       FROM Posts q
+                       WHERE q.Id = a.ParentId
+                         AND q.AcceptedAnswerId = a.Id)) AS AcceptedAnswerCount,
+        (SELECT AVG(COALESCE(vt.Score,0))
+         FROM Votes vt
+         JOIN Posts p ON vt.PostId = p.Id
+         WHERE p.OwnerUserId = u.Id) AS AvgVoteScore,
+        (SELECT COUNT(*)
+         FROM Badges b
+         WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadgeCount,
+        (SELECT COUNT(*)
+         FROM Badges b
+         WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadgeCount,
+        (SELECT COUNT(*)
+         FROM Badges b
+         WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadgeCount
+    FROM Users u
+),
+TagUsage AS (
+    SELECT
+        u.Id AS UserId,
+        t.TagName,
+        COUNT(*) AS TagCnt,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Users u
+    JOIN Posts p
+        ON p.OwnerUserId = u.Id
+       AND p.PostTypeId = 1
+       AND p.Tags IS NOT NULL
+    CROSS JOIN LATERAL
+        regexp_split_to_table(trim(both '<>' FROM p.Tags), '><') AS taglist(TagName)
+    JOIN Tags t
+        ON t.TagName = taglist.TagName
+    GROUP BY u.Id, t.TagName
+),
+TopTags AS (
+    SELECT
+        UserId,
+        STRING_AGG(TagName, ', ') FILTER (WHERE TagRank <= 3) AS Top3Tags
+    FROM TagUsage
+    GROUP BY UserId
+),
+RankedUsers AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.UserSince,
+        us.LastPostDate,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.AcceptedAnswerCount,
+        us.AvgVoteScore,
+        us.GoldBadgeCount,
+        us.SilverBadgeCount,
+        us.BronzeBadgeCount,
+        tu.Top3Tags,
+        RANK() OVER (ORDER BY us.Reputation DESC, (us.QuestionCount + us.AnswerCount) DESC) AS ReputationRank,
+        CASE
+            WHEN us.QuestionCount = 0 THEN NULL
+            ELSE CAST(us.AnswerCount AS numeric) / NULLIF(us.QuestionCount, 0)
+        END AS AnswerToQuestionRatio
+    FROM UserStats us
+    LEFT JOIN TopTags tu
+        ON tu.UserId = us.Id
+)
+SELECT
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.ReputationRank,
+    ru.QuestionCount,
+    ru.AnswerCount,
+    ru.AcceptedAnswerCount,
+    ROUND(ru.AnswerToQuestionRatio::numeric, 2) AS AnswerToQuestionRatio,
+    COALESCE(ru.AvgVoteScore, 0) AS AvgVoteScore,
+    ru.GoldBadgeCount,
+    ru.SilverBadgeCount,
+    ru.BronzeBadgeCount,
+    ru.Top3Tags,
+    CASE
+        WHEN ru.LastPostDate IS NULL THEN 'Never posted'
+        WHEN ru.LastPostDate < (CAST('2024-10-01' AS date) - INTERVAL '365 days') THEN 'Inactive >1y'
+        ELSE 'Active'
+    END AS ActivityStatus
+FROM RankedUsers ru
+WHERE ru.Reputation >= 1000
+   OR (ru.GoldBadgeCount > 0
+       AND ru.AnswerToQuestionRatio IS NOT NULL
+       AND ru.AnswerToQuestionRatio > 1)
+ORDER BY ru.ReputationRank
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL AS Id,
+    '---' AS DisplayName,
+    NULL AS Reputation,
+    NULL AS ReputationRank,
+    NULL AS QuestionCount,
+    NULL AS AnswerCount,
+    NULL AS AcceptedAnswerCount,
+    NULL AS AnswerToQuestionRatio,
+    NULL AS AvgVoteScore,
+    NULL AS GoldBadgeCount,
+    NULL AS SilverBadgeCount,
+    NULL AS BronzeBadgeCount,
+    NULL AS Top3Tags,
+    NULL AS ActivityStatus
+WHERE FALSE;

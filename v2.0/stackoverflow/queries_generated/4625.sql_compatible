@@ -1,0 +1,158 @@
+WITH RankedUserPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_user_post,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_day_score,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS next_day_score
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+      AND p.OwnerUserId <> -1
+),
+UserPostStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(p.PostId) AS TotalPosts,
+        SUM(p.PostScore) AS TotalScore,
+        AVG(p.PostScore) AS AvgScore,
+        MAX(p.PostScore) AS MaxScore,
+        MIN(p.PostScore) AS MinScore,
+        COUNT(CASE WHEN p.rn_user_post = 1 THEN 1 END) AS IsMostRecentPost,
+        SUM(CASE WHEN p.prev_day_score < p.PostScore AND p.next_day_score > p.PostScore THEN 1 ELSE 0 END) AS PostsWithScoreGains,
+        ROUND(AVG(CAST(p.prev_day_score AS NUMERIC)) - AVG(CAST(p.next_day_score AS NUMERIC)), 2) AS AvgScoreDifferenceFromNeighbors
+    FROM RankedUserPosts p
+    WHERE p.PostCreationDate >= (cast('2024-10-01' as date) - INTERVAL '1 year')
+    GROUP BY p.OwnerUserId
+),
+HighlyVotedAnswers AS (
+    SELECT
+        ans.ParentId AS QuestionId,
+        COUNT(ans.Id) AS NumHighlyVotedAnswers
+    FROM Posts ans
+    WHERE ans.PostTypeId = 2
+      AND ans.Score >= 10
+    GROUP BY ans.ParentId
+),
+QuestionsWithNoAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+      AND q.AnswerCount = 0
+      AND q.ClosedDate IS NULL
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Views AS UserViews,
+        COALESCE(UP.TotalPosts, 0) AS UserTotalPosts,
+        COALESCE(UP.TotalScore, 0) AS UserTotalScore,
+        COALESCE(UP.AvgScore, 0.0) AS UserAvgScore,
+        COALESCE(UP.MaxScore, 0) AS UserMaxScore,
+        COALESCE(UP.MinScore, 0) AS UserMinScore,
+        COALESCE(UP.IsMostRecentPost, 0) AS UserIsMostRecentPost,
+        COALESCE(UP.PostsWithScoreGains, 0) AS UserPostsWithScoreGains,
+        COALESCE(UP.AvgScoreDifferenceFromNeighbors, 0.0) AS UserAvgScoreDifferenceFromNeighbors,
+        COUNT(DISTINCT c.Id) AS UserCommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UserUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS UserDownvotes,
+        COUNT(DISTINCT b.Id) AS UserBadgeCount,
+        COUNT(DISTINCT QNA.QuestionId) AS UserQuestionsWithNoAnswers,
+        SUM(CASE WHEN HVA.QuestionId IS NOT NULL THEN 1 ELSE 0 END) AS UserQuestionsWithHighlyVotedAnswers
+    FROM Users u
+    LEFT JOIN UserPostStats UP ON u.Id = UP.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId AND c.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '1 year')
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '1 year') AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN QuestionsWithNoAnswers QNA ON QNA.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT hv.QuestionId
+        FROM HighlyVotedAnswers hv
+    ) HVA ON HVA.QuestionId IN (
+        SELECT p_hva.Id
+        FROM Posts p_hva
+        WHERE p_hva.OwnerUserId = u.Id
+          AND p_hva.PostTypeId = 1
+    )
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Views,
+        UP.TotalPosts,
+        UP.TotalScore,
+        UP.AvgScore,
+        UP.MaxScore,
+        UP.MinScore,
+        UP.IsMostRecentPost,
+        UP.PostsWithScoreGains,
+        UP.AvgScoreDifferenceFromNeighbors
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.CreationDate,
+    ue.UserViews,
+    ue.UserTotalPosts,
+    ue.UserTotalScore,
+    ue.UserAvgScore,
+    ue.UserMaxScore,
+    ue.UserMinScore,
+    ue.UserIsMostRecentPost,
+    ue.UserPostsWithScoreGains,
+    ue.UserAvgScoreDifferenceFromNeighbors,
+    ue.UserCommentCount,
+    ue.UserUpvotes,
+    ue.UserDownvotes,
+    ue.UserBadgeCount,
+    ue.UserQuestionsWithNoAnswers,
+    ue.UserQuestionsWithHighlyVotedAnswers,
+    CASE
+        WHEN ue.UserAvgScore > 50 THEN 'High Performer'
+        WHEN ue.Reputation > 10000 THEN 'Experienced User'
+        WHEN ue.UserCommentCount > 500 THEN 'Active Commenter'
+        WHEN ue.UserBadgeCount > 10 THEN 'Accomplished User'
+        ELSE 'Standard User'
+    END AS UserTier,
+    COALESCE(MAX(p_late.Score), 0) AS MaxScoreOfLatePost,
+    COUNT(DISTINCT p_older.Id) AS NumberOfOlderPosts
+FROM UserEngagement ue
+LEFT JOIN Posts p_late ON ue.UserId = p_late.OwnerUserId
+    AND p_late.CreationDate BETWEEN (cast('2024-10-01' as date) - INTERVAL '30 days') AND cast('2024-10-01' as date)
+LEFT JOIN Posts p_older ON ue.UserId = p_older.OwnerUserId
+    AND p_older.CreationDate < (cast('2024-10-01' as date) - INTERVAL '1 year')
+GROUP BY
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.CreationDate,
+    ue.UserViews,
+    ue.UserTotalPosts,
+    ue.UserTotalScore,
+    ue.UserAvgScore,
+    ue.UserMaxScore,
+    ue.UserMinScore,
+    ue.UserIsMostRecentPost,
+    ue.UserPostsWithScoreGains,
+    ue.UserAvgScoreDifferenceFromNeighbors,
+    ue.UserCommentCount,
+    ue.UserUpvotes,
+    ue.UserDownvotes,
+    ue.UserBadgeCount,
+    ue.UserQuestionsWithNoAnswers,
+    ue.UserQuestionsWithHighlyVotedAnswers
+HAVING
+    ue.UserTotalPosts > 5 OR ue.Reputation > 5000
+ORDER BY
+    ue.Reputation DESC,
+    ue.UserTotalScore DESC
+LIMIT 100;

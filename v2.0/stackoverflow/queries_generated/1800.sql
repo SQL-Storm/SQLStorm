@@ -1,0 +1,103 @@
+-- {"query": "1800.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1433} 
+
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(P.ViewCount) AS TotalPostViews,
+        SUM(P.Score) AS TotalPostScore,
+        SUM(P.FavoriteCount) AS TotalFavoriteCounts,
+        MAX(P.CreationDate) AS LatestPostDate,
+        MIN(P.CreationDate) AS EarliestPostDate,
+        SUM(CASE WHEN V_Up.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN V_Down.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / 86400.0 AS AccountAgeDays
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Votes V_Up ON U.Id = V_Up.UserId AND V_Up.VoteTypeId = 2 -- UpMod
+    LEFT JOIN Votes V_Down ON U.Id = V_Down.UserId AND V_Down.VoteTypeId = 3 -- DownMod
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostDetails AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.Title,
+        P.CreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount AS PostFavoriteCount,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.AcceptedAnswerId,
+        (SELECT COUNT(DISTINCT V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 2) AS UpvoteCount,
+        (SELECT COUNT(DISTINCT V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 3) AS DownvoteCount,
+        (SELECT PH.Comment FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId = 10 ORDER BY PH.CreationDate DESC LIMIT 1) AS CloseReasonId_Raw,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL AND P.PostTypeId = 1 THEN 'Closed Question'
+            WHEN P.AcceptedAnswerId IS NOT NULL AND P.PostTypeId = 1 THEN 'Answered Question'
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 'Community Wiki'
+            ELSE 'Open Post'
+        END AS PostStatus,
+        P.Tags
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+),
+ParsedPostTags AS (
+    SELECT
+        PD.PostId,
+        PD.PostTypeId,
+        PD.OwnerUserId,
+        TRIM(TagValue.value) AS TagName
+    FROM PostDetails PD
+    CROSS JOIN LATERAL UNNEST(
+        CASE
+            WHEN PD.Tags IS NOT NULL AND LENGTH(PD.Tags) > 2
+            THEN STRING_TO_ARRAY(SUBSTRING(PD.Tags, 2, LENGTH(PD.Tags) - 2), '><')
+            ELSE ARRAY[]::TEXT[]
+        END
+    ) AS TagValue(value)
+    WHERE PD.Tags IS NOT NULL AND LENGTH(PD.Tags) > 2
+),
+TagMetrics AS (
+    SELECT
+        T.TagName,
+        COUNT(DISTINCT PPT.PostId) AS TaggedPostsCount,
+        SUM(PD.PostScore) AS TotalTagScore,
+        AVG(PD.PostScore) AS AvgTagScore,
+        COUNT(DISTINCT PPT.OwnerUserId) AS UniqueUsersInTag,
+        AVG(PD.ViewCount) AS AvgTagViewCount,
+        RANK() OVER (ORDER BY SUM(PD.PostScore) DESC, COUNT(DISTINCT PPT.PostId) DESC) AS TagScoreRank
+    FROM Tags T
+    JOIN ParsedPostTags PPT ON LOWER(T.TagName) = LOWER(PPT.TagName)
+    JOIN PostDetails PD ON PPT.PostId = PD.PostId
+    GROUP BY T.TagName
+),
+UserPostAggregates AS (
+    SELECT
+        PD.OwnerUserId AS UserId,
+        PD.CreationDate,
+        AVG(PD.PostScore) OVER (PARTITION BY PD.OwnerUserId) AS AvgUserPostScore,
+        SUM(CASE WHEN PD.PostTypeId = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY PD.OwnerUserId) AS UserQuestionCount,
+        SUM(CASE WHEN PD.PostTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY PD.OwnerUserId) AS UserAnswerCount,
+        SUM(CASE WHEN PD.PostStatus = 'Closed Question' THEN 1 ELSE 0 END) OVER (PARTITION BY PD.OwnerUserId) AS ClosedQuestionsByOwner,
+        SUM(CASE WHEN PD.PostTypeId = 1 AND PD.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) OVER (PARTITION BY PD.OwnerUserId) AS QuestionsWithAcceptedAnswer,
+        MAX(PD.CreationDate) OVER (PARTITION BY PD.OwnerUserId) AS UserLatestPostDate,
+        MIN(PD.CreationDate) OVER (PARTITION BY PD.OwnerUserId) AS UserEarliestPostDate,
+        LAG(PD.CreationDate, 1, PD.CreationDate) OVER (PARTITION BY PD.OwnerUserId ORDER BY PD.CreationDate) AS PreviousPostDate
+    FROM PostDetails

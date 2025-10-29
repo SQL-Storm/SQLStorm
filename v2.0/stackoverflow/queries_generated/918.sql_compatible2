@@ -1,0 +1,422 @@
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.location,
+    date_trunc('month', u.creationdate) as cohort_month,
+    row_number() over (partition by date_trunc('month', u.creationdate) order by u.reputation desc, u.id) as cohort_rank
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+user_activity as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.posttypeid = 1) as q_count,
+    count(*) filter (where p.posttypeid = 2) as a_count,
+    coalesce(sum(case when p.posttypeid in (1,2) then greatest(p.score,0) end),0) as nonneg_score_sum,
+    count(*) filter (where p.closeddate is not null) as closed_q_count,
+    max(p.lastactivitydate) as last_post_activity,
+    avg(nullif(p.viewcount,0)) as avg_views_nonzero
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+accepted_answers as (
+  select
+    a.owneruserid as user_id,
+    count(*) as accepted_count,
+    avg(a.score) as avg_accepted_score
+  from posts q
+  join posts a on a.id = q.acceptedanswerid and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by a.owneruserid
+),
+vote_summary as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where v.votetypeid = 2) as upvotes_rcvd,
+    count(*) filter (where v.votetypeid = 3) as downvotes_rcvd,
+    count(*) filter (where v.votetypeid = 5) as favorites_rcvd,
+    sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_total
+  from posts p
+  left join votes v on v.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+comment_density as (
+  select
+    p.owneruserid as user_id,
+    sum(p.commentcount) as total_comments_on_posts,
+    case when sum(case when p.posttypeid in (1,2) then 1 else 0 end) > 0
+         then sum(p.commentcount) / cast(nullif(sum(case when p.posttypeid in (1,2) then 1 else 0 end),0) as numeric)
+         else null end as comments_per_post
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+tag_extract as (
+  select
+    p.id as post_id,
+    p.owneruserid as user_id,
+    unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tagname
+  from posts p
+  where p.posttypeid = 1 and p.tags is not null and p.owneruserid is not null
+),
+top_tags as (
+  select
+    tt.user_id,
+    array_agg(tt.tagname order by tt.tag_rank) as top3_tags
+  from (
+    select
+      te.user_id,
+      te.tagname,
+      row_number() over (partition by te.user_id order by count(*) desc, te.tagname) as tag_rank
+    from tag_extract te
+    group by te.user_id, te.tagname
+  ) tt
+  where tt.tag_rank <= 3
+  group by tt.user_id
+),
+linking as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where pl.linktypeid = 1) as linked_out,
+    count(*) filter (where pl.linktypeid = 3) as marked_duplicate
+  from postlinks pl
+  join posts p on p.id = pl.postid
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+closures as (
+  select
+    ph.postid,
+    ph.userid as closer_user_id,
+    max(ph.creationdate) as last_close_date,
+    max(case when ph.comment ~ '^[0-9]+$' then ph.comment end) as close_reason_id_text
+  from posthistory ph
+  where ph.posthistorytypeid = 10
+  group by ph.postid, ph.userid
+),
+dup_roots as (
+  select
+    p.owneruserid as user_id,
+    count(distinct pl.postid) as times_marked_as_dup_of_mine
+  from postlinks pl
+  join posts p on p.id = pl.relatedpostid
+  where pl.linktypeid = 3 and p.owneruserid is not null
+  group by p.owneruserid
+),
+badge_mix as (
+  select
+    b.userid as user_id,
+    count(*) as badges_total,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges,
+    count(*) filter (where b.tagbased = true) as tag_badges
+  from badges b
+  group by b.userid
+),
+post_quality as (
+  select
+    p.owneruserid as user_id,
+    percentile_cont(0.5) within group (order by p.score) as median_score,
+    percentile_cont(0.9) within group (order by coalesce(p.viewcount,0)) as p90_views
+  from posts p
+  where p.owneruserid is not null and p.posttypeid in (1,2)
+  group by p.owneruserid
+),
+recent_commenters as (
+  select
+    c.userid as commenter_id,
+    c.postid,
+    max(c.creationdate) as last_comment_date
+  from comments c
+  where c.userid is not null
+  group by c.userid, c.postid
+),
+engager_overlap as (
+  select
+    p.owneruserid as user_id,
+    count(distinct rc.commenter_id) as distinct_recent_commenters
+  from posts p
+  join recent_commenters rc on rc.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+activity_window as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as posts_90d,
+    count(*) filter (where p.lastactivitydate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as touched_30d,
+    max(p.creationdate) as last_post_created
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+user_base as (
+  select
+    u.user_id,
+    u.displayname,
+    u.reputation,
+    u.location,
+    u.cohort_month,
+    u.cohort_rank
+  from recent_users u
+  where u.cohort_rank <= 1000
+),
+scores as (
+  select
+    ub.user_id,
+    ua.q_count,
+    ua.a_count,
+    ua.nonneg_score_sum,
+    ua.closed_q_count,
+    ua.last_post_activity,
+    ua.avg_views_nonzero,
+    aa.accepted_count,
+    aa.avg_accepted_score,
+    vs.upvotes_rcvd,
+    vs.downvotes_rcvd,
+    vs.favorites_rcvd,
+    vs.bounty_total,
+    cd.total_comments_on_posts,
+    cd.comments_per_post,
+    coalesce(lk.linked_out,0) as linked_out,
+    coalesce(lk.marked_duplicate,0) as marked_duplicate,
+    coalesce(dr.times_marked_as_dup_of_mine,0) as times_marked_as_dup_of_mine,
+    bm.badges_total,
+    bm.gold_badges,
+    bm.silver_badges,
+    bm.bronze_badges,
+    bm.tag_badges,
+    pq.median_score,
+    pq.p90_views,
+    eo.distinct_recent_commenters,
+    aw.posts_90d,
+    aw.touched_30d,
+    aw.last_post_created
+  from user_base ub
+  left join user_activity ua on ua.user_id = ub.user_id
+  left join accepted_answers aa on aa.user_id = ub.user_id
+  left join vote_summary vs on vs.user_id = ub.user_id
+  left join comment_density cd on cd.user_id = ub.user_id
+  left join linking lk on lk.user_id = ub.user_id
+  left join dup_roots dr on dr.user_id = ub.user_id
+  left join badge_mix bm on bm.user_id = ub.user_id
+  left join post_quality pq on pq.user_id = ub.user_id
+  left join engager_overlap eo on eo.user_id = ub.user_id
+  left join activity_window aw on aw.user_id = ub.user_id
+),
+ranked as (
+  select
+    ub.user_id,
+    ub.displayname,
+    ub.reputation,
+    ub.location,
+    ub.cohort_month,
+    ub.cohort_rank,
+    s.q_count,
+    s.a_count,
+    s.nonneg_score_sum,
+    s.closed_q_count,
+    s.last_post_activity,
+    s.avg_views_nonzero,
+    s.accepted_count,
+    s.avg_accepted_score,
+    s.upvotes_rcvd,
+    s.downvotes_rcvd,
+    s.favorites_rcvd,
+    s.bounty_total,
+    s.total_comments_on_posts,
+    s.comments_per_post,
+    s.linked_out,
+    s.marked_duplicate,
+    s.times_marked_as_dup_of_mine,
+    s.badges_total,
+    s.gold_badges,
+    s.silver_badges,
+    s.bronze_badges,
+    s.tag_badges,
+    s.median_score,
+    s.p90_views,
+    s.distinct_recent_commenters,
+    s.posts_90d,
+    s.touched_30d,
+    s.last_post_created,
+    row_number() over (
+      partition by ub.cohort_month
+      order by coalesce(s.accepted_count,0) desc,
+               coalesce(s.nonneg_score_sum,0) desc,
+               coalesce(s.upvotes_rcvd,0) desc,
+               ub.reputation desc,
+               ub.user_id
+    ) as perf_rank_in_cohort
+  from user_base ub
+  left join scores s on s.user_id = ub.user_id
+),
+null_logic as (
+  select
+    r.user_id,
+    r.displayname,
+    r.reputation,
+    r.location,
+    r.cohort_month,
+    r.cohort_rank,
+    r.perf_rank_in_cohort,
+    r.q_count,
+    r.a_count,
+    r.accepted_count,
+    r.nonneg_score_sum,
+    r.closed_q_count,
+    r.last_post_activity,
+    r.avg_views_nonzero,
+    r.avg_accepted_score,
+    r.upvotes_rcvd,
+    r.downvotes_rcvd,
+    r.favorites_rcvd,
+    r.bounty_total,
+    r.total_comments_on_posts,
+    r.comments_per_post,
+    r.linked_out,
+    r.marked_duplicate,
+    r.times_marked_as_dup_of_mine,
+    r.badges_total,
+    r.gold_badges,
+    r.silver_badges,
+    r.bronze_badges,
+    r.tag_badges,
+    r.median_score,
+    r.p90_views,
+    r.distinct_recent_commenters,
+    r.posts_90d,
+    r.touched_30d,
+    r.last_post_created,
+    case
+      when coalesce(r.a_count,0) + coalesce(r.q_count,0) = 0 then null
+      else round(100.0 * coalesce(r.accepted_count,0) / greatest(coalesce(r.a_count,0),1), 2)
+    end as accept_rate_pct,
+    case
+      when r.downvotes_rcvd is null and r.upvotes_rcvd is null then null
+      else coalesce(r.upvotes_rcvd,0) - coalesce(r.downvotes_rcvd,0)
+    end as net_votes_rcvd,
+    case
+      when r.badges_total is null or r.badges_total = 0 then null
+      else round((coalesce(r.gold_badges,0)*3 + coalesce(r.silver_badges,0)*2 + coalesce(r.bronze_badges,0)*1) / cast(r.badges_total as numeric), 2)
+    end as badge_weight
+  from ranked r
+),
+string_bits as (
+  select
+    n.user_id,
+    n.displayname,
+    n.reputation,
+    n.location,
+    n.cohort_month,
+    n.cohort_rank,
+    n.perf_rank_in_cohort,
+    n.q_count,
+    n.a_count,
+    n.accepted_count,
+    n.nonneg_score_sum,
+    n.closed_q_count,
+    n.last_post_activity,
+    n.avg_views_nonzero,
+    n.avg_accepted_score,
+    n.upvotes_rcvd,
+    n.downvotes_rcvd,
+    n.favorites_rcvd,
+    n.bounty_total,
+    n.total_comments_on_posts,
+    n.comments_per_post,
+    n.linked_out,
+    n.marked_duplicate,
+    n.times_marked_as_dup_of_mine,
+    n.badges_total,
+    n.gold_badges,
+    n.silver_badges,
+    n.bronze_badges,
+    n.tag_badges,
+    n.median_score,
+    n.p90_views,
+    n.distinct_recent_commenters,
+    n.posts_90d,
+    n.touched_30d,
+    n.last_post_created,
+    n.accept_rate_pct,
+    n.net_votes_rcvd,
+    n.badge_weight,
+    trim(both ' ' from coalesce(n.location, '')) as loc_trim,
+    regexp_replace(coalesce(n.displayname,''), '\s+', ' ', 'g') as displayname_norm
+  from null_logic n
+),
+final_set as (
+  select
+    sb.user_id,
+    sb.displayname_norm as displayname,
+    sb.reputation,
+    sb.loc_trim as location,
+    sb.cohort_month,
+    sb.cohort_rank,
+    sb.perf_rank_in_cohort,
+    sb.q_count,
+    sb.a_count,
+    sb.accepted_count,
+    sb.accept_rate_pct,
+    sb.nonneg_score_sum,
+    sb.median_score,
+    sb.p90_views,
+    sb.upvotes_rcvd,
+    sb.downvotes_rcvd,
+    sb.net_votes_rcvd,
+    sb.favorites_rcvd,
+    sb.bounty_total,
+    sb.comments_per_post,
+    sb.total_comments_on_posts,
+    sb.linked_out,
+    sb.marked_duplicate,
+    sb.times_marked_as_dup_of_mine,
+    sb.badges_total,
+    sb.gold_badges,
+    sb.silver_badges,
+    sb.bronze_badges,
+    sb.badge_weight,
+    sb.distinct_recent_commenters,
+    sb.posts_90d,
+    sb.touched_30d,
+    sb.last_post_activity,
+    sb.last_post_created
+  from string_bits sb
+),
+cohort_extremes as (
+  select
+    cohort_month,
+    max(perf_rank_in_cohort) as cohort_size,
+    max(net_votes_rcvd) as max_net_votes,
+    min(net_votes_rcvd) as min_net_votes
+  from final_set
+  group by cohort_month
+)
+select
+  f.*,
+  ce.cohort_size,
+  ce.max_net_votes,
+  ce.min_net_votes,
+  case when f.net_votes_rcvd is not null and ce.max_net_votes is not null and ce.max_net_votes <> ce.min_net_votes
+       then round( (f.net_votes_rcvd - ce.min_net_votes) / nullif(ce.max_net_votes - ce.min_net_votes,0)::numeric, 4)
+       else null end as net_votes_norm_0_1
+from final_set f
+left join cohort_extremes ce on f.cohort_month = ce.cohort_month
+where
+  (
+    f.perf_rank_in_cohort <= 50
+    or (f.accept_rate_pct is not null and f.accept_rate_pct >= 50)
+    or (f.badge_weight is not null and f.badge_weight >= 1.5)
+  )
+and (
+    f.last_post_created is null
+    or f.last_post_created >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+)
+order by f.cohort_month desc, f.perf_rank_in_cohort, f.reputation desc, f.user_id
+limit 500;

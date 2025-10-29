@@ -1,0 +1,344 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        AVG(P.Score) AS AvgPostScore,
+        MAX(COALESCE(P.LastActivityDate, P.CreationDate, C.CreationDate, U.LastAccessDate)) AS LatestActivity,
+        BOOL_OR(B.Class = 1) AS HasGoldBadge,
+        BOOL_OR(B.Class = 2) AS HasSilverBadge,
+        COUNT(DISTINCT V.PostId) FILTER (WHERE V.VoteTypeId = 5) AS TotalFavoritesMade
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    WHERE
+        U.Reputation >= 1000
+        AND U.CreationDate >= DATE '2010-01-01'
+        AND U.LastAccessDate >= (DATE '2024-10-01' - INTERVAL '1 year')
+        AND U.Location IS NOT NULL
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.CreationDate, U.LastAccessDate
+    HAVING
+        COUNT(DISTINCT P.Id) > 5 OR COUNT(DISTINCT C.Id) > 10
+),
+PostDetailsExtended AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        COALESCE(P.LastEditDate, P.CreationDate) AS EffectiveLastEditDate,
+        (SELECT MAX(V.CreationDate) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId IN (2, 3) AND V.CreationDate >= P.CreationDate) AS LastVoteDate,
+        (SELECT COUNT(DISTINCT C.UserId) FROM Comments C WHERE C.PostId = P.Id AND C.CreationDate >= P.CreationDate) AS UniqueCommenters,
+        (
+            SELECT Text
+            FROM Comments SC
+            WHERE SC.PostId = P.Id
+            ORDER BY SC.CreationDate DESC
+            LIMIT 1
+        ) AS LatestCommentText,
+        (SELECT SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.CreationDate >= P.CreationDate) AS CloseVoteCount,
+        P.AcceptedAnswerId,
+        P.CommunityOwnedDate,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL AND P.ClosedDate > P.CreationDate THEN 'Closed'
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM
+        Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE
+        P.CreationDate >= DATE '2015-01-01'
+        AND P.ViewCount > 100
+        AND P.Score > 5
+        AND (P.OwnerUserId IS NOT NULL OR P.CommunityOwnedDate IS NOT NULL)
+        AND (P.Body ILIKE '%sql%' OR P.Title ILIKE '%database%')
+),
+TagProcessor AS (
+    SELECT
+        PostId,
+        UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM Tags), '><')) AS TagName
+    FROM
+        PostDetailsExtended
+    WHERE Tags IS NOT NULL AND Tags <> '' AND LENGTH(TRIM(BOTH '<>' FROM Tags)) > 0
+),
+RankedPostMetrics AS (
+    SELECT
+        PDE.PostId,
+        PDE.PostTypeName,
+        TP.TagName,
+        PDE.PostScore,
+        PDE.ViewCount,
+        PDE.OwnerUserId,
+        PDE.PostCreationDate,
+        PDE.EffectiveLastEditDate,
+        PDE.LatestCommentText,
+        PDE.CloseVoteCount,
+        PDE.AcceptedAnswerId,
+        PDE.UniqueCommenters,
+        PDE.PostStatus,
+        ROW_NUMBER() OVER(PARTITION BY TP.TagName ORDER BY PDE.PostScore DESC, PDE.ViewCount DESC, PDE.PostCreationDate DESC) AS TagPostRank,
+        LAG(PDE.PostCreationDate, 1, PDE.PostCreationDate) OVER(PARTITION BY PDE.OwnerUserId ORDER BY PDE.PostCreationDate) AS PreviousUserPostDate,
+        NTILE(4) OVER(ORDER BY PDE.PostScore DESC) AS ScoreQuartile,
+        AVG(PDE.PostScore) OVER(PARTITION BY PDE.OwnerUserId ORDER BY PDE.PostCreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS RollingAvgUserPostScore
+    FROM
+        PostDetailsExtended PDE
+    JOIN TagProcessor TP ON PDE.PostId = TP.PostId
+),
+UserPostTagPerformance AS (
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        UE.Reputation,
+        UE.TotalPosts,
+        UE.TotalQuestions,
+        UE.TotalAnswers,
+        UE.AvgPostScore,
+        UE.HasGoldBadge,
+        UE.HasSilverBadge,
+        RPM.PostId,
+        RPM.PostTypeName,
+        RPM.TagName,
+        RPM.PostScore,
+        RPM.ViewCount,
+        RPM.TagPostRank,
+        RPM.LatestCommentText,
+        RPM.CloseVoteCount,
+        RPM.ScoreQuartile,
+        RPM.UniqueCommenters,
+        RPM.PostStatus,
+        RPM.RollingAvgUserPostScore,
+        CASE
+            WHEN RPM.ViewCount > 20000 AND RPM.PostScore > 200 THEN 'Legendary Impact'
+            WHEN RPM.ViewCount > 10000 AND RPM.PostScore > 100 THEN 'Very High Impact'
+            WHEN RPM.ViewCount > 5000 AND RPM.PostScore > 50 THEN 'High Impact'
+            WHEN RPM.ViewCount > 1000 OR RPM.PostScore > 20 THEN 'Medium Impact'
+            ELSE 'Low Impact'
+        END AS ImpactCategory,
+        NULLIF(RPM.PostScore, 0) / NULLIF(RPM.ViewCount, 0) AS ScorePerViewRatio,
+        EXTRACT(EPOCH FROM (RPM.PostCreationDate - RPM.PreviousUserPostDate)) / 3600 AS HoursSincePreviousPost,
+        UE.UserCreationDate,
+        RPM.PostCreationDate AS RPM_PostCreationDate,
+        RPM.OwnerUserId
+    FROM
+        UserEngagement UE
+    INNER JOIN RankedPostMetrics RPM ON UE.UserId = RPM.OwnerUserId
+    WHERE
+        RPM.TagPostRank <= 10
+        AND RPM.PostScore >= (SELECT AVG(PostScore) FROM RankedPostMetrics WHERE OwnerUserId = UE.UserId AND PostCreationDate >= UE.UserCreationDate)
+        AND (UE.HasGoldBadge = TRUE OR UE.HasSilverBadge = TRUE)
+),
+PopularTagsWithWikiInfo AS (
+    SELECT
+        T.TagName,
+        T.Count AS TagUseCount,
+        TPW.Title AS WikiPostTitle,
+        TPW.ViewCount AS WikiPostViewCount,
+        AVG(P.Score) AS AvgPostScoreForTag,
+        COUNT(DISTINCT P.OwnerUserId) AS UniqueContributorsToTag,
+        MIN(P.CreationDate) AS FirstPostDateForTag,
+        MAX(P.LastActivityDate) AS LastActivityDateForTag
+    FROM
+        Tags T
+    LEFT JOIN Posts P ON P.Tags LIKE '%' || T.TagName || '%' AND P.PostTypeId IN (1,2)
+    LEFT JOIN Posts TPW ON T.WikiPostId = TPW.Id
+    WHERE T.Count > 1000 AND T.TagName IS NOT NULL
+    GROUP BY T.TagName, T.Count, TPW.Title, TPW.ViewCount
+    HAVING AVG(P.Score) IS NOT NULL AND AVG(P.Score) > 10 AND COUNT(DISTINCT P.OwnerUserId) > 20
+),
+RecentModerationActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT PH.PostId) AS ModeratedPostsCount,
+        MAX(PH.CreationDate) AS LastModerationActionDate,
+        STRING_AGG(DISTINCT PHT.Name, ' | ') AS ModerationActionTypes
+    FROM
+        Users U
+    JOIN PostHistory PH ON U.Id = PH.UserId
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE
+        PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 33, 34)
+        AND PH.CreationDate >= (DATE '2024-10-01' - INTERVAL '180 days')
+    GROUP BY
+        U.Id, U.DisplayName
+    HAVING
+        COUNT(DISTINCT PH.PostId) >= 5
+),
+QuestionAnswerLinkAnalysis AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.OwnerUserId AS QuestionOwnerId,
+        A.Id AS AnswerId,
+        A.OwnerUserId AS AnswerOwnerId,
+        A.Score AS AnswerScore,
+        A.CreationDate AS AnswerCreationDate,
+        CASE WHEN Q.AcceptedAnswerId = A.Id THEN TRUE ELSE FALSE END AS IsAcceptedAnswer,
+        ROW_NUMBER() OVER(PARTITION BY Q.Id ORDER BY A.Score DESC, A.CreationDate) AS AnswerRankByScore,
+        SUM(A.Score) OVER(PARTITION BY Q.Id) AS TotalAnswerScoreForQuestion
+    FROM
+        Posts Q
+    JOIN Posts A ON Q.Id = A.ParentId
+    WHERE
+        Q.PostTypeId = 1
+        AND A.PostTypeId = 2
+        AND Q.ViewCount > 5000
+        AND Q.AnswerCount > 3
+        AND Q.ClosedDate IS NULL
+),
+HighlyEngagedUsersByTag AS (
+    SELECT
+        UserId,
+        TagName,
+        COUNT(PostId) AS PostsInTag,
+        SUM(PostScore) AS TotalScoreInTag
+    FROM UserPostTagPerformance
+    GROUP BY UserId, TagName
+    HAVING COUNT(PostId) >= 3 AND SUM(PostScore) >= 50
+),
+EliteQuestions AS (
+    SELECT
+        UPTP.UserId,
+        UPTP.DisplayName,
+        UPTP.Reputation,
+        UPTP.PostId,
+        UPTP.PostTypeName,
+        UPTP.TagName,
+        UPTP.PostScore,
+        UPTP.ViewCount,
+        UPTP.ImpactCategory,
+        UPTP.ScorePerViewRatio,
+        'EliteQuestion' AS RecordType
+    FROM
+        UserPostTagPerformance UPTP
+    WHERE UPTP.PostTypeName = 'Question' AND UPTP.ImpactCategory IN ('Very High Impact', 'Legendary Impact')
+),
+TopAnswersForHighlyRatedQuestions AS (
+    SELECT
+        UPTP.UserId,
+        UPTP.DisplayName,
+        UPTP.Reputation,
+        UPTP.PostId,
+        UPTP.PostTypeName,
+        UPTP.TagName,
+        UPTP.PostScore,
+        UPTP.ViewCount,
+        UPTP.ImpactCategory,
+        UPTP.ScorePerViewRatio,
+        'TopAnswer' AS RecordType
+    FROM
+        UserPostTagPerformance UPTP
+    JOIN QuestionAnswerLinkAnalysis QALA ON UPTP.PostId = QALA.AnswerId
+    WHERE UPTP.PostTypeName = 'Answer' AND QALA.AnswerRankByScore = 1 AND QALA.TotalAnswerScoreForQuestion > 100
+),
+UsersWithHighRepAndRecentModeration AS (
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        UE.Reputation,
+        RMA.ModeratedPostsCount,
+        RMA.LastModerationActionDate,
+        RMA.ModerationActionTypes,
+        'ModeratorActivity' AS RecordType,
+        CAST(NULL AS INTEGER) AS PostId, CAST(NULL AS VARCHAR(50)) AS PostTypeName, CAST(NULL AS VARCHAR(50)) AS TagName,
+        CAST(NULL AS INTEGER) AS PostScore, CAST(NULL AS INTEGER) AS ViewCount, CAST(NULL AS VARCHAR(20)) AS ImpactCategory,
+        CAST(NULL AS NUMERIC) AS ScorePerViewRatio
+    FROM UserEngagement UE
+    JOIN RecentModerationActivity RMA ON UE.UserId = RMA.UserId
+    WHERE UE.Reputation > 50000
+),
+CombinedRecords AS (
+    SELECT * FROM EliteQuestions
+    UNION ALL
+    SELECT * FROM TopAnswersForHighlyRatedQuestions
+    UNION ALL
+    SELECT * FROM UsersWithHighRepAndRecentModeration
+)
+SELECT
+    CombinedRecords.UserId,
+    CombinedRecords.DisplayName,
+    CombinedRecords.Reputation,
+    CombinedRecords.PostId,
+    CombinedRecords.PostTypeName,
+    CombinedRecords.TagName,
+    CombinedRecords.PostScore,
+    CombinedRecords.ViewCount,
+    CombinedRecords.ImpactCategory,
+    CombinedRecords.ScorePerViewRatio,
+    CombinedRecords.RecordType,
+    UPTP.TotalPosts,
+    UPTP.TotalQuestions,
+    UPTP.TotalAnswers,
+    UPTP.AvgPostScore,
+    UPTP.LatestCommentText,
+    UPTP.CloseVoteCount,
+    UPTP.ScoreQuartile,
+    UPTP.UniqueCommenters,
+    UPTP.PostStatus,
+    UPTP.RollingAvgUserPostScore,
+    UPTP.HoursSincePreviousPost,
+    PTWI.TagUseCount,
+    PTWI.WikiPostTitle,
+    PTWI.AvgPostScoreForTag,
+    PTWI.FirstPostDateForTag,
+    PTWI.LastActivityDateForTag,
+    RMA_Final.ModeratedPostsCount,
+    RMA_Final.LastModerationActionDate,
+    RMA_Final.ModerationActionTypes,
+    QALA_Final.QuestionId,
+    QALA_Final.QuestionTitle,
+    QALA_Final.IsAcceptedAnswer,
+    QALA_Final.AnswerRankByScore,
+    QALA_Final.TotalAnswerScoreForQuestion,
+    HEUBT.PostsInTag,
+    HEUBT.TotalScoreInTag,
+    COALESCE(UPTP.ScorePerViewRatio * UPTP.Reputation / 1000, 0) AS WeightedContributionIndex,
+    CASE
+        WHEN UPTP.LatestCommentText ILIKE '%thank you%' THEN TRUE
+        WHEN UPTP.LatestCommentText IS NULL AND UPTP.UniqueCommenters = 0 THEN NULL
+        ELSE FALSE
+    END AS HasThankYouComment,
+    NULLIF(UPTP.PostScore, 0) - NULLIF(UPTP.ViewCount, 0) AS ScoreMinusViews,
+    AGE(DATE '2024-10-01', UPTP.PostCreationDate) AS PostAge
+FROM
+    CombinedRecords
+LEFT JOIN UserPostTagPerformance UPTP ON CombinedRecords.UserId = UPTP.UserId AND CombinedRecords.PostId = UPTP.PostId
+LEFT JOIN PopularTagsWithWikiInfo PTWI ON UPTP.TagName = PTWI.TagName
+LEFT JOIN RecentModerationActivity RMA_Final ON CombinedRecords.UserId = RMA_Final.UserId
+LEFT JOIN QuestionAnswerLinkAnalysis QALA_Final ON CombinedRecords.PostId = QALA_Final.AnswerId AND CombinedRecords.RecordType = 'TopAnswer'
+LEFT JOIN HighlyEngagedUsersByTag HEUBT ON CombinedRecords.UserId = HEUBT.UserId AND CombinedRecords.TagName = HEUBT.TagName
+WHERE
+    (
+        (CombinedRecords.RecordType <> 'ModeratorActivity' AND UPTP.HoursSincePreviousPost IS NOT NULL)
+        OR
+        (CombinedRecords.RecordType = 'ModeratorActivity' AND RMA_Final.ModeratedPostsCount IS NOT NULL)
+    )
+    AND CombinedRecords.Reputation > 10000
+    AND (
+        UPTP.PostScore > (SELECT AVG(P.Score) FROM Posts P WHERE P.CreationDate > (DATE '2024-10-01' - INTERVAL '2 years') AND P.ViewCount > 500)
+        OR CombinedRecords.RecordType = 'ModeratorActivity'
+    )
+ORDER BY
+    WeightedContributionIndex DESC, CombinedRecords.Reputation DESC, CombinedRecords.PostScore DESC
+LIMIT 10000;

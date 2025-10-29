@@ -1,0 +1,261 @@
+-- {"query": "687.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2788} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+        date_trunc('month', u.creationdate) as signup_month,
+        count(*) over () as total_users_window
+    from users u
+    where u.creationdate >= now() - interval '3 years'
+),
+q_posts as (
+    select
+        p.id as post_id,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.favoritecount,
+        p.commentcount,
+        p.title,
+        p.tags,
+        p.closeddate,
+        p.acceptedanswerid,
+        p.lastactivitydate,
+        p.contentlicense
+    from posts p
+    where p.posttypeid = 1
+),
+a_posts as (
+    select
+        p.id as post_id,
+        p.parentid as question_id,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.commentcount
+    from posts p
+    where p.posttypeid = 2
+),
+user_activity as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.location_norm,
+        ru.signup_month,
+        -- question stats
+        count(distinct qp.post_id) filter (where qp.owneruserid = ru.user_id) as questions_asked,
+        sum(qp.score) filter (where qp.owneruserid = ru.user_id) as q_score_sum,
+        avg(qp.score::numeric) filter (where qp.owneruserid = ru.user_id) as q_score_avg,
+        sum(qp.viewcount) filter (where qp.owneruserid = ru.user_id) as q_views_sum,
+        -- answer stats
+        count(distinct ap.post_id) filter (where ap.owneruserid = ru.user_id) as answers_posted,
+        sum(ap.score) filter (where ap.owneruserid = ru.user_id) as a_score_sum,
+        avg(ap.score::numeric) filter (where ap.owneruserid = ru.user_id) as a_score_avg,
+        -- comments on their questions
+        sum(qp.commentcount) filter (where qp.owneruserid = ru.user_id) as q_comments_sum,
+        -- favorites received on their questions
+        sum(qp.favoritecount) filter (where qp.owneruserid = ru.user_id) as q_favorites_sum,
+        -- closure rate of their questions
+        avg(case when qp.owneruserid = ru.user_id then (case when qp.closeddate is null then 0 else 1 end) end::numeric) as q_closed_rate
+    from recent_users ru
+    left join q_posts qp on qp.owneruserid = ru.user_id
+    left join a_posts ap on ap.owneruserid = ru.user_id
+    group by ru.user_id, ru.displayname, ru.reputation, ru.location_norm, ru.signup_month
+),
+accepted_answers as (
+    select
+        q.owneruserid as asker_id,
+        q.id as question_id,
+        q.acceptedanswerid,
+        case when q.acceptedanswerid is not null then 1 else 0 end as has_accepted
+    from posts q
+    where q.posttypeid = 1
+),
+aa_by_user as (
+    select
+        ru.user_id,
+        sum(a.has_accepted) as questions_with_accepted,
+        count(*) as total_questions
+    from recent_users ru
+    left join accepted_answers a on a.asker_id = ru.user_id
+    group by ru.user_id
+),
+votes_agg as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+    from votes v
+    group by v.postid
+),
+tag_extract as (
+    select
+        q.post_id,
+        unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tag
+    from q_posts q
+    where q.tags is not null and q.tags like '<%>'
+),
+user_top_tag as (
+    select
+        q.owneruserid as user_id,
+        t.tag,
+        count(*) as tag_count,
+        row_number() over (partition by q.owneruserid order by count(*) desc, min(q.creationdate)) as rn
+    from q_posts q
+    join tag_extract t on t.post_id = q.post_id
+    group by q.owneruserid, t.tag
+),
+post_edits as (
+    select
+        ph.postid,
+        sum(case when ph.posthistorytypeid in (4,5,6) then 1 else 0 end) as edits_count,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit_at,
+        sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as closes_count,
+        sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopens_count
+    from posthistory ph
+    group by ph.postid
+),
+comment_agg as (
+    select
+        c.postid,
+        count(*) as comments_count,
+        max(c.creationdate) as last_comment_at
+    from comments c
+    group by c.postid
+),
+question_engagement as (
+    select
+        q.post_id,
+        q.owneruserid as user_id,
+        q.creationdate,
+        q.score,
+        q.viewcount,
+        q.answercount,
+        coalesce(v.upvotes,0) as upvotes,
+        coalesce(v.downvotes,0) as downvotes,
+        coalesce(v.favorites,0) as favorites,
+        coalesce(pa.edits_count,0) as edits_count,
+        coalesce(pa.closes_count,0) as closes_count,
+        coalesce(pa.reopens_count,0) as reopens_count,
+        coalesce(ca.comments_count,0) as comments_count,
+        greatest(coalesce(pa.last_edit_at, q.creationdate), coalesce(ca.last_comment_at, q.creationdate), q.lastactivitydate) as last_touch
+    from q_posts q
+    left join votes_agg v on v.postid = q.post_id
+    left join post_edits pa on pa.postid = q.post_id
+    left join comment_agg ca on ca.postid = q.post_id
+),
+user_ranked as (
+    select
+        ua.*,
+        coalesce(aa.questions_with_accepted,0) as questions_with_accepted,
+        coalesce(aa.total_questions,0) as total_questions,
+        case when coalesce(aa.total_questions,0) > 0 then (coalesce(aa.questions_with_accepted,0)::numeric / nullif(aa.total_questions,0)) else null end as acceptance_rate,
+        ut.tag as top_tag,
+        ut.tag_count as top_tag_count,
+        dense_rank() over (order by ua.reputation desc, ua.q_score_sum desc nulls last, ua.a_score_sum desc nulls last) as rep_rank_global,
+        rank() over (partition by ua.location_norm order by ua.reputation desc) as rep_rank_by_location
+    from user_activity ua
+    left join aa_by_user aa on aa.user_id = ua.user_id
+    left join user_top_tag ut on ut.user_id = ua.user_id and ut.rn = 1
+),
+question_scored as (
+    select
+        qe.*,
+        -- engagement score mixing various signals
+        (
+            coalesce(qe.upvotes,0)*3
+            - coalesce(qe.downvotes,0)*2
+            + coalesce(qe.favorites,0)
+            + coalesce(qe.comments_count,0)*0.25
+            + coalesce(qe.answercount,0)*1.5
+            + least(greatest(coalesce(qe.viewcount,0), 0), 10000)::numeric / 1000.0
+        ) as engagement_score,
+        -- recency decay: newer is higher
+        exp(-extract(epoch from (now() - qe.creationdate)) / 86400.0 / 90.0) as recency_decay
+    from question_engagement qe
+),
+hot_candidates as (
+    select
+        qs.*,
+        (qs.engagement_score * qs.recency_decay) as hotness_score
+    from question_scored qs
+    where qs.score >= -2
+)
+select
+    ur.user_id,
+    ur.displayname,
+    ur.location_norm,
+    ur.reputation,
+    ur.rep_rank_global,
+    ur.rep_rank_by_location,
+    coalesce(ur.questions_asked,0) as questions_asked,
+    coalesce(ur.answers_posted,0) as answers_posted,
+    round(coalesce(ur.q_score_avg,0), 2) as q_score_avg,
+    round(coalesce(ur.a_score_avg,0), 2) as a_score_avg,
+    coalesce(ur.q_views_sum,0) as q_views_sum,
+    coalesce(ur.q_favorites_sum,0) as q_favorites_sum,
+    coalesce(ur.q_closed_rate,0) as q_closed_rate,
+    coalesce(ur.questions_with_accepted,0) as questions_with_accepted,
+    coalesce(ur.total_questions,0) as total_questions,
+    round(coalesce(ur.acceptance_rate,0)::numeric, 4) as acceptance_rate,
+    coalesce(ur.top_tag, '(none)') as top_tag,
+    coalesce(ur.top_tag_count,0) as top_tag_count,
+    -- windowed comparisons within signup cohort
+    percentile_cont(0.5) within group (order by coalesce(ur.q_score_avg,0)) over (partition by ur.signup_month) as cohort_qscore_median,
+    percentile_cont(0.5) within group (order by coalesce(ur.a_score_avg,0)) over (partition by ur.signup_month) as cohort_ascore_median,
+    -- correlated metrics: top 3 hot questions for this user in last year
+    (
+        select string_agg(left(coalesce(p.title, '[no title]'), 80), ' | ' order by hc.hotness_score desc)
+        from hot_candidates hc
+        join posts p on p.id = hc.post_id
+        where hc.user_id = ur.user_id
+          and hc.creationdate >= now() - interval '1 year'
+        fetch first 3 rows only
+    ) as top3_hot_titles_last_year,
+    -- set operator example: count of user's posts that are either highly viewed or highly scored but not both (symmetric difference)
+    (
+        select count(*) from (
+            (select qp.post_id
+             from q_posts qp
+             where qp.owneruserid = ur.user_id and coalesce(qp.viewcount,0) >= 10000)
+            union
+            (select qp2.post_id
+             from q_posts qp2
+             where qp2.owneruserid = ur.user_id and coalesce(qp2.score,0) >= 10)
+            except
+            (select qp3.post_id
+             from q_posts qp3
+             where qp3.owneruserid = ur.user_id and coalesce(qp3.viewcount,0) >= 10000
+                   and coalesce(qp3.score,0) >= 10)
+        ) z
+    ) as standout_questions_symdiff,
+    -- null logic and string expressions
+    concat_ws(' | ',
+        nullif(trim(ur.displayname), ''),
+        case when ur.location_norm = 'Unknown' then null else ur.location_norm end,
+        case when ur.top_tag is null or ur.top_tag = '' then null else '#' || ur.top_tag end
+    ) as identity_line
+from user_ranked ur
+where
+    -- diverse predicate mix
+    (coalesce(ur.questions_asked,0) + coalesce(ur.answers_posted,0)) >= 5
+    and (
+        ur.reputation >= 1000
+        or (coalesce(ur.acceptance_rate,0) >= 0.25 and coalesce(ur.q_score_avg,0) >= 0)
+        or (ur.rep_rank_by_location <= 10 and ur.location_norm is not null)
+    )
+order by
+    -- complex ordering for benchmarking
+    (coalesce(ur.acceptance_rate,0) * 0.5 + coalesce(ur.q_score_avg,0) * 0.02 + coalesce(ur.a_score_avg,0) * 0.02 + least(coalesce(ur.q_views_sum,0), 100000) / 100000.0) desc,
+    ur.rep_rank_global asc,
+    ur.user_id asc
+fetch first 200 rows only;

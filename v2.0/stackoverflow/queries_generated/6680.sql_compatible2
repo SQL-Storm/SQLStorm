@@ -1,0 +1,51 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestCreationDate,
+    AVG(p.Score) AS AvgScore,
+    AVG(p.ViewCount) AS AvgViewCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+    (
+        SELECT 
+            COUNT(*)
+        FROM 
+            Votes v
+        WHERE 
+            v.PostId = p.Id
+            AND v.VoteTypeId = 1
+    ) AS AcceptedAnswerCount,
+    (
+        SELECT 
+            COUNT(*)
+        FROM 
+            Badges b
+        WHERE 
+            b.UserId = u.Id
+            AND b.Class = 1
+    ) AS GoldBadgeCount,
+    (
+        SELECT 
+            COUNT(DISTINCT pl.RelatedPostId)
+        FROM 
+            PostLinks pl
+        WHERE 
+            pl.PostId = p.Id
+            AND pl.LinkTypeId = 3
+    ) AS DuplicatePostsCount
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Tags t ON ',' || COALESCE(p.Tags, '') || ',' LIKE '%,' || CAST(t.Id AS VARCHAR) || ',%'
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate
+HAVING 
+    u.Reputation > 1000
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC
+LIMIT 100;

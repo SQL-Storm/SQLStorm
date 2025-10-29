@@ -1,0 +1,141 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScoreOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(B.Id) AS TotalBadgesEarned,
+        MAX(B.Date) AS LastBadgeDate,
+        LAG(U.Reputation, 1, 0) OVER (ORDER BY U.Reputation DESC) AS PrevUserReputation,
+        (U.UpVotes - U.DownVotes) AS NetVotesGivenByOthers,
+        U.Views AS ProfileViews
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.UpVotes, U.DownVotes, U.Views
+),
+PostHistoryRaw AS (
+    SELECT
+        PH.PostId,
+        PH.UserId AS EditorUserId,
+        PH.PostHistoryTypeId,
+        PH.CreationDate AS HistoryEventDate,
+        PH.Comment AS HistoryComment,
+        PH.Text AS HistoryText,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate ASC) AS EventSequenceNum,
+        LEAD(PH.PostHistoryTypeId) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate ASC) AS NextHistoryEventType,
+        CASE
+            WHEN PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL THEN (
+                SELECT CRT.Name FROM CloseReasonTypes CRT WHERE CAST(CRT.Id AS VARCHAR) = PH.Comment
+            )
+            ELSE NULL
+        END AS CloseReasonName
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (2, 5, 10, 11)
+),
+PostBodyEvolution AS (
+    SELECT
+        PH.PostId,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 2 THEN LENGTH(PH.Text) ELSE NULL END) AS InitialBodyLength,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 5 THEN LENGTH(PH.Text) ELSE NULL END) AS LatestBodyEditLength,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 5 THEN PH.CreationDate ELSE NULL END) AS LastBodyEditDate
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (2, 5)
+    GROUP BY PH.PostId
+),
+PostTagAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        COUNT(DISTINCT tag_value) AS UniqueTagsOnPost,
+        SUM(T.Count) AS TotalTagPopularityScore,
+        STRING_AGG(T.TagName, ';') AS AllTagNames,
+        AVG(T.Count) FILTER (WHERE T.TagName IS NOT NULL) AS AvgTagPopularity
+    FROM Posts P
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(P.Tags, 2, char_length(P.Tags)-2), '><')) AS tag_value
+    ) tv ON P.Tags IS NOT NULL AND char_length(P.Tags) > 2
+    LEFT JOIN Tags T ON T.TagName = tv.tag_value
+    GROUP BY P.Id, P.OwnerUserId
+),
+PostStatusEvents AS (
+    SELECT PostId, HistoryEventDate AS EventDate, 'Closed' AS EventType
+    FROM PostHistoryRaw
+    WHERE PostHistoryTypeId = 10
+    UNION ALL
+    SELECT PostId, HistoryEventDate AS EventDate, 'Reopened' AS EventType
+    FROM PostHistoryRaw
+    WHERE PostHistoryTypeId = 11
+)
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.UserCreationDate,
+    UES.TotalPostsOwned,
+    UES.QuestionsAsked,
+    UES.AnswersProvided,
+    UES.TotalPostScoreOwned,
+    UES.TotalCommentsMade,
+    UES.TotalBadgesEarned,
+    UES.LastBadgeDate,
+    UES.PrevUserReputation,
+    UES.NetVotesGivenByOthers,
+    UES.ProfileViews,
+    AVG(P.Score) AS AvgPostScore,
+    MAX(P.Score) AS MaxPostScore,
+    MIN(P.Score) AS MinPostScore,
+    COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 1) AS QuestionCount,
+    COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 2) AS AnswerCount,
+    PTA.UniqueTagsOnPost,
+    PTA.TotalTagPopularityScore,
+    PTA.AllTagNames,
+    PTA.AvgTagPopularity,
+    PBE.InitialBodyLength,
+    PBE.LatestBodyEditLength,
+    PBE.LastBodyEditDate,
+    PSE.EventType AS LastStatusEventType,
+    PSE.EventDate AS LastStatusEventDate
+FROM UserEngagementSummary UES
+LEFT JOIN Posts P ON UES.UserId = P.OwnerUserId
+LEFT JOIN PostTagAnalysis PTA ON P.Id = PTA.PostId
+LEFT JOIN PostBodyEvolution PBE ON P.Id = PBE.PostId
+LEFT JOIN (
+    SELECT PostId, EventType, EventDate
+    FROM (
+        SELECT PostId, EventType, EventDate,
+               ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY EventDate DESC) AS rn
+        FROM PostStatusEvents
+    ) t
+    WHERE rn = 1
+) PSE ON P.Id = PSE.PostId
+GROUP BY
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.UserCreationDate,
+    UES.TotalPostsOwned,
+    UES.QuestionsAsked,
+    UES.AnswersProvided,
+    UES.TotalPostScoreOwned,
+    UES.TotalCommentsMade,
+    UES.TotalBadgesEarned,
+    UES.LastBadgeDate,
+    UES.PrevUserReputation,
+    UES.NetVotesGivenByOthers,
+    UES.ProfileViews,
+    PTA.UniqueTagsOnPost,
+    PTA.TotalTagPopularityScore,
+    PTA.AllTagNames,
+    PTA.AvgTagPopularity,
+    PBE.InitialBodyLength,
+    PBE.LatestBodyEditLength,
+    PBE.LastBodyEditDate,
+    PSE.EventType,
+    PSE.EventDate;

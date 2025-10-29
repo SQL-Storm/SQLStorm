@@ -1,0 +1,127 @@
+WITH
+    user_stats AS (
+        SELECT
+            u.id                                      AS user_id,
+            u.displayname,
+            u.reputation,
+            COALESCE(SUM(p.score), 0)                 AS total_post_score,
+            COUNT(p.id)                               AS post_count,
+            COALESCE(SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END), 0) AS upvote_cnt,
+            COALESCE(SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END), 0) AS downvote_cnt,
+            MAX(p.creationdate)                      AS last_post_date
+        FROM users u
+        LEFT JOIN posts p   ON p.owneruserid = u.id
+        LEFT JOIN votes v   ON v.postid = p.id
+        GROUP BY u.id, u.displayname, u.reputation
+    ),
+
+    badge_stats AS (
+        SELECT
+            b.userid                                 AS user_id,
+            COUNT(CASE WHEN b.class = 1 THEN 1 END)  AS gold_badges,
+            COUNT(CASE WHEN b.class = 2 THEN 1 END)  AS silver_badges,
+            COUNT(CASE WHEN b.class = 3 THEN 1 END)  AS bronze_badges,
+            STRING_AGG(DISTINCT b.name, '; ')        AS badge_list
+        FROM badges b
+        GROUP BY b.userid
+    ),
+
+    tag_usage AS (
+        SELECT
+            p.owneruserid                            AS user_id,
+            UNNEST(string_to_array(TRIM(BOTH '><' FROM p.tags), '><')) AS tag
+        FROM posts p
+        WHERE p.posttypeid = 1
+          AND p.tags IS NOT NULL
+    ),
+
+    tag_rank AS (
+        SELECT
+            tu.user_id,
+            tu.tag,
+            COUNT(*)                                 AS tag_freq,
+            ROW_NUMBER() OVER (PARTITION BY tu.user_id ORDER BY COUNT(*) DESC) AS rn
+        FROM tag_usage tu
+        GROUP BY tu.user_id, tu.tag
+    ),
+
+    user_tag_stats AS (
+        SELECT
+            tr.user_id,
+            COUNT(DISTINCT tr.tag)                   AS distinct_tag_cnt,
+            STRING_AGG(tr.tag, ', ' ORDER BY COUNT(*) DESC) AS top_5_tags
+        FROM tag_rank tr
+        WHERE tr.rn <= 5
+        GROUP BY tr.user_id
+    ),
+
+    recent_comments AS (
+        SELECT
+            c.userid,
+            COUNT(*)                                 AS recent_comment_cnt
+        FROM comments c
+        WHERE c.creationdate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+        GROUP BY c.userid
+    ),
+
+    combined AS (
+        SELECT
+            us.user_id,
+            us.displayname,
+            us.reputation,
+            us.total_post_score,
+            us.post_count,
+            us.upvote_cnt,
+            us.downvote_cnt,
+            us.last_post_date,
+            COALESCE(bs.gold_badges, 0)               AS gold_badges,
+            COALESCE(bs.silver_badges, 0)             AS silver_badges,
+            COALESCE(bs.bronze_badges, 0)             AS bronze_badges,
+            COALESCE(bs.badge_list, '')               AS badge_list,
+            COALESCE(uts.distinct_tag_cnt, 0)         AS distinct_tag_cnt,
+            COALESCE(uts.top_5_tags, '')              AS top_5_tags,
+            COALESCE(rc.recent_comment_cnt, 0)        AS recent_comment_cnt,
+            (SELECT ROUND(AVG(CAST(p2.score AS double precision))::numeric, 2)
+             FROM posts p2
+             WHERE p2.owneruserid = us.user_id
+               AND p2.posttypeid = 2
+               AND p2.score IS NOT NULL)             AS avg_answer_score,
+            ROW_NUMBER() OVER (ORDER BY us.reputation DESC, us.total_post_score DESC) AS reputation_rank,
+            CASE
+                WHEN us.reputation >= 20000 THEN 'Legendary'
+                WHEN us.reputation >= 10000 THEN 'Expert'
+                WHEN us.reputation >= 2000  THEN 'Seasoned'
+                ELSE 'Novice'
+            END                                      AS reputation_tier,
+            CONCAT('User ', us.displayname, ' (', us.reputation, ') holds ',
+                   COALESCE(bs.gold_badges, 0), ' gold, ',
+                   COALESCE(bs.silver_badges, 0), ' silver, ',
+                   COALESCE(bs.bronze_badges, 0), ' bronze badges') AS summary_text
+        FROM user_stats us
+        LEFT JOIN badge_stats bs      ON bs.user_id = us.user_id
+        LEFT JOIN user_tag_stats uts  ON uts.user_id = us.user_id
+        LEFT JOIN recent_comments rc  ON rc.userid = us.user_id
+        GROUP BY
+            us.user_id,
+            us.displayname,
+            us.reputation,
+            us.total_post_score,
+            us.post_count,
+            us.upvote_cnt,
+            us.downvote_cnt,
+            us.last_post_date,
+            bs.gold_badges,
+            bs.silver_badges,
+            bs.bronze_badges,
+            bs.badge_list,
+            uts.distinct_tag_cnt,
+            uts.top_5_tags,
+            rc.recent_comment_cnt
+    )
+
+SELECT *
+FROM combined
+WHERE reputation_rank <= 100
+  AND (gold_badges > 0 OR silver_badges > 0)
+  AND (distinct_tag_cnt > 0 OR recent_comment_cnt > 5)
+ORDER BY reputation_rank;

@@ -1,0 +1,259 @@
+-- {"query": "1830.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3129} 
+
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScoreReceived,
+        EXTRACT(YEAR FROM U.CreationDate) AS CreationYear,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM U.CreationDate) ORDER BY U.Reputation DESC, U.Id ASC) AS RankByReputationInYear,
+        NTILE(10) OVER (PARTITION BY EXTRACT(YEAR FROM U.CreationDate) ORDER BY U.UpVotes DESC, U.DownVotes ASC) AS UpVoteDecileInYear,
+        U.Views AS UserProfileViews,
+        CASE
+            WHEN U.LastAccessDate > NOW() - INTERVAL '30 days' THEN 'Active'
+            WHEN U.LastAccessDate > NOW() - INTERVAL '1 year' THEN 'Semi-Active'
+            ELSE 'Inactive'
+        END AS ActivityStatus
+    FROM
+        Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes, U.Views
+),
+PostContentAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostsNativeCommentCount, -- From Posts table
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        STRING_AGG(DISTINCT T.TagName, ' ') AS AssociatedTags,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount, -- UpMod
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount, -- DownMod
+        SUM(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswerVoteCount,
+        COUNT(DISTINCT P_InnerC.Id) AS PostCommentsCountDetailed, -- Calculated from Comments table
+        CASE
+            WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN P.PostTypeId = 1 AND P.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN P.PostTypeId = 2 AND P_ParentQ.AcceptedAnswerId = P.Id THEN 'AcceptedAnswer'
+            ELSE 'Open/Other'
+        END AS PostStatusCategory,
+        NULLIF(LENGTH(P.Title) - LENGTH(REPLACE(P.Title, ' ', '')), 0) + 1 AS TitleWordCount,
+        REPLACE(REPLACE(REPLACE(LOWER(P.Body), '<p>', ''), '</p>', ''), '&nbsp;', ' ') AS CleanedPostBody
+    FROM
+        Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN Comments P_InnerC ON P.Id = P_InnerC.PostId
+    LEFT JOIN Posts P_ParentQ ON P.ParentId = P_ParentQ.Id AND P.PostTypeId = 2 -- For answers, get parent question
+    LEFT JOIN Tags T ON P.Tags LIKE '%<' || T.TagName || '>%' -- Join for tags, potentially inefficient but elaborate
+    GROUP BY
+        P.Id, P.PostTypeId, PT.Name, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount,
+        P.FavoriteCount, P.ClosedDate, P.AcceptedAnswerId, P.ParentId, P.Title, P.Body
+),
+PostLifecycleEvents AS (
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS HistoryDate,
+        PHT.Name AS HistoryTypeName,
+        PH.UserId AS HistoryUserId,
+        PH.Comment,
+        PH.Text AS HistoryText,
+        LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousEventDate,
+        LEAD(PH.CreationDate, 1) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS NextEventDate,
+        CASE
+            WHEN PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL THEN
+                (SELECT CR.Name FROM CloseReasonTypes CR WHERE CR.Id = CAST(PH.Comment AS smallint))
+            ELSE NULL
+        END AS CloseReason,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS EventSequenceNum
+    FROM
+        PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+),
+PostAggregatedHistory AS (
+    SELECT
+        PLE.PostId,
+        MIN(PLE.HistoryDate) AS FirstEventDate,
+        MAX(PLE.HistoryDate) AS LastEventDate,
+        COUNT(CASE WHEN PLE.HistoryTypeName LIKE 'Edit%' THEN 1 ELSE NULL END) AS EditCount,
+        COUNT(CASE WHEN PLE.HistoryTypeName = 'Post Closed' THEN 1 ELSE NULL END) AS CloseCount,
+        COUNT(CASE WHEN PLE.HistoryTypeName = 'Post Reopened' THEN 1 ELSE NULL END) AS ReopenCount,
+        MAX(CASE WHEN PLE.HistoryTypeName = 'Post Closed' THEN AGE(PLE.HistoryDate, PLE.PreviousEventDate) END) AS TimeToFirstClose,
+        SUM(CASE WHEN PLE.HistoryTypeName = 'Post Closed' THEN 1 ELSE 0 END) AS TotalCloseEvents
+    FROM
+        PostLifecycleEvents PLE
+    GROUP BY
+        PLE.PostId
+),
+LinkedPostImpact AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS TotalLinkedPosts, -- LinkType 1 = Linked
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS TotalDuplicateOfPosts, -- LinkType 3 = Duplicate
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN COALESCE(P_Rel.Score, 0) ELSE 0 END) AS SumScoreOfLinkedPosts,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN COALESCE(P_Rel.ViewCount, 0) ELSE 0 END) AS SumViewCountOfDuplicatePosts
+    FROM
+        Posts P
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId
+    LEFT JOIN Posts P_Rel ON PL.RelatedPostId = P_Rel.Id
+    GROUP BY
+        P.Id, P.PostTypeId
+),
+BaseQueryResult AS (
+    SELECT
+        UE.DisplayName AS UserDisplayName,
+        UE.Reputation AS UserReputation,
+        UE.ActivityStatus,
+        UE.GoldBadges,
+        UE.TotalCommentsMade,
+        UE.TotalBadges,
+        PCA.PostId,
+        PCA.OwnerUserId AS PostOwnerUserId,
+        PCA.PostTypeName,
+        PCA.PostCreationDate,
+        PCA.PostScore,
+        PCA.ViewCount AS PostViewCount,
+        PCA.UpVoteCount AS PostUpVotes,
+        PCA.DownVoteCount AS PostDownVotes,
+        PCA.AssociatedTags,
+        COALESCE(LPI.TotalLinkedPosts, 0) AS NumberOfLinkedPosts,
+        COALESCE(LPI.TotalDuplicateOfPosts, 0) AS NumberOfDuplicateOfPosts,
+        PH.FirstEventDate,
+        PH.LastEventDate,
+        PH.EditCount,
+        PH.CloseCount,
+        PH.ReopenCount,
+        AGE(COALESCE(PH.LastEventDate, PCA.PostCreationDate), PCA.PostCreationDate) AS PostAgeAtLastEvent,
+        (PCA.UpVoteCount - PCA.DownVoteCount) AS NetVotes,
+        (PCA.PostScore * 0.7 + PCA.ViewCount * 0.1 + COALESCE(PCA.AnswerCount, 0) * 0.15 + COALESCE(PCA.PostCommentsCountDetailed, 0) * 0.05) AS CalculatedQualityScore,
+        CASE
+            WHEN PCA.PostStatusCategory = 'Closed' AND PH.TotalCloseEvents > 0 AND PH.TimeToFirstClose IS NOT NULL THEN 'Initially Closed'
+            WHEN PCA.PostStatusCategory = 'Closed' AND PH.TotalCloseEvents > 0 THEN 'Closed Later'
+            WHEN PCA.PostStatusCategory = 'AcceptedAnswer' THEN 'SuccessfullyAcceptedAnswer'
+            WHEN PCA.PostStatusCategory = 'Answered' THEN 'QuestionAnswered'
+            ELSE 'OtherPostStatus'
+        END AS DetailedPostState,
+        -- Correlated subquery to find average reputation of users who commented on the post
+        (
+            SELECT AVG(U_C.Reputation)
+            FROM Comments C_Sub
+            JOIN Users U_C ON C_Sub.UserId = U_C.Id
+            WHERE C_Sub.PostId = PCA.PostId AND U_C.Reputation > 100
+        ) AS AvgReputableCommenterReputation,
+        -- Subquery to find the most common close reason if closed
+        (
+            SELECT PLE_Sub.CloseReason
+            FROM PostLifecycleEvents PLE_Sub
+            WHERE PLE_Sub.PostId = PCA.PostId AND PLE_Sub.HistoryTypeName = 'Post Closed' AND PLE_Sub.CloseReason IS NOT NULL
+            GROUP BY PLE_Sub.CloseReason
+            ORDER BY COUNT(*) DESC
+            LIMIT 1
+        ) AS MostCommonCloseReason,
+        COALESCE(PCA.CleanedPostBody, 'NO_BODY_CONTENT') AS PostBodyPreview,
+        NULLIF(PCA.TitleWordCount, 0) AS ActualTitleWordCount,
+        UPPER(SUBSTRING(UE.DisplayName FROM 1 FOR 3)) || '-' || LPAD(COALESCE(UE.UserId, -1)::text, 5, '0') AS UserCode
+    FROM
+        UserEngagement UE
+    FULL OUTER JOIN PostContentAnalysis PCA ON UE.UserId = PCA.OwnerUserId
+    LEFT JOIN PostAggregatedHistory PH ON PCA.PostId = PH.PostId
+    LEFT JOIN LinkedPostImpact LPI ON PCA.PostId = LPI.PostId
+    WHERE
+        PCA.PostId IS NOT NULL -- Exclude rows where there's only user data but no posts
+)
+-- First branch of the UNION ALL: Focus on highly reputable users with active posts
+SELECT
+    UserDisplayName,
+    UserReputation,
+    ActivityStatus,
+    PostTypeName,
+    PostCreationDate,
+    PostScore,
+    PostViewCount,
+    PostUpVotes,
+    PostDownVotes,
+    AssociatedTags,
+    NumberOfLinkedPosts,
+    NumberOfDuplicateOfPosts,
+    FirstEventDate,
+    LastEventDate,
+    EditCount,
+    CloseCount,
+    PostAgeAtLastEvent,
+    NetVotes,
+    CalculatedQualityScore,
+    DetailedPostState,
+    AvgReputableCommenterReputation,
+    MostCommonCloseReason,
+    PostBodyPreview,
+    ActualTitleWordCount,
+    UserCode,
+    'HighRepActivePosts' AS ResultCategory
+FROM
+    BaseQueryResult
+WHERE
+    UserReputation > 5000
+    AND ActivityStatus = 'Active'
+    AND PostTypeName IN ('Question', 'Answer')
+    AND PostCreationDate BETWEEN '2020-01-01' AND '2022-12-31'
+    AND CalculatedQualityScore > 150
+
+UNION ALL
+
+-- Second branch of the UNION ALL: Focus on posts with significant history or specific tags, regardless of user activity
+SELECT
+    UserDisplayName,
+    UserReputation,
+    ActivityStatus,
+    PostTypeName,
+    PostCreationDate,
+    PostScore,
+    PostViewCount,
+    PostUpVotes,
+    PostDownVotes,
+    AssociatedTags,
+    NumberOfLinkedPosts,
+    NumberOfDuplicateOfPosts,
+    FirstEventDate,
+    LastEventDate,
+    EditCount,
+    CloseCount,
+    PostAgeAtLastEvent,
+    NetVotes,
+    CalculatedQualityScore,
+    DetailedPostState,
+    AvgReputableCommenterReputation,
+    MostCommonCloseReason,
+    PostBodyPreview,
+    ActualTitleWordCount,
+    UserCode,
+    'SpecificPostCriteria' AS ResultCategory
+FROM
+    BaseQueryResult
+WHERE
+    (EditCount > 5 OR CloseCount > 1 OR ReopenCount > 0 OR GoldBadges > 0)
+    AND (AssociatedTags LIKE '%<java>%' OR AssociatedTags LIKE '%<python>%')
+    AND PostScore > 20
+    AND PostCreationDate BETWEEN '2019-01-01' AND '2023-12-31'
+    AND UserReputation IS NOT NULL
+ORDER BY
+    CalculatedQualityScore DESC, UserReputation DESC, PostCreationDate DESC
+LIMIT 1000 OFFSET 100;

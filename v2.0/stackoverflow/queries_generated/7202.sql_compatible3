@@ -1,0 +1,208 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS TotalQuestionScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS TotalAnswerScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    COUNT(DISTINCT b.Id) AS BadgeCount,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS TagPreferences,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    STRING_AGG(DISTINCT pv.Name, ', ') AS VoteTypes,
+    COUNT(DISTINCT ph.Id) AS HistoryActions,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) AS ClosedReopenedDeleted,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (14, 15) THEN ph.Id END) AS LockedUnlocked,
+    LAG(u.Reputation, 1, 0) OVER (ORDER BY u.CreationDate) AS PreviousReputation,
+    LAG(u.CreationDate, 1) OVER (ORDER BY u.CreationDate) AS PreviousCreationDate,
+    CAST(EXTRACT(day FROM (u.CreationDate - LAG(u.CreationDate, 1) OVER (ORDER BY u.CreationDate))) AS bigint) * 1 AS DaysSincePreviousJoin,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0 / COUNT(DISTINCT p.Id))
+        ELSE 0 
+    END AS QuestionPercentage,
+    RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRank,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+    NTILE(10) OVER (ORDER BY u.Reputation DESC) AS ReputationDecile,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM Posts p2 
+            WHERE p2.OwnerUserId = u.Id 
+            AND p2.PostTypeId = 1 
+            AND p2.Score > 1000
+        ) THEN 'HighImpactQuestionAuthor'
+        WHEN EXISTS (
+            SELECT 1 FROM Posts p3 
+            WHERE p3.OwnerUserId = u.Id 
+            AND p3.PostTypeId = 2 
+            AND p3.Score > 1000
+        ) THEN 'HighImpactAnswerAuthor'
+        ELSE 'RegularUser'
+    END AS ExpertiseLevel,
+    COALESCE(
+        (SELECT sub.TagName 
+         FROM (
+           SELECT t1.TagName, COUNT(*) AS cnt
+           FROM Posts p4 
+           JOIN Posts p5 ON p4.Id = p5.ParentId 
+           JOIN Posts p6 ON p6.Id = p4.Id 
+           JOIN Tags t1 ON t1.TagName = SUBSTRING(p6.Tags FROM 2 FOR CHAR_LENGTH(p6.Tags)-2)
+           WHERE p4.OwnerUserId = u.Id 
+           AND p4.PostTypeId = 2 
+           AND p6.Tags IS NOT NULL
+           GROUP BY t1.TagName 
+           ORDER BY cnt DESC
+           LIMIT 1
+         ) sub
+        ), 
+        'NoTagSpecified'
+    ) AS PrimaryAnswerTag,
+    COALESCE(
+        (SELECT sub.TagName 
+         FROM (
+           SELECT t2.TagName, COUNT(*) AS cnt
+           FROM Posts p7 
+           JOIN Tags t2 ON t2.TagName = SUBSTRING(p7.Tags FROM 2 FOR CHAR_LENGTH(p7.Tags)-2)
+           WHERE p7.OwnerUserId = u.Id 
+           AND p7.PostTypeId = 1 
+           AND p7.Tags IS NOT NULL
+           GROUP BY t2.TagName 
+           ORDER BY cnt DESC
+           LIMIT 1
+         ) sub
+        ), 
+        'NoTagSpecified'
+    ) AS PrimaryQuestionTag,
+    CASE 
+        WHEN COUNT(DISTINCT ph.Id) > 100 THEN 'ActiveUser'
+        WHEN COUNT(DISTINCT ph.Id) > 50 THEN 'ModeratelyActiveUser'
+        WHEN COUNT(DISTINCT ph.Id) > 10 THEN 'OccasionalUser'
+        ELSE 'InactiveUser'
+    END AS EngagementLevel,
+    CASE 
+        WHEN COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) > 0
+        AND COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) = 0
+        THEN 'QuestionFocused'
+        WHEN COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) = 0
+        AND COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) > 0
+        THEN 'AnswerFocused'
+        WHEN COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) > 0
+        AND COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) > 0
+        AND COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) > COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0)
+        THEN 'QuestionDominant'
+        WHEN COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) > 0
+        AND COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) > 0
+        AND COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) < COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0)
+        THEN 'AnswerDominant'
+        ELSE 'Balanced'
+    END AS ContributionStyle,
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT ph1.PostId 
+        FROM PostHistory ph1 
+        WHERE ph1.UserId = u.Id 
+        AND ph1.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 24)
+        EXCEPT
+        SELECT DISTINCT ph2.PostId 
+        FROM PostHistory ph2 
+        WHERE ph2.UserId = u.Id 
+        AND ph2.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 25, 31, 33, 34, 35, 36, 37, 38, 50, 52, 53, 66)
+    ) AS editedPosts) AS EditedPostsCount,
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT ph3.PostId 
+        FROM PostHistory ph3 
+        WHERE ph3.UserId = u.Id 
+        AND ph3.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 25, 31, 33, 34, 35, 36, 37, 38, 50, 52, 53, 66)
+        EXCEPT
+        SELECT DISTINCT ph4.PostId 
+        FROM PostHistory ph4 
+        WHERE ph4.UserId = u.Id 
+        AND ph4.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 24)
+    ) AS moderationPosts) AS ModerationPostsCount,
+    CASE WHEN u.Reputation > 10000 THEN 'HighReputation' 
+         WHEN u.Reputation > 5000 THEN 'MediumReputation' 
+         WHEN u.Reputation > 1000 THEN 'LowReputation' 
+         ELSE 'VeryLowReputation' END AS ReputationTier,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p8 
+        WHERE p8.OwnerUserId = u.Id 
+        AND p8.PostTypeId = 1 
+        AND p8.AcceptedAnswerId IS NOT NULL
+    ) AS QuestionsWithAcceptedAnswers,
+    (
+        SELECT AVG(p10.Score) 
+        FROM Posts p10 
+        WHERE p10.OwnerUserId = u.Id 
+        AND p10.PostTypeId = 2 
+        AND p10.Score IS NOT NULL
+    ) AS AverageAnswerScoreForUser,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p9 
+        WHERE p9.OwnerUserId = u.Id 
+        AND p9.PostTypeId = 1 
+        AND p9.ClosedDate IS NOT NULL
+    ) AS ClosedQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p11 
+        WHERE p11.OwnerUserId = u.Id 
+        AND p11.PostTypeId = 2 
+        AND p11.ParentId IS NOT NULL
+        AND EXISTS (
+            SELECT 1 FROM Posts p12 
+            WHERE p12.Id = p11.ParentId 
+            AND p12.AcceptedAnswerId = p11.Id
+        )
+    ) AS AnsweredAcceptedQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c2 
+        WHERE c2.UserId = u.Id 
+        AND c2.Score >= 5
+    ) AS HighScoringComments
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN VoteTypes pv ON pv.Id = (
+    SELECT v1.VoteTypeId 
+    FROM Votes v1 
+    WHERE v1.UserId = u.Id
+    LIMIT 1
+)
+LEFT JOIN Tags t ON t.Id = (
+    SELECT CAST(tagid AS integer) FROM (
+      SELECT DISTINCT tagid
+      FROM (
+        SELECT TRIM(tag) AS tagstr,
+               NULLIF(TRIM(tag), '') AS tag,
+               CAST(NULLIF(TRIM(tag), '') AS integer) AS tagid
+        FROM (
+          SELECT REGEXP_SPLIT_TO_TABLE(
+            REPLACE(REPLACE(p13.Tags, '<', ''), '>', ','),
+            ','
+          ) AS tag
+          FROM Posts p13
+          WHERE p13.OwnerUserId = u.Id 
+            AND p13.PostTypeId = 1 
+            AND p13.Tags IS NOT NULL
+        ) s1
+      ) s2
+      WHERE tagid IS NOT NULL
+      LIMIT 1
+    ) s3
+)
+WHERE u.CreationDate >= (CAST('2024-10-01' AS date) + INTERVAL '0' DAY) - INTERVAL '5 year'
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+HAVING COUNT(DISTINCT p.Id) > 0 AND u.Reputation > 0
+ORDER BY TotalPosts DESC, u.Reputation DESC
+OFFSET 0 ROW FETCH NEXT 1000 ROWS ONLY;

@@ -1,0 +1,270 @@
+-- {"query": "1199.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3415} 
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(u.Location, 'Unknown') AS UserLocation,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalViewsOnOwnedPosts,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoritesOnOwnedPosts,
+        SUM(COALESCE(p.Score, 0)) AS TotalScoreOnOwnedPosts,
+        SUM(CASE WHEN v_up.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN v_down.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        COUNT(DISTINCT ph_edit.PostId) AS UniquePostsEditedByUser,
+        MAX(ph_initial_body.CreationDate) AS LastInitialPostBodyDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v_up ON u.Id = v_up.UserId AND v_up.VoteTypeId = 2
+    LEFT JOIN Votes v_down ON u.Id = v_down.UserId AND v_down.VoteTypeId = 3
+    LEFT JOIN PostHistory ph_edit ON u.Id = ph_edit.UserId AND ph_edit.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+    LEFT JOIN PostHistory ph_initial_body ON u.Id = ph_initial_body.UserId AND ph_initial_body.PostHistoryTypeId = 2
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+),
+PostContentMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount AS PostFavoriteCount,
+        p.ClosedDate,
+        COALESCE(p.Title, 'No Title Provided') AS PostTitle,
+        COALESCE(LENGTH(p.Body), 0) AS BodyLength,
+        COALESCE(LENGTH(REPLACE(p.Body, ' ', '')), 0) AS BodyCharLengthNoSpaces,
+        COALESCE(ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'), 1), 0) AS TagCount,
+        (SELECT COUNT(DISTINCT ph_edit.Id) FROM PostHistory ph_edit WHERE ph_edit.PostId = p.Id AND ph_edit.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)) AS TotalEditsToPost,
+        (SELECT COUNT(DISTINCT co.Id) FROM Comments co WHERE co.PostId = p.Id AND co.Text ILIKE '%bug%') AS CommentsMentioningBug,
+        CASE
+            WHEN p.Body LIKE '%<code>%' AND p.Body LIKE '%<pre>%' AND p.Body LIKE '%stackoverflow.com/questions/%'
+            THEN 'CodeAndLink'
+            WHEN p.Body LIKE '%<code>%' THEN 'CodeOnly'
+            WHEN p.Body LIKE '%stackoverflow.com/questions/%' THEN 'LinkOnly'
+            ELSE 'Normal'
+        END AS ContentComplexityType,
+        CASE
+            WHEN p.Body ILIKE '%NULL%' OR p.Body ILIKE '%IS NULL%' OR p.Body ILIKE '%IS NOT NULL%' THEN TRUE
+            ELSE FALSE
+        END AS MentionsNullLogic,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScoreByOwner,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostTypeScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2, 4, 5)
+    AND p.CreationDate BETWEEN (NOW() - INTERVAL '5 year') AND NOW()
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MIN(b.Date) AS FirstBadgeDate,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserTagUnnested AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS Tag,
+        p.Id AS PostId,
+        p.Score
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.Tags LIKE '<%>%' AND p.OwnerUserId IS NOT NULL
+),
+UserTagAggregated AS (
+    SELECT
+        utan.UserId,
+        utan.Tag,
+        COUNT(utan.PostId) AS PostCountForTag,
+        SUM(utan.Score) AS ScoreForTag,
+        ROW_NUMBER() OVER (PARTITION BY utan.UserId ORDER BY COUNT(utan.PostId) DESC, SUM(utan.Score) DESC, utan.Tag ASC) AS TagRank
+    FROM UserTagUnnested utan
+    GROUP BY utan.UserId, utan.Tag
+),
+TopTagsByUser AS (
+    SELECT
+        uta.UserId,
+        uta.Tag AS PrimaryTag,
+        uta.PostCountForTag AS PrimaryTagPostCount,
+        SUM(uta.PostCountForTag) OVER (PARTITION BY uta.UserId) AS TotalTaggedPosts,
+        SUM(uta.ScoreForTag) OVER (PARTITION BY uta.UserId) AS TotalTaggedScore
+    FROM UserTagAggregated uta
+    WHERE uta.TagRank = 1
+),
+FinalUserMetrics AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.UserCreationDate,
+        uas.LastAccessDate,
+        uas.UserLocation,
+        uas.TotalPostsOwned,
+        uas.TotalQuestionsOwned,
+        uas.TotalAnswersOwned,
+        uas.TotalCommentsMade,
+        uas.TotalViewsOnOwnedPosts,
+        uas.TotalFavoritesOnOwnedPosts,
+        uas.TotalScoreOnOwnedPosts,
+        uas.TotalUpvotesGiven,
+        uas.TotalDownvotesGiven,
+        uas.UniquePostsEditedByUser,
+        ubs.TotalBadges,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        tpt.PrimaryTag,
+        tpt.PrimaryTagPostCount,
+        tpt.TotalTaggedPosts,
+        tpt.TotalTaggedScore,
+        COALESCE(
+            (SELECT AVG(pcm_sub.PostScore)
+             FROM PostContentMetrics pcm_sub
+             WHERE pcm_sub.OwnerUserId = uas.UserId
+               AND pcm_sub.PostTypeId = 1
+               AND pcm_sub.PostCreationDate BETWEEN (uas.UserCreationDate + INTERVAL '1 month') AND (uas.UserCreationDate + INTERVAL '1 year')),
+            0.0
+        ) AS AvgQuestionScoreFirstYear,
+        COALESCE(
+            (SELECT COUNT(DISTINCT pl.RelatedPostId)
+             FROM PostLinks pl
+             WHERE pl.PostId IN (SELECT p_link.Id FROM Posts p_link WHERE p_link.OwnerUserId = uas.UserId AND p_link.PostTypeId = 1)),
+            0
+        ) AS CountOfLinkedQuestions,
+        COALESCE(
+             (SELECT MAX(pcm_q.PostScore) FROM PostContentMetrics pcm_q WHERE pcm_q.OwnerUserId = uas.UserId AND pcm_q.PostTypeId = 1 AND pcm_q.PostTypeScoreRank = 1)
+        , 0) AS TopQuestionScoreByRank,
+        COALESCE(
+            (SELECT MAX(pcm_ans.PostScore) FROM PostContentMetrics pcm_ans WHERE pcm_ans.OwnerUserId = uas.UserId AND pcm_ans.PostTypeId = 2 AND pcm_ans.PostTypeScoreRank = 1)
+        , 0) AS TopAnswerScoreByRank,
+        (NOW() - uas.UserCreationDate) AS UserAge,
+        (uas.LastAccessDate - uas.UserCreationDate) AS LastAccessDelta
+    FROM UserActivitySummary uas
+    LEFT JOIN UserBadgeStats ubs ON uas.UserId = ubs.UserId
+    LEFT JOIN TopTagsByUser tpt ON uas.UserId = tpt.UserId
+    WHERE uas.Reputation > 500
+)
+SELECT
+    fum.UserId,
+    fum.DisplayName,
+    fum.Reputation,
+    fum.UserLocation,
+    fum.TotalPostsOwned,
+    fum.TotalQuestionsOwned,
+    fum.TotalAnswersOwned,
+    fum.TotalCommentsMade,
+    fum.TotalViewsOnOwnedPosts,
+    fum.TotalFavoritesOnOwnedPosts,
+    fum.TotalScoreOnOwnedPosts,
+    fum.TotalUpvotesGiven,
+    fum.TotalDownvotesGiven,
+    fum.UniquePostsEditedByUser,
+    fum.TotalBadges,
+    fum.GoldBadges,
+    fum.SilverBadges,
+    fum.BronzeBadges,
+    fum.PrimaryTag,
+    fum.PrimaryTagPostCount,
+    fum.TotalTaggedPosts,
+    fum.TotalTaggedScore,
+    fum.AvgQuestionScoreFirstYear,
+    fum.CountOfLinkedQuestions,
+    fum.TopQuestionScoreByRank,
+    fum.TopAnswerScoreByRank,
+    EXTRACT(EPOCH FROM fum.UserAge) / (365.25 * 24 * 60 * 60) AS UserAgeYears,
+    EXTRACT(DAY FROM fum.LastAccessDelta) AS DaysSinceCreationLastAccess,
+    COALESCE(
+        CAST(fum.TotalCommentsMade + fum.UniquePostsEditedByUser * 2 + fum.TotalScoreOnOwnedPosts / 10 AS NUMERIC) /
+        NULLIF(CAST(fum.TotalPostsOwned + fum.TotalQuestionsOwned + fum.TotalAnswersOwned AS NUMERIC), 0),
+        0
+    ) AS UserEngagementRatio,
+    COALESCE(
+        CAST(fum.GoldBadges * 3 + fum.SilverBadges * 2 + fum.BronzeBadges AS NUMERIC) /
+        NULLIF(fum.TotalBadges, 0),
+        0
+    ) AS BadgeDiversityScore,
+    (
+        SELECT c_sub.CreationDate
+        FROM Comments c_sub
+        WHERE c_sub.UserId = fum.UserId
+          AND c_sub.Text ILIKE '%solution%'
+        ORDER BY c_sub.CreationDate DESC
+        LIMIT 1
+    ) AS LatestSolutionCommentDate
+FROM FinalUserMetrics fum
+WHERE fum.Reputation >= 1000
+  AND fum.TotalPostsOwned > 5
+  AND fum.AvgQuestionScoreFirstYear > 5
+  AND fum.UserLocation IS NOT NULL
+  AND fum.PrimaryTag IS NOT NULL
+  AND fum.TotalTaggedPosts > 2
+  AND EXTRACT(EPOCH FROM fum.UserAge) > (365 * 24 * 60 * 60)
+UNION ALL
+SELECT
+    fum.UserId,
+    fum.DisplayName,
+    fum.Reputation,
+    fum.UserLocation,
+    fum.TotalPostsOwned,
+    fum.TotalQuestionsOwned,
+    fum.TotalAnswersOwned,
+    fum.TotalCommentsMade,
+    fum.TotalViewsOnOwnedPosts,
+    fum.TotalFavoritesOnOwnedPosts,
+    fum.TotalScoreOnOwnedPosts,
+    fum.TotalUpvotesGiven,
+    fum.TotalDownvotesGiven,
+    fum.UniquePostsEditedByUser,
+    fum.TotalBadges,
+    fum.GoldBadges,
+    fum.SilverBadges,
+    fum.BronzeBadges,
+    fum.PrimaryTag,
+    fum.PrimaryTagPostCount,
+    fum.TotalTaggedPosts,
+    fum.TotalTaggedScore,
+    fum.AvgQuestionScoreFirstYear,
+    fum.CountOfLinkedQuestions,
+    fum.TopQuestionScoreByRank,
+    fum.TopAnswerScoreByRank,
+    EXTRACT(EPOCH FROM fum.UserAge) / (365.25 * 24 * 60 * 60) AS UserAgeYears,
+    EXTRACT(DAY FROM fum.LastAccessDelta) AS DaysSinceCreationLastAccess,
+    COALESCE(
+        CAST(fum.TotalCommentsMade + fum.UniquePostsEditedByUser * 2 + fum.TotalScoreOnOwnedPosts / 10 AS NUMERIC) /
+        NULLIF(CAST(fum.TotalPostsOwned + fum.TotalQuestionsOwned + fum.TotalAnswersOwned AS NUMERIC), 0),
+        0
+    ) AS UserEngagementRatio,
+    COALESCE(
+        CAST(fum.GoldBadges * 3 + fum.SilverBadges * 2 + fum.BronzeBadges AS NUMERIC) /
+        NULLIF(fum.TotalBadges, 0),
+        0
+    ) AS BadgeDiversityScore,
+    (
+        SELECT c_sub.CreationDate
+        FROM Comments c_sub
+        WHERE c_sub.UserId = fum.UserId
+          AND c_sub.Text ILIKE '%question%'
+        ORDER BY c_sub.CreationDate DESC
+        LIMIT 1
+    ) AS LatestQuestionCommentDate -- Different alias for clarity in UNION ALL
+FROM FinalUserMetrics fum
+WHERE fum.Reputation BETWEEN 200 AND 999
+  AND fum.TotalCommentsMade > 3
+  AND fum.TotalPostsOwned <= 5
+  AND fum.UserLocation ILIKE '%USA%'
+  AND fum.PrimaryTag IS NULL
+  AND fum.TotalBadges > 0
+ORDER BY UserEngagementRatio DESC, Reputation DESC
+LIMIT 5000;

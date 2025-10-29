@@ -1,0 +1,184 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        CAST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / 86400 AS bigint) AS AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Expert'
+            WHEN u.Reputation >= 1000 THEN 'Advanced'
+            WHEN u.Reputation >= 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS ReputationLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName
+),
+PostPerformance AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        CAST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / 86400 AS bigint) AS PostAgeDays,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'SlightlyVoted'
+            ELSE 'Unvoted'
+        END AS VoteCategory,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS EngagementCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        NTILE(4) OVER (ORDER BY p.Score DESC) AS ScoreQuartile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate IS NOT NULL
+),
+UserEngagement AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) THEN ph.Id END) AS EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) AS StatusChangeCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (24) THEN ph.Id END) AS EditAppliedCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (24) THEN 1 ELSE 0 END) AS EditAppliedTotal,
+        AVG(CASE WHEN ph.PostHistoryTypeId IN (24) THEN 1 ELSE 0 END) AS EditApprovalRate
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+TopPerformers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        ua.TotalPosts,
+        ua.Questions,
+        ua.Answers,
+        ua.Comments,
+        ua.Badges,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        RANK() OVER (ORDER BY ua.TotalPosts DESC) AS PostivityRank,
+        DENSE_RANK() OVER (ORDER BY ua.Questions DESC) AS QuestionRank,
+        CASE 
+            WHEN ua.Questions >= 100 AND ua.Reputation >= 5000 THEN 'Elite'
+            WHEN ua.Questions >= 50 AND ua.Reputation >= 2500 THEN 'Seasoned'
+            WHEN ua.Questions >= 20 AND ua.Reputation >= 1000 THEN 'Experienced'
+            ELSE 'Active'
+        END AS UserStatus
+    FROM Users u
+    INNER JOIN UserActivityStats ua ON u.Id = ua.UserId
+    WHERE ua.TotalPosts >= 5
+)
+SELECT 
+    tp.UserStatus,
+    tp.ReputationRank,
+    tp.PostivityRank,
+    tp.QuestionRank,
+    tp.DisplayName,
+    tp.Reputation,
+    tp.TotalPosts,
+    tp.Questions,
+    tp.Answers,
+    tp.Comments,
+    tp.Badges,
+    CASE 
+        WHEN tp.Reputation > 10000 THEN 'Diamond'
+        WHEN tp.Reputation > 5000 THEN 'Platinum'
+        WHEN tp.Reputation > 1000 THEN 'Gold'
+        WHEN tp.Reputation > 500 THEN 'Silver'
+        ELSE 'Bronze'
+    END AS MedalTier,
+    STRING_AGG(DISTINCT pp.Title, '; ') AS RecentTitles,
+    MAX(pp.Score) AS MaxScore,
+    AVG(pp.ViewCount) AS AvgViews,
+    COUNT(DISTINCT CASE WHEN pp.PostAgeDays <= 30 THEN pp.PostId END) AS RecentPostCount,
+    AVG(pp.EngagementCount) AS AvgEngagement,
+    ROW_NUMBER() OVER (ORDER BY tp.Reputation DESC, tp.TotalPosts DESC) AS OverallRank,
+    DENSE_RANK() OVER (ORDER BY tp.UserStatus, tp.Reputation DESC) AS StatusReputationRank,
+    CASE 
+        WHEN tp.TotalPosts > 100 AND tp.Reputation > 2000 THEN 'Pro'
+        WHEN tp.TotalPosts > 50 AND tp.Reputation > 1000 THEN 'Advanced'
+        WHEN tp.TotalPosts > 20 AND tp.Reputation > 500 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS ActivityLevel,
+    ABS(COALESCE(pp.Score, 0) - COALESCE(pp.PreviousScore, 0)) AS ScoreChange,
+    CASE 
+        WHEN pp.ScoreQuartile = 1 THEN 'Top 25% Scoring Posts'
+        WHEN pp.ScoreQuartile = 2 THEN 'Top 50% Scoring Posts'
+        WHEN pp.ScoreQuartile = 3 THEN 'Bottom 50% Scoring Posts'
+        ELSE 'Bottom 25% Scoring Posts'
+    END AS PerformanceQuartile,
+    COALESCE(ue.EditCount, 0) AS EditCount,
+    COALESCE(ue.EditAppliedCount, 0) AS SuggestedEdits,
+    CASE 
+        WHEN ue.EditApprovalRate > 0.8 THEN 'Excellent Editor'
+        WHEN ue.EditApprovalRate > 0.6 THEN 'Good Editor'
+        WHEN ue.EditApprovalRate > 0.4 THEN 'Fair Editor'
+        ELSE 'Needs Improvement'
+    END AS EditorQuality,
+    CASE 
+        WHEN tp.Questions > tp.Answers THEN 'Question Focused'
+        WHEN tp.Answers > tp.Questions THEN 'Answer Focused'
+        ELSE 'Balanced'
+    END AS ContributionFocus,
+    CONCAT('User_', tp.UserId) AS UserIdentifier,
+    CASE 
+        WHEN tp.TotalPosts > 30 AND tp.Answers >= tp.Questions THEN 'Answer Heavy'
+        WHEN tp.TotalPosts > 30 AND tp.Questions >= tp.Answers THEN 'Question Heavy'
+        ELSE 'Balanced Contributor'
+    END AS ContributionStyle,
+    CASE WHEN tp.Badges > 10 THEN 'Veteran' ELSE 'Regular' END AS BadgeStatus,
+    CASE 
+        WHEN tp.UserStatus = 'Elite' THEN 'Highest Priority'
+        WHEN tp.UserStatus IN ('Seasoned', 'Experienced') THEN 'High Priority'
+        ELSE 'Standard Priority'
+    END AS PriorityLevel,
+    CASE 
+        WHEN tp.QuestionRank <= 5 THEN 'Top Questioner'
+        WHEN tp.QuestionRank <= 20 THEN 'Active Questioner'
+        ELSE 'Occasional Questioner'
+    END AS QuestionerStatus,
+    COALESCE(STRING_AGG(DISTINCT ps.Name, ', '), 'No Tags') AS TagPreferences,
+    CASE WHEN tp.Badges > 0 THEN 1 ELSE 0 END AS HasBadges
+FROM TopPerformers tp
+LEFT JOIN UserEngagement ue ON tp.UserId = ue.UserId
+LEFT JOIN PostPerformance pp ON tp.UserId = pp.OwnerUserId
+LEFT JOIN (
+    SELECT p.Id AS PostId, STRING_AGG(TagName, ', ') AS Name
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS TagName
+    ) t
+    WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+    GROUP BY p.Id
+) ps ON pp.PostId = ps.PostId
+GROUP BY 
+    tp.UserStatus, tp.ReputationRank, tp.PostivityRank, tp.QuestionRank,
+    tp.DisplayName, tp.Reputation, tp.TotalPosts, tp.Questions, tp.Answers,
+    tp.Comments, tp.Badges, pp.Score, pp.PreviousScore, pp.ScoreQuartile,
+    ue.EditCount, ue.EditAppliedCount, ue.EditApprovalRate, tp.UserId, tp.UserStatus
+HAVING 
+    tp.TotalPosts >= 5 
+    AND tp.Reputation >= 100
+    AND (tp.TotalPosts > 10 OR tp.Reputation > 1000)
+ORDER BY 
+    tp.Reputation DESC, 
+    tp.TotalPosts DESC,
+    tp.QuestionRank ASC,
+    tp.PostivityRank ASC
+LIMIT 1000;

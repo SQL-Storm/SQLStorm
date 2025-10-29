@@ -1,0 +1,35 @@
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.Reputation) AS MaxReputation,
+    MIN(u.CreationDate) AS EarliestUserCreation,
+    AVG(p.Score) AS AvgPostScore,
+    SUM(CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) AS PopularPosts,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId ELSE NULL END) AS TotalDuplicates,
+    COUNT(DISTINCT CASE WHEN b.Id IS NOT NULL THEN u.Id ELSE NULL END) AS TotalBadges,
+    STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.TagName) AS PopularTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Tags t ON p.Id = ANY(STRING_TO_ARRAY(p.Tags, '<'))
+WHERE 
+    u.Reputation > 100
+    AND p.CreationDate BETWEEN DATE_TRUNC('month', CAST('2024-10-01' AS date)) AND CAST('2024-10-01' AS date)
+    AND (v.VoteTypeId = 2 OR v.VoteTypeId = 3)
+GROUP BY 
+    u.DisplayName, u.Reputation
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    TotalPosts DESC;

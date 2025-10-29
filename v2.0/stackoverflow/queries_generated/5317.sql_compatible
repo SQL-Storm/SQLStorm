@@ -1,0 +1,133 @@
+WITH RankedUsers AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    ROW_NUMBER() OVER (
+      PARTITION BY COALESCE(u.Location, 'NULL')
+      ORDER BY
+        u.Reputation DESC,
+        (u.UpVotes - u.DownVotes) DESC,
+        u.CreationDate ASC
+    ) AS rn_by_location
+  FROM Users u
+),
+TopLocations AS (
+  SELECT
+    COALESCE(Location, 'NULL') AS location_group,
+    COUNT(*) AS user_cnt,
+    AVG(Reputation) AS avg_rep,
+    MAX(LastAccessDate) AS last_active
+  FROM RankedUsers
+  GROUP BY COALESCE(Location, 'NULL')
+  ORDER BY user_cnt DESC
+  LIMIT 10
+),
+PostActivity AS (
+  SELECT
+    p.OwnerUserId AS user_id,
+    COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS questions,
+    COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS answers,
+    SUM(p.ViewCount) AS total_views,
+    MAX(p.LastActivityDate) AS last_activity
+  FROM Posts p
+  GROUP BY p.OwnerUserId
+),
+UserBadges AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS badge_cnt,
+    STRING_AGG(b.Name, ',') AS badge_names
+  FROM Badges b
+  GROUP BY b.UserId
+),
+RecentTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+LatestActivity AS (
+  SELECT
+    u.Id AS user_id,
+    MAX(p.LastActivityDate) AS last_seen
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id
+),
+ComplexQuery AS (
+  SELECT
+    ru.Id AS user_id,
+    ru.DisplayName,
+    ru.Reputation,
+    tl.avg_rep AS location_avg_rep,
+    la.last_seen AS last_seen,
+    pa.questions,
+    pa.total_views,
+    ub.badge_cnt,
+    ub.badge_names,
+    tl.location_group
+  FROM RankedUsers ru
+  LEFT JOIN TopLocations tl
+    ON COALESCE(ru.Location, 'NULL') = tl.location_group
+  LEFT JOIN PostActivity pa
+    ON ru.Id = pa.user_id
+  LEFT JOIN UserBadges ub
+    ON ru.Id = ub.UserId
+  LEFT JOIN LatestActivity la
+    ON ru.Id = la.user_id
+),
+-- correlated subquery example: determine if a user has any post with more than 100 views
+UsersWithPopularPosts AS (
+  SELECT
+    u.Id
+  FROM Users u
+  WHERE EXISTS (
+    SELECT 1
+    FROM Posts p
+    WHERE p.OwnerUserId = u.Id
+      AND p.ViewCount > 100
+  )
+),
+-- window: rank posts per user by LastActivityDate
+UserPostRecency AS (
+  SELECT
+    p.Id AS post_id,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.LastActivityDate DESC
+    ) AS rn
+  FROM Posts p
+)
+SELECT
+  cu.user_id,
+  cu.DisplayName,
+  cu.Reputation,
+  cu.location_group,
+  cu.last_seen,
+  COALESCE(cu.questions, 0) AS questions,
+  COALESCE(cu.total_views, 0) AS total_views,
+  COALESCE(cu.badge_cnt, 0) AS badge_cnt,
+  cu.badge_names,
+  pR.post_id AS most_recent_post_id,
+  pR.LastActivityDate AS most_recent_post_date,
+  pR.rn AS post_rank
+FROM ComplexQuery cu
+LEFT JOIN UserPostRecency pR
+  ON cu.user_id = pR.OwnerUserId AND pR.rn = 1
+ORDER BY cu.Reputation DESC NULLS LAST, cu.total_views DESC NULLS LAST
+LIMIT 100;

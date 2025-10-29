@@ -1,0 +1,180 @@
+WITH
+    user_stats AS (
+        SELECT
+            u.Id                                   AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 1)               AS question_cnt,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 2)               AS answer_cnt,
+            SUM(COALESCE(p.Score,0))                              AS total_score,
+            MAX(p.CreationDate)                                   AS last_post_dt
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    badge_stats AS (
+        SELECT
+            b.UserId                                   AS user_id,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)   AS gold_cnt,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)   AS silver_cnt,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)   AS bronze_cnt,
+            COUNT(*)                                      AS total_badges,
+            STRING_AGG(DISTINCT b.Name, ',') 
+                FILTER (WHERE b.Class = 1)               AS gold_names
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    tag_activity AS (
+        SELECT
+            p.OwnerUserId                               AS user_id,
+            UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2),
+                                   '><'))                AS tag,
+            COUNT(*)                                    AS posts_per_tag,
+            SUM(p.Score)                                AS score_per_tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+        GROUP BY p.OwnerUserId, UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2),
+                                   '><'))
+    ),
+
+    top_tags AS (
+        SELECT
+            ta.user_id,
+            ta.tag,
+            ta.posts_per_tag,
+            ta.score_per_tag,
+            RANK() OVER (PARTITION BY ta.user_id
+                         ORDER BY ta.score_per_tag DESC)   AS tag_rank
+        FROM tag_activity ta
+    ),
+
+    user_rankings AS (
+        SELECT
+            us.user_id,
+            us.DisplayName,
+            us.Reputation,
+            us.question_cnt,
+            us.answer_cnt,
+            us.total_score,
+            bs.gold_cnt,
+            bs.silver_cnt,
+            bs.bronze_cnt,
+            ROW_NUMBER() OVER (ORDER BY us.total_score DESC) AS overall_rank,
+            ROW_NUMBER() OVER (ORDER BY us.Reputation DESC)  AS rep_rank
+        FROM user_stats us
+        LEFT JOIN badge_stats bs ON bs.user_id = us.user_id
+    ),
+
+    recent_month AS (
+        SELECT
+            u.Id                                          AS user_id,
+            COALESCE(vc.vote_delta,0)                     AS vote_delta_30d,
+            COALESCE(cm.comment_cnt,0)                    AS comment_cnt_30d,
+            COALESCE(pl.link_cnt,0)                       AS linked_posts_30d
+        FROM Users u
+        LEFT JOIN (
+            SELECT
+                p.OwnerUserId,
+                SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+                         WHEN v.VoteTypeId = 3 THEN -1
+                         ELSE 0 END)                     AS vote_delta
+            FROM Votes v
+            JOIN Posts p ON p.Id = v.PostId
+            WHERE v.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30 day')
+              AND v.VoteTypeId IN (2,3)
+            GROUP BY p.OwnerUserId
+        ) vc ON vc.OwnerUserId = u.Id
+        LEFT JOIN (
+            SELECT
+                c.UserId,
+                COUNT(*) AS comment_cnt
+            FROM Comments c
+            WHERE c.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30 day')
+            GROUP BY c.UserId
+        ) cm ON cm.UserId = u.Id
+        LEFT JOIN (
+            SELECT
+                pl.PostId,
+                COUNT(*) AS link_cnt
+            FROM PostLinks pl
+            WHERE pl.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30 day')
+            GROUP BY pl.PostId
+        ) pl ON pl.PostId = u.Id
+    ),
+
+    summary AS (
+        SELECT
+            CAST(NULL AS integer)                AS user_id,
+            'SUMMARY'                            AS DisplayName,
+            CAST(NULL AS integer)                AS Reputation,
+            SUM(question_cnt)                    AS question_cnt,
+            SUM(answer_cnt)                      AS answer_cnt,
+            SUM(total_score)                     AS total_score,
+            SUM(gold_cnt)                        AS gold_cnt,
+            SUM(silver_cnt)                      AS silver_cnt,
+            SUM(bronze_cnt)                      AS bronze_cnt,
+            CAST(NULL AS bigint)                 AS overall_rank,
+            CAST(NULL AS bigint)                 AS rep_rank,
+            CAST(NULL AS integer)                AS vote_delta_30d,
+            CAST(NULL AS integer)                AS comment_cnt_30d,
+            CAST(NULL AS integer)                AS linked_posts_30d,
+            CAST(NULL AS text)                   AS tag,
+            CAST(NULL AS integer)                AS posts_per_tag,
+            CAST(NULL AS integer)                AS score_per_tag,
+            CAST(NULL AS integer)                AS tag_rank
+        FROM user_rankings
+    )
+
+SELECT
+    ur.user_id,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.question_cnt,
+    ur.answer_cnt,
+    ur.total_score,
+    ur.gold_cnt,
+    ur.silver_cnt,
+    ur.bronze_cnt,
+    ur.overall_rank,
+    ur.rep_rank,
+    rm.vote_delta_30d,
+    rm.comment_cnt_30d,
+    rm.linked_posts_30d,
+    tt.tag,
+    tt.posts_per_tag,
+    tt.score_per_tag,
+    tt.tag_rank
+FROM user_rankings ur
+LEFT JOIN recent_month rm      ON rm.user_id = ur.user_id
+LEFT JOIN top_tags tt          ON tt.user_id = ur.user_id
+                               AND tt.tag_rank <= 3
+WHERE ur.Reputation > 1000
+ORDER BY ur.overall_rank
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    user_id,
+    DisplayName,
+    Reputation,
+    question_cnt,
+    answer_cnt,
+    total_score,
+    gold_cnt,
+    silver_cnt,
+    bronze_cnt,
+    overall_rank,
+    rep_rank,
+    vote_delta_30d,
+    comment_cnt_30d,
+    linked_posts_30d,
+    tag,
+    posts_per_tag,
+    score_per_tag,
+    tag_rank
+FROM summary
+WHERE NOT EXISTS (SELECT 1 FROM user_rankings WHERE Reputation > 1000);

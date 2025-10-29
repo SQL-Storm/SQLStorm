@@ -1,0 +1,206 @@
+-- {"query": "1311.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3261} 
+
+WITH UserEngagementMetrics AS (
+    -- Aggregates various engagement metrics for each user, including post counts,
+    -- votes given/received, comments made, and calculates account age.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        DATE_PART('day', U.LastAccessDate - U.CreationDate) AS AccountAgeDays,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 2) AS AnswersPosted,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COALESCE(SUM(CASE WHEN V_Given.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesGiven,
+        COALESCE(SUM(CASE WHEN V_Given.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesGiven,
+        COALESCE(SUM(CASE WHEN V_Received.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceivedOnOwnPosts,
+        COALESCE(SUM(CASE WHEN V_Received.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceivedOnOwnPosts,
+        COUNT(DISTINCT C.Id) AS CommentsMade,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserTotalUpVotesAccrued,
+        U.DownVotes AS UserTotalDownVotesAccrued
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Votes AS V_Given ON U.Id = V_Given.UserId
+    LEFT JOIN Votes AS V_Received ON P.Id = V_Received.PostId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostEventTimelines AS (
+    -- Tracks key lifecycle dates and edit counts for questions and answers,
+    -- including creation, first/last edit, closure, and accepted answer dates.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.ViewCount,
+        P.Score,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS FirstEditDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS LastActualEditDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS ActualClosedDate_PH,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate ELSE NULL END) AS ActualReopenedDate_PH,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE NULL END) AS EditCount,
+        COALESCE(AA.CreationDate, '1900-01-01'::timestamp) AS AcceptedAnswerCreationDate
+    FROM Posts AS P
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    LEFT JOIN Posts AS AA ON P.AcceptedAnswerId = AA.Id
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.LastActivityDate, P.LastEditDate, P.ClosedDate, P.CommunityOwnedDate, P.ViewCount, P.Score, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.Title, P.Tags, AA.CreationDate
+),
+PostTagExplosion AS (
+    -- Decomposes the 'Tags' string into individual tag rows for questions.
+    SELECT
+        P.Id AS PostId,
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')) AS TagName
+    FROM Posts AS P
+    WHERE P.Tags IS NOT NULL AND P.Tags != '' AND P.PostTypeId = 1
+),
+TagPerformance AS (
+    -- Analyzes performance metrics for each tag, such as average score and view count.
+    SELECT
+        PTE.TagName,
+        COUNT(DISTINCT P.Id) AS TotalTaggedQuestions,
+        AVG(P.Score) AS AvgQuestionScore,
+        AVG(P.ViewCount) AS AvgQuestionViewCount,
+        SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        (COUNT(DISTINCT P.Id) * 1.0 / (SELECT COUNT(*) FROM PostTagExplosion)) AS TagPopularityRatio,
+        RANK() OVER (ORDER BY AVG(P.Score) DESC, COUNT(DISTINCT P.Id) DESC) AS TagRankByScoreAndCount
+    FROM PostTagExplosion AS PTE
+    JOIN Posts AS P ON PTE.PostId = P.Id
+    GROUP BY PTE.TagName
+    HAVING COUNT(DISTINCT P.Id) > 50 -- Filter for tags with significant usage
+),
+ModerationActionSummary AS (
+    -- Summarizes moderation-related events for each post from PostHistory.
+    SELECT
+        PH.PostId,
+        P.OwnerUserId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE NULL END) AS CloseEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE NULL END) AS ReopenEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 12 THEN 1 ELSE NULL END) AS DeleteEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 13 THEN 1 ELSE NULL END) AS UndeleteEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 19 THEN 1 ELSE NULL END) AS ProtectEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 20 THEN 1 ELSE NULL END) AS UnprotectEvents,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS LatestCloseDate
+    FROM PostHistory AS PH
+    JOIN Posts AS P ON PH.PostId = P.Id
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 19, 20)
+    GROUP BY PH.PostId, P.OwnerUserId
+)
+SELECT
+    UEM.UserId,
+    UEM.DisplayName,
+    UEM.Reputation,
+    UEM.AccountAgeDays,
+    UEM.QuestionsPosted,
+    UEM.AnswersPosted,
+    UEM.UpVotesReceivedOnOwnPosts,
+    UEM.DownVotesReceivedOnOwnPosts,
+    PTL.PostId,
+    PTL.PostTypeId,
+    PTL.PostCreationDate,
+    PTL.LastActivityDate,
+    PTL.FirstEditDate,
+    PTL.ActualClosedDate_PH,
+    PTL.ActualReopenedDate_PH,
+    PTL.EditCount,
+    PTL.ViewCount,
+    PTL.Score,
+    PTL.AnswerCount,
+    PTL.FavoriteCount,
+    PTL.Title,
+    COALESCE(BestTag.TagName, 'Untagged/Misc') AS TopPerformingTag,
+    BestTag.AvgQuestionScore AS TopTagAvgScore,
+    BestTag.AvgQuestionViewCount AS TopTagAvgViews,
+    COALESCE(MAS.CloseEvents, 0) AS CloseEvents,
+    COALESCE(MAS.ReopenEvents, 0) AS ReopenEvents,
+    COALESCE(MAS.DeleteEvents, 0) AS DeleteEvents,
+    COALESCE(MAS.ProtectEvents, 0) AS ProtectEvents,
+    -- Complex calculation: Reputation normalized by total engagement.
+    CAST(UEM.Reputation AS NUMERIC) / NULLIF(UEM.TotalPostsCreated + UEM.CommentsMade, 0) AS ReputationPerEngagementScore,
+    -- Complex calculation: A weighted score combining post attributes and moderation events.
+    (PTL.Score * 0.7 + PTL.ViewCount * 0.1 + PTL.FavoriteCount * 0.2 + COALESCE(MAS.ReopenEvents, 0) * 10 - COALESCE(MAS.CloseEvents, 0) * 5) AS PostEngagementMetric,
+    -- Window function: Retrieves the score of the user's previous post.
+    LAG(PTL.Score, 1, 0) OVER (PARTITION BY UEM.UserId ORDER BY PTL.PostCreationDate) AS PreviousPostScore,
+    -- Window function: Ranks posts by quality (score, then view count) for each user.
+    RANK() OVER (PARTITION BY UEM.UserId ORDER BY PTL.Score DESC, PTL.ViewCount DESC) AS PostQualityRankByUser,
+    -- Conditional logic: Categorizes post status based on closure and accepted answer events.
+    CASE
+        WHEN PTL.ActualClosedDate_PH IS NOT NULL AND PTL.ActualReopenedDate_PH IS NOT NULL AND PTL.ActualReopenedDate_PH > PTL.ActualClosedDate_PH
+            THEN 'ClosedThenReopened'
+        WHEN PTL.ActualClosedDate_PH IS NOT NULL
+            THEN 'Closed'
+        WHEN PTL.AcceptedAnswerCreationDate > PTL.PostCreationDate + INTERVAL '1 hour' THEN 'SlowlyAccepted'
+        WHEN PTL.PostTypeId = 1 AND PTL.AcceptedAnswerCreationDate = '1900-01-01' THEN 'NoAcceptedAnswer'
+        ELSE 'OpenOrAccepted'
+    END AS PostStatusCategory,
+    -- Correlated subquery: Counts high-score related posts.
+    (
+        SELECT COUNT(DISTINCT PL.RelatedPostId)
+        FROM PostLinks AS PL
+        JOIN Posts AS RelatedP ON PL.RelatedPostId = RelatedP.Id
+        WHERE PL.PostId = PTL.PostId
+          AND RelatedP.Score > (SELECT AVG(Score) * 2 FROM Posts WHERE PostTypeId = 1 AND Score > 0) -- Nested aggregation in subquery
+          AND PL.LinkTypeId = 1 -- Linked type
+    ) AS LinkedToHighScorePostsCount,
+    -- String expression: Concatenates display name and user ID.
+    UEM.DisplayName || ' (' || UEM.UserId || ')' AS UserIdentifierString,
+    -- Complex boolean predicate with NULL logic: Checks for high interaction.
+    (PTL.FavoriteCount IS NOT NULL AND PTL.FavoriteCount > 5) OR (PTL.CommentCount IS NOT NULL AND PTL.CommentCount > 10) AS IsHighlyInteracted,
+    -- String expressions: Calculates title length and extracts a prefix.
+    LENGTH(PTL.Title) AS TitleLength,
+    TRIM(SUBSTRING(PTL.Title, 1, 10)) AS TitlePrefix,
+    -- Correlated subquery with aggregation: Calculates net votes during the post's active period.
+    (SELECT SUM(CASE WHEN VT.Name = 'UpMod' THEN 1 ELSE -1 END)
+     FROM Votes AS V_Sub
+     JOIN VoteTypes AS VT ON V_Sub.VoteTypeId = VT.Id
+     WHERE V_Sub.PostId = PTL.PostId
+     AND V_Sub.CreationDate BETWEEN PTL.PostCreationDate AND PTL.LastActivityDate
+    ) AS NetVotesDuringActivePeriod
+FROM UserEngagementMetrics AS UEM
+JOIN PostEventTimelines AS PTL ON UEM.UserId = PTL.OwnerUserId
+LEFT JOIN ModerationActionSummary AS MAS ON PTL.PostId = MAS.PostId
+LEFT JOIN (
+    -- Subquery to determine the single best performing tag for each post based on tag performance.
+    SELECT
+        PTE_Inner.PostId,
+        TP_Inner.TagName,
+        TP_Inner.AvgQuestionScore,
+        TP_Inner.AvgQuestionViewCount,
+        ROW_NUMBER() OVER (PARTITION BY PTE_Inner.PostId ORDER BY TP_Inner.AvgQuestionScore DESC, TP_Inner.TotalTaggedQuestions DESC) AS rn
+    FROM PostTagExplosion AS PTE_Inner
+    JOIN TagPerformance AS TP_Inner ON PTE_Inner.TagName = TP_Inner.TagName
+) AS BestTag ON PTL.PostId = BestTag.PostId AND BestTag.rn = 1
+WHERE
+    UEM.Reputation > 5000 -- Filter for users with high reputation
+    AND PTL.PostTypeId = 1 -- Focus on Questions
+    AND PTL.ViewCount > 1000 -- Posts with significant views
+    AND PTL.Score > 20 -- Posts with a good score
+    AND (PTL.ActualClosedDate_PH IS NULL OR PTL.ActualReopenedDate_PH IS NOT NULL) -- Exclude permanently closed posts
+    AND PTL.PostCreationDate >= '2020-01-01' -- Recent posts
+    -- Complex string predicates combining multiple conditions.
+    AND (PTL.Title ILIKE '%sql%' OR PTL.Tags LIKE '%<database>%' OR PTL.Tags LIKE '%<performance>%')
+    -- Subquery in NOT EXISTS to exclude duplicate posts.
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostLinks AS PL_Sub
+        WHERE PL_Sub.PostId = PTL.PostId
+          AND PL_Sub.LinkTypeId = 3 -- LinkType 3 indicates a duplicate
+    )
+ORDER BY
+    UEM.Reputation DESC,
+    PostEngagementMetric DESC,
+    PTL.PostCreationDate DESC,
+    UEM.UserId;

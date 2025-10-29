@@ -1,0 +1,268 @@
+-- {"query": "7710.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2163} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p2 
+             WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1 AND p2.ViewCount > 1000),
+            0
+        ) as PopularQuestions,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p3 
+             WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2 AND p3.Score > 10),
+            0
+        ) as HighScoringAnswers,
+        COALESCE(
+            (SELECT AVG(p4.Score) 
+             FROM Posts p4 
+             WHERE p4.OwnerUserId = u.Id AND p4.PostTypeId = 1),
+            0
+        ) as AvgQuestionScore,
+        COALESCE(
+            (SELECT AVG(p5.Score) 
+             FROM Posts p5 
+             WHERE p5.OwnerUserId = u.Id AND p5.PostTypeId = 2),
+            0
+        ) as AvgAnswerScore,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 5000 THEN 'Veteran'
+            WHEN u.Reputation >= 1000 THEN 'Contributor'
+            ELSE 'Newbie'
+        END as ReputationLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        Reputation,
+        DisplayName,
+        TotalPosts,
+        Questions,
+        Answers,
+        Badges,
+        LastPostDate,
+        PopularQuestions,
+        HighScoringAnswers,
+        AvgQuestionScore,
+        AvgAnswerScore,
+        ReputationLevel,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC) as RankByReputation,
+        ROW_NUMBER() OVER (ORDER BY TotalPosts DESC) as RankByActivity,
+        ROW_NUMBER() OVER (ORDER BY Badges DESC) as RankByBadges,
+        ROW_NUMBER() OVER (ORDER BY (PopularQuestions + HighScoringAnswers) DESC) as RankByEngagement
+    FROM UserStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        ISNULL(p.Tags, '') as Tags,
+        LEN(ISNULL(p.Tags, '')) as TagLength,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High Traffic'
+            WHEN p.ViewCount > 100 THEN 'Medium Traffic'
+            ELSE 'Low Traffic'
+        END as TrafficLevel,
+        DATEDIFF(day, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysSinceCreation,
+        COALESCE(
+            (SELECT AVG(v.Score) 
+             FROM Votes v 
+             WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3)),
+            0
+        ) as AvgVoteScore,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Comments c 
+             WHERE c.PostId = p.Id),
+            0
+        ) as CommentCount,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM PostHistory ph 
+             WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (2, 5)), -- Edit Body
+            0
+        ) as EditCount,
+        COALESCE(
+            (SELECT MAX(ph.CreationDate) 
+             FROM PostHistory ph 
+             WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (2, 5)),
+            p.CreationDate
+        ) as LastEditDate
+    FROM Posts p
+),
+EngagementAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.PostTypeId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.ParentId,
+        pa.PostType,
+        pa.Tags,
+        pa.TagLength,
+        pa.TrafficLevel,
+        pa.DaysSinceCreation,
+        pa.AvgVoteScore,
+        pa.CommentCount as Comments,
+        pa.EditCount,
+        pa.LastEditDate,
+        CASE 
+            WHEN pa.PostTypeId = 1 THEN 
+                CASE 
+                    WHEN pa.AnswerCount > 10 THEN 'Highly Engaged'
+                    WHEN pa.AnswerCount > 5 THEN 'Engaged'
+                    ELSE 'Low Engagement'
+                END
+            WHEN pa.PostTypeId = 2 THEN 
+                CASE 
+                    WHEN pa.Score > 50 THEN 'Highly Rated'
+                    WHEN pa.Score > 10 THEN 'Rated'
+                    ELSE 'Low Rated'
+                END
+            ELSE 'N/A'
+        END as EngagementCategory,
+        CASE 
+            WHEN pa.ViewCount > 1000 AND pa.Score > 10 THEN 'Viral'
+            WHEN pa.ViewCount > 500 AND pa.Score > 5 THEN 'Popular'
+            WHEN pa.ViewCount > 100 THEN 'Noticeable'
+            ELSE 'Average'
+        END as PopularityRank
+    FROM PostAnalysis pa
+)
+SELECT 
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.ReputationLevel,
+    tu.TotalPosts,
+    tu.Questions,
+    tu.Answers,
+    tu.Badges,
+    tu.LastPostDate,
+    tu.PopularQuestions,
+    tu.HighScoringAnswers,
+    CAST(tu.AvgQuestionScore AS DECIMAL(10,2)) as AvgQuestionScore,
+    CAST(tu.AvgAnswerScore AS DECIMAL(10,2)) as AvgAnswerScore,
+    tu.RankByReputation,
+    tu.RankByActivity,
+    tu.RankByBadges,
+    tu.RankByEngagement,
+    (
+        SELECT COUNT(*) 
+        FROM EngagementAnalysis ea
+        WHERE ea.OwnerUserId = tu.UserId 
+        AND ea.PopularityRank IN ('Viral', 'Popular')
+    ) as HighPerformingPosts,
+    (
+        SELECT STRING_AGG(DISTINCT 
+            CASE 
+                WHEN ea.PostTypeId = 1 THEN 'Q' + CAST(ea.PostId AS VARCHAR(10))
+                WHEN ea.PostTypeId = 2 THEN 'A' + CAST(ea.PostId AS VARCHAR(10))
+            END, 
+            ', ')
+        FROM EngagementAnalysis ea
+        WHERE ea.OwnerUserId = tu.UserId 
+        AND ea.DaysSinceCreation < 30
+    ) as RecentPosts,
+    CASE 
+        WHEN tu.TotalPosts > 0 AND tu.Reputation > 0 THEN 
+            CASE 
+                WHEN (tu.TotalPosts * 100.0 / NULLIF(tu.Reputation, 0)) > 1 THEN 'High Activity'
+                WHEN (tu.TotalPosts * 100.0 / NULLIF(tu.Reputation, 0)) > 0.5 THEN 'Moderate Activity'
+                ELSE 'Low Activity'
+            END
+        ELSE 'No Data'
+    END as ActivityLevel,
+    (
+        SELECT COUNT(DISTINCT ph.PostId) 
+        FROM PostHistory ph
+        JOIN EngagementAnalysis ea ON ph.PostId = ea.PostId
+        WHERE ph.UserId = tu.UserId 
+        AND ph.PostHistoryTypeId IN (2, 5)
+        AND ph.CreationDate > DATEADD(day, -30, cast('2024-10-01 12:34:56' as timestamp))
+    ) as RecentEdits,
+    (
+        SELECT COUNT(DISTINCT b.Id) 
+        FROM Badges b
+        WHERE b.UserId = tu.UserId 
+        AND b.Date > DATEADD(day, -30, cast('2024-10-01 12:34:56' as timestamp))
+    ) as RecentBadges,
+    (
+        SELECT STRING_AGG(
+            CASE 
+                WHEN b.Class = 1 THEN 'Gold'
+                WHEN b.Class = 2 THEN 'Silver'
+                ELSE 'Bronze'
+            END, 
+            ', ')
+        FROM Badges b
+        WHERE b.UserId = tu.UserId 
+        AND b.Date > DATEADD(day, -30, cast('2024-10-01 12:34:56' as timestamp))
+    ) as RecentBadgeClasses,
+    (
+        SELECT TOP 1 b.Name 
+        FROM Badges b 
+        WHERE b.UserId = tu.UserId 
+        ORDER BY b.Date DESC
+    ) as LatestBadge,
+    (
+        SELECT COUNT(DISTINCT ph.PostId) 
+        FROM PostHistory ph 
+        JOIN EngagementAnalysis ea ON ph.PostId = ea.PostId
+        WHERE ph.UserId = tu.UserId 
+        AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15)
+    ) as ActivityChanges,
+    (
+        SELECT COUNT(DISTINCT ph.PostId) 
+        FROM PostHistory ph
+        JOIN EngagementAnalysis ea ON ph.PostId = ea.PostId
+        WHERE ph.UserId = tu.UserId 
+        AND ph.PostHistoryTypeId IN (35, 36)
+    ) as MigrationCount,
+    (
+        SELECT CASE 
+            WHEN COUNT(*) > 0 THEN 'Active'
+            ELSE 'Inactive'
+        END
+        FROM Posts p
+        WHERE p.OwnerUserId = tu.UserId 
+        AND p.CreationDate > DATEADD(day, -7, cast('2024-10-01 12:34:56' as timestamp))
+    ) as RecentActivity
+FROM TopUsers tu
+WHERE tu.RankByReputation <= 100
+ORDER BY tu.Reputation DESC, tu.TotalPosts DESC, tu.Badges DESC;

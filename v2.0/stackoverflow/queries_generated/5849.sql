@@ -1,0 +1,135 @@
+-- {"query": "5849.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1197} 
+WITH latest_posts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.FavoriteCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.Body,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2) -- Questions and Answers
+),
+user_activity AS (
+  SELECT
+    up.Id AS UserId,
+    up.DisplayName AS UserDisplayName,
+    up.Reputation,
+    up.CreationDate AS UserCreationDate,
+    up.LastAccessDate,
+    up.Views,
+    up.UpVotes,
+    up.DownVotes,
+    up.AccountId,
+    b.Class AS GoldSilverBronze,
+    COALESCE(vt.Name, 'Unknown') AS FavoriteOrVoteType
+  FROM Users up
+  LEFT JOIN Badges b ON b.UserId = up.Id
+  LEFT JOIN (
+    SELECT UserId, MAX(VoteTypes.Name) AS Name
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY UserId
+  ) vt ON vt.UserId = up.Id
+),
+tag_popularity AS (
+  SELECT
+    t.TagName,
+    t.Id AS TagId,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+    SUM(p.ViewCount) AS TotalViews,
+    AVG(p.Score) AS AvgScore,
+    STRING_AGG(DISTINCT p.Tags, ',') FILTER (WHERE p.Tags IS NOT NULL) AS AllTagsSample
+  FROM Tags t
+  LEFT JOIN Posts p ON p.Tags LIKE CONCAT('%', t.TagName, '%')
+  GROUP BY t.TagName, t.Id
+),
+recent_hot AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.Tags,
+    ROW_NUMBER() OVER (ORDER BY p.LastActivityDate DESC, p.Score DESC) AS hot_rank
+  FROM Posts p
+  WHERE p.LastActivityDate > NOW() - INTERVAL '30 days'
+)
+SELECT
+  l.Id AS PostId,
+  l.Title,
+  l.PostTypeId,
+  l.OwnerUserId,
+  l.CreationDate,
+  l.LastActivityDate,
+  l.Score,
+  l.ViewCount,
+  l.Tags,
+  l.AnswerCount,
+  l.CommentCount,
+  COALESCE(u.UserDisplayName, '') AS OwnerDisplayName,
+  COALESCE(u.Reputation, 0) AS OwnerReputation,
+  COALESCE(vs.Name, 'Unknown') AS LastEditorVoteRole,
+  COALESCE(bl.Class, 0) AS OwnerBadgeClass,
+  ARRAY_AGG(DISTINCT cl.Name) FILTER (WHERE cl.Name IS NOT NULL) AS CloseReasons,
+  (SELECT COUNT(*) FROM PostLinks PL WHERE PL.PostId = l.Id) AS LinkedCount,
+  (SELECT COUNT(*) FROM Votes V WHERE V.PostId = l.Id AND V.VoteTypeId = 2) AS UpModCount,
+  (SELECT COUNT(*) FROM Votes V WHERE V.PostId = l.Id AND V.VoteTypeId = 3) AS DownModCount,
+  (SELECT MAX(CreationDate) FROM Votes V WHERE V.PostId = l.Id AND V.VoteTypeId = 8) AS LastBountyStart,
+  (SELECT LISTAGG(U.DisplayName, ',') WITHIN GROUP (ORDER BY V.CreationDate) 
+     FROM Votes V JOIN Users U ON U.Id = V.UserId WHERE V.PostId = l.Id AND V.VoteTypeId = 9) AS BountyClosers
+FROM (
+  SELECT *
+  FROM recent_hot
+  WHERE hot_rank <= 1000
+) l
+LEFT JOIN (
+  SELECT Id, DisplayName AS UserDisplayName, Reputation, CreationDate AS UserCreationDate, LastAccessDate
+  FROM Users
+) u ON u.Id = l.OwnerUserId
+LEFT JOIN (
+  SELECT Id, Name
+  FROM PostHistoryTypes
+) ph ON ph.Id = 10
+LEFT JOIN (
+  SELECT UserId, Class
+  FROM Badges
+) bl ON bl.UserId = l.OwnerUserId
+LEFT JOIN (
+  SELECT PostId, MAX(UserId) AS LastEditorUserId
+  FROM Posts p
+  GROUP BY PostId
+) le ON le.PostId = l.Id
+LEFT JOIN (
+  SELECT PostId, Name
+  FROM PostHistoryTypes
+) vs ON vs.Id = 16
+LEFT JOIN (
+  SELECT PostId, CloseReasonId
+  FROM PostHistory
+  WHERE PostHistoryTypeId = 10
+) cr ON cr.PostId = l.Id
+LEFT JOIN CloseReasonTypes cl ON cl.Id = cr.CloseReasonId
+GROUP BY
+  l.Id, l.Title, l.PostTypeId, l.OwnerUserId, l.CreationDate, l.LastActivityDate,
+  l.Score, l.ViewCount, l.Tags, l.AnswerCount, l.CommentCount,
+  u.UserDisplayName, u.Reputation, vs.Name, bl.Class
+ORDER BY l.LastActivityDate DESC
+LIMIT 200;

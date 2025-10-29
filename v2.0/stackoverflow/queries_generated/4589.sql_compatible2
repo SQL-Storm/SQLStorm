@@ -1,0 +1,133 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_desc,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS rn_score_desc,
+        AVG(CAST(p.Score AS DOUBLE PRECISION)) OVER (PARTITION BY p.PostTypeId) AS avg_score_per_type,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) AS comment_count_for_post
+    FROM Posts AS p
+    JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments AS c ON p.Id = c.PostId
+    WHERE p.OwnerUserId IS NOT NULL AND p.CreationDate >= DATE '2023-01-01'
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users AS u
+    JOIN Posts AS p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= DATE '2022-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PopularTags AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagCount,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS popular_rank
+    FROM Tags AS t
+    WHERE (t.IsModeratorOnly = FALSE) OR (t.IsModeratorOnly IS NOT DISTINCT FROM 0)
+),
+HighEngagementPosts AS (
+    SELECT
+        rp.PostId,
+        rp.Title,
+        rp.PostTypeName,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.comment_count_for_post,
+        ups.DisplayName AS OwnerDisplayName,
+        ups.Reputation AS OwnerReputation,
+        CASE
+            WHEN rp.FavoriteCount > 100 AND rp.comment_count_for_post > 50 AND rp.Score > 1000 THEN 'High Engagement'
+            WHEN rp.Score > 500 THEN 'High Score'
+            WHEN rp.ViewCount > 10000 THEN 'High Views'
+            ELSE 'Standard'
+        END AS EngagementLevel,
+        CASE
+            WHEN rp.ClosedDate IS NOT NULL AND rp.ClosedDate > rp.CreationDate + INTERVAL '30' DAY THEN 'Long Term Closed'
+            WHEN rp.ClosedDate IS NOT NULL THEN 'Recently Closed'
+            ELSE 'Open'
+        END AS ClosureStatus,
+        COALESCE(rp.AnswerCount, 0) AS UndeletedAnswerCount,
+        rp.CreationDate
+    FROM RankedPosts AS rp
+    JOIN UserPostStats AS ups ON rp.OwnerUserId = ups.UserId
+    WHERE rp.rn_desc <= 100
+),
+TagWikiEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        u.DisplayName AS EditorDisplayName,
+        ph.CreationDate AS EditDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS edit_sequence
+    FROM PostHistory AS ph
+    JOIN Users AS u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId = 5
+      AND EXISTS (SELECT 1 FROM Tags AS t WHERE t.WikiPostId = ph.PostId)
+      AND ph.Comment LIKE '%wiki%'
+)
+SELECT
+    hep.PostId,
+    hep.Title,
+    hep.PostTypeName,
+    hep.OwnerDisplayName,
+    hep.OwnerReputation,
+    hep.Score,
+    hep.ViewCount,
+    hep.UndeletedAnswerCount,
+    hep.comment_count_for_post,
+    hep.EngagementLevel,
+    hep.ClosureStatus,
+    pt.Name AS LatestPostTypeName,
+    COALESCE(pt.Name, 'Unknown') AS CoalescedPostTypeName,
+    CASE
+        WHEN hep.OwnerReputation > 10000 THEN 'Expert'
+        WHEN hep.OwnerReputation > 1000 THEN 'Experienced'
+        ELSE 'Novice'
+    END AS UserTier,
+    (pt.Name || ' - ' || hep.Title) AS TitleWithType,
+    CASE
+        WHEN hep.Score > hep.ViewCount / 100 THEN 'High Score Ratio'
+        ELSE 'Normal Ratio'
+    END AS ScoreToViewRatio,
+    tl.TagName AS TopTag,
+    twi.EditorDisplayName AS LastWikiEditor,
+    twi.EditDate AS LastWikiEditDate,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM PostLinks AS pl WHERE pl.PostId = hep.PostId AND pl.LinkTypeId = 3) THEN 'Is Duplicate Of'
+        ELSE 'Not Marked Duplicate'
+    END AS DuplicateStatus,
+    (SELECT COUNT(*) FROM Comments AS c WHERE c.PostId = hep.PostId AND c.Score < 0) AS NegativeScoreComments,
+    (SELECT COUNT(*) FROM Votes AS v WHERE v.PostId = hep.PostId AND v.VoteTypeId = 3) AS DownvoteCount
+FROM HighEngagementPosts AS hep
+LEFT JOIN PostTypes AS pt ON hep.PostTypeName = pt.Name
+LEFT JOIN PopularTags AS pt_pop ON pt_pop.popular_rank = 1
+LEFT JOIN Tags AS tl ON tl.TagName = pt_pop.TagName
+LEFT JOIN TagWikiEdits AS twi ON twi.PostId = hep.PostId AND twi.edit_sequence = (
+    SELECT MAX(edit_sequence) FROM TagWikiEdits WHERE PostId = hep.PostId
+)
+WHERE hep.OwnerReputation > 500
+  AND hep.Score > 10
+  AND hep.ViewCount > 100
+  AND hep.PostTypeName <> 'TagWikiExcerpt'
+ORDER BY hep.Score DESC, hep.ViewCount DESC
+LIMIT 50;

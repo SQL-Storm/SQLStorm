@@ -1,0 +1,213 @@
+-- {"query": "1346.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3069} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersProvided,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        MAX(B.Date) AS LatestBadgeDate,
+        MIN(P.CreationDate) AS FirstPostDate,
+        MAX(P.CreationDate) AS LastPostDate,
+        DATE_PART('day', U.LastAccessDate - U.CreationDate) AS DaysSinceCreation,
+        SUM(V.BountyAmount) AS TotalBountyPosted,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceived
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    LEFT JOIN Votes AS V ON U.Id = V.UserId AND V.VoteTypeId IN (8, 2, 3) -- BountyStart, UpMod, DownMod
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        U.UpVotes, U.DownVotes
+),
+PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.AcceptedAnswerId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.OwnerUserId,
+        P.Title,
+        P.Tags,
+        P.LastActivityDate,
+        P.ClosedDate,
+        COUNT(DISTINCT PH_Edit.Id) AS TotalEditHistoryEvents,
+        COUNT(DISTINCT PH_Close.Id) AS TotalCloseEvents,
+        COUNT(DISTINCT PH_Reopen.Id) AS TotalReopenEvents,
+        MAX(CASE WHEN PH_Close.PostHistoryTypeId = 10 THEN PH_Close.CreationDate END) AS LastClosedDate,
+        MAX(CASE WHEN PH_Reopen.PostHistoryTypeId = 11 THEN PH_Reopen.CreationDate END) AS LastReopenedDate,
+        MAX(CASE WHEN PH_Close.PostHistoryTypeId = 10 THEN PH_Close.Comment ELSE NULL END) AS LastCloseReasonComment,
+        FIRST_VALUE(PH_Close.Comment) OVER (PARTITION BY P.Id ORDER BY PH_Close.CreationDate ASC) AS InitialCloseReasonComment,
+        COALESCE(
+            (SELECT CR.Name FROM CloseReasonTypes CR WHERE CR.Id = CAST(SUBSTRING(PH_Close_Initial.Comment FROM '^[0-9]+') AS SMALLINT)),
+            'N/A'
+        ) AS InitialCloseReasonName
+    FROM Posts AS P
+    LEFT JOIN PostHistory AS PH_Edit ON P.Id = PH_Edit.PostId AND PH_Edit.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 24) -- Edits/Rollbacks/SuggestedEditApplied
+    LEFT JOIN PostHistory AS PH_Close ON P.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory AS PH_Reopen ON P.Id = PH_Reopen.PostId AND PH_Reopen.PostHistoryTypeId = 11
+    LEFT JOIN PostHistory AS PH_Close_Initial ON P.Id = PH_Close_Initial.PostId AND PH_Close_Initial.PostHistoryTypeId = 10
+                                            AND PH_Close_Initial.CreationDate = (SELECT MIN(sub_ph.CreationDate) FROM PostHistory sub_ph WHERE sub_ph.PostId = P.Id AND sub_ph.PostHistoryTypeId = 10)
+    GROUP BY
+        P.Id, P.PostTypeId, P.AcceptedAnswerId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount,
+        P.OwnerUserId, P.Title, P.Tags, P.LastActivityDate, P.ClosedDate, PH_Close_Initial.Comment
+),
+TagAnalysis AS (
+    SELECT
+        PHM.PostId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(PHM.Tags FROM 2 FOR LENGTH(PHM.Tags) - 2), '><'))) AS TagName
+    FROM PostHistoricalMetrics AS PHM
+    WHERE PHM.Tags IS NOT NULL AND PHM.PostTypeId = 1 -- Only analyze tags for questions
+),
+PostLinkage AS (
+    SELECT
+        PL.PostId,
+        COUNT(CASE WHEN PL.LinkTypeId = 1 THEN PL.RelatedPostId END) AS LinkedPostsCount,
+        COUNT(CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId END) AS DuplicatePostsCount,
+        ARRAY_AGG(DISTINCT CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId END) FILTER (WHERE PL.LinkTypeId = 3) AS DuplicateOfPostIds
+    FROM PostLinks AS PL
+    GROUP BY PL.PostId
+),
+BaseQueryResults AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName AS AuthorDisplayName,
+        UAS.Reputation,
+        UAS.QuestionsAsked,
+        UAS.AnswersProvided,
+        PHM.PostId,
+        PT.Name AS PostTypeName,
+        PHM.PostCreationDate,
+        PHM.Title AS PostTitle,
+        PHM.Tags AS RawTags,
+        PHM.Score AS PostScore,
+        PHM.ViewCount,
+        PHM.AnswerCount,
+        PHM.CommentCount AS PostCommentCount,
+        PHM.FavoriteCount,
+        PHM.TotalEditHistoryEvents,
+        PHM.TotalCloseEvents,
+        PHM.TotalReopenEvents,
+        PHM.InitialCloseReasonName,
+        PHM.ClosedDate IS NOT NULL AS IsClosed,
+        (PHM.LastReopenedDate IS NOT NULL AND PHM.ClosedDate IS NULL) AS IsReopenedButNotClosedAgain,
+        (PHM.TotalCloseEvents > 0 AND PHM.TotalReopenEvents > 0 AND PHM.ClosedDate IS NOT NULL AND PHM.ClosedDate > PHM.LastReopenedDate) AS WasClosedReopenedAndClosedAgain,
+        PLK.LinkedPostsCount,
+        PLK.DuplicatePostsCount,
+        ARRAY_TO_STRING(PLK.DuplicateOfPostIds, ', ') AS DuplicateOfPostsList,
+        (PHM.Score * 0.7 + COALESCE(PHM.FavoriteCount, 0) * 0.2 + PHM.CommentCount * 0.1) AS WeightedEngagementScore,
+        CAST(PHM.Score AS DECIMAL) / NULLIF(PHM.ViewCount, 0) AS ScorePerViewRatio,
+        CAST(PHM.AnswerCount AS DECIMAL) / NULLIF(PHM.CommentCount, 0) AS AnswersPerCommentRatio,
+        (SELECT COUNT(DISTINCT C.UserId) FROM Comments C WHERE C.PostId = PHM.PostId) AS DistinctCommenters,
+        (SELECT COUNT(DISTINCT V.UserId) FROM Votes V WHERE V.PostId = PHM.PostId AND V.VoteTypeId = 5) AS DistinctFavoriters, -- Favorite
+        CASE
+            WHEN PHM.PostTypeId = 1 AND PHM.AcceptedAnswerId IS NOT NULL AND PHM.ViewCount > 500 AND PHM.Score > 20 THEN 'High-Impact Question (Answered)'
+            WHEN PHM.PostTypeId = 1 AND PHM.AcceptedAnswerId IS NULL AND PHM.ViewCount > 1000 AND PHM.Score > 10 THEN 'High-Visibility Unanswered Question'
+            WHEN PHM.PostTypeId = 2 AND PHM.Score > 50 THEN 'Highly-Rated Answer'
+            WHEN PHM.PostTypeId = 1 AND PHM.TotalCloseEvents > 0 AND PHM.ClosedDate IS NOT NULL THEN 'Closed Question'
+            ELSE 'Other'
+        END AS PostCategory,
+        COALESCE(
+            (SELECT 'True'
+             FROM Badges B_INNER
+             WHERE B_INNER.UserId = UAS.UserId
+               AND B_INNER.Class = 1 -- Gold badge
+               AND B_INNER.TagBased = TRUE
+               AND EXISTS (
+                   SELECT 1
+                   FROM TagAnalysis TA_INNER
+                   JOIN Tags T_INNER ON TA_INNER.TagName = T_INNER.TagName
+                   WHERE TA_INNER.PostId = PHM.PostId AND T_INNER.Name = B_INNER.Name
+                   AND B_INNER.Date > PHM.PostCreationDate -- Badge earned after post creation
+               )
+             LIMIT 1),
+            'False'
+        ) AS HasRelatedGoldBadgeAfterPost,
+        (
+            SELECT
+                SUBSTRING(C_corr.Text, 1, 50) || '...'
+            FROM Comments C_corr
+            WHERE C_corr.PostId = PHM.PostId
+            ORDER BY C_corr.CreationDate DESC
+            OFFSET 2 -- Third most recent comment
+            LIMIT 1
+        ) AS ThirdMostRecentCommentSnippet,
+        LAG(PHM.LastActivityDate, 1, PHM.PostCreationDate) OVER (PARTITION BY UAS.UserId ORDER BY PHM.PostCreationDate) AS PrevPostActivityDate,
+        LEAD(PHM.LastActivityDate, 1, PHM.PostCreationDate) OVER (PARTITION BY UAS.UserId ORDER BY PHM.PostCreationDate) AS NextPostActivityDate,
+        NTILE(5) OVER (ORDER BY PHM.Score DESC, PHM.ViewCount DESC) AS ScoreViewQuintile,
+        CASE
+            WHEN PHM.PostTypeId = 1
+            THEN (
+                SELECT MAX(CAST(V_bounty.BountyAmount AS DECIMAL))
+                FROM Votes V_bounty
+                WHERE V_bounty.PostId = PHM.PostId AND V_bounty.VoteTypeId = 8 -- BountyStart
+            )
+            ELSE NULL
+        END AS MaxBountyAmountForQuestion,
+        (
+            SELECT U_active.DisplayName
+            FROM Comments C_active
+            JOIN Users U_active ON C_active.UserId = U_active.Id
+            WHERE C_active.PostId = PHM.PostId
+            GROUP BY U_active.Id, U_active.DisplayName
+            ORDER BY COUNT(C_active.Id) DESC, MAX(C_active.CreationDate) DESC
+            LIMIT 1
+        ) AS MostProlificCommenterDisplayName,
+        (PHM.TotalEditHistoryEvents > 5 AND PHM.TotalReopenEvents > 0 AND PHM.Score < 0) AS IsControversialAndChurned
+    FROM PostHistoricalMetrics AS PHM
+    JOIN PostTypes AS PT ON PHM.PostTypeId = PT.Id
+    LEFT JOIN UserActivitySummary AS UAS ON PHM.OwnerUserId = UAS.UserId
+    LEFT JOIN PostLinkage AS PLK ON PHM.PostId = PLK.PostId
+    WHERE
+        UAS.Reputation > 1000
+        AND PHM.PostCreationDate BETWEEN '2019-01-01' AND '2023-12-31'
+        AND PHM.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2019-01-01') / 2
+        AND (
+            PHM.Title ILIKE '%sql%'
+            OR PHM.Tags ILIKE '%<sql>%'
+            OR PHM.Tags ILIKE '%<database>%'
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM PostHistory PH_Deleted
+            WHERE PH_Deleted.PostId = PHM.PostId AND PH_Deleted.PostHistoryTypeId = 12
+            AND PH_Deleted.CreationDate > PHM.PostCreationDate
+        )
+)
+SELECT *
+FROM BaseQueryResults
+WHERE
+    PostScore >= 10
+    AND PostTypeName = 'Question'
+    AND ScorePerViewRatio IS NOT NULL
+    AND ScorePerViewRatio > 0.01
+    AND HasRelatedGoldBadgeAfterPost = 'True'
+UNION ALL
+SELECT *
+FROM BaseQueryResults
+WHERE
+    PostTypeName = 'Answer'
+    AND AnswersProvided > 0
+    AND PostCommentCount > 5
+    AND IsControversialAndChurned = TRUE
+    AND MaxBountyAmountForQuestion IS NOT NULL
+ORDER BY
+    WeightedEngagementScore DESC,
+    Reputation DESC,
+    PostCreationDate DESC
+LIMIT 500;

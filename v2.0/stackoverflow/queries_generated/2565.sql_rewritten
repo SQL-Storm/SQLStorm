@@ -1,0 +1,150 @@
+-- {"query": "2565.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1369} 
+WITH RecursiveTagCounts AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(p.Score) OVER (PARTITION BY u.Id) AS UserTotalPostScore,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY p.Score DESC NULLS LAST) AS TagUserRank
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+),
+FilteredTags AS (
+    SELECT DISTINCT
+        rtc.TagName,
+        rtc.UserId,
+        rtc.DisplayName,
+        rtc.UserTotalPostScore
+    FROM RecursiveTagCounts rtc
+    WHERE rtc.TagUserRank <= 5 AND rtc.UserTotalPostScore > 1000
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+HighReputationUsers AS (
+    SELECT
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+        COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+        u.WebsiteUrl,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.ProfileImageUrl
+    FROM Users u
+    LEFT JOIN UserBadgeStats ubs ON u.Id = ubs.UserId
+    WHERE u.Reputation >= 5000
+),
+UserPostAggregates AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1, 2)) AS AvgPostScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        COUNT(DISTINCT CASE WHEN EXISTS (
+            SELECT 1 FROM Comments c WHERE c.PostId = p.Id AND c.Score > 5
+        ) THEN p.Id END) AS PostsWithPopularComments
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+UserActivitySummary AS (
+    SELECT
+        hru.Id AS UserId,
+        hru.DisplayName,
+        hru.Reputation,
+        hru.GoldBadges,
+        hru.SilverBadges,
+        hru.BronzeBadges,
+        hru.Location,
+        hru.WebsiteUrl,
+        upa.QuestionCount,
+        upa.AnswerCount,
+        COALESCE(upa.AvgPostScore, 0) AS AvgPostScore,
+        upa.LatestPostDate,
+        upa.PostsWithPopularComments
+    FROM HighReputationUsers hru
+    LEFT JOIN UserPostAggregates upa ON hru.Id = upa.UserId
+),
+RecentClosedQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.ClosedDate,
+        p.OwnerUserId,
+        prh.Comment AS CloseReason,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY prh.CreationDate DESC) AS rn
+    FROM Posts p
+    INNER JOIN PostHistory prh ON p.Id = prh.PostId AND prh.PostHistoryTypeId = 10
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL
+),
+LatestClosedQuestions AS (
+    SELECT
+        rcq.Id,
+        rcq.Title,
+        rcq.CreationDate,
+        rcq.ClosedDate,
+        rcq.OwnerUserId,
+        rcq.CloseReason
+    FROM RecentClosedQuestions rcq
+    WHERE rcq.rn = 1
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    COALESCE(upt.TopTags, 'No Tags') AS TopTags,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.AvgPostScore,
+    uas.LatestPostDate,
+    uas.PostsWithPopularComments,
+    COALESCE(lcq.ClosedQuestionCount, 0) AS ClosedQuestionsAuthored,
+    lcq.LastClosedQuestionTitle,
+    CASE
+        WHEN uas.WebsiteUrl IS NOT NULL AND uas.WebsiteUrl <> ''
+            THEN CONCAT('Website: ', uas.WebsiteUrl)
+        ELSE 'No Website'
+    END AS WebsiteInfo,
+    CASE
+        WHEN uas.Location IS NOT NULL THEN uas.Location ELSE 'Unknown Location' END AS LocationInfo
+FROM UserActivitySummary uas
+LEFT JOIN (
+    SELECT
+        p.OwnerUserId AS UserId,
+        STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.Count DESC) AS TopTags
+    FROM Posts p
+    CROSS JOIN LATERAL unnest(string_to_array(substring(COALESCE(p.Tags, '') from 2 for char_length(p.Tags)-2), '><')) AS tname
+    JOIN Tags t ON t.TagName = tname
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+) upt ON uas.UserId = upt.UserId
+LEFT JOIN (
+    SELECT
+        lcq.OwnerUserId AS UserId,
+        COUNT(*) AS ClosedQuestionCount,
+        MAX(lcq.Title) FILTER (WHERE lcq.ClosedDate = MAX(lcq.ClosedDate) OVER (PARTITION BY lcq.OwnerUserId)) AS LastClosedQuestionTitle
+    FROM LatestClosedQuestions lcq
+    GROUP BY lcq.OwnerUserId
+) lcq ON uas.UserId = lcq.UserId
+WHERE uas.QuestionCount > 10
+ORDER BY uas.Reputation DESC, uas.GoldBadges DESC, uas.AnswerCount DESC
+LIMIT 100;

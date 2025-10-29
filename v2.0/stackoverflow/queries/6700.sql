@@ -1,0 +1,72 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        U.DisplayName,
+        U.Reputation,
+        U.LastAccessDate,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0 AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    WHERE 
+        B.Class = 1 AND B.TagBased = FALSE
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+CommentMetrics AS (
+    SELECT 
+        Posts.Id AS PostId,
+        COUNT(Comments.Id) AS CommentCount,
+        SUM(Comments.Score) AS TotalCommentScore
+    FROM 
+        Posts
+    LEFT JOIN 
+        Comments ON Posts.Id = Comments.PostId
+    GROUP BY 
+        Posts.Id
+)
+SELECT 
+    RP.Id AS PostId,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.Rank,
+    RP.DisplayName,
+    RP.Reputation,
+    RP.LastAccessDate,
+    BM.BadgeCount,
+    CM.CommentCount,
+    COALESCE(CM.TotalCommentScore, 0) AS TotalCommentScore,
+    CASE 
+        WHEN RP.Score > 100 THEN 'High'
+        WHEN RP.ViewCount > 1000 THEN 'Popular'
+        ELSE 'Regular'
+    END AS Popularity,
+    LAG(RP.Score) OVER (ORDER BY RP.Rank) AS PreviousRankScore,
+    LEAD(RP.Score) OVER (ORDER BY RP.Rank) AS NextRankScore
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BM ON RP.DisplayName = BM.DisplayName
+LEFT JOIN 
+    CommentMetrics CM ON RP.Id = CM.PostId
+ORDER BY 
+    RP.Rank;

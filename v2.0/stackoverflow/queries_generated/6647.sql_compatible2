@@ -1,0 +1,42 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(ph.CreationDate) AS LatestPostEdit,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    AVG(p.Score) AS AvgScorePerPost,
+    MAX(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Score ELSE 0 END) AS HighestAcceptedQuestionScore,
+    MIN(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS FirstClosedDate,
+    MAX(CASE WHEN POSITION('database' IN COALESCE(p.Tags, '')) > 0 THEN p.Score ELSE 0 END) AS DatabaseTagScoreSum
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Tags t ON (
+        -- match tag text against tags string like '<tag1><tag2>'
+        POSITION('<' || t.TagName || '>' IN COALESCE(p.Tags, '')) > 0
+    )
+WHERE 
+    u.Reputation > 1000
+    AND u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    AvgScorePerPost DESC, 
+    TotalPosts DESC
+LIMIT 100;

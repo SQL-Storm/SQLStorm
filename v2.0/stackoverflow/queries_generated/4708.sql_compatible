@@ -1,0 +1,177 @@
+WITH
+  RecentQuestions AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount,
+      u.DisplayName AS OwnerDisplayName,
+      u.Reputation AS OwnerReputation,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          p.CreationDate DESC
+      ) AS rn
+    FROM
+      Posts AS p
+      JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '1 year')
+  ),
+  TopAnswers AS (
+    SELECT
+      p.ParentId AS QuestionId,
+      COUNT(p.Id) AS AnswerCount,
+      SUM(p.Score) AS TotalAnswerScore,
+      AVG(p.Score) AS AverageAnswerScore,
+      MAX(p.Score) AS MaxAnswerScore,
+      ROW_NUMBER() OVER (
+        PARTITION BY
+          p.ParentId
+        ORDER BY
+          SUM(p.Score) DESC
+      ) AS answer_rn
+    FROM
+      Posts AS p
+    WHERE
+      p.PostTypeId = 2
+    GROUP BY
+      p.ParentId
+  ),
+  QuestionEngagement AS (
+    SELECT
+      rq.QuestionId,
+      rq.Title,
+      rq.OwnerDisplayName,
+      rq.OwnerReputation,
+      rq.CreationDate,
+      rq.Score AS QuestionScore,
+      rq.FavoriteCount,
+      rq.ViewCount,
+      COALESCE(ta.AnswerCount, 0) AS ActualAnswerCount,
+      COALESCE(ta.TotalAnswerScore, 0) AS TotalAnswerScore,
+      COALESCE(ta.AverageAnswerScore, 0) AS AverageAnswerScore,
+      CASE
+        WHEN rq.ViewCount > 1000
+        AND rq.Score > 50 THEN 'High Engagement'
+        WHEN rq.ViewCount > 500
+        AND rq.Score > 10 THEN 'Medium Engagement'
+        ELSE 'Low Engagement'
+      END AS EngagementLevel,
+      CHAR_LENGTH(rq.Title) AS TitleLength,
+      SUBSTRING(rq.Title FROM 1 FOR 10) AS TitlePrefix
+    FROM
+      RecentQuestions AS rq
+      LEFT JOIN TopAnswers AS ta
+      ON rq.QuestionId = ta.QuestionId
+    WHERE
+      rq.rn <= 1000
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(DISTINCT ph.PostId) AS PostsEdited,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5) THEN 1 END) AS EditsMade,
+      MAX(ph.CreationDate) AS LastEditDate
+    FROM
+      Users AS u
+      JOIN PostHistory AS ph
+      ON u.Id = ph.UserId
+    WHERE
+      ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9)
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+    HAVING
+      COUNT(DISTINCT ph.PostId) > 5
+  )
+SELECT
+  qe.QuestionId,
+  qe.Title,
+  qe.OwnerDisplayName,
+  qe.OwnerReputation,
+  qe.CreationDate,
+  qe.QuestionScore,
+  qe.FavoriteCount,
+  qe.ViewCount,
+  qe.ActualAnswerCount,
+  qe.TotalAnswerScore,
+  qe.AverageAnswerScore,
+  qe.EngagementLevel,
+  qe.TitleLength,
+  qe.TitlePrefix,
+  ua.DisplayName AS LastEditorDisplayName,
+  ua.Reputation AS LastEditorReputation,
+  ua.PostsEdited AS EditorPosts,
+  ua.EditsMade AS EditorEdits,
+  ua.LastEditDate AS EditorLastEdit
+FROM
+  QuestionEngagement AS qe
+  LEFT JOIN PostHistory AS ph_latest_edit
+  ON qe.QuestionId = ph_latest_edit.PostId
+  AND ph_latest_edit.PostHistoryTypeId IN (4, 5)
+  LEFT JOIN PostHistory AS ph_final_edit
+  ON qe.QuestionId = ph_final_edit.PostId
+  AND ph_final_edit.PostHistoryTypeId IN (4, 5)
+  AND ph_final_edit.CreationDate = (
+    SELECT
+      MAX(ph2.CreationDate)
+    FROM
+      PostHistory AS ph2
+    WHERE
+      ph2.PostId = qe.QuestionId
+      AND ph2.PostHistoryTypeId IN (4, 5)
+  )
+  LEFT JOIN Users AS ua
+  ON ph_final_edit.UserId = ua.Id
+WHERE
+  qe.OwnerReputation > 100
+  AND qe.TotalAnswerScore > 0
+  AND qe.TitleLength BETWEEN 20 AND 100
+  AND qe.TitlePrefix <> 'The'
+  AND ua.Id IS NOT NULL
+UNION ALL
+SELECT
+  NULL AS QuestionId,
+  'Summary Statistics' AS Title,
+  'N/A' AS OwnerDisplayName,
+  NULL AS OwnerReputation,
+  NULL AS CreationDate,
+  AVG(qe.QuestionScore) AS QuestionScore,
+  AVG(qe.FavoriteCount) AS FavoriteCount,
+  AVG(qe.ViewCount) AS ViewCount,
+  AVG(qe.ActualAnswerCount) AS ActualAnswerCount,
+  AVG(qe.TotalAnswerScore) AS TotalAnswerScore,
+  AVG(qe.AverageAnswerScore) AS AverageAnswerScore,
+  NULL AS EngagementLevel,
+  AVG(qe.TitleLength) AS TitleLength,
+  NULL AS TitlePrefix,
+  NULL AS LastEditorDisplayName,
+  NULL AS LastEditorReputation,
+  NULL AS EditorPosts,
+  NULL AS EditorEdits,
+  NULL AS EditorLastEdit
+FROM
+  QuestionEngagement AS qe
+WHERE
+  qe.OwnerReputation > 100
+  AND qe.TotalAnswerScore > 0
+  AND qe.TitleLength BETWEEN 20 AND 100
+  AND qe.TitlePrefix <> 'The'
+  AND EXISTS (
+    SELECT
+      1
+    FROM
+      PostHistory AS ph_check
+    WHERE
+      ph_check.PostId = qe.QuestionId
+      AND ph_check.PostHistoryTypeId IN (4, 5)
+  );

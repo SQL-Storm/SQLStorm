@@ -1,0 +1,230 @@
+WITH RECURSIVE RecursiveCTE AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        1 AS Depth,
+        CAST(p.Id AS VARCHAR) AS Path
+    FROM Posts p
+    WHERE p.ParentId IS NULL AND p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT 
+        c.Id,
+        c.PostTypeId,
+        c.AcceptedAnswerId,
+        c.ParentId,
+        c.CreationDate,
+        c.Score,
+        c.ViewCount,
+        c.OwnerUserId,
+        c.Title,
+        c.Tags,
+        r.Depth + 1,
+        r.Path || '>' || CAST(c.Id AS VARCHAR)
+    FROM Posts c
+    INNER JOIN RecursiveCTE r ON c.ParentId = r.Id
+    WHERE c.PostTypeId = 2
+),
+BadgeRankings AS (
+    SELECT 
+        UserId,
+        Name,
+        Class,
+        RANK() OVER (PARTITION BY UserId ORDER BY Class ASC, Date DESC) AS BadgeRank
+    FROM Badges
+    WHERE TagBased = 0
+),
+UserEngagement AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(SUM(vtCounts.UpVotes),0) AS TotalUpVotes,
+        COALESCE(SUM(vtCounts.DownVotes),0) AS TotalDownVotes,
+        COALESCE(AVG(pc.AvgPostScore),0) AS AveragePostScore,
+        COUNT(DISTINCT c.Id) AS TotalComments
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.TagBased = 0
+    LEFT JOIN (
+        SELECT 
+            p.OwnerUserId,
+            AVG(p.Score) AS AvgPostScore
+        FROM Posts p
+        GROUP BY p.OwnerUserId
+    ) pc ON pc.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            p.OwnerUserId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts p 
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        GROUP BY p.OwnerUserId
+    ) vtCounts ON vtCounts.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+DuplicateLinks AS (
+    SELECT pl.PostId, pl.RelatedPostId, pl.CreationDate
+    FROM PostLinks pl
+    INNER JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId AND lt.Name = 'Duplicate'
+),
+PostActivitySummary AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AcceptedAnswerId,
+        COALESCE(phc.CloseCount,0) AS CloseVotes,
+        COALESCE(phr.ReopenCount,0) AS ReopenVotes,
+        COALESCE(phu.UndeleteCount,0) AS UndeleteCount,
+        COALESCE(vtUp.UpVotes,0) AS UpVotes,
+        COALESCE(vtDown.DownVotes,0) AS DownVotes,
+        COALESCE(cmt.CommentCount,0) AS CommentCount
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CloseCount FROM PostHistory 
+        WHERE PostHistoryTypeId = 10
+        GROUP BY PostId
+    ) phc ON phc.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS ReopenCount FROM PostHistory 
+        WHERE PostHistoryTypeId = 11
+        GROUP BY PostId
+    ) phr ON phr.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS UndeleteCount FROM PostHistory 
+        WHERE PostHistoryTypeId = 13
+        GROUP BY PostId
+    ) phu ON phu.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes FROM Votes 
+        GROUP BY PostId
+    ) vtUp ON vtUp.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes FROM Votes 
+        GROUP BY PostId
+    ) vtDown ON vtDown.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount FROM Comments 
+        GROUP BY PostId
+    ) cmt ON cmt.PostId = p.Id
+),
+RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC
+        ) AS UserPostRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+FilteredQuestions AS (
+    SELECT * FROM RankedPosts
+    WHERE UserPostRank <= 3
+),
+CorrelatedCTE AS (
+    SELECT
+        fq.Id,
+        fq.Title,
+        fq.OwnerUserId,
+        fq.Score,
+        fq.ViewCount,
+        fq.CreationDate,
+        fq.AcceptedAnswerId,
+        u.DisplayName AS OwnerName,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = fq.Id) AS AnswerCount,
+        (SELECT AVG(a.Score) FROM Posts a WHERE a.ParentId = fq.Id) AS AvgAnswerScore,
+        (SELECT MAX(c.Score) FROM Comments c WHERE c.PostId = fq.Id) AS MaxCommentScore,
+        (SELECT COUNT(*) FROM DuplicateLinks dl WHERE dl.PostId = fq.Id OR dl.RelatedPostId = fq.Id) AS DuplicateRelations
+    FROM FilteredQuestions fq
+    LEFT JOIN Users u ON u.Id = fq.OwnerUserId
+)
+SELECT
+    c.Id,
+    c.Title,
+    c.OwnerName,
+    ueg.TotalBadges,
+    ueg.GoldBadges,
+    ueg.SilverBadges,
+    ueg.BronzeBadges,
+    c.Score,
+    c.ViewCount,
+    c.AnswerCount,
+    ROUND(COALESCE(c.AvgAnswerScore,0),2) AS AvgAnswerScore,
+    COALESCE(c.MaxCommentScore,0) AS MaxCommentScore,
+    c.DuplicateRelations,
+    pa.CloseVotes,
+    pa.ReopenVotes,
+    pa.UndeleteCount,
+    pa.UpVotes,
+    pa.DownVotes,
+    pa.CommentCount,
+    CASE 
+        WHEN c.Score < 0 THEN 'Negative'
+        WHEN c.Score = 0 THEN 'Neutral'
+        WHEN c.Score > 0 AND c.Score <= 10 THEN 'Low Positive'
+        ELSE 'High Positive'
+    END AS ScoreCategory,
+    CASE 
+        WHEN pos.RuleCount = 0 THEN 'No PostHistory'
+        ELSE 'Has PostHistory'
+    END AS PostHistoryStatus,
+    rct.Depth,
+    rct.Path,
+    DENSE_RANK() OVER (ORDER BY c.ViewCount DESC) AS ViewRank
+FROM CorrelatedCTE c
+LEFT JOIN UserEngagement ueg ON ueg.Id = c.OwnerUserId
+LEFT JOIN PostActivitySummary pa ON pa.PostId = c.Id
+LEFT JOIN (
+    SELECT PostId, COUNT(*) AS RuleCount FROM PostHistory GROUP BY PostId
+) pos ON pos.PostId = c.Id
+LEFT JOIN RecursiveCTE rct ON rct.Id = c.Id
+WHERE c.DuplicateRelations > 0
+GROUP BY 
+    c.Id,
+    c.Title,
+    c.OwnerName,
+    ueg.TotalBadges,
+    ueg.GoldBadges,
+    ueg.SilverBadges,
+    ueg.BronzeBadges,
+    c.Score,
+    c.ViewCount,
+    c.AnswerCount,
+    c.AvgAnswerScore,
+    c.MaxCommentScore,
+    c.DuplicateRelations,
+    pa.CloseVotes,
+    pa.ReopenVotes,
+    pa.UndeleteCount,
+    pa.UpVotes,
+    pa.DownVotes,
+    pa.CommentCount,
+    pos.RuleCount,
+    rct.Depth,
+    rct.Path
+ORDER BY c.ViewCount DESC, c.Score DESC
+LIMIT 100;

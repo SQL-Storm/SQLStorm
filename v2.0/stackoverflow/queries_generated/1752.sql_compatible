@@ -1,0 +1,198 @@
+WITH UserMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COALESCE(U.Location, 'Unknown') AS UserLocation,
+        U.Views AS UserProfileViews,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(CASE WHEN B.Name = 'Fanatic' THEN 1 ELSE 0 END) AS HasFanaticBadge,
+        NTILE(4) OVER (ORDER BY U.Reputation DESC) AS ReputationQuartile,
+        (
+            SELECT AVG(Sp.Score)
+            FROM Posts Sp
+            JOIN Users Su ON Sp.OwnerUserId = Su.Id
+            WHERE Su.Location = U.Location
+              AND Sp.PostTypeId IN (1, 2)
+              AND Sp.CreationDate BETWEEN U.CreationDate AND U.LastAccessDate
+        ) AS AvgLocationPostScore
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location, U.Views, U.UpVotes, U.DownVotes
+),
+PostDetailedMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        COALESCE(P.ViewCount, 0) AS PostViewCount,
+        COALESCE(P.AnswerCount, 0) AS PostAnswerCount,
+        COALESCE(P.CommentCount, 0) AS PostCommentCount,
+        COALESCE(P.FavoriteCount, 0) AS PostFavoriteCount,
+        COALESCE(P.Title, SUBSTRING(P.Body FROM 1 FOR 50) || '...') AS PostTitleExcerpt,
+        P.Tags,
+        P.LastActivityDate,
+        P.ClosedDate,
+        PT.Name AS PostTypeName,
+        (COALESCE(P.ViewCount, 0) * 0.1
+         + COALESCE(P.Score, 0) * 1.5
+         + COALESCE(P.AnswerCount, 0) * 5
+         + COALESCE(P.CommentCount, 0) * 2
+         + COALESCE(P.FavoriteCount, 0) * 10
+         + CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 20 ELSE 0 END
+        ) AS EngagementScore,
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY (COALESCE(P.ViewCount, 0) + COALESCE(P.Score, 0) * 10) DESC) AS PostTypeEngagementRank,
+        AVG(P.Score) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS RunningAvgUserPostScore,
+        LAG(P.Score, 1, 0) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PrevPostScore,
+        (SELECT COUNT(C.Id) FROM Comments C WHERE C.PostId = P.Id AND C.Score > 0) AS PositiveCommentsCount,
+        MAX(CASE WHEN PH_Close.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN PH_Reopen.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        NULLIF(
+            EXTRACT(EPOCH FROM (COALESCE(P.LastEditDate, P.LastActivityDate) - P.CreationDate)) / (60 * 60 * 24),
+            0
+        ) AS DaysUntilLastActivityOrEdit,
+        (CASE WHEN P.Title ILIKE '%index%' OR P.Title ILIKE '%optimize%' THEN 1 ELSE 0 END) AS IsPerformanceRelated,
+        (
+            SELECT COUNT(*)
+            FROM (
+                SELECT TRIM(tag) AS t
+                FROM (
+                    SELECT UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR (CHAR_LENGTH(P.Tags) - 2)), '><')) AS tag
+                ) sub_tags
+                WHERE LOWER(TRIM(tag)) IN ('sql', 'database', 'performance')
+            ) matched_tags
+        ) AS SpecificTagCount,
+        NULLIF(
+            (string_to_array(SUBSTRING(P.Tags FROM 2 FOR (CHAR_LENGTH(P.Tags) - 2)), '><'))[1],
+            ''
+        ) AS PrimaryTag
+    FROM Posts P
+    LEFT JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostHistory PH_Close ON P.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory PH_Reopen ON P.Id = PH_Reopen.PostId AND PH_Reopen.PostHistoryTypeId = 11
+    WHERE P.OwnerUserId IS NOT NULL
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.Title, P.Body, P.Tags, P.LastActivityDate, P.ClosedDate, PT.Name, P.AcceptedAnswerId, P.LastEditDate
+),
+TagUsageStats AS (
+    SELECT
+        T.TagName AS TagName,
+        COUNT(DISTINCT P.Id) AS TaggedPostCount,
+        AVG(P.Score) AS AvgScoreForTag,
+        SUM(PD.EngagementScore) AS TotalEngagementForTag,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(P.Id) AS QuestionPercentageForTag
+    FROM Posts P
+    JOIN PostDetailedMetrics PD ON P.Id = PD.PostId
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR (CHAR_LENGTH(P.Tags) - 2)), '><')) AS TagName
+    ) T ON TRUE
+    WHERE P.Tags IS NOT NULL AND CHAR_LENGTH(P.Tags) > 2 AND T.TagName IS NOT NULL
+    GROUP BY T.TagName
+    HAVING COUNT(DISTINCT P.Id) > 500
+),
+CommentActivitySummary AS (
+    SELECT
+        C.PostId,
+        COUNT(C.Id) AS TotalCommentsOnPost,
+        SUM(C.Score) AS TotalCommentScoreOnPost,
+        AVG(CHAR_LENGTH(C.Text)) AS AvgCommentLength,
+        SUM(CASE WHEN C.UserId IS NULL THEN 1 ELSE 0 END) AS AnonymousCommentCount,
+        MAX(C.CreationDate) AS LastCommentDate,
+        MAX(CASE WHEN C.Text ILIKE '%thanks%' THEN 1 ELSE 0 END) AS HasThanksComment
+    FROM Comments C
+    GROUP BY C.PostId
+),
+UsersWhoVoteAndPostButNeverComment AS (
+    SELECT UserId FROM UserMetrics WHERE TotalPosts > 0
+    INTERSECT
+    SELECT UserId FROM (SELECT DISTINCT UserId FROM Votes WHERE UserId IS NOT NULL) AS VotedUsers
+    EXCEPT
+    SELECT UserId FROM UserMetrics WHERE TotalComments > 0
+),
+HotPostsToday AS (
+    SELECT
+        PostId,
+        PostTitleExcerpt,
+        EngagementScore,
+        ROW_NUMBER() OVER (ORDER BY EngagementScore DESC, PostCreationDate DESC) AS HotRank
+    FROM PostDetailedMetrics
+    WHERE PostCreationDate >= (DATE '2024-10-01' - INTERVAL '7' DAY)
+      AND PostTypeId = 1
+)
+SELECT
+    UM.UserId,
+    UM.DisplayName,
+    UM.Reputation,
+    UM.ReputationQuartile,
+    UM.TotalPosts,
+    UM.QuestionCount,
+    UM.AnswerCount,
+    UM.AvgLocationPostScore,
+    UM.HasFanaticBadge,
+    PDM.PostId,
+    PDM.PostTypeName,
+    PDM.PostTitleExcerpt,
+    PDM.PostScore,
+    PDM.EngagementScore,
+    PDM.PostTypeEngagementRank,
+    PDM.RunningAvgUserPostScore,
+    PDM.PrevPostScore,
+    PDM.PositiveCommentsCount,
+    PDM.DaysUntilLastActivityOrEdit,
+    PDM.WasClosed,
+    PDM.WasReopened,
+    PDM.IsPerformanceRelated,
+    PDM.SpecificTagCount,
+    CAS.TotalCommentsOnPost,
+    CAS.TotalCommentScoreOnPost,
+    CAS.AvgCommentLength,
+    CAS.AnonymousCommentCount,
+    (CAS.HasThanksComment = 1) AS ContainsThanksComment,
+    TS.TagName AS TopDiscussedTag,
+    TS.TaggedPostCount AS TopDiscussedTagPosts,
+    TS.QuestionPercentageForTag,
+    CASE
+        WHEN UVAPNC.UserId IS NOT NULL THEN 'VotePostNoCommentUser'
+        WHEN UM.QuestionCount > 0 AND UM.AnswerCount = 0 THEN 'QuestionOnlyUser'
+        WHEN UM.TotalPosts = 0 AND UM.TotalComments > 0 THEN 'CommentOnlyUser'
+        ELSE 'BalancedUser'
+    END AS UserBehaviorCategory,
+    (UM.Reputation * 0.01 + PDM.EngagementScore * 0.5 + COALESCE(TS.AvgScoreForTag, 0) * 0.1
+     + (CASE WHEN PDM.WasClosed = 1 THEN -10 ELSE 0 END)
+     + (CASE WHEN PDM.IsPerformanceRelated = 1 THEN 5 ELSE 0 END)
+     + (PDM.SpecificTagCount * 2)
+     + COALESCE(CAS.TotalCommentsOnPost, 0) * 0.5
+     - (PDM.PostScore * 0.1 * PDM.PrevPostScore)
+    ) AS UserPostInfluenceScore,
+    NULLIF(UM.DisplayName, 'Community') AS ActualDisplayName,
+    UPPER(SUBSTRING(COALESCE(PDM.PostTitleExcerpt, 'NO TITLE') FROM 1 FOR 5)) AS TitleFragment,
+    EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.PostId = PDM.PostId AND PL.LinkTypeId = 3) AS HasDuplicateLinks,
+    (SELECT TOP_HOT.HotRank FROM HotPostsToday TOP_HOT WHERE TOP_HOT.PostId = PDM.PostId LIMIT 1) AS HotPostRank
+FROM UserMetrics UM
+LEFT JOIN PostDetailedMetrics PDM ON UM.UserId = PDM.OwnerUserId
+LEFT JOIN CommentActivitySummary CAS ON PDM.PostId = CAS.PostId
+LEFT JOIN TagUsageStats TS ON PDM.PrimaryTag = TS.TagName
+LEFT JOIN UsersWhoVoteAndPostButNeverComment UVAPNC ON UM.UserId = UVAPNC.UserId
+WHERE UM.Reputation > 500
+  AND PDM.PostId IS NOT NULL
+  AND PDM.PostCreationDate > UM.UserCreationDate + INTERVAL '30' DAY
+  AND PDM.EngagementScore > (SELECT AVG(EngagementScore) FROM PostDetailedMetrics)
+  AND NOT EXISTS (
+      SELECT 1 FROM PostHistory PH_Del
+      WHERE PH_Del.PostId = PDM.PostId
+        AND PH_Del.PostHistoryTypeId = 12
+        AND PH_Del.CreationDate = (SELECT MAX(PH_Inner.CreationDate) FROM PostHistory PH_Inner WHERE PH_Inner.PostId = PDM.PostId)
+  )
+ORDER BY UserPostInfluenceScore DESC, UM.Reputation DESC, PDM.EngagementScore DESC, PDM.DaysUntilLastActivityOrEdit ASC
+LIMIT 10000;

@@ -1,0 +1,183 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS TotalUpvotesGiven,
+        U.DownVotes AS TotalDownvotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScoreReceived,
+        COUNT(C.Id) AS TotalCommentsMade,
+        MAX(U.LastAccessDate) AS LastUserActivityDate,
+        AVG(CASE WHEN P.PostTypeId IN (1,2) THEN P.Score END) AS AvgQuestionAnswerScore
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostDetailMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        LENGTH(P.Body) AS BodyLength,
+        CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer,
+        CASE WHEN P.ClosedDate IS NOT NULL THEN TRUE ELSE FALSE END AS IsClosed,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS PostUpVotes,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS PostDownVotes,
+        COUNT(DISTINCT C.UserId) AS DistinctCommenters,
+        (SELECT COUNT(DISTINCT UserId) FROM Votes WHERE PostId = P.Id AND VoteTypeId IN (2,3)) AS DistinctVoters,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate DESC) AS rn_latest_post_by_user
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount,
+        P.AnswerCount, P.CommentCount, P.FavoriteCount, P.Title, P.Tags, P.Body, P.AcceptedAnswerId, P.ClosedDate
+),
+RecentPostActivity AS (
+    SELECT
+        PDM.PostId,
+        PDM.OwnerUserId,
+        PDM.PostTypeId,
+        PDM.PostCreationDate,
+        PDM.Title,
+        PDM.PostScore,
+        PDM.PostUpVotes,
+        PDM.PostDownVotes,
+        PDM.CommentCount,
+        PDM.BodyLength,
+        PDM.Tags,
+        COALESCE(
+          NULLIF(array_length(string_to_array(SUBSTRING(PDM.Tags, 2, LENGTH(PDM.Tags) - 2), '><'), 1), 0),
+          0
+        ) AS TagCount,
+        CASE
+            WHEN PDM.BodyLength > 2000 THEN 'Very Long'
+            WHEN PDM.BodyLength BETWEEN 501 AND 2000 THEN 'Medium'
+            ELSE 'Short'
+        END AS BodyLengthCategory,
+        CASE
+            WHEN PDM.PostTypeId = 1 AND PDM.PostScore > 50 THEN 'High Impact Question'
+            WHEN PDM.PostTypeId = 2 AND PDM.PostScore > 20 AND PDM.HasAcceptedAnswer THEN 'High Impact Accepted Answer'
+            WHEN PDM.PostTypeId IN (1,2) AND PDM.PostScore > 10 THEN 'Medium Impact Post'
+            ELSE 'Low Impact Post'
+        END AS PostImpactCategory,
+        PDM.rn_latest_post_by_user
+    FROM PostDetailMetrics PDM
+    WHERE PDM.PostCreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months')
+),
+PostLinkInformation AS (
+    SELECT
+        PL.PostId,
+        PL.RelatedPostId,
+        LT.Name AS LinkTypeName
+    FROM PostLinks PL
+    JOIN LinkTypes LT ON PL.LinkTypeId = LT.Id
+    WHERE LT.Id = 3
+),
+PostEditorHistory AS (
+    SELECT
+        PH.PostId,
+        PH.UserId AS EditorUserId,
+        COUNT(PH.Id) AS EditCount,
+        MAX(PH.CreationDate) AS LastEditDate
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY PH.PostId, PH.UserId
+),
+BadgesSummary AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS RecentBadgesCount,
+        MAX(B.Date) AS LastBadgeDate,
+        STRING_AGG(DISTINCT B.Name, ', ' ORDER BY B.Name) AS RecentBadgeNames
+    FROM Badges B
+    WHERE B.Date >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    GROUP BY B.UserId
+),
+TopUsersByMetric AS (
+    SELECT UE.UserId, 'High Upvoted Questions' AS MetricType
+    FROM UserEngagement UE
+    JOIN RecentPostActivity RPA ON UE.UserId = RPA.OwnerUserId
+    WHERE RPA.PostTypeId = 1 AND RPA.PostUpVotes > 100 AND RPA.PostImpactCategory = 'High Impact Question'
+    UNION ALL
+    SELECT UE.UserId, 'Highly Scored Answers' AS MetricType
+    FROM UserEngagement UE
+    JOIN RecentPostActivity RPA ON UE.UserId = RPA.OwnerUserId
+    WHERE RPA.PostTypeId = 2 AND RPA.PostScore > 50 AND RPA.HasAcceptedAnswer
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.UserCreationDate,
+    UE.UserProfileViews,
+    UE.TotalPostsCreated,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    UE.TotalPostScoreReceived,
+    UE.TotalCommentsMade,
+    UE.LastUserActivityDate,
+    UE.AvgQuestionAnswerScore,
+    BS.RecentBadgesCount,
+    BS.LastBadgeDate,
+    BS.RecentBadgeNames,
+    COUNT(DISTINCT RPA.PostId) AS RecentActivePostsCount,
+    COALESCE(SUM(RPA.PostUpVotes), 0) AS TotalRecentUpvotes,
+    COALESCE(SUM(RPA.PostDownVotes), 0) AS TotalRecentDownvotes,
+    COALESCE(SUM(CASE WHEN RPA.BodyLengthCategory = 'Very Long' THEN 1 ELSE 0 END), 0) AS VeryLongPostsCount,
+    COALESCE(SUM(CASE WHEN RPA.BodyLengthCategory = 'Medium' THEN 1 ELSE 0 END), 0) AS MediumPostsCount,
+    COALESCE(SUM(CASE WHEN RPA.TagCount > 5 THEN 1 ELSE 0 END), 0) AS PostsWithManyTagsCount,
+    RANK() OVER (ORDER BY COALESCE(SUM(RPA.PostUpVotes), 0) DESC, UE.Reputation DESC, UE.TotalPostsCreated DESC) AS OverallEngagementRank,
+    (
+        SELECT AVG(P_OTHER.Score)
+        FROM Posts P_OTHER
+        WHERE P_OTHER.OwnerUserId = UE.UserId
+          AND P_OTHER.PostTypeId IN (1, 2)
+          AND P_OTHER.Id NOT IN (SELECT PostId FROM RecentPostActivity WHERE OwnerUserId = UE.UserId)
+    ) AS AvgOtherPostScore,
+    CASE WHEN COUNT(PLI.PostId) > 0 THEN TRUE ELSE FALSE END AS HasRecentDuplicateLinkedPost,
+    CASE WHEN COUNT(CASE WHEN PEH.EditCount > 3 AND PEH.PostId = RPA.PostId AND PEH.EditorUserId = UE.UserId AND RPA.rn_latest_post_by_user = 1 THEN 1 END) > 0 THEN TRUE ELSE FALSE END AS LatestPostEditedFrequentlyBySelf,
+    STRING_AGG(DISTINCT (RPA.PostImpactCategory || ' (' || RPA.BodyLengthCategory || ')'), '; ') FILTER (WHERE RPA.PostImpactCategory IS NOT NULL) AS RecentPostCategoryMix,
+    COUNT(DISTINCT TUM.MetricType) AS DistinctTopMetricTypes
+FROM UserEngagement UE
+LEFT JOIN RecentPostActivity RPA ON UE.UserId = RPA.OwnerUserId
+LEFT JOIN PostLinkInformation PLI ON RPA.PostId = PLI.PostId
+LEFT JOIN PostEditorHistory PEH ON RPA.PostId = PEH.PostId AND UE.UserId = PEH.EditorUserId
+LEFT JOIN BadgesSummary BS ON UE.UserId = BS.UserId
+LEFT JOIN TopUsersByMetric TUM ON UE.UserId = TUM.UserId
+WHERE
+    UE.Reputation > 10000
+    AND UE.TotalPostsCreated > 10
+    AND UE.LastUserActivityDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months')
+    AND (
+        (RPA.PostTypeId = 1 AND RPA.PostScore >= 20) OR
+        (RPA.PostTypeId = 2 AND RPA.PostScore >= 10 AND RPA.HasAcceptedAnswer) OR
+        RPA.PostId IS NULL
+    )
+    AND UE.DisplayName IS NOT NULL AND UE.DisplayName != ''
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.UserCreationDate, UE.UserProfileViews, UE.TotalPostsCreated,
+    UE.TotalQuestions, UE.TotalAnswers, UE.TotalPostScoreReceived, UE.TotalCommentsMade,
+    UE.LastUserActivityDate, UE.AvgQuestionAnswerScore, BS.RecentBadgesCount, BS.LastBadgeDate, BS.RecentBadgeNames,
+    UE.TotalPostsCreated -- included because used in window/order and grouped expressions
+HAVING
+    COUNT(DISTINCT RPA.PostId) > 0
+    OR UE.TotalPostsCreated > 50
+ORDER BY
+    OverallEngagementRank ASC, UE.Reputation DESC, TotalRecentUpvotes DESC
+LIMIT 100;

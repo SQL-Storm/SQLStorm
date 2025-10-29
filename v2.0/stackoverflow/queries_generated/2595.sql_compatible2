@@ -1,0 +1,188 @@
+with RecursiveUserPaths as (
+    select 
+        u.Id as UserId,
+        cast(u.DisplayName as varchar(1000)) as Path,
+        1 as Level
+    from Users u
+    where u.Id in (
+        select distinct OwnerUserId from Posts where OwnerUserId is not null
+        union
+        select distinct UserId from Comments where UserId is not null
+        union
+        select distinct UserId from Votes where UserId is not null
+        union
+        select distinct UserId from Badges
+    )
+    union all
+    select 
+        u.Id,
+        p.Path || ' -> ' || coalesce(u.DisplayName,'[NoName]'),
+        p.Level + 1
+    from Users u
+    join RecursiveUserPaths p on p.UserId = u.Id
+    where p.Level < 3
+),
+PostsWithScoreStats as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate, 
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.PostTypeId,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankByScore,
+        avg(p.Score) over (partition by p.PostTypeId) as AvgScore,
+        count(*) over (partition by p.OwnerUserId) as UserPostCount
+    from Posts p
+),
+TopUsers as (
+    select 
+        u.Id, 
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(b.BadgeCount,0) as BadgeCount,
+        coalesce(p.UserPostCount,0) as PostCount,
+        case 
+            when u.Reputation > 100000 then 'Legendary'
+            when u.Reputation > 10000 then 'Expert'
+            when u.Reputation > 1000 then 'Intermediate'
+            else 'Beginner'
+        end as UserTier
+    from Users u
+    left join (
+        select UserId, count(*) as BadgeCount 
+        from Badges 
+        where Class = 1 
+        group by UserId
+    ) b on b.UserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as UserPostCount 
+        from Posts 
+        where OwnerUserId is not null
+        group by OwnerUserId
+    ) p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+),
+QuestionAnswerPairs as (
+    select 
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.CreationDate as QuestionCreated,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreated,
+        a.OwnerUserId as AnswerOwnerUserId
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+CloseVoteInfo as (
+    select
+        ph.PostId,
+        count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseVotesCount,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as LastCloseVoteDate,
+        max(case when ph.PostHistoryTypeId = 10 then ph.Comment end) as LastCloseReason
+    from PostHistory ph
+    group by ph.PostId
+),
+UserBadgeStrings as (
+    select 
+        b.UserId,
+        string_agg(distinct b.Name || '(' || b.Class || ')', ', ') as BadgeList
+    from Badges b
+    group by b.UserId
+),
+HighlyActiveUsers as (
+    select 
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct c.Id) as TotalComments,
+        count(distinct bh.Id) as TotalEdits
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory bh on bh.UserId = u.Id
+    group by u.Id, u.DisplayName
+    having count(distinct p.Id) + count(distinct c.Id) + count(distinct bh.Id) > 100
+)
+select
+    tu.Id as UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.UserTier,
+    coalesce(ub.BadgeList, '[No Badges]') as Badges,
+    tu.BadgeCount,
+    tu.PostCount,
+    hau.TotalComments,
+    hau.TotalEdits,
+    qa.QuestionId,
+    qa.QuestionTitle,
+    qa.QuestionCreated,
+    qa.QuestionScore,
+    qa.QuestionViews,
+    qa.AnswerId,
+    qa.AnswerScore,
+    qa.AnswerCreated,
+    coalesce(cv.CloseVotesCount,0) as CloseVotesCount,
+    cv.LastCloseVoteDate,
+    cv.LastCloseReason,
+    r.Path as UserPath,
+    CASE 
+        WHEN tu.Reputation > 100000 THEN '🔥'
+        WHEN tu.Reputation > 20000 THEN '⭐'
+        WHEN tu.Reputation > 5000 THEN '👍'
+        ELSE ' '
+    END as ReputationEmoji,
+    (select string_agg(distinct trim(both '<>' from t), '|')
+        from Posts p cross join lateral unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as t
+        where p.OwnerUserId = tu.Id and p.PostTypeId = 1 and p.Tags is not null) as DistinctTagsConcatenated,
+    case 
+        when qa.AnswerScore is null then 'Unanswered'
+        when qa.AnswerScore > qa.QuestionScore then 'Answer better scored'
+        else 'Question better scored'
+    end as ScoreComparison,
+    rank() over (partition by tu.Id order by qa.QuestionViews desc NULLS LAST) as QuestionViewRank
+from TopUsers tu
+left join UserBadgeStrings ub on ub.UserId = tu.Id
+left join HighlyActiveUsers hau on hau.Id = tu.Id
+left join QuestionAnswerPairs qa on qa.AnswerOwnerUserId = tu.Id
+left join CloseVoteInfo cv on cv.PostId = qa.QuestionId
+left join RecursiveUserPaths r on r.UserId = tu.Id
+where (qa.QuestionCreated >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year' or qa.QuestionCreated is null)
+  and (cv.CloseVotesCount > 0 or cv.CloseVotesCount is null)
+union
+select
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    'Inactive' as UserTier,
+    '[No Badges]' as Badges,
+    0 as BadgeCount,
+    0 as PostCount,
+    0 as TotalComments,
+    0 as TotalEdits,
+    null as QuestionId,
+    null as QuestionTitle,
+    null as QuestionCreated,
+    null as QuestionScore,
+    null as QuestionViews,
+    null as AnswerId,
+    null as AnswerScore,
+    null as AnswerCreated,
+    0 as CloseVotesCount,
+    null as LastCloseVoteDate,
+    null as LastCloseReason,
+    null as UserPath,
+    ' ' as ReputationEmoji,
+    null as DistinctTagsConcatenated,
+    'No Activity' as ScoreComparison,
+    null as QuestionViewRank
+from Users u
+where u.Reputation <= 1000
+order by Reputation desc, BadgeCount desc, PostCount desc
+limit 100;

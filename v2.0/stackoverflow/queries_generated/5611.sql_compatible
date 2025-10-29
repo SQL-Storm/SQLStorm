@@ -1,0 +1,101 @@
+WITH
+TopUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COALESCE(u.Location, 'Unknown') AS Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    CASE WHEN (u.UpVotes + u.DownVotes) = 0 THEN NULL
+         ELSE CAST(u.UpVotes AS DOUBLE PRECISION) / NULLIF(CAST(u.UpVotes + u.DownVotes AS DOUBLE PRECISION), 0) END AS UpvoteShare,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount
+  FROM Users u
+),
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '90' DAY
+),
+UserInteractions AS (
+  SELECT
+    ra.OwnerUserId AS UserId,
+    COUNT(DISTINCT ra.PostId) AS RecentPosts,
+    SUM(p.ViewCount) AS TotalViews,
+    SUM(CASE WHEN c.Id IS NOT NULL THEN 1 ELSE 0 END) AS CommentCountLast90,
+    SUM(CASE WHEN v.Id IS NOT NULL THEN 1 ELSE 0 END) AS VoteCountLast90
+  FROM RecentActivity ra
+  LEFT JOIN Posts p ON p.Id = ra.PostId
+  LEFT JOIN Comments c ON c.PostId = ra.PostId AND c.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '90' DAY
+  LEFT JOIN Votes v ON v.PostId = ra.PostId AND v.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '90' DAY
+  GROUP BY ra.OwnerUserId
+),
+TaggedQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    trim(t.TagName) AS TagName,
+    NULL AS TagCount
+  FROM Posts p,
+  LATERAL (
+    SELECT unnest(string_to_array( REPLACE(REPLACE(COALESCE(p.Tags,''),'<',''),'>',''), ',' )) AS TagName
+  ) t
+  WHERE p.PostTypeId = 1
+),
+ScoreRank AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Score,
+    p.CreationDate,
+    DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST, p.CreationDate DESC) AS ScoreRank
+  FROM Posts p
+  WHERE p.Score IS NOT NULL
+),
+BenchmarkFrame AS (
+  SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.Location,
+    ui.RecentPosts,
+    ui.TotalViews,
+    ui.CommentCountLast90,
+    ui.VoteCountLast90,
+    tu.BadgeCount AS BadgeCount,
+    sr.PostId AS TopPostId,
+    sr.ScoreRank,
+    ra.rn AS ActivityRank
+  FROM TopUsers tu
+  LEFT JOIN UserInteractions ui ON ui.UserId = tu.UserId
+  LEFT JOIN ScoreRank sr ON sr.OwnerUserId = tu.UserId
+  LEFT JOIN RecentActivity ra ON ra.OwnerUserId = tu.UserId AND ra.rn = 1
+)
+SELECT
+  bf.UserId,
+  bf.DisplayName,
+  bf.Reputation,
+  bf.Location,
+  bf.RecentPosts,
+  bf.TotalViews,
+  bf.CommentCountLast90,
+  bf.VoteCountLast90,
+  bf.BadgeCount,
+  bf.TopPostId,
+  bf.ScoreRank,
+  bf.ActivityRank
+FROM BenchmarkFrame bf
+ORDER BY bf.Reputation DESC NULLS LAST, bf.TotalViews DESC NULLS LAST
+LIMIT 100;

@@ -1,0 +1,148 @@
+-- {"query": "3786.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2647} 
+WITH
+/* 1️⃣ Gather per‑user aggregates */
+user_stats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0)                AS net_votes,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS gold_badges,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS silver_badges,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS bronze_badges,
+           (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS q_cnt,
+           (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS a_cnt,
+           (SELECT COUNT(*) FROM PostHistory ph
+               WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId = 10)          AS closed_votes_cast
+    FROM   Users u
+    WHERE  u.Reputation > 0
+),
+
+/* 2️⃣ Tag‑level activity (uses string pattern matching on the stored <tag> format) */
+tag_activity AS (
+    SELECT t.TagName,
+           COUNT(*) FILTER (WHERE p.PostTypeId = 1)                     AS question_posts,
+           COUNT(*) FILTER (WHERE p.PostTypeId = 2)                     AS answer_posts,
+           ROUND(AVG(p.Score)::numeric,2)                               AS avg_score,
+           STRING_AGG(DISTINCT u.DisplayName, ', ')
+               FILTER (WHERE u.Reputation > 10000)                      AS top_contributors
+    FROM   Tags t
+    LEFT   JOIN Posts p
+           ON p.Tags LIKE CONCAT('%<',t.TagName,'%>')                 -- tag stored as <tag1><tag2>…
+    LEFT   JOIN Users u
+           ON u.Id = p.OwnerUserId
+    GROUP  BY t.TagName
+    HAVING COUNT(*) > 10
+),
+
+/* 3️⃣ Rank users by reputation and by badge “points” */
+user_rankings AS (
+    SELECT us.Id,
+           us.DisplayName,
+           us.Reputation,
+           us.net_votes,
+           us.gold_badges,
+           us.silver_badges,
+           us.bronze_badges,
+           us.q_cnt,
+           us.a_cnt,
+           ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.net_votes DESC) AS rep_rank,
+           RANK()      OVER (ORDER BY (us.gold_badges*3 + us.silver_badges*2 + us.bronze_badges) DESC) AS badge_rank
+    FROM   user_stats us
+),
+
+/* 4️⃣ Recent votes (last 30 days) */
+recent_votes AS (
+    SELECT v.PostId,
+           v.VoteTypeId,
+           vt.Name                                     AS vote_type,
+           v.CreationDate,
+           CASE WHEN v.UserId IS NULL THEN 'Anonymous' ELSE u.DisplayName END AS voter_name
+    FROM   Votes v
+    JOIN   VoteTypes vt ON vt.Id = v.VoteTypeId
+    LEFT   JOIN Users u   ON u.Id = v.UserId
+    WHERE  v.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 day'
+),
+
+/* 5️⃣ Aggregate post info, with window ranking per post type */
+agg_posts AS (
+    SELECT p.Id,
+           p.Title,
+           p.PostTypeId,
+           pt.Name                                 AS post_type,
+           COALESCE(p.Score,0)                     AS score,
+           p.ViewCount,
+           p.AnswerCount,
+           p.FavoriteCount,
+           p.CreationDate,
+           p.OwnerUserId,
+           u.DisplayName                          AS owner_name,
+           COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS up_votes,
+           COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS down_votes,
+           ROW_NUMBER() OVER (PARTITION BY p.PostTypeId
+                              ORDER BY p.Score DESC)   AS score_rank_within_type
+    FROM   Posts p
+    JOIN   PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT   JOIN Users u   ON u.Id = p.OwnerUserId
+    LEFT   JOIN Votes v   ON v.PostId = p.Id
+    GROUP  BY p.Id, pt.Name, u.DisplayName
+)
+
+SELECT
+    ur.Id,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.net_votes,
+    ur.gold_badges,
+    ur.silver_badges,
+    ur.bronze_badges,
+    ur.q_cnt,
+    ur.a_cnt,
+    ur.rep_rank,
+    ur.badge_rank,
+
+    ta.TagName,
+    ta.question_posts,
+    ta.answer_posts,
+    ta.avg_score,
+    ta.top_contributors,
+
+    ap.Title,
+    ap.post_type,
+    ap.score,
+    ap.ViewCount,
+    ap.up_votes,
+    ap.down_votes,
+    ap.score_rank_within_type,
+
+    rv.vote_type,
+    rv.CreationDate   AS recent_vote_date,
+    rv.voter_name
+FROM   user_rankings ur
+LEFT   JOIN tag_activity ta
+       ON ta.TagName = (
+              SELECT t.TagName
+              FROM   Tags t
+              WHERE  t.TagName ILIKE '%'||ur.DisplayName||'%'
+              LIMIT  1
+          )
+LEFT   JOIN agg_posts ap
+       ON ap.OwnerUserId = ur.Id
+      AND ap.score_rank_within_type <= 5
+LEFT   JOIN LATERAL (
+              SELECT *
+              FROM   recent_votes rv
+              WHERE  rv.PostId = ap.Id
+              ORDER  BY rv.CreationDate DESC
+              LIMIT  1
+          ) rv ON TRUE
+WHERE  ur.rep_rank <= 100
+ORDER  BY ur.rep_rank ASC, ur.badge_rank ASC
+LIMIT  100
+
+UNION ALL
+
+/*  Dummy rows to stress the engine’s ability to handle a set operator */
+SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+       NULL,NULL,NULL,NULL,NULL,
+       NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+       NULL,NULL,NULL;

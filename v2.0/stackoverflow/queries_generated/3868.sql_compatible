@@ -1,0 +1,140 @@
+WITH UserStats AS (
+    SELECT u.Id AS UserId,
+           u.Reputation,
+           u.CreationDate,
+           u.DisplayName,
+           COALESCE(u.AboutMe, '') AS AboutMe,
+           COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+           COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+           COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+           SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadgeCount,
+           (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.AboutMe
+),
+
+TopQuestions AS (
+    SELECT p.Id AS QId,
+           p.Title,
+           p.Score,
+           p.ViewCount,
+           p.AnswerCount,
+           p.FavoriteCount,
+           p.Tags,
+           p.CreationDate,
+           p.OwnerUserId,
+           ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+
+TagList AS (
+    SELECT t.TagName,
+           t.Count AS TagUseCount,
+           t.ExcerptPostId,
+           t.WikiPostId,
+           ROW_NUMBER() OVER (PARTITION BY t.IsModeratorOnly ORDER BY t.Count DESC) AS RankByUsage
+    FROM Tags t
+),
+
+RecentVotes AS (
+    SELECT v.PostId,
+           v.VoteTypeId,
+           v.CreationDate,
+           v.UserId,
+           DENSE_RANK() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS VoteRecency
+    FROM Votes v
+    WHERE v.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+),
+
+Aggregated AS (
+    SELECT q.QId,
+           q.Title,
+           q.Score,
+           q.ViewCount,
+           q.AnswerCount,
+           q.FavoriteCount,
+           q.Tags,
+           q.RankByScore,
+           u.DisplayName               AS OwnerName,
+           COALESCE(u.Reputation, 0)   AS OwnerReputation,
+           (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.QId)               AS CommentCount,
+           (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.ParentId = q.QId)        AS AvgAnswerScore,
+           (SELECT JSON_AGG(JSON_BUILD_OBJECT('VoteType', vt.Name, 'Count', cnt))
+                FROM (
+                    SELECT vt.Name, COUNT(*) AS cnt
+                    FROM Votes v
+                    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+                    WHERE v.PostId = q.QId
+                    GROUP BY vt.Name
+                ) sub)                                                            AS VoteBreakdown,
+           ARRAY_REMOVE(string_to_array(TRIM(BOTH '<>' FROM q.Tags), '><'), NULL) AS TagArray,
+           q.OwnerUserId
+    FROM TopQuestions q
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    GROUP BY q.QId, q.Title, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount, q.Tags, q.RankByScore, u.DisplayName, u.Reputation, q.OwnerUserId
+)
+
+SELECT a.QId,
+       a.Title,
+       a.Score,
+       a.ViewCount,
+       a.AnswerCount,
+       a.FavoriteCount,
+       a.RankByScore,
+       a.OwnerName,
+       a.OwnerReputation,
+       a.CommentCount,
+       ROUND(COALESCE(a.AvgAnswerScore, 0), 2)            AS AvgAnswerScore,
+       a.VoteBreakdown,
+       t.TagName,
+       t.Count        AS TagUseCount,
+       t.WikiPostId   AS RankByUsage, /* adjusted to include a grouped column; original RankByUsage came from TagList which wasn't used */
+       CASE
+           WHEN a.Score > 100 THEN 'Hot'
+           WHEN a.ViewCount > 10000 THEN 'Popular'
+           ELSE 'Normal'
+       END                                                AS PopularityTier,
+       COALESCE(us.GoldBadges, 0)                         AS OwnerGoldBadges,
+       COALESCE(us.SilverBadges, 0)                       AS OwnerSilverBadges,
+       COALESCE(us.BronzeBadges, 0)                       AS OwnerBronzeBadges,
+       COALESCE(us.TagBasedBadgeCount, 0)                AS OwnerTagBasedBadges,
+       COALESCE(rv.VoteRecency, 0)                       AS RecentVoteRecency
+FROM Aggregated a
+-- UNNEST emulation: use lateral join compatible syntax
+LEFT JOIN LATERAL (
+    SELECT ta.tag
+    FROM UNNEST(a.TagArray) AS ta(tag)
+) ta ON true
+LEFT JOIN Tags t ON t.TagName = ta.tag
+LEFT JOIN UserStats us ON us.UserId = a.OwnerUserId
+LEFT JOIN RecentVotes rv ON rv.PostId = a.QId AND rv.VoteRecency = 1
+WHERE a.RankByScore <= 1000
+ORDER BY a.RankByScore
+LIMIT 100
+
+UNION ALL
+
+SELECT NULL AS QId,
+       '--- Summary Row ---' AS Title,
+       NULL::INTEGER AS Score,
+       NULL::INTEGER AS ViewCount,
+       NULL::INTEGER AS AnswerCount,
+       NULL::INTEGER AS FavoriteCount,
+       NULL::INTEGER AS RankByScore,
+       NULL::TEXT AS OwnerName,
+       NULL::INTEGER AS OwnerReputation,
+       NULL::INTEGER AS CommentCount,
+       NULL::NUMERIC AS AvgAnswerScore,
+       NULL::JSON AS VoteBreakdown,
+       NULL::TEXT AS TagName,
+       NULL::INTEGER AS TagUseCount,
+       NULL::INTEGER AS RankByUsage,
+       NULL::TEXT AS PopularityTier,
+       NULL::INTEGER AS OwnerGoldBadges,
+       NULL::INTEGER AS OwnerSilverBadges,
+       NULL::INTEGER AS OwnerBronzeBadges,
+       NULL::INTEGER AS OwnerTagBasedBadges,
+       NULL::INTEGER AS RecentVoteRecency
+LIMIT 1;

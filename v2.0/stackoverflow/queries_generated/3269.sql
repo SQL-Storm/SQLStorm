@@ -1,0 +1,126 @@
+-- {"query": "3269.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1626} 
+
+/*  Benchmark Query:  complex multi‑CTE, window functions, outer joins, set operators,
+    string manipulation, correlated subqueries and NULL handling on the StackOverflow schema */
+WITH
+/* 1️⃣  Aggregate badge counts per user, split by class (Gold/Silver/Bronze) */
+badge_counts AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt,
+        COUNT(*)                                   AS total_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/* 2️⃣  Aggregate post statistics per user (questions, answers, avg score, acceptance rate) */
+post_stats AS (
+    SELECT 
+        p.OwnerUserId                     AS user_id,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS question_cnt,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS answer_cnt,
+        ROUND(AVG(p.Score)::numeric, 2)         AS avg_score,
+        /* acceptance rate = accepted answers / total answers */
+        CASE 
+            WHEN COUNT(*) FILTER (WHERE p.PostTypeId = 2) = 0 THEN NULL
+            ELSE ROUND(
+                100.0 * 
+                COUNT(*) FILTER (WHERE p.PostTypeId = 2 AND p.Id = p.AcceptedAnswerId)::numeric
+                / COUNT(*) FILTER (WHERE p.PostTypeId = 2), 2)
+        END AS accept_rate_pct,
+        /* list of distinct tags (as a concatenated string) from questions */
+        STRING_AGG(DISTINCT TRIM(BOTH '<>' FROM UNNEST(string_to_array(p.Tags, '><'))), ', ') 
+            FILTER (WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL) AS tags_used
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+
+/* 3️⃣  Recent activity per user (latest post date, latest vote date, latest comment date) */
+recent_activity AS (
+    SELECT 
+        u.Id                                      AS user_id,
+        GREATEST(
+            COALESCE((SELECT MAX(CreationDate) FROM Posts    WHERE OwnerUserId = u.Id), '1970-01-01'::timestamp),
+            COALESCE((SELECT MAX(CreationDate) FROM Votes    WHERE UserId       = u.Id), '1970-01-01'::timestamp),
+            COALESCE((SELECT MAX(CreationDate) FROM Comments WHERE UserId       = u.Id), '1970-01-01'::timestamp)
+        )                                        AS last_activity_ts,
+        (SELECT COUNT(*) FROM Posts    WHERE OwnerUserId = u.Id AND CreationDate > NOW() - INTERVAL '30 days') AS posts_last_30d,
+        (SELECT COUNT(*) FROM Votes    WHERE UserId       = u.Id AND CreationDate > NOW() - INTERVAL '30 days') AS votes_last_30d,
+        (SELECT COUNT(*) FROM Comments WHERE UserId       = u.Id AND CreationDate > NOW() - INTERVAL '30 days') AS comments_last_30d
+    FROM Users u
+),
+
+/* 4️⃣  Users who have self‑answered at least one of their own questions (correlated subquery) */
+self_answerers AS (
+    SELECT DISTINCT q.OwnerUserId AS user_id
+    FROM Posts q
+    JOIN Posts a ON a.ParentId = q.Id
+    WHERE q.PostTypeId = 1               -- question
+      AND a.PostTypeId = 2               -- answer
+      AND q.OwnerUserId = a.OwnerUserId  -- same user
+),
+
+/* 5️⃣  Users with zero badges – to be UNIONed later */
+zero_badge_users AS (
+    SELECT u.Id AS user_id, u.DisplayName
+    FROM Users u
+    LEFT JOIN badge_counts bc ON bc.UserId = u.Id
+    WHERE bc.UserId IS NULL
+)
+
+/* Final Result Set – combine aggregates, apply outer joins, rank users */
+SELECT
+    u.Id                                 AS user_id,
+    COALESCE(u.DisplayName, '<deleted>') AS display_name,
+    u.Reputation,
+    COALESCE(bc.gold_cnt,   0)           AS gold_badges,
+    COALESCE(bc.silver_cnt, 0)           AS silver_badges,
+    COALESCE(bc.bronze_cnt, 0)           AS bronze_badges,
+    COALESCE(bc.total_badges,0)          AS total_badges,
+    COALESCE(ps.question_cnt,0)          AS questions,
+    COALESCE(ps.answer_cnt,0)            AS answers,
+    ps.avg_score,
+    ps.accept_rate_pct,
+    ps.tags_used,
+    ra.last_activity_ts,
+    ra.posts_last_30d,
+    ra.votes_last_30d,
+    ra.comments_last_30d,
+    CASE WHEN sa.user_id IS NOT NULL THEN 'YES' ELSE 'NO' END AS self_answered_flag,
+    RANK() OVER (ORDER BY u.Reputation DESC, total_badges DESC) AS reputation_rank
+FROM Users u
+LEFT JOIN badge_counts   bc ON bc.UserId = u.Id
+LEFT JOIN post_stats     ps ON ps.user_id = u.Id
+LEFT JOIN recent_activity ra ON ra.user_id = u.Id
+LEFT JOIN self_answerers sa ON sa.user_id = u.Id
+WHERE u.Id IS NOT NULL
+/* Keep only the top 5000 users for the benchmark; adjust as needed */
+ORDER BY u.Reputation DESC
+LIMIT 5000
+
+UNION ALL
+
+/* Include users with zero badges to test set‑operator handling */
+SELECT
+    zbu.user_id,
+    zbu.display_name,
+    NULL::int            AS Reputation,
+    0                    AS gold_badges,
+    0                    AS silver_badges,
+    0                    AS bronze_badges,
+    0                    AS total_badges,
+    0                    AS questions,
+    0                    AS answers,
+    NULL::numeric        AS avg_score,
+    NULL::numeric        AS accept_rate_pct,
+    NULL::text           AS tags_used,
+    NULL::timestamp      AS last_activity_ts,
+    0                    AS posts_last_30d,
+    0                    AS votes_last_30d,
+    0                    AS comments_last_30d,
+    'NO'                 AS self_answered_flag,
+    NULL::int            AS reputation_rank
+FROM zero_badge_users zbu
+ORDER BY user_id;

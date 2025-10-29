@@ -1,0 +1,268 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as avg_score_3_posts,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                COALESCE(
+                    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0),
+                    0
+                )
+            ELSE 0 
+        END as positive_comments
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+),
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.ViewCount as user_views,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answer_count,
+        SUM(COALESCE(p.Score, 0)) as total_score,
+        AVG(COALESCE(p.Score, 0)) as avg_score,
+        STRING_AGG(COALESCE(p.Tags, ''), '; ') as all_tags,
+        MAX(p.CreationDate) as last_post_date,
+        CASE WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            (COUNT(DISTINCT p.Id) * 100.0) / NULLIF((SELECT COUNT(*) FROM Posts), 0) 
+        ELSE 0 END as percentage_of_all_posts
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.ViewCount
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'),
+            0
+        ) as related_posts_count,
+        CASE 
+            WHEN t.Count > 100 THEN 'High'
+            WHEN t.Count > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as popularity_level,
+        t.IsRequired,
+        t.IsModeratorOnly
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND LENGTH(t.TagName) > 2
+),
+ComplexPosts AS (
+    SELECT 
+        rp.Id,
+        rp.Title,
+        rp.Tags,
+        rp.PostTypeId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.rn,
+        rp.prev_score,
+        rp.avg_score_3_posts,
+        rp.positive_comments,
+        us.DisplayName as author_name,
+        us.Reputation as author_reputation,
+        us.total_posts,
+        us.question_count,
+        us.answer_count,
+        us.total_score,
+        us.avg_score,
+        us.all_tags,
+        ta.Count as tag_count,
+        ta.popularity_level,
+        CASE 
+            WHEN rp.Score > 0 AND rp.AnswerCount > 0 THEN 
+                (rp.Score * 1.0) / NULLIF(rp.AnswerCount, 0)
+            ELSE 0 
+        END as score_per_answer,
+        CASE 
+            WHEN rp.Score < 0 THEN 'Negative'
+            WHEN rp.Score > 10 THEN 'High'
+            WHEN rp.Score > 5 THEN 'Medium'
+            ELSE 'Low'
+        END as score_category,
+        CASE 
+            WHEN rp.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7' DAY) THEN 'Recent'
+            WHEN rp.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY) THEN 'This Month'
+            ELSE 'Older'
+        END as post_age_group,
+        ta.TagName as matched_tagname
+    FROM RankedPosts rp
+    INNER JOIN UserStats us ON rp.OwnerUserId = us.Id
+    LEFT JOIN TagAnalysis ta ON rp.Tags LIKE '%' || ta.TagName || '%'
+    WHERE rp.rn <= 10 
+    AND (rp.Score IS NOT NULL OR rp.Score = 0)
+    AND rp.Title IS NOT NULL
+    AND LENGTH(rp.Title) > 10
+),
+FinalAggregation AS (
+    SELECT 
+        cp.Id,
+        cp.Title,
+        cp.Tags,
+        cp.PostTypeId,
+        cp.Score,
+        cp.ViewCount,
+        cp.CreationDate,
+        cp.rn,
+        cp.prev_score,
+        cp.avg_score_3_posts,
+        cp.positive_comments,
+        cp.author_name,
+        cp.author_reputation,
+        cp.total_posts,
+        cp.question_count,
+        cp.answer_count,
+        cp.total_score,
+        cp.avg_score,
+        cp.all_tags,
+        cp.tag_count,
+        cp.popularity_level,
+        cp.score_per_answer,
+        cp.score_category,
+        cp.post_age_group,
+        LAG(cp.Score) OVER (ORDER BY cp.CreationDate DESC) as prev_post_score,
+        ROW_NUMBER() OVER (ORDER BY cp.CreationDate DESC) as overall_rank,
+        RANK() OVER (PARTITION BY cp.PostTypeId ORDER BY cp.Score DESC) as type_rank,
+        DENSE_RANK() OVER (ORDER BY cp.total_score DESC) as author_score_rank,
+        NTILE(4) OVER (ORDER BY cp.Score) as score_quartile,
+        CASE 
+            WHEN cp.total_score >= 1000 THEN 'Elite'
+            WHEN cp.total_score >= 500 THEN 'Active'
+            WHEN cp.total_score >= 100 THEN 'Regular'
+            ELSE 'New'
+        END as user_engagement_level,
+        cp.matched_tagname
+    FROM ComplexPosts cp
+    WHERE cp.Score IS NOT NULL
+    AND cp.author_reputation IS NOT NULL
+)
+SELECT 
+    fa.Id,
+    fa.Title,
+    fa.Tags,
+    fa.PostTypeId,
+    fa.Score,
+    fa.ViewCount,
+    fa.CreationDate,
+    fa.rn,
+    fa.prev_score,
+    fa.avg_score_3_posts,
+    fa.positive_comments,
+    fa.author_name,
+    fa.author_reputation,
+    fa.total_posts,
+    fa.question_count,
+    fa.answer_count,
+    fa.total_score,
+    fa.avg_score,
+    fa.all_tags,
+    fa.tag_count,
+    fa.popularity_level,
+    fa.score_per_answer,
+    fa.score_category,
+    fa.post_age_group,
+    fa.prev_post_score,
+    fa.overall_rank,
+    fa.type_rank,
+    fa.author_score_rank,
+    fa.score_quartile,
+    fa.user_engagement_level,
+    CASE 
+        WHEN fa.prev_post_score IS NOT NULL AND fa.Score > fa.prev_post_score THEN 'Improved'
+        WHEN fa.prev_post_score IS NOT NULL AND fa.Score < fa.prev_post_score THEN 'Declined'
+        ELSE 'Stable'
+    END as performance_trend,
+    CASE 
+        WHEN fa.total_posts < 5 THEN 'Novice'
+        WHEN fa.total_posts < 20 THEN 'Experienced'
+        WHEN fa.total_posts < 50 THEN 'Veteran'
+        ELSE 'Expert'
+    END as posting_experience,
+    COALESCE(
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = fa.Id AND v.VoteTypeId = 2),
+        0
+    ) as upvotes,
+    COALESCE(
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = fa.Id AND v.VoteTypeId = 3),
+        0
+    ) as downvotes,
+    COALESCE(
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = fa.Id),
+        0
+    ) as comment_count,
+    CASE 
+        WHEN fa.Tags IS NOT NULL AND POSITION('python' IN LOWER(fa.Tags)) > 0 THEN 'Python Related'
+        WHEN fa.Tags IS NOT NULL AND POSITION('java' IN LOWER(fa.Tags)) > 0 THEN 'Java Related'
+        WHEN fa.Tags IS NOT NULL AND POSITION('javascript' IN LOWER(fa.Tags)) > 0 THEN 'JavaScript Related'
+        ELSE 'Other'
+    END as language_category,
+    (SELECT COUNT(DISTINCT UserId) FROM Votes v WHERE v.PostId = fa.Id) as unique_voters,
+    (SELECT COUNT(DISTINCT UserId) FROM Comments c WHERE c.PostId = fa.Id) as unique_commenters,
+    COALESCE(
+        (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = fa.Id AND v.VoteTypeId = 8),
+        0
+    ) as avg_bounty_amount,
+    COALESCE(
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = fa.author_reputation AND b.Class = 1),
+        0
+    ) as gold_badges_count,
+    COALESCE(
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = fa.author_reputation AND b.Class = 2),
+        0
+    ) as silver_badges_count,
+    ROUND(
+        (CASE 
+            WHEN fa.total_score > 0 THEN (fa.total_score * 100.0) / NULLIF((SELECT MAX(total_score) FROM UserStats), 0)
+            ELSE 0 
+        END), 2
+    ) as relative_author_score,
+    ROUND(
+        (CASE 
+            WHEN fa.Score > 0 THEN (fa.Score * 100.0) / NULLIF((SELECT MAX(Score) FROM Posts), 0)
+            ELSE 0 
+        END), 2
+    ) as relative_post_score,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = fa.Id AND pl.LinkTypeId = 1) as linked_posts_count,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = fa.Id AND pl.LinkTypeId = 3) as duplicate_count,
+    (SELECT COUNT(*) FROM Posts p WHERE p.ParentId = fa.Id) as child_posts_count,
+    CASE 
+        WHEN fa.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN fa.PostTypeId = 1 AND fa.AnswerCount = 0 THEN 'Unanswered'
+        WHEN fa.PostTypeId = 1 AND fa.AnswerCount > 0 THEN 'Answered'
+        ELSE 'No Status'
+    END as post_status,
+    fa.matched_tagname
+FROM FinalAggregation fa
+WHERE 
+    fa.author_reputation > 100
+    AND fa.total_score >= 0
+    AND fa.total_posts >= 1
+    AND fa.matched_tagname IS NOT NULL
+    AND (fa.post_age_group IN ('Recent', 'This Month') OR fa.score_category IN ('High', 'Medium'))
+ORDER BY 
+    fa.CreationDate DESC,
+    fa.total_score DESC,
+    fa.Score DESC
+LIMIT 1000;

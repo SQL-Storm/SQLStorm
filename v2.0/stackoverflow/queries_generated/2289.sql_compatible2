@@ -1,0 +1,181 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        CAST(ARRAY[t.TagName] AS VARCHAR[]) AS TagPath
+    FROM Tags t
+    WHERE NOT EXISTS (
+        SELECT 1 FROM PostLinks pl 
+        JOIN Posts p ON pl.PostId = p.Id
+        WHERE pl.RelatedPostId = t.ExcerptPostId AND pl.LinkTypeId = 1
+    )
+    UNION ALL
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.TagPath || t2.TagName
+    FROM RecursiveTagHierarchy r
+    JOIN PostLinks pl ON pl.PostId = r.ExcerptPostId AND pl.LinkTypeId = 1
+    JOIN Posts p ON pl.RelatedPostId = p.Id
+    JOIN Tags t2 ON t2.ExcerptPostId = p.Id
+    WHERE NOT t2.TagName = ANY(r.TagPath)
+),
+TopUsersCTE AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceived,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER(ORDER BY u.Reputation DESC NULLS LAST, u.CreationDate ASC) AS Rank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(p.Id) > 10
+),
+PostScoreStats AS (
+    SELECT 
+        p.OwnerUserId,
+        p.PostTypeId,
+        COUNT(*) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.Score) AS MaxScore,
+        STDDEV_POP(p.Score) AS ScoreStdDev
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId IN (1, 2)
+    GROUP BY p.OwnerUserId, p.PostTypeId
+),
+LatestCloseReasons AS (
+    SELECT DISTINCT ON (ph.PostId)
+        ph.PostId,
+        crt.Name AS CloseReason,
+        ph.CreationDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^\d+$'
+    ORDER BY ph.PostId, ph.CreationDate DESC
+),
+QuestionsWithDetailedStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.Tags,
+        lcr.CloseReason,
+        usr.DisplayName AS OwnerDisplayName,
+        usr.Reputation AS OwnerReputation,
+        pss_post.PostCount AS OwnerQuestionCount,
+        pss_post.MaxScore AS OwnerMaxQuestionScore,
+        pss_answer.PostCount AS OwnerAnswerCount,
+        pss_answer.AvgScore AS OwnerAvgAnswerScore,
+        ROW_NUMBER() OVER (
+            PARTITION BY usr.Id ORDER BY q.CreationDate DESC
+        ) AS QuestionRecencyRank,
+        q.OwnerUserId
+    FROM Posts q
+    LEFT JOIN Users usr ON usr.Id = q.OwnerUserId
+    LEFT JOIN PostScoreStats pss_post ON pss_post.OwnerUserId = usr.Id AND pss_post.PostTypeId = 1
+    LEFT JOIN PostScoreStats pss_answer ON pss_answer.OwnerUserId = usr.Id AND pss_answer.PostTypeId = 2
+    LEFT JOIN LatestCloseReasons lcr ON lcr.PostId = q.Id
+    WHERE q.PostTypeId = 1
+),
+AnswerScoresWithWindow AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        u.DisplayName AS AnswerOwner,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC) AS AnswerRank,
+        COUNT(*) OVER (PARTITION BY a.ParentId) AS TotalAnswersPerQuestion
+    FROM Posts a
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE a.PostTypeId = 2
+),
+AggregatedUserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        EXTRACT(EPOCH FROM (MAX(p.CreationDate) - MIN(p.CreationDate)))/86400 AS ActiveDays
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 0
+)
+SELECT 
+    q.QuestionId,
+    q.Title,
+    q.Tags,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.CloseReason,
+    q.OwnerDisplayName,
+    q.OwnerReputation,
+    q.OwnerQuestionCount,
+    q.OwnerMaxQuestionScore,
+    q.OwnerAnswerCount,
+    ROUND(COALESCE(q.OwnerAvgAnswerScore, 0), 2) AS OwnerAvgAnswerScore,
+    a.AnswerId,
+    a.Score AS AnswerScore,
+    a.AnswerOwner,
+    a.AnswerRank,
+    a.TotalAnswersPerQuestion,
+    tu.DisplayName AS TopUserDisplayName,
+    tu.UpVotesReceived,
+    tu.DownVotesReceived,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    au.TotalPosts AS UserTotalPosts,
+    au.TotalComments AS UserTotalComments,
+    au.GoldBadges AS UserGoldBadges,
+    au.SilverBadges AS UserSilverBadges,
+    au.BronzeBadges AS UserBronzeBadges,
+    au.LastPostDate,
+    au.FirstPostDate,
+    ROUND(COALESCE(au.ActiveDays, 0), 1) AS UserActiveDays,
+    th.Level AS TagHierarchyLevel,
+    array_to_string(th.TagPath, ' > ') AS TagHierarchyPath
+FROM QuestionsWithDetailedStats q
+LEFT JOIN AnswerScoresWithWindow a ON a.ParentId = q.QuestionId AND a.AnswerRank = 1
+LEFT JOIN TopUsersCTE tu ON tu.UserId = q.OwnerUserId AND tu.Rank <= 50
+LEFT JOIN AggregatedUserActivity au ON au.Id = q.OwnerUserId
+LEFT JOIN RecursiveTagHierarchy th ON th.TagName = substring(q.Tags FROM '<([^>]+)>')
+WHERE q.QuestionRecencyRank <= 5
+  AND (
+    (q.CloseReason IS NULL)
+    OR (q.CloseReason NOT IN ('Exact Duplicate', 'Duplicate'))
+  )
+  AND q.Score > (
+    SELECT AVG(p.Score) 
+    FROM Posts p 
+    WHERE p.PostTypeId = 1
+  ) 
+ORDER BY q.Score DESC, q.ViewCount DESC, a.Score DESC NULLS LAST
+LIMIT 100;

@@ -1,0 +1,290 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC) AS rn
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with accepted answer'
+            WHEN p.PostTypeId = 1 THEN 'Question without accepted answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostCategory,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 10 THEN 'Moderately Voted'
+            WHEN p.Score > 0 THEN 'Slightly Voted'
+            WHEN p.Score = 0 THEN 'No Votes'
+            ELSE 'Negative Votes'
+        END AS VoteCategory,
+        COALESCE(p.Tags, '') AS CleanTags,
+        regexp_split_to_array(REPLACE(REPLACE(REPLACE(COALESCE(p.Tags, ''), '<', ''), '>', ''), ' ', ''), '><') AS TagArray,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+        PERCENT_RANK() OVER (ORDER BY p.CreationDate) AS CreationDatePercentile,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostSequence
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= TIMESTAMP '2020-01-01'
+),
+UserPostAggregates AS (
+    SELECT 
+        ps.PostId,
+        ps.Title,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.CreationDate,
+        ps.OwnerUserId,
+        ps.PostTypeId,
+        ps.Tags,
+        ps.PostCategory,
+        ps.VoteCategory,
+        ps.CleanTags,
+        ps.TagArray,
+        ps.ScoreRank,
+        ps.ViewRank,
+        ps.CreationDatePercentile,
+        ps.AvgUserScore,
+        ps.UserPostSequence,
+        CASE 
+            WHEN ps.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1) THEN 'Above Average'
+            WHEN ps.Score < (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1) THEN 'Below Average'
+            ELSE 'Average'
+        END AS ScoreComparison,
+        CASE 
+            WHEN ps.ViewCount > 1000 THEN 'Highly Viewed'
+            WHEN ps.ViewCount > 100 THEN 'Moderately Viewed'
+            ELSE 'Low Viewed'
+        END AS ViewCategory,
+        CAST((CAST('2024-10-01 12:34:56' AS timestamp) - ps.CreationDate) AS interval) AS _tmp_interval,
+        EXTRACT(DAY FROM CAST((CAST('2024-10-01 12:34:56' AS timestamp) - ps.CreationDate) AS interval)) 
+            + EXTRACT(EPOCH FROM CAST((CAST('2024-10-01 12:34:56' AS timestamp) - ps.CreationDate) AS interval))/86400 - 
+              FLOOR(EXTRACT(EPOCH FROM CAST((CAST('2024-10-01 12:34:56' AS timestamp) - ps.CreationDate) AS interval))/86400) AS _tmp_days_fraction,
+        FLOOR(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - ps.CreationDate))/86400) AS DaysSinceCreation,
+        ('Post ' || ps.PostId || ' by ' || u.DisplayName) AS PostDescription
+    FROM PostStats ps
+    INNER JOIN Users u ON ps.OwnerUserId = u.Id
+    WHERE ps.Score >= 0 AND ps.ViewCount >= 0
+),
+ComplexQueryResults AS (
+    SELECT 
+        upa.PostId,
+        upa.Title,
+        upa.Score,
+        upa.ViewCount,
+        upa.AnswerCount,
+        upa.CommentCount,
+        upa.CreationDate,
+        upa.OwnerUserId,
+        upa.PostTypeId,
+        upa.Tags,
+        upa.PostCategory,
+        upa.VoteCategory,
+        upa.CleanTags,
+        upa.TagArray,
+        upa.ScoreRank,
+        upa.ViewRank,
+        upa.CreationDatePercentile,
+        upa.AvgUserScore,
+        upa.UserPostSequence,
+        upa.ScoreComparison,
+        upa.ViewCategory,
+        upa.DaysSinceCreation,
+        upa.PostDescription,
+        CASE 
+            WHEN upa.Score > 50 AND upa.ViewCount > 100 AND upa.AnswerCount > 5 THEN 'Popular High-Quality'
+            WHEN upa.Score > 10 AND upa.ViewCount > 1000 THEN 'Popular Low-Quality'
+            WHEN upa.Score < 0 AND upa.AnswerCount = 0 THEN 'Unpopular No Answers'
+            ELSE 'Other'
+        END AS QualityAssessment,
+        LAG(upa.Score) OVER (ORDER BY upa.CreationDate) AS PreviousScore,
+        LEAD(upa.Score) OVER (ORDER BY upa.CreationDate) AS NextScore,
+        SUM(upa.Score) OVER (ORDER BY upa.CreationDate ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS MovingAvgScore,
+        NTILE(4) OVER (ORDER BY upa.Score) AS ScoreQuartile,
+        NTH_VALUE(upa.Title, 1) OVER (ORDER BY upa.Score DESC) AS HighestScoringTitle,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY upa.Score) AS MedianScore,
+        COUNT(*) OVER () AS TotalPosts,
+        COUNT(upa.PostId) OVER (PARTITION BY upa.OwnerUserId) AS UserTotalPosts,
+        MAX(upa.ViewCount) OVER (PARTITION BY upa.OwnerUserId) AS UserMaxViewCount,
+        AVG(upa.ViewCount) OVER (PARTITION BY upa.OwnerUserId) AS UserAvgViewCount,
+        STRING_AGG(upa.CleanTags, ', ' ORDER BY upa.CreationDate) AS UserTagHistory,
+        ROW_NUMBER() OVER (ORDER BY upa.Score DESC) AS OverallRank,
+        RANK() OVER (PARTITION BY upa.PostTypeId ORDER BY upa.Score DESC) AS TypeRank,
+        DENSE_RANK() OVER (PARTITION BY upa.OwnerUserId ORDER BY upa.Score DESC) AS UserScoreRank,
+        COALESCE(upa.Score, 0) + COALESCE(upa.ViewCount, 0) AS ScoreViewSum,
+        CASE 
+            WHEN upa.CreationDate >= DATE '2022-01-01' THEN 'Recent'
+            WHEN upa.CreationDate >= DATE '2021-01-01' THEN '2021'
+            WHEN upa.CreationDate >= DATE '2020-01-01' THEN '2020'
+            ELSE 'Older'
+        END AS CreationYearCategory,
+        CASE 
+            WHEN CHAR_LENGTH(upa.Title) > 100 THEN 'Long Title'
+            WHEN CHAR_LENGTH(upa.Title) > 50 THEN 'Medium Title'
+            WHEN CHAR_LENGTH(upa.Title) > 0 THEN 'Short Title'
+            ELSE 'No Title'
+        END AS TitleLengthCategory,
+        CASE 
+            WHEN upa.AnswerCount > 10 THEN 'Many Answers'
+            WHEN upa.AnswerCount > 5 THEN 'Some Answers'
+            WHEN upa.AnswerCount > 0 THEN 'Few Answers'
+            ELSE 'No Answers'
+        END AS AnswerQuantityCategory,
+        CASE 
+            WHEN upa.CommentCount > 20 THEN 'Many Comments'
+            WHEN upa.CommentCount > 10 THEN 'Some Comments'
+            WHEN upa.CommentCount > 0 THEN 'Few Comments'
+            ELSE 'No Comments'
+        END AS CommentQuantityCategory,
+        REVERSE(upa.Title) AS ReversedTitle,
+        INITCAP(LOWER(REGEXP_REPLACE(upa.Title, '[^a-zA-Z0-9 ]', '', 'g'))) AS CleanTitle,
+        SUBSTRING(upa.CleanTags FROM 1 FOR 50) AS TagPreview,
+        CASE 
+            WHEN upa.Score > 0 AND upa.Score < 10 THEN 'Low Score'
+            WHEN upa.Score >= 10 AND upa.Score < 50 THEN 'Medium Score'
+            WHEN upa.Score >= 50 AND upa.Score < 100 THEN 'High Score'
+            WHEN upa.Score >= 100 THEN 'Very High Score'
+            ELSE 'Zero or Negative Score'
+        END AS ScoreLevel,
+        CASE 
+            WHEN upa.ViewCount > 0 THEN upa.Score / NULLIF(upa.ViewCount, 0)
+            ELSE NULL
+        END AS ScoreToViewRatio,
+        CASE 
+            WHEN upa.Score > upa.AvgUserScore THEN 'Above User Average'
+            WHEN upa.Score < upa.AvgUserScore THEN 'Below User Average'
+            ELSE 'At User Average'
+        END AS ScoreVsUserAvg
+    FROM UserPostAggregates upa
+    WHERE upa.Score >= -50
+)
+SELECT 
+    cr.PostId,
+    cr.Title,
+    cr.Score,
+    cr.ViewCount,
+    cr.AnswerCount,
+    cr.CommentCount,
+    cr.CreationDate,
+    cr.OwnerUserId,
+    cr.PostTypeId,
+    cr.Tags,
+    cr.PostCategory,
+    cr.VoteCategory,
+    cr.CleanTags,
+    cr.TagArray,
+    cr.ScoreRank,
+    cr.ViewRank,
+    cr.CreationDatePercentile,
+    cr.AvgUserScore,
+    cr.UserPostSequence,
+    cr.ScoreComparison,
+    cr.ViewCategory,
+    cr.DaysSinceCreation,
+    cr.PostDescription,
+    cr.QualityAssessment,
+    cr.PreviousScore,
+    cr.NextScore,
+    cr.MovingAvgScore,
+    cr.ScoreQuartile,
+    cr.HighestScoringTitle,
+    cr.MedianScore,
+    cr.TotalPosts,
+    cr.UserTotalPosts,
+    cr.UserMaxViewCount,
+    cr.UserAvgViewCount,
+    cr.UserTagHistory,
+    cr.OverallRank,
+    cr.TypeRank,
+    cr.UserScoreRank,
+    cr.ScoreViewSum,
+    cr.CreationYearCategory,
+    cr.TitleLengthCategory,
+    cr.AnswerQuantityCategory,
+    cr.CommentQuantityCategory,
+    cr.ReversedTitle,
+    cr.CleanTitle,
+    cr.TagPreview,
+    cr.ScoreLevel,
+    cr.ScoreToViewRatio,
+    cr.ScoreVsUserAvg,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = cr.PostId AND v.VoteTypeId = 1) THEN TRUE
+        ELSE FALSE
+    END AS HasAcceptedAnswer,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = cr.PostId AND c.UserId IS NOT NULL) THEN TRUE
+        ELSE FALSE
+    END AS HasUserComments,
+    CASE 
+        WHEN cr.ViewCount > (SELECT AVG(p3.ViewCount) FROM Posts p3 WHERE p3.PostTypeId = 1) THEN 'Above Post Average Views'
+        WHEN cr.ViewCount < (SELECT AVG(p3.ViewCount) FROM Posts p3 WHERE p3.PostTypeId = 1) THEN 'Below Post Average Views'
+        ELSE 'At Post Average Views'
+    END AS ViewComparison,
+    CASE 
+        WHEN cr.Score > (SELECT AVG(p4.Score) FROM Posts p4 WHERE p4.PostTypeId = 2) THEN 'Above Answer Average Score'
+        ELSE 'Below Answer Average Score'
+    END AS AnswerScoreComparison,
+    FLOOR(EXTRACT(EPOCH FROM (cr.CreationDate - DATE '2020-01-01'))/86400) AS DaysSinceBaseline,
+    ABS(COALESCE(cr.Score, 0) - COALESCE(cr.AnswerCount, 0)) AS ScoreAnswerDifference,
+    (CASE WHEN cr.CleanTags IS NOT NULL THEN CHAR_LENGTH(cr.CleanTags) ELSE 0 END) AS TagLength,
+    (CASE WHEN cr.Title IS NOT NULL THEN CHAR_LENGTH(cr.Title) ELSE 0 END) AS TitleLength,
+    COALESCE((SELECT COUNT(*) FROM Posts p5 WHERE p5.OwnerUserId = cr.OwnerUserId AND p5.PostTypeId = 1), 0) AS UserQuestionCount,
+    COALESCE((SELECT COUNT(*) FROM Posts p6 WHERE p6.OwnerUserId = cr.OwnerUserId AND p6.PostTypeId = 2), 0) AS UserAnswerCount,
+    (COALESCE(cr.Score, 0) + COALESCE(cr.ViewCount, 0) + COALESCE(cr.AnswerCount, 0)) AS ComprehensiveMetric,
+    CASE 
+        WHEN cr.Score > (SELECT AVG(p7.Score) FROM Posts p7 WHERE p7.PostTypeId = 1) AND cr.ViewCount > 100 THEN 'Viral Quality Post'
+        WHEN cr.Score > 0 AND cr.ViewCount > 0 THEN 'Active Post'
+        WHEN cr.Score <= 0 AND cr.ViewCount = 0 THEN 'Inactive Post'
+        ELSE 'Normal Post'
+    END AS PostStatus,
+    COALESCE((SELECT COUNT(*) FROM Posts p8 WHERE p8.OwnerUserId = cr.OwnerUserId GROUP BY p8.OwnerUserId), 0) AS UserPostDistribution,
+    (CASE 
+        WHEN cr.Score > (SELECT AVG(p9.Score) FROM Posts p9 WHERE p9.PostTypeId = 1) AND cr.ViewCount > (SELECT AVG(p10.ViewCount) FROM Posts p10 WHERE p10.PostTypeId = 1) THEN 1
+        ELSE 0
+    END) AS HighPerformanceIndicator,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = cr.PostId AND pl.LinkTypeId = 3) AS DuplicateLinkCount,
+    (SELECT COUNT(*) FROM PostLinks pl2 WHERE pl2.RelatedPostId = cr.PostId AND pl2.LinkTypeId = 1) AS LinkedPostCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = cr.PostId AND ph.PostHistoryTypeId IN (1, 2, 3)) AS EditCount,
+    (SELECT COUNT(*) FROM Comments c2 WHERE c2.PostId = cr.PostId AND c2.Score > 0) AS PositiveCommentCount,
+    (SELECT AVG(c3.Score) FROM Comments c3 WHERE c3.PostId = cr.PostId) AS AvgCommentScore,
+    CASE 
+        WHEN cr.Score < 0 THEN 'Negative'
+        WHEN cr.Score = 0 THEN 'Neutral'
+        ELSE 'Positive'
+    END AS ScoreSentiment
+FROM ComplexQueryResults cr
+WHERE cr.Score >= -100
+  AND (cr.ViewCount > 50 OR cr.AnswerCount > 1 OR cr.CommentCount > 2)
+  AND cr.CreationDate >= DATE '2021-01-01'
+ORDER BY cr.Score DESC, cr.ViewCount DESC, cr.CreationDate DESC
+FETCH FIRST 1000 ROWS ONLY;

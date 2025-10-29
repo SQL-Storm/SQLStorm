@@ -1,0 +1,176 @@
+-- {"query": "7053.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1587} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as next_score,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as total_posts,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = p.OwnerUserId) 
+            THEN 'Above Average' 
+            ELSE 'Below Average' 
+        END as score_category
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+      AND p.CreationDate >= '2023-01-01'
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) as total_posts,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        MAX(p.CreationDate) as last_post_date,
+        MIN(CASE WHEN p.PostTypeId = 1 THEN p.CreationDate END) as first_question_date,
+        MIN(CASE WHEN p.PostTypeId = 2 THEN p.CreationDate END) as first_answer_date
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= '2023-01-01'
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > (SELECT AVG(Count) FROM Tags) THEN 'High Frequency'
+            WHEN t.Count < (SELECT AVG(Count) FROM Tags) THEN 'Low Frequency'
+            ELSE 'Average Frequency'
+        END as frequency_category,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'Required Tag'
+            WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only'
+            ELSE 'Regular Tag'
+        END as tag_type
+    FROM Tags t
+    WHERE t.Count > 0
+),
+PostPerformance AS (
+    SELECT 
+        rp.PostId,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.ren,
+        rp.prev_score,
+        rp.next_score,
+        rp.total_posts,
+        rp.avg_score,
+        rp.score_category,
+        CASE 
+            WHEN rp.Score > 1000 THEN 'Highly Popular'
+            WHEN rp.Score > 100 THEN 'Popular'
+            WHEN rp.Score > 10 THEN 'Moderate'
+            WHEN rp.Score > 0 THEN 'Low'
+            ELSE 'Negative'
+        END as popularity_level,
+        CASE 
+            WHEN rp.AnswerCount > 0 AND rp.CommentCount > 0 THEN 1
+            WHEN rp.AnswerCount > 0 OR rp.CommentCount > 0 THEN 0
+            ELSE -1
+        END as engagement_flag,
+        CASE 
+            WHEN rp.Tags IS NOT NULL AND LENGTH(rp.Tags) > 0 THEN 
+                ARRAY_LENGTH(SPLIT_PART(rp.Tags, '><', 1), '><')
+            ELSE 0
+        END as tag_count,
+        ABS(COALESCE(rp.next_score, 0) - COALESCE(rp.prev_score, 0)) as score_volatility
+    FROM RankedPosts rp
+)
+SELECT 
+    ps.UserId,
+    ps.DisplayName,
+    ps.Reputation,
+    ps.total_posts,
+    ps.total_score,
+    ps.avg_score,
+    ps.last_post_date,
+    ps.first_question_date,
+    ps.first_answer_date,
+    pa.PostId,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.CreationDate,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.score_category,
+    pa.popularity_level,
+    pa.engagement_flag,
+    pa.tag_count,
+    pa.score_volatility,
+    ta.TagName,
+    ta.Count as tag_frequency,
+    ta.frequency_category,
+    ta.tag_type,
+    CASE 
+        WHEN ps.total_posts > 50 AND ps.avg_score > 100 THEN 'High Performing User'
+        WHEN ps.total_posts > 20 AND ps.avg_score > 50 THEN 'Mid Performing User'
+        WHEN ps.total_posts > 5 THEN 'Low Performing User'
+        ELSE 'New User'
+    END as user_performance_category,
+    CASE 
+        WHEN pa.Score > 100 AND pa.ViewCount > 1000 THEN 'Viral Post'
+        WHEN pa.Score > 50 AND pa.ViewCount > 500 THEN 'Engaging Post'
+        WHEN pa.Score > 10 AND pa.ViewCount > 100 THEN 'Regular Post'
+        ELSE 'Low Engagement Post'
+    END as post_engagement_level,
+    RANK() OVER (ORDER BY pa.Score DESC, pa.ViewCount DESC) as post_rank,
+    DENSE_RANK() OVER (PARTITION BY ps.UserId ORDER BY pa.CreationDate) as user_post_sequence,
+    COALESCE(DATEDIFF(CURDATE(), pa.CreationDate), 0) as days_since_post,
+    COALESCE(pa.ViewCount / NULLIF(pa.Score, 0), 0) as view_to_score_ratio,
+    CASE 
+        WHEN pa.prev_score IS NULL AND pa.next_score IS NOT NULL THEN 'First Post'
+        WHEN pa.prev_score IS NOT NULL AND pa.next_score IS NULL THEN 'Last Post'
+        WHEN pa.prev_score IS NOT NULL AND pa.next_score IS NOT NULL THEN 'Mid Post'
+        ELSE 'Single Post'
+    END as post_position
+FROM UserStats ps
+INNER JOIN PostPerformance pa ON ps.UserId = pa.OwnerUserId
+LEFT JOIN TagAnalysis ta ON pa.Tags IS NOT NULL 
+    AND ta.TagName IN (
+        SELECT TRIM(BOTH '<>' FROM UNNEST(STRING_TO_ARRAY(pa.Tags, '><')))
+        WHERE pa.Tags IS NOT NULL AND LENGTH(pa.Tags) > 0
+    )
+WHERE ps.total_posts > 0 
+  AND pa.total_posts > 1
+  AND ps.Reputation > 100
+  AND (pa.Score > 0 OR pa.ViewCount > 100)
+  AND (
+    pa.Score > (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = ps.UserId)
+    OR pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE OwnerUserId = ps.UserId)
+  )
+  AND CASE 
+    WHEN ta.TagName IS NOT NULL THEN 
+      ta.frequency_category IN ('High Frequency', 'Average Frequency')
+    ELSE TRUE
+  END
+ORDER BY pa.Score DESC, pa.ViewCount DESC, ps.Reputation DESC, pa.CreationDate DESC
+LIMIT 1000;

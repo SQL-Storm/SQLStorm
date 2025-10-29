@@ -1,0 +1,171 @@
+-- {"query": "1002.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2504} 
+
+WITH UserEngagement AS (
+    -- CTE 1: Summarize user engagement and ranking
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        -- Detect if a user has at least one Gold badge (Class = 1)
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        -- Rank users by reputation globally
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        -- Divide users into 10 reputation deciles
+        NTILE(10) OVER (ORDER BY u.Reputation) AS ReputationDecile,
+        -- Calculate the ratio of upvotes to downvotes, handling potential division by zero and NULLs
+        CAST(u.UpVotes AS NUMERIC) / NULLIF(u.DownVotes, 0) AS UpDownVoteRatio,
+        -- Correlated subquery: Find the creation date of the user's most recent post
+        (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS MostRecentPostDate,
+        -- Calculate the approximate number of days since the user's last access
+        EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - u.LastAccessDate)) / 86400.0 AS DaysSinceLastAccess
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostDetails AS (
+    -- CTE 2: Extract and calculate question-specific details
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastEditDate,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.Title,
+        p.Tags,
+        -- Calculate a composite 'popularity score' using various metrics and COALESCE for NULLs
+        (p.Score * 2 + COALESCE(p.ViewCount, 0) / 100.0 + COALESCE(p.AnswerCount, 0) * 3 + COALESCE(p.CommentCount, 0) * 1.5 + COALESCE(p.FavoriteCount, 0) * 5) AS PopularityScore,
+        -- String manipulation: Format tags from 'tag1><tag2>' to 'tag1,tag2'
+        TRIM(BOTH '>' FROM REPLACE(REPLACE(p.Tags, '>', ','), '<', '')) AS FormattedTags,
+        -- Determine the current status of the question using CASE statements
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+            WHEN p.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Open'
+        END AS QuestionStatus,
+        -- Correlated subquery: Get the DisplayName of the user who performed the most recent content edit
+        (SELECT ph.UserDisplayName
+         FROM PostHistory ph
+         WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6) -- Edit Title, Body, Tags
+         ORDER BY ph.CreationDate DESC
+         LIMIT 1) AS LastEditorDisplayNameFromHistory,
+        -- Correlated subquery: Count the number of distinct users who have edited the post
+        (SELECT COUNT(DISTINCT UserId) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS DistinctEditors
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Focus only on questions
+),
+PostHistoryAggregates AS (
+    -- CTE 3: Analyze post history for each question to understand editing patterns
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEntries,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) AS EditCount, -- Count only actual content edits
+        COUNT(DISTINCT ph.UserId) AS DistinctContributorsToHistory,
+        MIN(ph.CreationDate) AS FirstHistoryEvent,
+        MAX(ph.CreationDate) AS LastHistoryEvent,
+        -- Correlated subquery: Find the name of the last close reason if the post was closed
+        (SELECT crt.Name
+         FROM PostHistory ph_close
+         JOIN CloseReasonTypes crt ON CAST(ph_close.Comment AS smallint) = crt.Id -- Explicit cast for Comment (CloseReasonId)
+         WHERE ph_close.PostId = ph.PostId
+           AND ph_close.PostHistoryTypeId = 10 -- Post Closed event
+         ORDER BY ph_close.CreationDate DESC
+         LIMIT 1) AS LastCloseReason,
+        -- Window function: Calculate the average time difference (in days) between consecutive edits for a post
+        AVG(EXTRACT(EPOCH FROM (LEAD(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) - ph.CreationDate)) / 86400.0) AS AvgDaysBetweenEdits
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+AnswerQuality AS (
+    -- CTE 4: Analyze the quality and count of answers associated with each question
+    SELECT
+        q.Id AS QuestionId,
+        COUNT(a.Id) AS TotalAnswers,
+        COALESCE(SUM(a.Score), 0) AS TotalAnswerScore,
+        COALESCE(AVG(a.Score), 0.0) AS AverageAnswerScore,
+        -- Correlated subquery: Get the score of the accepted answer
+        (SELECT p_acc.Score FROM Posts p_acc WHERE p_acc.Id = q.AcceptedAnswerId) AS AcceptedAnswerScore,
+        -- Correlated subquery: Get the reputation of the user who owns the accepted answer
+        (SELECT u_acc.Reputation FROM Posts p_acc JOIN Users u_acc ON p_acc.OwnerUserId = u_acc.Id WHERE p_acc.Id = q.AcceptedAnswerId) AS AcceptedAnswerOwnerReputation
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2 -- Link answers to their parent questions
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.AcceptedAnswerId
+)
+-- Main Query: Combine all derived information to identify characteristics of questions and their users
+SELECT
+    pd.PostId,
+    pd.Title,
+    ue.DisplayName AS QuestionOwnerDisplayName,
+    ue.Reputation AS QuestionOwnerReputation,
+    ue.ReputationRank AS QuestionOwnerReputationRank,
+    ue.ReputationDecile AS QuestionOwnerReputationDecile,
+    ue.TotalBadges AS QuestionOwnerBadges,
+    pd.PostCreationDate,
+    pd.PostScore,
+    pd.ViewCount,
+    pd.AnswerCount,
+    aq.TotalAnswers,
+    aq.AverageAnswerScore,
+    aq.AcceptedAnswerScore,
+    aq.AcceptedAnswerOwnerReputation,
+    pd.PopularityScore,
+    pd.QuestionStatus,
+    pd.FormattedTags,
+    ph_agg.EditCount AS TotalEditsToQuestion,
+    ph_agg.DistinctContributorsToHistory,
+    ph_agg.AvgDaysBetweenEdits,
+    ph_agg.LastCloseReason,
+    pd.LastEditorDisplayNameFromHistory,
+    pd.DistinctEditors,
+    -- Correlated subquery: Count explicit upvotes from the 'Votes' table for the question
+    (SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) FROM Votes v WHERE v.PostId = pd.PostId) AS TotalUpVotesFromVotesTable,
+    -- Complex CASE statement for categorizing question engagement based on multiple criteria
+    CASE
+        WHEN pd.AnswerCount > 5 AND pd.Score > 100 AND pd.ViewCount > 10000 THEN 'Highly Engaged & Popular'
+        WHEN pd.Score > 50 AND ph_agg.EditCount > 5 THEN 'Well-Maintained & Valued'
+        WHEN pd.ClosedDate IS NOT NULL AND ph_agg.LastCloseReason LIKE '%Duplicate%' THEN 'Closed as Duplicate'
+        ELSE 'Standard Activity'
+    END AS QuestionEngagementCategory,
+    -- Window function: Rank questions by popularity within their owner's reputation decile
+    RANK() OVER (PARTITION BY ue.ReputationDecile ORDER BY pd.PopularityScore DESC) AS RankWithinOwnerRepDecile,
+    -- NULL logic: Provide 'Community User' as default if OwnerDisplayName is NULL
+    COALESCE(ue.DisplayName, 'Community User') AS EffectiveOwner,
+    -- Identify "Evergreen Questions" that are old but still active
+    CASE
+        WHEN pd.PostCreationDate < CURRENT_TIMESTAMP - INTERVAL '1 year' -- Older than 1 year
+             AND pd.ViewCount > 5000 -- High view count
+             AND ph_agg.LastHistoryEvent > CURRENT_TIMESTAMP - INTERVAL '6 months' -- Recent activity
+        THEN 'Evergreen Question'
+        ELSE 'Normal'
+    END AS LifecycleStage
+FROM PostDetails pd
+LEFT JOIN UserEngagement ue ON pd.OwnerUserId = ue.UserId
+LEFT JOIN PostHistoryAggregates ph_agg ON pd.PostId = ph_agg.PostId
+LEFT JOIN AnswerQuality aq ON pd.PostId = aq.QuestionId
+WHERE pd.PostScore > 5 -- Filter for questions with a moderate score
+  AND ue.Reputation > 100 -- Filter for owners with some reputation
+  -- Complex predicate: Filter for questions that are either well-answered or highly popular by reputable owners
+  AND (
+        (aq.TotalAnswers > 0 AND aq.AcceptedAnswerScore > 10) -- Has good accepted answer
+        OR (pd.ViewCount > 5000 AND pd.FavoriteCount > 10 AND ue.HasGoldBadge = 1) -- High views/favorites by Gold badge owner
+      )
+  -- Another complex predicate: Filter based on specific tags or recent editing activity
+  AND (
+        (pd.FormattedTags LIKE '%sql%' OR pd.FormattedTags LIKE '%database%' OR pd.FormattedTags LIKE '%performance%') -- Tag-based filtering
+        OR (pd.LastEditDate IS NOT NULL AND pd.LastEditorDisplayNameFromHistory IS NOT NULL) -- Recently edited by a known editor
+      )
+ORDER BY pd.PopularityScore DESC, ue.Reputation DESC
+LIMIT 100;

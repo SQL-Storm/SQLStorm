@@ -1,0 +1,134 @@
+-- {"query": "2107.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1426} 
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Date,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc, b.Name) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Date is not null
+),
+LatestBadges as (
+    select UserId, DisplayName, BadgeName, Class, Date
+    from RecursiveUserBadges
+    where BadgeRank <= 3
+),
+QuestionAnswerStats as (
+    select
+        p.OwnerUserId,
+        count(distinct case when pt.Name = 'Question' then p.Id end) as QuestionsCount,
+        count(distinct case when pt.Name = 'Answer' then p.Id end) as AnswersCount,
+        avg(case when pt.Name = 'Answer' then p.Score else null end) as AvgAnswerScore,
+        max(case when pt.Name = 'Question' then p.ViewCount else null end) as MaxQuestionViews
+    from Posts p
+    join PostTypes pt on p.PostTypeId = pt.Id
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+    group by p.OwnerUserId
+),
+PostLinksCounts as (
+    select
+        pl.PostId,
+        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicatesCount,
+        count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId end) as LinkedCount
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId
+),
+UserTopPosts as (
+    select
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        pl.DuplicatesCount,
+        pl.LinkedCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc nulls last) as RankedByScore
+    from Posts p
+    left join PostLinksCounts pl on p.Id = pl.PostId
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(qa.QuestionsCount, 0) as QuestionsCount,
+        coalesce(qa.AnswersCount, 0) as AnswersCount,
+        coalesce(qa.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(qa.MaxQuestionViews, 0) as MaxQuestionViews,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 10) as CloseVotesCount,
+        count(distinct c.Id) as CommentsCount,
+        coalesce(sum(v.VoteTypeId = 2::int)::int, 0) as TotalUpVotes,
+        coalesce(sum(v.VoteTypeId = 3::int)::int, 0) as TotalDownVotes,
+        max(case when u.Location is null or trim(u.Location) = '' then 'Unknown' else u.Location end) as KnownLocation,
+        string_agg(distinct lb.BadgeName || ' (' || case lb.Class when 1 then 'Gold' when 2 then 'Silver' when 3 then 'Bronze' else 'Other' end || ')', ', ') as TopBadges
+    from Users u
+    left join QuestionAnswerStats qa on u.Id = qa.OwnerUserId
+    left join PostHistory ph on u.Id = ph.UserId
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join LatestBadges lb on u.Id = lb.UserId
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, qa.QuestionsCount, qa.AnswersCount, qa.AvgAnswerScore, qa.MaxQuestionViews
+),
+UserRanking as (
+    select
+        uas.*,
+        ntile(5) over (order by Reputation desc) as ReputationQuintile,
+        ntile(5) over (order by QuestionsCount desc) as QuestionActivityQuintile,
+        ntile(5) over (order by AnswersCount desc) as AnswerActivityQuintile
+    from UserActivitySummary uas
+),
+CorrelatedBadgesCount as (
+    select
+        u.Id as UserId,
+        (select count(*) from Badges b where b.UserId = u.Id and b.Class = 1) as GoldBadgeCount,
+        (select count(*) from Badges b where b.UserId = u.Id and b.Class = 2) as SilverBadgeCount,
+        (select count(*) from Badges b where b.UserId = u.Id and b.Class = 3) as BronzeBadgeCount
+    from Users u
+)
+select
+    ur.UserId,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.CreationDate,
+    ur.LastAccessDate,
+    ur.KnownLocation,
+    ur.QuestionsCount,
+    ur.AnswersCount,
+    round(ur.AvgAnswerScore::numeric, 2) as AvgAnswerScore,
+    ur.MaxQuestionViews,
+    ur.CloseVotesCount,
+    ur.CommentsCount,
+    ur.TotalUpVotes,
+    ur.TotalDownVotes,
+    ur.TopBadges,
+    ur.ReputationQuintile,
+    ur.QuestionActivityQuintile,
+    ur.AnswerActivityQuintile,
+    coalesce(cb.GoldBadgeCount,0) as GoldBadgeCount,
+    coalesce(cb.SilverBadgeCount,0) as SilverBadgeCount,
+    coalesce(cb.BronzeBadgeCount,0) as BronzeBadgeCount,
+    (
+        select string_agg(concat_ws(' - ',
+            p.Title,
+            'Score:', p.Score::text,
+            'Views:', coalesce(plc.ViewCount::text, '0'),
+            'Duplicates:', coalesce(pl.DuplicatesCount::text,'0'),
+            'Linked:', coalesce(pl.LinkedCount::text,'0')
+            ), ' | ')
+        from UserTopPosts p
+        left join PostLinksCounts pl on p.PostId = pl.PostId
+        left join Posts plc on p.PostId = plc.Id
+        where p.OwnerUserId = ur.UserId and p.RankedByScore <= 3
+    ) as Top3PostsSummary
+from UserRanking ur
+left join CorrelatedBadgesCount cb on ur.UserId = cb.UserId
+where ur.Reputation > 1000
+order by ur.Reputation desc, ur.QuestionsCount desc
+limit 100;

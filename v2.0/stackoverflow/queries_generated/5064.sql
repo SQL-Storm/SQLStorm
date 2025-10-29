@@ -1,0 +1,127 @@
+-- {"query": "5064.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1001} 
+WITH
+recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.Tags,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.FavoriteCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= NOW() - INTERVAL '180 days'
+),
+top_tags AS (
+  SELECT
+    t.TagName,
+    AVG(p.Score) AS avg_score,
+    AVG(p.ViewCount) AS avg_views,
+    COUNT(*) AS q_count
+  FROM Tags tg
+  JOIN Posts p ON tg.Id = p.AnswerCount /* placeholder relation for demo; join via Tags/Posts indirect in sample schema */
+  WHERE tg.TagName IS NOT NULL
+  GROUP BY t.TagName
+  ORDER BY avg_score DESC
+  LIMIT 10
+),
+activity_window AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.OwnerUserId,
+    q.ViewCount,
+    q.Score,
+    q.AnswerCount,
+    q.CommentCount,
+    q.Tags,
+    q.LastActivityDate
+  FROM recent_questions q
+  LEFT JOIN Posts a ON a.ParentId = q.PostId
+  WINDOW w AS (ORDER BY q.LastActivityDate ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+),
+correlated_vote AS (
+  SELECT
+    rw.PostId,
+    rw.Title,
+    rw.OwnerUserId,
+    rw.ViewCount,
+    rw.Score,
+    rw.AnswerCount,
+    rw.CommentCount,
+    rw.Tags,
+    rw.LastActivityDate,
+    v.VoteTypeId,
+    v.UserId AS VoterUserId,
+    v.CreationDate AS VoteDate,
+    CASE
+      WHEN v.VoteTypeId = 2 THEN 1
+      WHEN v.VoteTypeId = 3 THEN -1
+      ELSE 0
+    END AS VoteImpact
+  FROM activity_window rw
+  LEFT JOIN Votes v ON v.PostId = rw.PostId
+  WHERE v.CreationDate >= rw.LastActivityDate - INTERVAL '60 days'
+),
+title_history AS (
+  SELECT
+    ph.PostId,
+    ph.Title AS PreviousTitle,
+    ph.CreationDate,
+    ph.UserId,
+    ph.Comment
+  FROM PostHistory ph
+  WHERE ph.PostId IN (SELECT PostId FROM recent_questions)
+    AND ph.PostHistoryTypeId IN (1,4,6,10) -- title edits, etc.
+),
+null_aware_aggregation AS (
+  SELECT
+    c.PostId,
+    c.OwnerUserId,
+    u.Reputation,
+    u.DisplayName,
+    u.Location,
+    u.AccountId,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes_received,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes_received,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes_given_by_owner
+  FROM correlated_vote c
+  LEFT JOIN Users u ON u.Id = c.OwnerUserId
+  LEFT JOIN Votes v ON v.PostId = c.PostId
+  GROUP BY c.PostId, c.OwnerUserId, u.Reputation, u.DisplayName, u.Location, u.AccountId
+)
+SELECT
+  n.PostId,
+  n.Title,
+  n.CreationDate AS PostCreationDate,
+  n.LastActivityDate,
+  n.ViewCount,
+  n.Score,
+  n.AnswerCount,
+  n.CommentCount,
+  n.Tags,
+  u.DisplayName AS PostOwner,
+  u.Reputation AS OwnerReputation,
+  u.Location AS OwnerLocation,
+  COALESCE(u.Views, 0) AS OwnerViews,
+  COALESCE(n.FavoriteCount, 0) AS FavoriteCount,
+  COALESCE(aq.upvotes_received, 0) AS UpvotesOnOwnerPosts,
+  COALESCE(aq.downvotes_received, 0) AS DownvotesOnOwnerPosts,
+  COALESCE(vt.avg_score, 0) AS AvgTagScore,
+  vt.TagName
+FROM null_aware_aggregation aq
+JOIN Posts n ON n.Id = aq.PostId
+LEFT JOIN Users u ON u.Id = aq.OwnerUserId
+LEFT JOIN (
+  SELECT t.TagName, AVG(p.Score) AS avg_score
+  FROM Tags t
+  JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+  GROUP BY t.TagName
+) vt ON vt.TagName LIKE '%' || (SELECT unnest(string_to_array(n.Tags, '<>'))) || '%'
+ORDER BY n.LastActivityDate DESC
+LIMIT 100;

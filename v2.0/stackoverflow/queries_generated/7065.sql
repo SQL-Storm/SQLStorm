@@ -1,0 +1,227 @@
+-- {"query": "7065.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1797} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as moving_avg_score,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as score_category,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                (SELECT COUNT(*) FROM unnest(string_to_array(trim(trim(p.Tags, '<>'), '><')) as tag)
+            ELSE 0
+        END as tag_count
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(SUM(p.Score), 0) as total_score,
+        COUNT(p.Id) as post_count,
+        AVG(p.Score) as avg_post_score,
+        MAX(p.CreationDate) as latest_activity,
+        STRING_AGG(DISTINCT p.Tags, ', ') as all_tags_used,
+        CASE 
+            WHEN COUNT(p.Id) > 100 THEN 'Veteran'
+            WHEN COUNT(p.Id) > 50 THEN 'Experienced'
+            ELSE 'Beginner'
+        END as user_level
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 500 THEN 'Moderate'
+            ELSE 'Niche'
+        END as tag_category,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') as posts_with_tag
+    FROM Tags t
+    WHERE t.Count > 100
+),
+PostEngagement AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'Viral'
+            WHEN p.ViewCount > 500 THEN 'Popular'
+            ELSE 'Moderate'
+        END as engagement_level,
+        COALESCE(p.CommentCount + p.AnswerCount, 0) as interaction_count,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'AboveAvg'
+            ELSE 'BelowAvg'
+        END as score_performance,
+        ROW_NUMBER() OVER (ORDER BY (p.CommentCount + p.AnswerCount + p.FavoriteCount) DESC) as engagement_rank,
+        LAG(p.ViewCount, 1) OVER (ORDER BY p.CreationDate) as prev_views
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate > '2020-01-01'
+),
+ComplexAnalysis AS (
+    SELECT 
+        rp.Id as PostId,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.score_category,
+        rp.tag_count,
+        rp.moving_avg_score,
+        us.DisplayName as OwnerName,
+        us.total_score,
+        us.post_count,
+        us.avg_post_score,
+        us.user_level,
+        ta.TagName,
+        ta.tag_category,
+        pa.engagement_level,
+        pa.interaction_count,
+        pa.engagement_rank,
+        CASE 
+            WHEN rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) AND 
+                 (rp.AnswerCount > 2 OR rp.CommentCount > 5) THEN 'HighImpact'
+            WHEN rp.Score < 0 THEN 'Negative'
+            ELSE 'Neutral'
+        END as impact_category,
+        CASE 
+            WHEN rp.prev_score IS NOT NULL AND rp.prev_score > rp.Score 
+            THEN 'Decline'
+            WHEN rp.prev_score IS NOT NULL AND rp.prev_score < rp.Score 
+            THEN 'Growth'
+            ELSE 'Stable'
+        END as trend,
+        DATE_TRUNC('month', rp.CreationDate) as activity_month
+    FROM RankedPosts rp
+    LEFT JOIN UserStats us ON rp.OwnerUserId = us.UserId
+    LEFT JOIN (
+        SELECT DISTINCT p.Id, t.TagName
+        FROM Posts p
+        JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+        WHERE p.PostTypeId = 1
+    ) ta ON rp.Id = ta.Id
+    LEFT JOIN PostEngagement pa ON rp.Id = pa.PostId
+    WHERE rp.rn = 1 -- Only latest post per user
+),
+FinalAnalysis AS (
+    SELECT 
+        ca.PostId,
+        ca.PostTypeId,
+        ca.OwnerUserId,
+        ca.OwnerName,
+        ca.Score,
+        ca.ViewCount,
+        ca.Title,
+        ca.Tags,
+        ca.AnswerCount,
+        ca.CommentCount,
+        ca.score_category,
+        ca.tag_count,
+        ca.moving_avg_score,
+        ca.total_score,
+        ca.post_count,
+        ca.avg_post_score,
+        ca.user_level,
+        ca.TagName,
+        ca.tag_category,
+        ca.engagement_level,
+        ca.interaction_count,
+        ca.engagement_rank,
+        ca.impact_category,
+        ca.trend,
+        ca.activity_month,
+        ROW_NUMBER() OVER (PARTITION BY ca.activity_month ORDER BY ca.interaction_count DESC) as monthly_rank,
+        CASE 
+            WHEN ca.Score > 100 AND ca.engagement_level = 'Viral' THEN 'Star'
+            WHEN ca.Score > 50 AND ca.engagement_level IN ('Viral', 'Popular') THEN 'Notable'
+            ELSE 'Regular'
+        END as post_status,
+        (ca.ViewCount - COALESCE(ca.prev_views, 0)) as view_growth,
+        EXTRACT(DAY FROM (CURRENT_TIMESTAMP - ca.CreationDate)) as days_since_creation,
+        ROUND(
+            (ca.interaction_count * 1.0 / NULLIF(ca.ViewCount, 0)) * 100, 2
+        ) as engagement_rate
+    FROM ComplexAnalysis ca
+)
+SELECT 
+    fa.PostId,
+    fa.PostTypeId,
+    fa.OwnerUserId,
+    fa.OwnerName,
+    fa.Score,
+    fa.ViewCount,
+    fa.Title,
+    fa.Tags,
+    fa.AnswerCount,
+    fa.CommentCount,
+    fa.score_category,
+    fa.tag_count,
+    fa.moving_avg_score,
+    fa.total_score,
+    fa.post_count,
+    fa.avg_post_score,
+    fa.user_level,
+    fa.TagName,
+    fa.tag_category,
+    fa.engagement_level,
+    fa.interaction_count,
+    fa.engagement_rank,
+    fa.impact_category,
+    fa.trend,
+    fa.activity_month,
+    fa.monthly_rank,
+    fa.post_status,
+    fa.view_growth,
+    fa.days_since_creation,
+    fa.engagement_rate,
+    CASE 
+        WHEN fa.engagement_rate > 10 THEN 'High Engagement'
+        WHEN fa.engagement_rate > 5 THEN 'Medium Engagement'
+        ELSE 'Low Engagement'
+    END as engagement_label
+FROM FinalAnalysis fa
+WHERE fa.days_since_creation < 365
+  AND fa.engagement_rate IS NOT NULL
+  AND fa.engagement_rate BETWEEN 0 AND 100
+  AND (fa.post_status = 'Star' OR fa.post_status = 'Notable')
+ORDER BY fa.engagement_rank, fa.Score DESC, fa.ViewCount DESC
+LIMIT 1000;

@@ -1,0 +1,150 @@
+-- {"query": "3675.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1604} 
+
+WITH
+-- 1. Basic user activity metrics
+user_activity AS (
+    SELECT
+        u.Id                                   AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.Location, 'Unknown')        AS location,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS question_count,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS answer_count,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 3) AS wiki_count,
+        SUM(p.Score)                           AS total_score,
+        AVG(p.Score)                           AS avg_score,
+        MAX(p.CreationDate)                    AS last_post_date
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+
+-- 2. Badge aggregates per user
+badge_stats AS (
+    SELECT
+        b.UserId                             AS user_id,
+        COUNT(*)                             AS total_badges,
+        COUNT(*) FILTER (WHERE b.Class = 1)  AS gold_badges,
+        COUNT(*) FILTER (WHERE b.Class = 2)  AS silver_badges,
+        COUNT(*) FILTER (WHERE b.Class = 3)  AS bronze_badges,
+        STRING_AGG(DISTINCT b.Name, '; ')    AS badge_list
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- 3. Recent voting activity (correlated subquery inside CTE)
+recent_votes AS (
+    SELECT
+        v.UserId                             AS voter_id,
+        COUNT(*)                             AS recent_vote_count,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS downvotes,
+        MAX(v.CreationDate)                  AS last_vote_date
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= (CURRENT_DATE - INTERVAL '30 days')
+    GROUP BY v.UserId
+),
+
+-- 4. Tag usage per user (derived from post tags)
+user_tag_usage AS (
+    SELECT
+        p.OwnerUserId                         AS user_id,
+        t.TagName,
+        COUNT(*)                              AS tag_uses,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC) AS tag_rank
+    FROM Posts p
+    JOIN LATERAL (
+        SELECT UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag
+    ) AS taglist(tag) ON true
+    JOIN Tags t ON t.TagName = taglist.tag
+    WHERE p.PostTypeId = 1                     -- only questions
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, t.TagName
+),
+
+-- 5. Users with high recent activity (union of two sets)
+high_activity_users AS (
+    SELECT user_id, 'questions' AS activity_type, question_count AS activity_count
+    FROM user_activity
+    WHERE question_count >= 50
+
+    UNION ALL
+
+    SELECT user_id, 'answers' AS activity_type, answer_count AS activity_count
+    FROM user_activity
+    WHERE answer_count >= 200
+),
+
+-- 6. Final ranking with window functions
+ranked_users AS (
+    SELECT
+        ua.user_id,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.location,
+        ua.question_count,
+        ua.answer_count,
+        ua.wiki_count,
+        ua.total_score,
+        ua.avg_score,
+        ua.last_post_date,
+        bs.total_badges,
+        bs.gold_badges,
+        bs.silver_badges,
+        bs.bronze_badges,
+        bs.badge_list,
+        rv.recent_vote_count,
+        rv.upvotes,
+        rv.downvotes,
+        rv.last_vote_date,
+        ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC) AS reputation_rank,
+        RANK()      OVER (ORDER BY ua.total_score DESC) AS score_rank,
+        DENSE_RANK()OVER (ORDER BY ua.question_count + ua.answer_count DESC) AS activity_rank
+    FROM user_activity ua
+    LEFT JOIN badge_stats bs   ON bs.user_id = ua.user_id
+    LEFT JOIN recent_votes rv ON rv.voter_id = ua.user_id
+)
+
+SELECT
+    ru.user_id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.location,
+    ru.question_count,
+    ru.answer_count,
+    ru.wiki_count,
+    ru.total_score,
+    ROUND(ru.avg_score::numeric,2)                                      AS avg_score,
+    ru.last_post_date,
+    ru.total_badges,
+    ru.gold_badges,
+    ru.silver_badges,
+    ru.bronze_badges,
+    COALESCE(ru.badge_list, 'None')                                     AS badges,
+    COALESCE(rv.recent_vote_count,0)                                    AS recent_votes,
+    COALESCE(rv.upvotes,0)                                              AS recent_upvotes,
+    COALESCE(rv.downvotes,0)                                            AS recent_downvotes,
+    rv.last_vote_date,
+    ru.reputation_rank,
+    ru.score_rank,
+    ru.activity_rank,
+    -- Most used tag (if any) via a correlated subquery
+    (SELECT tt.TagName
+       FROM user_tag_usage tt
+      WHERE tt.user_id = ru.user_id
+        AND tt.tag_rank = 1)                                            AS top_tag,
+    -- Flag if user has any gold badges OR high recent activity
+    CASE
+        WHEN ru.gold_badges > 0 THEN 'GoldBadgeHolder'
+        WHEN EXISTS (
+            SELECT 1 FROM high_activity_users hau
+            WHERE hau.user_id = ru.user_id AND hau.activity_type = 'answers' AND hau.activity_count >= 250
+        ) THEN 'PowerAnswerer'
+        ELSE 'RegularUser'
+    END                                                                AS user_category
+FROM ranked_users ru
+LEFT JOIN recent_votes rv ON rv.voter_id = ru.user_id
+WHERE ru.reputation_rank <= 1000
+ORDER BY ru.reputation_rank;

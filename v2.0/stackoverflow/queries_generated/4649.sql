@@ -1,0 +1,147 @@
+-- {"query": "4649.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1393} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+    FROM
+        Posts p
+    JOIN
+        PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE
+        p.OwnerUserId IS NOT NULL
+        AND p.Score > 0
+        AND p.CreationDate > DATE('now', '-1 year')
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE NULL END) AS AvgAnswersPerQuestion,
+        MAX(u.Reputation) AS MaxReputation
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE
+        u.Id IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE CreationDate > DATE('now', '-1 year'))
+    GROUP BY
+        u.Id, u.DisplayName
+),
+HotQuestions AS (
+    SELECT
+        Id,
+        Title,
+        Tags,
+        CreationDate,
+        Score,
+        ROW_NUMBER() OVER (ORDER BY Score DESC, CreationDate DESC) AS Rank
+    FROM
+        Posts
+    WHERE
+        PostTypeId = 1
+        AND Score > 1000
+        AND CreationDate > DATE('now', '-3 months')
+),
+TagPerformance AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS TotalPosts,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews
+    FROM
+        Tags t
+    JOIN
+        Posts p ON p.Tags LIKE '%' || t.TagName || '%' AND p.PostTypeId = 1
+    GROUP BY
+        t.TagName
+    HAVING
+        COUNT(p.Id) > 50
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        CASE
+            WHEN u.LastAccessDate < DATE('now', '-6 months') THEN 'Inactive'
+            WHEN u.LastAccessDate < DATE('now', '-1 month') THEN 'Less Active'
+            ELSE 'Active'
+        END AS ActivityLevel
+    FROM
+        Users u
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+    GROUP BY
+        u.Id, u.DisplayName, u.LastAccessDate
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    ups.DisplayName AS OwnerDisplayName,
+    ups.QuestionCount,
+    ups.AnswerCount AS UserAnswerCount,
+    ups.TotalQuestionScore,
+    ups.TotalAnswerScore,
+    ups.AvgAnswersPerQuestion,
+    hq.Title AS HotQuestionTitle,
+    hq.Rank AS HotQuestionRank,
+    tp.TagName AS TopTag,
+    tp.AvgScore AS TopTagAvgScore,
+    uas.ActivityLevel,
+    uas.CommentCount AS UserCommentCount,
+    uas.PostHistoryCount AS UserPostHistoryCount,
+    uas.BadgeCount AS UserBadgeCount,
+    uas.UpVoteCount AS UserUpVotes,
+    uas.DownVoteCount AS UserDownVotes,
+    COALESCE(u.WebsiteUrl, 'No Website') AS UserWebsite,
+    CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus
+FROM
+    RankedPosts rp
+LEFT JOIN
+    UserPostStats ups ON rp.OwnerUserId = ups.UserId
+LEFT JOIN
+    HotQuestions hq ON rp.rn <= 5 AND rp.PostTypeId = 1
+LEFT JOIN
+    TagPerformance tp ON rp.PostId = (SELECT Id FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%' || tp.TagName || '%' ORDER BY Score DESC LIMIT 1)
+LEFT JOIN
+    UserActivitySummary uas ON rp.OwnerUserId = uas.Id
+LEFT JOIN
+    Users u ON rp.OwnerUserId = u.Id
+LEFT JOIN
+    Posts p ON rp.PostId = p.Id
+WHERE
+    rp.rn <= 10
+    AND ups.MaxReputation > 10000
+    AND (tp.TotalPosts IS NULL OR tp.TotalPosts > 100)
+    AND uas.ActivityLevel <> 'Inactive'
+    AND rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = rp.PostTypeId AND CreationDate > DATE('now', '-30 days'))
+ORDER BY
+    rp.rn, ups.MaxReputation DESC;

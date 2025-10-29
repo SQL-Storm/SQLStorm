@@ -1,0 +1,186 @@
+-- {"query": "2674.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1755} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score as PostScore,
+        p.ViewCount,
+        p.CreationDate as PostCreationDate,
+        ph.CreationDate as LastEditDate,
+        ph.PostHistoryTypeId,
+        ph.Comment as CloseReasonId,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as rn
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.PostId = p.Id and ph.CreationDate = (
+        select max(ph2.CreationDate) 
+        from PostHistory ph2 
+        where ph2.PostId = p.Id
+    )
+    where u.Reputation > 1000
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+UserPostScoresWindow as (
+    select
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.Score,
+        avg(p.Score) over (partition by p.OwnerUserId) as AvgPostScore,
+        max(p.Score) over (partition by p.OwnerUserId) as MaxPostScore,
+        count(*) over (partition by p.OwnerUserId) as TotalPosts
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+UserTagsUsage as (
+    select
+        p.OwnerUserId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as TagName
+    from Posts p
+    where p.Tags is not null and p.PostTypeId = 1
+),
+UserTopTags as (
+    select
+        uto.OwnerUserId as UserId,
+        uto.TagName,
+        count(*) as TagUsageCount,
+        rank() over (partition by uto.OwnerUserId order by count(*) desc) as TagRank
+    from UserTagsUsage uto
+    group by uto.OwnerUserId, uto.TagName
+    having count(*) > 2
+),
+FilteredUserTopTags as (
+    select UserId, TagName, TagUsageCount
+    from UserTopTags
+    where TagRank <= 3
+),
+PostsWithLinkInfo as (
+    select
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        pl.LinkTypeId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+),
+JoinedCommentsVotes as (
+    select
+        c.PostId,
+        count(distinct c.Id) as CommentsCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesCount,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesCount,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as FavoriteVotesCount
+    from Comments c
+    left join Votes v on v.PostId = c.PostId
+    group by c.PostId
+),
+ComplexUserStats as (
+    select
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        count(distinct ru.PostId) filter (where ru.PostTypeId = 1) as QuestionCount,
+        count(distinct ru.PostId) filter (where ru.PostTypeId = 2) as AnswerCount,
+        coalesce(avg(ups.AvgPostScore), 0) as AvgPostScore,
+        coalesce(max(ups.MaxPostScore), 0) as MaxPostScore,
+        coalesce(sum(ups.TotalPosts), 0) as TotalPosts,
+        string_agg(distinct ft.TagName, ', ' order by ft.TagUsageCount desc) as TopTags,
+        max(nullif(ru.PostScore, 0)) as MaxPostScorePerUser,
+        bool_or(ru.PostHistoryTypeId = 10 AND ru.CloseReasonId::int in (101, 102, 103, 104, 105)) as HasClosedPosts,
+        min(ru.PostCreationDate) as FirstPostDate,
+        max(ru.PostCreationDate) as LastPostDate,
+        max(ru.LastEditDate) as LastEditDate
+    from RecursiveUserActivity ru
+    left join UserBadgeCounts ub on ub.UserId = ru.UserId
+    left join UserPostScoresWindow ups on ups.OwnerUserId = ru.UserId
+    left join FilteredUserTopTags ft on ft.UserId = ru.UserId
+    group by ru.UserId, ru.DisplayName, ru.Reputation, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges
+),
+RecentHighScorePosts as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        rank() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as ScoreRank
+    from Posts p
+    where p.CreationDate > cast('2024-10-01' as date) - interval '1 year'
+      and p.Score > 10
+      and p.PostTypeId = 1
+),
+FinalSelection as (
+    select
+        cus.UserId,
+        cus.DisplayName,
+        cus.Reputation,
+        cus.GoldBadges,
+        cus.SilverBadges,
+        cus.BronzeBadges,
+        cus.QuestionCount,
+        cus.AnswerCount,
+        cus.AvgPostScore,
+        cus.MaxPostScore,
+        cus.TotalPosts,
+        cus.TopTags,
+        cus.HasClosedPosts,
+        cus.FirstPostDate,
+        cus.LastPostDate,
+        cus.LastEditDate,
+        rhp.Id as RecentHighScorePostId,
+        rhp.Title as RecentHighScorePostTitle,
+        rhp.Score as RecentHighScorePostScore,
+        rhp.ViewCount as RecentHighScorePostViewCount
+    from ComplexUserStats cus
+    left join RecentHighScorePosts rhp on rhp.OwnerUserId = cus.UserId and rhp.ScoreRank = 1
+    where cus.Reputation > 5000
+      and cus.TotalPosts > 10
+)
+select
+    fs.UserId,
+    fs.DisplayName,
+    fs.Reputation,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.QuestionCount,
+    fs.AnswerCount,
+    round(fs.AvgPostScore::numeric, 2) as AvgPostScore,
+    fs.MaxPostScore,
+    fs.TotalPosts,
+    coalesce(fs.TopTags, 'None') as TopTags,
+    case when fs.HasClosedPosts then 'Yes' else 'No' end as HasClosedPosts,
+    to_char(fs.FirstPostDate, 'YYYY-MM-DD') as FirstPostDate,
+    to_char(fs.LastPostDate, 'YYYY-MM-DD') as LastPostDate,
+    to_char(fs.LastEditDate, 'YYYY-MM-DD') as LastEditDate,
+    fs.RecentHighScorePostId,
+    fs.RecentHighScorePostTitle,
+    fs.RecentHighScorePostScore,
+    fs.RecentHighScorePostViewCount,
+    length(coalesce(fs.RecentHighScorePostTitle, '')) as TitleLength,
+    CASE
+        WHEN fs.RecentHighScorePostScore > 50 THEN 'Very High'
+        WHEN fs.RecentHighScorePostScore BETWEEN 20 AND 50 THEN 'High'
+        WHEN fs.RecentHighScorePostScore BETWEEN 10 AND 19 THEN 'Moderate'
+        ELSE 'Low'
+    END as PostScoreRange
+from FinalSelection fs
+order by fs.Reputation desc nulls last, fs.TotalPosts desc nulls last
+limit 100;

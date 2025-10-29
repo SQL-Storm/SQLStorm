@@ -1,0 +1,347 @@
+-- {"query": "651.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3215} 
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm,
+    date_trunc('month', u.creationdate) as cohort_month
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+user_badge_agg as (
+  select
+    b.userid,
+    count(*) as total_badges,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    min(b.date) as first_badge_date,
+    max(b.date) as last_badge_date
+  from badges b
+  where b.date >= (select min(creationdate) from recent_users)
+  group by b.userid
+),
+question_posts as (
+  select
+    p.id,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.commentcount,
+    p.favoritecount,
+    p.title,
+    p.tags,
+    p.acceptedanswerid,
+    p.closeddate
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select min(creationdate) from recent_users)
+),
+answer_posts as (
+  select
+    p.id,
+    p.parentid,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.commentcount
+  from posts p
+  where p.posttypeid = 2
+    and p.creationdate >= (select min(creationdate) from recent_users)
+),
+user_post_activity as (
+  select
+    ru.user_id,
+    count(distinct qp.id) as questions_asked,
+    count(distinct ap.id) as answers_given,
+    avg(qp.score) filter (where qp.id is not null) as avg_question_score,
+    avg(ap.score) filter (where ap.id is not null) as avg_answer_score,
+    sum(qp.viewcount) filter (where qp.id is not null) as total_question_views,
+    sum(qp.favoritecount) filter (where qp.id is not null) as total_question_favs,
+    max(greatest(coalesce(qp.creationdate, timestamp 'epoch'), coalesce(ap.creationdate, timestamp 'epoch'))) as last_post_activity
+  from recent_users ru
+  left join question_posts qp on qp.owneruserid = ru.user_id
+  left join answer_posts ap on ap.owneruserid = ru.user_id
+  group by ru.user_id
+),
+vote_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_flow
+  from votes v
+  where v.creationdate >= (select min(creationdate) from recent_users)
+  group by v.postid
+),
+question_enriched as (
+  select
+    qp.id as question_id,
+    qp.owneruserid as owner_id,
+    qp.creationdate as q_created,
+    qp.score as q_score,
+    qp.viewcount as q_views,
+    qp.answercount as q_answers,
+    qp.commentcount as q_comments,
+    qp.favoritecount as q_favs,
+    qp.title,
+    qp.tags,
+    qp.acceptedanswerid,
+    qp.closeddate,
+    va.upvotes as q_up,
+    va.downvotes as q_down,
+    va.favorites as q_fav_votes,
+    va.bounty_flow as q_bounty
+  from question_posts qp
+  left join vote_agg va on va.postid = qp.id
+),
+answer_enriched as (
+  select
+    ap.id as answer_id,
+    ap.parentid as question_id,
+    ap.owneruserid as owner_id,
+    ap.creationdate as a_created,
+    ap.score as a_score,
+    ap.commentcount as a_comments,
+    va.upvotes as a_up,
+    va.downvotes as a_down
+  from answer_posts ap
+  left join vote_agg va on va.postid = ap.id
+),
+answer_stats as (
+  select
+    ae.question_id,
+    count(*) as answers_total,
+    sum(case when ae.a_score > 0 then 1 else 0 end) as answers_positive,
+    max(ae.a_score) as max_answer_score,
+    min(ae.a_score) as min_answer_score,
+    avg(ae.a_score) as avg_answer_score,
+    count(distinct ae.owner_id) as distinct_answerers,
+    max(ae.a_created) as last_answer_time
+  from answer_enriched ae
+  group by ae.question_id
+),
+accepted_answer_gap as (
+  select
+    qe.question_id,
+    min(ae.a_created) filter (where ae.answer_id = qe.acceptedanswerid) as accepted_time,
+    qe.q_created as question_time
+  from question_enriched qe
+  left join answer_enriched ae on ae.answer_id = qe.acceptedanswerid
+  group by qe.question_id, qe.q_created
+),
+question_quality as (
+  select
+    qe.question_id,
+    qe.owner_id,
+    qe.q_created,
+    qe.q_score,
+    qe.q_views,
+    qe.q_answers,
+    qe.q_comments,
+    qe.q_favs + coalesce(qe.q_fav_votes,0) as total_favs,
+    coalesce(qe.q_up,0) - coalesce(qe.q_down,0) as net_votes,
+    case when qe.closeddate is not null then 1 else 0 end as is_closed,
+    extract(epoch from (aag.accepted_time - aag.question_time)) / 3600.0 as hours_to_accept,
+    asg.answers_total,
+    asg.answers_positive,
+    asg.max_answer_score,
+    asg.min_answer_score,
+    asg.avg_answer_score,
+    asg.distinct_answerers,
+    asg.last_answer_time,
+    -- simple quality score mixing views, votes, answers; protect against nulls and zeros
+    (
+      ln(1 + greatest(qe.q_views, 0)) * 0.4
+      + greatest(coalesce(qe.q_score,0), 0) * 0.3
+      + greatest(coalesce(asg.answers_total,0), 0) * 0.2
+      + greatest(coalesce(asg.answers_positive,0), 0) * 0.1
+      - case when qe.closeddate is not null then 2 else 0 end
+    ) as quality_score
+  from question_enriched qe
+  left join answer_stats asg on asg.question_id = qe.question_id
+  left join accepted_answer_gap aag on aag.question_id = qe.question_id
+),
+tag_exploded as (
+  select
+    qq.question_id,
+    lower(trim(tg)) as tag
+  from question_quality qq
+  cross join lateral (
+    select unnest(string_to_array(substring(qqq.tags, 2, length(qqq.tags)-2), '><')) as tg
+    from (select qq.question_id, qq.owner_id from question_quality qq) qids
+    join question_enriched qqq on qqq.question_id = qids.question_id
+  ) s
+),
+user_tag_mix as (
+  select
+    qq.owner_id as user_id,
+    te.tag,
+    count(*) as tag_q_count,
+    avg(qq.quality_score) as tag_avg_quality,
+    percentile_cont(0.9) within group (order by qq.quality_score) as tag_q90_quality
+  from question_quality qq
+  join tag_exploded te on te.question_id = qq.question_id
+  group by qq.owner_id, te.tag
+),
+user_closure_events as (
+  select
+    ph.userid as user_id,
+    sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as closures_made,
+    sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopens_made
+  from posthistory ph
+  where ph.creationdate >= (select min(creationdate) from recent_users)
+  group by ph.userid
+),
+dupe_links as (
+  select
+    pl.postid as duplicate_of_id,
+    count(*) as duplicate_count_inbound
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid
+),
+user_ranked as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.cohort_month,
+    upa.questions_asked,
+    upa.answers_given,
+    upa.avg_question_score,
+    upa.avg_answer_score,
+    upa.total_question_views,
+    upa.total_question_favs,
+    upa.last_post_activity,
+    uba.total_badges,
+    uba.gold_badges,
+    uba.silver_badges,
+    uba.bronze_badges,
+    uce.closures_made,
+    uce.reopens_made,
+    coalesce(
+      (select avg(qq.quality_score) from question_quality qq where qq.owner_id = ru.user_id),
+      0
+    ) as avg_q_quality,
+    coalesce(
+      (select avg(ae.a_score) from answer_enriched ae where ae.owner_id = ru.user_id),
+      0
+    ) as avg_a_score,
+    coalesce(
+      (select sum(dl.duplicate_count_inbound)
+       from dupe_links dl
+       join question_enriched qe on qe.question_id = dl.duplicate_of_id
+       where qe.owner_id = ru.user_id), 0
+    ) as inbound_dupe_marks
+  from recent_users ru
+  left join user_post_activity upa on upa.user_id = ru.user_id
+  left join user_badge_agg uba on uba.userid = ru.user_id
+  left join user_closure_events uce on uce.user_id = ru.user_id
+),
+scored as (
+  select
+    ur.*,
+    -- composite score with various weights; normalize nulls
+    (
+      coalesce(ur.reputation,0) * 0.002
+      + coalesce(ur.questions_asked,0) * 0.5
+      + coalesce(ur.answers_given,0) * 0.7
+      + coalesce(ur.avg_q_quality,0) * 1.2
+      + coalesce(ur.avg_a_score,0) * 0.8
+      + coalesce(ur.total_badges,0) * 0.1
+      + coalesce(ur.gold_badges,0) * 0.5
+      + coalesce(ur.inbound_dupe_marks,0) * -0.6
+      + case when ur.last_post_activity >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 2 else 0 end
+    ) as composite_score
+  from user_ranked ur
+),
+dense_ranked as (
+  select
+    s.*,
+    dense_rank() over (order by s.composite_score desc nulls last) as dense_rnk,
+    row_number() over (order by s.composite_score desc nulls last, s.user_id) as rn,
+    ntile(10) over (order by s.composite_score desc nulls last) as decile
+  from scored s
+),
+top_users as (
+  select *
+  from dense_ranked
+  where decile in (1,2)
+),
+user_top_tags as (
+  select
+    utm.user_id,
+    string_agg(format('%s:%s', utm.tag, utm.tag_q_count), ', ' order by utm.tag_q_count desc, utm.tag) as top_tags
+  from (
+    select
+      ut.user_id,
+      ut.tag,
+      ut.tag_q_count,
+      row_number() over (partition by ut.user_id order by ut.tag_q_count desc, ut.tag) as rnk
+    from user_tag_mix ut
+  ) utm
+  where utm.rnk <= 5
+  group by utm.user_id
+),
+activity_trend as (
+  select
+    ru.user_id,
+    date_trunc('month', coalesce(p.creationdate, a.creationdate)) as month,
+    count(*) as posts_in_month
+  from recent_users ru
+  left join posts p on p.owneruserid = ru.user_id and p.posttypeid = 1
+  left join posts a on a.owneruserid = ru.user_id and a.posttypeid = 2
+  group by ru.user_id, date_trunc('month', coalesce(p.creationdate, a.creationdate))
+),
+activity_slope as (
+  select
+    at.user_id,
+    -- simple linear approximation using row_number as x; slope of count trend
+    case
+      when count(*) filter (where at.posts_in_month is not null) <= 1 then 0.0
+      else
+        corr(extract(epoch from at.month)::numeric, at.posts_in_month::numeric)
+    end as post_trend_corr
+  from activity_trend at
+  group by at.user_id
+)
+select
+  tu.user_id,
+  tu.displayname,
+  tu.reputation,
+  tu.cohort_month,
+  tu.questions_asked,
+  tu.answers_given,
+  round(tu.avg_q_quality::numeric, 3) as avg_q_quality,
+  round(tu.avg_answer_score::numeric, 3) as avg_answer_score,
+  tu.total_badges,
+  tu.gold_badges,
+  tu.silver_badges,
+  tu.bronze_badges,
+  tu.closures_made,
+  tu.reopens_made,
+  tu.inbound_dupe_marks,
+  round(tu.composite_score::numeric, 3) as composite_score,
+  tu.dense_rnk,
+  tu.decile,
+  coalesce(utt.top_tags, '(none)') as top_tags,
+  round(coalesce(asl.post_trend_corr, 0)::numeric, 4) as activity_trend_corr,
+  case
+    when tu.reputation >= 10000 and tu.answers_given > tu.questions_asked then 'guru'
+    when tu.reputation >= 2000 and tu.avg_q_quality >= 3 then 'rising'
+    when tu.answers_given >= 20 and tu.avg_answer_score >= 1 then 'helper'
+    when tu.questions_asked >= 10 and tu.avg_q_quality < 1 then 'asker'
+    else 'mixed'
+  end as user_archetype
+from top_users tu
+left join user_top_tags utt on utt.user_id = tu.user_id
+left join activity_slope asl on asl.user_id = tu.user_id
+order by tu.composite_score desc, tu.user_id
+limit 200;

@@ -1,0 +1,209 @@
+-- {"query": "1465.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3010} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserTotalUpVotes,
+        U.DownVotes AS UserTotalDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswers,
+        SUM(P.Score) AS TotalPostScoreOwned,
+        AVG(COALESCE(P.ViewCount, 0)) AS AvgPostViewCount,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        -- Calculate days since last access
+        EXTRACT(EPOCH FROM (NOW() - U.LastAccessDate)) / (60 * 60 * 24) AS DaysSinceLastAccess,
+        -- Correlated subquery: Check if user has posted any question with 'sql' tag
+        (SELECT COUNT(DISTINCT Q.Id)
+         FROM Posts Q
+         WHERE Q.OwnerUserId = U.Id
+           AND Q.PostTypeId = 1
+           AND Q.Tags LIKE '%<sql>%'
+        ) AS SqlTaggedQuestionsCount
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        U.Views, U.UpVotes, U.DownVotes
+    HAVING U.Reputation >= 5000 -- Focus on more influential users
+),
+PostHistoryAndCommentEvents AS (
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS EventDate,
+        PH.PostHistoryTypeId,
+        PHT.Name AS HistoryTypeName,
+        PH.UserId AS EventUserId,
+        'PostHistory' AS EventSource,
+        NULLIF(PH.Comment, '') AS EventComment, -- NULLIF for empty strings
+        PH.Text AS EventText
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 16, 33) -- Initial, Edits, Close, Reopen, Delete, Undelete, CommunityOwned, PostNoticeAdded
+    UNION ALL -- Combine post history events with significant comments
+    SELECT
+        C.PostId,
+        C.CreationDate AS EventDate,
+        NULL AS PostHistoryTypeId, -- No direct PostHistoryTypeId for comments
+        'Comment' AS HistoryTypeName,
+        C.UserId AS EventUserId,
+        'Comment' AS EventSource,
+        NULLIF(C.Text, '') AS EventComment,
+        NULL AS EventText
+    FROM Comments C
+    WHERE C.Score > 5 -- Consider only significant comments
+),
+AggregatedPostEvents AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.Title,
+        P.Tags,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        P.ClosedDate,
+        P.LastEditDate,
+        SUM(CASE WHEN PHE.HistoryTypeName LIKE 'Edit%' THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN PHE.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN PHE.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount,
+        SUM(CASE WHEN PHE.HistoryTypeName = 'Comment' THEN 1 ELSE 0 END) AS HighScoreCommentCount,
+        MAX(CASE WHEN PHE.HistoryTypeName LIKE 'Edit%' THEN PHE.EventDate ELSE NULL END) AS LastEditHistoryDate
+    FROM Posts P
+    LEFT JOIN PostHistoryAndCommentEvents PHE ON P.Id = PHE.PostId
+    WHERE P.PostTypeId IN (1, 2) -- Only questions and answers
+    GROUP BY
+        P.Id, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount,
+        P.Title, P.Tags, P.ParentId, P.AcceptedAnswerId, P.ClosedDate, P.LastEditDate
+),
+TopUsersByTagEngagement AS (
+    SELECT
+        UAS.UserId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'))) AS TagName, -- String array manipulation
+        COUNT(DISTINCT P.Id) AS PostsInTag,
+        SUM(P.Score) AS ScoreInTag
+    FROM UserActivitySummary UAS
+    JOIN Posts P ON UAS.UserId = P.OwnerUserId
+    WHERE P.Tags IS NOT NULL
+      AND P.Tags != ''
+      AND P.PostTypeId = 1 -- Only questions for tag engagement
+    GROUP BY UAS.UserId, TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')))
+    HAVING COUNT(DISTINCT P.Id) > 5 -- At least 5 questions in a tag for meaningful engagement
+),
+UserBadgeData AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(CASE WHEN B.Class = 1 THEN B.Date ELSE NULL END) AS LatestGoldBadgeDate,
+        MIN(CASE WHEN B.Class = 1 THEN B.Date ELSE NULL END) AS EarliestGoldBadgeDate
+    FROM Badges B
+    GROUP BY B.UserId
+),
+VoteAnalysis AS (
+    SELECT
+        V.PostId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId IN (4, 12) THEN 1 ELSE 0 END) AS FlagVotesReceived
+    FROM Votes V
+    GROUP BY V.PostId
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.TotalPostsOwned,
+    UAS.TotalQuestionsOwned,
+    UAS.TotalAnswersOwned,
+    UAS.QuestionsWithAcceptedAnswers,
+    UAS.TotalPostScoreOwned,
+    UAS.AvgPostViewCount,
+    UAS.SqlTaggedQuestionsCount,
+    UAS.DaysSinceLastAccess,
+    -- User Badge Metrics with NULL handling
+    COALESCE(UBD.TotalBadges, 0) AS UserTotalBadges,
+    COALESCE(UBD.GoldBadges, 0) AS UserGoldBadges,
+    COALESCE(UBD.SilverBadges, 0) AS UserSilverBadges,
+    COALESCE(UBD.BronzeBadges, 0) AS UserBronzeBadges,
+    UBD.LatestGoldBadgeDate,
+    -- Post-specific metrics, aggregated from AggregatedPostEvents
+    COUNT(DISTINCT APE.PostId) AS ActivePostsCount,
+    SUM(APE.EditCount) AS TotalPostEdits,
+    SUM(APE.CloseCount) AS TotalPostCloseEvents,
+    SUM(APE.ReopenCount) AS TotalPostReopenEvents,
+    AVG(APE.HighScoreCommentCount) AS AvgHighScoreCommentsPerPost,
+    -- Top Tags engagement for each user, using STRING_AGG and a window function
+    STRING_AGG(DISTINCT TUTE.TagName || ' (' || TUTE.PostsInTag || ' posts, ' || TUTE.ScoreInTag || ' score)', '; ') FILTER (WHERE TUTE.RN <= 3) AS TopTagEngagement,
+    -- Window functions: Rank users by reputation and by total post score
+    RANK() OVER (ORDER BY UAS.Reputation DESC, UAS.UserTotalUpVotes DESC) AS OverallReputationRank,
+    NTH_VALUE(UAS.DisplayName, 2) OVER (ORDER BY UAS.Reputation DESC) AS SecondHighestRepUser,
+    -- Calculate a "contributor score" with complex arithmetic and NULL logic
+    (UAS.Reputation * 0.1
+     + UAS.TotalQuestionsOwned * 0.5
+     + UAS.TotalAnswersOwned * 0.8
+     + UAS.TotalPostScoreOwned * 0.05
+     + COALESCE(UBD.GoldBadges, 0) * 5
+     - UAS.DaysSinceLastAccess * 0.01 -- penalize for inactivity
+     - UAS.UserTotalDownVotes * 0.1
+    ) AS ContributorScore,
+    -- Complicated string expression for location with NULL handling and conditional formatting
+    UPPER(LEFT(COALESCE(U.Location, 'UNKNOWN'), LEAST(10, LENGTH(COALESCE(U.Location, 'UNKNOWN'))))) ||
+    CASE WHEN LENGTH(COALESCE(U.Location, 'UNKNOWN')) > 10 THEN '...' ELSE '' END ||
+    ' [' || REPLACE(LOWER(COALESCE(U.Location, 'UNKNOWN')), ' ', '_') || ']' AS FormattedLocationInfo,
+    -- Overall post upvote/downvote ratio for posts owned by the user, using NULLIF for division by zero
+    COALESCE(SUM(VA.UpVotesReceived) * 1.0 / NULLIF(SUM(VA.DownVotesReceived), 0), SUM(VA.UpVotesReceived) * 1.0, 0) AS OverallPostVoteRatio,
+    -- Complex date comparison for posts that were closed within a week of creation, using NULL logic
+    COUNT(CASE WHEN APE.ClosedDate IS NOT NULL AND APE.PostCreationDate IS NOT NULL
+                AND APE.ClosedDate < (APE.PostCreationDate + INTERVAL '7 days') THEN APE.PostId END) AS QuickClosePostCount,
+    -- Correlated EXISTS subquery to check for specific highly viewed Java questions with accepted answers
+    EXISTS (
+        SELECT 1
+        FROM Posts P_INNER
+        WHERE P_INNER.OwnerUserId = UAS.UserId
+          AND P_INNER.PostTypeId = 1
+          AND P_INNER.ViewCount > 100000
+          AND P_INNER.Tags LIKE '%<java>%'
+          AND P_INNER.AcceptedAnswerId IS NOT NULL
+    ) AS HasHighlyViewedJavaQuestionWithAcceptedAnswer
+FROM UserActivitySummary UAS
+LEFT JOIN Users U ON UAS.UserId = U.Id -- Join back to Users for Location
+LEFT JOIN AggregatedPostEvents APE ON UAS.UserId = APE.OwnerUserId
+LEFT JOIN UserBadgeData UBD ON UAS.UserId = UBD.UserId
+LEFT JOIN VoteAnalysis VA ON APE.PostId = VA.PostId
+LEFT JOIN (
+    -- Subquery to rank tags per user for STRING_AGG
+    SELECT
+        UserId,
+        TagName,
+        PostsInTag,
+        ScoreInTag,
+        ROW_NUMBER() OVER(PARTITION BY UserId ORDER BY ScoreInTag DESC, PostsInTag DESC) AS RN
+    FROM TopUsersByTagEngagement
+) TUTE ON UAS.UserId = TUTE.UserId
+GROUP BY
+    UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.TotalPostsOwned, UAS.TotalQuestionsOwned,
+    UAS.TotalAnswersOwned, UAS.QuestionsWithAcceptedAnswers, UAS.TotalPostScoreOwned,
+    UAS.AvgPostViewCount, UAS.SqlTaggedQuestionsCount, UAS.DaysSinceLastAccess,
+    UBD.TotalBadges, UBD.GoldBadges, UBD.SilverBadges, UBD.BronzeBadges, UBD.LatestGoldBadgeDate,
+    U.Location,
+    UAS.UserTotalUpVotes, UAS.UserTotalDownVotes, -- Needed for window function ordering
+    HasHighlyViewedJavaQuestionWithAcceptedAnswer -- Boolean result of EXISTS must be grouped if not aggregated
+HAVING
+    UAS.TotalPostsOwned > 10 -- Ensure users have substantial activity
+    AND COALESCE(UBD.GoldBadges, 0) >= 1 -- At least one gold badge
+ORDER BY
+    ContributorScore DESC, OverallReputationRank
+LIMIT 100;

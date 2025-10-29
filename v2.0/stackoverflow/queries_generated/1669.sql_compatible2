@@ -1,0 +1,147 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        COUNT(DISTINCT p.Id) AS TotalPostsByOwner,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestionsByOwner,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswersByOwner,
+        COUNT(c.Id) AS TotalCommentsByOwner,
+        COALESCE(SUM(p.Score), 0) AS CumulativePostScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        MAX(p.CreationDate) AS LatestPostCreationDate,
+        EXTRACT(DAY FROM (COALESCE(u.LastAccessDate, u.CreationDate) - u.CreationDate)) AS UserAccountAgeDays,
+        NTILE(4) OVER (ORDER BY u.Reputation DESC) AS ReputationQuartile,
+        ROW_NUMBER() OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY u.Reputation DESC, u.CreationDate ASC) AS RankInLocationByReputation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 10 AND u.Reputation > 1500
+),
+PostVersionHistory AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Score AS PostCurrentScore,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.ClosedDate,
+        COUNT(ph.Id) AS TotalHistoryEntries,
+        COUNT(DISTINCT ph.PostHistoryTypeId) AS UniqueHistoryEventTypes,
+        STRING_AGG(DISTINCT crt.Name, ' | ') FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL) AS CombinedCloseReasons,
+        STRING_AGG(DISTINCT CAST(pl.RelatedPostId AS VARCHAR), ',') FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateLinkedPostIds,
+        EXTRACT(HOUR FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate)) AS HoursToLastActivity,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScoreByOwner,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS ExplicitEditCount,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS RollingAvgOwnerPostScore
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND CAST(ph.Comment AS SMALLINT) = crt.Id
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 3
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.PostTypeId, p.Title, p.CreationDate, p.LastEditDate, p.LastActivityDate, p.Score, p.ViewCount, p.Tags, p.OwnerUserId, p.ClosedDate
+    HAVING COUNT(ph.Id) > 5 AND p.Score > 0
+),
+TagPerformanceOverview AS (
+    SELECT
+        LOWER(TRIM(tag_value)) AS TagName,
+        COUNT(DISTINCT phv.PostId) AS PostsWithTagCount,
+        AVG(phv.PostCurrentScore) AS AvgScoreForTag,
+        MAX(phv.PostCreationDate) AS LatestTagUsageDate,
+        MIN(phv.PostCreationDate) AS EarliestTagUsageDate,
+        SUM(CASE WHEN phv.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsWithTag,
+        SUM(CASE WHEN phv.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersWithTag,
+        DENSE_RANK() OVER (ORDER BY AVG(phv.PostCurrentScore) DESC, COUNT(DISTINCT phv.PostId) DESC) AS TagPopularityRank
+    FROM PostVersionHistory phv,
+         LATERAL (
+             SELECT value AS tag_value
+             FROM UNNEST(string_to_array(SUBSTRING(phv.Tags FROM 2 FOR CHAR_LENGTH(phv.Tags)-2), '><')) AS t(value)
+         ) AS tag_exploded
+    WHERE phv.Tags IS NOT NULL AND CHAR_LENGTH(phv.Tags) > 2
+    GROUP BY LOWER(TRIM(tag_value))
+    HAVING COUNT(DISTINCT phv.PostId) > 20 AND AVG(phv.PostCurrentScore) > 10
+),
+ModeratorInteractions AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        STRING_AGG(DISTINCT ph.Comment, '; ') FILTER (WHERE ph.Comment IS NOT NULL) AS ModeratorActionComments,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN 1 END) AS TotalModeratorActionEvents,
+        MAX(ph.CreationDate) AS LatestModeratorActionDate
+    FROM Posts p
+    JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)
+      AND ph.UserId IS NOT NULL
+    GROUP BY p.Id, p.Title, p.OwnerUserId
+    HAVING COUNT(CASE WHEN ph.PostHistoryTypeId IN (14, 15, 19, 20) THEN 1 END) >= 1
+)
+SELECT
+    ues.UserId,
+    ues.DisplayName,
+    ues.Reputation,
+    ues.TotalQuestionsByOwner,
+    ues.TotalAnswersByOwner,
+    phv.PostId,
+    phv.Title,
+    phv.PostCurrentScore,
+    phv.ViewCount,
+    phv.CombinedCloseReasons,
+    phv.DuplicateLinkedPostIds,
+    phv.TotalHistoryEntries,
+    phv.HoursToLastActivity,
+    phv.PreviousPostScoreByOwner,
+    phv.ExplicitEditCount,
+    phv.RollingAvgOwnerPostScore,
+    tpo.TagName AS PrimaryConcernedTag,
+    tpo.AvgScoreForTag,
+    mi.TotalModeratorActionEvents,
+    mi.ModeratorActionComments,
+    CASE
+        WHEN phv.CombinedCloseReasons IS NOT NULL AND phv.DuplicateLinkedPostIds IS NOT NULL THEN 'Highly Intervened & Duplicated'
+        WHEN phv.PostCurrentScore > ues.AvgAnswerScore * 2 AND phv.PostTypeId = 2 AND phv.ViewCount > 10000 THEN 'Exceptional Answer to Popular Question'
+        WHEN phv.PostTypeId = 1 AND phv.ViewCount > 5000 AND phv.HoursToLastActivity < 48 AND phv.ExplicitEditCount = 0 THEN 'Viral Question with Minimal Edits'
+        WHEN COALESCE(mi.TotalModeratorActionEvents, 0) > 0 THEN 'Moderator-Touched Post'
+        ELSE 'Other Significant Activity Post'
+    END AS PostImpactCategory,
+    (CAST(ues.Reputation AS NUMERIC) / NULLIF(ues.UserAccountAgeDays, 0)) *
+    COALESCE(phv.PostCurrentScore, 0) / NULLIF(phv.TotalHistoryEntries, 0) *
+    COALESCE(tpo.AvgScoreForTag, 1) AS WeightedUserPostInfluenceScore,
+    SUBSTRING(u_orig.AboutMe FROM '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,4}') AS ExtractedEmailFromAboutMe,
+    CHAR_LENGTH(COALESCE(phv.Title, '')) AS PostTitleLength,
+    (phv.PostId IN (SELECT Id FROM Posts WHERE Body ILIKE '%algorithm%' AND Body ILIKE '%performance%')) AS ContainsAlgorithmPerformanceKeywords
+FROM UserEngagementSummary ues
+INNER JOIN PostVersionHistory phv ON ues.UserId = phv.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT
+        tpo_inner.TagName,
+        tpo_inner.AvgScoreForTag,
+        tpo_inner.PostsWithTagCount
+    FROM TagPerformanceOverview tpo_inner
+    WHERE phv.Tags ILIKE '%' || '<' || tpo_inner.TagName || '>' || '%'
+      AND (tpo_inner.TagName LIKE 'sql%' OR tpo_inner.TagName LIKE 'java%' OR tpo_inner.TagName LIKE 'python%')
+    ORDER BY tpo_inner.AvgScoreForTag DESC, tpo_inner.PostsWithTagCount DESC
+    LIMIT 1
+) tpo ON TRUE
+LEFT JOIN ModeratorInteractions mi ON phv.PostId = mi.PostId
+INNER JOIN Users u_orig ON ues.UserId = u_orig.Id
+WHERE ues.ReputationQuartile = 1
+  AND phv.PostCreationDate BETWEEN DATE '2020-01-01' AND DATE '2023-12-31'
+  AND (phv.Title ILIKE '%benchmark%' OR phv.Title ILIKE '%optimization%' OR phv.Title ILIKE '%query performance%')
+  AND phv.ViewCount > 2500
+  AND (phv.PostId % 7 = 0 OR phv.OwnerUserId % 5 = 1)
+  AND NOT EXISTS (
+      SELECT 1 FROM Badges b WHERE b.UserId = ues.UserId AND b.Name = 'Philosopher' AND b.Class = 1
+  )
+  AND (phv.CombinedCloseReasons IS NULL OR phv.CombinedCloseReasons NOT ILIKE '%off-topic%')
+ORDER BY WeightedUserPostInfluenceScore DESC, phv.PostCurrentScore DESC, phv.ViewCount DESC
+LIMIT 200;

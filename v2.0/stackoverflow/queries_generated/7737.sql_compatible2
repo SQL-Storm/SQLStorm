@@ -1,0 +1,250 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 1000 THEN 'Expert'
+            WHEN u.Reputation > 100 THEN 'Novice'
+            ELSE 'Newbie'
+        END as ReputationLevel,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) as QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) as AnswerCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 3 THEN 1 ELSE 0 END), 0) as WikiCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        AvgPostScore,
+        LastPostDate,
+        ReputationLevel,
+        QuestionCount,
+        AnswerCount,
+        WikiCount,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) as RankByReputation,
+        ROW_NUMBER() OVER (ORDER BY PostCount DESC, Reputation DESC) as RankByActivity
+    FROM UserStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.AcceptedAnswerId, 0) as HasAcceptedAnswer,
+        (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - p.CreationDate) AS _age_interval,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - p.CreationDate)) / 86400 AS AgeInDays,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 10 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'LowVoted'
+            ELSE 'Unvoted'
+        END as VoteCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'Popular'
+            WHEN p.ViewCount > 100 THEN 'Moderate'
+            WHEN p.ViewCount > 0 THEN 'Low'
+            ELSE 'Unseen'
+        END as Popularity,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id),
+            0
+        ) as CommentCount,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN 
+                (CAST(LENGTH(p.Tags) AS DOUBLE PRECISION) / CAST(CHAR_LENGTH(p.Tags) AS DOUBLE PRECISION)) * 100
+            ELSE 0
+        END as TagDensity,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as RankByScore,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) as RankInType,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) as PreviousScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) as NextScore
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+QuestionDetails AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.OwnerName,
+        pa.PostTypeId,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.HasAcceptedAnswer,
+        pa.AgeInDays,
+        pa.VoteCategory,
+        pa.Popularity,
+        pa.TagDensity,
+        pa.RankByScore,
+        pa.RankInType,
+        pa.PreviousScore,
+        pa.NextScore,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 2) as UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 3) as DownVotes,
+        CASE 
+            WHEN pa.HasAcceptedAnswer > 0 THEN 'Yes'
+            WHEN pa.AnswerCount > 0 THEN 'No but has answers'
+            ELSE 'No'
+        END as HasAccepted,
+        (CASE WHEN pa.CommentCount > 0 THEN 'Commented' ELSE 'No comments' END) as CommentStatus,
+        COALESCE(
+            LAG(pa.Score, 1) OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.CreationDate),
+            0
+        ) as OwnerPreviousScore,
+        AVG(pa.Score) OVER (PARTITION BY pa.OwnerUserId) as OwnerAvgScore,
+        SUM(pa.Score) OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as OwnerCumulativeScore
+    FROM PostAnalysis pa
+    WHERE pa.PostTypeId = 1
+),
+AnswerAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.OwnerName,
+        pa.PostTypeId,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.HasAcceptedAnswer,
+        pa.AgeInDays,
+        pa.VoteCategory,
+        pa.Popularity,
+        pa.TagDensity,
+        pa.RankByScore,
+        pa.RankInType,
+        pa.PreviousScore,
+        pa.NextScore,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 2) as UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 3) as DownVotes,
+        (CASE WHEN pa.AnswerCount > 0 THEN 'Answered' ELSE 'No answers' END) as AnswerStatus,
+        AVG(pa.Score) OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.CreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as RecentAvgScore,
+        MAX(pa.Score) OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.CreationDate ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) as RecentMaxScore,
+        COUNT(*) OVER (PARTITION BY pa.OwnerUserId) as TotalPosts,
+        CASE 
+            WHEN pa.Score > 10 THEN 'HighValue'
+            WHEN pa.Score > 5 THEN 'MediumValue'
+            ELSE 'LowValue'
+        END as ValueLevel
+    FROM PostAnalysis pa
+    WHERE pa.PostTypeId = 2
+)
+SELECT 
+    'All Posts Summary' as ReportType,
+    COUNT(*) as TotalPosts,
+    COUNT(DISTINCT OwnerUserId) as UniqueAuthors,
+    AVG(Score) as AvgScore,
+    AVG(ViewCount) as AvgViews,
+    MAX(CreationDate) as LatestPost,
+    MIN(CreationDate) as EarliestPost,
+    COUNT(DISTINCT CASE WHEN PostTypeId = 1 THEN PostId END) as TotalQuestions,
+    COUNT(DISTINCT CASE WHEN PostTypeId = 2 THEN PostId END) as TotalAnswers,
+    COUNT(DISTINCT CASE WHEN PostTypeId = 3 THEN PostId END) as TotalWikis
+FROM Posts p
+UNION ALL
+SELECT 
+    'User Statistics' as ReportType,
+    COUNT(*) as TotalPosts,
+    COUNT(DISTINCT UserId) as UniqueUsers,
+    AVG(Reputation) as AvgReputation,
+    AVG(PostCount) as AvgPostsPerUser,
+    MAX(LastPostDate) as LatestActivity,
+    MIN(CreationDate) as EarliestUser,
+    0 as TotalQuestions,
+    0 as TotalAnswers,
+    0 as TotalWikis
+FROM (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate,
+        us.PostCount,
+        us.LastPostDate
+    FROM Users u
+    JOIN UserStats us ON u.Id = us.UserId
+) user_summary
+UNION ALL
+SELECT 
+    'Top Questions' as ReportType,
+    COUNT(*) as TotalPosts,
+    COUNT(DISTINCT OwnerUserId) as UniqueAuthors,
+    AVG(Score) as AvgScore,
+    AVG(ViewCount) as AvgViews,
+    MAX(CreationDate) as LatestPost,
+    MIN(CreationDate) as EarliestPost,
+    COUNT(DISTINCT CASE WHEN PostTypeId = 1 THEN PostId END) as TotalQuestions,
+    0 as TotalAnswers,
+    0 as TotalWikis
+FROM QuestionDetails
+UNION ALL
+SELECT 
+    'Top Answers' as ReportType,
+    COUNT(*) as TotalPosts,
+    COUNT(DISTINCT OwnerUserId) as UniqueAuthors,
+    AVG(Score) as AvgScore,
+    AVG(ViewCount) as AvgViews,
+    MAX(CreationDate) as LatestPost,
+    MIN(CreationDate) as EarliestPost,
+    0 as TotalQuestions,
+    COUNT(DISTINCT CASE WHEN PostTypeId = 2 THEN PostId END) as TotalAnswers,
+    0 as TotalWikis
+FROM AnswerAnalysis
+UNION ALL
+SELECT 
+    'Tag Analysis' as ReportType,
+    0 as TotalPosts,
+    0 as UniqueAuthors,
+    0 as AvgScore,
+    0 as AvgViews,
+    MAX(CreationDate) as LatestPost,
+    MIN(CreationDate) as EarliestPost,
+    0 as TotalQuestions,
+    0 as TotalAnswers,
+    0 as TotalWikis
+FROM (
+    SELECT 
+        COUNT(*) as TagCount,
+        AVG(t.Count) as AvgTagCount,
+        MIN(t.Count) as MinCount,
+        MAX(t.Count) as MaxCount,
+        p.CreationDate as CreationDate
+    FROM Tags t
+    CROSS JOIN (
+        SELECT MAX(CreationDate) as CreationDate FROM Posts
+    ) p
+) tag_summary
+ORDER BY ReportType;

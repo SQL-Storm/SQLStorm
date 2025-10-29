@@ -1,0 +1,122 @@
+-- {"query": "3755.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2223} 
+WITH 
+-- Aggregate per‑user post statistics
+user_stats AS (
+    SELECT 
+        u.id,
+        u.displayname,
+        COALESCE(SUM(p.score),0)               AS total_post_score,
+        COUNT(p.id)                           AS total_posts,
+        COUNT(CASE WHEN p.posttypeid = 1 THEN 1 END) AS question_count,
+        COUNT(CASE WHEN p.posttypeid = 2 THEN 1 END) AS answer_count,
+        MAX(p.creationdate)                  AS last_post_date
+    FROM users u
+    LEFT JOIN posts p ON p.owneruserid = u.id
+    GROUP BY u.id, u.displayname
+),
+
+-- Badge aggregates per user
+badge_stats AS (
+    SELECT 
+        b.userid,
+        SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        COUNT(*)                                    AS total_badges
+    FROM badges b
+    GROUP BY b.userid
+),
+
+-- Recent vote activity per post (last 30 days)
+recent_votes AS (
+    SELECT 
+        v.postid,
+        SUM(CASE WHEN vt.name = 'UpMod'      THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN vt.name = 'DownMod'    THEN 1 ELSE 0 END) AS down_votes,
+        MAX(v.creationdate)                                   AS last_vote_date
+    FROM votes v
+    JOIN votetypes vt ON vt.id = v.votetypeid
+    WHERE v.creationdate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+    GROUP BY v.postid
+),
+
+-- Top‑scoring post per post type (question/answer)
+top_posts AS (
+    SELECT 
+        p.id,
+        p.title,
+        p.score,
+        p.posttypeid,
+        ROW_NUMBER() OVER (PARTITION BY p.posttypeid 
+                           ORDER BY p.score DESC, p.creationdate DESC) AS rn
+    FROM posts p
+    WHERE p.posttypeid IN (1,2)               -- questions & answers
+)
+
+SELECT 
+    u.id,
+    u.displayname,
+    COALESCE(us.total_post_score,0)      AS total_post_score,
+    COALESCE(us.total_posts,0)           AS total_posts,
+    COALESCE(us.question_count,0)        AS question_count,
+    COALESCE(us.answer_count,0)          AS answer_count,
+    COALESCE(bs.gold_badges,0)           AS gold_badges,
+    COALESCE(bs.silver_badges,0)         AS silver_badges,
+    COALESCE(bs.bronze_badges,0)         AS bronze_badges,
+    CASE 
+        WHEN COALESCE(us.total_post_score,0) > 2000 THEN 'PowerUser'
+        WHEN COALESCE(us.question_count,0)   > 100  THEN 'ProlificAsker'
+        ELSE 'Regular'
+    END                                 AS user_tier,
+    tp.title                            AS top_post_title,
+    tp.score                            AS top_post_score,
+    rv.up_votes,
+    rv.down_votes,
+    rv.last_vote_date
+FROM users u
+LEFT JOIN user_stats us   ON us.id = u.id
+LEFT JOIN badge_stats bs  ON bs.userid = u.id
+LEFT JOIN LATERAL (
+        SELECT p.title, p.score
+        FROM top_posts p
+        WHERE p.rn = 1
+          AND p.id = (
+              SELECT id
+              FROM posts
+              WHERE owneruserid = u.id
+              ORDER BY score DESC NULLS LAST
+              LIMIT 1
+          )
+) tp ON TRUE
+LEFT JOIN LATERAL (
+        SELECT 
+            SUM(r.up_votes)   AS up_votes,
+            SUM(r.down_votes) AS down_votes,
+            MAX(r.last_vote_date) AS last_vote_date
+        FROM recent_votes r
+        WHERE r.postid = tp.id
+) rv ON TRUE
+WHERE u.reputation > 1000
+  AND (us.last_post_date IS NULL 
+       OR us.last_post_date > cast('2024-10-01' as date) - INTERVAL '1 year')
+
+UNION ALL
+
+-- Summary row with grand totals
+SELECT 
+    NULL,
+    'TOTAL',
+    SUM(COALESCE(us.total_post_score,0)),
+    SUM(COALESCE(us.total_posts,0)),
+    SUM(COALESCE(us.question_count,0)),
+    SUM(COALESCE(us.answer_count,0)),
+    SUM(COALESCE(bs.gold_badges,0)),
+    SUM(COALESCE(bs.silver_badges,0)),
+    SUM(COALESCE(bs.bronze_badges,0)),
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM user_stats us
+LEFT JOIN badge_stats bs ON bs.userid = us.id;

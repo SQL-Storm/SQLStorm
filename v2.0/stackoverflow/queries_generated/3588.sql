@@ -1,0 +1,183 @@
+-- {"query": "3588.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2825} 
+
+WITH 
+/*--------------------------------------------------------------
+   1.  Aggregate user‑level statistics (badges, posts, votes)
+--------------------------------------------------------------*/
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(b.GoldCnt,0)   AS GoldBadges,
+        COALESCE(b.SilverCnt,0) AS SilverBadges,
+        COALESCE(b.BronzeCnt,0) AS BronzeBadges,
+        COALESCE(p.QCnt,0)      AS QuestionCount,
+        COALESCE(p.ACnt,0)      AS AnswerCount,
+        COALESCE(v.UpCnt,0)     AS UpVotesGiven,
+        COALESCE(v.DownCnt,0)   AS DownVotesGiven
+    FROM Users u
+    LEFT JOIN (
+        SELECT 
+            UserId,
+            SUM(CASE WHEN Class=1 THEN 1 ELSE 0 END) AS GoldCnt,
+            SUM(CASE WHEN Class=2 THEN 1 ELSE 0 END) AS SilverCnt,
+            SUM(CASE WHEN Class=3 THEN 1 ELSE 0 END) AS BronzeCnt
+        FROM Badges
+        GROUP BY UserId
+    ) b ON u.Id = b.UserId
+    LEFT JOIN (
+        SELECT 
+            OwnerUserId,
+            SUM(CASE WHEN PostTypeId=1 THEN 1 ELSE 0 END) AS QCnt,
+            SUM(CASE WHEN PostTypeId=2 THEN 1 ELSE 0 END) AS ACnt
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) p ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT 
+            UserId,
+            SUM(CASE WHEN VoteTypeId=2 THEN 1 ELSE 0 END) AS UpCnt,
+            SUM(CASE WHEN VoteTypeId=3 THEN 1 ELSE 0 END) AS DownCnt
+        FROM Votes
+        GROUP BY UserId
+    ) v ON u.Id = v.UserId
+),
+
+/*--------------------------------------------------------------
+   2.  Rank active users (reputation + badge weight)
+--------------------------------------------------------------*/
+TopActiveUsers AS (
+    SELECT 
+        us.*,
+        ROW_NUMBER() OVER (
+            ORDER BY 
+                (us.GoldBadges*5 + us.SilverBadges*3 + us.BronzeBadges) DESC,
+                us.Reputation DESC,
+                us.LastAccessDate DESC
+        ) AS Rank
+    FROM UserStats us
+    WHERE us.Reputation > 1000
+      AND (us.QuestionCount + us.AnswerCount) >= 10
+),
+
+/*--------------------------------------------------------------
+   3.  Tag‑level activity per user (using LATERAL split)
+--------------------------------------------------------------*/
+UserTagStats AS (
+    SELECT 
+        u.Id                             AS UserId,
+        t.TagName,
+        COUNT(*) FILTER (WHERE p.PostTypeId=1) AS QuestionsWithTag,
+        COUNT(*) FILTER (WHERE p.PostTypeId=2) AS AnswersWithTag,
+        MAX(p.CreationDate)                     AS LastActivityTag
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT regexp_split_to_table(p.Tags, '[><]') AS Tag
+    ) AS ts ON true
+    JOIN Tags t ON t.TagName = ts.Tag
+    GROUP BY u.Id, t.TagName
+),
+
+/*--------------------------------------------------------------
+   4.  Recent badge earners (last 30 days) – correlated subquery demo
+--------------------------------------------------------------*/
+RecentBadgeEarners AS (
+    SELECT 
+        b.UserId,
+        b.Name  AS BadgeName,
+        b.Date,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS BadgeRank
+    FROM Badges b
+    WHERE b.Date >= CURRENT_DATE - INTERVAL '30 days'
+),
+
+/*--------------------------------------------------------------
+   5.  Combine everything, pick each user's top tag (outer join)
+--------------------------------------------------------------*/
+FinalResult AS (
+    SELECT 
+        tau.Id,
+        tau.DisplayName,
+        tau.Reputation,
+        tau.GoldBadges,
+        tau.SilverBadges,
+        tau.BronzeBadges,
+        tau.QuestionCount,
+        tau.AnswerCount,
+        tau.UpVotesGiven,
+        tau.DownVotesGiven,
+        tau.Rank,
+        COALESCE(rt.TagName, 'NoTag')               AS TopTag,
+        COALESCE(rt.QuestionsWithTag,0)            AS TopTagQuestions,
+        COALESCE(rt.AnswersWithTag,0)              AS TopTagAnswers,
+        rt.LastActivityTag
+    FROM TopActiveUsers tau
+    LEFT JOIN LATERAL (
+        SELECT 
+            uts.TagName,
+            uts.QuestionsWithTag,
+            uts.AnswersWithTag,
+            uts.LastActivityTag
+        FROM UserTagStats uts
+        WHERE uts.UserId = tau.Id
+        ORDER BY (uts.QuestionsWithTag + uts.AnswersWithTag) DESC
+        LIMIT 1
+    ) rt ON true
+    WHERE tau.Rank <= 100
+)
+
+/*=================================================================
+   Final SELECT – combines ranked active users with a legacy bucket
+=================================================================*/
+SELECT *
+FROM FinalResult
+WHERE (GoldBadges + SilverBadges + BronzeBadges) IS NOT NULL
+ORDER BY Rank, Reputation DESC
+LIMIT 50
+
+UNION ALL
+
+/*--------------------------------------------------------------
+   Legacy users (created >10 years ago & low reputation) – set op.
+--------------------------------------------------------------*/
+SELECT 
+    legacy.Id,
+    legacy.DisplayName,
+    legacy.Reputation,
+    legacy.GoldBadges,
+    legacy.SilverBadges,
+    legacy.BronzeBadges,
+    legacy.QuestionCount,
+    legacy.AnswerCount,
+    legacy.UpVotesGiven,
+    legacy.DownVotesGiven,
+    NULL                                   AS Rank,
+    'Legacy'                               AS TopTag,
+    0                                      AS TopTagQuestions,
+    0                                      AS TopTagAnswers,
+    NULL                                   AS LastActivityTag
+FROM (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(g.GoldCnt,0)   AS GoldBadges,
+        COALESCE(s.SilverCnt,0) AS SilverBadges,
+        COALESCE(b.BronzeCnt,0) AS BronzeBadges,
+        0 AS QuestionCount,
+        0 AS AnswerCount,
+        0 AS UpVotesGiven,
+        0 AS DownVotesGiven
+    FROM Users u
+    LEFT JOIN (SELECT UserId, COUNT(*) AS GoldCnt   FROM Badges WHERE Class=1 GROUP BY UserId) g ON u.Id = g.UserId
+    LEFT JOIN (SELECT UserId, COUNT(*) AS SilverCnt FROM Badges WHERE Class=2 GROUP BY UserId) s ON u.Id = s.UserId
+    LEFT JOIN (SELECT UserId, COUNT(*) AS BronzeCnt FROM Badges WHERE Class=3 GROUP BY UserId) b ON u.Id = b.UserId
+    WHERE u.CreationDate < CURRENT_DATE - INTERVAL '10 years'
+      AND u.Reputation < 100
+) legacy
+ORDER BY Rank NULLS LAST, Reputation DESC
+OFFSET 0 ROWS FETCH NEXT 20 ROWS ONLY;

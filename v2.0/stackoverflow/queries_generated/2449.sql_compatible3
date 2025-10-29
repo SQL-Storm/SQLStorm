@@ -1,0 +1,169 @@
+WITH RecursiveUserPosts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        CASE
+          WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL THEN
+            (SELECT string_agg(m, ',')
+             FROM regexp_matches(substring(p.Tags FROM 2 FOR length(p.Tags) - 2), '[^><]+', 'g') AS t(m)
+            )
+          ELSE NULL
+        END AS TagList,
+        row_number() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS PostRank
+    FROM users u
+    LEFT JOIN posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000
+),
+UserTopTags AS (
+    SELECT
+        rup.UserId,
+        t.tag,
+        count(1) AS TagCount
+    FROM RecursiveUserPosts rup
+    CROSS JOIN LATERAL (
+        SELECT value AS tag
+        FROM unnest(string_to_array(coalesce(rup.TagList, ''), ',')) AS x(value)
+    ) t
+    WHERE t.tag <> ''
+    GROUP BY rup.UserId, t.tag
+    HAVING count(1) > 1
+),
+UserBadgesSummary AS (
+    SELECT
+        b.UserId,
+        count(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        count(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        count(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        count(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name END) AS TagBasedBadgeCount
+    FROM badges b
+    GROUP BY b.UserId
+),
+PostActivityWindows AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        count(DISTINCT c.Id) OVER (PARTITION BY p.Id ORDER BY c.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeCommentCount,
+        sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id ORDER BY v.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeUpVotes,
+        sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id ORDER BY v.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeDownVotes
+    FROM posts p
+    LEFT JOIN comments c ON c.PostId = p.Id
+    LEFT JOIN votes v ON v.PostId = p.Id
+),
+ClosedQuestionsWithReason AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS CloseDate
+    FROM posthistory ph
+    JOIN closereasontypes crt ON crt.Id = CAST(ph.Comment AS integer)
+    WHERE ph.PostHistoryTypeId = 10
+),
+DuplicatesAndLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkType,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM postlinks pl
+    JOIN linktypes lt ON lt.Id = pl.LinkTypeId
+    LEFT JOIN posts p1 ON p1.Id = pl.PostId
+    LEFT JOIN posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE lt.Name IN ('Duplicate', 'Linked')
+),
+UserEngagementAggregate AS (
+    SELECT
+        u.Id AS UserId,
+        count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS Questions,
+        count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS Answers,
+        count(DISTINCT c.Id) AS Comments,
+        count(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesReceived,
+        count(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesReceived,
+        max(p.Score) AS HighestPostScore,
+        min(p.CreationDate) AS FirstPostDate,
+        max(p.CreationDate) AS LastPostDate,
+        extract(epoch FROM max(p.CreationDate) - min(p.CreationDate))/86400 AS DaysActive
+    FROM users u
+    LEFT JOIN posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN comments c ON c.UserId = u.Id
+    LEFT JOIN votes v ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+TopDuplicateQuestions AS (
+    SELECT DISTINCT p1.Id, p1.Title, p1.Score, d.RelatedPostId AS DuplicateOf
+    FROM posts p1
+    JOIN DuplicatesAndLinks d ON d.PostId = p1.Id AND d.LinkType = 'Duplicate'
+    WHERE p1.PostTypeId = 1 AND p1.Score > 100
+),
+RecursiveUserBadges AS (
+    SELECT
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.TagBased,
+        row_number() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS Rank
+    FROM badges b
+    WHERE b.Class IN (1, 2) AND b.TagBased = 0
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    coalesce(uba.GoldBadges,0) AS GoldBadges,
+    coalesce(uba.SilverBadges,0) AS SilverBadges,
+    coalesce(uba.BronzeBadges,0) AS BronzeBadges,
+    coalesce(uba.TagBasedBadgeCount,0) AS TagBasedBadges,
+    ua.Questions,
+    ua.Answers,
+    ua.Comments,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.HighestPostScore,
+    ua.DaysActive,
+    tdt.Title AS HighScoreDuplicateQuestion,
+    tdt.DuplicateOf,
+    (
+      SELECT string_agg(tag, ', ' ORDER BY TagCount DESC)
+      FROM (
+        SELECT ut2.tag, ut2.TagCount
+        FROM UserTopTags ut2
+        WHERE ut2.UserId = u.Id
+        ORDER BY ut2.TagCount DESC
+        LIMIT 3
+      ) sub
+    ) AS TopTags,
+    string_agg(distinct concat(rb.Name, '(', rb.Class, ')') , ', ' ORDER BY rb.Rank) AS RecentNamedBadges
+FROM users u
+LEFT JOIN UserBadgesSummary uba ON uba.UserId = u.Id
+LEFT JOIN UserEngagementAggregate ua ON ua.UserId = u.Id
+LEFT JOIN TopDuplicateQuestions tdt ON tdt.Id = (
+    SELECT p.Id FROM posts p WHERE p.OwnerUserId = u.Id ORDER BY p.Score DESC LIMIT 1
+)
+LEFT JOIN UserTopTags ut ON ut.UserId = u.Id
+LEFT JOIN RecursiveUserBadges rb ON rb.UserId = u.Id AND rb.Rank <= 5
+WHERE u.Reputation > 1000
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    uba.GoldBadges,
+    uba.SilverBadges,
+    uba.BronzeBadges,
+    uba.TagBasedBadgeCount,
+    ua.Questions,
+    ua.Answers,
+    ua.Comments,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.HighestPostScore,
+    ua.DaysActive,
+    tdt.Title,
+    tdt.DuplicateOf
+ORDER BY ua.UpVotesReceived DESC NULLS LAST, ua.HighestPostScore DESC NULLS LAST
+LIMIT 50;

@@ -1,0 +1,432 @@
+with
+recent_questions as (
+    select
+        p.Id as QuestionId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        coalesce(p.AnswerCount, 0) as AnswerCount
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts)
+),
+answers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.CreationDate,
+        a.Score,
+        a.OwnerUserId
+    from Posts a
+    where a.PostTypeId = 2
+),
+user_activity as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        coalesce(nullif(trim(u.DisplayName), ''), '(anonymous)') as DisplayName
+    from Users u
+),
+question_activity as (
+    select
+        q.QuestionId,
+        count(distinct c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpvoteCount,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownvoteCount,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as FavoriteCount
+    from recent_questions q
+    left join Comments c on c.PostId = q.QuestionId
+    left join Votes v on v.PostId = q.QuestionId
+    group by q.QuestionId
+),
+answer_stats as (
+    select
+        a.QuestionId,
+        count(*) as AnswerTotal,
+        sum(case when a.Score > 0 then 1 else 0 end) as PosAnswers,
+        avg(cast(a.Score as numeric)) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore,
+        max(a.CreationDate) as LastAnswerDate
+    from answers a
+    group by a.QuestionId
+),
+accepted as (
+    select
+        q.QuestionId,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAccepted,
+        p.AcceptedAnswerId
+    from recent_questions q
+    join Posts p on p.Id = q.QuestionId
+),
+tag_expansion as (
+    select
+        q.QuestionId,
+        unnest(string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><')) as TagName
+    from recent_questions q
+    where q.Tags is not null
+),
+tag_quality as (
+    select
+        t.TagName,
+        count(*) as TagQCount,
+        avg(cast(q.Score as numeric)) as AvgQScore,
+        percentile_cont(0.9) within group (order by q.ViewCount) as P90Views
+    from tag_expansion te
+    join recent_questions q on q.QuestionId = te.QuestionId
+    join Tags t on lower(t.TagName) = lower(te.TagName)
+    group by t.TagName
+),
+post_edits as (
+    select
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9,24)) as EditEvents,
+        min(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9,24)) as FirstEditDate,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9,24)) as LastEditDate,
+        count(*) filter (where ph.PostHistoryTypeId in (10,11,12,13,14,15,19,20,35)) as ModEvents,
+        sum(case when ph.PostHistoryTypeId = 10 and ph.Comment ~ '^[0-9]+$' then 1 else 0 end) as CloseEvents
+    from PostHistory ph
+    group by ph.PostId
+),
+dup_links as (
+    select
+        pl.PostId as QuestionId,
+        count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinks,
+        count(*) filter (where pl.LinkTypeId = 1) as LinkedLinks
+    from PostLinks pl
+    group by pl.PostId
+),
+hotness as (
+    select
+        rq.QuestionId,
+        (
+            0.6 * coalesce(qa.UpvoteCount - qa.DownvoteCount,0)
+          + 0.3 * coalesce(ast.AnswerTotal,0)
+          + 0.1 * ln(1 + coalesce(rq.ViewCount,0))
+        ) / greatest(extract(epoch from (timestamp '2024-10-01 12:34:56' - rq.CreationDate)) / 86400.0, 1) as DecayedEngagement
+    from recent_questions rq
+    left join question_activity qa on qa.QuestionId = rq.QuestionId
+    left join answer_stats ast on ast.QuestionId = rq.QuestionId
+),
+user_badges as (
+    select
+        b.UserId,
+        count(*) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as Gold,
+        sum(case when b.Class = 2 then 1 else 0 end) as Silver,
+        sum(case when b.Class = 3 then 1 else 0 end) as Bronze,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+user_summary as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Location,
+        ua.UpVotes,
+        ua.DownVotes,
+        ua.Views,
+        coalesce(ub.BadgeCount,0) as BadgeCount,
+        coalesce(ub.Gold,0) as GoldBadges,
+        coalesce(ub.Silver,0) as SilverBadges,
+        coalesce(ub.Bronze,0) as BronzeBadges,
+        ub.LastBadgeDate
+    from user_activity ua
+    left join user_badges ub on ub.UserId = ua.UserId
+),
+question_owner as (
+    select
+        rq.QuestionId,
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.Location,
+        us.BadgeCount,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.LastBadgeDate
+    from recent_questions rq
+    left join user_summary us on us.UserId = rq.OwnerUserId
+),
+question_windowed as (
+    select
+        rq.QuestionId,
+        rq.CreationDate,
+        rq.Score,
+        rq.ViewCount,
+        rq.OwnerUserId,
+        rq.Title,
+        rq.Tags,
+        rq.AnswerCount,
+        qa.CommentCount,
+        qa.UpvoteCount,
+        qa.DownvoteCount,
+        qa.FavoriteCount,
+        coalesce(ast.AnswerTotal, 0) as AnswerTotal,
+        ast.AvgAnswerScore,
+        ast.MaxAnswerScore,
+        ast.MinAnswerScore,
+        ast.LastAnswerDate,
+        ac.HasAccepted,
+        dl.DuplicateLinks,
+        dl.LinkedLinks,
+        pe.EditEvents,
+        pe.FirstEditDate,
+        pe.LastEditDate,
+        pe.ModEvents,
+        pe.CloseEvents,
+        h.DecayedEngagement,
+        row_number() over (order by h.DecayedEngagement desc nulls last, rq.Score desc, rq.ViewCount desc) as rn_global,
+        rank() over (partition by (case when rq.Score >= 0 then 'nonneg' else 'neg' end)
+                     order by coalesce(ast.AnswerTotal,0) desc, rq.Score desc) as rnk_by_sentiment
+    from recent_questions rq
+    left join question_activity qa on qa.QuestionId = rq.QuestionId
+    left join answer_stats ast on ast.QuestionId = rq.QuestionId
+    left join accepted ac on ac.QuestionId = rq.QuestionId
+    left join dup_links dl on dl.QuestionId = rq.QuestionId
+    left join post_edits pe on pe.PostId = rq.QuestionId
+    left join hotness h on h.QuestionId = rq.QuestionId
+),
+thresholds as (
+    select
+        avg(DecayedEngagement) as avg_eng,
+        stddev_pop(DecayedEngagement) as std_eng,
+        percentile_cont(0.75) within group (order by DecayedEngagement) as p75_eng
+    from question_windowed
+    where DecayedEngagement is not null
+),
+owner_quality as (
+    select
+        qo.UserId,
+        count(*) as QCount,
+        avg(cast(qw.Score as numeric)) as AvgQScore,
+        avg(cast(coalesce(qw.AnswerTotal,0) as numeric)) as AvgAnswers,
+        sum(case when qw.HasAccepted = 1 then 1 else 0 end) as AcceptedQs,
+        max(qw.ViewCount) as MaxQViews
+    from question_owner qo
+    join question_windowed qw on qw.OwnerUserId = qo.UserId and qw.QuestionId = qo.QuestionId
+    group by qo.UserId
+),
+question_ranked as (
+    select
+        qw.QuestionId,
+        qw.CreationDate,
+        qw.Score,
+        qw.ViewCount,
+        qw.OwnerUserId,
+        qw.Title,
+        qw.Tags,
+        qw.AnswerCount,
+        qw.CommentCount,
+        qw.UpvoteCount,
+        qw.DownvoteCount,
+        qw.FavoriteCount,
+        qw.AnswerTotal,
+        qw.AvgAnswerScore,
+        qw.MaxAnswerScore,
+        qw.MinAnswerScore,
+        qw.LastAnswerDate,
+        qw.HasAccepted,
+        qw.DuplicateLinks,
+        qw.LinkedLinks,
+        qw.EditEvents,
+        qw.FirstEditDate,
+        qw.LastEditDate,
+        qw.ModEvents,
+        qw.CloseEvents,
+        qw.DecayedEngagement,
+        qw.rn_global,
+        qw.rnk_by_sentiment,
+        qo.DisplayName as OwnerName,
+        qo.Reputation as OwnerReputation,
+        qo.Location as OwnerLocation,
+        qo.BadgeCount as OwnerBadges,
+        oq.AvgQScore as OwnerAvgQScore,
+        oq.AvgAnswers as OwnerAvgAnswers,
+        oq.AcceptedQs as OwnerAcceptedQs,
+        case
+            when (qw.DecayedEngagement is null) then 'unknown'
+            when qw.DecayedEngagement >= (select p75_eng from thresholds) then 'top'
+            when qw.DecayedEngagement >= (select avg_eng from thresholds) then 'above_avg'
+            else 'below_avg'
+        end as EngagementBand
+    from question_windowed qw
+    left join question_owner qo on qo.QuestionId = qw.QuestionId
+    left join owner_quality oq on oq.UserId = qo.UserId
+),
+qualified as (
+    select
+        qr.QuestionId,
+        qr.CreationDate,
+        qr.Score,
+        qr.ViewCount,
+        qr.OwnerUserId,
+        qr.Title,
+        qr.Tags,
+        qr.AnswerCount,
+        qr.CommentCount,
+        qr.UpvoteCount,
+        qr.DownvoteCount,
+        qr.FavoriteCount,
+        qr.AnswerTotal,
+        qr.AvgAnswerScore,
+        qr.MaxAnswerScore,
+        qr.MinAnswerScore,
+        qr.LastAnswerDate,
+        qr.HasAccepted,
+        qr.DuplicateLinks,
+        qr.LinkedLinks,
+        qr.EditEvents,
+        qr.FirstEditDate,
+        qr.LastEditDate,
+        qr.ModEvents,
+        qr.CloseEvents,
+        qr.DecayedEngagement,
+        qr.rn_global,
+        qr.rnk_by_sentiment,
+        qr.OwnerName,
+        qr.OwnerReputation,
+        qr.OwnerLocation,
+        qr.OwnerBadges,
+        qr.OwnerAvgQScore,
+        qr.OwnerAvgAnswers,
+        qr.OwnerAcceptedQs,
+        qr.EngagementBand,
+        (
+            case when qr.HasAccepted = 1 then 2 else 0 end
+            + case when coalesce(qr.AnswerTotal,0) >= 3 then 1 else 0 end
+            + case when coalesce(qr.UpvoteCount,0) - coalesce(qr.DownvoteCount,0) >= 5 then 1 else 0 end
+            + case when coalesce(qr.EditEvents,0) >= 1 then 1 else 0 end
+            + case when coalesce(qr.DuplicateLinks,0) >= 1 then -1 else 0 end
+        ) as CompositeFlags
+    from question_ranked qr
+),
+outliers as (
+    select
+        q.QuestionId,
+        q.Score,
+        q.ViewCount,
+        q.DecayedEngagement,
+        case
+            when q.Score is null or q.ViewCount is null then 'missing'
+            when q.ViewCount = 0 and q.Score > 0 then 'no_views_pos_score'
+            when q.ViewCount > 100000 and q.Score <= 0 then 'high_views_low_score'
+            when q.DecayedEngagement < 0 then 'neg_eng'
+            else null
+        end as OutlierType
+    from question_ranked q
+    where
+        q.Score is null
+        or q.ViewCount is null
+        or (q.ViewCount = 0 and q.Score > 0)
+        or (q.ViewCount > 100000 and q.Score <= 0)
+        or q.DecayedEngagement < 0
+),
+final_rows as (
+    select
+        q.QuestionId,
+        coalesce(q.Title, '(no title)') as Title,
+        q.OwnerName,
+        q.OwnerReputation,
+        q.OwnerLocation,
+        q.Score,
+        q.ViewCount,
+        q.AnswerTotal,
+        q.HasAccepted,
+        q.UpvoteCount,
+        q.DownvoteCount,
+        q.FavoriteCount,
+        q.EditEvents,
+        q.ModEvents,
+        q.CloseEvents,
+        q.DuplicateLinks,
+        q.LinkedLinks,
+        to_char(q.CreationDate, 'YYYY-MM-DD') as CreatedDate,
+        q.LastAnswerDate,
+        q.FirstEditDate,
+        q.LastEditDate,
+        q.DecayedEngagement,
+        q.rn_global,
+        q.rnk_by_sentiment,
+        q.EngagementBand,
+        q.CompositeFlags,
+        o.OutlierType,
+        trim(both ' ' from
+            coalesce(q.OwnerName, '') || case when q.OwnerLocation is not null then ' @ ' || q.OwnerLocation else '' end
+        ) as OwnerDisplay,
+        (cast(coalesce(q.UpvoteCount,0) - coalesce(q.DownvoteCount,0) as numeric))
+            / nullif(greatest(1, q.AnswerTotal), 0) as NetVotesPerAnswer,
+        case
+            when q.Tags is null then array[]::text[]
+            else string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><')
+        end as TagArray
+    from qualified q
+    left join outliers o on o.QuestionId = q.QuestionId
+    where
+        (
+            q.EngagementBand in ('top','above_avg')
+            or q.CompositeFlags >= 3
+            or o.OutlierType is not null
+        )
+)
+select *
+from final_rows
+union all
+select
+    rq.QuestionId,
+    coalesce(rq.Title, '(no title)') as Title,
+    us.DisplayName as OwnerName,
+    us.Reputation as OwnerReputation,
+    us.Location as OwnerLocation,
+    rq.Score,
+    rq.ViewCount,
+    coalesce(ast.AnswerTotal,0) as AnswerTotal,
+    case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAccepted,
+    qa.UpvoteCount,
+    qa.DownvoteCount,
+    qa.FavoriteCount,
+    coalesce(pe.EditEvents,0) as EditEvents,
+    coalesce(pe.ModEvents,0) as ModEvents,
+    coalesce(pe.CloseEvents,0) as CloseEvents,
+    coalesce(dl.DuplicateLinks,0) as DuplicateLinks,
+    coalesce(dl.LinkedLinks,0) as LinkedLinks,
+    to_char(rq.CreationDate, 'YYYY-MM-DD') as CreatedDate,
+    ast.LastAnswerDate,
+    pe.FirstEditDate,
+    pe.LastEditDate,
+    h.DecayedEngagement,
+    cast(null as bigint) as rn_global,
+    cast(null as bigint) as rnk_by_sentiment,
+    'zero_answer_high_view' as EngagementBand,
+    0 as CompositeFlags,
+    null as OutlierType,
+    coalesce(us.DisplayName, '') || case when us.Location is not null then ' @ ' || us.Location else '' end as OwnerDisplay,
+    (cast(coalesce(qa.UpvoteCount,0) - coalesce(qa.DownvoteCount,0) as numeric)) / nullif(1,0) as NetVotesPerAnswer,
+    case
+        when rq.Tags is null then array[]::text[]
+        else string_to_array(substring(rq.Tags, 2, greatest(length(rq.Tags)-2,0)), '><')
+    end as TagArray
+from recent_questions rq
+left join question_activity qa on qa.QuestionId = rq.QuestionId
+left join answer_stats ast on ast.QuestionId = rq.QuestionId
+left join Posts p on p.Id = rq.QuestionId
+left join post_edits pe on pe.PostId = rq.QuestionId
+left join dup_links dl on dl.QuestionId = rq.QuestionId
+left join hotness h on h.QuestionId = rq.QuestionId
+left join Users us on us.Id = rq.OwnerUserId
+where coalesce(ast.AnswerTotal,0) = 0 and rq.ViewCount >= (
+    select percentile_cont(0.9) within group (order by ViewCount) from recent_questions
+)
+order by DecayedEngagement desc nulls last, Score desc, ViewCount desc
+limit 500;

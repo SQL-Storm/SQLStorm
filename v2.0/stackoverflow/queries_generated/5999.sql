@@ -1,0 +1,132 @@
+-- {"query": "5999.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 929} 
+WITH recent_top_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.LastActivityDate DESC) AS rn_owner
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.ClosedDate IS NULL
+),
+owner_summary AS (
+  SELECT
+    r1.OwnerUserId,
+    r1.OwnerName,
+    COUNT(*) AS questions_seen,
+    SUM(r1.Score) AS total_score,
+    MAX(r1.LastActivityDate) AS last_active,
+    STRING_AGG(DISTINCT t.Name, ',') ASTagPivTo
+  FROM recent_top_questions r1
+  LEFT JOIN PostTags pt ON pt.PostId = r1.PostId
+  LEFT JOIN Tags t ON t.Id = COALESCE(pt.TagId, 0)
+  GROUP BY r1.OwnerUserId, r1.OwnerName
+),
+complex_metrics AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.Tags,
+    rp.CreationDate,
+    rp.ViewCount,
+    rp.Score,
+    rp.OwnerUserId,
+    rp.OwnerName,
+    -- correlated subquery: count of comments on the post with non-null UserId and high score
+    (
+      SELECT COUNT(*)
+      FROM Comments c
+      WHERE c.PostId = rp.PostId
+        AND c.UserId IS NOT NULL
+        AND c.Score > 0
+    ) AS positive_comments,
+    -- window function: rank posts per day by score
+    ROW_NUMBER() OVER (PARTITION BY CAST(rp.CreationDate AS DATE) ORDER BY rp.Score DESC, rp.ViewCount DESC) AS day_rank
+  FROM recent_top_questions rp
+  WHERE rp.rn_owner = 1 -- only top per owner for variety
+),
+set_operations AS (
+  SELECT
+    cm.PostId,
+    cm.Title,
+    cm.Tags,
+    cm.CreationDate,
+    cm.ViewCount,
+    cm.Score,
+    cm.OwnerUserId,
+    cm.OwnerName,
+    cm.positive_comments,
+    cm.day_rank
+  FROM complex_metrics cm
+  UNION ALL
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    0 AS positive_comments,
+    ROW_NUMBER() OVER (PARTITION BY CAST(p.CreationDate AS DATE) ORDER BY p.Score DESC) AS day_rank
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+    AND p.LastActivityDate > NOW() - INTERVAL '30 days'
+),
+final_pass AS (
+  SELECT
+    s.PostId,
+    s.Title,
+    s.Tags,
+    s.CreationDate,
+    s.ViewCount,
+    s.Score,
+    s.OwnerUserId,
+    s.OwnerName,
+    s.positive_comments,
+    s.day_rank,
+    -- complex predicate with NULL handling and string expressions
+    CASE
+      WHEN s.OwnerUserId IS NULL THEN 'anonymous'
+      ELSE COALESCE(s.OwnerName, 'unknown')
+    END AS owner_display,
+    CASE
+      WHEN s.ViewCount IS NULL THEN 0
+      ELSE s.ViewCount
+    END AS view_count_nonnull
+  FROM set_operations s
+)
+SELECT
+  fh.PostId,
+  fh.Title,
+  fh.Tags,
+  fh.CreationDate,
+  fh.ViewCount,
+  fh.Score,
+  fh.OwnerUserId,
+  fh.OwnerName,
+  fh.positive_comments,
+  fh.day_rank,
+  fh.owner_display,
+  fh.view_count_nonnull
+FROM final_pass fh
+JOIN LATERAL (
+  SELECT
+    up.Reputation
+  FROM Users up
+  WHERE up.Id = fh.OwnerUserId
+) AS rep ON TRUE
+LEFT JOIN Badges b ON b.UserId = fh.OwnerUserId
+WHERE fh.day_rank <= 10
+ORDER BY fh.day_rank, fh.Score DESC
+LIMIT 100;

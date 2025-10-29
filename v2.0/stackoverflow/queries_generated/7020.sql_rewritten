@@ -1,0 +1,192 @@
+-- {"query": "7020.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1923} 
+WITH UserPostStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) as TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+        MAX(p.CreationDate) as LastPostDate,
+        COUNT(DISTINCT c.Id) as TotalComments,
+        COUNT(DISTINCT b.Id) as TotalBadges,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '; ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalQuestionScore DESC, TotalAnswerScore DESC) as RankByScore,
+        RANK() OVER (ORDER BY TotalPosts DESC) as RankByPostCount,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) as RankByReputation
+    FROM UserPostStats
+),
+UserActivity AS (
+    SELECT 
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.TotalPosts,
+        r.QuestionCount,
+        r.AnswerCount,
+        r.TotalQuestionScore,
+        r.TotalAnswerScore,
+        r.AvgQuestionScore,
+        r.AvgAnswerScore,
+        r.LastPostDate,
+        r.TotalComments,
+        r.TotalBadges,
+        r.AllTags,
+        CASE 
+            WHEN r.TotalPosts > 100 THEN 'High Activity'
+            WHEN r.TotalPosts > 50 THEN 'Medium Activity'
+            ELSE 'Low Activity'
+        END as ActivityLevel,
+        CASE 
+            WHEN r.TotalQuestionScore > 10000 THEN 'Expert Level'
+            WHEN r.TotalQuestionScore > 5000 THEN 'Advanced Level'
+            WHEN r.TotalQuestionScore > 1000 THEN 'Intermediate Level'
+            ELSE 'Beginner Level'
+        END as QuestionSkillLevel,
+        CASE 
+            WHEN r.TotalAnswerScore > 5000 THEN 'Helpful Contributor'
+            WHEN r.TotalAnswerScore > 1000 THEN 'Regular Contributor'
+            ELSE 'New Contributor'
+        END as AnswerContributionLevel,
+        COALESCE(
+            (SELECT TOP 1 p.Title 
+             FROM Posts p 
+             WHERE p.OwnerUserId = r.UserId AND p.PostTypeId = 1 
+             ORDER BY p.CreationDate DESC), 
+            'No Questions'
+        ) as LatestQuestion,
+        COALESCE(
+            (SELECT TOP 1 p.Title 
+             FROM Posts p 
+             WHERE p.OwnerUserId = r.UserId AND p.PostTypeId = 2 
+             ORDER BY p.CreationDate DESC), 
+            'No Answers'
+        ) as LatestAnswer,
+        -- Calculate if the user has been active in the last 30 days
+        CASE 
+            WHEN DATEDIFF(day, r.LastPostDate, cast('2024-10-01 12:34:56' as timestamp)) <= 30 THEN 'Active'
+            ELSE 'Inactive'
+        END as CurrentActivityStatus,
+        -- User's top 3 tags by frequency
+        CASE 
+            WHEN r.AllTags IS NOT NULL AND LEN(r.AllTags) > 0 THEN 
+                LEFT(r.AllTags, CHARINDEX(';', r.AllTags, 1) - 1)
+            ELSE NULL 
+        END as PrimaryTag,
+        -- Calculate ratio of answers to questions
+        CASE 
+            WHEN r.QuestionCount > 0 THEN CAST(r.AnswerCount AS FLOAT) / CAST(r.QuestionCount AS FLOAT)
+            ELSE 0 
+        END as AnswerToQuestionRatio,
+        -- Calculate engagement score based on multiple factors
+        (r.TotalPosts * 0.3 + r.TotalQuestionScore * 0.2 + r.TotalAnswerScore * 0.2 + 
+         r.TotalComments * 0.1 + r.TotalBadges * 0.2) as EngagementScore
+    FROM RankedUsers r
+),
+FinalAnalysis AS (
+    SELECT 
+        *,
+        CASE 
+            WHEN EngagementScore > 1000 THEN 'Elite Contributor'
+            WHEN EngagementScore > 500 THEN 'Active Contributor'
+            WHEN EngagementScore > 100 THEN 'Regular Contributor'
+            ELSE 'Casual Contributor'
+        END as ContributorTier,
+        -- User's reputation score normalized
+        CASE 
+            WHEN Reputation > 100000 THEN 'Extreme'
+            WHEN Reputation > 10000 THEN 'High'
+            WHEN Reputation > 1000 THEN 'Moderate'
+            ELSE 'Low'
+        END as ReputationLevel,
+        -- Age of user account in years
+        DATEDIFF(year, CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as AccountAgeYears,
+        -- Activity score based on days since last post
+        CASE 
+            WHEN DATEDIFF(day, LastPostDate, cast('2024-10-01 12:34:56' as timestamp)) > 365 THEN 'Very Inactive'
+            WHEN DATEDIFF(day, LastPostDate, cast('2024-10-01 12:34:56' as timestamp)) > 180 THEN 'Inactive'
+            WHEN DATEDIFF(day, LastPostDate, cast('2024-10-01 12:34:56' as timestamp)) > 90 THEN 'Semi-Active'
+            ELSE 'Active'
+        END as ActivityStatus,
+        -- Calculate user's contribution percentage to total questions
+        CAST(QuestionCount AS FLOAT) / 
+        (SELECT CAST(SUM(QuestionCount) AS FLOAT) FROM UserActivity) * 100 as QuestionContributionPercentage,
+        -- Calculate user's contribution percentage to total answers
+        CAST(AnswerCount AS FLOAT) / 
+        (SELECT CAST(SUM(AnswerCount) AS FLOAT) FROM UserActivity) * 100 as AnswerContributionPercentage
+    FROM UserActivity
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.TotalPosts,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.TotalQuestionScore,
+    fa.TotalAnswerScore,
+    fa.AvgQuestionScore,
+    fa.AvgAnswerScore,
+    fa.LastPostDate,
+    fa.TotalComments,
+    fa.TotalBadges,
+    fa.AllTags,
+    fa.ActivityLevel,
+    fa.QuestionSkillLevel,
+    fa.AnswerContributionLevel,
+    fa.LatestQuestion,
+    fa.LatestAnswer,
+    fa.CurrentActivityStatus,
+    fa.PrimaryTag,
+    fa.AnswerToQuestionRatio,
+    fa.EngagementScore,
+    fa.ContributorTier,
+    fa.ReputationLevel,
+    fa.AccountAgeYears,
+    fa.ActivityStatus,
+    fa.QuestionContributionPercentage,
+    fa.AnswerContributionPercentage,
+    -- Advanced calculations
+    CASE 
+        WHEN fa.AnswerToQuestionRatio >= 1.5 THEN 'High Answerer'
+        WHEN fa.AnswerToQuestionRatio >= 1.0 THEN 'Equal Ratio'
+        WHEN fa.AnswerToQuestionRatio >= 0.5 THEN 'Moderate Answerer'
+        ELSE 'Question Focused'
+    END as PostingStyle,
+    -- Calculate user's peak activity period (assuming this is inferred from post dates)
+    CASE 
+        WHEN fa.LastPostDate >= DATEADD(day, -7, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Weekly Peak'
+        WHEN fa.LastPostDate >= DATEADD(day, -30, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Monthly Peak'
+        WHEN fa.LastPostDate >= DATEADD(day, -90, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Quarterly Peak'
+        ELSE 'Seasonal'
+    END as PeakActivityPeriod,
+    -- Determine user's overall impact based on engagement score and reputation
+    CASE 
+        WHEN fa.EngagementScore > 2000 OR fa.Reputation > 50000 THEN 'High Impact'
+        WHEN fa.EngagementScore > 1000 OR fa.Reputation > 20000 THEN 'Medium Impact'
+        WHEN fa.EngagementScore > 500 OR fa.Reputation > 10000 THEN 'Low Impact'
+        ELSE 'Minimal Impact'
+    END as UserImpact
+FROM FinalAnalysis fa
+WHERE fa.Reputation > 100 
+    AND (fa.QuestionCount > 0 OR fa.AnswerCount > 0)
+    AND fa.ActivityStatus NOT IN ('Very Inactive', 'Inactive')
+    AND fa.ContributorTier IN ('Elite Contributor', 'Active Contributor')
+ORDER BY fa.EngagementScore DESC, fa.Reputation DESC
+OFFSET 10 ROWS 
+FETCH NEXT 20 ROWS ONLY
+OPTION (MAXDOP 4);

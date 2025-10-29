@@ -1,0 +1,166 @@
+-- {"query": "5300.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1096} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.LastActivityDate > NOW() - INTERVAL '30 days'
+),
+TopUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+TagInsights AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount,
+    tl.PostId AS TagPostId,
+    pr.Title AS PostTitle,
+    pr.Score AS PostScore,
+    pr.ViewCount AS PostViews,
+    pr.OwnerUserId AS PostOwner
+  FROM Tags t
+  LEFT JOIN Posts pr ON t.WikiPostId = pr.Id
+  LEFT JOIN UNNEST(string_to_array(pr.Tags, '><')) WITH ORDINALITY AS tl(TagName, ord)
+    ON TRUE
+  WHERE t.IsModeratorOnly = 0
+),
+Combined AS (
+  SELECT
+    rap.Id AS PostId,
+    rap.PostTypeId,
+    rap.OwnerUserId,
+    tu.UserId AS OwnerUserId2,
+    rap.Title,
+    rap.Tags,
+    rap.CreationDate,
+    rap.LastActivityDate,
+    rap.Score,
+    rap.ViewCount,
+    rap.CommentCount,
+    rap.AnswerCount,
+    rap.FavoriteCount,
+    rap.ParentId,
+    rap.AcceptedAnswerId,
+    rap.LastEditorUserId,
+    rap.LastEditDate,
+    rap.ContentLicense,
+    tu.DisplayName AS OwnerDisplayName,
+    br.Name AS BorderCase,
+    v.Badges
+  FROM RecentActivePosts rap
+  LEFT JOIN TopUsers tu ON rap.OwnerUserId = tu.UserId
+  LEFT JOIN Votes v ON rap.Id = v.PostId
+  LEFT JOIN PostLinks pl ON rap.Id = pl.PostId
+  LEFT JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+  LEFT JOIN PostHistory ph ON rap.Id = ph.PostId
+  LEFT JOIN Badges b ON rap.OwnerUserId = b.UserId
+  LEFT JOIN Tags t ON rap.Tags LIKE '%' || t.TagName || '%'
+  LEFT JOIN CloseReasonTypes br ON ph.Comment LIKE '%' || br.Id || '%'
+  WHERE rap.PostTypeId IN (1,2)
+),
+WindowAgg AS (
+  SELECT
+    PostId,
+    PostTypeId,
+    OwnerUserId,
+    Title,
+    Tags,
+    CreationDate,
+    LastActivityDate,
+    Score,
+    ViewCount,
+    CommentCount,
+    AnswerCount,
+    FavoriteCount,
+    ParentId,
+    AcceptedAnswerId,
+    LastEditorUserId,
+    LastEditDate,
+    ContentLicense,
+    OwnerDisplayName,
+    BR.Name AS CloseReason
+  FROM Combined c
+  LEFT JOIN PostHistory ph ON ph.PostId = c.PostId AND ph.PostHistoryTypeId = 10
+  LEFT JOIN PostHistory ph2 ON ph2.PostId = c.PostId AND ph2.PostHistoryTypeId = 11
+  LEFT JOIN CloseReasonTypes BR ON CAST(ph.Comment AS varchar) LIKE '%' || CAST(BR.Id AS varchar) || '%'
+),
+Final AS (
+  SELECT
+    w.PostId,
+    w.PostTypeId,
+    w.OwnerUserId,
+    w.OwnerDisplayName,
+    w.Title,
+    w.Tags,
+    w.CreationDate,
+    w.LastActivityDate,
+    w.Score,
+    w.ViewCount,
+    w.CommentCount,
+    w.AnswerCount,
+    w.FavoriteCount,
+    w.ParentId,
+    w.AcceptedAnswerId,
+    w.LastEditorUserId,
+    w.LastEditDate,
+    w.ContentLicense,
+    w.CloseReason,
+    SUM(CASE WHEN v.PostId IS NOT NULL THEN v.BountyAmount ELSE 0 END) OVER (PARTITION BY w.PostId) AS TotalBounty
+  FROM WindowAgg w
+  LEFT JOIN Votes v ON w.PostId = v.PostId
+  WHERE w.PostTypeId IN (1,2)
+)
+SELECT
+  PostId,
+  PostTypeId,
+  OwnerUserId,
+  OwnerDisplayName,
+  Title,
+  Tags,
+  CreationDate,
+  LastActivityDate,
+  Score,
+  ViewCount,
+  CommentCount,
+  AnswerCount,
+  FavoriteCount,
+  ParentId,
+  AcceptedAnswerId,
+  LastEditorUserId,
+  LastEditDate,
+  ContentLicense,
+  CloseReason,
+  TotalBounty
+FROM Final
+WHERE TotalBounty > 0
+ORDER BY LastActivityDate DESC, Score DESC
+LIMIT 100;

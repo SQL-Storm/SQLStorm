@@ -1,0 +1,143 @@
+with UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+        row_number() over (partition by u.Id order by count(distinct b.Id) desc) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostAnswerDetails as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerUserId,
+        case when a.Score > p.Score then 1 else 0 end as AnswerBeatQuestionScore,
+        row_number() over (partition by p.Id order by a.Score desc, a.CreationDate) as AnswerRank
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1 and p.Score is not null
+),
+PostCommentsSummary as (
+    select
+        PostId,
+        count(c.Id) as CommentCount,
+        max(c.CreationDate) as LastCommentDate,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ','
+            order by max(c.CreationDate) desc) as Commenters
+    from Comments c
+    group by PostId
+),
+CloseReasonsSummary as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as CloseEventRank
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+),
+DuplicateQuestions as (
+    select distinct pl.PostId as DuplicateQuestionId, pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+UserActivityWindows as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId in (10,11)) as CloseReopenEvents,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p2.Id) filter (where p2.PostTypeId = 2) as AnswersCount,
+        avg(coalesce(p.Score, 0)) filter (where p.PostTypeId = 1) as AvgQuestionScore,
+        avg(coalesce(p2.Score, 0)) filter (where p2.PostTypeId = 2) as AvgAnswerScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts p2 on p2.OwnerUserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+RankedQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        row_number() over (order by p.Score desc NULLS LAST, p.ViewCount desc NULLS LAST) as QuestionRank
+    from Posts p
+    where p.PostTypeId = 1 and p.Score is not null
+),
+TopTags as (
+    select
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as Tag,
+        count(*) as TagUseCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><'))
+    order by TagUseCount desc
+    limit 20
+),
+ComplexAggregations as (
+    select
+        t.Tag,
+        count(distinct p.Id) as QuestionCount,
+        avg(p.Score) as AvgScore,
+        sum(p.ViewCount) as TotalViews,
+        max(p.CreationDate) as MostRecentQuestionDate,
+        min(p.CreationDate) as OldestQuestionDate,
+        count(distinct case when p.AcceptedAnswerId is not null then p.Id end) as AcceptedAnswerCount,
+        count(distinct pl.Id) as NumberOfDuplicatesLinked
+    from TopTags t
+    join Posts p on p.PostTypeId = 1 and p.Tags like ('%' || '<' || t.Tag || '>' || '%')
+    left join PostLinks pl on pl.PostId = p.Id and pl.LinkTypeId = 3
+    group by t.Tag
+),
+FinalResult as (
+    select
+        r.QuestionRank,
+        r.Title,
+        r.CreationDate,
+        r.Score,
+        r.ViewCount,
+        coalesce(c.CommentCount, 0) as NumberOfComments,
+        coalesce(cr.CloseReasonName, 'Open') as LatestCloseReason,
+        coalesce(u.DisplayName, 'Unknown') as OwnerUserName,
+        coalesce(u.Reputation, 0) as OwnerReputation,
+        coalesce(b.GoldBadges, 0) as OwnerGoldBadges,
+        coalesce(b.SilverBadges, 0) as OwnerSilverBadges,
+        coalesce(b.BronzeBadges, 0) as OwnerBronzeBadges,
+        array_to_string(array_agg(distinct ds.OriginalQuestionId), ',') as DuplicatedFromQuestions,
+        ca.Tag,
+        ca.QuestionCount as TagQuestionCount,
+        ca.AvgScore as TagAvgScore,
+        ca.TotalViews as TagTotalViews
+    from RankedQuestions r
+    left join PostCommentsSummary c on c.PostId = r.Id
+    left join CloseReasonsSummary cr on cr.PostId = r.Id and cr.CloseEventRank = 1
+    left join Users u on u.Id = (select OwnerUserId from Posts where Id = r.Id)
+    left join UserBadgeStats b on b.UserId = u.Id
+    left join DuplicateQuestions ds on ds.DuplicateQuestionId = r.Id
+    left join ComplexAggregations ca on r.Tags like ('%' || '<' || ca.Tag || '>' || '%')
+    group by
+        r.QuestionRank, r.Title, r.CreationDate, r.Score, r.ViewCount, c.CommentCount, cr.CloseReasonName,
+        u.DisplayName, u.Reputation, b.GoldBadges, b.SilverBadges, b.BronzeBadges, ca.Tag, ca.QuestionCount, ca.AvgScore, ca.TotalViews
+    order by r.QuestionRank
+    limit 50
+)
+select * from FinalResult;

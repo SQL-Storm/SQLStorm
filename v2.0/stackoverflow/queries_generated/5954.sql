@@ -1,0 +1,30 @@
+-- {"query": "5954.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 353} 
+SELECT
+  u.DisplayName AS UserName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS PostCount,
+  AVG(p.Score) AS AvgScorePerPost,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+  MAX(p.LastActivityDate) AS LastActive,
+  MAX(p.CreationDate) AS FirstPostDate,
+  COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+  COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+  STRING_AGG(DISTINCT t.Name, ',') AS TaggedCategories
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(p.Tags, ', ')) AS tag
+  ) AS t1 ON TRUE
+  LEFT JOIN TagNames t ON t.TagName = TRIM(BOTH '"' FROM REPLACE(REPLACE(p.Tags, '[', ''), ']', '')) -- placeholder for tag extraction
+WHERE
+  u.CreationDate >= NOW() - INTERVAL '1 year'
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation
+HAVING
+  COUNT(DISTINCT p.Id) > 0
+ORDER BY
+  AvgScorePerPost DESC NULLS LAST, PostCount DESC
+LIMIT 100;

@@ -1,0 +1,224 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(MAX(p.CreationDate), u.CreationDate) AS LastActivity,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) AS Ranking,
+        CASE WHEN u.Reputation > 10000 THEN 'Gold' 
+             WHEN u.Reputation > 5000 THEN 'Silver' 
+             ELSE 'Bronze' END AS RepTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.PostTypeId,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS IsAnswered,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+        CAST(COALESCE(p.ClosedDate, TIMESTAMP '2024-10-01 12:34:56') AS TIMESTAMP) - p.CreationDate AS DaysOpenInterval,
+        EXTRACT(EPOCH FROM (CAST(COALESCE(p.ClosedDate, TIMESTAMP '2024-10-01 12:34:56') AS TIMESTAMP) - p.CreationDate))/86400 AS DaysOpen,
+        TRIM(BOTH ', ' FROM
+            REPLACE(REPLACE(p.Tags, '<', ''), '>', '')
+        ) AS RawTags,
+        -- Convert tags like "<tag1><tag2>" to "tag1, tag2"
+        (
+          SELECT STRING_AGG(tag, ', ' ORDER BY ord)
+          FROM (
+            SELECT unnest(string_to_array(regexp_replace(p.Tags, '^<|>$', ''), '><')) AS tag,
+                   generate_series(1, array_length(string_to_array(regexp_replace(p.Tags, '^<|>$', ''), '><'),1)) AS ord
+          ) t
+        ) AS AllTags,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS MovingAvgScore,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'AboveAvg'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'BelowAvg'
+            ELSE 'Avg'
+        END AS ScoreCategory
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+RecentActivity AS (
+    SELECT 
+        PostId,
+        COUNT(*) AS EditCount,
+        MAX(CreationDate) AS LastEdit,
+        STRING_AGG(CONCAT('Edit by ', COALESCE(UserDisplayName, 'Anonymous')), '; ') AS Editors
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (5, 6) 
+    GROUP BY PostId
+),
+TagImpact AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        AVG(p.Score) AS AvgScore,
+        MIN(p.Score) AS MinScore,
+        MAX(p.Score) AS MaxScore,
+        COUNT(DISTINCT p.OwnerUserId) AS ActiveUsers,
+        ROW_NUMBER() OVER (ORDER BY AVG(p.Score) DESC) AS PopularityRank
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE t.TagName IS NOT NULL AND p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+),
+ComplexQuery AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.RepTier,
+        us.TotalPosts,
+        us.Questions,
+        us.Answers,
+        us.Comments,
+        us.Badges,
+        us.TotalScore,
+        us.Ranking,
+        pa.PostId,
+        pa.Title,
+        pa.Score AS PostScore,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.IsAnswered,
+        pa.IsClosed,
+        pa.DaysOpen,
+        pa.AllTags,
+        pa.ScoreCategory,
+        ra.EditCount,
+        ra.LastEdit,
+        ra.Editors,
+        ti.TagName,
+        ti.TagCount,
+        ti.AvgScore AS TagAvgScore,
+        ti.PopularityRank,
+        CASE 
+            WHEN us.Reputation > 10000 AND pa.Score > 50 THEN 'EliteHighValue'
+            WHEN us.Reputation > 5000 AND pa.Score > 25 THEN 'VeteranHighValue'
+            WHEN us.Reputation > 1000 AND pa.Score > 10 THEN 'ActiveHighValue'
+            ELSE 'Standard'
+        END AS ContributorTier,
+        ROUND((pa.Score * 100.0) / NULLIF(us.TotalScore, 0)::numeric, 2) AS ScoreContributionPct,
+        CASE 
+            WHEN pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+            AND pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1)
+            THEN 'PopularHighImpact'
+            WHEN pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+            OR pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1)
+            THEN 'Popular'
+            ELSE 'Normal'
+        END AS PostTier,
+        CASE 
+            WHEN pa.Score > 100 THEN 'VeteranPost'
+            WHEN pa.Score > 50 THEN 'ExperiencedPost'
+            ELSE 'RegularPost'
+        END AS ExperienceLevel,
+        CAST((cast('2024-10-01' as date) + (CAST('2024-10-01' AS DATE) - cast('2024-10-01' as date))) AS DATE), -- placeholder to satisfy parser
+        CAST(pa.CreationDate AS TIMESTAMP),
+        CAST((CAST('2024-10-01 12:34:56' AS TIMESTAMP) - pa.CreationDate) AS INTERVAL) AS AgeInterval,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - pa.CreationDate))/86400 AS AgeInDays,
+        NULLIF(pa.ViewCount, 0) / NULLIF(pa.Score, 0) AS ViewsPerScore,
+        COALESCE(pa.MovingAvgScore, 0) AS MovingAverageScore,
+        CASE 
+            WHEN pa.MovingAvgScore > 10 AND pa.Score - pa.PrevScore > 5 THEN 'Increasing'
+            WHEN pa.MovingAvgScore < 5 AND pa.Score - pa.NextScore > 5 THEN 'Decreasing'
+            ELSE 'Stable'
+        END AS TrendStatus,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = us.UserId AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = us.UserId AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = us.UserId AND b.Class = 3) AS BronzeBadges,
+        CASE 
+            WHEN pa.Score > 0 AND pa.ViewCount > 0 THEN LN(pa.ViewCount * pa.Score)
+            ELSE 0 
+        END AS ComplexMetric,
+        CONCAT('User ', us.UserId::text, ': ', us.DisplayName) AS UserIdDisplayName,
+        LEFT(us.AboutMe, 100) AS ShortBio,
+        CASE WHEN pa.Title ~* '[Qq]uestion|[Aa]nswer' THEN 'QuestionAnswer' ELSE 'Regular' END AS ContentCategory
+    FROM UserStats us
+    INNER JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+    LEFT JOIN RecentActivity ra ON pa.PostId = ra.PostId
+    LEFT JOIN TagImpact ti ON ti.TagName IN (
+        SELECT trim(value) FROM unnest(string_to_array(COALESCE(pa.AllTags, ''), ',')) AS value
+    )
+    WHERE pa.Score > 0 
+      AND (pa.ViewCount > 10 OR us.Reputation > 1000 OR us.TotalScore > 100)
+      AND pa.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    RepTier,
+    TotalPosts,
+    Questions,
+    Answers,
+    Comments,
+    Badges,
+    TotalScore,
+    Ranking,
+    PostId,
+    Title,
+    PostScore,
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    IsAnswered,
+    IsClosed,
+    DaysOpen,
+    AllTags,
+    ScoreCategory,
+    EditCount,
+    LastEdit,
+    Editors,
+    TagName,
+    TagCount,
+    TagAvgScore,
+    PopularityRank,
+    ContributorTier,
+    ScoreContributionPct,
+    PostTier,
+    ExperienceLevel,
+    AgeInDays,
+    ViewsPerScore,
+    MovingAverageScore,
+    TrendStatus,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    ComplexMetric,
+    UserIdDisplayName,
+    ShortBio,
+    ContentCategory
+FROM ComplexQuery
+WHERE PostTier IN ('PopularHighImpact', 'Popular') 
+  AND (ScoreContributionPct > 5 OR TagAvgScore > 50)
+  AND TotalPosts > 5
+ORDER BY TotalScore DESC, PostScore DESC, ViewsPerScore DESC
+LIMIT 1000 OFFSET 0;

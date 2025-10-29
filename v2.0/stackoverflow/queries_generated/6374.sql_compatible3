@@ -1,0 +1,95 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        U.DisplayName,
+        U.Reputation,
+        P.OwnerUserId AS UserId,
+        P.Tags,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS rank
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.DisplayName,
+    RP.Reputation,
+    COALESCE(BC.BadgeCount, 0) AS BadgeCount,
+    CASE
+        WHEN RP.rank <= 3 THEN 'Top'
+        WHEN RP.rank <= 10 THEN 'Top 10'
+        ELSE 'Other'
+    END AS RankCategory,
+    (
+        SELECT 
+            STRING_AGG(T.TagName, ', ')
+        FROM 
+            (
+                SELECT TRIM(BOTH '<>' FROM tag_text) AS tag_text_clean
+                FROM (
+                    -- split tags string like "<1><2><3>" into elements "1","2","3"
+                    SELECT value AS tag_text
+                    FROM (
+                        -- use a generic split: replace '><' with a delimiter and trim leading/trailing angle
+                        SELECT REPLACE(RP.Tags, '><', '|') AS tags_replaced
+                    ) r,
+                    -- split into rows using standard SQL approach via recursive CTE
+                    LATERAL (
+                        WITH RECURSIVE split(idx, rest, val) AS (
+                            SELECT 1, tags_replaced,
+                                   CASE WHEN POSITION('|' IN tags_replaced)=0 THEN tags_replaced
+                                        ELSE SUBSTRING(tags_replaced FROM 1 FOR POSITION('|' IN tags_replaced)-1) END
+                            UNION ALL
+                            SELECT idx+1,
+                                   CASE WHEN POSITION('|' IN rest)=0 THEN '' ELSE SUBSTRING(rest FROM POSITION('|' IN rest)+1) END,
+                                   CASE WHEN POSITION('|' IN rest)=0 THEN rest
+                                        ELSE SUBSTRING(rest FROM 1 FOR POSITION('|' IN rest)-1) END
+                            FROM split
+                            WHERE rest <> '' AND rest IS NOT NULL
+                        )
+                        SELECT val AS value FROM split WHERE val IS NOT NULL AND val <> ''
+                    ) s
+                ) t
+            ) tags_split
+        JOIN Tags T ON CAST(tags_split.tag_text_clean AS INTEGER) = T.Id
+    ) AS Tags
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.UserId = BC.UserId
+GROUP BY
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.DisplayName,
+    RP.Reputation,
+    RP.UserId,
+    RP.rank,
+    RP.Tags,
+    BC.BadgeCount
+ORDER BY 
+    RP.Score DESC, RP.ViewCount DESC;

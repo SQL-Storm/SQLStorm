@@ -1,0 +1,169 @@
+-- {"query": "7546.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2085} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        SUM(COALESCE(p.Score, 0)) as TotalScore,
+        AVG(CAST(p.ViewCount as FLOAT)) as AvgViewCount,
+        STRING_AGG(DISTINCT p.Tags, ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, PostCount DESC) as ScoreRank,
+        RANK() OVER (ORDER BY Reputation DESC) as RepRank,
+        NTILE(10) OVER (ORDER BY TotalScore DESC) as ScorePercentile
+    FROM UserActivityStats
+),
+TopQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        LAG(p.Score) OVER (ORDER BY p.Score DESC) as PrevScore,
+        LEAD(p.Score) OVER (ORDER BY p.Score DESC) as NextScore,
+        AVG(p.Score) OVER (PARTITION BY SUBSTRING(p.Tags, 1, 5)) as AvgScoreByTagPrefix,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'Very Low'
+        END as ScoreCategory,
+        COALESCE(p.Tags, '') as SafeTags,
+        SUBSTRING(p.Title, 1, 50) as TitlePreview,
+        DATEDIFF(day, p.CreationDate, CURRENT_TIMESTAMP) as AgeDays
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate >= DATEADD(month, -12, CURRENT_TIMESTAMP)
+      AND p.Score >= 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as RankByUsage,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) as PrevCount,
+        (t.Count - LAG(t.Count) OVER (ORDER BY t.Count DESC)) / NULLIF(LAG(t.Count) OVER (ORDER BY t.Count DESC), 0) * 100 as GrowthRatePercent
+    FROM Tags t
+    WHERE t.Count > 0
+),
+UserPostPerformance AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as UserPostCount,
+        AVG(CAST(p.Score as FLOAT)) as AvgUserScore,
+        MAX(p.Score) as MaxUserScore,
+        MIN(p.Score) as MinUserScore,
+        SUM(p.Score) as TotalUserScore,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) as UserQuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) as UserAnswerCount,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) = 0 THEN NULL
+            WHEN AVG(CAST(p.Score as FLOAT)) >= 10 THEN 'Expert'
+            WHEN AVG(CAST(p.Score as FLOAT)) >= 5 THEN 'Advanced'
+            WHEN AVG(CAST(p.Score as FLOAT)) >= 1 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as SkillLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    'Performance Metrics' as MetricType,
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT CASE WHEN ru.ScoreRank <= 10 THEN ru.UserId END) as Top10Scorers,
+    COUNT(DISTINCT CASE WHEN ru.RepRank <= 10 THEN ru.UserId END) as Top10Reputation,
+    COUNT(DISTINCT CASE WHEN ta.PopularityLevel = 'Popular' THEN ta.TagName END) as PopularTags,
+    COUNT(DISTINCT CASE WHEN tq.ScoreCategory = 'High' THEN tq.Id END) as HighScoreQuestions,
+    AVG(CAST(ru.TotalScore as FLOAT)) as AvgTotalScore,
+    AVG(CAST(tq.Score as FLOAT)) as AvgQuestionScore,
+    AVG(CAST(ta.Count as FLOAT)) as AvgTagCount,
+    STRING_AGG(DISTINCT CASE WHEN ru.ScoreRank <= 5 THEN CONCAT(ru.DisplayName, ':', ru.TotalScore) END, '; ') as TopScorersInfo,
+    STRING_AGG(DISTINCT CASE WHEN ta.RankByUsage <= 5 THEN CONCAT(ta.TagName, ':', ta.Count) END, '; ') as TopTags,
+    STRING_AGG(DISTINCT CASE WHEN tq.ScoreCategory = 'High' THEN CONCAT(tq.TitlePreview, ' (', tq.Score, ')') END, '; ') as HighScoreQuestionPreview,
+    COUNT(*) OVER () as OverallRecordCount,
+    ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) as RowNum
+FROM RankedUsers ru
+FULL OUTER JOIN TopQuestions tq ON 1 = 1
+FULL OUTER JOIN TagAnalysis ta ON 1 = 1
+FULL OUTER JOIN UserPostPerformance upp ON 1 = 1
+WHERE EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = ru.UserId)
+  AND EXISTS (SELECT 1 FROM Tags t WHERE t.Count > 100)
+  AND EXISTS (SELECT 1 FROM Users u WHERE u.Id = upp.UserId)
+  AND (COALESCE(ru.ScoreRank, 0) < 100 OR COALESCE(tq.Score, 0) > 50 OR COALESCE(ta.Count, 0) > 50)
+GROUP BY 
+    CASE 
+        WHEN COUNT(*) IS NULL THEN 'Empty Result'
+        WHEN COUNT(*) > 1000 THEN 'Large Set'
+        WHEN COUNT(*) > 100 THEN 'Medium Set'
+        ELSE 'Small Set'
+    END
+HAVING COUNT(*) > 0
+UNION ALL
+SELECT 
+    'Complex Analysis Results' as MetricType,
+    COUNT(*) as TotalRecords,
+    SUM(CASE WHEN ru.ScoreRank <= 10 THEN 1 ELSE 0 END) as Top10Scorers,
+    SUM(CASE WHEN ru.RepRank <= 10 THEN 1 ELSE 0 END) as Top10Reputation,
+    SUM(CASE WHEN ta.PopularityLevel = 'Popular' THEN 1 ELSE 0 END) as PopularTags,
+    SUM(CASE WHEN tq.ScoreCategory = 'High' THEN 1 ELSE 0 END) as HighScoreQuestions,
+    AVG(CAST(ru.TotalScore as FLOAT)) as AvgTotalScore,
+    AVG(CAST(tq.Score as FLOAT)) as AvgQuestionScore,
+    AVG(CAST(ta.Count as FLOAT)) as AvgTagCount,
+    STRING_AGG(DISTINCT CASE WHEN ru.ScoreRank <= 5 THEN CONCAT(ru.DisplayName, ':', ru.TotalScore) END, '; ') as TopScorersInfo,
+    STRING_AGG(DISTINCT CASE WHEN ta.RankByUsage <= 5 THEN CONCAT(ta.TagName, ':', ta.Count) END, '; ') as TopTags,
+    STRING_AGG(DISTINCT CASE WHEN tq.ScoreCategory = 'High' THEN CONCAT(tq.TitlePreview, ' (', tq.Score, ')') END, '; ') as HighScoreQuestionPreview,
+    COUNT(*) OVER () as OverallRecordCount,
+    ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) as RowNum
+FROM RankedUsers ru
+LEFT JOIN TopQuestions tq ON ru.UserId = tq.OwnerUserId
+LEFT JOIN TagAnalysis ta ON 1 = 1
+LEFT JOIN UserPostPerformance upp ON ru.UserId = upp.UserId
+WHERE (
+    (ru.UserId >= 1000 AND ru.UserId <= 2000 AND ru.ScoreRank <= 50) OR
+    (tq.Id IS NOT NULL AND tq.Score > 10 AND tq.Score < 1000) OR
+    (ta.Count > 500 AND ta.Count < 10000) OR
+    upp.TotalUserScore > 500
+)
+GROUP BY 
+    CASE 
+        WHEN COUNT(*) IS NULL THEN 'Complex Empty Result'
+        WHEN COUNT(*) > 500 THEN 'Complex Large Set'
+        WHEN COUNT(*) > 50 THEN 'Complex Medium Set'
+        ELSE 'Complex Small Set'
+    END
+HAVING 
+    COUNT(*) >= 1 
+    OR EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId IN (SELECT UserId FROM RankedUsers WHERE ScoreRank <= 20))
+    OR EXISTS (SELECT 1 FROM Tags t WHERE t.Count > 500)
+ORDER BY RowNum DESC;

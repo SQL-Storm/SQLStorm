@@ -1,0 +1,150 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.Views, 0) AS Views,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount,
+        (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastPostDate
+    FROM Users u
+),
+RecentVotes AS (
+    SELECT 
+        v.UserId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS UpVotesGiven,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVotesGiven,
+        COUNT(CASE WHEN vt.Name = 'Favorite' THEN 1 END) AS FavoritesGiven,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= CAST(CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY AS DATE)
+    GROUP BY v.UserId
+),
+TagPerformance AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavorites,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.Reputation > 10000) AS TopExpertUsers
+    FROM Tags t
+    LEFT JOIN Posts p 
+        ON p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')
+        AND p.PostTypeId = 1
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 100
+),
+UserRankings AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.BadgeCount,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.AnswerCount DESC) AS ReputationRank,
+        PERCENT_RANK() OVER (ORDER BY us.AnswerCount DESC) AS AnswerPercentile,
+        us.LastPostDate
+    FROM UserStats us
+),
+TopTagPerUser AS (
+    SELECT DISTINCT
+        ur.Id AS UserId,
+        tp2.TagName,
+        tp2.QuestionCount,
+        tp2.AvgScore,
+        tp2.TotalFavorites,
+        tp2.TopExpertUsers
+    FROM UserRankings ur
+    LEFT JOIN LATERAL (
+        SELECT 
+            tp2.TagName,
+            tp2.QuestionCount,
+            tp2.AvgScore,
+            tp2.TotalFavorites,
+            tp2.TopExpertUsers
+        FROM TagPerformance tp2
+        ORDER BY tp2.AvgScore DESC
+        LIMIT 1
+    ) tp2 ON TRUE
+)
+SELECT 
+    ur.Id,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.ReputationRank,
+    ur.AnswerPercentile,
+    ur.QuestionCount,
+    ur.AnswerCount,
+    ur.BadgeCount,
+    rv.UpVotesGiven,
+    rv.DownVotesGiven,
+    rv.FavoritesGiven,
+    rv.LastVoteDate,
+    COALESCE(rv.LastVoteDate, ur.LastPostDate) AS LastActivity,
+    CASE
+        WHEN ur.Reputation > 20000 THEN 'Elite'
+        WHEN ur.Reputation > 10000 THEN 'Pro'
+        WHEN ur.Reputation > 5000  THEN 'Experienced'
+        ELSE 'Novice'
+    END AS ReputationTier,
+    tt.TagName,
+    tt.QuestionCount AS TagQuestionCount,
+    tt.AvgScore AS TagAvgScore,
+    tt.TotalFavorites AS TagFavorites,
+    tt.TopExpertUsers
+FROM UserRankings ur
+LEFT JOIN RecentVotes rv ON rv.UserId = ur.Id
+LEFT JOIN TopTagPerUser tt ON tt.UserId = ur.Id
+WHERE ur.AnswerCount > 0
+  AND (ur.LastPostDate IS NOT NULL OR rv.LastVoteDate IS NOT NULL)
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS BIGINT) AS Id,
+    'Aggregated Summary' AS DisplayName,
+    CAST(NULL AS BIGINT) AS Reputation,
+    CAST(NULL AS BIGINT) AS ReputationRank,
+    CAST(NULL AS DOUBLE PRECISION) AS AnswerPercentile,
+    SUM(us.QuestionCount) AS QuestionCount,
+    SUM(us.AnswerCount) AS AnswerCount,
+    SUM(us.BadgeCount) AS BadgeCount,
+    SUM(COALESCE(rv.UpVotesGiven,0)) AS UpVotesGiven,
+    SUM(COALESCE(rv.DownVotesGiven,0)) AS DownVotesGiven,
+    SUM(COALESCE(rv.FavoritesGiven,0)) AS FavoritesGiven,
+    MAX(COALESCE(rv.LastVoteDate, us.LastPostDate)) AS LastVoteDate,
+    MAX(COALESCE(rv.LastVoteDate, us.LastPostDate)) AS LastActivity,
+    CAST(NULL AS TEXT) AS ReputationTier,
+    tp_summary.TagName,
+    tp_summary.QuestionCount,
+    tp_summary.AvgScore,
+    tp_summary.TotalFavorites,
+    tp_summary.TopExpertUsers
+FROM UserStats us
+LEFT JOIN RecentVotes rv ON rv.UserId = us.Id
+JOIN (
+    SELECT 
+        TagName,
+        SUM(QuestionCount) AS QuestionCount,
+        AVG(AvgScore) AS AvgScore,
+        SUM(TotalFavorites) AS TotalFavorites,
+        STRING_AGG(TopExpertUsers, '; ') AS TopExpertUsers
+    FROM TagPerformance
+    GROUP BY TagName
+    ORDER BY SUM(QuestionCount) DESC
+    LIMIT 1
+) tp_summary ON TRUE
+GROUP BY 
+    tp_summary.TagName,
+    tp_summary.QuestionCount,
+    tp_summary.AvgScore,
+    tp_summary.TotalFavorites,
+    tp_summary.TopExpertUsers
+
+ORDER BY ReputationRank NULLS LAST, QuestionCount DESC
+LIMIT 100;

@@ -1,0 +1,156 @@
+-- {"query": "3667.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2710} 
+
+WITH
+    /* ------------------------------------------------------------------
+       Aggregate user statistics including badges, posts and vote activity
+    ------------------------------------------------------------------ */
+    UserStats AS (
+        SELECT
+            u.Id                                   AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+            COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+            COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+            SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+            SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+            MAX(p.CreationDate)                    AS LastPostDate,
+            MAX(v.CreationDate) FILTER (WHERE v.VoteTypeId = 2) AS LastUpvoteDate
+        FROM Users u
+        LEFT JOIN Badges     b ON b.UserId = u.Id
+        LEFT JOIN Posts      p ON p.OwnerUserId = u.Id
+        LEFT JOIN Votes      v ON v.UserId = u.Id AND v.VoteTypeId = 2
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    /* ------------------------------------------------------------------
+       Top tags by overall usage (excluding moderator‑only tags)
+    ------------------------------------------------------------------ */
+    TopTags AS (
+        SELECT
+            t.TagName,
+            t.Count,
+            ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+        FROM Tags t
+        WHERE t.IsModeratorOnly = 0
+    ),
+
+    /* ------------------------------------------------------------------
+       Per‑question detailed stats, including derived columns and subqueries
+    ------------------------------------------------------------------ */
+    QuestionStats AS (
+        SELECT
+            q.Id                                 AS QuestionId,
+            q.OwnerUserId,
+            q.Title,
+            q.CreationDate,
+            q.Score,
+            q.ViewCount,
+            q.FavoriteCount,
+            q.Tags,
+            COALESCE(q.ClosedDate, '9999-12-31'::timestamp) AS EffectiveClosedDate,
+            (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS AnswerCount,
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 3) AS DownVoteCount,
+            (SELECT MAX(v.CreationDate)
+               FROM Votes v
+               WHERE v.PostId = q.Id AND v.VoteTypeId = 2)                           AS LastUpvote,
+            (SELECT ph.Comment
+               FROM PostHistory ph
+               WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId = 10
+               ORDER BY ph.CreationDate DESC
+               LIMIT 1)                                                             AS CloseReasonId
+        FROM Posts q
+        WHERE q.PostTypeId = 1                      -- only questions
+    ),
+
+    /* ------------------------------------------------------------------
+       Duplicate links (most recent per question)
+    ------------------------------------------------------------------ */
+    DupLinks AS (
+        SELECT
+            pl.PostId,
+            pl.RelatedPostId,
+            lt.Name                     AS LinkTypeName,
+            ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) AS rn
+        FROM PostLinks pl
+        JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+        WHERE lt.Name = 'Duplicate'
+    ),
+
+    /* ------------------------------------------------------------------
+       Combine everything, add window ranking and string processing
+    ------------------------------------------------------------------ */
+    Combined AS (
+        SELECT
+            us.UserId,
+            us.DisplayName,
+            us.Reputation,
+            us.GoldBadges,
+            us.SilverBadges,
+            us.BronzeBadges,
+            us.QuestionsAsked,
+            us.AnswersGiven,
+            us.LastPostDate,
+            us.LastUpvoteDate,
+            qs.QuestionId,
+            qs.Title,
+            qs.Score,
+            qs.ViewCount,
+            qs.FavoriteCount,
+            qs.AnswerCount,
+            qs.UpVoteCount,
+            qs.DownVoteCount,
+            COALESCE(qs.CloseReasonId, '0')::int                                    AS CloseReasonCode,
+            /* turn the <tag><tag> string into a CSV list */
+            CASE
+                WHEN qs.Tags IS NOT NULL
+                THEN array_to_string(
+                         ARRAY(
+                             SELECT trim(both '<>' FROM unnest(
+                                 string_to_array(substring(qs.Tags, 2, length(qs.Tags)-2), '><')
+                             ))
+                         ),
+                         ','
+                     )
+                ELSE NULL
+            END                                                                     AS TagList,
+            dl.RelatedPostId                                                      AS DuplicateOf,
+            ROW_NUMBER() OVER (PARTITION BY us.UserId ORDER BY qs.Score DESC NULLS LAST) AS QuestionRank
+        FROM UserStats   us
+        LEFT JOIN QuestionStats qs ON qs.OwnerUserId = us.UserId
+        LEFT JOIN DupLinks      dl ON dl.PostId = qs.QuestionId AND dl.rn = 1
+        WHERE us.Reputation > 10000
+          AND (qs.Score IS NULL OR qs.Score > 0)
+          AND (qs.EffectiveClosedDate > now() OR qs.EffectiveClosedDate IS NULL)
+    )
+
+SELECT
+    c.UserId,
+    c.DisplayName,
+    c.Reputation,
+    c.GoldBadges,
+    c.SilverBadges,
+    c.BronzeBadges,
+    c.QuestionsAsked,
+    c.AnswersGiven,
+    c.LastPostDate,
+    c.LastUpvoteDate,
+    c.QuestionId,
+    c.Title,
+    c.Score,
+    c.ViewCount,
+    c.FavoriteCount,
+    c.AnswerCount,
+    c.UpVoteCount,
+    c.DownVoteCount,
+    cr.Name                                    AS CloseReasonName,
+    c.TagList,
+    t.TagName                                  AS MostPopularTag,
+    c.DuplicateOf,
+    c.QuestionRank
+FROM Combined c
+LEFT JOIN CloseReasonTypes cr ON cr.Id = c.CloseReasonCode
+LEFT JOIN TopTags          t  ON t.rn = 1
+WHERE c.QuestionRank <= 5
+ORDER BY c.Reputation DESC, c.QuestionRank;

@@ -1,0 +1,127 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        ARRAY[t.TagName] AS TagPath,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false
+    UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        r.TagPath || t.TagName,
+        r.Depth + 1
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id = r.Id + 1
+    WHERE r.Depth < 3
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COALESCE(SUM(vb.VoteScore), 0) AS VoteScoreSum,
+        RANK() OVER (ORDER BY COALESCE(SUM(vb.VoteScore), 0) DESC) AS VoteScoreRank
+    FROM
+        Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN Comments c ON c.UserId = u.Id
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        LEFT JOIN (
+            SELECT
+                v.PostId,
+                p.OwnerUserId AS OwnerUserId,
+                CASE
+                    WHEN vt.Name = 'UpMod' THEN 1
+                    WHEN vt.Name = 'DownMod' THEN -1
+                    ELSE 0
+                END AS VoteScore
+            FROM Votes v
+            JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+            JOIN Posts p ON v.PostId = p.Id
+            WHERE vt.Name IN ('UpMod','DownMod')
+        ) vb ON vb.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+HotQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        COUNT(v.Id) FILTER (WHERE vt.Name = 'UpMod') AS UpVotes,
+        COUNT(v.Id) FILTER (WHERE vt.Name = 'DownMod') AS DownVotes,
+        (COUNT(v.Id) FILTER (WHERE vt.Name = 'UpMod') - COUNT(v.Id) FILTER (WHERE vt.Name = 'DownMod')) AS VoteDiff,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE p.PostTypeId = 1 AND p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '30 day'
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount
+),
+ClosedQuestionsWithReasons AS (
+    SELECT
+        ph.PostId,
+        p.Title,
+        p.CreationDate,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS CloseDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS CloseEventRank
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS integer) = crt.Id
+    JOIN Posts p ON p.Id = ph.PostId
+    WHERE p.PostTypeId = 1 AND ph.Comment IS NOT NULL AND ph.PostHistoryTypeId = 10
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.BadgeCount,
+    ua.VoteScoreSum,
+    ua.VoteScoreRank,
+    hq.Id AS HotQuestionId,
+    hq.Title AS HotQuestionTitle,
+    hq.Score AS HotQuestionScore,
+    hq.UpVotes,
+    hq.DownVotes,
+    hq.VoteDiff,
+    cqwr.CloseReason,
+    cqwr.CloseDate,
+    cqwr.Title AS ClosedQuestionTitle,
+    CASE
+        WHEN POSITION('sql' IN COALESCE(p.Body, '')) > 0 THEN 'Contains SQL'
+        ELSE 'No SQL'
+    END AS BodyContainsSQL,
+    rth.TagName,
+    rth.TagPath,
+    rth.Depth
+FROM UserActivity ua
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM HotQuestions hq
+    WHERE hq.Id IN (
+        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ua.UserId AND p.PostTypeId = 1
+    )
+    ORDER BY hq.ScoreRank
+    LIMIT 1
+) hq ON true
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM ClosedQuestionsWithReasons cqwr
+    WHERE cqwr.PostId IN (
+        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ua.UserId AND p.PostTypeId = 1
+    )
+    AND cqwr.CloseEventRank = 1
+    ORDER BY cqwr.CloseDate DESC
+    LIMIT 1
+) cqwr ON true
+LEFT JOIN Posts p ON p.OwnerUserId = ua.UserId AND p.PostTypeId = 1
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = ANY(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'))
+WHERE ua.VoteScoreRank <= 100
+ORDER BY ua.VoteScoreRank, hq.ScoreRank, cqwr.CloseDate;

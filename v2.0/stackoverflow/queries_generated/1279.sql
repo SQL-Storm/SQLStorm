@@ -1,0 +1,244 @@
+-- {"query": "1279.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3290} 
+
+WITH UserReputationSnapshots AS (
+    -- Synthesize reputation events for users to demonstrate LAG/LEAD over a pseudo-time series.
+    -- In a real scenario, this would come from a dedicated reputation history table.
+    SELECT
+        U.Id AS UserId,
+        U.Reputation AS CurrentReputationAtEvent,
+        U.CreationDate AS EventDate,
+        'UserCreated' AS EventType,
+        1 AS EventWeight -- Baseline event
+    FROM Users U
+    UNION ALL
+    SELECT
+        B.UserId,
+        U.Reputation AS CurrentReputationAtEvent, -- Using current reputation as a placeholder for rep at badge date
+        B.Date AS EventDate,
+        CONCAT('Badge: ', B.Name) AS EventType,
+        CASE B.Class
+            WHEN 1 THEN 10 -- Gold badge
+            WHEN 2 THEN 5  -- Silver badge
+            WHEN 3 THEN 1  -- Bronze badge
+            ELSE 0
+        END AS EventWeight
+    FROM Badges B
+    JOIN Users U ON B.UserId = U.Id
+),
+UserReputationEvents AS (
+    -- Applies LAG window function to analyze reputation changes between synthesized events.
+    SELECT
+        UserId,
+        EventDate,
+        EventType,
+        CurrentReputationAtEvent,
+        LAG(EventDate, 1, EventDate) OVER (PARTITION BY UserId ORDER BY EventDate, EventType) AS PreviousEventDate,
+        LAG(CurrentReputationAtEvent, 1, 0) OVER (PARTITION BY UserId ORDER BY EventDate, EventType) AS ReputationAtPreviousEvent,
+        SUM(EventWeight) OVER (PARTITION BY UserId ORDER BY EventDate, EventType) AS CumulativeEventWeight,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY EventDate DESC, EventType DESC) AS rn
+    FROM UserReputationSnapshots
+),
+UserActivitySummary AS (
+    -- Aggregates user-level metrics including posts, comments, and engagement ratios.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersGiven,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        MAX(COALESCE(P.LastActivityDate, P.CreationDate, C.CreationDate, U.LastAccessDate)) AS LastKnownActivity,
+        CAST(COUNT(DISTINCT P.Id) + COUNT(DISTINCT C.Id) AS DECIMAL(10,2)) / NULLIF(U.Views + 1, 0) AS EngagementRatio
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostDetailsAggregated AS (
+    -- Combines post, history, and comment sentiment data for individual posts.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        P.LastEditorUserId,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Title,
+        P.Tags,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        -- Post History aggregates
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        MIN(PH.CreationDate) AS FirstHistoryDate,
+        MAX(PH.CreationDate) AS LastHistoryDate,
+        -- Correlated subquery for initial author (demonstrates correlated subquery within CTE)
+        (
+            SELECT UserId
+            FROM PostHistory
+            WHERE PostId = P.Id AND PostHistoryTypeId IN (1, 2, 3) -- Initial Title, Body, Tags
+            ORDER BY CreationDate
+            LIMIT 1
+        ) AS InitialAuthorUserId,
+        -- Comment sentiment aggregates using string expressions
+        SUM(CASE WHEN LOWER(C.Text) LIKE '%great%' OR LOWER(C.Text) LIKE '%helpful%' THEN 1 ELSE 0 END) AS PositiveComments,
+        SUM(CASE WHEN LOWER(C.Text) LIKE '%bug%' OR LOWER(C.Text) LIKE '%error%' THEN 1 ELSE 0 END) AS NegativeComments
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.AcceptedAnswerId, P.ParentId, P.CreationDate, P.Score, P.ViewCount, P.OwnerUserId,
+        P.LastEditorUserId, P.LastEditDate, P.LastActivityDate, P.Title, P.Tags, P.AnswerCount, P.CommentCount,
+        P.FavoriteCount, P.ClosedDate, P.CommunityOwnedDate
+),
+UserBadgeStats AS (
+    -- Summarizes badge achievements for each user.
+    SELECT
+        B.UserId,
+        MAX(CASE WHEN B.Class = 1 THEN B.Date END) AS FirstGoldBadgeDate,
+        MAX(CASE WHEN B.Class = 2 THEN B.Date END) AS FirstSilverBadgeDate,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        -- Non-correlated subquery for global average badges (demonstrates non-correlated subquery)
+        (SELECT AVG(BadgeCount) FROM (SELECT COUNT(Id) AS BadgeCount FROM Badges GROUP BY UserId) AS AvgBadges) AS GlobalAvgBadges
+    FROM Badges B
+    GROUP BY B.UserId
+),
+HotTagsRanking AS (
+    -- Identifies and ranks 'hot' tags based on aggregated post views and answers.
+    SELECT
+        T.TagName,
+        SUM(P.ViewCount) AS TotalTagViews,
+        SUM(P.AnswerCount) AS TotalTagAnswers,
+        COUNT(DISTINCT P.Id) AS PostsWithTag,
+        DENSE_RANK() OVER (ORDER BY SUM(P.ViewCount) DESC, SUM(P.AnswerCount) DESC) AS TagRank
+    FROM Posts P
+    JOIN Tags T ON P.Tags LIKE CONCAT('%<', T.TagName, '>%') -- String expression for tag matching
+    WHERE P.PostTypeId = 1
+    AND P.ViewCount IS NOT NULL AND P.AnswerCount IS NOT NULL
+    GROUP BY T.TagName
+    HAVING COUNT(DISTINCT P.Id) >= 50
+),
+UserVotingProfile AS (
+    -- Summarizes voting activity initiated by each user.
+    SELECT
+        V.UserId,
+        COUNT(V.Id) AS TotalVotesCast,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCast,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCast,
+        SUM(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVotesCast,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotesCast
+    FROM Votes V
+    WHERE V.UserId IS NOT NULL
+    GROUP BY V.UserId
+)
+-- Main query to identify influential users and their posts based on diverse criteria.
+SELECT
+    UE.UserId,
+    COALESCE(UE.DisplayName, 'Deleted User #' || CAST(UE.UserId AS VARCHAR)) AS UserDisplayName, -- NULL logic (COALESCE)
+    UE.Reputation,
+    UE.UserProfileViews,
+    UE.TotalPosts,
+    UE.QuestionsAsked,
+    UE.AnswersGiven,
+    UE.EngagementRatio,
+    UBD.TotalBadges,
+    UBD.GoldBadges,
+    UBD.SilverBadges,
+    UBD.FirstGoldBadgeDate,
+    UBD.GlobalAvgBadges,
+    UVP.UpVotesCast,
+    UVP.DownVotesCast,
+    UVP.AcceptedVotesCast,
+    -- Complicated calculation for 'InfluenceScore' integrating various user and post metrics,
+    -- including nested subqueries for PostLinks activity.
+    (UE.Reputation * 0.1
+        + UE.TotalPostScore * 0.05
+        + UE.TotalCommentScore * 0.02
+        + COALESCE(UVP.UpVotesCast, 0) * 0.01
+        - COALESCE(UVP.DownVotesCast, 0) * 0.01
+        + (SELECT COUNT(PL.Id) FROM PostLinks PL WHERE PL.RelatedPostId = PDA.PostId AND PL.LinkTypeId = 1) * 0.005 -- Linked by others
+        + (SELECT COUNT(PL.Id) FROM PostLinks PL WHERE PL.PostId = PDA.PostId AND PL.LinkTypeId = 3) * 0.002 -- Duplicates of this post
+    ) AS InfluenceScore,
+    PDA.PostId,
+    PDA.Title,
+    PDA.ViewCount AS PostViewCount,
+    PDA.Score AS PostScore,
+    PDA.CreationDate AS PostCreationDate,
+    PDA.LastEditDate,
+    PDA.AnswerCount,
+    PDA.FavoriteCount,
+    PDA.EditCount,
+    PDA.LastHistoryDate AS PostLastEditHistoryDate,
+    PDA.CommunityOwnedDate IS NOT NULL AS IsCommunityWiki, -- NULL logic (IS NOT NULL)
+    COALESCE(PDA.ClosedDate, '1900-01-01 00:00:00') AS EffectiveClosedDate, -- NULL logic (COALESCE)
+    -- String manipulations on Tags, including REPLACE and TRIM for cleaning.
+    TRIM(BOTH '<>' FROM REPLACE(REPLACE(PDA.Tags, '><', ', '), '<', ''), ' ') AS CleanedTagsString,
+    -- Complex CASE expression for categorizing posts based on performance and user engagement.
+    CASE
+        WHEN PDA.Score >= 500 AND PDA.ViewCount >= 100000 THEN 'Mega-Viral Post'
+        WHEN PDA.Score >= 100 AND PDA.ViewCount >= 20000 THEN 'Highly Popular Post'
+        WHEN PDA.AcceptedAnswerId IS NOT NULL AND PDA.EditCount >= 3 AND PDA.PositiveComments > 0 THEN 'Answered & Refined Positively'
+        WHEN PDA.NegativeComments > 0 AND PDA.Score < 0 THEN 'Controversial/Problematic Post'
+        ELSE 'Standard Post'
+    END AS PostImpactCategory,
+    HTR.TagName AS TopTagName,
+    HTR.TagRank,
+    PDA.PositiveComments,
+    PDA.NegativeComments,
+    URE.EventDate AS LastReputationEventDate,
+    URE.EventType AS LastReputationEventType,
+    (URE.CurrentReputationAtEvent - URE.ReputationAtPreviousEvent) AS ReputationChangeSincePreviousEvent,
+    -- Correlated subquery: get latest comment text from the user on this post.
+    (
+        SELECT C.Text
+        FROM Comments C
+        WHERE C.PostId = PDA.PostId AND C.UserId = UE.UserId
+        ORDER BY C.CreationDate DESC
+        LIMIT 1
+    ) AS LatestUserCommentOnPost,
+    -- Window functions for ranking and distribution.
+    ROW_NUMBER() OVER (PARTITION BY UE.UserId ORDER BY PDA.Score DESC, PDA.ViewCount DESC) AS PostRankByUser,
+    RANK() OVER (ORDER BY PDA.Score DESC, PDA.ViewCount DESC, UE.Reputation DESC) AS GlobalPostRank,
+    NTILE(5) OVER (ORDER BY UE.Reputation DESC, UE.EngagementRatio DESC) AS ReputationEngagementQuintile
+FROM UserEngagement UE
+INNER JOIN PostDetailsAggregated PDA ON UE.UserId = PDA.OwnerUserId
+LEFT JOIN UserBadgeStats UBD ON UE.UserId = UBD.UserId
+LEFT JOIN UserVotingProfile UVP ON UE.UserId = UVP.UserId
+LEFT JOIN HotTagsRanking HTR ON PDA.Tags LIKE CONCAT('%<', HTR.TagName, '>%') AND HTR.TagRank <= 20 -- Joining on string pattern
+LEFT JOIN UserReputationEvents URE ON UE.UserId = URE.UserId AND URE.rn = 1 -- Get the latest reputation event for each user
+WHERE
+    PDA.PostTypeId = 1 -- Focus on questions
+    AND PDA.CreationDate >= (NOW() - INTERVAL '3 year') -- Date arithmetic
+    AND UE.Reputation >= 500 -- Complex predicate filtering
+    AND PDA.ViewCount >= 500
+    AND PDA.AnswerCount >= 1
+    AND (
+        (PDA.Score > 20 AND PDA.EditCount >= 1)
+        OR (COALESCE(UBD.GoldBadges, 0) > 0 AND COALESCE(PDA.FavoriteCount, 0) > 5)
+        OR (UE.EngagementRatio > 0.2 AND COALESCE(PDA.PositiveComments, 0) > 0 AND HTR.TagRank IS NOT NULL)
+    )
+ORDER BY
+    InfluenceScore DESC,
+    GlobalPostRank ASC,
+    PostLastEditHistoryDate DESC
+LIMIT 500;

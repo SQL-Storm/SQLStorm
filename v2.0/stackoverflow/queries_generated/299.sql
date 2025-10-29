@@ -1,0 +1,295 @@
+-- {"query": "299.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2700} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           coalesce(nullif(trim(split_part(coalesce(u.location,''), ',', 1)), ''), 'Unknown') as region_hint,
+           dense_rank() over (order by u.creationdate desc) as recency_rank
+    from users u
+),
+user_badge_stats as (
+    select b.userid,
+           count(*) as total_badges,
+           sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+           sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+           sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+           max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_posts as (
+    select p.id,
+           p.owneruserid,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.title,
+           p.tags,
+           p.answercount,
+           p.closeddate,
+           p.communityowneddate,
+           case when p.closeddate is not null then 1 else 0 end as is_closed
+    from posts p
+    where p.posttypeid = 1
+),
+answer_posts as (
+    select pa.id,
+           pa.parentid as question_id,
+           pa.owneruserid as answer_user_id,
+           pa.score as answer_score,
+           pa.creationdate as answer_creation,
+           row_number() over (partition by pa.parentid order by pa.score desc, pa.creationdate asc, pa.id asc) as answer_rank_by_score
+    from posts pa
+    where pa.posttypeid = 2
+),
+accepted_answers as (
+    select q.id as question_id,
+           q.acceptedanswerid as accepted_id
+    from posts q
+    where q.posttypeid = 1
+      and q.acceptedanswerid is not null
+),
+tag_expansion as (
+    select q.id as question_id,
+           unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+    from question_posts q
+    where q.tags is not null
+      and length(q.tags) > 2
+),
+top_tags as (
+    select te.tag,
+           count(*) as tag_q_count,
+           percentile_cont(0.5) within group (order by qp.viewcount) as median_views
+    from tag_expansion te
+    join question_posts qp on qp.id = te.question_id
+    group by te.tag
+    having count(*) > 50
+),
+question_activity as (
+    select q.id as question_id,
+           coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end),0) as net_votes,
+           coalesce(sum(case when v.votetypeid = 2 then 1 else 0 end),0) as upvotes,
+           coalesce(sum(case when v.votetypeid = 3 then 1 else 0 end),0) as downvotes,
+           coalesce(sum(case when v.votetypeid = 5 then 1 else 0 end),0) as favorites,
+           count(distinct c.id) as comment_count
+    from question_posts q
+    left join votes v on v.postid = q.id
+    left join comments c on c.postid = q.id
+    group by q.id
+),
+closure_reasons as (
+    select ph.postid as question_id,
+           max(case when ph.posthistorytypeid = 10 then try_cast(ph.comment as int) else null end) as close_reason_id,
+           min(case when ph.posthistorytypeid = 10 then ph.creationdate end) as first_close_date
+    from posthistory ph
+    where ph.posthistorytypeid in (10, 11, 12, 13, 14, 15, 19, 20, 35)
+    group by ph.postid
+),
+duplicate_links as (
+    select pl.postid as dup_question_id,
+           pl.relatedpostid as original_question_id
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+user_question_stats as (
+    select u.id as user_id,
+           count(q.id) as questions_asked,
+           avg(q.score) as avg_q_score,
+           avg(q.viewcount) as avg_q_views,
+           sum(case when q.closeddate is not null then 1 else 0 end) as questions_closed,
+           sum(case when q.acceptedanswerid is not null then 1 else 0 end) as with_accepted_answer
+    from users u
+    left join posts q on q.posttypeid = 1 and q.owneruserid = u.id
+    group by u.id
+),
+user_answer_stats as (
+    select u.id as user_id,
+           count(a.id) as answers_posted,
+           avg(a.score) as avg_a_score
+    from users u
+    left join posts a on a.posttypeid = 2 and a.owneruserid = u.id
+    group by u.id
+),
+question_quality as (
+    select q.id as question_id,
+           q.owneruserid as owner_user_id,
+           q.score,
+           q.viewcount,
+           qa.net_votes,
+           qa.upvotes,
+           qa.downvotes,
+           qa.favorites,
+           qa.comment_count,
+           coalesce(c.close_reason_id, 0) as close_reason_id,
+           case
+             when q.viewcount is null or q.viewcount = 0 then null
+             else round((q.score::numeric + greatest(qa.net_votes,0)::numeric + coalesce(qa.favorites,0)::numeric) / nullif(q.viewcount::numeric,0), 6)
+           end as engagement_ratio,
+           case when q.closeddate is not null then 1 else 0 end as is_closed
+    from question_posts q
+    left join question_activity qa on qa.question_id = q.id
+    left join closure_reasons c on c.question_id = q.id
+),
+user_rollup as (
+    select ru.user_id,
+           ru.displayname,
+           ru.reputation,
+           ru.creationdate,
+           ru.region_hint,
+           uqs.questions_asked,
+           uqs.avg_q_score,
+           uqs.avg_q_views,
+           uqs.questions_closed,
+           uqs.with_accepted_answer,
+           uas.answers_posted,
+           uas.avg_a_score,
+           ubs.total_badges,
+           ubs.gold_badges,
+           ubs.silver_badges,
+           ubs.bronze_badges,
+           ubs.last_badge_date,
+           ru.recency_rank
+    from recent_users ru
+    left join user_question_stats uqs on uqs.user_id = ru.user_id
+    left join user_answer_stats  uas on uas.user_id = ru.user_id
+    left join user_badge_stats   ubs on ubs.userid = ru.user_id
+),
+question_enriched as (
+    select qq.question_id,
+           qq.owner_user_id,
+           qq.score,
+           qq.viewcount,
+           qq.net_votes,
+           qq.upvotes,
+           qq.downvotes,
+           qq.favorites,
+           qq.comment_count,
+           qq.close_reason_id,
+           qq.engagement_ratio,
+           qq.is_closed,
+           at.answer_user_id as top_answer_user_id,
+           at.answer_score as top_answer_score,
+           case when aa.accepted_id is not null then 1 else 0 end as has_accepted_answer,
+           case when aa.accepted_id = at.id then 1 else 0 end as top_is_accepted
+    from question_quality qq
+    left join answer_posts at on at.question_id = qq.question_id and at.answer_rank_by_score = 1
+    left join accepted_answers aa on aa.question_id = qq.question_id
+),
+ranked_questions as (
+    select qe.*,
+           tt.tag as dominant_tag,
+           row_number() over (
+               partition by qe.owner_user_id
+               order by coalesce(qe.engagement_ratio, -1) desc, qe.viewcount desc, qe.score desc, qe.question_id asc
+           ) as rn_by_owner_engagement
+    from question_enriched qe
+    left join tag_expansion te on te.question_id = qe.question_id
+    left join top_tags tt on tt.tag = te.tag
+),
+user_question_window as (
+    select rq.*,
+           count(*) over (partition by rq.owner_user_id) as owner_q_count,
+           sum(case when rq.is_closed = 1 then 1 else 0 end) over (partition by rq.owner_user_id) as owner_closed_count,
+           avg(rq.engagement_ratio) over (partition by rq.owner_user_id) as owner_avg_engagement,
+           max(rq.viewcount) over (partition by rq.owner_user_id) as owner_max_views
+    from ranked_questions rq
+),
+final_set as (
+    select 'HIGH_ENGAGEMENT' as bucket,
+           uw.owner_user_id as user_id,
+           uqw.question_id,
+           uqw.engagement_ratio,
+           uqw.viewcount,
+           uqw.score,
+           uqw.net_votes,
+           uqw.favorites,
+           uqw.comment_count,
+           uqw.close_reason_id,
+           uqw.has_accepted_answer,
+           uqw.top_is_accepted,
+           uqw.owner_q_count,
+           uqw.owner_closed_count,
+           uqw.owner_avg_engagement,
+           uqw.owner_max_views,
+           ur.displayname,
+           ur.reputation,
+           ur.total_badges,
+           ur.gold_badges,
+           ur.silver_badges,
+           ur.bronze_badges,
+           ur.recency_rank
+    from user_question_window uqw
+    join user_rollup ur on ur.user_id = uqw.owner_user_id
+    join lateral (
+        select 1 as marker
+        where uqw.engagement_ratio is not null
+          and uqw.engagement_ratio > coalesce(ur.avg_q_views / nullif(ur.reputation,0)::numeric, 0.001)
+    ) uw on true
+    where uqw.rn_by_owner_engagement <= 5
+
+    union all
+
+    select 'LOW_OR_NO_ENGAGEMENT' as bucket,
+           ur.user_id,
+           uqw.question_id,
+           uqw.engagement_ratio,
+           uqw.viewcount,
+           uqw.score,
+           uqw.net_votes,
+           uqw.favorites,
+           uqw.comment_count,
+           uqw.close_reason_id,
+           uqw.has_accepted_answer,
+           uqw.top_is_accepted,
+           uqw.owner_q_count,
+           uqw.owner_closed_count,
+           uqw.owner_avg_engagement,
+           uqw.owner_max_views,
+           ur.displayname,
+           ur.reputation,
+           ur.total_badges,
+           ur.gold_badges,
+           ur.silver_badges,
+           ur.bronze_badges,
+           ur.recency_rank
+    from user_question_window uqw
+    right join user_rollup ur on ur.user_id = uqw.owner_user_id
+    where coalesce(uqw.engagement_ratio, -1) <= coalesce(ur.avg_q_views / nullif(ur.reputation,0)::numeric, 0.001)
+)
+select fs.bucket,
+       fs.user_id,
+       fs.displayname,
+       fs.reputation,
+       fs.total_badges,
+       fs.gold_badges,
+       fs.silver_badges,
+       fs.bronze_badges,
+       fs.recency_rank,
+       fs.question_id,
+       fs.engagement_ratio,
+       fs.viewcount,
+       fs.score,
+       fs.net_votes,
+       fs.favorites,
+       fs.comment_count,
+       fs.close_reason_id,
+       fs.has_accepted_answer,
+       fs.top_is_accepted,
+       fs.owner_q_count,
+       fs.owner_closed_count,
+       fs.owner_avg_engagement,
+       fs.owner_max_views,
+       case
+         when fs.close_reason_id in (101,1) then 'Duplicate'
+         when fs.close_reason_id in (102,2) then 'Off-topic'
+         when fs.close_reason_id in (103) then 'Needs details/clarity'
+         when fs.close_reason_id in (104) then 'Needs more focus'
+         when fs.close_reason_id in (105,3,4,7,10,20) then 'Other'
+         when fs.close_reason_id is null or fs.close_reason_id = 0 then 'Open'
+         else 'Closed-Other'
+       end as close_reason_label
+from final_set fs
+where (fs.bucket = 'HIGH_ENGAGEMENT' and fs.reputation >= 100)
+   or (fs.bucket = 'LOW_OR_NO_ENGAGEMENT' and (fs.reputation < 100 or fs.total_badges is null))
+order by fs.bucket, fs.recency_rank, fs.reputation desc nulls last, fs.engagement_ratio desc nulls last, fs.viewcount desc, fs.question_id;

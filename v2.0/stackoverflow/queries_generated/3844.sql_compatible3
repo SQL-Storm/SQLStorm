@@ -1,0 +1,125 @@
+WITH
+    user_stats AS (
+        SELECT
+            u.id                              AS user_id,
+            u.displayname                     AS display_name,
+            u.reputation,
+            COUNT(p.id)                       AS total_posts,
+            SUM(CASE WHEN p.posttypeid = 1 THEN 1 ELSE 0 END) AS question_cnt,
+            SUM(CASE WHEN p.posttypeid = 2 THEN 1 ELSE 0 END) AS answer_cnt,
+            COALESCE(SUM(p.score),0)          AS total_score,
+            MAX(p.creationdate)               AS last_post_dt
+        FROM users u
+        LEFT JOIN posts p ON p.owneruserid = u.id
+        GROUP BY u.id, u.displayname, u.reputation
+    ),
+    badge_counts AS (
+        SELECT
+            b.userid,
+            SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+            SUM(CASE WHEN b.class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+            SUM(CASE WHEN b.class = 3 THEN 1 ELSE 0 END) AS bronze_cnt
+        FROM badges b
+        GROUP BY b.userid
+    ),
+    top_tags AS (
+        SELECT
+            t.tagname,
+            t.count,
+            ROW_NUMBER() OVER (ORDER BY t.count DESC) AS rn
+        FROM tags t
+        WHERE t.ismoderatoronly = 0
+    ),
+    user_tag_affinity AS (
+        SELECT
+            u.id                                   AS user_id,
+            t.tagname,
+            COUNT(*)                               AS tag_post_cnt,
+            SUM(p.score)                           AS tag_score
+        FROM users u
+        JOIN posts p ON p.owneruserid = u.id
+        LEFT JOIN LATERAL (
+            SELECT regexp_split_to_table(trim(both '<>' FROM p.tags), '><') AS tag
+        ) AS split ON TRUE
+        JOIN tags t ON t.tagname = split.tag
+        GROUP BY u.id, t.tagname
+    ),
+    user_tag_rank AS (
+        SELECT
+            uta.user_id,
+            uta.tagname,
+            uta.tag_post_cnt,
+            RANK() OVER (PARTITION BY uta.user_id ORDER BY uta.tag_post_cnt DESC) AS tag_rank
+        FROM user_tag_affinity uta
+    ),
+    vote_agg AS (
+        SELECT
+            p.owneruserid,
+            SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS up_votes,
+            SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) AS down_votes
+        FROM posts p
+        LEFT JOIN votes v ON v.postid = p.id
+        GROUP BY p.owneruserid
+    ),
+    main_result AS (
+        SELECT
+            us.user_id,
+            us.display_name,
+            us.reputation,
+            us.total_posts,
+            us.question_cnt,
+            us.answer_cnt,
+            us.total_score,
+            us.last_post_dt,
+            bc.gold_cnt,
+            bc.silver_cnt,
+            bc.bronze_cnt,
+            tt.tagname                     AS top_global_tag,
+            utr.tagname                    AS top_user_tag,
+            utr.tag_rank                   AS tag_rank_within_user,
+            COALESCE(v.up_votes,0) - COALESCE(v.down_votes,0) AS net_votes,
+            CASE
+                WHEN us.reputation > 20000 THEN 'Legendary'
+                WHEN us.reputation > 10000 THEN 'Expert'
+                WHEN us.reputation > 2000  THEN 'Experienced'
+                ELSE 'Novice'
+            END                           AS reputation_band,
+            (SELECT COUNT(*)
+             FROM comments c
+             WHERE c.userid = us.user_id
+               AND c.creationdate > (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+            ) AS recent_comments_cnt
+        FROM user_stats us
+        LEFT JOIN badge_counts bc       ON bc.userid = us.user_id
+        LEFT JOIN (SELECT tagname FROM top_tags WHERE rn = 1) tt ON TRUE
+        LEFT JOIN user_tag_rank utr     ON utr.user_id = us.user_id AND utr.tag_rank = 1
+        LEFT JOIN vote_agg v            ON v.owneruserid = us.user_id
+        WHERE (us.total_posts > 0 OR bc.gold_cnt IS NOT NULL)
+          AND COALESCE(us.reputation,0) BETWEEN 1000 AND 50000
+    )
+SELECT *
+FROM main_result
+ORDER BY reputation DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS TEXT),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS TIMESTAMP),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS TEXT),
+    CAST(NULL AS TEXT),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS TEXT)
+WHERE NOT EXISTS (SELECT 1 FROM users);

@@ -1,0 +1,441 @@
+-- {"query": "424.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 4139} 
+with
+-- Active users with recent activity windowed stats
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.location,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm,
+    sum(u.upvotes - u.downvotes) over (partition by (case when u.location is null or trim(u.location) = '' then 'UNKNOWN' else upper(u.location) end)) as net_votes_by_location,
+    row_number() over (partition by (case when u.location is null or trim(u.location) = '' then 'UNKNOWN' else upper(u.location) end) order by u.reputation desc, u.id) as loc_rep_rank
+  from users u
+  where u.reputation > 0
+),
+-- Questions with tag arrays and activity metrics
+questions as (
+  select
+    p.id as question_id,
+    p.owneruserid as owner_user_id,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.favoritecount,
+    p.answercount,
+    p.title,
+    p.tags,
+    string_to_array(substring(p.tags, 2, length(p.tags)-2), '><') as tag_arr,
+    (p.viewcount::numeric / nullif(p.favoritecount, 0)) as views_per_fav,
+    (p.score::numeric / nullif(p.viewcount, 0)) as score_per_view
+  from posts p
+  where p.posttypeid = 1
+),
+-- Answers joined to their questions
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as owner_user_id,
+    a.score as answer_score,
+    a.creationdate as answer_creationdate,
+    (a.id = q.acceptedanswerid) as is_accepted
+  from posts a
+  join posts q on q.id = a.parentid and a.posttypeid = 2 and q.posttypeid = 1
+),
+-- Per-question answer stats
+answer_stats as (
+  select
+    q.question_id,
+    count(*) as total_answers,
+    sum(case when ans.is_accepted then 1 else 0 end) as accepted_answers,
+    max(ans.answer_score) as max_answer_score,
+    avg(ans.answer_score::numeric) as avg_answer_score
+  from questions q
+  left join answers ans on ans.question_id = q.question_id
+  group by q.question_id
+),
+-- Votes breakdown per post (question or answer)
+votes_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid = 8 then v.bountyamount else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then v.bountyamount else 0 end) as bounty_awarded,
+    count(*) as total_votes
+  from votes v
+  group by v.postid
+),
+-- Comments sentiment proxy via score and length
+comment_signal as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    coalesce(sum(c.score), 0) as comment_score_sum,
+    avg(length(c.text)::numeric) as avg_comment_len
+  from comments c
+  group by c.postid
+),
+-- Post history closure/migration signals
+post_history_flags as (
+  select
+    ph.postid,
+    max(case when ph.posthistorytypeid = 10 then 1 else 0 end) as was_closed,
+    max(case when ph.posthistorytypeid = 11 then 1 else 0 end) as was_reopened,
+    max(case when ph.posthistorytypeid in (35,36) then 1 else 0 end) as was_migrated,
+    max(case when ph.posthistorytypeid = 19 then 1 else 0 end) as was_protected,
+    max(case when ph.posthistorytypeid = 50 then 1 else 0 end) as community_bump
+  from posthistory ph
+  group by ph.postid
+),
+-- Duplicate links and related links
+post_links_agg as (
+  select
+    pl.postid,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_links,
+    sum(case when pl.linktypeid = 1 then 1 else 0 end) as related_links
+  from postlinks pl
+  group by pl.postid
+),
+-- Badge summary per user
+badge_summary as (
+  select
+    b.userid,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    count(*) as total_badges,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+-- Tag popularity mapping
+tag_popularity as (
+  select
+    t.tagname,
+    t.count as tag_post_count
+  from tags t
+),
+-- Explode tags for questions
+question_tags as (
+  select
+    q.question_id,
+    unnest(q.tag_arr) as tagname
+  from questions q
+),
+-- Compute tag-weighted popularity per question
+question_tag_popularity as (
+  select
+    qt.question_id,
+    avg(tp.tag_post_count::numeric) as avg_tag_popularity,
+    sum(case when tp.tag_post_count > 0 then ln(tp.tag_post_count::numeric) else null end) as sum_log_tag_popularity
+  from question_tags qt
+  left join tag_popularity tp on tp.tagname = qt.tagname
+  group by qt.question_id
+),
+-- Derive user metrics joining users with their content
+user_content as (
+  select
+    au.user_id,
+    au.displayname,
+    au.reputation,
+    au.location,
+    au.creationdate,
+    au.lastaccessdate,
+    au.websiteurl_norm,
+    au.net_votes_by_location,
+    au.loc_rep_rank,
+    coalesce(bs.total_badges, 0) as total_badges,
+    coalesce(bs.gold_badges, 0) as gold_badges,
+    coalesce(bs.silver_badges, 0) as silver_badges,
+    coalesce(bs.bronze_badges, 0) as bronze_badges,
+    bs.last_badge_date
+  from active_users au
+  left join badge_summary bs on bs.userid = au.user_id
+),
+-- Join everything into question-centric dataset
+question_all as (
+  select
+    q.question_id,
+    q.owner_user_id,
+    q.creationdate,
+    q.score,
+    q.viewcount,
+    q.favoritecount,
+    q.answercount,
+    q.title,
+    q.tags,
+    q.views_per_fav,
+    q.score_per_view,
+    coalesce(vq.upvotes, 0) as q_upvotes,
+    coalesce(vq.downvotes, 0) as q_downvotes,
+    coalesce(vq.favorites, 0) as q_favorites,
+    coalesce(vq.total_votes, 0) as q_total_votes,
+    coalesce(vq.bounty_started, 0) as q_bounty_started,
+    coalesce(vq.bounty_awarded, 0) as q_bounty_awarded,
+    coalesce(cs.comment_count, 0) as q_comment_count,
+    coalesce(cs.comment_score_sum, 0) as q_comment_score_sum,
+    cs.avg_comment_len as q_avg_comment_len,
+    coalesce(ph.was_closed, 0) as was_closed,
+    coalesce(ph.was_reopened, 0) as was_reopened,
+    coalesce(ph.was_migrated, 0) as was_migrated,
+    coalesce(ph.was_protected, 0) as was_protected,
+    coalesce(ph.community_bump, 0) as community_bump,
+    coalesce(pla.duplicate_links, 0) as duplicate_links,
+    coalesce(pla.related_links, 0) as related_links,
+    coalesce(qtp.avg_tag_popularity, 0) as avg_tag_popularity,
+    qtp.sum_log_tag_popularity
+  from questions q
+  left join votes_agg vq on vq.postid = q.question_id
+  left join comment_signal cs on cs.postid = q.question_id
+  left join post_history_flags ph on ph.postid = q.question_id
+  left join post_links_agg pla on pla.postid = q.question_id
+  left join question_tag_popularity qtp on qtp.question_id = q.question_id
+),
+-- Answer centric with votes/comments
+answer_all as (
+  select
+    a.answer_id,
+    a.question_id,
+    a.owner_user_id,
+    a.answer_score,
+    a.answer_creationdate,
+    a.is_accepted,
+    coalesce(va.upvotes, 0) as a_upvotes,
+    coalesce(va.downvotes, 0) as a_downvotes,
+    coalesce(va.total_votes, 0) as a_total_votes,
+    coalesce(ca.comment_count, 0) as a_comment_count,
+    coalesce(ca.comment_score_sum, 0) as a_comment_score_sum
+  from answers a
+  left join votes_agg va on va.postid = a.answer_id
+  left join comment_signal ca on ca.postid = a.answer_id
+),
+-- Aggregate answers per question for richer signals
+answer_rollup as (
+  select
+    aa.question_id,
+    count(*) as answers_count,
+    sum(case when aa.is_accepted then 1 else 0 end) as accepted_count,
+    max(aa.answer_score) as max_answer_score,
+    avg(aa.answer_score::numeric) as avg_answer_score,
+    sum(aa.a_upvotes) as sum_answer_upvotes,
+    sum(aa.a_downvotes) as sum_answer_downvotes,
+    sum(aa.a_total_votes) as sum_answer_votes,
+    sum(aa.a_comment_count) as sum_answer_comments
+  from answer_all aa
+  group by aa.question_id
+),
+-- Enrich with owner user metrics
+question_owner_enriched as (
+  select
+    qa.*,
+    uc.displayname as owner_displayname,
+    uc.reputation as owner_reputation,
+    uc.location as owner_location,
+    uc.total_badges as owner_total_badges,
+    uc.gold_badges as owner_gold_badges,
+    uc.silver_badges as owner_silver_badges,
+    uc.bronze_badges as owner_bronze_badges,
+    uc.loc_rep_rank as owner_loc_rep_rank
+  from question_all qa
+  left join user_content uc on uc.user_id = qa.owner_user_id
+),
+-- Derive complex ranking and scoring
+question_scored as (
+  select
+    qoe.*,
+    coalesce(ar.answers_count, 0) as answers_count,
+    coalesce(ar.accepted_count, 0) as accepted_count,
+    ar.max_answer_score,
+    ar.avg_answer_score,
+    coalesce(ar.sum_answer_upvotes, 0) as sum_answer_upvotes,
+    coalesce(ar.sum_answer_downvotes, 0) as sum_answer_downvotes,
+    coalesce(ar.sum_answer_votes, 0) as sum_answer_votes,
+    coalesce(ar.sum_answer_comments, 0) as sum_answer_comments,
+    -- Composite quality score with null handling and scaling
+    (
+      coalesce(qoe.score::numeric, 0) * 1.0
+      + coalesce(qoe.q_upvotes::numeric, 0) * 0.75
+      - coalesce(qoe.q_downvotes::numeric, 0) * 0.9
+      + coalesce(qoe.viewcount::numeric, 0) / 100.0
+      + coalesce(qoe.favoritecount::numeric, 0) * 2.0
+      + coalesce(ar.answers_count::numeric, 0) * 1.5
+      + coalesce(ar.accepted_count::numeric, 0) * 4.0
+      + coalesce(ar.sum_answer_upvotes::numeric, 0) * 0.5
+      - coalesce(ar.sum_answer_downvotes::numeric, 0) * 0.6
+      + coalesce(qoe.avg_tag_popularity, 0) / 50.0
+      + case when qoe.was_closed = 1 then -25 else 0 end
+      + case when qoe.was_protected = 1 then 5 else 0 end
+      + case when qoe.community_bump = 1 then 2 else 0 end
+      + case when qoe.duplicate_links > 0 then -10 else 0 end
+    ) as composite_quality_score,
+    -- Engagement velocity proxy
+    (
+      coalesce(qoe.q_total_votes::numeric, 0)
+      + coalesce(qoe.q_comment_count::numeric, 0)
+      + coalesce(ar.sum_answer_votes::numeric, 0)
+      + coalesce(ar.sum_answer_comments::numeric, 0)
+    ) / greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qoe.creationdate)) / 86400.0, 1.0) as engagement_per_day,
+    -- Windowed rank over multiple dimensions
+    row_number() over (
+      partition by (case when qoe.owner_location is null or trim(qoe.owner_location) = '' then 'UNKNOWN' else upper(qoe.owner_location) end)
+      order by
+        (
+          coalesce(qoe.score::numeric, 0) + coalesce(ar.answers_count::numeric, 0) * 2 + coalesce(qoe.viewcount::numeric, 0) / 200.0
+        ) desc, qoe.question_id
+    ) as location_activity_rank
+  from question_owner_enriched qoe
+  left join answer_rollup ar on ar.question_id = qoe.question_id
+),
+-- Identify "peers" via correlated subquery: similar score and tag popularity
+peer_candidates as (
+  select
+    qs.question_id,
+    (
+      select count(*)
+      from question_scored q2
+      where q2.question_id <> qs.question_id
+        and abs(coalesce(q2.composite_quality_score, 0) - coalesce(qs.composite_quality_score, 0)) <= 10
+        and abs(coalesce(q2.avg_tag_popularity, 0) - coalesce(qs.avg_tag_popularity, 0)) <= 1000
+    ) as peer_count
+  from question_scored qs
+),
+-- Filter to interesting subset for benchmarking
+filtered as (
+  select
+    qs.*,
+    pc.peer_count
+  from question_scored qs
+  join peer_candidates pc on pc.question_id = qs.question_id
+  where
+    (qs.viewcount >= 100 or qs.favoritecount >= 5 or qs.answers_count >= 3)
+    and (qs.was_closed = 0 or qs.was_reopened = 1)
+    and not (qs.owner_reputation is null and qs.owner_displayname is null)
+),
+-- Final ranking with window functions and set operator demonstration
+top_by_location as (
+  select
+    f.*,
+    dense_rank() over (
+      partition by (case when f.owner_location is null or trim(f.owner_location) = '' then 'UNKNOWN' else upper(f.owner_location) end)
+      order by f.composite_quality_score desc, f.engagement_per_day desc
+    ) as loc_dense_rank
+  from filtered f
+),
+-- Another branch: high-velocity recent questions regardless of score
+recent_velocity as (
+  select
+    qs.question_id,
+    qs.owner_user_id,
+    qs.creationdate,
+    qs.title,
+    qs.tags,
+    qs.engagement_per_day,
+    qs.composite_quality_score
+  from question_scored qs
+  where qs.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+    and qs.engagement_per_day > 5
+)
+-- Final select combining branches with set operator, deduped and ranked
+select
+  final.question_id,
+  final.title,
+  final.tags,
+  final.owner_user_id,
+  final.owner_displayname,
+  final.owner_reputation,
+  coalesce(nullif(trim(final.owner_location), ''), 'UNKNOWN') as owner_location_norm,
+  final.viewcount,
+  final.score,
+  final.answers_count,
+  final.accepted_count,
+  final.q_upvotes,
+  final.q_downvotes,
+  final.q_comment_count,
+  final.sum_answer_upvotes,
+  final.sum_answer_downvotes,
+  final.sum_answer_comments,
+  final.avg_tag_popularity,
+  final.sum_log_tag_popularity,
+  final.duplicate_links,
+  final.was_closed,
+  final.was_reopened,
+  final.was_protected,
+  final.composite_quality_score,
+  round(final.engagement_per_day::numeric, 3) as engagement_per_day,
+  final.location_activity_rank,
+  final.loc_dense_rank,
+  final.peer_count,
+  -- String expressions: compact descriptor
+  ('Q' || final.question_id::varchar || ' | ' ||
+   coalesce(final.owner_displayname, 'anon') || ' | rep=' ||
+   coalesce(final.owner_reputation::varchar, '0') || ' | loc=' ||
+   coalesce(nullif(trim(final.owner_location), ''), 'UNKNOWN')) as descriptor
+from (
+  select
+    tbl.*
+  from top_by_location tbl
+  where tbl.loc_dense_rank <= 10
+  union all
+  select
+    qs.question_id,
+    qs.owner_user_id,
+    qs.creationdate,
+    qs.score,
+    qs.viewcount,
+    qs.favoritecount,
+    qs.answercount,
+    qs.title,
+    qs.tags,
+    qs.views_per_fav,
+    qs.score_per_view,
+    qs.q_upvotes,
+    qs.q_downvotes,
+    qs.q_favorites,
+    qs.q_total_votes,
+    qs.q_bounty_started,
+    qs.q_bounty_awarded,
+    qs.q_comment_count,
+    qs.q_comment_score_sum,
+    qs.q_avg_comment_len,
+    qs.was_closed,
+    qs.was_reopened,
+    qs.was_migrated,
+    qs.was_protected,
+    qs.community_bump,
+    qs.duplicate_links,
+    qs.related_links,
+    qs.avg_tag_popularity,
+    qs.sum_log_tag_popularity,
+    qs.owner_displayname,
+    qs.owner_reputation,
+    qs.owner_location,
+    qs.owner_total_badges,
+    qs.owner_gold_badges,
+    qs.owner_silver_badges,
+    qs.owner_bronze_badges,
+    qs.owner_loc_rep_rank,
+    qs.answers_count,
+    qs.accepted_count,
+    qs.max_answer_score,
+    qs.avg_answer_score,
+    qs.sum_answer_upvotes,
+    qs.sum_answer_downvotes,
+    qs.sum_answer_votes,
+    qs.sum_answer_comments,
+    qs.composite_quality_score,
+    qs.engagement_per_day,
+    qs.location_activity_rank,
+    999999 as loc_dense_rank,
+    0 as peer_count
+  from recent_velocity rv
+  join question_scored qs on qs.question_id = rv.question_id
+) final
+where final.composite_quality_score is not null
+  and (final.owner_reputation is null or final.owner_reputation >= 1)
+order by final.composite_quality_score desc, final.engagement_per_day desc, final.question_id
+limit 500;

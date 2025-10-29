@@ -1,0 +1,159 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsCreated,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersCreated,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScoreReceived,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        (SELECT COALESCE(MAX(v.BountyAmount), 0) FROM Votes AS v WHERE v.PostId IN (SELECT p_inner.Id FROM Posts AS p_inner WHERE p_inner.OwnerUserId = u.Id) AND v.VoteTypeId = 9) AS MaxBountyReceived,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(CASE WHEN b.Class = 1 THEN b.Date ELSE NULL END) AS LastGoldBadgeDate
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostContentAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        COALESCE(p.Title, SUBSTRING(p.Body FROM 1 FOR 100)) AS PostTitleOrExcerpt,
+        LENGTH(p.Body) AS BodyLength,
+        COALESCE(array_length(string_to_array(SUBSTRING(COALESCE(p.Tags, '><') FROM 2 FOR LENGTH(COALESCE(p.Tags, '><'))-2), '><'), 1), 0) AS TagCount,
+        EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.LastActivityDate)) / 3600 AS HoursSinceLastActivity,
+        (SELECT pa.Score FROM Posts AS pa WHERE pa.Id = p.AcceptedAnswerId AND pa.PostTypeId = 2) AS AcceptedAnswerScore,
+        CASE WHEN LENGTH(p.Body) > 1000 THEN 'Long' WHEN LENGTH(p.Body) > 300 THEN 'Medium' ELSE 'Short' END AS BodyLengthCategory
+    FROM Posts AS p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.Score > 0
+      AND p.ViewCount IS NOT NULL AND p.ViewCount > 0
+),
+PostHistoryDetails AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEntries,
+        COUNT(DISTINCT ph.PostHistoryTypeId) AS DistinctHistoryTypes,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS TotalClosedEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS TotalReopenedEvents,
+        (SELECT MIN(ph_inner.CreationDate) FROM PostHistory AS ph_inner WHERE ph_inner.PostId = ph.PostId AND ph_inner.PostHistoryTypeId IN (4, 5, 6)) AS FirstEditDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN SUBSTRING(ph.Comment FROM 1 FOR 20) ELSE NULL END) AS LatestCloseReasonExcerpt
+    FROM PostHistory AS ph
+    GROUP BY ph.PostId
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostsCount,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatePostsCount,
+        MAX(CASE WHEN pl.LinkTypeId = 1 THEN EXTRACT(EPOCH FROM (p_related.CreationDate - p_main.CreationDate)) / (3600*24) ELSE NULL END) AS MaxLinkedPostAgeDiffDays
+    FROM PostLinks AS pl
+    JOIN Posts AS p_main ON pl.PostId = p_main.Id
+    JOIN Posts AS p_related ON pl.RelatedPostId = p_related.Id
+    GROUP BY pl.PostId
+),
+TopTagsPerPost AS (
+    SELECT
+        p.Id AS PostId,
+        tag AS TagName
+    FROM Posts AS p,
+    UNNEST(string_to_array(SUBSTRING(COALESCE(p.Tags, '><') FROM 2 FOR LENGTH(COALESCE(p.Tags, '><'))-2), '><')) AS tag
+    WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1 AND LENGTH(p.Tags) > 2
+)
+SELECT
+    ues.UserId,
+    ues.DisplayName,
+    ues.Reputation,
+    ues.TotalPostsCreated,
+    pca.PostId,
+    pca.PostTitleOrExcerpt,
+    pca.Score AS PostScore,
+    pca.ViewCount AS PostViewCount,
+    pca.AnswerCount,
+    pca.CommentCount,
+    pca.FavoriteCount,
+    pca.BodyLength,
+    pca.TagCount,
+    pca.HoursSinceLastActivity,
+    pca.AcceptedAnswerScore,
+    pca.BodyLengthCategory,
+    phd.TotalHistoryEntries,
+    phd.DistinctHistoryTypes,
+    phd.TotalEditEvents,
+    phd.TotalClosedEvents,
+    phd.TotalReopenedEvents,
+    phd.FirstEditDate,
+    phd.LatestCloseReasonExcerpt,
+    COALESCE(pla.LinkedPostsCount, 0) AS LinkedPostsCount,
+    COALESCE(pla.DuplicatePostsCount, 0) AS DuplicatePostsCount,
+    pla.MaxLinkedPostAgeDiffDays,
+    RANK() OVER (PARTITION BY EXTRACT(YEAR FROM ues.UserCreationDate) ORDER BY ues.Reputation DESC) AS RankInCreationYear,
+    AVG(pca.Score) OVER (PARTITION BY pca.OwnerUserId, pca.PostTypeId) AS AvgScoreForUserPostType,
+    CASE
+        WHEN LOWER(pca.PostTitleOrExcerpt) LIKE '%sql%' OR LOWER(pca.PostTitleOrExcerpt) LIKE '%database%' OR LOWER(pca.PostTitleOrExcerpt) LIKE '%query%' THEN 'DB_Related_Post'
+        WHEN LOWER(pca.PostTitleOrExcerpt) LIKE '%python%' OR LOWER(pca.PostTitleOrExcerpt) LIKE '%java%' OR LOWER(pca.PostTitleOrExcerpt) LIKE '%javascript%' THEN 'Programming_Language_Post'
+        WHEN LOWER(pca.PostTitleOrExcerpt) LIKE '%web%' OR LOWER(pca.PostTitleOrExcerpt) LIKE '%html%' OR LOWER(pca.PostTitleOrExcerpt) LIKE '%css%' THEN 'Web_Dev_Post'
+        ELSE 'Other_Category_Post'
+    END AS PostCategoryByTitle,
+    (COALESCE(pca.Score, 0) * 0.5 + COALESCE(pca.FavoriteCount, 0) * 1.5 + COALESCE(pca.CommentCount, 0) * 0.8 + COALESCE(pca.AcceptedAnswerScore, 0) * 2 - (COALESCE(pca.HoursSinceLastActivity, 0) / 100)) AS EngagementIndex,
+    CASE
+        WHEN pca.ClosedDate IS NOT NULL AND COALESCE(phd.TotalReopenedEvents, 0) > 0 THEN 'ClosedAndReopened'
+        WHEN pca.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN pca.AcceptedAnswerId IS NOT NULL THEN 'AcceptedAnswer'
+        WHEN pca.CommentCount > 5 AND COALESCE(pca.AnswerCount, 0) = 0 THEN 'DiscussionButNoAnswer'
+        WHEN pca.HoursSinceLastActivity > 720 THEN 'Stale'
+        ELSE 'Active'
+    END AS PostStatus,
+    EXISTS (SELECT 1 FROM Badges AS b WHERE b.UserId = ues.UserId AND b.Name = 'Great Answer' AND b.Class = 2) AS HasGreatAnswerBadge,
+    (
+        SELECT STRING_AGG(tt.TagName, ', ' ORDER BY tt.TagUsage DESC)
+        FROM (
+            SELECT TagName, COUNT(*) AS TagUsage
+            FROM TopTagsPerPost AS ttp
+            WHERE ttp.PostId = pca.PostId
+            GROUP BY TagName
+            ORDER BY TagUsage DESC
+            LIMIT 3
+        ) AS tt
+    ) AS Top3TagsForPost,
+    SUM(pca.ViewCount) OVER (PARTITION BY ues.UserId ORDER BY pca.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeUserViews
+FROM UserEngagementSummary AS ues
+INNER JOIN PostContentAnalysis AS pca ON ues.UserId = pca.OwnerUserId
+LEFT JOIN PostHistoryDetails AS phd ON pca.PostId = phd.PostId
+LEFT JOIN PostLinkAnalysis AS pla ON pca.PostId = pla.PostId
+WHERE ues.Reputation > 5000
+  AND pca.Score >= 50
+  AND pca.ViewCount >= 1000
+  AND pca.HoursSinceLastActivity < 720
+  AND (pca.FavoriteCount IS NULL OR pca.FavoriteCount >= 5)
+  AND (
+      (COALESCE(phd.TotalEditEvents, 0) >= 3 AND COALESCE(phd.DistinctHistoryTypes, 0) >= 2)
+      OR
+      (COALESCE(pla.DuplicatePostsCount, 0) > 0 AND COALESCE(pla.LinkedPostsCount, 0) > 0)
+      OR
+      (pca.PostTypeId = 1 AND pca.AcceptedAnswerScore IS NULL AND COALESCE(pca.AnswerCount, 0) > 0 AND pca.CommentCount > 3)
+  )
+  AND ues.LastGoldBadgeDate IS NOT NULL
+ORDER BY EngagementIndex DESC, ues.Reputation DESC, pca.PostCreationDate DESC
+LIMIT 500;

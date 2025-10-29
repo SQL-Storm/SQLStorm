@@ -1,0 +1,139 @@
+-- {"query": "3145.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2170} 
+WITH 
+    -- aggregate basic user posting stats
+    user_posts AS (
+        SELECT 
+            u.Id                         AS user_id,
+            u.DisplayName                AS display_name,
+            u.Reputation,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS question_cnt,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS answer_cnt,
+            SUM(p.Score)                 AS total_score,
+            MAX(p.CreationDate)          AS last_post_dt
+        FROM Users u
+        LEFT JOIN Posts p
+            ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    -- badge counts per user
+    user_badges AS (
+        SELECT 
+            b.UserId                     AS user_id,
+            COUNT(*) FILTER (WHERE b.Class = 1) AS gold_cnt,
+            COUNT(*) FILTER (WHERE b.Class = 2) AS silver_cnt,
+            COUNT(*) FILTER (WHERE b.Class = 3) AS bronze_cnt,
+            STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 1) AS gold_names
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    -- unwind tags from questions and count usage
+    tag_usage AS (
+        SELECT 
+            p.OwnerUserId                AS user_id,
+            UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS tag,
+            COUNT(*)                     AS tag_cnt
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+        GROUP BY p.OwnerUserId, tag
+    ),
+
+    -- rank tags per user
+    top_tags AS (
+        SELECT 
+            tu.user_id,
+            tu.tag,
+            tu.tag_cnt,
+            ROW_NUMBER() OVER (PARTITION BY tu.user_id ORDER BY tu.tag_cnt DESC, tu.tag) AS rn
+        FROM tag_usage tu
+    ),
+
+    -- most recent vote per user (correlated sub‑query via window)
+    recent_votes AS (
+        SELECT 
+            v.UserId                    AS user_id,
+            v.VoteTypeId,
+            v.CreationDate,
+            ROW_NUMBER() OVER (PARTITION BY v.UserId ORDER BY v.CreationDate DESC) AS rn
+        FROM Votes v
+    ),
+    last_vote AS (
+        SELECT 
+            rv.user_id,
+            rv.VoteTypeId,
+            rv.CreationDate
+        FROM recent_votes rv
+        WHERE rv.rn = 1
+    ),
+
+    -- users with no posts (for the UNION branch)
+    inactive_users AS (
+        SELECT 
+            u.Id                         AS user_id,
+            COALESCE(u.DisplayName, 'Anonymous') AS display_name,
+            u.Reputation,
+            0 AS question_cnt,
+            0 AS answer_cnt,
+            0 AS total_score,
+            NULL AS last_post_dt,
+            0 AS gold_cnt,
+            0 AS silver_cnt,
+            0 AS bronze_cnt,
+            NULL AS gold_names,
+            NULL AS top_tag,
+            NULL AS top_tag_cnt,
+            NULL AS last_vote_type,
+            NULL AS last_vote_dt
+        FROM Users u
+        WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+          AND u.Reputation BETWEEN 1 AND 5000
+    ),
+
+    -- active users (the main SELECT)
+    active_users AS (
+        SELECT 
+            up.user_id,
+            COALESCE(up.display_name, 'Anonymous') AS display_name,
+            up.Reputation,
+            up.question_cnt,
+            up.answer_cnt,
+            up.total_score,
+            up.last_post_dt,
+            COALESCE(ub.gold_cnt, 0)   AS gold_cnt,
+            COALESCE(ub.silver_cnt, 0) AS silver_cnt,
+            COALESCE(ub.bronze_cnt, 0) AS bronze_cnt,
+            ub.gold_names,
+            tt.tag                      AS top_tag,
+            tt.tag_cnt                  AS top_tag_cnt,
+            CASE 
+                WHEN lv.VoteTypeId = 2 THEN 'Upvote'
+                WHEN lv.VoteTypeId = 3 THEN 'Downvote'
+                WHEN lv.VoteTypeId = 1 THEN 'AcceptedByOriginator'
+                ELSE NULL
+            END                         AS last_vote_type,
+            lv.CreationDate             AS last_vote_dt
+        FROM user_posts up
+        LEFT JOIN user_badges ub
+            ON ub.user_id = up.user_id
+        LEFT JOIN top_tags tt
+            ON tt.user_id = up.user_id
+           AND tt.rn = 1
+        LEFT JOIN last_vote lv
+            ON lv.user_id = up.user_id
+        WHERE up.Reputation > 10000 
+           OR COALESCE(ub.gold_cnt,0) > 0
+    )
+
+-- combine active and inactive users, keep column order identical
+SELECT *
+FROM active_users
+
+UNION ALL
+
+SELECT *
+FROM inactive_users
+
+ORDER BY Reputation DESC
+LIMIT 100;

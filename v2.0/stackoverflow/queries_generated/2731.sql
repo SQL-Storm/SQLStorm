@@ -1,0 +1,162 @@
+-- {"query": "2731.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1407} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        p.Id AS PostId,
+        p.CreationDate,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY p.Score DESC, p.CreationDate DESC) AS RankByTag
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%') AND p.PostTypeId = 1 -- Questions only
+    WHERE t.IsModeratorOnly = 0
+),
+TopRankedPosts AS (
+    SELECT
+        rth.TagName,
+        rth.PostId,
+        rth.CreationDate,
+        rth.Score,
+        p.Title,
+        p.AnswerCount,
+        p.ViewCount,
+        p.FavoriteCount,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        IFNULL(b.BadgeSummary, 'No Badges') AS BadgeSummary
+    FROM RecursiveTagHierarchy rth
+    INNER JOIN Posts p ON p.Id = rth.PostId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT
+            UserId,
+            STRING_AGG(CONCAT(Name, '(', Class, ')'), ', ') AS BadgeSummary
+        FROM Badges
+        WHERE Date >= CURRENT_DATE - INTERVAL '1 year'
+        GROUP BY UserId
+    ) b ON b.UserId = u.Id
+    WHERE rth.RankByTag <= 3
+),
+UserRecentCommentCounts AS (
+    SELECT
+        c.UserId,
+        COUNT(*) AS RecentCommentsCount,
+        COUNT(DISTINCT c.PostId) AS DistinctPostsCommented
+    FROM Comments c
+    WHERE c.CreationDate > CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY c.UserId
+),
+PostWithAcceptedAnswerScore AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.AcceptedAnswerId,
+        COALESCE((
+            SELECT score FROM Posts a WHERE a.Id = p.AcceptedAnswerId
+        ), 0) AS AcceptedAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+CombinedPostStats AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.AcceptedAnswerId,
+        p.AcceptedAnswerScore,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(rc.RecentCommentsCount, 0) AS RecentCommentsCount,
+        COALESCE(rc.DistinctPostsCommented, 0) AS DistinctPostsCommented,
+        ABS(p.Score - p.AcceptedAnswerScore) AS ScoreDelta,
+        CASE 
+            WHEN p.AcceptedAnswerScore > p.Score THEN 'AnswerBetter'
+            WHEN p.AcceptedAnswerScore = p.Score THEN 'EqualScore'
+            ELSE 'QuestionBetter'
+        END AS ScoreComparison,
+        pl.LinkTypeId,
+        lt.Name AS LinkTypeName,
+        COALESCE(ph.CloseReasonName, 'NULL') AS CloseReason
+    FROM PostWithAcceptedAnswerScore p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN UserRecentCommentCounts rc ON rc.UserId = u.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    LEFT JOIN (
+        SELECT 
+            ph.PostId,
+            crt.Name AS CloseReasonName
+        FROM PostHistory ph
+        LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS smallint)
+        WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+        GROUP BY ph.PostId, crt.Name
+    ) ph ON ph.PostId = p.Id
+),
+FinalRankedPosts AS (
+    SELECT
+        cps.*,
+        RANK() OVER (PARTITION BY cps.LinkTypeId ORDER BY cps.Score DESC, cps.AcceptedAnswerScore DESC, cps.CreationDate DESC) AS LinkTypeRank
+    FROM CombinedPostStats cps
+    WHERE (cps.CloseReason IS NULL OR cps.CloseReason NOT IN ('Duplicate', 'Off-topic'))
+      AND cps.RecentCommentsCount > 5
+)
+SELECT
+    frp.Id AS PostId,
+    frp.Title,
+    frp.CreationDate,
+    frp.Score,
+    frp.AcceptedAnswerScore,
+    frp.ScoreDelta,
+    frp.ScoreComparison,
+    frp.DisplayName AS Owner,
+    frp.Reputation AS OwnerReputation,
+    frp.RecentCommentsCount,
+    frp.DistinctPostsCommented,
+    frp.LinkTypeName,
+    frp.LinkTypeRank,
+    string_agg(distinct tb.BadgeSummary, '; ') AS BadgesOnOwner,
+    CONCAT(
+        'Title Length: ', LENGTH(frp.Title), '; ',
+        'View-Fav Ratio: ', 
+            CASE WHEN viewcount = 0 THEN NULL ELSE (favoritecount::float/viewcount) END, '; ',
+        'Tags Present: ', COALESCE(TRIM(BOTH '<>' FROM p.Tags), 'No Tags')
+    ) AS PostAnalysis,
+    CASE
+        WHEN frp.Reputation > 10000 AND frp.Score > 100 THEN 'High Reputation High Score'
+        WHEN frp.Reputation <= 10000 AND frp.Score > 100 THEN 'Low Rep High Score'
+        WHEN frp.Reputation > 10000 AND frp.Score <= 100 THEN 'High Rep Low Score'
+        ELSE 'Other'
+    END AS ReputationScoreCategory
+FROM FinalRankedPosts frp
+LEFT JOIN Posts p ON p.Id = frp.Id
+LEFT JOIN (
+    SELECT
+        UserId,
+        STRING_AGG(CONCAT(Name, '(', Class, ')'), ', ') AS BadgeSummary
+    FROM Badges
+    WHERE Date >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY UserId
+) tb ON tb.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = frp.Id)
+WHERE frp.LinkTypeRank <= 5
+GROUP BY 
+    frp.Id,
+    frp.Title,
+    frp.CreationDate,
+    frp.Score,
+    frp.AcceptedAnswerScore,
+    frp.ScoreDelta,
+    frp.ScoreComparison,
+    frp.DisplayName,
+    frp.Reputation,
+    frp.RecentCommentsCount,
+    frp.DistinctPostsCommented,
+    frp.LinkTypeName,
+    frp.LinkTypeRank,
+    p.Tags,
+    p.ViewCount,
+    p.FavoriteCount
+ORDER BY frp.LinkTypeRank, frp.Score DESC, frp.CreationDate DESC;

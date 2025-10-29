@@ -1,0 +1,212 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        DATE_PART('day', AGE(u.LastAccessDate, u.CreationDate)) AS DaysActive,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END), 0) AS QuestionWithAcceptedAnswerCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 AND p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END), 0) AS AcceptedAnswersGivenCount,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS CommentCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpvotesGiven,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownvotesGiven,
+        COALESCE(SUM(CASE WHEN p.OwnerUserId = u.Id AND pv.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS ReceivedUpvotesOnPosts,
+        COALESCE(SUM(CASE WHEN p.OwnerUserId = u.Id AND pv.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS ReceivedDownvotesOnPosts,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Posts q ON p.PostTypeId = 1 AND q.Id = p.ParentId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Votes pv ON p.Id = pv.PostId AND p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostHistoricalAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEntries,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate ELSE NULL END) AS LastEditDate,
+        MIN(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate ELSE NULL END) AS FirstEditDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS ClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate ELSE NULL END) AS ReopenedDate,
+        (SELECT u_owner.Reputation FROM Users u_owner WHERE u_owner.Id = p.OwnerUserId LIMIT 1) AS OwnerReputationAtPostCreation
+    FROM
+        Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE
+        p.PostTypeId IN (1, 2)
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.LastActivityDate, p.ViewCount, p.Score, p.AnswerCount, p.OwnerUserId
+),
+NormalizedPostTags AS (
+    SELECT
+        p.Id AS PostId,
+        TRIM(tag_val) AS TagName
+    FROM
+        Posts p,
+        UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')) AS tag_val
+    WHERE
+        p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+TagPerformanceMetrics AS (
+    SELECT
+        npt.TagName,
+        COUNT(DISTINCT npt.PostId) AS TaggedPostCount,
+        SUM(p.Score) AS TotalTagScore,
+        AVG(p.Score) AS AvgTagScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN npt.PostId ELSE NULL END) AS QuestionCountByTag,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN npt.PostId ELSE NULL END) AS AnswerCountByTag,
+        (SELECT u_freq.DisplayName
+         FROM Posts p_inner
+         JOIN NormalizedPostTags npt_inner ON p_inner.Id = npt_inner.PostId
+         JOIN Users u_freq ON p_inner.OwnerUserId = u_freq.Id
+         WHERE npt_inner.TagName = npt.TagName
+         GROUP BY u_freq.DisplayName
+         ORDER BY COUNT(p_inner.Id) DESC
+         LIMIT 1
+        ) AS MostFrequentTagOwnerDisplayName
+    FROM
+        NormalizedPostTags npt
+    JOIN Posts p ON npt.PostId = p.Id
+    WHERE
+        p.PostTypeId IN (1, 2)
+    GROUP BY
+        npt.TagName
+    HAVING
+        COUNT(DISTINCT npt.PostId) > 100
+),
+DuplicatePostChains AS (
+    SELECT
+        pl.PostId AS OriginalPostId,
+        pl.RelatedPostId AS DuplicateOfPostId,
+        p.Title AS OriginalPostTitle,
+        pr.Title AS DuplicateOfPostTitle,
+        ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) AS rn_duplicate
+    FROM
+        PostLinks pl
+    JOIN Posts p ON pl.PostId = p.Id
+    JOIN Posts pr ON pl.RelatedPostId = pr.Id
+    WHERE
+        pl.LinkTypeId = 3
+),
+ModeratorActivitySnapshots AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS ActionDate,
+        ph.UserId AS ModeratorId,
+        u.DisplayName AS ModeratorDisplayName,
+        ph.PostHistoryTypeId AS ActionTypeId,
+        pht.Name AS ActionTypeName,
+        LAG(ph.PostHistoryTypeId, 1, 0) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousActionTypeId,
+        LEAD(ph.CreationDate, 1, TIMESTAMP '9999-12-31') OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS NextActionDate,
+        CASE
+            WHEN ph.PostHistoryTypeId = 10 AND LEAD(ph.PostHistoryTypeId, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) = 11
+            THEN DATE_PART('hour', LEAD(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) - ph.CreationDate)
+            ELSE NULL
+        END AS HoursUntilReopenedAfterClose
+    FROM
+        PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN Users u ON ph.UserId = u.Id
+    WHERE
+        ph.PostHistoryTypeId IN (10, 11, 14, 15, 19, 20)
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.DaysActive,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.AcceptedAnswersGivenCount,
+    uas.CommentCount,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    (uas.QuestionCount * 5 + uas.AnswerCount * 3 + uas.AcceptedAnswersGivenCount * 10 + uas.CommentCount + uas.ReceivedUpvotesOnPosts * 2 + uas.GoldBadges * 50 + uas.SilverBadges * 20 + uas.BronzeBadges * 5) AS UserEngagementScore,
+    DENSE_RANK() OVER (ORDER BY (uas.QuestionCount * 5 + uas.AnswerCount * 3 + uas.AcceptedAnswersGivenCount * 10 + uas.CommentCount + uas.ReceivedUpvotesOnPosts * 2 + uas.GoldBadges * 50 + uas.SilverBadges * 20 + uas.BronzeBadges * 5) DESC) AS UserEngagementRank,
+    p.Id AS PostId,
+    COALESCE(pha.PostTypeId, p.PostTypeId) AS PostTypeId,
+    pha.PostCreationDate,
+    COALESCE(pha.Score, p.Score) AS PostScore,
+    COALESCE(pha.ViewCount, p.ViewCount) AS PostViewCount,
+    COALESCE(pha.AnswerCount, p.AnswerCount) AS PostAnswerCount,
+    pha.TotalHistoryEntries,
+    pha.FirstEditDate,
+    pha.LastEditDate,
+    pha.ClosedDate,
+    pha.ReopenedDate,
+    COALESCE(DATE_PART('day', AGE(pha.LastEditDate, pha.FirstEditDate)), 0) AS DaysBetweenFirstAndLastEdit,
+    CASE
+        WHEN pha.FirstEditDate IS NOT NULL THEN
+            DATE_PART('day', AGE(pha.FirstEditDate, pha.PostCreationDate))
+        ELSE NULL
+    END AS DaysToFirstEdit,
+    pha.OwnerReputationAtPostCreation,
+    npt.TagName,
+    tpm.TaggedPostCount,
+    tpm.AvgTagScore,
+    tpm.MostFrequentTagOwnerDisplayName,
+    dpc.DuplicateOfPostId,
+    dpc.DuplicateOfPostTitle,
+    UPPER(SUBSTRING(COALESCE(p.Title, 'NO_TITLE_AVAILABLE') FROM 1 FOR 20)) AS PostTitlePrefix,
+    LOWER(REPLACE(SUBSTRING(p.Body FROM 1 FOR 100), ' ', '_')) AS PostBodySlugFragment,
+    mas.ModeratorDisplayName,
+    mas.ActionTypeName,
+    mas.HoursUntilReopenedAfterClose,
+    NTILE(5) OVER (ORDER BY COALESCE(pha.ViewCount, p.ViewCount) DESC, COALESCE(pha.Score, p.Score) DESC) AS ViewScoreQuartile,
+    (SELECT SUM(s.Score) FROM Comments s WHERE s.PostId = p.Id) AS TotalCommentScore,
+    p.FavoriteCount,
+    CASE
+        WHEN COALESCE(pha.ClosedDate, p.ClosedDate) IS NOT NULL AND COALESCE(pha.ReopenedDate, pha.ReopenedDate, p.ReopenedDate) IS NULL THEN 'Closed'
+        WHEN COALESCE(pha.ReopenedDate, p.ReopenedDate) IS NOT NULL THEN 'Reopened'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+        ELSE 'Active'
+    END AS PostStatusCategory
+FROM
+    UserActivitySummary uas
+INNER JOIN Posts p ON uas.UserId = p.OwnerUserId
+LEFT JOIN PostHistoricalAnalysis pha ON p.Id = pha.PostId
+LEFT JOIN NormalizedPostTags npt ON p.Id = npt.PostId
+LEFT JOIN TagPerformanceMetrics tpm ON npt.TagName = tpm.TagName
+LEFT JOIN DuplicatePostChains dpc ON p.Id = dpc.OriginalPostId AND dpc.rn_duplicate = 1
+LEFT JOIN ModeratorActivitySnapshots mas ON p.Id = mas.PostId AND mas.ActionTypeId = 10
+WHERE
+    uas.Reputation > 15000
+    AND COALESCE(pha.PostCreationDate, p.CreationDate) BETWEEN DATE '2021-01-01' AND DATE '2023-06-30'
+    AND (p.ViewCount > 7500 OR p.Score > 75)
+    AND (npt.TagName IN ('sql', 'postgresql', 'database', 'performance'))
+    AND (COALESCE(pha.ClosedDate, p.ClosedDate) IS NULL OR COALESCE(pha.ReopenedDate, p.ReopenedDate) IS NOT NULL)
+    AND uas.AnswerCount > uas.QuestionCount * 0.75
+    AND uas.GoldBadges > 0
+GROUP BY
+    uas.UserId, uas.DisplayName, uas.Reputation, uas.DaysActive, uas.QuestionCount, uas.AnswerCount, uas.AcceptedAnswersGivenCount,
+    uas.CommentCount, uas.GoldBadges, uas.SilverBadges, uas.BronzeBadges,
+    p.Id, p.Title, p.Body, p.FavoriteCount, p.ClosedDate, p.ReopenedDate, p.CommunityOwnedDate,
+    pha.PostTypeId, pha.PostCreationDate, pha.Score, pha.ViewCount, pha.AnswerCount,
+    pha.TotalHistoryEntries, pha.FirstEditDate, pha.LastEditDate, pha.ClosedDate, pha.ReopenedDate, pha.OwnerReputationAtPostCreation,
+    npt.TagName, tpm.TaggedPostCount, tpm.AvgTagScore, tpm.MostFrequentTagOwnerDisplayName,
+    dpc.DuplicateOfPostId, dpc.DuplicateOfPostTitle,
+    mas.ModeratorDisplayName, mas.ActionTypeName, mas.HoursUntilReopenedAfterClose
+HAVING
+    COUNT(DISTINCT p.Id) > 5
+ORDER BY
+    UserEngagementRank ASC,
+    PostScore DESC,
+    PostViewCount DESC,
+    COALESCE(pha.LastActivityDate, p.LastActivityDate) DESC
+LIMIT 1000;

@@ -1,0 +1,36 @@
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    SUM(CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) AS PopularPosts,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 0 THEN b.Id END) AS NamedBadges,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Id END) AS TagBadges,
+    AVG(u.Reputation) AS AvgReputation,
+    MAX(u.LastAccessDate) AS LastAccessDate,
+    LEFT(STRING_AGG(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN p.Title END ORDER BY p.CreationDate DESC, ', '), 1000) AS RecentDuplicates
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+WHERE 
+    u.Reputation > 100
+    AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+    AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.LastAccessDate
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    AvgReputation DESC, 
+    TotalPosts DESC;

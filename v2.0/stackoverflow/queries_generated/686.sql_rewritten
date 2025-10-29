@@ -1,0 +1,378 @@
+-- {"query": "686.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3139} 
+with recent_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        p.parentid,
+        p.lastactivitydate,
+        coalesce(nullif(trim(p.ownerdisplayname), ''), u.displayname, 'Unknown') as owner_name,
+        u.reputation,
+        u.upvotes,
+        u.downvotes,
+        extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - p.creationdate)) / 86400.0 as age_days
+    from posts p
+    left join users u on u.id = p.owneruserid
+    where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+post_activity as (
+    select
+        rp.id,
+        count(distinct c.id) as comment_count,
+        count(distinct v.id) filter (where v.votetypeid = 2) as upvotes_count,
+        count(distinct v.id) filter (where v.votetypeid = 3) as downvotes_count,
+        count(distinct v.id) filter (where v.votetypeid = 5) as favorites_count,
+        count(distinct ph.id) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+        max(greatest(coalesce(c.creationdate, timestamp 'epoch'), coalesce(v.creationdate, timestamp 'epoch'), coalesce(ph.creationdate, timestamp 'epoch'))) as last_interaction
+    from recent_posts rp
+    left join comments c on c.postid = rp.id
+    left join votes v on v.postid = rp.id
+    left join posthistory ph on ph.postid = rp.id
+    group by rp.id
+),
+dup_links as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+        count(*) filter (where pl.linktypeid = 1) as linked_links,
+        bool_or(pl.linktypeid = 3) as has_duplicate_flag
+    from postlinks pl
+    join recent_posts rp on rp.id = pl.postid
+    group by pl.postid
+),
+close_reasons as (
+    select
+        ph.postid,
+        array_agg(distinct crt.name order by crt.name) as close_reason_names,
+        count(*) as close_events
+    from posthistory ph
+    join closerreasontypes crt on crt.id::text = ph.comment
+    where ph.posthistorytypeid = 10
+      and ph.postid in (select id from recent_posts)
+    group by ph.postid
+),
+tag_split as (
+    select
+        rp.id,
+        unnest(string_to_array(substring(rp.tags from 2 for length(rp.tags)-2), '><')) as tag
+    from recent_posts rp
+    where rp.tags is not null
+),
+tag_stats as (
+    select
+        ts.id,
+        count(*) as tag_count,
+        count(*) filter (where t.isrequired) as required_tag_count,
+        count(*) filter (where t.ismoderatoronly) as modonly_tag_count,
+        sum(coalesce(t.count,0)) as global_tag_popularity
+    from tag_split ts
+    left join tags t on t.tagname = ts.tag
+    group by ts.id
+),
+user_badge_summary as (
+    select
+        b.userid,
+        count(*) as total_badges,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where b.tagbased = 1) as tag_badges
+    from badges b
+    group by b.userid
+),
+owner_enriched as (
+    select
+        rp.id,
+        rp.owneruserid,
+        coalesce(ubs.total_badges,0) as total_badges,
+        coalesce(ubs.gold_badges,0) as gold_badges,
+        coalesce(ubs.silver_badges,0) as silver_badges,
+        coalesce(ubs.bronze_badges,0) as bronze_badges,
+        coalesce(ubs.tag_badges,0) as tag_badges
+    from recent_posts rp
+    left join user_badge_summary ubs on ubs.userid = rp.owneruserid
+),
+acceptance as (
+    select
+        q.id as question_id,
+        case when q.acceptedanswerid is not null then 1 else 0 end as has_accepted_answer,
+        aa.owneruserid as accepted_owner_id,
+        aa.score as accepted_score
+    from posts q
+    left join posts aa on aa.id = q.acceptedanswerid
+    where q.id in (select id from recent_posts where posttypeid = 1)
+),
+answers as (
+    select
+        a.parentid as question_id,
+        count(*) as answer_count,
+        avg(a.score) as avg_answer_score,
+        max(a.score) as max_answer_score,
+        min(a.score) as min_answer_score,
+        count(*) filter (where a.score > 0) as positive_answers,
+        count(*) filter (where a.score < 0) as negative_answers
+    from posts a
+    where a.posttypeid = 2
+      and a.parentid in (select id from recent_posts where posttypeid = 1)
+    group by a.parentid
+),
+owner_quality as (
+    select
+        rp.owneruserid,
+        count(*) as owner_post_count,
+        avg(rp.score) as owner_avg_score,
+        sum(case when rp.posttypeid = 1 then 1 else 0 end) as owner_questions,
+        sum(case when rp.posttypeid = 2 then 1 else 0 end) as owner_answers
+    from recent_posts rp
+    where rp.owneruserid is not null
+    group by rp.owneruserid
+),
+post_quality as (
+    select
+        rp.id,
+        rp.posttypeid,
+        rp.score,
+        rp.viewcount,
+        rp.age_days,
+        pa.comment_count,
+        pa.upvotes_count,
+        pa.downvotes_count,
+        pa.favorites_count,
+        pa.edit_events,
+        coalesce(d.duplicate_links,0) as duplicate_links,
+        coalesce(d.linked_links,0) as linked_links,
+        coalesce(d.has_duplicate_flag,false) as has_duplicate_flag,
+        coalesce(ts.tag_count,0) as tag_count,
+        coalesce(ts.required_tag_count,0) as required_tag_count,
+        coalesce(ts.modonly_tag_count,0) as modonly_tag_count,
+        coalesce(ts.global_tag_popularity,0) as global_tag_popularity,
+        greatest(coalesce(pa.last_interaction, rp.lastactivitydate, rp.creationdate), rp.creationdate) as last_touch
+    from recent_posts rp
+    left join post_activity pa on pa.id = rp.id
+    left join dup_links d on d.postid = rp.id
+    left join tag_stats ts on ts.id = rp.id
+),
+ranking as (
+    select
+        pq.*,
+        row_number() over (order by (pq.score + coalesce(pq.upvotes_count,0) - coalesce(pq.downvotes_count,0)) desc, pq.viewcount desc, pq.last_touch desc) as global_rank,
+        dense_rank() over (partition by pq.posttypeid order by (pq.score + coalesce(pq.upvotes_count,0) - coalesce(pq.downvotes_count,0)) desc) as type_rank,
+        percent_rank() over (order by pq.viewcount) as view_percentile,
+        ntile(10) over (order by pq.score desc nulls last) as score_decile,
+        sum(pq.viewcount) over (order by pq.last_touch rows between unbounded preceding and current row) as cumulative_views_by_time
+    from post_quality pq
+),
+question_enriched as (
+    select
+        r.id,
+        r.posttypeid,
+        r.score,
+        r.viewcount,
+        r.age_days,
+        r.comment_count,
+        r.upvotes_count,
+        r.downvotes_count,
+        r.favorites_count,
+        r.edit_events,
+        r.duplicate_links,
+        r.linked_links,
+        r.has_duplicate_flag,
+        r.tag_count,
+        r.required_tag_count,
+        r.modonly_tag_count,
+        r.global_tag_popularity,
+        r.last_touch,
+        a.answer_count,
+        a.avg_answer_score,
+        a.max_answer_score,
+        a.min_answer_score,
+        ac.has_accepted_answer,
+        ac.accepted_owner_id,
+        ac.accepted_score,
+        cr.close_reason_names,
+        cr.close_events
+    from ranking r
+    left join answers a on a.question_id = r.id
+    left join acceptance ac on ac.question_id = r.id
+    left join close_reasons cr on cr.postid = r.id
+    where r.posttypeid = 1
+),
+owner_agg as (
+    select
+        rp.id,
+        oe.total_badges,
+        oe.gold_badges,
+        oe.silver_badges,
+        oe.bronze_badges,
+        oe.tag_badges,
+        oq.owner_post_count,
+        oq.owner_avg_score,
+        oq.owner_questions,
+        oq.owner_answers
+    from recent_posts rp
+    left join owner_enriched oe on oe.id = rp.id
+    left join owner_quality oq on oq.owneruserid = rp.owneruserid
+),
+score_model as (
+    select
+        r.id,
+        r.posttypeid,
+        r.score,
+        r.viewcount,
+        r.upvotes_count,
+        r.downvotes_count,
+        r.favorites_count,
+        r.tag_count,
+        r.global_tag_popularity,
+        oa.total_badges,
+        oa.owner_avg_score,
+        coalesce(r.score,0)
+          + 0.7 * coalesce(r.upvotes_count,0)
+          - 1.2 * coalesce(r.downvotes_count,0)
+          + 0.05 * coalesce(r.viewcount,0)
+          + 0.3 * coalesce(r.favorites_count,0)
+          + 0.02 * coalesce(oa.total_badges,0)
+          + 0.1 * coalesce(oa.owner_avg_score,0)
+          + case when r.has_duplicate_flag then -5 else 0 end
+          + ln(1 + greatest(r.tag_count,0) * greatest(r.global_tag_popularity,0)) as composite_score
+    from ranking r
+    left join owner_agg oa on oa.id = r.id
+),
+anomalies as (
+    select
+        r.id,
+        case
+            when r.viewcount > 10000 and r.score <= 0 then 'High views, low score'
+            when r.viewcount < 50 and r.score >= 10 then 'Low views, high score'
+            when r.upvotes_count is null and r.downvotes_count is not null then 'Missing upvotes'
+            when r.downvotes_count is null and r.upvotes_count is not null then 'Missing downvotes'
+            else null
+        end as anomaly_flag
+    from ranking r
+),
+final_union as (
+    select
+        r.id,
+        r.posttypeid,
+        'Question' as kind,
+        r.global_rank,
+        r.type_rank,
+        r.view_percentile,
+        r.score_decile,
+        r.cumulative_views_by_time,
+        sm.composite_score,
+        q.answer_count,
+        q.avg_answer_score,
+        q.max_answer_score,
+        q.min_answer_score,
+        q.has_accepted_answer,
+        q.accepted_owner_id,
+        q.accepted_score,
+        q.close_reason_names,
+        q.close_events,
+        r.score,
+        r.viewcount,
+        r.upvotes_count,
+        r.downvotes_count,
+        r.favorites_count,
+        r.comment_count,
+        r.edit_events,
+        r.duplicate_links,
+        r.linked_links,
+        r.has_duplicate_flag,
+        r.tag_count,
+        r.required_tag_count,
+        r.modonly_tag_count,
+        r.global_tag_popularity,
+        r.last_touch,
+        a.anomaly_flag
+    from ranking r
+    join question_enriched q on q.id = r.id
+    join score_model sm on sm.id = r.id
+    left join anomalies a on a.id = r.id
+
+    union all
+
+    select
+        r.id,
+        r.posttypeid,
+        'NonQuestion' as kind,
+        r.global_rank,
+        r.type_rank,
+        r.view_percentile,
+        r.score_decile,
+        r.cumulative_views_by_time,
+        sm.composite_score,
+        null, null, null, null, null, null, null, null,
+        r.score,
+        r.viewcount,
+        r.upvotes_count,
+        r.downvotes_count,
+        r.favorites_count,
+        r.comment_count,
+        r.edit_events,
+        r.duplicate_links,
+        r.linked_links,
+        r.has_duplicate_flag,
+        r.tag_count,
+        r.required_tag_count,
+        r.modonly_tag_count,
+        r.global_tag_popularity,
+        r.last_touch,
+        a.anomaly_flag
+    from ranking r
+    join score_model sm on sm.id = r.id
+    left join anomalies a on a.id = r.id
+    where r.posttypeid <> 1
+),
+dedupe as (
+    select
+        f.*,
+        row_number() over (partition by f.id order by f.composite_score desc, f.last_touch desc) as rn
+    from final_union f
+)
+select
+    d.id,
+    d.posttypeid,
+    d.kind,
+    d.global_rank,
+    d.type_rank,
+    round(d.view_percentile::numeric, 4) as view_percentile,
+    d.score_decile,
+    d.cumulative_views_by_time,
+    round(d.composite_score::numeric, 3) as composite_score,
+    d.answer_count,
+    round(d.avg_answer_score::numeric, 3) as avg_answer_score,
+    d.max_answer_score,
+    d.min_answer_score,
+    d.has_accepted_answer,
+    d.accepted_owner_id,
+    d.accepted_score,
+    d.close_reason_names,
+    d.close_events,
+    d.score,
+    d.viewcount,
+    d.upvotes_count,
+    d.downvotes_count,
+    d.favorites_count,
+    d.comment_count,
+    d.edit_events,
+    d.duplicate_links,
+    d.linked_links,
+    d.has_duplicate_flag,
+    d.tag_count,
+    d.required_tag_count,
+    d.modonly_tag_count,
+    d.global_tag_popularity,
+    d.last_touch,
+    coalesce(d.anomaly_flag, case when d.close_events > 0 then 'Closed' end) as anomaly_or_status
+from dedupe d
+where d.rn = 1
+order by d.composite_score desc nulls last, d.global_rank, d.id
+limit 500;

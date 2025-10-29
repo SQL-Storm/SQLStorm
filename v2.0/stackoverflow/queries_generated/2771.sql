@@ -1,0 +1,221 @@
+-- {"query": "2771.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2055} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id, 
+        t.TagName, 
+        0 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select 
+        t2.Id, 
+        t2.TagName, 
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> r.Id and not t2.TagName = any(r.Path)
+    where r.Level < 2
+),
+UserBadgeCounts as (
+    select 
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserAggregate as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate,
+        COALESCE(SUM(vote_counts.UpVotes), 0) as TotalUpVotes,
+        COALESCE(SUM(vote_counts.DownVotes), 0) as TotalDownVotes,
+        COALESCE(MAX(ph.CreationDate), '1970-01-01'::timestamp) as LastPostEditDate,
+        COALESCE(ubc_gold.BadgeCount,0) as GoldBadges,
+        COALESCE(ubc_silver.BadgeCount,0) as SilverBadges,
+        COALESCE(ubc_bronze.BadgeCount,0) as BronzeBadges
+    from Users u
+    left join (
+        select 
+            p.OwnerUserId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on v.VoteTypeId = vt.Id
+        join Posts p on v.PostId = p.Id
+        where p.OwnerUserId is not null and p.OwnerUserId <> -1
+        group by p.OwnerUserId
+    ) vote_counts on vote_counts.OwnerUserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.Id and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.Id and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.Id and ubc_bronze.Class = 3
+    group by u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate, ubc_gold.BadgeCount, ubc_silver.BadgeCount, ubc_bronze.BadgeCount
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        count(a.Id) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        count(distinct c.Id) as TotalComments,
+        bool_or(q.ClosedDate is not null) as IsClosed,
+        string_agg(coalesce(u.DisplayName, 'Unknown'), ',' order by u.Reputation desc) filter (where u.Id is not null) as TopAnswerers
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Comments c on c.PostId = q.Id
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.Tags, q.CreationDate, q.Score, q.ViewCount, q.ClosedDate
+),
+LatestPostLinks as (
+    select distinct on (pl.PostId, pl.RelatedPostId)
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkType,
+        pl.CreationDate
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    order by pl.PostId, pl.RelatedPostId, pl.CreationDate desc
+),
+PostWithLinkedDuplicates as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.Tags,
+        q.QuestionCreation,
+        q.QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.AvgAnswerScore,
+        q.MaxAnswerScore,
+        q.TotalComments,
+        q.IsClosed,
+        q.TopAnswerers,
+        dup.RelatedPostId as DuplicateOfQuestionId
+    from QuestionAnswerStats q
+    left join LatestPostLinks dup on dup.PostId = q.QuestionId and dup.LinkType = 'Duplicate'
+),
+WindowedUsers as (
+    select 
+        ua.Id,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Location,
+        ua.CreationDate,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ua.LastPostEditDate,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        row_number() over (partition by ua.Location order by ua.Reputation desc, ua.TotalUpVotes desc nulls last) as LocRank,
+        rank() over (order by ua.Reputation desc) as GlobalRank,
+        ntile(4) over (order by ua.Reputation desc) as QuarterRank
+    from UserAggregate ua
+    where ua.Location is not null
+),
+UsersWithRecentActivity as (
+    select 
+        wu.Id,
+        wu.DisplayName,
+        wu.Location,
+        wu.Reputation,
+        wu.TotalUpVotes,
+        wu.TotalDownVotes,
+        wu.LastPostEditDate,
+        wu.GoldBadges,
+        wu.SilverBadges,
+        wu.BronzeBadges,
+        wu.LocRank,
+        wu.GlobalRank,
+        wu.QuarterRank,
+        exists(
+            select 1 from Posts p 
+            where p.OwnerUserId = wu.Id and p.CreationDate > now() - interval '30 days'
+        ) as HasRecentPosts
+    from WindowedUsers wu
+),
+HighActivityQuestions as (
+    select 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        case 
+            when p.Tags is not null then array_length(string_to_array(substring(p.Tags, 2, char_length(p.Tags) - 2), '><'), 1)
+            else 0
+        end as TagCount,
+        row_number() over (order by p.ViewCount desc, p.Score desc) as PopularityRank
+    from Posts p
+    where p.PostTypeId = 1 and p.ClosedDate is null and p.ViewCount > 1000
+),
+PostsWithHistoryInfo as (
+    select 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        coalesce(phLatest.EditCount, 0) as EditCount,
+        coalesce(phLatest.LastEditDate, p.CreationDate) as LastEditDate,
+        pht.Name as LastEditTypeName
+    from Posts p
+    left join lateral (
+        select 
+            count(*) as EditCount,
+            max(ph.CreationDate) as LastEditDate,
+            max(ph.PostHistoryTypeId) filter (where ph.CreationDate = max(ph.CreationDate)) as LastEditType
+        from PostHistory ph 
+        where ph.PostId = p.Id
+    ) phLatest on true
+    left join PostHistoryTypes pht on pht.Id = phLatest.LastEditType
+    where p.PostTypeId in (1, 2)
+)
+select 
+    htq.Id as HotQuestionId,
+    htq.Title as HotQuestionTitle,
+    htq.Tags as HotQuestionTags,
+    htq.CreationDate as QuestionCreatedOn,
+    htq.ViewCount,
+    htq.Score as QuestionScore,
+    htq.AnswerCount,
+    htq.CommentCount,
+    htq.FavoriteCount,
+    htq.TagCount,
+    hpl.EditCount as NumberOfEdits,
+    hpl.LastEditDate,
+    coalesce(hpl.LastEditTypeName, 'None') as LastEditType,
+    uw.DisplayName as OwnerUserName,
+    uw.Reputation as OwnerReputation,
+    uw.Location as OwnerLocation,
+    uw.GoldBadges,
+    uw.SilverBadges,
+    uw.BronzeBadges,
+    case when uw.HasRecentPosts then 'Active' else 'Inactive' end as OwnerActivityStatus,
+    dup.DuplicateOfQuestionId,
+    path.Path as SampleTagPath,
+    row_number() over (partition by uw.Location order by htq.ViewCount desc) as RankWithinLocation
+from HighActivityQuestions htq
+join PostsWithHistoryInfo hpl on hpl.Id = htq.Id
+left join UsersWithRecentActivity uw on uw.Id = hpl.OwnerUserId
+left join PostWithLinkedDuplicates dup on dup.QuestionId = htq.Id
+left join RecursiveTagHierarchy path on path.Level = 0 and lower(path.TagName) = any(string_to_array(lower(substring(htq.Tags, 2, char_length(htq.Tags) - 2)), '><'))
+where uw.GlobalRank <= 500
+order by htq.ViewCount desc, htq.Score desc, uw.Reputation desc
+limit 100;

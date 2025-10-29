@@ -1,0 +1,124 @@
+WITH 
+UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id)                         AS TotalBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1)        AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2)        AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3)        AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2)   AS UpVotesCast,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3)   AS DownVotesCast
+    FROM Users u
+),
+RecentActivity AS (
+    SELECT 
+        p.OwnerUserId                     AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END)               AS RecentQuestions,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END)               AS RecentAnswers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END)           AS QuestionScoreSum,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END)           AS AnswerScoreSum,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY p.CreationDate DESC)      AS RecentPostRank
+    FROM Posts p
+    WHERE p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '90 days')
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+TagEngagement AS (
+    SELECT 
+        t.TagName,
+        COUNT(DISTINCT p.Id)                     AS QuestionsWithTag,
+        SUM(p.ViewCount)                         AS TotalViews,
+        AVG(p.Score)                             AS AvgScore,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.Reputation > 10000) 
+                                                 AS TopContributors
+    FROM Posts p
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(
+            regexp_replace(p.Tags, '^<|>$', '', 'g'), '><')) AS Tag
+    ) taglist ON TRUE
+    JOIN Tags t ON t.TagName = taglist.Tag
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '365 days')
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT p.Id) > 1000
+),
+BadgeScoreRatio AS (
+    SELECT 
+        um.Id                                 AS UserId,
+        um.DisplayName,
+        (CASE 
+            WHEN um.TotalBadges = 0 THEN NULL
+            ELSE ROUND( (CAST(um.QuestionCount AS numeric) + CAST(um.AnswerCount AS numeric)) / CAST(um.TotalBadges AS numeric), 2)
+         END)                                 AS PostsPerBadge,
+        (CASE 
+            WHEN um.GoldBadges = 0 THEN 0
+            ELSE (um.QuestionCount * 2 + um.AnswerCount) / NULLIF(um.GoldBadges,0)
+         END)                                 AS WeightedScorePerGold
+    FROM UserMetrics um
+    WHERE um.Reputation >= 5000
+),
+TopUsersAndTags AS (
+    SELECT 
+        um.Id                                 AS EntityId,
+        um.DisplayName                        AS EntityName,
+        um.Reputation,
+        um.GoldBadges,
+        ra.RecentQuestions,
+        ra.RecentAnswers,
+        bsr.PostsPerBadge,
+        bsr.WeightedScorePerGold,
+        CAST(NULL AS VARCHAR)                         AS TagName,
+        CAST(NULL AS INTEGER)                             AS QuestionsWithTag,
+        CAST(NULL AS BIGINT)                          AS TotalViews,
+        CAST(NULL AS NUMERIC)                         AS AvgScore,
+        CAST(NULL AS VARCHAR)                         AS TopContributors,
+        ROW_NUMBER() OVER (ORDER BY um.Reputation DESC, um.Id) AS RankOverall
+    FROM UserMetrics um
+    LEFT JOIN RecentActivity ra ON ra.UserId = um.Id
+    LEFT JOIN BadgeScoreRatio bsr ON bsr.UserId = um.Id
+
+    UNION ALL
+
+    SELECT 
+        CAST(NULL AS INTEGER)                            AS EntityId,
+        te.TagName                           AS EntityName,
+        CAST(NULL AS INTEGER)                            AS Reputation,
+        CAST(NULL AS INTEGER)                            AS GoldBadges,
+        CAST(NULL AS INTEGER)                            AS RecentQuestions,
+        CAST(NULL AS INTEGER)                            AS RecentAnswers,
+        CAST(NULL AS NUMERIC)                        AS PostsPerBadge,
+        CAST(NULL AS NUMERIC)                        AS WeightedScorePerGold,
+        te.TagName,
+        te.QuestionsWithTag,
+        te.TotalViews,
+        te.AvgScore,
+        te.TopContributors,
+        ROW_NUMBER() OVER (ORDER BY te.QuestionsWithTag DESC, te.TagName) AS RankOverall
+    FROM TagEngagement te
+)
+SELECT 
+    t.EntityId,
+    t.EntityName,
+    COALESCE(CAST(t.Reputation AS TEXT), 'N/A')                     AS Reputation,
+    COALESCE(CAST(t.GoldBadges AS TEXT), '0')                       AS GoldBadges,
+    COALESCE(CAST(t.RecentQuestions AS TEXT), '0')                 AS RecentQuestions,
+    COALESCE(CAST(t.RecentAnswers AS TEXT), '0')                   AS RecentAnswers,
+    COALESCE(CAST(t.PostsPerBadge AS TEXT), 'NULL')                AS PostsPerBadge,
+    COALESCE(CAST(t.WeightedScorePerGold AS TEXT), '0')            AS WeightedScorePerGold,
+    COALESCE(t.TagName, '-')                               AS TagName,
+    COALESCE(CAST(t.QuestionsWithTag AS TEXT), '-')               AS QuestionsWithTag,
+    COALESCE(CAST(t.TotalViews AS TEXT), '-')                      AS TotalViews,
+    COALESCE(CAST(ROUND(t.AvgScore::numeric, 2) AS TEXT), '-')              AS AvgScore,
+    COALESCE(t.TopContributors, 'None')                    AS TopContributors,
+    t.RankOverall
+FROM TopUsersAndTags t
+ORDER BY t.RankOverall
+LIMIT 200;

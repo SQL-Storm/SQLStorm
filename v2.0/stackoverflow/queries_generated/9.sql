@@ -1,0 +1,298 @@
+-- {"query": "9.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2741} 
+with
+-- recent active users with engagement metrics
+recent_users as (
+  select
+    u.id as user_id,
+    coalesce(nullif(trim(u.displayname), ''), concat('user#', u.id::varchar)) as display_name,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    u.location,
+    u.upvotes,
+    u.downvotes,
+    u.views,
+    sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes_cast,
+    count(distinct b.id) filter (where b.class = 1) as gold_badges,
+    count(distinct b.id) filter (where b.class = 2) as silver_badges,
+    count(distinct b.id) filter (where b.class = 3) as bronze_badges,
+    max(b.date) as last_badge_date
+  from users u
+  left join votes v on v.userid = u.id
+  left join badges b on b.userid = u.id
+  where u.creationdate >= now() - interval '10 years'
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.location, u.upvotes, u.downvotes, u.views
+),
+-- classify users by activity recency and voting behavior
+user_flags as (
+  select
+    ru.*,
+    case
+      when ru.lastaccessdate >= now() - interval '30 days' then 'active_30d'
+      when ru.lastaccessdate >= now() - interval '180 days' then 'active_180d'
+      else 'inactive'
+    end as activity_bucket,
+    case when ru.net_votes_cast > 50 then true else false end as is_heavy_voter,
+    case when ru.gold_badges > 0 then true else false end as is_gold
+  from recent_users ru
+),
+-- questions with derived metrics
+questions as (
+  select
+    p.id as q_id,
+    p.owneruserid as owner_id,
+    p.creationdate as q_created,
+    p.score as q_score,
+    p.viewcount as q_views,
+    p.title,
+    p.tags,
+    p.answercount,
+    p.acceptedanswerid,
+    p.closeddate,
+    coalesce(p.favoritecount, 0) as favoritecount,
+    count(c.id) as commentcount_calc,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    min(a.creationdate) filter (where a.id = p.acceptedanswerid) as accepted_answer_date,
+    min(a2.creationdate) as first_answer_date,
+    count(a2.id) as total_answers
+  from posts p
+  left join comments c on c.postid = p.id
+  left join votes v on v.postid = p.id
+  left join posts a on a.id = p.acceptedanswerid
+  left join posts a2 on a2.parentid = p.id and a2.posttypeid = 2
+  where p.posttypeid = 1
+    and p.creationdate >= now() - interval '8 years'
+  group by p.id, p.owneruserid, p.creationdate, p.score, p.viewcount, p.title, p.tags, p.answercount, p.acceptedanswerid, p.closeddate, p.favoritecount
+),
+-- parse tags into rows
+question_tags as (
+  select
+    q.q_id,
+    unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+  from questions q
+  where q.tags is not null and length(q.tags) > 2
+),
+-- engagement timing metrics
+q_timings as (
+  select
+    q.q_id,
+    q.owner_id,
+    q.q_created,
+    q.q_score,
+    q.q_views,
+    q.title,
+    q.answercount,
+    q.acceptedanswerid,
+    q.closeddate,
+    q.upvotes,
+    q.downvotes,
+    q.favoritecount,
+    q.commentcount_calc,
+    extract(epoch from (min(q.first_answer_date) - q.q_created)) as secs_to_first_answer,
+    extract(epoch from (min(q.accepted_answer_date) - q.q_created)) as secs_to_accept,
+    case when q.acceptedanswerid is null then 1 else 0 end as is_unaccepted,
+    case when q.closeddate is null then 0 else 1 end as is_closed
+  from questions q
+  group by q.q_id, q.owner_id, q.q_created, q.q_score, q.q_views, q.title, q.answercount, q.acceptedanswerid, q.closeddate, q.upvotes, q.downvotes, q.favoritecount, q.commentcount_calc
+),
+-- duplicate relationships and link types
+dup_links as (
+  select
+    pl.postid as source_id,
+    pl.relatedpostid as target_id,
+    lt.name as link_type,
+    pl.creationdate as link_created
+  from postlinks pl
+  join linktypes lt on lt.id = pl.linktypeid
+  where pl.linktypeid = 3
+),
+-- post history facts of interest
+ph_events as (
+  select
+    ph.postid,
+    ph.posthistorytypeid,
+    pht.name as ph_name,
+    ph.creationdate as ph_date,
+    ph.comment
+  from posthistory ph
+  join posthistorytypes pht on pht.id = ph.posthistorytypeid
+  where ph.posthistorytypeid in (10, 11, 12, 13, 50, 52, 53)
+),
+-- per-question last significant event
+q_last_event as (
+  select
+    postid as q_id,
+    max(ph_date) as last_event_date,
+    max(ph_name) filter (where ph_date = max(ph_date) over (partition by postid)) as last_event_name
+  from ph_events
+  group by postid
+),
+-- rolling popularity by tag
+tag_popularity as (
+  select
+    qt.tag,
+    date_trunc('month', q.q_created) as month_bucket,
+    count(*) as questions_in_month,
+    sum(q.q_views) as views_in_month,
+    avg(nullif(q.q_score, 0)) as avg_nonzero_score
+  from question_tags qt
+  join q_timings q on q.q_id = qt.q_id
+  group by qt.tag, date_trunc('month', q.q_created)
+),
+-- top tags recent window
+top_tags as (
+  select
+    tp.tag,
+    sum(tp.questions_in_month) as q_last_12m,
+    sum(tp.views_in_month) as views_last_12m,
+    row_number() over (order by sum(tp.views_in_month) desc nulls last) as rn_by_views
+  from tag_popularity tp
+  where tp.month_bucket >= date_trunc('month', now()) - interval '12 months'
+  group by tp.tag
+),
+-- per-question window stats and dense ranks
+q_windowed as (
+  select
+    q.*,
+    dense_rank() over (order by q.q_views desc nulls last) as rk_views,
+    dense_rank() over (order by q.q_score desc nulls last) as rk_score,
+    row_number() over (partition by q.owner_id order by q.q_views desc nulls last, q.q_score desc nulls last, q.q_created desc) as rn_owner_popular,
+    avg(q.q_views) over (partition by date_trunc('year', q.q_created)) as avg_views_same_year,
+    percentile_disc(0.9) within group (order by q.q_views) over () as p90_views_global
+  from q_timings q
+),
+-- aggregate owner performance
+owner_perf as (
+  select
+    q.owner_id,
+    count(*) as total_questions,
+    sum(case when q.is_unaccepted = 1 then 1 else 0 end) as unanswered_questions,
+    avg(q.q_score) as avg_q_score,
+    avg(q.q_views) as avg_q_views,
+    avg(nullif(q.secs_to_first_answer, 0)) as avg_secs_to_first_answer,
+    avg(nullif(q.secs_to_accept, 0)) as avg_secs_to_accept,
+    sum(q.upvotes) as sum_upvotes,
+    sum(q.downvotes) as sum_downvotes
+  from q_timings q
+  group by q.owner_id
+),
+-- set of candidate questions blending multiple criteria
+candidate_q as (
+  select q.q_id
+  from q_windowed q
+  left join dup_links d on d.source_id = q.q_id
+  left join q_last_event le on le.q_id = q.q_id
+  where
+    (q.rk_views <= 1000 or q.rk_score <= 1000)
+    and coalesce(q.q_views, 0) > coalesce(q.avg_views_same_year, 0)
+    and (le.last_event_date is null or le.last_event_date >= q.q_created)
+    and (q.closeddate is null or q.q_score >= 0)
+    and (d.target_id is null or q.q_score >= 1)
+),
+-- integrate everything with user flags and top tags
+final_set as (
+  select
+    q.q_id,
+    q.owner_id,
+    uf.display_name,
+    uf.activity_bucket,
+    uf.is_heavy_voter,
+    uf.is_gold,
+    op.total_questions,
+    op.unanswered_questions,
+    op.avg_q_score,
+    op.avg_q_views,
+    q.q_created,
+    q.q_score,
+    q.q_views,
+    q.answercount,
+    q.acceptedanswerid,
+    q.upvotes,
+    q.downvotes,
+    q.favoritecount,
+    q.commentcount_calc,
+    q.secs_to_first_answer,
+    q.secs_to_accept,
+    q.is_unaccepted,
+    q.is_closed,
+    le.last_event_date,
+    le.last_event_name,
+    tt.tag as top_tag_hit,
+    tt.q_last_12m as tag_q_12m,
+    tt.views_last_12m as tag_views_12m,
+    q.rk_views,
+    q.rk_score,
+    q.rn_owner_popular,
+    q.avg_views_same_year,
+    q.p90_views_global
+  from q_windowed q
+  join candidate_q cq on cq.q_id = q.q_id
+  left join user_flags uf on uf.user_id = q.owner_id
+  left join owner_perf op on op.owner_id = q.owner_id
+  left join q_last_event le on le.q_id = q.q_id
+  left join question_tags qt on qt.q_id = q.q_id
+  left join top_tags tt on tt.tag = qt.tag and tt.rn_by_views <= 200
+),
+-- deduplicate to most relevant tag per question by tag popularity
+final_ranked as (
+  select
+    f.*,
+    row_number() over (
+      partition by f.q_id
+      order by
+        coalesce(f.tag_views_12m, 0) desc,
+        coalesce(f.tag_q_12m, 0) desc,
+        f.rk_views asc,
+        f.rk_score asc
+    ) as rn_per_question
+  from final_set f
+)
+select
+  fr.q_id,
+  fr.owner_id,
+  fr.display_name,
+  fr.activity_bucket,
+  fr.is_heavy_voter,
+  fr.is_gold,
+  fr.total_questions,
+  fr.unanswered_questions,
+  round(fr.avg_q_score::numeric, 3) as avg_q_score,
+  round(fr.avg_q_views::numeric, 3) as avg_q_views,
+  fr.q_created,
+  fr.q_score,
+  fr.q_views,
+  fr.answercount,
+  fr.acceptedanswerid,
+  fr.upvotes,
+  fr.downvotes,
+  fr.favoritecount,
+  fr.commentcount_calc,
+  fr.secs_to_first_answer,
+  fr.secs_to_accept,
+  fr.is_unaccepted,
+  fr.is_closed,
+  fr.last_event_date,
+  fr.last_event_name,
+  coalesce(fr.top_tag_hit, '(no-tag)') as representative_tag,
+  fr.tag_q_12m,
+  fr.tag_views_12m,
+  fr.rk_views,
+  fr.rk_score,
+  fr.rn_owner_popular,
+  fr.avg_views_same_year,
+  fr.p90_views_global,
+  case
+    when fr.q_views >= fr.p90_views_global then 'top_10_percent_views'
+    when fr.q_score >= 10 then 'top_score'
+    when fr.is_unaccepted = 1 and fr.answercount > 0 then 'needs_accept'
+    when fr.is_closed = 1 then 'closed'
+    else 'normal'
+  end as status_bucket
+from final_ranked fr
+where fr.rn_per_question = 1
+order by
+  status_bucket,
+  fr.rk_views,
+  fr.q_created desc
+limit 1000;

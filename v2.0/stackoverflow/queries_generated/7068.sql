@@ -1,0 +1,390 @@
+-- {"query": "7068.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 6424} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as avg_score_3posts,
+        NTILE(4) OVER (ORDER BY p.Score) as quartile_score,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question without Accepted Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as post_category,
+        COALESCE(p.Title, 'No Title') as safe_title,
+        REPLACE(p.Tags, '<', '') as clean_tags,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 50 THEN 'Moderately Voted'
+            WHEN p.Score > 0 THEN 'Slightly Voted'
+            ELSE 'Not Voted'
+        END as vote_category,
+        DATEDIFF('day', p.CreationDate, p.LastActivityDate) as days_since_last_activity,
+        CASE 
+            WHEN p.CommentCount > 0 THEN 'Has Comments'
+            ELSE 'No Comments'
+        END as comment_status,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'Popular'
+            WHEN p.ViewCount > 100 THEN 'Moderately Popular'
+            ELSE 'Less Popular'
+        END as popularity_level
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(u.EmailHash, 'No Email') as safe_email_hash,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'High Reputation'
+            WHEN u.Reputation > 1000 THEN 'Medium Reputation'
+            ELSE 'Low Reputation'
+        END as reputation_level,
+        COUNT(DISTINCT p.Id) as total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as answer_count,
+        AVG(p.Score) as avg_post_score,
+        MAX(p.Score) as highest_post_score,
+        COUNT(DISTINCT b.Id) as badge_count,
+        MAX(b.Date) as last_badge_date,
+        COUNT(DISTINCT ph.Id) as history_entries,
+        COUNT(DISTINCT c.Id) as comment_count,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Veteran'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Experienced'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Active'
+            ELSE 'New'
+        END as user_experience_level
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.EmailHash
+),
+PostAnalysis AS (
+    SELECT 
+        rp.Id as post_id,
+        rp.Title as post_title,
+        rp.safe_title,
+        rp.post_category,
+        rp.vote_category,
+        rp.popularity_level,
+        rp.days_since_last_activity,
+        rp.comment_status,
+        rp.Score as current_score,
+        rp.prev_score as previous_score,
+        rp.avg_score_3posts,
+        rp.quartile_score,
+        rp.OwnerUserId,
+        rp.AcceptedAnswerId,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        CASE 
+            WHEN rp.prev_score IS NULL THEN 'New Post'
+            WHEN rp.Score > rp.prev_score THEN 'Improved'
+            WHEN rp.Score < rp.prev_score THEN 'Deteriorated'
+            ELSE 'No Change'
+        END as score_trend,
+        RANK() OVER (ORDER BY rp.Score DESC) as global_rank_by_score,
+        PERCENT_RANK() OVER (ORDER BY rp.Score) as score_percentile,
+        CONCAT('Post_', rp.Id, '_Score_', rp.Score) as post_identifier,
+        LTRIM(RTRIM(CONCAT('Title: ', rp.Title, ' | Score: ', rp.Score))) as title_score_combo,
+        (rp.Score * 0.7 + rp.ViewCount * 0.3) as composite_score, -- Weighted score calculation
+        CASE 
+            WHEN rp.Score > 1000 THEN 'Trending'
+            WHEN rp.Score > 500 THEN 'Noticeable'
+            WHEN rp.Score > 100 THEN 'Moderate'
+            ELSE 'Low'
+        END as trend_level
+    FROM RankedPosts rp
+    WHERE rp.rn = 1
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Highly Popular'
+            WHEN t.Count > 500 THEN 'Moderately Popular'
+            WHEN t.Count > 100 THEN 'Popular'
+            ELSE 'Less Popular'
+        END as tag_popularity,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'Required Tag'
+            WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only'
+            ELSE 'General Tag'
+        END as tag_type,
+        t.Count * 10 as tag_weighted_score
+    FROM Tags t
+),
+UserBadges AS (
+    SELECT 
+        u.Id as user_id,
+        u.DisplayName,
+        COUNT(b.Id) as total_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) as gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) as silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) as bronze_badges,
+        STRING_AGG(b.Name, ', ') as badge_list,
+        MAX(b.Date) as latest_badge_date,
+        AVG(DATEDIFF('day', b.Date, CURRENT_TIMESTAMP)) as avg_days_since_badge,
+        CASE 
+            WHEN COUNT(b.Id) > 50 THEN 'Collector'
+            WHEN COUNT(b.Id) > 25 THEN 'Enthusiast'
+            WHEN COUNT(b.Id) > 10 THEN 'Regular'
+            ELSE 'Beginner'
+        END as badge_level
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    CONCAT('Analysis Result: ', COUNT(pa.post_id), ' posts analyzed') as result_summary,
+    CASE 
+        WHEN COUNT(pa.post_id) > 1000 THEN 'Large Dataset'
+        WHEN COUNT(pa.post_id) > 500 THEN 'Medium Dataset'
+        ELSE 'Small Dataset'
+    END as dataset_size,
+    COUNT(DISTINCT pa.OwnerUserId) as unique_authors,
+    AVG(pa.current_score) as overall_avg_score,
+    MAX(pa.current_score) as highest_score,
+    MIN(pa.current_score) as lowest_score,
+    AVG(pa.composite_score) as avg_composite_score,
+    (SELECT COUNT(*) FROM UserMetrics um WHERE um.total_posts > 100) as prolific_users,
+    (SELECT COUNT(*) FROM PostAnalysis pa WHERE pa.trend_level = 'Trending') as trending_posts,
+    (SELECT COUNT(*) FROM PostAnalysis pa WHERE pa.score_trend = 'Improved') as improved_posts,
+    (SELECT COUNT(*) FROM PostAnalysis pa WHERE pa.vote_category = 'Highly Voted') as highly_voted_posts,
+    (SELECT COUNT(*) FROM PostAnalysis pa WHERE pa.popularity_level = 'Popular') as popular_posts,
+    (SELECT COUNT(*) FROM PostAnalysis pa WHERE pa.comment_status = 'Has Comments') as commented_posts,
+    (SELECT COUNT(*) FROM UserBadges ub WHERE ub.badge_level = 'Collector') as badge_collectors,
+    (SELECT COUNT(*) FROM UserBadges ub WHERE ub.badge_level = 'Enthusiast') as badge_enthusiasts,
+    (SELECT COUNT(*) FROM TagAnalysis ta WHERE ta.tag_popularity = 'Highly Popular') as highly_popular_tags,
+    CASE 
+        WHEN (SELECT AVG(pa.current_score) FROM PostAnalysis pa) > 100 THEN 'High Scoring Content'
+        WHEN (SELECT AVG(pa.current_score) FROM PostAnalysis pa) > 50 THEN 'Moderate Scoring Content'
+        ELSE 'Low Scoring Content'
+    END as content_sentiment,
+    (SELECT COUNT(*) FROM Tags t WHERE t.Count > 1000) as very_active_tags,
+    (SELECT COUNT(DISTINCT p.OwnerUserId) FROM Posts p WHERE p.Score > 1000) as top_scorers,
+    (SELECT COUNT(DISTINCT p.OwnerUserId) FROM Posts p WHERE p.ViewCount > 10000) as highly_viewed_authors,
+    (SELECT COUNT(*) FROM Votes v WHERE v.VoteTypeId = 2) as upvotes_count,
+    (SELECT COUNT(*) FROM Votes v WHERE v.VoteTypeId = 3) as downvotes_count,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostHistoryTypeId = 10) as post_closures_count,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostHistoryTypeId = 11) as post_reopens_count,
+    (SELECT COUNT(*) FROM Comments c) as total_comments,
+    (SELECT COUNT(*) FROM Badges b) as total_badges,
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 1) as question_count,
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 2) as answer_count,
+    (SELECT COUNT(*) FROM Posts p WHERE p.ClosedDate IS NOT NULL) as closed_posts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.CommunityOwnedDate IS NOT NULL) as community_owned_posts,
+    (SELECT COUNT(DISTINCT ph.UserId) FROM PostHistory ph) as unique_history_users,
+    (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph) as unique_history_posts,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.LinkTypeId = 3) as duplicate_links,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.LinkTypeId = 1) as regular_links,
+    (SELECT COUNT(*) FROM Users u WHERE u.Reputation > 100000) as elite_users,
+    (SELECT COUNT(*) FROM Users u WHERE u.Views > 100000) as highly_viewed_users,
+    (SELECT COUNT(*) FROM Users u WHERE u.UpVotes > 10000) as highly_upvoted_users,
+    (SELECT COUNT(*) FROM Users u WHERE u.DownVotes > 10000) as highly_downvoted_users,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL) > (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 1) / 2 THEN 'High Acceptance Rate'
+        ELSE 'Low Acceptance Rate'
+    END as acceptance_rate_status,
+    (SELECT COUNT(*) FROM Posts p WHERE p.Score < 0) as negative_score_posts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.Score = 0) as zero_score_posts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.FavoriteCount > 100) as highly_favorited_posts,
+    (SELECT MAX(pa.global_rank_by_score) FROM PostAnalysis pa) as max_global_rank,
+    (SELECT MIN(pa.global_rank_by_score) FROM PostAnalysis pa) as min_global_rank,
+    (SELECT AVG(pa.global_rank_by_score) FROM PostAnalysis pa) as avg_global_rank,
+    (SELECT COUNT(*) FROM PostAnalysis pa WHERE pa.global_rank_by_score <= 100) as top_100_posts,
+    (SELECT COUNT(*) FROM PostAnalysis pa WHERE pa.global_rank_by_score <= 1000) as top_1000_posts,
+    (SELECT COUNT(*) FROM PostAnalysis pa WHERE pa.score_percentile > 0.8) as percentile_high_scorers,
+    (SELECT COUNT(*) FROM PostAnalysis pa WHERE pa.score_percentile > 0.5) as percentile_mid_scorers,
+    (SELECT COUNT(*) FROM PostAnalysis pa WHERE pa.score_percentile <= 0.2) as percentile_low_scorers,
+    (SELECT COUNT(*) FROM PostAnalysis pa WHERE pa.days_since_last_activity > 30) as inactive_posts,
+    (SELECT COUNT(*) FROM PostAnalysis pa WHERE pa.days_since_last_activity <= 7) as very_active_posts,
+    (SELECT COUNT(*) FROM PostAnalysis pa WHERE pa.days_since_last_activity BETWEEN 8 AND 30) as moderately_active_posts,
+    (SELECT COUNT(*) FROM UserMetrics um WHERE um.reputation_level = 'High Reputation') as high_reputation_users,
+    (SELECT COUNT(*) FROM UserMetrics um WHERE um.reputation_level = 'Medium Reputation') as medium_reputation_users,
+    (SELECT COUNT(*) FROM UserMetrics um WHERE um.reputation_level = 'Low Reputation') as low_reputation_users,
+    (SELECT COUNT(*) FROM UserMetrics um WHERE um.user_experience_level = 'Veteran') as veteran_users,
+    (SELECT COUNT(*) FROM UserMetrics um WHERE um.user_experience_level = 'Experienced') as experienced_users,
+    (SELECT COUNT(*) FROM UserMetrics um WHERE um.user_experience_level = 'Active') as active_users,
+    (SELECT COUNT(*) FROM UserMetrics um WHERE um.user_experience_level = 'New') as new_users,
+    (SELECT COUNT(*) FROM UserMetrics um WHERE um.user_experience_level = 'Veteran' AND um.total_posts > 1000) as top_veterans,
+    (SELECT COUNT(*) FROM UserMetrics um WHERE um.user_experience_level = 'Experienced' AND um.total_posts > 500) as top_experienced,
+    (SELECT COUNT(*) FROM UserMetrics um WHERE um.user_experience_level = 'Active' AND um.total_posts > 100) as top_active,
+    (SELECT COUNT(*) FROM UserMetrics um WHERE um.user_experience_level = 'New' AND um.total_posts < 10) as top_new,
+    (SELECT COUNT(*) FROM UserBadges ub WHERE ub.badge_level = 'Collector' AND ub.total_badges > 100) as top_collectors,
+    (SELECT COUNT(*) FROM UserBadges ub WHERE ub.badge_level = 'Enthusiast' AND ub.total_badges > 50) as top_enthusiasts,
+    (SELECT COUNT(*) FROM UserBadges ub WHERE ub.badge_level = 'Regular' AND ub.total_badges > 25) as top_regular,
+    (SELECT COUNT(*) FROM UserBadges ub WHERE ub.badge_level = 'Beginner' AND ub.total_badges < 10) as top_beginners,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.CreationDate > DATEADD('day', -30, CURRENT_TIMESTAMP)) as recent_history,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.CreationDate > DATEADD('month', -6, CURRENT_TIMESTAMP)) as recent_history_last_6months,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.CreationDate > DATEADD('year', -1, CURRENT_TIMESTAMP)) as recent_history_last_year,
+    (SELECT COUNT(*) FROM Comments c WHERE c.CreationDate > DATEADD('day', -7, CURRENT_TIMESTAMP)) as recent_comments,
+    (SELECT COUNT(*) FROM Comments c WHERE c.CreationDate > DATEADD('week', -4, CURRENT_TIMESTAMP)) as recent_comments_last_4weeks,
+    (SELECT COUNT(*) FROM Badges b WHERE b.Date > DATEADD('day', -30, CURRENT_TIMESTAMP)) as recent_badges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.Date > DATEADD('month', -6, CURRENT_TIMESTAMP)) as recent_badges_last_6months,
+    (SELECT COUNT(*) FROM Badges b WHERE b.Date > DATEADD('year', -1, CURRENT_TIMESTAMP)) as recent_badges_last_year,
+    (SELECT COUNT(*) FROM Posts p WHERE p.CreationDate > DATEADD('day', -7, CURRENT_TIMESTAMP)) as recent_posts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.CreationDate > DATEADD('week', -4, CURRENT_TIMESTAMP)) as recent_posts_last_4weeks,
+    NULL as placeholder_column,
+    NULL as another_placeholder,
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 1 AND p.Score > 0 AND p.LastActivityDate > DATEADD('day', -1, CURRENT_TIMESTAMP)) as today_active_questions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 2 AND p.Score > 0 AND p.LastActivityDate > DATEADD('day', -1, CURRENT_TIMESTAMP)) as today_active_answers,
+    (SELECT COUNT(*) FROM Users u WHERE u.LastAccessDate > DATEADD('hour', -1, CURRENT_TIMESTAMP)) as recently_active_users,
+    (SELECT COUNT(*) FROM Users u WHERE u.LastAccessDate > DATEADD('day', -1, CURRENT_TIMESTAMP)) as daily_active_users,
+    (SELECT COUNT(*) FROM Users u WHERE u.LastAccessDate > DATEADD('week', -1, CURRENT_TIMESTAMP)) as weekly_active_users,
+    (SELECT COUNT(*) FROM Users u WHERE u.LastAccessDate > DATEADD('month', -1, CURRENT_TIMESTAMP)) as monthly_active_users,
+    NULL as final_placeholder
+FROM 
+    PostAnalysis pa
+    FULL OUTER JOIN UserMetrics um ON TRUE
+    FULL OUTER JOIN UserBadges ub ON TRUE
+    FULL OUTER JOIN TagAnalysis ta ON TRUE
+WHERE 
+    pa.post_id IS NOT NULL 
+    OR um.Id IS NOT NULL 
+    OR ub.user_id IS NOT NULL 
+    OR ta.TagName IS NOT NULL
+GROUP BY 
+    CASE 
+        WHEN COUNT(pa.post_id) > 1000 THEN 'Large Dataset'
+        WHEN COUNT(pa.post_id) > 500 THEN 'Medium Dataset'
+        ELSE 'Small Dataset'
+    END
+HAVING 
+    COUNT(pa.post_id) > 0
+UNION ALL
+SELECT 
+    'Final Aggregated Result' as result_summary,
+    'Aggregated' as dataset_size,
+    COUNT(DISTINCT pa.OwnerUserId) as unique_authors,
+    AVG(pa.current_score) as overall_avg_score,
+    MAX(pa.current_score) as highest_score,
+    MIN(pa.current_score) as lowest_score,
+    AVG(pa.composite_score) as avg_composite_score,
+    COUNT(DISTINCT um.Id) as prolific_users,
+    COUNT(DISTINCT CASE WHEN pa.trend_level = 'Trending' THEN pa.post_id END) as trending_posts,
+    COUNT(DISTINCT CASE WHEN pa.score_trend = 'Improved' THEN pa.post_id END) as improved_posts,
+    COUNT(DISTINCT CASE WHEN pa.vote_category = 'Highly Voted' THEN pa.post_id END) as highly_voted_posts,
+    COUNT(DISTINCT CASE WHEN pa.popularity_level = 'Popular' THEN pa.post_id END) as popular_posts,
+    COUNT(DISTINCT CASE WHEN pa.comment_status = 'Has Comments' THEN pa.post_id END) as commented_posts,
+    COUNT(DISTINCT ub.user_id) as badge_collectors,
+    COUNT(DISTINCT CASE WHEN ub.badge_level = 'Enthusiast' THEN ub.user_id END) as badge_enthusiasts,
+    COUNT(DISTINCT CASE WHEN ta.tag_popularity = 'Highly Popular' THEN ta.TagName END) as highly_popular_tags,
+    'Aggregated Content Sentiment' as content_sentiment,
+    COUNT(DISTINCT t.TagName) as very_active_tags,
+    COUNT(DISTINCT CASE WHEN p.Score > 1000 THEN p.OwnerUserId END) as top_scorers,
+    COUNT(DISTINCT CASE WHEN p.ViewCount > 10000 THEN p.OwnerUserId END) as highly_viewed_authors,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as upvotes_count,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) as downvotes_count,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) as post_closures_count,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.Id END) as post_reopens_count,
+    COUNT(DISTINCT c.Id) as total_comments,
+    COUNT(DISTINCT b.Id) as total_badges,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as question_count,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answer_count,
+    COUNT(DISTINCT CASE WHEN p.ClosedDate IS NOT NULL THEN p.Id END) as closed_posts,
+    COUNT(DISTINCT CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN p.Id END) as community_owned_posts,
+    COUNT(DISTINCT ph.UserId) as unique_history_users,
+    COUNT(DISTINCT ph.PostId) as unique_history_posts,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.Id END) as duplicate_links,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.Id END) as regular_links,
+    COUNT(DISTINCT CASE WHEN u.Reputation > 100000 THEN u.Id END) as elite_users,
+    COUNT(DISTINCT CASE WHEN u.Views > 100000 THEN u.Id END) as highly_viewed_users,
+    COUNT(DISTINCT CASE WHEN u.UpVotes > 10000 THEN u.Id END) as highly_upvoted_users,
+    COUNT(DISTINCT CASE WHEN u.DownVotes > 10000 THEN u.Id END) as highly_downvoted_users,
+    CASE 
+        WHEN (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) * 1.0 / 
+              COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)) > 0.5 THEN 'High Acceptance Rate'
+        ELSE 'Low Acceptance Rate'
+    END as acceptance_rate_status,
+    COUNT(DISTINCT CASE WHEN p.Score < 0 THEN p.Id END) as negative_score_posts,
+    COUNT(DISTINCT CASE WHEN p.Score = 0 THEN p.Id END) as zero_score_posts,
+    COUNT(DISTINCT CASE WHEN p.FavoriteCount > 100 THEN p.Id END) as highly_favorited_posts,
+    MAX(pa.global_rank_by_score) as max_global_rank,
+    MIN(pa.global_rank_by_score) as min_global_rank,
+    AVG(pa.global_rank_by_score) as avg_global_rank,
+    COUNT(DISTINCT CASE WHEN pa.global_rank_by_score <= 100 THEN pa.post_id END) as top_100_posts,
+    COUNT(DISTINCT CASE WHEN pa.global_rank_by_score <= 1000 THEN pa.post_id END) as top_1000_posts,
+    COUNT(DISTINCT CASE WHEN pa.score_percentile > 0.8 THEN pa.post_id END) as percentile_high_scorers,
+    COUNT(DISTINCT CASE WHEN pa.score_percentile > 0.5 THEN pa.post_id END) as percentile_mid_scorers,
+    COUNT(DISTINCT CASE WHEN pa.score_percentile <= 0.2 THEN pa.post_id END) as percentile_low_scorers,
+    COUNT(DISTINCT CASE WHEN pa.days_since_last_activity > 30 THEN pa.post_id END) as inactive_posts,
+    COUNT(DISTINCT CASE WHEN pa.days_since_last_activity <= 7 THEN pa.post_id END) as very_active_posts,
+    COUNT(DISTINCT CASE WHEN pa.days_since_last_activity BETWEEN 8 AND 30 THEN pa.post_id END) as moderately_active_posts,
+    COUNT(DISTINCT CASE WHEN um.reputation_level = 'High Reputation' THEN um.Id END) as high_reputation_users,
+    COUNT(DISTINCT CASE WHEN um.reputation_level = 'Medium Reputation' THEN um.Id END) as medium_reputation_users,
+    COUNT(DISTINCT CASE WHEN um.reputation_level = 'Low Reputation' THEN um.Id END) as low_reputation_users,
+    COUNT(DISTINCT CASE WHEN um.user_experience_level = 'Veteran' THEN um.Id END) as veteran_users,
+    COUNT(DISTINCT CASE WHEN um.user_experience_level = 'Experienced' THEN um.Id END) as experienced_users,
+    COUNT(DISTINCT CASE WHEN um.user_experience_level = 'Active' THEN um.Id END) as active_users,
+    COUNT(DISTINCT CASE WHEN um.user_experience_level = 'New' THEN um.Id END) as new_users,
+    COUNT(DISTINCT CASE WHEN um.user_experience_level = 'Veteran' AND um.total_posts > 1000 THEN um.Id END) as top_veterans,
+    COUNT(DISTINCT CASE WHEN um.user_experience_level = 'Experienced' AND um.total_posts > 500 THEN um.Id END) as top_experienced,
+    COUNT(DISTINCT CASE WHEN um.user_experience_level = 'Active' AND um.total_posts > 100 THEN um.Id END) as top_active,
+    COUNT(DISTINCT CASE WHEN um.user_experience_level = 'New' AND um.total_posts < 10 THEN um.Id END) as top_new,
+    COUNT(DISTINCT CASE WHEN ub.badge_level = 'Collector' AND ub.total_badges > 100 THEN ub.user_id END) as top_collectors,
+    COUNT(DISTINCT CASE WHEN ub.badge_level = 'Enthusiast' AND ub.total_badges > 50 THEN ub.user_id END) as top_enthusiasts,
+    COUNT(DISTINCT CASE WHEN ub.badge_level = 'Regular' AND ub.total_badges > 25 THEN ub.user_id END) as top_regular,
+    COUNT(DISTINCT CASE WHEN ub.badge_level = 'Beginner' AND ub.total_badges < 10 THEN ub.user_id END) as top_beginners,
+    COUNT(DISTINCT CASE WHEN ph.CreationDate > DATEADD('day', -30, CURRENT_TIMESTAMP) THEN ph.Id END) as recent_history,
+    COUNT(DISTINCT CASE WHEN ph.CreationDate > DATEADD('month', -6, CURRENT_TIMESTAMP) THEN ph.Id END) as recent_history_last_6months,
+    COUNT(DISTINCT CASE WHEN ph.CreationDate > DATEADD('year', -1, CURRENT_TIMESTAMP) THEN ph.Id END) as recent_history_last_year,
+    COUNT(DISTINCT CASE WHEN c.CreationDate > DATEADD('day', -7, CURRENT_TIMESTAMP) THEN c.Id END) as recent_comments,
+    COUNT(DISTINCT CASE WHEN c.CreationDate > DATEADD('week', -4, CURRENT_TIMESTAMP) THEN c.Id END) as recent_comments_last_4weeks,
+    COUNT(DISTINCT CASE WHEN b.Date > DATEADD('day', -30, CURRENT_TIMESTAMP) THEN b.Id END) as recent_badges,
+    COUNT(DISTINCT CASE WHEN b.Date > DATEADD('month', -6, CURRENT_TIMESTAMP) THEN b.Id END) as recent_badges_last_6months,
+    COUNT(DISTINCT CASE WHEN b.Date > DATEADD('year', -1, CURRENT_TIMESTAMP) THEN b.Id END) as recent_badges_last_year,
+    COUNT(DISTINCT CASE WHEN p.CreationDate > DATEADD('day', -7, CURRENT_TIMESTAMP) THEN p.Id END) as recent_posts,
+    COUNT(DISTINCT CASE WHEN p.CreationDate > DATEADD('week', -4, CURRENT_TIMESTAMP) THEN p.Id END) as recent_posts_last_4weeks,
+    NULL as placeholder_column,
+    NULL as another_placeholder,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Score > 0 AND p.LastActivityDate > DATEADD('day', -1, CURRENT_TIMESTAMP) THEN p.Id END) as today_active_questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 AND p.LastActivityDate > DATEADD('day', -1, CURRENT_TIMESTAMP) THEN p.Id END) as today_active_answers,
+    COUNT(DISTINCT CASE WHEN u.LastAccessDate > DATEADD('hour', -1, CURRENT_TIMESTAMP) THEN u.Id END) as recently_active_users,
+    COUNT(DISTINCT CASE WHEN u.LastAccessDate > DATEADD('day', -1, CURRENT_TIMESTAMP) THEN u.Id END) as daily_active_users,
+    COUNT(DISTINCT CASE WHEN u.LastAccessDate > DATEADD('week', -1, CURRENT_TIMESTAMP) THEN u.Id END) as weekly_active_users,
+    COUNT(DISTINCT CASE WHEN u.LastAccessDate > DATEADD('month', -1, CURRENT_TIMESTAMP) THEN u.Id END) as monthly_active_users,
+    NULL as final_placeholder
+FROM 
+    PostAnalysis pa
+    FULL OUTER JOIN UserMetrics um ON TRUE
+    FULL OUTER JOIN UserBadges ub ON TRUE
+    FULL OUTER JOIN TagAnalysis ta ON TRUE
+    LEFT JOIN Posts p ON TRUE
+    LEFT JOIN Votes v ON TRUE
+    LEFT JOIN PostHistory ph ON TRUE
+    LEFT JOIN Comments c ON TRUE
+    LEFT JOIN Badges b ON TRUE
+    LEFT JOIN Users u ON TRUE
+    LEFT JOIN Tags t ON TRUE
+WHERE 
+    (pa.post_id IS NOT NULL OR um.Id IS NOT NULL OR ub.user_id IS NOT NULL OR ta.TagName IS NOT NULL)
+    AND (pa.post_id IS NOT NULL OR p.Id IS NOT NULL OR v.Id IS NOT NULL OR ph.Id IS NOT NULL OR c.Id IS NOT NULL OR b.Id IS NOT NULL OR u.Id IS NOT NULL OR t.TagName IS NOT NULL)
+GROUP BY 
+    'Aggregated'

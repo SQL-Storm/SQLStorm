@@ -1,0 +1,201 @@
+-- {"query": "1651.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3046} 
+
+WITH ActiveUserStats AS (
+    -- CTE 1: Aggregates user activity, including post and comment counts, reputation, and assigns a reputation quintile.
+    -- Filters for users with substantial activity and recent access.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(P.Score) AS TotalPostScore,
+        COALESCE(AVG(P.Score), 0) AS AvgPostScore,
+        COUNT(C.Id) AS TotalCommentsMade,
+        COALESCE(SUM(LENGTH(C.Text)), 0) AS TotalCommentChars,
+        MAX(U.LastAccessDate) AS UserLastActivity,
+        NTILE(5) OVER (ORDER BY U.Reputation DESC, COUNT(P.Id) DESC) AS ReputationQuintile
+    FROM Users AS U
+    INNER JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    WHERE U.Reputation >= 1000
+      AND U.LastAccessDate >= DATE_TRUNC('year', NOW()) - INTERVAL '1 year'
+      AND U.DisplayName IS NOT NULL
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes, U.LastAccessDate
+    HAVING COUNT(P.Id) > 10
+),
+PostDetailsRaw AS (
+    -- CTE 2: Extracts basic details for relevant posts (Questions and Answers),
+    -- including string operations on tags and checks for accepted answers.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        COALESCE(P.ViewCount, 0) AS ViewCount,
+        COALESCE(P.AnswerCount, 0) AS AnswerCount,
+        COALESCE(P.CommentCount, 0) AS PostCommentCount,
+        COALESCE(P.FavoriteCount, 0) AS PostFavoriteCount,
+        P.LastEditDate,
+        P.AcceptedAnswerId,
+        P.ClosedDate,
+        LENGTH(P.Body) AS BodyLength,
+        LENGTH(COALESCE(P.Title, '')) AS TitleLength,
+        REPLACE(REPLACE(REPLACE(LOWER(P.Tags), '<sql>', ''), '<database>', ''), '<performance>', '') AS CleanedTags,
+        -- Correlated subquery to count unique up-voters for a post
+        (SELECT COUNT(DISTINCT V.UserId) FROM Votes AS V WHERE V.PostId = P.Id AND V.VoteTypeId = 2) AS UniqueUpVoters
+    FROM Posts AS P
+    WHERE P.PostTypeId IN (1, 2) -- Questions or Answers
+      AND P.CreationDate >= DATE_TRUNC('year', NOW()) - INTERVAL '3 year'
+),
+PostEngagementMetrics AS (
+    -- CTE 3: Calculates various engagement metrics for posts, joining with comments and votes.
+    SELECT
+        PDR.PostId,
+        PDR.PostTypeId,
+        PDR.OwnerUserId,
+        PDR.PostCreationDate,
+        PDR.PostScore,
+        PDR.ViewCount,
+        PDR.AnswerCount,
+        PDR.PostCommentCount,
+        PDR.PostFavoriteCount,
+        PDR.AcceptedAnswerId,
+        PDR.ClosedDate,
+        PDR.BodyLength,
+        PDR.TitleLength,
+        PDR.CleanedTags,
+        PDR.UniqueUpVoters,
+        (CASE WHEN PDR.ViewCount > 0 THEN CAST(PDR.PostScore AS NUMERIC) / PDR.ViewCount ELSE 0 END) AS ScorePerViewRatio,
+        COALESCE(C_agg.AvgCommentLength, 0) AS AvgCommentLengthOnPost,
+        COALESCE(C_agg.DistinctCommenters, 0) AS DistinctCommentersOnPost,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesOnPost,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesOnPost
+    FROM PostDetailsRaw AS PDR
+    LEFT JOIN (
+        SELECT
+            C.PostId,
+            AVG(LENGTH(C.Text)) AS AvgCommentLength,
+            COUNT(DISTINCT C.UserId) AS DistinctCommenters
+        FROM Comments AS C
+        GROUP BY C.PostId
+    ) AS C_agg ON PDR.PostId = C_agg.PostId
+    LEFT JOIN Votes AS V ON PDR.PostId = V.PostId
+    GROUP BY
+        PDR.PostId, PDR.PostTypeId, PDR.OwnerUserId, PDR.PostCreationDate, PDR.PostScore, PDR.ViewCount, PDR.AnswerCount,
+        PDR.PostCommentCount, PDR.PostFavoriteCount, PDR.AcceptedAnswerId, PDR.ClosedDate, PDR.BodyLength,
+        PDR.TitleLength, PDR.CleanedTags, PDR.UniqueUpVoters, C_agg.AvgCommentLength, C_agg.DistinctCommenters
+),
+PostEditAnalysis AS (
+    -- CTE 4: Analyzes post history for edit activity and close events.
+    -- Filters for posts with multiple editors or significant edit count.
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditors,
+        MAX(PH.CreationDate) AS LastHistoryEditDate,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount, -- Edit Title, Body, Tags
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEventCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS LastCloseDate
+    FROM PostHistory AS PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13) -- Relevant history types for edits/status changes
+    GROUP BY PH.PostId
+    HAVING COUNT(DISTINCT PH.UserId) > 1 OR SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) > 2
+),
+HighPerformingPosts AS (
+    -- CTE 5: Identifies highly viewed questions with accepted answers and good engagement.
+    SELECT
+        PEM.PostId,
+        PEM.OwnerUserId,
+        'Question' AS PostTypeCategory,
+        PEM.PostScore,
+        PEM.ViewCount,
+        PEM.PostCommentCount,
+        PEM.AnswerCount,
+        PEM.ScorePerViewRatio,
+        PEM.CleanedTags,
+        COALESCE(PEA.EditCount, 0) AS EditActivityScore
+    FROM PostEngagementMetrics AS PEM
+    LEFT JOIN PostEditAnalysis AS PEA ON PEM.PostId = PEA.PostId
+    WHERE PEM.PostTypeId = 1 -- Question
+      AND PEM.ViewCount > 5000
+      AND PEM.AcceptedAnswerId IS NOT NULL
+      AND PEM.PostCommentCount >= 5
+      AND PEM.ScorePerViewRatio >= 0.005
+      AND PEM.CleanedTags LIKE '%java%'
+),
+InfluentialAnswers AS (
+    -- CTE 6: Identifies high-scoring answers to popular questions, posted by high-reputation users,
+    -- and excludes users with a specific badge ('Disciplined').
+    SELECT
+        PEM.PostId,
+        PEM.OwnerUserId,
+        'Answer' AS PostTypeCategory,
+        PEM.PostScore,
+        -- Correlated subquery to get parent question's view count
+        (SELECT PQ.ViewCount FROM Posts AS PQ WHERE PQ.Id = P_ans.ParentId) AS ParentQuestionViewCount,
+        PEM.PostCommentCount,
+        -- Correlated subquery to get parent question's answer count
+        (SELECT PQ.AnswerCount FROM Posts AS PQ WHERE PQ.Id = P_ans.ParentId) AS ParentQuestionAnswerCount,
+        PEM.ScorePerViewRatio,
+        PEM.CleanedTags, -- Will be NULL for answers, but kept for UNION ALL compatibility
+        COALESCE(PEA.EditCount, 0) AS EditActivityScore
+    FROM PostEngagementMetrics AS PEM
+    INNER JOIN Posts AS P_ans ON PEM.PostId = P_ans.Id AND P_ans.PostTypeId = 2 -- Ensure it's an answer
+    LEFT JOIN PostEditAnalysis AS PEA ON PEM.PostId = PEA.PostId
+    WHERE PEM.PostTypeId = 2 -- Answer
+      AND PEM.PostScore > 50
+      AND (SELECT PQ.AnswerCount FROM Posts AS PQ WHERE PQ.Id = P_ans.ParentId) > 10 -- Parent question has many answers
+      AND PEM.OwnerUserId IN (SELECT AUS.UserId FROM ActiveUserStats AS AUS WHERE AUS.Reputation > 10000) -- Owner is a high-reputation active user
+      -- Correlated subquery using NOT EXISTS for badge exclusion
+      AND NOT EXISTS (SELECT 1 FROM Badges AS B WHERE B.UserId = PEM.OwnerUserId AND B.Name = 'Disciplined')
+)
+-- Main Query: Joins user statistics with the combined set of high-performing posts and answers.
+-- Applies window functions for ranking and average calculations, and includes complex conditional logic.
+SELECT
+    AUS.DisplayName,
+    AUS.Reputation,
+    AUS.ReputationQuintile,
+    CombinedPosts.PostId,
+    CombinedPosts.PostTypeCategory,
+    CombinedPosts.PostScore,
+    CombinedPosts.ViewCount,
+    CombinedPosts.PostCommentCount,
+    CombinedPosts.AnswerCount, -- Represents Post.AnswerCount for questions, ParentQuestionAnswerCount for answers
+    CombinedPosts.ScorePerViewRatio,
+    COALESCE(CombinedPosts.CleanedTags, 'no_tags') AS ProcessedTags, -- NULL logic for tags
+    CombinedPosts.EditActivityScore,
+    -- Window function: Average post score within the user's reputation quintile
+    AVG(CombinedPosts.PostScore) OVER (PARTITION BY AUS.ReputationQuintile) AS AvgScoreInReputationQuintile,
+    -- Window function: Rank posts within their category by score and view count
+    RANK() OVER (PARTITION BY CombinedPosts.PostTypeCategory ORDER BY CombinedPosts.PostScore DESC, CombinedPosts.ViewCount DESC) AS RankWithinCategory,
+    -- Window function: Calculate a user's total engagement score based on their posts
+    SUM(CombinedPosts.PostScore + CombinedPosts.EditActivityScore * 5 + CombinedPosts.PostCommentCount * 2)
+        OVER (PARTITION BY AUS.UserId ORDER BY CombinedPosts.PostCreationDate DESC) AS UserCumulativeEngagementScore,
+    -- Complex CASE expression for post status classification
+    CASE
+        WHEN CombinedPosts.PostTypeCategory = 'Question' AND CombinedPosts.AnswerCount > 0 THEN 'Answered Question'
+        WHEN CombinedPosts.PostTypeCategory = 'Question' AND CombinedPosts.AnswerCount = 0 THEN 'Unanswered Question'
+        WHEN CombinedPosts.PostTypeCategory = 'Answer' THEN 'Provided Answer'
+        ELSE 'Uncategorized'
+    END AS PostStatusClassifier,
+    -- Correlated subquery to count gold badges for each user
+    (SELECT COUNT(DISTINCT B.Name) FROM Badges AS B WHERE B.UserId = AUS.UserId AND B.Class = 1) AS GoldBadgeCount
+FROM ActiveUserStats AS AUS
+INNER JOIN (
+    -- Set operator: UNION ALL combines high-performing questions and influential answers
+    SELECT PostId, OwnerUserId, PostTypeCategory, PostScore, ViewCount, PostCommentCount, AnswerCount, ScorePerViewRatio, CleanedTags, EditActivityScore, PostCreationDate
+    FROM HighPerformingPosts
+    UNION ALL
+    SELECT PostId, OwnerUserId, PostTypeCategory, PostScore, ParentQuestionViewCount AS ViewCount, PostCommentCount, ParentQuestionAnswerCount AS AnswerCount, ScorePerViewRatio, CleanedTags, EditActivityScore, (SELECT P.CreationDate FROM Posts P WHERE P.Id = PostId) AS PostCreationDate -- Add PostCreationDate for window function
+    FROM InfluentialAnswers
+) AS CombinedPosts ON AUS.UserId = CombinedPosts.OwnerUserId
+WHERE AUS.TotalPosts > 20 -- Further filter active users
+  AND COALESCE(CombinedPosts.CleanedTags, '') LIKE '%python%' -- String expression with NULL logic
+  -- Correlated subquery: Filter posts with score above the average for their post type
+  AND CombinedPosts.PostScore > (SELECT AVG(PEM.PostScore) FROM PostEngagementMetrics AS PEM WHERE PEM.PostTypeId = (CASE WHEN CombinedPosts.PostTypeCategory = 'Question' THEN 1 ELSE 2 END))
+ORDER BY AUS.Reputation DESC, UserCumulativeEngagementScore DESC, RankWithinCategory ASC
+LIMIT 1000;

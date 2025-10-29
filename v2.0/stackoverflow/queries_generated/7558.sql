@@ -1,0 +1,151 @@
+-- {"query": "7558.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1749} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT CASE WHEN p.CreationDate >= DATEADD(YEAR, -1, GETDATE()) THEN p.Id END) AS RecentPosts,
+        AVG(p.Score) AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LEN(p.Tags)-2), ', ') AS AllTags,
+        CASE WHEN COUNT(DISTINCT p.Id) = 0 THEN 0 ELSE 
+            CAST(COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) AS FLOAT) * 100 / COUNT(DISTINCT p.Id) END AS PositiveScorePercentage
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATEADD(YEAR, -5, GETDATE())
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        RANK() OVER (ORDER BY Reputation DESC, TotalPosts DESC) AS UserRank,
+        NTILE(10) OVER (ORDER BY Reputation DESC) AS ReputationDecile,
+        DENSE_RANK() OVER (ORDER BY Views DESC) AS ViewRank,
+        ROW_NUMBER() OVER (ORDER BY LastPostDate DESC) AS RecentActivityRank
+    FROM UserActivityStats
+),
+TopQuestionAuthors AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        STRING_AGG(DISTINCT p.Title, '; ') AS SampleQuestions,
+        STRING_AGG(DISTINCT p.Tags, '; ') AS SampleTags
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= DATEADD(MONTH, -6, GETDATE())
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(p.Id) >= 5
+),
+ComplexQuery AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.Views,
+        ru.TotalPosts,
+        ru.Questions,
+        ru.Answers,
+        ru.Comments,
+        ru.Badges,
+        ru.UserRank,
+        ru.ReputationDecile,
+        ru.ViewRank,
+        ru.RecentActivityRank,
+        ru.LastPostDate,
+        ru.AvgPostScore,
+        ru.AllTags,
+        ru.PositiveScorePercentage,
+        CASE 
+            WHEN ru.TotalPosts > 100 AND ru.Reputation > 10000 THEN 'Elite'
+            WHEN ru.TotalPosts > 50 AND ru.Reputation > 5000 THEN 'Veteran'
+            WHEN ru.TotalPosts > 10 AND ru.Reputation > 500 THEN 'Active'
+            ELSE 'Regular'
+        END AS UserTier,
+        COALESCE(tqa.QuestionCount, 0) AS TopQuestionCount,
+        tqa.AvgQuestionScore,
+        CASE WHEN tqa.QuestionCount IS NOT NULL THEN 1 ELSE 0 END AS IsTopQuestionAuthor,
+        CASE 
+            WHEN ru.Comments > 0 AND ru.Badges > 0 AND ru.TotalPosts > 0 THEN 
+                (ru.Comments + ru.Badges) * 100.0 / NULLIF(ru.TotalPosts, 0)
+            ELSE 0 
+        END AS EngagementRate,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = ru.UserId AND p2.Score > 0 AND p2.PostTypeId = 1) AS PositiveQuestions,
+        NULLIF(ru.AvgPostScore, 0) AS ScoreAdjustedForNull,
+        DATEDIFF(DAY, ru.LastPostDate, GETDATE()) AS DaysSinceLastPost,
+        CASE 
+            WHEN DATEDIFF(DAY, ru.LastPostDate, GETDATE()) > 365 THEN 'Inactive'
+            WHEN DATEDIFF(DAY, ru.LastPostDate, GETDATE()) > 90 THEN 'Low Activity'
+            WHEN DATEDIFF(DAY, ru.LastPostDate, GETDATE()) > 30 THEN 'Medium Activity'
+            ELSE 'High Activity'
+        END AS ActivityStatus,
+        LAG(ru.Reputation, 1, 0) OVER (ORDER BY ru.Reputation DESC) - ru.Reputation AS ReputationDifferenceFromNext,
+        NTILE(4) OVER (ORDER BY ru.Reputation) AS ReputationQuartile,
+        COUNT(*) OVER () AS TotalUsersCount
+    FROM RankedUsers ru
+    LEFT JOIN TopQuestionAuthors tqa ON ru.UserId = tqa.OwnerUserId
+    WHERE ru.Reputation > 100 
+)
+SELECT 
+    *,
+    CASE 
+        WHEN UserTier = 'Elite' AND EngagementRate > 20 THEN 'Highly Engaged Elite'
+        WHEN UserTier = 'Veteran' AND EngagementRate > 15 THEN 'Highly Engaged Veteran'
+        WHEN UserTier IN ('Active', 'Regular') AND EngagementRate > 10 THEN 'Engaged User'
+        WHEN ActivityStatus = 'Inactive' THEN 'Inactive User'
+        ELSE 'Normal User'
+    END AS UserEngagementClassification,
+    CASE 
+        WHEN PositiveQuestions > 0 AND PositiveScorePercentage > 60 THEN 'High Quality Contributor'
+        WHEN PositiveQuestions > 0 AND PositiveScorePercentage > 40 THEN 'Moderate Quality Contributor'
+        WHEN PositiveQuestions = 0 THEN 'No Positive Content'
+        ELSE 'Low Quality Contributor'
+    END AS ContributionQuality,
+    CASE 
+        WHEN ReputationDifferenceFromNext > 0 THEN 'Rising Star'
+        WHEN ReputationDifferenceFromNext < 0 THEN 'Declining'
+        ELSE 'Stable'
+    END AS CareerStatus,
+    REPLICATE('★', ReputationDecile) AS ReputationStars,
+    ROUND(100.0 * (UserRank - 1) / (TotalUsersCount - 1), 2) AS PercentileRank,
+    CASE 
+        WHEN PositiveScorePercentage BETWEEN 70 AND 100 THEN 'Very High'
+        WHEN PositiveScorePercentage BETWEEN 50 AND 69 THEN 'High'
+        WHEN PositiveScorePercentage BETWEEN 30 AND 49 THEN 'Moderate'
+        WHEN PositiveScorePercentage BETWEEN 10 AND 29 THEN 'Low'
+        ELSE 'Very Low'
+    END AS PositiveScoreLevel,
+    CASE 
+        WHEN UserRank <= 100 THEN 'Top 100'
+        WHEN UserRank <= 500 THEN 'Top 500'
+        WHEN UserRank <= 1000 THEN 'Top 1000'
+        ELSE 'Below Top 1000'
+    END AS RankCategory,
+    ABS(Reputation - AVG(Reputation) OVER()) AS ReputationDeviation,
+    ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalPosts DESC) AS GlobalRank,
+    CASE 
+        WHEN Views > 10000 AND Reputation > 5000 THEN 'Popular Active Contributor'
+        WHEN Views > 1000 AND Reputation > 1000 THEN 'Well Known Contributor'
+        WHEN Views > 100 AND Reputation > 500 THEN 'Known Contributor'
+        ELSE 'Local Contributor'
+    END AS InfluenceLevel
+FROM ComplexQuery
+WHERE IsTopQuestionAuthor = 1 
+   OR (UserTier IN ('Elite', 'Veteran') AND EngagementRate > 15)
+   OR (Reputation > 10000 AND TotalPosts > 100)
+ORDER BY 
+    Reputation DESC,
+    TotalPosts DESC,
+    PositiveScorePercentage DESC,
+    RecentActivityRank ASC
+OFFSET 0 ROWS
+FETCH NEXT 1000 ROWS ONLY;

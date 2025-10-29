@@ -1,0 +1,28 @@
+-- {"query": "1441.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 305} 
+WITH PopularTags AS (
+    SELECT
+        T.TagName,
+        T.Id AS TagId,
+        COUNT(P.Id) AS PostCount
+    FROM Tags T
+    JOIN Posts P ON P.Tags IS NOT NULL AND EXISTS (
+        SELECT 1
+        FROM UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><')) AS PostTag
+        WHERE PostTag = T.TagName
+    )
+    WHERE P.PostTypeId = 1 -- Only questions contribute to tag popularity
+      AND P.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 year') -- Filter for recent activity
+    GROUP BY T.TagName, T.Id
+    HAVING COUNT(P.Id) > 750 -- Higher threshold for popularity
+),
+ExpertUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        COUNT(DISTINCT P_Ans.Id) AS AnswerCount,
+        COUNT(

@@ -1,0 +1,116 @@
+-- {"query": "5282.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 782} 
+WITH
+RecentQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_owner
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+),
+TagStats AS (
+  SELECT
+    unnest(string_to_array(substr(t.Tags, 2, length(t.Tags)-2), '><')) AS TagName,
+    COUNT(*) AS TagCount
+  FROM Posts t
+  WHERE t.PostTypeId = 1
+  GROUP BY 1
+),
+ActiveTagWikis AS (
+  SELECT
+    tg.TagName,
+    tg.TagCount,
+    r.OwnerUserId,
+    r.OwnerDisplayName,
+    r.CreationDate AS QuestionCreated
+  FROM TagStats tg
+  JOIN LATERAL (
+    SELECT p.OwnerUserId, p.OwnerDisplayName, p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 5 -- TagWiki
+      AND p.Tags ILIKE '%' || tg.TagName || '%'
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+  ) r ON true
+),
+CrossLink AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.OwnerUserId,
+    q.OwnerDisplayName,
+    COALESCE(v1.CountVotes, 0) AS Upvotes,
+    COALESCE(v2.CountVotes, 0) AS Downvotes
+  FROM RecentQuestions q
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CountVotes
+    FROM Votes
+    WHERE VoteTypeId = 2
+    GROUP BY PostId
+  ) v1 ON v1.PostId = q.PostId
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CountVotes
+    FROM Votes
+    WHERE VoteTypeId = 3
+    GROUP BY PostId
+  ) v2 ON v2.PostId = q.PostId
+),
+Windowed AS (
+  SELECT
+    PostId,
+    Title,
+    Tags,
+    CreationDate,
+    ViewCount,
+    Upvotes,
+    Downvotes,
+    OwnerUserId,
+    OwnerDisplayName,
+    ROW_NUMBER() OVER (
+      PARTITION BY OwnerUserId
+      ORDER BY CreationDate DESC
+    ) AS rn_by_owner
+  FROM CrossLink
+)
+SELECT
+  w.PostId,
+  w.Title,
+  w.Tags,
+  w.CreationDate,
+  w.ViewCount,
+  w.Upvotes,
+  w.Downvotes,
+  u.Id AS UserId,
+  u.DisplayName AS UserDisplayName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  u.LastAccessDate,
+  u.Location,
+  u.AboutMe,
+  u.Views,
+  u.UpVotes,
+  u.DownVotes,
+  u.ProfileImageUrl,
+  u.WebsiteUrl,
+  u.EmailHash,
+  u.AccountId,
+  COALESCE(a.TagName, NULL) AS MostDiscussedTag,
+  COALESCE(a.TagCount, 0) AS TagPopularity
+FROM Windowed w
+LEFT JOIN Users u ON w.OwnerUserId = u.Id
+LEFT JOIN ActiveTagWikis a ON TRUE
+WHERE w.rn_by_owner = 1
+ORDER BY w.Upvotes - w.Downvotes DESC, w.ViewCount DESC
+LIMIT 100;

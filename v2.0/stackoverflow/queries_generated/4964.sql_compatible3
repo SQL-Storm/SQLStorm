@@ -1,0 +1,149 @@
+WITH
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS AnswerCount,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      COUNT(DISTINCT v.Id) FILTER (WHERE vt.Name = 'UpMod') AS UpVoteCount,
+      COUNT(DISTINCT v.Id) FILTER (WHERE vt.Name = 'DownMod') AS DownVoteCount,
+      MAX(p.CreationDate) AS LastPostDate,
+      CAST(EXTRACT(EPOCH FROM (MAX(p.CreationDate) - MIN(p.CreationDate))) / 86400 AS INTEGER) AS PostActivitySpanDays
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments AS c
+      ON u.Id = c.UserId AND p.Id = c.PostId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId AND p.Id = v.PostId
+    LEFT JOIN VoteTypes AS vt
+      ON v.VoteTypeId = vt.Id
+    WHERE
+      u.Id > 0
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  ),
+  PostQuality AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      CASE
+        WHEN p.PostTypeId = 1 THEN COALESCE(p.Score, 0) + COALESCE(p.AnswerCount, 0) * 5 + COALESCE(p.FavoriteCount, 0) * 10
+        WHEN p.PostTypeId = 2 THEN COALESCE(p.Score, 0) + COALESCE(p.CommentCount, 0)
+        ELSE COALESCE(p.Score, 0)
+      END AS CalculatedQualityScore,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+      END AS PostStatus,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRankByUser
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId IN (1, 2)
+  ),
+  TagPopularity AS (
+    SELECT
+      t.TagName,
+      t.Count AS TagUsageCount,
+      COALESCE(tp.Score, 0) AS TagPostScore,
+      COALESCE(tq.AnswerCount, 0) AS TagQuestionCount,
+      (t.Count::numeric / NULLIF((SELECT MAX("Count") FROM Tags),0)) * 100 AS RelativeTagPopularity
+    FROM Tags AS t
+    LEFT JOIN (
+      SELECT
+        Tag,
+        SUM(p.Score) AS Score,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+      FROM Posts AS p
+      INNER JOIN (
+        SELECT DISTINCT
+          Id AS PostId,
+          OwnerUserId,
+          TRIM(regexp_split_to_table(REPLACE(REPLACE(Tags, '<', ''), '>', ''), ' ')) AS Tag
+        FROM Posts
+        WHERE
+          PostTypeId = 1 AND Tags IS NOT NULL
+      ) AS pt
+        ON p.Id = pt.PostId
+      GROUP BY
+        Tag
+    ) AS tp
+      ON t.TagName = tp.Tag
+    LEFT JOIN (
+      SELECT
+        Tag,
+        COUNT(*) AS AnswerCount
+      FROM (
+        SELECT
+          TRIM(regexp_split_to_table(REPLACE(REPLACE(Tags, '<', ''), '>', ''), ' ')) AS Tag
+        FROM Posts
+        WHERE
+          PostTypeId = 1 AND Tags IS NOT NULL
+      ) sub
+      GROUP BY Tag
+    ) AS tq
+      ON t.TagName = tq.Tag
+  )
+SELECT
+  ua.DisplayName,
+  ua.Reputation,
+  ua.TotalPosts,
+  ua.QuestionCount,
+  ua.AnswerCount,
+  ua.CommentCount,
+  ua.UpVoteCount,
+  ua.DownVoteCount,
+  ua.PostActivitySpanDays,
+  pq.PostId,
+  pq.CalculatedQualityScore,
+  pq.PostStatus,
+  tp.TagName,
+  tp.TagUsageCount,
+  tp.RelativeTagPopularity,
+  CASE
+    WHEN ua.Reputation > 100000 THEN 'Legendary'
+    WHEN ua.Reputation BETWEEN 50000 AND 100000 THEN 'Expert'
+    WHEN ua.Reputation BETWEEN 10000 AND 50000 THEN 'Advanced'
+    WHEN ua.Reputation BETWEEN 1000 AND 10000 THEN 'Intermediate'
+    ELSE 'Beginner'
+  END AS ReputationLevel,
+  ua.LastPostDate AS LastActivityOrAccess,
+  CASE
+    WHEN pg.TagName IS NOT NULL THEN 'Tag Qualified'
+    ELSE 'Not Tag Qualified'
+  END AS TagQualificationStatus
+FROM UserActivity AS ua
+LEFT JOIN PostQuality AS pq
+  ON ua.UserId = pq.OwnerUserId AND pq.PostRankByUser <= 5
+LEFT JOIN TagPopularity AS tp
+  ON LOWER(tp.TagName) = LOWER(SUBSTRING(ua.DisplayName FROM 1 FOR COALESCE(NULLIF(POSITION(' ' IN ua.DisplayName),0)-1, CHAR_LENGTH(ua.DisplayName))))
+LEFT JOIN (
+  SELECT
+    t.TagName
+  FROM Tags AS t
+  WHERE
+    t.IsModeratorOnly = FALSE AND t.Count > 1000
+  GROUP BY t.TagName
+) AS pg
+  ON LOWER(tp.TagName) = LOWER(pg.TagName)
+WHERE
+  ua.TotalPosts > 10
+  AND ua.PostActivitySpanDays > 0
+  AND ua.UpVoteCount > ua.DownVoteCount * 2
+  AND (pq.CalculatedQualityScore > 50 OR pq.PostStatus = 'Closed')
+ORDER BY
+  ua.Reputation DESC,
+  pq.CalculatedQualityScore DESC,
+  tp.TagUsageCount DESC;

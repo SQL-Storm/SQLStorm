@@ -1,0 +1,150 @@
+-- {"query": "3672.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1749} 
+
+/*  Benchmark query: complex analytics across Users, Posts, Badges, Votes, Tags, and PostHistory   */
+WITH 
+-- 1. Recent activity per user (last activity date across posts, comments, votes)
+user_last_activity AS (
+    SELECT 
+        u.Id                                           AS user_id,
+        GREATEST(
+            MAX(p.LastActivityDate)                    AS post_activity,
+            MAX(c.CreationDate)                        AS comment_activity,
+            MAX(v.CreationDate)                        AS vote_activity
+        )                                             AS last_activity
+    FROM Users u
+    LEFT JOIN Posts p      ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c   ON c.UserId = u.Id
+    LEFT JOIN Votes v      ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+
+-- 2. Aggregate badge counts per user, flagging gold badge existence
+user_badge_stats AS (
+    SELECT 
+        b.UserId                                     AS user_id,
+        COUNT(*)                                     AS total_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 1) AS gold_badge_names
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- 3. Questions authored by users with parsing of tags and ranking of top tags per user
+user_question_tags AS (
+    SELECT 
+        p.OwnerUserId                                           AS user_id,
+        LOWER(TRIM(t.tag))                                      AS tag,
+        COUNT(*)                                                AS tag_usage,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY COUNT(*) DESC)            AS tag_rank
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(
+            REGEXP_REPLACE(p.Tags, '[<>]', '', 'g'), ','
+        )) AS tag
+    ) t
+    WHERE p.PostTypeId = 1            -- only questions
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, LOWER(TRIM(t.tag))
+),
+
+-- 4. Latest 5 posts per user (questions & answers) with window functions
+user_recent_posts AS (
+    SELECT 
+        p.OwnerUserId                                           AS user_id,
+        p.Id                                                    AS post_id,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY p.CreationDate DESC)     AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+
+-- 5. Vote distribution per post (pivoted into columns)
+post_vote_distribution AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS down_votes,
+        SUM(CASE WHEN vt.Id = 5 THEN 1 ELSE 0 END) AS favorite_votes,
+        SUM(CASE WHEN vt.Id = 12 THEN 1 ELSE 0 END) AS spam_votes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+
+-- 6. Users with at least one gold badge (set A) and users without any gold badge (set B)
+gold_users AS (
+    SELECT ub.user_id
+    FROM user_badge_stats ub
+    WHERE ub.gold_badges > 0
+),
+non_gold_users AS (
+    SELECT u.Id AS user_id
+    FROM Users u
+    LEFT JOIN user_badge_stats ub ON ub.user_id = u.Id
+    WHERE COALESCE(ub.gold_badges, 0) = 0
+),
+
+-- 7. Combined user list (union of both sets) with a flag indicating gold status
+combined_users AS (
+    SELECT user_id, 1 AS has_gold
+    FROM gold_users
+    UNION ALL
+    SELECT user_id, 0 AS has_gold
+    FROM non_gold_users
+)
+
+SELECT 
+    cu.user_id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(u.Location, 'Unknown')                           AS location,
+    lau.last_activity,
+    COALESCE(ubs.total_badges, 0)                             AS total_badges,
+    COALESCE(ubs.gold_badges, 0)                              AS gold_badges,
+    ubs.gold_badge_names,
+    CASE 
+        WHEN cu.has_gold = 1 THEN 'Gold Holder'
+        ELSE 'No Gold'
+    END                                                      AS gold_status,
+    /* Top 3 tags per user */
+    STRING_AGG(CASE WHEN uqt.tag_rank <= 3 THEN uqt.tag END, ', ') 
+        FILTER (WHERE uqt.tag_rank <= 3)                    AS top_tags,
+    /* Average question score (null‑safe) */
+    ROUND(AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END)::numeric, 2) 
+        AS avg_question_score,
+    /* Total answers posted */
+    COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END)             AS answer_count,
+    /* Latest 5 post titles (concatenated) */
+    STRING_AGG(rp.Title, ' | ') 
+        FILTER (WHERE rp.rn <= 5)                           AS recent_post_titles,
+    /* Vote aggregates across recent posts */
+    SUM(pvd.up_votes)                                        AS recent_up_votes,
+    SUM(pvd.down_votes)                                      AS recent_down_votes,
+    SUM(pvd.favorite_votes)                                  AS recent_fav_votes,
+    SUM(pvd.spam_votes)                                      AS recent_spam_votes
+FROM combined_users cu
+JOIN Users u               ON u.Id = cu.user_id
+LEFT JOIN user_last_activity lau   ON lau.user_id = u.Id
+LEFT JOIN user_badge_stats ubs     ON ubs.user_id = u.Id
+LEFT JOIN user_question_tags uqt  ON uqt.user_id = u.Id
+LEFT JOIN Posts p                 ON p.OwnerUserId = u.Id
+LEFT JOIN user_recent_posts rp    ON rp.user_id = u.Id
+LEFT JOIN post_vote_distribution pvd ON pvd.PostId = rp.post_id
+WHERE
+    /* Complex predicate mixing NULL logic and date calculations */
+    (lau.last_activity IS NOT NULL 
+        AND lau.last_activity > DATE_TRUNC('year', CURRENT_DATE) - INTERVAL '2 years')
+    OR cu.has_gold = 1
+GROUP BY 
+    cu.user_id, u.DisplayName, u.Reputation, u.Location,
+    lau.last_activity, ubs.total_badges, ubs.gold_badges, ubs.gold_badge_names,
+    cu.has_gold
+ORDER BY 
+    u.Reputation DESC,
+    recent_up_votes DESC
+LIMIT 50;

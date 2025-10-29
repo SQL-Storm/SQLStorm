@@ -1,0 +1,80 @@
+-- {"query": "5507.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 620} 
+WITH top_users AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+  WHERE u.Reputation > 1000
+),
+recent_activities AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    COALESCE(vt.Name, 'Unknown') AS VoteTypeName,
+    v.CreationDate AS VoteDate,
+    v.BountyAmount
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  WHERE p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+tagged_activity AS (
+  SELECT
+    ra.PostId,
+    ra.Title,
+    unnest(string_to_array(substring(ra.Tags, 2, length(ra.Tags)-2), '><')) AS tag,
+    ra.CreationDate,
+    ra.Score,
+    ra.ViewCount
+  FROM recent_activities ra
+  WHERE ra.Tags IS NOT NULL AND ra.Tags <> ''
+),
+complex_calc AS (
+  SELECT
+    ta.PostId,
+    ta.Title,
+    ta.tag,
+    ta.CreationDate,
+    ta.Score,
+    ta.ViewCount,
+    (ta.Score * 2 + COALESCE(vt2.Name, 'Unknown')::text) AS score_factor,
+    CASE
+      WHEN ta.ViewCount > 1000 THEN 'high-views'
+      WHEN ta.ViewCount BETWEEN 100 AND 1000 THEN 'mid-views'
+      ELSE 'low-views'
+    END AS view_bucket,
+    ROW_NUMBER() OVER (PARTITION BY ta.tag ORDER BY ta.Score DESC, ta.CreationDate DESC) AS tag_rank
+  FROM tagged_activity ta
+  LEFT JOIN Votes v ON v.PostId = ta.PostId
+  LEFT JOIN VoteTypes vt2 ON vt2.Id = v.VoteTypeId
+)
+SELECT
+  hu.Id AS user_id,
+  hu.DisplayName AS user_name,
+  hu.Reputation,
+  hu.AccountId,
+  hu.rn AS user_rank,
+  ca.PostId,
+  ca.Title AS post_title,
+  ca.tag AS post_tag,
+  ca.CreationDate AS post_creation,
+  ca.Score AS post_score,
+  ca.ViewCount AS post_views,
+  ca.score_factor,
+  ca.view_bucket,
+  ca.tag_rank
+FROM top_users hu
+JOIN recent_activities ra ON ra.OwnerUserId = hu.Id
+JOIN complex_calc ca ON ca.PostId = ra.PostId
+WHERE hu.rn <= 100
+ORDER BY hu.Reputation DESC, ca.post_score DESC, ca.post_views DESC
+LIMIT 100;

@@ -1,0 +1,376 @@
+with
+params as (
+  select
+    365 as lookback_days,
+    cast(0.05 as numeric) as heavy_editor_pct,
+    10 as min_answers_for_question
+),
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl,
+    date_trunc('day', u.lastaccessdate) as lastaccess_utc,
+    count(*) filter (where p.owneruserid = u.id) as authored_posts,
+    sum(coalesce(p.score,0)) filter (where p.owneruserid = u.id) as total_post_score,
+    count(distinct b.id) as badges_count,
+    count(distinct t.tagname) as distinct_tag_wiki_owned
+  from users u
+  left join posts p on p.owneruserid = u.id
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 day' * (select lookback_days from params)
+  left join badges b on b.userid = u.id
+    and b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 day' * (select lookback_days from params)
+  left join tags t on t.wikipostid in (
+      select id from posts wp where wp.owneruserid = u.id
+    )
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.websiteurl, u.lastaccessdate
+),
+q as (
+  select
+    p.id as question_id,
+    p.owneruserid as asker_id,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.favoritecount,
+    p.answercount,
+    p.tags,
+    p.title,
+    (select count(*) from comments c where c.postid = p.id) as comment_count,
+    exists (select 1 from posthistory ph where ph.postid = p.id and ph.posthistorytypeid = 10) as has_close_votes_event,
+    (p.closeddate is not null) as is_closed,
+    coalesce(p.acceptedanswerid, -1) as accepted_answer_id
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 day' * (select lookback_days from params)
+),
+a as (
+  select
+    p.id as answer_id,
+    p.parentid as question_id,
+    p.owneruserid as answerer_id,
+    p.creationdate,
+    p.score,
+    p.commentcount,
+    (p.id = q.accepted_answer_id) as is_accepted
+  from posts p
+  join q on q.question_id = p.parentid
+  where p.posttypeid = 2
+),
+vote_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_amount
+  from votes v
+  where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 day' * (select lookback_days from params)
+  group by v.postid
+),
+q_tags as (
+  select
+    q.question_id,
+    lower(trim(t)) as tag
+  from q
+  cross join lateral (
+    select unnest(string_to_array(substring(coalesce(q.tags,'') from 2 for greatest(length(coalesce(q.tags,'')) - 2, 0)), '><')) as t
+  ) as ut
+),
+edit_events as (
+  select
+    ph.postid,
+    ph.userid as editor_id,
+    count(*) as edit_events,
+    min(ph.creationdate) as first_edit,
+    max(ph.creationdate) as last_edit
+  from posthistory ph
+  where ph.posthistorytypeid in (4,5,6,7,8,9,24)
+    and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 day' * (select lookback_days from params)
+  group by ph.postid, ph.userid
+),
+post_edit_density as (
+  select
+    ph.postid,
+    count(*) as total_edits,
+    count(distinct ph.userid) as distinct_editors
+  from posthistory ph
+  where ph.posthistorytypeid in (4,5,6,7,8,9,24)
+    and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 day' * (select lookback_days from params)
+  group by ph.postid
+),
+heavy_edit_posts as (
+  select
+    ped.postid,
+    ped.total_edits,
+    ped.distinct_editors,
+    (ped.total_edits >= greatest(3, ceil((select heavy_editor_pct from params) * coalesce(q.answercount, 0) + 0.5))) as heavily_edited
+  from post_edit_density ped
+  left join q on q.question_id = ped.postid
+),
+closed_reasons as (
+  select
+    ph.postid as question_id,
+    max(case when ph.posthistorytypeid = 10 then cast(ph.comment as integer) end) as last_close_reason_id,
+    max(case when ph.posthistorytypeid = 10 then ph.creationdate end) as last_close_event
+  from posthistory ph
+  where ph.posthistorytypeid = 10
+    and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 day' * (select lookback_days from params)
+  group by ph.postid
+),
+q_links as (
+  select
+    pl.postid as question_id,
+    sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_count,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_of_count,
+    count(*) as total_links
+  from postlinks pl
+  join q on q.question_id = pl.postid
+  group by pl.postid
+),
+answer_times as (
+  select
+    a.question_id,
+    min(a.creationdate) as first_answer_time,
+    max(a.creationdate) as last_answer_time,
+    sum(case when a.is_accepted then 1 else 0 end) as accepted_answers,
+    count(*) as answers_total,
+    sum(case when a.score > 0 then 1 else 0 end) as pos_answers
+  from a
+  group by a.question_id
+),
+user_answer_stats as (
+  select
+    a.answerer_id as user_id,
+    count(*) as answers_written,
+    sum(case when a.is_accepted then 1 else 0 end) as answers_accepted,
+    avg(cast(a.score as numeric)) as avg_answer_score,
+    min(a.creationdate) as first_answer_date,
+    max(a.creationdate) as last_answer_date
+  from a
+  group by a.answerer_id
+),
+user_answer_rank as (
+  select
+    uas.user_id,
+    uas.answers_written,
+    uas.answers_accepted,
+    uas.avg_answer_score,
+    uas.first_answer_date,
+    uas.last_answer_date,
+    rank() over (order by answers_written desc, answers_accepted desc, avg_answer_score desc) as rank_global,
+    dense_rank() over (order by answers_accepted desc) as rank_by_accepts,
+    percent_rank() over (order by answers_written) as pr_answers_written
+  from user_answer_stats uas
+),
+tag_activity as (
+  select
+    qt.tag,
+    count(distinct qt.question_id) as questions_tagged,
+    sum(coalesce(q.viewcount,0)) as total_views,
+    sum(coalesce(q.score,0)) as total_score,
+    avg(nullif(q.answercount,0)) filter (where q.answercount is not null) as avg_answers_per_q
+  from q_tags qt
+  join q on q.question_id = qt.question_id
+  group by qt.tag
+),
+question_fact as (
+  select
+    q.question_id,
+    q.asker_id,
+    q.creationdate as question_created,
+    q.score as question_score,
+    q.viewcount,
+    q.favoritecount,
+    q.answercount,
+    q.comment_count,
+    q.is_closed,
+    q.has_close_votes_event,
+    ar.first_answer_time,
+    ar.last_answer_time,
+    ar.answers_total,
+    ar.accepted_answers,
+    ar.pos_answers,
+    hl.heavily_edited,
+    coalesce(ql.total_links, 0) as q_total_links,
+    coalesce(ql.duplicate_of_count, 0) as dup_count,
+    cr.last_close_reason_id,
+    cast(extract(epoch from coalesce(ar.first_answer_time, q.creationdate) - q.creationdate)/60.0 as numeric(18,2)) as minutes_to_first_answer,
+    case when q.answercount is null or q.answercount = 0 then null
+         else cast(extract(epoch from coalesce(ar.last_answer_time, q.creationdate) - q.creationdate)/60.0 as numeric(18,2))
+    end as minutes_to_last_answer,
+    q.has_close_votes_event as has_close_votes_event_col
+  from q
+  left join answer_times ar on ar.question_id = q.question_id
+  left join heavy_edit_posts hl on hl.postid = q.question_id
+  left join q_links ql on ql.question_id = q.question_id
+  left join closed_reasons cr on cr.question_id = q.question_id
+),
+engaging_questions as (
+  select
+    qf.question_id,
+    qf.asker_id,
+    qf.question_created,
+    qf.question_score,
+    qf.viewcount,
+    qf.favoritecount,
+    qf.answercount,
+    qf.comment_count,
+    qf.is_closed,
+    qf.has_close_votes_event_col as has_close_votes_event,
+    qf.first_answer_time,
+    qf.last_answer_time,
+    qf.answers_total,
+    qf.accepted_answers,
+    qf.pos_answers,
+    qf.heavily_edited,
+    qf.q_total_links,
+    qf.dup_count,
+    qf.last_close_reason_id,
+    qf.minutes_to_first_answer,
+    qf.minutes_to_last_answer
+  from question_fact qf
+  where
+    (qf.viewcount >= 100 or qf.question_score >= 5 or qf.favoritecount >= 3)
+    and coalesce(qf.answercount, 0) >= (select min_answers_for_question from params)
+    and (
+      qf.is_closed = false
+      or (qf.is_closed = true and qf.dup_count = 0)
+    )
+    and not (
+      qf.heavily_edited = true
+      and qf.has_close_votes_event_col = true
+      and coalesce(qf.minutes_to_first_answer, 0) > 1440
+    )
+),
+best_answers as (
+  select distinct on (a.question_id)
+    a.question_id,
+    a.answer_id,
+    a.answerer_id,
+    a.score as answer_score,
+    a.creationdate as answer_created,
+    a.is_accepted
+  from a
+  order by a.question_id, a.score desc, a.creationdate asc
+),
+best_answer_enriched as (
+  select
+    ba.question_id,
+    ba.answer_id,
+    ba.answerer_id,
+    ba.answer_score,
+    ba.answer_created,
+    ba.is_accepted,
+    uar.rank_global,
+    uar.rank_by_accepts,
+    uar.pr_answers_written
+  from best_answers ba
+  left join user_answer_rank uar on uar.user_id = ba.answerer_id
+),
+final_rows as (
+  select
+    eq.question_id,
+    eq.asker_id,
+    au.displayname as asker_name,
+    au.reputation as asker_rep,
+    coalesce(nullif(au.location, ''), 'unknown') as asker_location,
+    eq.question_score,
+    eq.viewcount,
+    eq.favoritecount,
+    eq.answercount,
+    eq.comment_count,
+    eq.minutes_to_first_answer,
+    eq.minutes_to_last_answer,
+    eq.q_total_links,
+    eq.dup_count,
+    eq.last_close_reason_id,
+    coalesce(vaq.upvotes,0) as q_upvotes,
+    coalesce(vaq.downvotes,0) as q_downvotes,
+    coalesce(vaq.bounty_amount,0) as q_bounty,
+    bae.answer_id as best_answer_id,
+    bae.answerer_id,
+    bu.displayname as answerer_name,
+    coalesce(vab.upvotes,0) as a_upvotes,
+    coalesce(vab.downvotes,0) as a_downvotes,
+    coalesce(vab.bounty_amount,0) as a_bounty,
+    bae.answer_score,
+    bae.is_accepted,
+    bae.rank_global as answerer_rank_global,
+    bae.rank_by_accepts as answerer_rank_by_accepts,
+    bae.pr_answers_written as answerer_percent_rank,
+    case
+      when eq.viewcount >= 10000 then 'viral'
+      when eq.viewcount >= 1000 then 'popular'
+      when eq.viewcount >= 100 then 'notable'
+      else 'niche'
+    end as popularity_bucket,
+    trim(both ' ' from coalesce(au.websiteurl, '')) as asker_website_sanitized,
+    replace(regexp_replace(lower(coalesce(au.displayname, 'anon')), '[^a-z0-9]+', '-', 'g'), '--', '-') as asker_slug,
+    nullif(split_part(coalesce(au.location, ''), ',', 1), '') as asker_region_guess,
+    eq.minutes_to_first_answer as minutes_to_first_answer_col
+  from engaging_questions eq
+  left join active_users au on au.user_id = eq.asker_id
+  left join vote_agg vaq on vaq.postid = eq.question_id
+  left join best_answer_enriched bae on bae.question_id = eq.question_id
+  left join users bu on bu.id = bae.answerer_id
+  left join vote_agg vab on vab.postid = bae.answer_id
+),
+ranked_final as (
+  select
+    fr.*,
+    row_number() over (
+      partition by fr.question_id
+      order by
+        case when fr.is_accepted then 0 else 1 end,
+        fr.answer_score desc,
+        fr.a_upvotes desc,
+        fr.minutes_to_first_answer_col asc
+    ) as rn
+  from final_rows fr
+)
+select
+  rf.question_id,
+  rf.asker_id,
+  rf.asker_name,
+  rf.asker_rep,
+  rf.asker_location,
+  rf.question_score,
+  rf.viewcount,
+  rf.favoritecount,
+  rf.answercount,
+  rf.comment_count,
+  rf.minutes_to_first_answer,
+  rf.minutes_to_last_answer,
+  rf.q_total_links,
+  rf.dup_count,
+  rf.last_close_reason_id,
+  rf.q_upvotes,
+  rf.q_downvotes,
+  rf.q_bounty,
+  rf.best_answer_id,
+  rf.answerer_id,
+  rf.answerer_name,
+  rf.a_upvotes,
+  rf.a_downvotes,
+  rf.a_bounty,
+  rf.answer_score,
+  rf.is_accepted,
+  rf.answerer_rank_global,
+  rf.answerer_rank_by_accepts,
+  rf.answerer_percent_rank,
+  rf.popularity_bucket,
+  rf.asker_website_sanitized,
+  rf.asker_slug,
+  rf.asker_region_guess
+from ranked_final rf
+where rf.rn = 1
+order by
+  rf.popularity_bucket desc,
+  rf.question_score desc,
+  rf.viewcount desc,
+  rf.minutes_to_first_answer asc
+limit 500;

@@ -1,0 +1,145 @@
+WITH
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVotes,
+        (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastPostDate,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id) AS AvgPostScore
+    FROM Users u
+),
+BadgeCounts AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostTags AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        TRIM(BOTH '<>' FROM p.Tags) AS tags_str
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL
+),
+SplittedTags AS (
+    -- base rows
+    SELECT
+        UserId,
+        CASE 
+          WHEN tags_str = '' THEN NULL
+          WHEN POSITION('><' IN tags_str) = 0 THEN tags_str
+          ELSE SUBSTR(tags_str, 1, POSITION('><' IN tags_str)-1)
+        END AS tag,
+        CASE 
+          WHEN POSITION('><' IN tags_str) = 0 THEN NULL
+          ELSE SUBSTR(tags_str, POSITION('><' IN tags_str)+2)
+        END AS rest
+    FROM PostTags
+
+    UNION ALL
+
+    -- recursive part; refer only to previous CTE SplittedTags (this CTE is recursive)
+    SELECT
+        st.UserId,
+        CASE 
+          WHEN st.rest = '' THEN NULL
+          WHEN st.rest IS NULL THEN NULL
+          WHEN POSITION('><' IN st.rest) = 0 THEN st.rest
+          ELSE SUBSTR(st.rest, 1, POSITION('><' IN st.rest)-1)
+        END AS tag,
+        CASE 
+          WHEN st.rest IS NULL THEN NULL
+          WHEN POSITION('><' IN st.rest) = 0 THEN NULL
+          ELSE SUBSTR(st.rest, POSITION('><' IN st.rest)+2)
+        END AS rest
+    FROM SplittedTags st
+    WHERE st.rest IS NOT NULL
+),
+TagUsage AS (
+    SELECT 
+        UserId,
+        tag AS Tag,
+        COUNT(*) AS TagCount
+    FROM SplittedTags
+    WHERE tag IS NOT NULL AND tag <> ''
+    GROUP BY UserId, tag
+),
+TopTagsPrep AS (
+    SELECT 
+        tu.UserId,
+        tu.Tag,
+        tu.TagCount,
+        ROW_NUMBER() OVER (PARTITION BY tu.UserId ORDER BY tu.TagCount DESC, tu.Tag) AS rn
+    FROM TagUsage tu
+),
+TopTags AS (
+    SELECT
+        t.UserId,
+        STRING_AGG(t.Tag, ', ' ORDER BY t.TagCount DESC, t.Tag) AS Top3Tags
+    FROM TopTagsPrep t
+    WHERE t.rn <= 3
+    GROUP BY t.UserId
+)
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.NetVotes,
+    us.QuestionCount,
+    us.AnswerCount,
+    ROUND(COALESCE(us.AvgPostScore,0),2) AS AvgPostScore,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges,
+    bc.TotalBadges,
+    tt.Top3Tags,
+    CASE 
+        WHEN us.LastPostDate IS NULL THEN 'Never posted'
+        WHEN us.LastPostDate < (DATE '2024-10-01' - INTERVAL '1' YEAR) THEN 'Inactive >1y'
+        WHEN us.LastPostDate < (DATE '2024-10-01' - INTERVAL '30' DAY) THEN 'Inactive >30d'
+        ELSE 'Active'
+    END AS ActivityStatus,
+    ROW_NUMBER() OVER (ORDER BY us.Reputation DESC) AS ReputationRank
+FROM UserStats us
+LEFT JOIN BadgeCounts bc ON bc.UserId = us.Id
+LEFT JOIN TopTags tt ON tt.UserId = us.Id
+WHERE us.Reputation > 1000
+  AND (us.QuestionCount + us.AnswerCount) > 0
+  AND EXISTS (
+        SELECT 1 
+        FROM Posts p 
+        WHERE p.OwnerUserId = us.Id 
+          AND LOWER(p.Title) LIKE '%sql%' 
+          AND p.CreationDate > (DATE '2024-10-01' - INTERVAL '2' YEAR)
+      )
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS INTEGER) AS Id,
+    'Aggregate' AS DisplayName,
+    SUM(us.Reputation) AS Reputation,
+    SUM(us.NetVotes) AS NetVotes,
+    SUM(us.QuestionCount) AS QuestionCount,
+    SUM(us.AnswerCount) AS AnswerCount,
+    ROUND(AVG(us.AvgPostScore),2) AS AvgPostScore,
+    SUM(COALESCE(bc.GoldBadges,0)) AS GoldBadges,
+    SUM(COALESCE(bc.SilverBadges,0)) AS SilverBadges,
+    SUM(COALESCE(bc.BronzeBadges,0)) AS BronzeBadges,
+    SUM(COALESCE(bc.TotalBadges,0)) AS TotalBadges,
+    NULL AS Top3Tags,
+    NULL AS ActivityStatus,
+    NULL AS ReputationRank
+FROM UserStats us
+LEFT JOIN BadgeCounts bc ON bc.UserId = us.Id
+WHERE us.Reputation > 1000
+  AND (us.QuestionCount + us.AnswerCount) > 0
+ORDER BY ReputationRank NULLS LAST, Reputation DESC
+LIMIT 100;

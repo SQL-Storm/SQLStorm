@@ -1,0 +1,140 @@
+WITH
+RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        P.OwnerUserId,
+        U.DisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank,
+        P.Tags,
+        P.PostTypeId
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0 AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+RecentVotes AS (
+    SELECT 
+        V.PostId,
+        V.UserId,
+        V.CreationDate,
+        V.VoteTypeId,
+        CASE 
+            WHEN V.VoteTypeId IN (2, 8) THEN 'UpVote'
+            WHEN V.VoteTypeId IN (3, 9) THEN 'DownVote'
+            ELSE 'Other'
+        END AS VoteType
+    FROM 
+        Votes V
+    WHERE 
+        V.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 month')
+),
+nums AS (
+    SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+),
+-- move the recursive positions builder out so it can be referenced in the main query via lateral joins
+TagPositions AS (
+    SELECT
+        RP.Id AS PostId,
+        RP.Tags,
+        n.n AS n,
+        -- we will build positions up to n using a recursive CTE per post+ n
+        0 AS prev_pos,
+        (CASE WHEN POSITION(',' IN RP.Tags) = 0 THEN 0 ELSE POSITION(',' IN RP.Tags) END) AS curr_pos,
+        1 AS idx
+    FROM RankedPosts RP
+    CROSS JOIN nums n
+    UNION ALL
+    SELECT
+        tp.PostId,
+        tp.Tags,
+        tp.n,
+        tp.curr_pos AS prev_pos,
+        (CASE
+           WHEN POSITION(',' IN SUBSTRING(tp.Tags FROM tp.curr_pos + 1)) = 0 THEN 0
+           ELSE tp.curr_pos + POSITION(',' IN SUBSTRING(tp.Tags FROM tp.curr_pos + 1))
+         END) AS curr_pos,
+        tp.idx + 1 AS idx
+    FROM TagPositions tp
+    WHERE tp.curr_pos <> 0 AND tp.idx < tp.n
+),
+TagTargets AS (
+    -- pick the last computed position row per post+n
+    SELECT
+        PostId,
+        n,
+        prev_pos,
+        curr_pos,
+        idx
+    FROM (
+        SELECT
+            PostId, n, prev_pos, curr_pos, idx,
+            ROW_NUMBER() OVER (PARTITION BY PostId, n ORDER BY idx DESC) AS rn
+        FROM TagPositions
+    ) t
+    WHERE rn = 1
+)
+SELECT 
+    RP.Id, 
+    RP.Title, 
+    RP.Score, 
+    RP.ViewCount, 
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.Rank,
+    RP.OwnerUserId,
+    RC.BadgeCount,
+    RV.PostId AS VotedPostId,
+    RV.VoteType,
+    CASE
+      WHEN RP.Tags IS NULL THEN NULL
+      WHEN n.n = 1 THEN
+        CASE WHEN POSITION(',' IN RP.Tags) = 0 THEN RP.Tags ELSE SUBSTRING(RP.Tags FROM 1 FOR POSITION(',' IN RP.Tags)-1) END
+      ELSE
+        (
+          -- use the precomputed target positions to extract the nth element
+          CASE
+            WHEN tt.curr_pos = 0 THEN
+              LTRIM(RTRIM(SUBSTRING(RP.Tags FROM tt.prev_pos + 1)))
+            WHEN tt.prev_pos = 0 THEN
+              LTRIM(RTRIM(SUBSTRING(RP.Tags FROM 1 FOR tt.curr_pos - 1)))
+            ELSE
+              LTRIM(RTRIM(SUBSTRING(RP.Tags FROM tt.prev_pos + 1 FOR tt.curr_pos - tt.prev_pos - 1)))
+          END
+        )
+    END AS Tag
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts RC ON RP.OwnerUserId = RC.UserId
+LEFT JOIN 
+    RecentVotes RV ON RP.Id = RV.PostId
+CROSS JOIN 
+    nums n
+LEFT JOIN
+    TagTargets tt
+    ON tt.PostId = RP.Id AND tt.n = n.n
+WHERE 
+    RP.Rank <= 5
+ORDER BY 
+    RP.Score DESC, RP.ViewCount DESC
+FETCH FIRST 100 ROWS ONLY;

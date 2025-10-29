@@ -1,0 +1,141 @@
+-- {"query": "5066.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1032} 
+WITH
+recent_user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    COALESCE(b.TotalBadges, 0) AS BadgeCount
+  FROM Users u
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS TotalBadges
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+),
+top_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.PostTypeId,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.ContentLicense,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC, p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '90 days'
+),
+recent_comments AS (
+  SELECT
+    c.PostId,
+    c.Id AS CommentId,
+    c.UserId,
+    c.Text,
+    c.Score,
+    c.CreationDate,
+    c.UserDisplayName,
+    c.ContentLicense
+  FROM Comments c
+  WHERE c.CreationDate >= NOW() - INTERVAL '30 days'
+),
+latest_votes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount
+  FROM Votes v
+  WHERE v.CreationDate >= NOW() - INTERVAL '60 days'
+),
+linked_posts AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    lt.Name AS LinkTypeName
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+tag_stats AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+)
+SELECT
+  up.UserId,
+  up.DisplayName AS UserDisplayName,
+  up.Reputation,
+  up.UserCreationDate,
+  up.LastAccessDate,
+  up.Location,
+  up.WebsiteUrl,
+  up.AboutMe,
+  up.Views,
+  up.UpVotes,
+  up.DownVotes,
+  up.BadgeCount,
+  rp.PostId AS MostInterestingPostId,
+  rp.Title AS MostInterestingPostTitle,
+  rp.Tags AS MostInterestingPostTags,
+  rp.Score AS MostInterestingPostScore,
+  rp.ViewCount AS MostInterestingPostViews,
+  rp.CreationDate AS MostInterestingPostCreationDate,
+  rp.LastActivityDate AS MostInterestingPostLastActivityDate,
+  rc.CommentId AS RecentCommentId,
+  rc.Text AS RecentCommentText,
+  rc.CreationDate AS RecentCommentDate,
+  rv.VoteTypeId AS RecentVoteTypeId,
+  rv.CreationDate AS RecentVoteDate,
+  CASE
+    WHEN rv.VoteTypeId IN (2, 3) THEN 'User up/down-voted the post'
+    WHEN rv.VoteTypeId = 8 THEN 'Bounty started'
+    ELSE 'Other'
+  END AS ActivityCategory,
+  lp.RelatedPostId AS LinkedPostId,
+  p2.Title AS LinkedPostTitle,
+  p2.ViewCount AS LinkedPostViews,
+  ts.TagName AS TopTag
+FROM recent_user_activity up
+LEFT JOIN (
+  SELECT
+    p.OwnerUserId,
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC, p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+) rp ON rp.OwnerUserId = up.UserId AND rp.rn = 1
+LEFT JOIN latest_votes rv ON rv.PostId = rp.PostId
+LEFT JOIN recent_comments rc ON rc.PostId = rp.PostId
+LEFT JOIN Posts p2 ON p2.Id = rc.PostId
+LEFT JOIN linked_posts lp ON lp.PostId = rp.PostId
+LEFT JOIN Posts p3 ON p3.Id = lp.RelatedPostId
+LEFT JOIN tag_stats ts ON ts.TagName = SUBSTRING(t.UPDATE_TAGS, 1, 0) -- placeholder cross-join to exercise complex predicates
+WHERE up.Reputation > 1000
+ORDER BY up.Reputation DESC
+LIMIT 100;

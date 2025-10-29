@@ -1,0 +1,39 @@
+-- {"query": "5994.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 431} 
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS PostCount,
+    AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+    AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+    STRING_AGG(DISTINCT t.Name, ',') AS TagsInvolved,
+    MAX(p.LastActivityDate) AS LastActive,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven,
+    CASE
+        WHEN u.Reputation > 10000 THEN 'Legendary'
+        WHEN u.Reputation > 1000 THEN 'Influential'
+        ELSE 'Newcomer'
+    END AS ReputationTier,
+    COUNT(DISTINCT CASE WHEN c.Id IS NOT NULL THEN c.Id END) AS CommentCount,
+    MAX(CASE WHEN b.Id IS NOT NULL THEN b.Date END) AS LastBadgeDate
+FROM
+    Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag
+) AS taglist ON true
+LEFT JOIN Tags t ON t.TagName = taglist.tag
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN Comments c ON c.PostId = p.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+WHERE
+    u.AccountId IS NOT NULL
+    AND u.CreationDate < NOW()
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation
+HAVING
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) > 0
+ORDER BY
+    Reputation DESC, LastActive DESC
+LIMIT 100;

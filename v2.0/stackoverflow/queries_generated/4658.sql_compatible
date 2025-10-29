@@ -1,0 +1,132 @@
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      pt.Name AS PostTypeName,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn_score_views,
+      COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCountTotal,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS DownVoteCount,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed
+    FROM
+      Posts AS p
+      JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+      LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+      LEFT JOIN Votes AS v
+      ON p.Id = v.PostId
+    WHERE
+      p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '365 days'
+    GROUP BY
+      p.Id,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      pt.Name
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT ph.PostId) AS PostsEdited,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE 0 END) AS BodyEdits,
+      AVG(rp.Score) AS AvgPostScore,
+      MAX(u.Reputation) AS MaxReputation,
+      COUNT(b.Id) AS BadgeCount
+    FROM
+      Users AS u
+      LEFT JOIN PostHistory AS ph
+      ON u.Id = ph.UserId
+      LEFT JOIN RankedPosts AS rp
+      ON u.Id = rp.OwnerUserId
+      LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    WHERE
+      u.Id > 0
+    GROUP BY
+      u.Id,
+      u.DisplayName
+    HAVING
+      COUNT(DISTINCT ph.PostId) > 10
+  )
+SELECT
+  rp.Id AS PostId,
+  rp.PostTypeName,
+  rp.Score,
+  rp.ViewCount,
+  rp.CommentCountTotal,
+  rp.UpVoteCount,
+  rp.DownVoteCount,
+  rp.IsClosed,
+  rp.rn_score_views,
+  ua.DisplayName AS OwnerDisplayName,
+  ua.PostsEdited,
+  ua.BodyEdits,
+  ua.AvgPostScore,
+  ua.MaxReputation,
+  ua.BadgeCount,
+  CASE
+    WHEN rp.Score > 100 AND rp.ViewCount > 10000 THEN 'High Impact'
+    WHEN rp.Score > 20 OR rp.ViewCount > 1000 THEN 'Medium Impact'
+    ELSE 'Low Impact'
+  END AS ImpactCategory,
+  COALESCE(rp.FavoriteCount, 0) AS SafeFavoriteCount,
+  CASE
+    WHEN rp.OwnerUserId IS NULL THEN 'Community Owned'
+    WHEN rp.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN rp.Score < 0 THEN 'Negative Score'
+    ELSE 'Active'
+  END AS PostStatus,
+  LENGTH(rp.PostTypeName) AS TypeNameLength,
+  SUBSTRING(rp.PostTypeName FROM 1 FOR 3) AS TypeNamePrefix,
+  SUM(rp.Score) OVER (PARTITION BY rp.PostTypeId) AS TotalScorePerType,
+  AVG(rp.ViewCount) OVER (PARTITION BY rp.PostTypeId) AS AvgViewCountPerType,
+  rp.Score * rp.AnswerCount AS ScoreAnswerProduct,
+  CASE
+    WHEN rp.OwnerUserId IS NOT NULL AND EXISTS (
+      SELECT
+        1
+      FROM
+        PostLinks AS pl
+      WHERE
+        pl.PostId = rp.Id AND pl.LinkTypeId = 3
+    ) THEN 'Is Duplicate'
+    ELSE 'Not Duplicate'
+  END AS DuplicateStatus,
+  CASE
+    WHEN ua.UserId IS NOT NULL AND ua.BadgeCount > 5 THEN 'Experienced User'
+    WHEN ua.UserId IS NOT NULL THEN 'Regular User'
+    ELSE 'New User'
+  END AS UserExperienceLevel,
+  rp.PostTypeId,
+  rp.AnswerCount,
+  rp.ClosedDate,
+  rp.FavoriteCount,
+  rp.OwnerUserId
+FROM
+  RankedPosts AS rp
+LEFT OUTER JOIN
+  UserActivity AS ua
+  ON rp.OwnerUserId = ua.UserId
+WHERE
+  rp.rn_score_views <= 100
+  AND rp.PostTypeId IN (1, 2)
+ORDER BY
+  rp.PostTypeId,
+  rp.rn_score_views;

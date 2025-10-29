@@ -1,0 +1,188 @@
+WITH ranked_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.Tags,
+    p.Body,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName,
+    u.Id AS UserId,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY
+        p.Score DESC,
+        p.ViewCount DESC,
+        p.CreationDate ASC
+    ) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE p.PostTypeId IN (1,2)
+),
+-- Expand tags using a standard JOIN with a string-splitting approach
+tags_expanded AS (
+  SELECT
+    rp.*,
+    trim(both '<>' FROM t.tag) AS tag
+  FROM ranked_posts rp
+  JOIN (
+    -- emulate unnest(string_to_array(...)) in a dialect-agnostic way using a recursive CTE
+    SELECT rp_inner.PostId, parts.ordinal, parts.part AS tag
+    FROM ranked_posts rp_inner
+    CROSS JOIN LATERAL (
+      -- split tags by '><' after removing surrounding parentheses
+      SELECT regexp_replace(rp_inner.Tags, '^\\(|\\)$', '', 'g') AS tags_clean
+    ) rc
+    CROSS JOIN LATERAL (
+      -- split into rows using a recursive approach
+      WITH RECURSIVE split(part, rest, ordinal) AS (
+        SELECT
+          CASE
+            WHEN position('><' IN rc.tags_clean) = 0 THEN rc.tags_clean
+            ELSE substring(rc.tags_clean FROM 1 FOR position('><' IN rc.tags_clean)-1)
+          END,
+          CASE
+            WHEN position('><' IN rc.tags_clean) = 0 THEN ''
+            ELSE substring(rc.tags_clean FROM position('><' IN rc.tags_clean)+2)
+          END,
+          1
+        UNION ALL
+        SELECT
+          CASE
+            WHEN position('><' IN rest) = 0 THEN rest
+            ELSE substring(rest FROM 1 FOR position('><' IN rest)-1)
+          END,
+          CASE
+            WHEN position('><' IN rest) = 0 THEN ''
+            ELSE substring(rest FROM position('><' IN rest)+2)
+          END,
+          ordinal + 1
+        FROM split
+        WHERE rest <> ''
+      )
+      SELECT part, rest, ordinal FROM split
+    ) parts
+    WHERE rp_inner.Tags IS NOT NULL AND rp_inner.PostTypeId = 1
+  ) t ON t.PostId = rp.PostId
+),
+complex_metrics AS (
+  SELECT
+    te.PostId,
+    te.Title,
+    te.CreationDate,
+    te.Score,
+    te.ViewCount,
+    te.OwnerUserId,
+    te.DisplayName,
+    te.Reputation,
+    te.Tags,
+    te.Body,
+    te.AcceptedAnswerId,
+    te.ParentId,
+    te.CommentCount,
+    te.FavoriteCount,
+    te.ContentLicense,
+    -- count of tags per post (as tag_group_score)
+    COUNT(te.tag) OVER (PARTITION BY te.PostId) AS tag_group_score
+  FROM tags_expanded te
+  WHERE te.PostTypeId = 1
+),
+corr AS (
+  SELECT
+    cm.PostId,
+    cm.Title,
+    cm.CreationDate,
+    cm.Score,
+    cm.ViewCount,
+    cm.OwnerUserId,
+    cm.DisplayName,
+    cm.Reputation,
+    cm.Tags,
+    cm.Body,
+    cm.AcceptedAnswerId,
+    cm.ParentId,
+    cm.CommentCount,
+    cm.FavoriteCount,
+    cm.ContentLicense,
+    cm.tag_group_score,
+    COALESCE(uv.Upvotes, 0) AS Upvotes,
+    COALESCE(dv.Downvotes, 0) AS Downvotes,
+    COALESCE(cc.CommentCountTotal, 0) AS CommentCountTotal
+  FROM complex_metrics cm
+  LEFT JOIN (
+    SELECT v.PostId, COUNT(*) AS Upvotes
+    FROM Votes v
+    WHERE v.VoteTypeId = 2
+    GROUP BY v.PostId
+  ) uv ON uv.PostId = cm.PostId
+  LEFT JOIN (
+    SELECT v.PostId, COUNT(*) AS Downvotes
+    FROM Votes v
+    WHERE v.VoteTypeId = 3
+    GROUP BY v.PostId
+  ) dv ON dv.PostId = cm.PostId
+  LEFT JOIN (
+    SELECT c.PostId, COUNT(*) AS CommentCountTotal
+    FROM Comments c
+    GROUP BY c.PostId
+  ) cc ON cc.PostId = cm.PostId
+),
+latest_activity AS (
+  SELECT
+    c.PostId,
+    MAX(com.CreationDate) AS LastUserInteraction
+  FROM corr c
+  LEFT JOIN Comments com ON com.PostId = c.PostId
+  GROUP BY c.PostId
+),
+link_summary AS (
+  SELECT
+    l.PostId,
+    SUM(CASE WHEN lt.Name ILIKE '%duplicate%' THEN 1 ELSE 0 END) AS DupLinkCount,
+    COUNT(*) AS TotalLinks
+  FROM PostLinks l
+  JOIN LinkTypes lt ON l.LinkTypeId = lt.Id
+  GROUP BY l.PostId
+)
+SELECT
+  c.PostId,
+  c.Title,
+  c.CreationDate,
+  c.Score,
+  c.ViewCount,
+  c.OwnerUserId AS UserId,
+  c.DisplayName,
+  c.Reputation,
+  c.Tags,
+  c.Body,
+  c.AcceptedAnswerId,
+  c.ParentId,
+  c.CommentCount,
+  c.FavoriteCount,
+  c.ContentLicense,
+  c.Upvotes,
+  c.Downvotes,
+  c.CommentCountTotal,
+  la.LastUserInteraction,
+  ls.DupLinkCount,
+  ls.TotalLinks,
+  CASE
+    WHEN c.Score > 50 THEN 'Hot'
+    WHEN c.ViewCount > 10000 THEN 'Popular'
+    ELSE 'Normal'
+  END AS ActivityLabel
+FROM corr c
+LEFT JOIN latest_activity la ON la.PostId = c.PostId
+LEFT JOIN link_summary ls ON ls.PostId = c.PostId
+ORDER BY c.Score DESC NULLS LAST, c.ViewCount DESC;

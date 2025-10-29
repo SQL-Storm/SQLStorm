@@ -1,0 +1,274 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           coalesce(nullif(trim(u.websiteurl), ''), 'https://stackexchange.com/users/' || u.id) as canonical_website,
+           row_number() over (order by u.creationdate desc, u.id desc) as rn
+    from users u
+    where u.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from users)
+),
+post_rollup as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as question_count,
+        count(*) filter (where p.posttypeid = 2) as answer_count,
+        sum(coalesce(p.score,0)) as total_post_score,
+        avg(nullif(p.viewcount,0)) as avg_viewcount_nonzero,
+        max(p.lastactivitydate) as last_activity,
+        count(*) filter (where p.closeddate is not null) as closed_posts,
+        sum(case when p.posttypeid = 1 and p.acceptedanswerid is not null then 1 else 0 end) as accepted_questions
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+comment_rollup as (
+    select c.userid as user_id,
+           count(*) as comments,
+           sum(coalesce(c.score,0)) as comment_score,
+           max(c.creationdate) as last_commented_at
+    from comments c
+    where c.userid is not null
+    group by c.userid
+),
+badge_rollup as (
+    select b.userid as user_id,
+           count(*) filter (where b.class = 1) as gold_badges,
+           count(*) filter (where b.class = 2) as silver_badges,
+           count(*) filter (where b.class = 3) as bronze_badges,
+           count(*) filter (where b.tagbased = 1) as tag_badges,
+           min(b.date) as first_badge_at,
+           max(b.date) as last_badge_at
+    from badges b
+    group by b.userid
+),
+hot_questions as (
+    select ph.postid,
+           min(ph.creationdate) as first_hot_at
+    from posthistory ph
+    where ph.posthistorytypeid = 52
+    group by ph.postid
+),
+dup_links as (
+    select pl.relatedpostid as canonical_qid,
+           count(*) as dup_count
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.relatedpostid
+),
+favorite_counts as (
+    select v.postid,
+           count(*) as favs
+    from votes v
+    where v.votetypeid = 5
+    group by v.postid
+),
+user_activity_window as (
+    select
+        p.owneruserid as user_id,
+        p.id as post_id,
+        p.posttypeid,
+        p.creationdate,
+        coalesce(p.score,0) as score,
+        sum(coalesce(p.score,0)) over (partition by p.owneruserid order by p.creationdate rows between unbounded preceding and current row) as running_user_score,
+        count(*) over (partition by p.owneruserid) as total_posts_by_user
+    from posts p
+    where p.owneruserid is not null
+),
+question_metrics as (
+    select
+        q.id as question_id,
+        q.owneruserid as user_id,
+        q.creationdate,
+        q.score,
+        q.viewcount,
+        q.answercount,
+        q.acceptedanswerid,
+        (select count(*) from posts a where a.parentid = q.id and a.owneruserid = q.owneruserid) as self_answers,
+        (select count(*) from comments c where c.postid = q.id) as comment_count,
+        coalesce(fc.favs, 0) as favorites,
+        coalesce(dl.dup_count, 0) as duplicate_count,
+        case when hq.postid is not null then 1 else 0 end as was_hot
+    from posts q
+    left join favorite_counts fc on fc.postid = q.id
+    left join dup_links dl on dl.canonical_qid = q.id
+    left join hot_questions hq on hq.postid = q.id
+    where q.posttypeid = 1
+),
+user_quality as (
+    select
+        u.user_id,
+        percentile_cont(0.5) within group (order by qm.score) as median_q_score,
+        avg(nullif(qm.viewcount,0)) as avg_q_views_nonzero,
+        avg(qm.answercount) as avg_answers_per_q,
+        sum(case when qm.acceptedanswerid is not null then 1 else 0 end) as questions_with_accepted,
+        sum(qm.favorites) as total_favs_on_q,
+        sum(qm.duplicate_count) as total_dups,
+        sum(qm.was_hot) as total_hot_qs
+    from question_metrics qm
+    join posts p on p.id = qm.question_id
+    right join recent_users u on u.user_id = qm.user_id
+    group by u.user_id
+),
+tag_popularity as (
+    select
+        q.owneruserid as user_id,
+        unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag,
+        count(*) as tag_count
+    from posts q
+    where q.posttypeid = 1 and q.tags is not null and length(q.tags) > 2
+    group by q.owneruserid, unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><'))
+),
+top_tags as (
+    -- build ordered tags per user and aggregate top 3 into a comma-separated string for cross-dialect compatibility
+    select tp.user_id,
+           string_agg(tp.tag, ',' order by tp.tag_count desc, tp.tag asc) as top_tags_csv
+    from (
+        select user_id, tag, tag_count,
+               row_number() over (partition by user_id order by tag_count desc, tag asc) as rn
+        from tag_popularity
+    ) tp
+    where tp.rn <= 3
+    group by tp.user_id
+),
+posttype_names as (
+    select id, name from posttypes
+),
+vote_agg as (
+    select
+        v.postid,
+        count(*) filter (where v.votetypeid = 2) as upvotes,
+        count(*) filter (where v.votetypeid = 3) as downvotes,
+        count(*) filter (where v.votetypeid = 1) as accept_marks
+    from votes v
+    group by v.postid
+),
+answer_quality as (
+    select
+        a.owneruserid as user_id,
+        avg(coalesce(va.upvotes,0) - coalesce(va.downvotes,0)) as avg_net_votes_on_answers,
+        sum(case when va.accept_marks > 0 then 1 else 0 end) as accepted_answers
+    from posts a
+    left join vote_agg va on va.postid = a.id
+    where a.posttypeid = 2
+    group by a.owneruserid
+),
+activity_buckets as (
+    select
+        u.user_id,
+        date_trunc('month', p.creationdate) as ym,
+        count(*) as posts_in_month
+    from recent_users u
+    left join posts p on p.owneruserid = u.user_id
+    group by u.user_id, date_trunc('month', p.creationdate)
+),
+activity_sparseness as (
+    select
+        ab.user_id,
+        avg(ab.posts_in_month) as avg_posts_per_month,
+        stddev_samp(ab.posts_in_month) as stddev_posts_per_month
+    from activity_buckets ab
+    group by ab.user_id
+),
+latest_title_edits as (
+    select
+        ph.postid,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (1,4,7)) as last_title_edit_at
+    from posthistory ph
+    group by ph.postid
+),
+question_enrichment as (
+    select
+        qm.question_id,
+        qm.user_id,
+        qm.score,
+        coalesce(lt.last_title_edit_at, qm.creationdate) as last_title_edit_at_norm,
+        case
+            when qm.viewcount is null or qm.viewcount = 0 then null
+            else round(1000.0 * qm.score / qm.viewcount, 6)
+        end as score_per_1k_views
+    from question_metrics qm
+    left join latest_title_edits lt on lt.postid = qm.question_id
+),
+ranked_questions as (
+    select
+        qe.user_id,
+        qe.question_id,
+        qe.score,
+        qe.score_per_1k_views,
+        row_number() over (partition by qe.user_id order by coalesce(qe.score_per_1k_views, -1e9) desc, qe.score desc, qe.question_id asc) as rn_best,
+        row_number() over (partition by qe.user_id order by coalesce(qe.score_per_1k_views, 1e9) asc, qe.score asc, qe.question_id asc) as rn_worst
+    from question_enrichment qe
+)
+select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.creationdate as user_created_at,
+    ru.location,
+    ru.canonical_website,
+    pr.question_count,
+    pr.answer_count,
+    pr.total_post_score,
+    pr.avg_viewcount_nonzero,
+    pr.closed_posts,
+    pr.accepted_questions,
+    pr.last_activity,
+    cr.comments,
+    cr.comment_score,
+    cr.last_commented_at,
+    br.gold_badges,
+    br.silver_badges,
+    br.bronze_badges,
+    br.tag_badges,
+    br.first_badge_at,
+    br.last_badge_at,
+    uq.median_q_score,
+    uq.avg_q_views_nonzero,
+    uq.avg_answers_per_q,
+    uq.questions_with_accepted,
+    uq.total_favs_on_q,
+    uq.total_dups,
+    uq.total_hot_qs,
+    aq.avg_net_votes_on_answers,
+    aq.accepted_answers,
+    aspar.avg_posts_per_month,
+    aspar.stddev_posts_per_month,
+    -- expose top3 as array-like by splitting CSV; if array type not supported downstream, top_tags_csv remains usable
+    case when tt.top_tags_csv is null then null else tt.top_tags_csv end as top3_tags,
+    best_q.question_id as best_efficiency_qid,
+    worst_q.question_id as worst_efficiency_qid,
+    case
+        when coalesce(pr.answer_count,0) + coalesce(pr.question_count,0) = 0 then 'Inactive'
+        when pr.total_post_score >= 1000 then 'Elite'
+        when pr.total_post_score >= 100 then 'Active'
+        when pr.total_post_score >= 10 then 'Contributor'
+        else 'Newcomer'
+    end as activity_tier,
+    case
+        when ru.displayname is null or trim(ru.displayname) = '' then 'Anonymous'
+        when position(' ' in ru.displayname) > 0 then split_part(ru.displayname, ' ', 1)
+        else ru.displayname
+    end as short_name,
+    coalesce(pr.total_post_score,0) - coalesce(cr.comment_score,0) as post_minus_comment_score,
+    coalesce(pr.answer_count,0) = 0 and coalesce(pr.question_count,0) > 0 as questions_only_flag
+from recent_users ru
+left join post_rollup pr on pr.user_id = ru.user_id
+left join comment_rollup cr on cr.user_id = ru.user_id
+left join badge_rollup br on br.user_id = ru.user_id
+left join user_quality uq on uq.user_id = ru.user_id
+left join answer_quality aq on aq.user_id = ru.user_id
+left join activity_sparseness aspar on aspar.user_id = ru.user_id
+left join top_tags tt on tt.user_id = ru.user_id
+left join lateral (
+    select question_id from ranked_questions rq where rq.user_id = ru.user_id and rq.rn_best = 1
+) best_q on true
+left join lateral (
+    select question_id from ranked_questions rq where rq.user_id = ru.user_id and rq.rn_worst = 1
+) worst_q on true
+where ru.rn <= 1000
+order by
+    coalesce(pr.total_post_score, -2147483648) desc,
+    coalesce(pr.answer_count, -2147483648) desc,
+    ru.user_id asc;

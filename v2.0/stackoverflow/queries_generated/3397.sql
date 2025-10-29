@@ -1,0 +1,112 @@
+-- {"query": "3397.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1914} 
+
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS rn,
+        COALESCE(u.Reputation,0)                                    AS UserRep,
+        LEN(p.Title)                                                AS TitleLen,
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.PostId = p.Id AND v.VoteTypeId = 2)               AS UpVotesCount,
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.PostId = p.Id AND v.VoteTypeId = 3)               AS DownVotesCount,
+        (SELECT STRING_AGG(t.TagName, ',')
+         FROM Tags t
+         JOIN (SELECT pt.PostId, pt.TagId 
+               FROM (SELECT Id, Title FROM Posts) pt
+               WHERE pt.PostId = p.Id) pt2 ON pt2.TagId = t.Id)    AS TagList,
+        ISNULL(NULLIF(p.ViewCount,0),-1)                           AS ViewCountAdj,
+        CONCAT('Q_', p.Id)                                         AS QKey
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1               -- only questions
+      AND p.CreationDate >= '2020-01-01'
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopCommenters AS (
+    SELECT 
+        c.PostId,
+        u.Id                               AS UserId,
+        u.DisplayName,
+        COUNT(*)                           AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY COUNT(*) DESC) AS rn
+    FROM Comments c
+    JOIN Users u ON c.UserId = u.Id
+    GROUP BY c.PostId, u.Id, u.DisplayName
+),
+ClosedPostsInfo AS (
+    SELECT 
+        ph.PostId,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END)      AS ClosedDate,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END)           AS CloseReasonId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+)
+SELECT 
+    rp.Id,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.UserRep,
+    rp.TitleLen,
+    rp.UpVotesCount,
+    rp.DownVotesCount,
+    rp.TagList,
+    rp.ViewCountAdj,
+    rp.QKey,
+    COALESCE(ubs.GoldBadges,0)   AS GoldBadges,
+    COALESCE(ubs.SilverBadges,0) AS SilverBadges,
+    COALESCE(ubs.BronzeBadges,0) AS BronzeBadges,
+    ci.ClosedDate,
+    cr.Name                      AS CloseReason,
+    tc.DisplayName               AS TopCommenter,
+    tc.CommentCount              AS TopCommenterCount
+FROM RankedPosts rp
+LEFT JOIN UserBadgeStats ubs      ON rp.OwnerUserId = ubs.UserId
+LEFT JOIN ClosedPostsInfo ci      ON rp.Id = ci.PostId
+LEFT JOIN CloseReasonTypes cr    ON TRY_CAST(ci.CloseReasonId AS SMALLINT) = cr.Id
+LEFT JOIN (
+    SELECT PostId, DisplayName, CommentCount
+    FROM TopCommenters
+    WHERE rn = 1
+) tc                              ON rp.Id = tc.PostId
+WHERE rp.rn <= 10                -- keep only top‑10 per type (here just questions)
+ORDER BY rp.Score DESC
+
+UNION ALL
+
+SELECT 
+    NULL,
+    '--- Summary ---',
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    SUM(COALESCE(ubs.GoldBadges,0))   AS TotalGoldBadges,
+    SUM(COALESCE(ubs.SilverBadges,0)) AS TotalSilverBadges,
+    SUM(COALESCE(ubs.BronzeBadges,0)) AS TotalBronzeBadges,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM UserBadgeStats ubs;

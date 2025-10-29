@@ -1,0 +1,273 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(COALESCE(p.Score, 0)) AS TotalScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(DISTINCT p.Tags, ', ') AS AllTags,
+        AVG(COALESCE(p.ViewCount, 0)) AS AvgViewCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(p.Id), 0) AS QuestionPercentage,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC, u.Reputation DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate
+),
+TopUsers AS (
+    SELECT 
+        UserId, 
+        Reputation, 
+        DisplayName, 
+        PostCount,
+        QuestionCount,
+        AnswerCount,
+        TotalScore,
+        LastPostDate,
+        AllTags,
+        AvgViewCount,
+        QuestionPercentage,
+        UserRank,
+        CASE 
+            WHEN PostCount > 100 THEN 'Elite'
+            WHEN PostCount > 50 THEN 'Veteran'
+            WHEN PostCount > 10 THEN 'Regular'
+            ELSE 'Newbie'
+        END AS UserCategory,
+        LAG(PostCount) OVER (ORDER BY UserRank) - PostCount AS PostCountDiffFromPrevious
+    FROM UserActivityStats
+    WHERE PostCount > 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN COALESCE(t.IsRequired, FALSE) = TRUE THEN 'Required' ELSE 'Optional' END AS TagType,
+        CASE WHEN COALESCE(t.IsModeratorOnly, FALSE) = TRUE THEN 'Moderator Only' ELSE 'Public' END AS AccessLevel,
+        t.Count * 100.0 / (SELECT SUM(Count) FROM Tags) AS TagPercentage,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsRequired, t.IsModeratorOnly
+),
+PostTagRelationships AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        regexp_split_to_array(replace(replace(p.Tags, '<', ''), '>', ''), '><') AS TagArray,
+        array_length(regexp_split_to_array(replace(replace(p.Tags, '<', ''), '>', ''), '><'), 1) AS NumTags,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.Score > 10 THEN 'Highly Voted'
+            WHEN p.Score > 0 THEN 'Positive Score'
+            ELSE 'Low Score'
+        END AS PostStatus,
+        CAST((cast('2024-10-01' as date) - CAST('2024-10-01' AS date)) AS integer) * -1 + CAST((p.CreationDate::date - p.CreationDate::date) AS integer) AS DaysSinceCreation, -- placeholder if DATEDIFF not available
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostSequence,
+        FIRST_VALUE(p.Id) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS LastPostId
+    FROM Posts p
+    WHERE p.CreationDate IS NOT NULL
+),
+UserTagPreferences AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.PostCount,
+        tu.QuestionCount,
+        STRING_AGG(DISTINCT pt.TagArray[1], ', ') AS PrimaryTag,
+        STRING_AGG(DISTINCT pt.TagArray[2], ', ') AS SecondaryTag,
+        STRING_AGG(DISTINCT CASE WHEN pt.TagArray IS NOT NULL AND array_length(pt.TagArray, 1) > 2 THEN pt.TagArray[3] END, ', ') AS TertiaryTag,
+        COUNT(*) AS TotalTagOccurrences,
+        AVG(pt.Score) AS AvgScorePerTagPost,
+        MAX(pt.Score) AS MaxScorePerTagPost
+    FROM TopUsers tu
+    JOIN PostTagRelationships pt ON tu.UserId = pt.OwnerUserId
+    WHERE pt.TagArray IS NOT NULL AND array_length(pt.TagArray, 1) >= 1
+    GROUP BY tu.UserId, tu.DisplayName, tu.PostCount, tu.QuestionCount
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        ptr.PostId,
+        ptr.Title,
+        ptr.Tags,
+        ptr.Score,
+        ptr.ViewCount,
+        ptr.CreationDate,
+        ptr.OwnerUserId,
+        ptr.PostType,
+        ptr.TagArray,
+        ptr.NumTags,
+        ptr.AnswerCount,
+        ptr.CommentCount,
+        ptr.FavoriteCount,
+        ptr.PostStatus,
+        ptr.DaysSinceCreation,
+        ptr.PostSequence,
+        ptr.LastPostId,
+        CASE 
+            WHEN ptr.NumTags = 0 THEN 'No Tags'
+            WHEN ptr.NumTags = 1 THEN 'Single Tag'
+            WHEN ptr.NumTags BETWEEN 2 AND 3 THEN 'Multiple Tags'
+            ELSE 'Many Tags'
+        END AS TagCategory,
+        PERCENT_RANK() OVER (ORDER BY ptr.Score DESC) AS ScorePercentile,
+        RANK() OVER (ORDER BY ptr.ViewCount DESC) AS ViewRank,
+        CASE 
+            WHEN ptr.DaysSinceCreation <= 30 THEN 'New'
+            WHEN ptr.DaysSinceCreation <= 90 THEN 'Recent'
+            ELSE 'Old'
+        END AS AgeCategory,
+        CASE 
+            WHEN ptr.Score > 0 AND ptr.ViewCount > 100 THEN 'Popular'
+            WHEN ptr.Score > 0 THEN 'Upvoted'
+            WHEN ptr.ViewCount > 100 THEN 'Viewed'
+            ELSE 'Unknown'
+        END AS PopularityStatus,
+        DENSE_RANK() OVER (ORDER BY ptr.CreationDate DESC) AS NewnessRank
+    FROM PostTagRelationships ptr
+),
+MergedFinalAnalysis AS (
+    SELECT 
+        cpa.PostId,
+        cpa.Title,
+        cpa.Tags,
+        cpa.Score,
+        cpa.ViewCount,
+        cpa.CreationDate,
+        cpa.OwnerUserId,
+        cpa.PostType,
+        cpa.TagArray,
+        cpa.NumTags,
+        cpa.AnswerCount,
+        cpa.CommentCount,
+        cpa.FavoriteCount,
+        cpa.PostStatus,
+        cpa.DaysSinceCreation,
+        cpa.PostSequence,
+        cpa.LastPostId,
+        cpa.TagCategory,
+        cpa.ScorePercentile,
+        cpa.ViewRank,
+        cpa.AgeCategory,
+        cpa.PopularityStatus,
+        cpa.NewnessRank,
+        utp.PrimaryTag,
+        utp.SecondaryTag,
+        utp.TertiaryTag,
+        utp.TotalTagOccurrences,
+        utp.AvgScorePerTagPost,
+        utp.MaxScorePerTagPost,
+        ta.TagName AS MostPopularTag,
+        ta.TagPercentage,
+        ta.TagRank,
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.TotalScore,
+        tu.LastPostDate,
+        tu.UserCategory,
+        tu.UserRank,
+        CASE 
+            WHEN tu.UserCategory = 'Elite' OR tu.UserCategory = 'Veteran' THEN 1
+            ELSE 0
+        END AS HighEngagementUser,
+        CASE 
+            WHEN cpa.NumTags > 0 AND cpa.Score > 0 AND cpa.ViewCount > 100 THEN 'Excellent Post'
+            WHEN cpa.Score > 0 AND cpa.ViewCount > 50 THEN 'Good Post'
+            WHEN cpa.Score > 0 THEN 'Upvoted Post'
+            WHEN cpa.ViewCount > 100 THEN 'Viewed Post'
+            ELSE 'Low Activity'
+        END AS QualityScore,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = tu.UserId AND p2.PostTypeId IN (1, 2)) AS TotalActivePosts,
+        ROW_NUMBER() OVER (ORDER BY cpa.Score DESC, cpa.ViewCount DESC) AS RankByPopularity
+    FROM ComplexPostAnalysis cpa
+    LEFT JOIN UserTagPreferences utp ON cpa.OwnerUserId = utp.UserId
+    LEFT JOIN TagAnalysis ta ON EXISTS (
+        SELECT 1 FROM unnest(cpa.TagArray) AS tag_elem 
+        WHERE ta.TagName ILIKE '%' || tag_elem || '%'
+    )
+    LEFT JOIN TopUsers tu ON cpa.OwnerUserId = tu.UserId
+    WHERE cpa.PostId IS NOT NULL
+)
+SELECT 
+    mfa.RankByPopularity,
+    mfa.PostId,
+    mfa.Title,
+    mfa.Tags,
+    mfa.Score,
+    mfa.ViewCount,
+    mfa.PostStatus,
+    mfa.PostType,
+    mfa.TagCategory,
+    mfa.PopularityStatus,
+    mfa.AgeCategory,
+    mfa.QualityScore,
+    mfa.PrimaryTag,
+    mfa.SecondaryTag,
+    mfa.TertiaryTag,
+    mfa.TotalTagOccurrences,
+    mfa.AvgScorePerTagPost,
+    mfa.MaxScorePerTagPost,
+    mfa.MostPopularTag,
+    mfa.TagPercentage,
+    mfa.TagRank,
+    mfa.DisplayName,
+    mfa.Reputation,
+    mfa.PostCount,
+    mfa.QuestionCount,
+    mfa.AnswerCount,
+    mfa.TotalScore,
+    mfa.LastPostDate,
+    mfa.UserCategory,
+    mfa.UserRank,
+    mfa.HighEngagementUser,
+    mfa.TotalActivePosts,
+    CASE 
+        WHEN mfa.HighEngagementUser = 1 AND mfa.Score > 10 AND mfa.ViewCount > 1000 THEN 'Superstar'
+        WHEN mfa.HighEngagementUser = 1 AND mfa.Score > 5 THEN 'Expert'
+        WHEN mfa.Score > 100 THEN 'Huge Impact'
+        WHEN mfa.ViewCount > 1000 THEN 'Viral'
+        ELSE 'Regular Contributor'
+    END AS ContributionLevel,
+    CAST(DATE_PART('month', AGE(CAST('2024-10-01 12:34:56' AS timestamp), mfa.CreationDate)) AS integer) AS MonthsActive,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = mfa.PostId AND v.VoteTypeId IN (2, 3)) AS TotalVotes,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = mfa.PostId) AS CommentCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = mfa.PostId) AS LinkCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = mfa.PostId AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) AS EditCount,
+    CASE 
+        WHEN mfa.TotalActivePosts > 100 THEN 'Legendary'
+        WHEN mfa.TotalActivePosts > 50 THEN 'Master'
+        WHEN mfa.TotalActivePosts > 10 THEN 'Contributor'
+        ELSE 'Member'
+    END AS ActivityTier
+FROM MergedFinalAnalysis mfa
+WHERE mfa.PostId IS NOT NULL
+ORDER BY RankByPopularity ASC, mfa.Score DESC, mfa.ViewCount DESC
+LIMIT 1000;

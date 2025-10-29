@@ -1,0 +1,119 @@
+WITH
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS QuestionsAsked,
+      SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS AnswersGiven,
+      COUNT(DISTINCT c.Id) AS TotalComments,
+      COUNT(DISTINCT b.Id) AS TotalBadges,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceived,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceived,
+      ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC, SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) DESC) AS PostRank,
+      DENSE_RANK() OVER (PARTITION BY u.Id ORDER BY COUNT(DISTINCT b.Id) DESC) AS BadgeRank
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments AS c
+      ON u.Id = c.UserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    WHERE
+      u.Reputation > 1000
+      AND u.CreationDate < DATE '2023-01-01'
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+    HAVING
+      COUNT(DISTINCT p.Id) > 10
+  ),
+  QuestionMetrics AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate AS QuestionCreationDate,
+      p.AnswerCount,
+      p.Score AS QuestionScore,
+      COALESCE(AVG(CAST(a.Score AS DOUBLE PRECISION)), 0) AS AvgAnswerScore,
+      (
+        SELECT
+          COUNT(*)
+        FROM PostHistory AS ph
+        WHERE
+          ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 11)
+      ) AS CloseReopenCount,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.ViewCount > 100000 THEN 'High Traffic'
+        ELSE 'Active'
+      END AS QuestionStatus,
+      ROW_NUMBER() OVER (ORDER BY p.AnswerCount DESC, p.Score DESC) AS HotQuestionRank
+    FROM Posts AS p
+    LEFT JOIN Posts AS a
+      ON p.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate BETWEEN DATE '2022-01-01' AND DATE '2023-01-01'
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.AnswerCount,
+      p.Score,
+      p.ClosedDate,
+      p.ViewCount
+    HAVING
+      p.AnswerCount > 0 OR p.Score > 50
+  )
+SELECT
+  ue.DisplayName AS UserDisplayName,
+  ue.TotalPosts,
+  ue.QuestionsAsked,
+  ue.AnswersGiven,
+  ue.TotalBadges,
+  qm.Title AS TopQuestionTitle,
+  qm.QuestionScore,
+  qm.AnswerCount AS NumberOfAnswers,
+  qm.AvgAnswerScore,
+  qm.CloseReopenCount,
+  qm.QuestionStatus,
+  CASE
+    WHEN RANK() OVER (ORDER BY ue.TotalBadges DESC) <= 5 THEN 'Top Tier Badges'
+    WHEN ue.BadgeRank <= 2 THEN 'Highly Decorated'
+    ELSE 'Standard User'
+  END AS BadgeTier,
+  CASE
+    WHEN qm.HotQuestionRank <= 10 AND qm.QuestionScore > 100 THEN 'Popular Hot Question'
+    WHEN qm.HotQuestionRank BETWEEN 11 AND 50 AND qm.AnswerCount > 10 THEN 'Moderately Popular Question'
+    ELSE 'Standard Question'
+  END AS QuestionPopularity,
+  CASE
+    WHEN ue.DisplayName IS NULL OR ue.DisplayName = '' THEN 'Anonymous'
+    WHEN ue.DisplayName LIKE '%[^a-zA-Z0-9 ]%' THEN 'Special Characters'
+    ELSE 'Regular Name'
+  END AS NameComplexity,
+  CASE
+    WHEN qm.QuestionScore < 0 THEN 'Negative Score'
+    WHEN qm.QuestionScore BETWEEN 0 AND 10 THEN 'Low Score'
+    WHEN qm.QuestionScore > 1000 THEN 'High Score'
+    ELSE 'Medium Score'
+  END AS ScoreCategory
+FROM UserEngagement AS ue
+FULL OUTER JOIN QuestionMetrics AS qm
+  ON ue.UserId = qm.OwnerUserId
+WHERE
+  (ue.Reputation IS NOT NULL AND ue.Reputation > 5000)
+  OR (qm.QuestionScore IS NOT NULL AND qm.QuestionScore > 200)
+ORDER BY
+  ue.PostRank,
+  qm.QuestionScore DESC
+LIMIT 100;

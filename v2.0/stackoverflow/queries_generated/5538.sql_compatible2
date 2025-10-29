@@ -1,0 +1,106 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title AS Title,
+    p.Tags AS Tags,
+    p.CreationDate AS CreationDate,
+    p.Score AS Score,
+    p.ViewCount AS ViewCount,
+    p.OwnerUserId AS OwnerUserId,
+    p.LastActivityDate AS LastActivityDate,
+    p.CommentCount AS CommentCount,
+    p.AnswerCount AS AnswerCount,
+    p.FavoriteCount AS FavoriteCount,
+    p.Body AS Body,
+    p.ContentLicense AS ContentLicense,
+    u.Reputation AS UserReputation,
+    u.DisplayName AS UserDisplayName,
+    u.Location AS UserLocation,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+),
+tag_burst AS (
+  SELECT
+    t.TagName AS TagName,
+    t.Count AS Count,
+    t.IsModeratorOnly AS IsModeratorOnly,
+    t.IsRequired AS IsRequired,
+    CASE WHEN t.Count > 100 THEN 'HOT' ELSE 'WARM' END AS BurstLabel
+  FROM Tags t
+  WHERE t.Count >= 50
+),
+polygon AS (
+  SELECT
+    p1.Id AS PostId,
+    p1.Title AS PostTitle,
+    p1.Tags AS PostTags,
+    p2.Id AS RelatedPostId,
+    p2.Title AS RelatedPostTitle,
+    p2.Tags AS RelatedPostTags,
+    p1.Score - COALESCE(p2.Score, 0) AS ScoreDelta,
+    p1.ViewCount - COALESCE(p2.ViewCount, 0) AS ViewDelta,
+    ROW_NUMBER() OVER (PARTITION BY p1.Id ORDER BY (p1.Score - COALESCE(p2.Score,0)) DESC) AS rn
+  FROM Posts p1
+  LEFT JOIN PostLinks pl ON pl.PostId = p1.Id AND pl.LinkTypeId = 3
+  LEFT JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+  WHERE p1.PostTypeId = 1
+    AND p1.CreationDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7' DAY
+),
+correlated_notes AS (
+  SELECT
+    q.PostId AS PostId,
+    q.Title AS PostTitle,
+    q.Tags AS PostTags,
+    (q.PostId % 5) AS mod_group,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = q.PostId AND v.BountyAmount IS NOT NULL) AS AvgBounty
+  FROM recent_questions q
+),
+window_stats AS (
+  SELECT
+    rp.PostId AS PostId,
+    rp.Title AS PostTitle,
+    rp.Tags AS PostTags,
+    rp.Score AS Score,
+    rp.ViewCount AS ViewCount,
+    rp.OwnerUserId AS OwnerUserId,
+    ROW_NUMBER() OVER (PARTITION BY rp.OwnerUserId ORDER BY rp.Score DESC) AS rank_by_user,
+    DENSE_RANK() OVER (ORDER BY rp.Score DESC) AS DENSE_RIFT
+  FROM recent_questions rp
+),
+set_ops AS (
+  SELECT PostId, Title AS PostTitle FROM recent_questions
+  UNION ALL
+  SELECT PostId, RelatedPostTitle AS PostTitle FROM polygon WHERE rn = 1
+)
+SELECT
+  ro.PostId,
+  ro.PostTitle,
+  cn.PostTags,
+  COALESCE(cn.AvgBounty, 0) AS AvgBounty,
+  cn.mod_group,
+  ws.rank_by_user,
+  ws.DENSE_RIFT,
+  tb.BurstLabel,
+  tb.IsModeratorOnly
+FROM correlated_notes cn
+JOIN window_stats ws ON ws.PostId = cn.PostId
+LEFT JOIN tag_burst tb ON tb.TagName = ANY(
+  -- split tags like "<tag1><tag2>" into array of tag names
+  string_to_array(REGEXP_REPLACE(cn.PostTags, '[<>]', '', 'g'), ',')
+)
+LEFT JOIN set_ops ro ON ro.PostId = cn.PostId
+LEFT JOIN (
+  SELECT PostId, AvgBounty
+  FROM (
+    SELECT
+      v.PostId,
+      v.BountyAmount AS AvgBounty,
+      ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn
+    FROM Votes v
+    WHERE v.BountyAmount IS NOT NULL
+  ) t
+  WHERE t.rn = 1
+) wb2 ON wb2.PostId = cn.PostId;

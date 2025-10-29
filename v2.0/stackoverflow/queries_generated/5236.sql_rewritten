@@ -1,0 +1,116 @@
+-- {"query": "5236.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 821} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.AcceptedAnswerId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+),
+TopTags AS (
+  SELECT
+    unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag,
+    p.Id
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+TagStats AS (
+  SELECT
+    tg.Tag,
+    COUNT(*) AS PostCount,
+    SUM(p.ViewCount) AS TotalViews,
+    AVG(p.Score) AS AvgScore
+  FROM TopTags tg
+  JOIN Posts p ON p.Id = tg.Id
+  GROUP BY tg.Tag
+),
+CrossJoined AS (
+  SELECT
+    r.Id AS PostId,
+    r.Title,
+    r.OwnerUserId,
+    r.ViewCount,
+    r.Score,
+    r.LastActivityDate,
+    r.CommentCount,
+    r.AnswerCount,
+    r.FavoriteCount,
+    r.Tags,
+    t.Tag
+  FROM RecentActivePosts r
+  LEFT JOIN TopTags t ON t.Id = r.Id
+),
+Windowed AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (PARTITION BY PostTypeId ORDER BY Score DESC NULLS LAST, ViewCount DESC NULLS LAST) AS rn
+  FROM (
+    SELECT
+      p.Id AS PostId,
+      p.PostTypeId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.ViewCount,
+      p.Score,
+      p.LastActivityDate,
+      p.CommentCount,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.Tags,
+      p.AcceptedAnswerId
+    FROM Posts p
+    WHERE p.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '60 days'
+      AND p.OwnerUserId IS NOT NULL
+  ) AS q
+)
+SELECT
+  w.PostId,
+  w.PostTypeId,
+  w.Title,
+  w.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  w.CreationDate,
+  w.LastActivityDate,
+  w.ViewCount,
+  w.Score,
+  w.AnswerCount,
+  w.CommentCount,
+  w.FavoriteCount,
+  w.Tags,
+  COALESCE(a.Title, NULL) AS AcceptedAnswerTitle,
+  v1.VoteTypeName AS LastUpvoteType,
+  COALESCE(v2.BountyAmount, 0) AS LastBountyAmount,
+  COALESCE(bt.PostCount, 0) AS RelatedPostCount,
+  COALESCE(ts.TotalViews, 0) AS TagTotalViews,
+  CASE
+    WHEN w.Score > 20 THEN 'Hot'
+    WHEN w.Score > 0 THEN 'Rising'
+    ELSE 'New'
+  END AS BuzzLevel
+FROM Windowed w
+JOIN Users u ON w.OwnerUserId = u.Id
+LEFT JOIN Posts a ON w.AcceptedAnswerId = a.Id
+LEFT JOIN Votes v1 ON v1.PostId = w.PostId AND v1.VoteTypeId = 2
+LEFT JOIN Votes v2 ON v2.PostId = w.PostId AND v2.VoteTypeId = 8
+LEFT JOIN (
+  SELECT PostId, Count(*) AS PostCount
+  FROM PostLinks
+  GROUP BY PostId
+) bt ON bt.PostId = w.PostId
+LEFT JOIN TagStats ts ON ts.Tag = REGEXP_REPLACE(w.Tags, '^\\(|\\)$', '', 'g')
+ORDER BY w.LastActivityDate DESC, w.Score DESC
+LIMIT 100;

@@ -1,0 +1,163 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT ph_edit.PostId) AS DistinctPostsEdited,
+        SUM(CASE WHEN ph_edit.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEdits,
+        MAX(ph_edit.CreationDate) AS LastPostEditActivityDate,
+        MAX(u.LastAccessDate) AS LastAccessDateSummary
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph_edit ON u.Id = ph_edit.UserId AND ph_edit.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY u.Id
+),
+QuestionPerformance AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CreationDate AS QuestionCreationDate,
+        q.AcceptedAnswerId,
+        COALESCE(a.Score, 0) AS AcceptedAnswerScore,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0 AS TimeToAcceptAnswerHours,
+        (SELECT COUNT(DISTINCT v.UserId) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2) AS UpvotersCount,
+        (SELECT COUNT(DISTINCT c.UserId) FROM Comments c WHERE c.PostId = q.Id) AS CommentersCount,
+        (SELECT COUNT(pl.Id) FROM PostLinks pl WHERE pl.PostId = q.Id AND pl.LinkTypeId = 1) AS LinkedPostsCount
+    FROM Posts q
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+      AND q.ViewCount > 0
+),
+PostHistoryDetails AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId AS HistoryUserId,
+        ph.Text AS CurrentText,
+        LEAD(ph.Text, 1, ph.Text) OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS PreviousText,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn_latest
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (5, 6, 10, 11)
+),
+RecentTagChanges AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS TagEditDate,
+        ph.UserId AS EditorId,
+        string_to_array(SUBSTRING(ph.Text FROM 2 FOR (LENGTH(ph.Text) - 2)), '><') AS CurrentTagsArray,
+        string_to_array(SUBSTRING(LAG(ph.Text, 1, ph.Text) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) FROM 2 FOR (LENGTH(LAG(ph.Text, 1, ph.Text) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate)) - 2)), '><') AS PreviousTagsArray
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 6
+      AND ph.Text IS NOT NULL AND LENGTH(ph.Text) > 2
+),
+SignificantTagChanges AS (
+    SELECT
+        rtc.PostId,
+        rtc.EditorId,
+        rtc.TagEditDate,
+        ARRAY_TO_STRING(ARRAY(SELECT UNNEST(rtc.CurrentTagsArray) EXCEPT SELECT UNNEST(rtc.PreviousTagsArray)), ', ') AS AddedTags,
+        ARRAY_TO_STRING(ARRAY(SELECT UNNEST(rtc.PreviousTagsArray) EXCEPT SELECT UNNEST(rtc.CurrentTagsArray)), ', ') AS RemovedTags
+    FROM RecentTagChanges rtc
+    WHERE rtc.TagEditDate = (SELECT MAX(TagEditDate) FROM RecentTagChanges WHERE PostId = rtc.PostId)
+)
+SELECT
+    u.Id AS UserId,
+    COALESCE(u.DisplayName, 'Anonymous User') AS UserDisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    uas.TotalPosts,
+    uas.TotalComments,
+    uas.DistinctPostsEdited,
+    uas.TotalEdits,
+    uas.LastPostEditActivityDate,
+    STRING_AGG(DISTINCT b.Name, '; ') FILTER (WHERE b.Class = 1) AS GoldBadges,
+    AVG(qp.QuestionScore * 1.0) AS AvgQuestionScore,
+    SUM(CASE WHEN qp.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswerCount,
+    SUM(qp.QuestionScore * (qp.UpvotersCount * 0.5 + qp.CommentersCount * 0.75) / NULLIF(qp.ViewCount, 0)) AS EngagementWeightedScore,
+    RANK() OVER (ORDER BY SUM(qp.QuestionScore * (qp.UpvotersCount * 0.5 + qp.CommentersCount * 0.75) / NULLIF(qp.ViewCount, 0)) DESC NULLS LAST) AS EngagementRank,
+    (
+        SELECT COALESCE(MAX(a_user.Score), 0)
+        FROM Posts a_user
+        WHERE a_user.OwnerUserId = u.Id AND a_user.PostTypeId = 2
+    ) AS MaxAnswerScore,
+    BOOL_OR(
+        EXISTS (
+            SELECT 1
+            FROM PostHistoryDetails phd_closed
+            WHERE phd_closed.PostId = qp.QuestionId
+              AND phd_closed.PostHistoryTypeId = 10
+              AND phd_closed.HistoryUserId = u.Id
+              AND EXISTS (
+                  SELECT 1
+                  FROM PostHistoryDetails phd_reopened
+                  WHERE phd_reopened.PostId = qp.QuestionId
+                    AND phd_reopened.PostHistoryTypeId = 11
+                    AND phd_reopened.HistoryDate > phd_closed.HistoryDate
+              )
+        )
+    ) AS EditedAndReopenedPostFlag,
+    (
+        SELECT STRING_AGG(
+            COALESCE('Added: ' || NULLIF(stc.AddedTags, ''), '') ||
+            COALESCE(' Removed: ' || NULLIF(stc.RemovedTags, ''), '')
+        , ' | ')
+        FROM SignificantTagChanges stc
+        WHERE stc.EditorId = u.Id
+          AND stc.PostId IN (SELECT qp_inner.QuestionId FROM QuestionPerformance qp_inner WHERE qp_inner.OwnerUserId = u.Id)
+          AND stc.TagEditDate >= CAST('2024-10-01' AS date) - INTERVAL '180 days'
+          AND (stc.AddedTags IS NOT NULL OR stc.RemovedTags IS NOT NULL)
+    ) AS RecentSignificantTagEditsSummary,
+    SUM(CASE
+            WHEN qp.TimeToAcceptAnswerHours IS NOT NULL AND qp.TimeToAcceptAnswerHours <= 24 AND qp.QuestionScore > 10 THEN qp.QuestionScore * 2.0
+            WHEN qp.TimeToAcceptAnswerHours IS NOT NULL AND qp.TimeToAcceptAnswerHours > 24 AND qp.QuestionScore > 5 THEN qp.QuestionScore * 1.0
+            ELSE 0.0
+        END) AS TimelyAcceptedHighScoreImpact,
+    (
+        SELECT SUBSTRING(t_tag.TagName FROM 1 FOR 20)
+        FROM Posts p_tag
+        JOIN LATERAL (SELECT UNNEST(string_to_array(SUBSTRING(p_tag.Tags FROM 2 FOR (LENGTH(p_tag.Tags) - 2)), '><')) AS TagName) AS unnested_tag ON TRUE
+        JOIN Tags t_tag ON unnested_tag.TagName = t_tag.TagName
+        WHERE p_tag.OwnerUserId = u.Id AND p_tag.PostTypeId = 1 AND p_tag.Tags IS NOT NULL AND LENGTH(p_tag.Tags) > 2
+        GROUP BY t_tag.TagName
+        ORDER BY COUNT(p_tag.Id) DESC, t_tag.TagName ASC
+        LIMIT 1
+    ) AS MostFrequentQuestionTag,
+    EXTRACT(DAY FROM (uas.LastAccessDateSummary - LAG(uas.LastAccessDateSummary) OVER (ORDER BY uas.LastAccessDateSummary ASC, u.Id))) AS DaysSincePreviousUserActivity,
+    COALESCE(MAX(CASE WHEN phd_latest_body_edit.PostHistoryTypeId = 5 THEN 'Yes' ELSE 'No' END), 'No') AS LastEditWasBodyEdit,
+    AVG(LENGTH(c_user.Text)) AS AvgCommentLength
+FROM Users u
+JOIN UserActivitySummary uas ON u.Id = uas.UserId
+LEFT JOIN QuestionPerformance qp ON u.Id = qp.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c_user ON u.Id = c_user.UserId
+LEFT JOIN (
+    SELECT PostId, UserId AS HistoryUserId, CreationDate AS HistoryDate, PostHistoryTypeId,
+           ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY CreationDate DESC) as rn_latest_user_edit
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (5, 6)
+) AS phd_latest_body_edit ON u.Id = phd_latest_body_edit.HistoryUserId AND phd_latest_body_edit.rn_latest_user_edit = 1 AND phd_latest_body_edit.PostHistoryTypeId = 5
+WHERE u.Reputation >= 1000
+  AND uas.TotalPosts > 5
+  AND uas.TotalEdits > 2
+  AND u.CreationDate <= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+  AND u.LastAccessDate >= CAST('2024-10-01' AS date) - INTERVAL '6 months'
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    uas.TotalPosts,
+    uas.TotalComments,
+    uas.DistinctPostsEdited,
+    uas.TotalEdits,
+    uas.LastPostEditActivityDate,
+    uas.LastAccessDateSummary
+HAVING SUM(qp.QuestionScore * (qp.UpvotersCount * 0.5 + qp.CommentersCount * 0.75) / NULLIF(qp.ViewCount, 0)) IS NOT NULL
+   AND SUM(qp.QuestionScore * (qp.UpvotersCount * 0.5 + qp.CommentersCount * 0.75) / NULLIF(qp.ViewCount, 0)) > 100
+ORDER BY EngagementRank ASC, u.Reputation DESC
+LIMIT 50;

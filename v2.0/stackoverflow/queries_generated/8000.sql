@@ -1,0 +1,211 @@
+-- {"query": "8000.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1947} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COUNT(DISTINCT c.Id) AS Comments,
+        MAX(p.CreationDate) AS LastPostDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            WHEN u.Reputation >= 100 THEN 'Novice'
+            ELSE 'Beginner'
+        END AS ReputationTier,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(AVG(p.Score), 0) AS AvgScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY u.Views DESC) AS ViewRank,
+        PERCENT_RANK() OVER (ORDER BY u.Reputation) AS ReputationPercentile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+            ELSE 'Other'
+        END AS PostType,
+        DATEDIFF(DAY, p.CreationDate, CURRENT_TIMESTAMP) AS DaysSinceCreation,
+        CASE 
+            WHEN p.Score > 0 THEN 'Positive'
+            WHEN p.Score < 0 THEN 'Negative'
+            ELSE 'Neutral'
+        END AS ScoreCategory,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM PostHistory ph 
+             WHERE ph.PostId = p.Id 
+               AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)), 
+            0
+        ) AS EditCount,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Votes v 
+             WHERE v.PostId = p.Id 
+               AND v.VoteTypeId = 2), 
+            0
+        ) AS UpvotesForPost,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Votes v 
+             WHERE v.PostId = p.Id 
+               AND v.VoteTypeId = 3), 
+            0
+        ) AS DownvotesForPost
+    FROM Posts p
+    WHERE p.CreationDate > '2020-01-01'
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        CASE WHEN t.Count > 1000 THEN 'Popular' ELSE 'Regular' END AS PopularityTier,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS PopularityRank,
+        PERCENT_RANK() OVER (ORDER BY t.Count) AS PopularityPercentile,
+        LAG(t.Count, 1, 0) OVER (ORDER BY t.Count DESC) - t.Count AS CountDifferenceFromPrevious
+    FROM Tags t
+    WHERE t.Count > 100
+),
+ActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT ph.PostId) AS PostActivityCount,
+        COUNT(DISTINCT ph.Id) AS HistoryActivityCount,
+        MIN(ph.CreationDate) AS FirstActivity,
+        MAX(ph.CreationDate) AS LastActivity,
+        DATEDIFF(DAY, MIN(ph.CreationDate), MAX(ph.CreationDate)) AS ActivityDurationDays,
+        CASE 
+            WHEN COUNT(DISTINCT ph.PostId) > 100 THEN 'HighlyActive'
+            WHEN COUNT(DISTINCT ph.PostId) > 50 THEN 'Active'
+            WHEN COUNT(DISTINCT ph.PostId) > 10 THEN 'Moderate'
+            ELSE 'LowActivity'
+        END AS ActivityLevel,
+        AVG(CASE 
+            WHEN ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) THEN 1
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12) THEN 1
+            ELSE 0
+        END) AS ActivityIntensity
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE ph.CreationDate > '2021-01-01'
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT ph.PostId) > 0
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.Views,
+    us.UpVotes,
+    us.DownVotes,
+    us.TotalPosts,
+    us.Questions,
+    us.Answers,
+    us.Badges,
+    us.Comments,
+    us.ReputationTier,
+    us.TotalScore,
+    us.AvgScore,
+    us.ReputationRank,
+    us.ViewRank,
+    us.ReputationPercentile,
+    pa.PostId,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.DaysSinceCreation,
+    pa.ScoreCategory,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.IsClosed,
+    pa.IsCommunityOwned,
+    pa.EditCount,
+    pa.UpvotesForPost,
+    pa.DownvotesForPost,
+    ta.TagName,
+    ta.Count AS TagCount,
+    ta.PopularityTier,
+    ta.PopularityRank,
+    ta.PopularityPercentile,
+    ast.PostActivityCount,
+    ast.HistoryActivityCount,
+    ast.FirstActivity,
+    ast.LastActivity,
+    ast.ActivityDurationDays,
+    ast.ActivityLevel,
+    ast.ActivityIntensity,
+    CASE 
+        WHEN us.Reputation > 50000 AND pa.Score > 100 THEN 'HighImpactUser'
+        WHEN us.Reputation < 1000 AND pa.Score < 10 THEN 'LowImpactUser'
+        ELSE 'NormalUser'
+    END AS ImpactLevel,
+    CASE 
+        WHEN (CASE WHEN pa.Score > 0 THEN 1 ELSE 0 END) * 100.0 / NULLIF(us.TotalPosts, 0) > 50 THEN 'HighScoring'
+        WHEN (CASE WHEN pa.Score > 0 THEN 1 ELSE 0 END) * 100.0 / NULLIF(us.TotalPosts, 0) < 20 THEN 'LowScoring'
+        ELSE 'ModerateScoring'
+    END AS ScoringIntensity,
+    CONCAT(
+        'User ', us.UserId, ' - ',
+        'Reputation: ', us.Reputation, ', ',
+        'Posts: ', us.TotalPosts, ', ',
+        'ReputationTier: ', us.ReputationTier
+    ) AS UserInfoSummary,
+    IIF(
+        pa.PostTypeId = 1 AND pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1),
+        'AboveAverageQuestion',
+        'NormalOrBelowQuestion'
+    ) AS QuestionQuality,
+    IIF(
+        (pa.EditCount > 5 OR pa.EditCount IS NULL) AND pa.Score > 10,
+        'WellMaintained',
+        'MaintenanceRequired'
+    ) AS PostMaintenanceAssessment
+FROM UserStats us
+INNER JOIN Posts pa ON us.UserId = pa.OwnerUserId
+LEFT JOIN Tags ta ON pa.Tags LIKE CONCAT('%<', ta.TagName, '>%')
+LEFT JOIN ActivityStats ast ON us.UserId = ast.UserId
+WHERE us.Reputation > 1000
+  AND pa.CreationDate > '2021-01-01'
+  AND pa.PostTypeId IN (1, 2)
+  AND (pa.Tags IS NOT NULL AND pa.Tags != '')
+ORDER BY 
+    us.Reputation DESC,
+    pa.Score DESC,
+    pa.ViewCount DESC,
+    pa.CreationDate DESC
+LIMIT 5000;

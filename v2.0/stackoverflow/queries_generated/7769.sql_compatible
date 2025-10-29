@@ -1,0 +1,259 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END as ReputationTier,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) as QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) as AnswerCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreDenseRank,
+        NTILE(10) OVER (ORDER BY p.Score DESC) as ScoreDecile,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) as PrevScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.Score DESC) as NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) as AvgScoreByType,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = p.PostTypeId) THEN 'AboveAvg'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = p.PostTypeId) THEN 'BelowAvg'
+            ELSE 'Avg'
+        END as ScoreComparison
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        tp.Id,
+        tp.Title,
+        tp.Score,
+        tp.ViewCount,
+        tp.CreationDate,
+        tp.OwnerUserId,
+        tp.PostTypeId,
+        tp.Tags,
+        tp.AnswerCount,
+        tp.CommentCount,
+        tp.FavoriteCount,
+        tp.ScoreRank,
+        tp.ScoreDenseRank,
+        tp.ScoreDecile,
+        tp.PrevScore,
+        tp.NextScore,
+        tp.AvgScoreByType,
+        tp.ScoreComparison,
+        CASE 
+            WHEN tp.Score > 100 AND tp.ViewCount > 1000 THEN 'PopularHighScore'
+            WHEN tp.Score <= 100 AND tp.ViewCount > 1000 THEN 'PopularLowScore'
+            WHEN tp.Score > 100 AND tp.ViewCount <= 1000 THEN 'HighScoreLowViews'
+            ELSE 'Other'
+        END as PostCategory,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = tp.Id AND v.VoteTypeId = 2), 
+            0
+        ) as UpvoteCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = tp.Id AND v.VoteTypeId = 3), 
+            0
+        ) as DownvoteCount,
+        COALESCE(
+            (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = tp.Id AND v.VoteTypeId = 8), 
+            0
+        ) as AvgBountyAmount,
+        CASE 
+            WHEN tp.Tags IS NOT NULL AND tp.Tags <> '' THEN 
+                ARRAY_LENGTH(string_to_array(substring(tp.Tags, 2, length(tp.Tags)-2), '><'), 1)
+            ELSE 0
+        END as TagCount,
+        COALESCE(
+            (SELECT MAX(ph.CreationDate) FROM PostHistory ph 
+             WHERE ph.PostId = tp.Id AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)), 
+            tp.CreationDate
+        ) as LastEditDate,
+        -- Standard SQL: use DATE_PART('day', ... ) or DATE_TRUNC difference expressed in days.
+        CAST(
+            EXTRACT(EPOCH FROM (
+                COALESCE(
+                    (SELECT MAX(ph.CreationDate) FROM PostHistory ph 
+                     WHERE ph.PostId = tp.Id AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)), 
+                    tp.CreationDate
+                )
+            ) - EXTRACT(EPOCH FROM tp.CreationDate)
+            ) / 86400
+            AS INTEGER
+        ) as DaysSinceLastEdit,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM PostLinks pl 
+                WHERE pl.PostId = tp.Id AND pl.LinkTypeId = 3
+            ) THEN 'HasDuplicateLink'
+            ELSE 'NoDuplicateLink'
+        END as DuplicateStatus
+    FROM TopPosts tp
+    WHERE tp.ScoreRank <= 100
+),
+UserPerformance AS (
+    SELECT 
+        us.UserId,
+        us.Reputation,
+        us.DisplayName,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.AvgPostScore,
+        us.LastPostDate,
+        us.ReputationTier,
+        us.QuestionCount,
+        us.AnswerCount,
+        CASE 
+            WHEN us.PostCount = 0 THEN 0
+            ELSE CAST(us.QuestionCount AS DOUBLE PRECISION) / CAST(us.PostCount AS DOUBLE PRECISION)
+        END as QuestionRatio,
+        CASE 
+            WHEN us.PostCount = 0 THEN 0
+            ELSE CAST(us.AnswerCount AS DOUBLE PRECISION) / CAST(us.PostCount AS DOUBLE PRECISION)
+        END as AnswerRatio,
+        CASE 
+            WHEN us.QuestionCount = 0 THEN 0
+            ELSE CAST(us.AnswerCount AS DOUBLE PRECISION) / CAST(us.QuestionCount AS DOUBLE PRECISION)
+        END as AnswersPerQuestion,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC) as ReputationRank,
+        RANK() OVER (ORDER BY us.PostCount DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY us.BadgeCount DESC) as BadgeRank
+    FROM UserStats us
+    WHERE us.PostCount > 0
+),
+FinalAnalysis AS (
+    SELECT 
+        up.UserId,
+        up.Reputation,
+        up.DisplayName,
+        up.PostCount,
+        up.CommentCount,
+        up.BadgeCount,
+        up.AvgPostScore,
+        up.LastPostDate,
+        up.ReputationTier,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.QuestionRatio,
+        up.AnswerRatio,
+        up.AnswersPerQuestion,
+        up.ReputationRank,
+        up.PostRank,
+        up.BadgeRank,
+        CASE 
+            WHEN up.Reputation > 10000 OR up.PostCount > 1000 THEN 'HighPerformer'
+            WHEN up.Reputation > 5000 OR up.PostCount > 500 THEN 'MediumPerformer'
+            WHEN up.Reputation > 1000 OR up.PostCount > 100 THEN 'LowPerformer'
+            ELSE 'Regular'
+        END as PerformanceTier,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = up.UserId AND p.PostTypeId = 1) as UserQuestions,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = up.UserId AND p.PostTypeId IN (2, 3)) as UserAnswersAndWikis,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = up.UserId) as UserComments,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = up.UserId) as UserBadges,
+        (
+            SELECT STRING_AGG(
+                CONCAT(b.Name, ':', b.Date), 
+                '; ' 
+                ORDER BY b.Date
+            )
+            FROM Badges b 
+            WHERE b.UserId = up.UserId
+        ) as UserBadgeList,
+        (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = up.UserId) as LastActivity,
+        (
+            SELECT AVG(p.Score) 
+            FROM Posts p 
+            WHERE p.OwnerUserId = up.UserId AND p.PostTypeId IN (1, 2)
+        ) as UserAverageScore,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.OwnerUserId = up.UserId AND p.Score > 100
+        ) as HighScorePosts,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.OwnerUserId = up.UserId AND p.ViewCount > 1000
+        ) as PopularPosts
+    FROM UserPerformance up
+    WHERE up.Reputation > 1000
+)
+SELECT 
+    fa.UserId,
+    fa.Reputation,
+    fa.DisplayName,
+    fa.PostCount,
+    fa.CommentCount,
+    fa.BadgeCount,
+    fa.AvgPostScore,
+    fa.LastPostDate,
+    fa.ReputationTier,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.QuestionRatio,
+    fa.AnswerRatio,
+    fa.AnswersPerQuestion,
+    fa.ReputationRank,
+    fa.PostRank,
+    fa.BadgeRank,
+    fa.PerformanceTier,
+    fa.UserQuestions,
+    fa.UserAnswersAndWikis,
+    fa.UserComments,
+    fa.UserBadges,
+    COALESCE(fa.UserBadgeList, '') as UserBadgeList,
+    fa.LastActivity,
+    fa.UserAverageScore,
+    fa.HighScorePosts,
+    fa.PopularPosts,
+    CASE 
+        WHEN fa.PostRank <= 50 AND fa.BadgeRank <= 50 THEN 'TopPerformer'
+        WHEN fa.PostRank <= 200 OR fa.BadgeRank <= 200 THEN 'GoodPerformer'
+        ELSE 'AveragePerformer'
+    END as OverallRanking,
+    CAST(
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - fa.LastActivity)
+        ) / 86400
+        AS INTEGER
+    ) as DaysSinceLastActivity,
+    CASE 
+        WHEN (fa.PostCount > 100 AND fa.CommentCount > 100) OR (fa.BadgeCount > 50) THEN 'ActiveContributor'
+        WHEN (fa.PostCount > 50 AND fa.CommentCount > 50) OR (fa.BadgeCount > 25) THEN 'RegularContributor'
+        ELSE 'OccasionalContributor'
+    END as ContributionStatus
+FROM FinalAnalysis fa
+WHERE fa.PostCount > 10 AND fa.Reputation > 5000
+ORDER BY fa.Reputation DESC, fa.PostCount DESC, fa.BadgeCount DESC
+LIMIT 1000;

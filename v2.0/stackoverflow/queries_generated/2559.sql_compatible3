@@ -1,0 +1,208 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    -- anchor
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 AS Level,
+        CAST(t.TagName AS VARCHAR(500)) AS FullPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false
+
+    UNION ALL
+
+    -- recursive step: assume parent-child relation is represented by ParentId on Tags
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.FullPath || ' > ' || t.TagName
+    FROM Tags t
+    INNER JOIN RecursiveTagHierarchy r ON t.ParentId = r.Id
+    WHERE t.IsModeratorOnly = false AND r.Level < 3
+),
+PostReputationScore AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        COALESCE(u.Reputation,0) AS OwnerReputation,
+        COALESCE(u.UpVotes,0) AS OwnerUpVotes,
+        COALESCE(u.DownVotes,0) AS OwnerDownVotes,
+        (p.Score * 10 + p.ViewCount / NULLIF(p.AnswerCount + 1,1) + COALESCE(u.Reputation,0) / 100) AS PerformanceScore,
+        p.Title,
+        p.CreationDate,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserRecentPostRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1,2)
+),
+BadgeSummary AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(b.GoldBadges,0) AS GoldBadges,
+        COALESCE(b.SilverBadges,0) AS SilverBadges,
+        COALESCE(b.BronzeBadges,0) AS BronzeBadges,
+        COALESCE(b.TotalBadges,0) AS TotalBadges,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        MAX(p.Score) AS MaxPostScore,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(COALESCE(vt.VoteCount,0)) AS TotalVotes
+    FROM Users u
+    LEFT JOIN BadgeSummary b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)
+    LEFT JOIN (
+        SELECT VoteTypes.VoteTypeId, Posts.OwnerUserId, COUNT(Votes.Id) AS VoteCount
+        FROM Votes
+        INNER JOIN Posts ON Votes.PostId = Posts.Id
+        INNER JOIN VoteTypes ON Votes.VoteTypeId = VoteTypes.Id
+        GROUP BY VoteTypes.VoteTypeId, Posts.OwnerUserId
+    ) vt ON vt.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, b.GoldBadges, b.SilverBadges, b.BronzeBadges, b.TotalBadges, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostCloseStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) AS ReopenCount,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS FirstCloseDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LastReopenDate,
+        MAX(ph.CreationDate) AS LastActionDate
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    GROUP BY p.Id, p.Title, p.OwnerUserId
+),
+UserCommentsStats AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(CHAR_LENGTH(c.Text)) AS AvgCommentLength,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+HighlyActiveUsers AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.QuestionsCount,
+        ua.AnswersCount,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.TotalBadges,
+        ua.MaxPostScore,
+        ua.AvgPostScore,
+        ua.TotalVotes,
+        COALESCE(cs.CloseCount,0) AS UserClosePostCount,
+        COALESCE(cm.CommentCount,0) AS UserCommentCount,
+        ua.LastAccessDate,
+        RANK() OVER (ORDER BY ua.TotalPosts DESC, ua.Reputation DESC) AS ActivityRank
+    FROM UserActivity ua
+    LEFT JOIN (
+        SELECT p.OwnerUserId, COUNT(DISTINCT p.Id) AS CloseCount
+        FROM Posts p
+        INNER JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+        GROUP BY p.OwnerUserId
+    ) cs ON cs.OwnerUserId = ua.UserId
+    LEFT JOIN UserCommentsStats cm ON cm.UserId = ua.UserId
+    WHERE ua.TotalPosts > 100 AND ua.Reputation > 1000
+)
+SELECT
+    hau.UserId,
+    hau.DisplayName,
+    hau.Reputation,
+    hau.TotalPosts,
+    hau.QuestionsCount,
+    hau.AnswersCount,
+    hau.GoldBadges,
+    hau.SilverBadges,
+    hau.BronzeBadges,
+    hau.TotalBadges,
+    hau.MaxPostScore,
+    ROUND(hau.AvgPostScore,2) AS AvgPostScore,
+    COALESCE(hau.TotalVotes,0) AS TotalVotes,
+    hau.UserClosePostCount,
+    hau.UserCommentCount,
+    hau.LastAccessDate,
+    pt.PostId,
+    pt.Title AS TopPostTitle,
+    pt.PerformanceScore,
+    pt.Tags,
+    STRING_AGG(DISTINCT rth.FullPath, ', ') AS TagHierarchies,
+    phs.CloseCount AS PostCloseCount,
+    phs.ReopenCount AS PostReopenCount,
+    phs.FirstCloseDate,
+    phs.LastReopenDate,
+    phs.LastActionDate,
+    hau.ActivityRank
+FROM HighlyActiveUsers hau
+CROSS JOIN LATERAL (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        (p.Score * 10 + p.ViewCount / NULLIF(p.AnswerCount + 1,1) + COALESCE(u.Reputation,0) / 100) AS PerformanceScore,
+        p.Tags
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.OwnerUserId = hau.UserId AND p.PostTypeId = 1
+    ORDER BY PerformanceScore DESC NULLS LAST
+    LIMIT 1
+) pt
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = ANY(STRING_TO_ARRAY(SUBSTRING(pt.Tags FROM 2 FOR CHAR_LENGTH(pt.Tags) - 2), '><'))
+LEFT JOIN PostCloseStats phs ON phs.PostId = pt.PostId
+GROUP BY
+    hau.UserId,
+    hau.DisplayName,
+    hau.Reputation,
+    hau.TotalPosts,
+    hau.QuestionsCount,
+    hau.AnswersCount,
+    hau.GoldBadges,
+    hau.SilverBadges,
+    hau.BronzeBadges,
+    hau.TotalBadges,
+    hau.MaxPostScore,
+    hau.AvgPostScore,
+    hau.TotalVotes,
+    hau.UserClosePostCount,
+    hau.UserCommentCount,
+    hau.LastAccessDate,
+    pt.PostId,
+    pt.Title,
+    pt.PerformanceScore,
+    pt.Tags,
+    phs.CloseCount,
+    phs.ReopenCount,
+    phs.FirstCloseDate,
+    phs.LastReopenDate,
+    phs.LastActionDate,
+    hau.ActivityRank
+ORDER BY hau.ActivityRank ASC
+LIMIT 25;

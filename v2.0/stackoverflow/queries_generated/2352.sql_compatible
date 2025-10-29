@@ -1,0 +1,188 @@
+WITH RecursiveTagCounts AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        p.Id AS PostId,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        COALESCE(p.Score, 0) AS PostScore,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM Tags t
+    JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT
+        rtc.TagId,
+        rtc.TagName,
+        pl.RelatedPostId AS PostId,
+        COALESCE(p2.ViewCount, 0) AS ViewCount,
+        COALESCE(p2.Score, 0) AS PostScore,
+        p2.OwnerUserId,
+        rtc.PostRank + 1 AS PostRank
+    FROM RecursiveTagCounts rtc
+    JOIN PostLinks pl ON pl.PostId = rtc.PostId AND pl.LinkTypeId = 1
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE rtc.PostRank < 3
+),
+
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+VoteAggregates AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.OwnerUserId
+),
+
+LatestComments AS (
+    SELECT DISTINCT ON (c.PostId)
+      c.PostId,
+      c.Id AS CommentId,
+      c.UserId AS CommentUserId,
+      c.Text AS CommentText,
+      c.CreationDate AS CommentDate
+    FROM Comments c
+    ORDER BY c.PostId, c.CreationDate DESC
+),
+
+PostCloseHistory AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LastReopenedDate,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseEvents
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+
+RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.TotalBadges,
+        va.UpVotes,
+        va.DownVotes,
+        va.Favorites,
+        lc.CommentId,
+        lc.CommentText,
+        lc.CommentDate,
+        pch.LastClosedDate,
+        pch.LastReopenedDate,
+        pch.CloseEvents,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.Score DESC, p.ViewCount DESC
+        ) AS UserPostRank
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN UserBadgeStats us ON us.UserId = p.OwnerUserId
+    LEFT JOIN VoteAggregates va ON va.PostId = p.Id
+    LEFT JOIN LatestComments lc ON lc.PostId = p.Id
+    LEFT JOIN PostCloseHistory pch ON pch.PostId = p.Id
+    WHERE p.PostTypeId = 1
+),
+
+TagSummary AS (
+    SELECT
+        rtc.TagId,
+        rtc.TagName,
+        COUNT(DISTINCT rtc.PostId) AS TotalPosts,
+        AVG(rtc.ViewCount) AS AvgViews,
+        AVG(rtc.PostScore) AS AvgScore,
+        MAX(rtc.PostScore) AS MaxScore
+    FROM RecursiveTagCounts rtc
+    GROUP BY rtc.TagId, rtc.TagName
+),
+
+TopContributorPerTag AS (
+    SELECT
+        rtc.TagId,
+        rtc.TagName,
+        rtc.OwnerUserId,
+        COUNT(*) AS PostsContributed,
+        SUM(rtc.PostScore) AS ScoreSum,
+        RANK() OVER (PARTITION BY rtc.TagId ORDER BY COUNT(*) DESC, SUM(rtc.PostScore) DESC) AS ContributorRank
+    FROM RecursiveTagCounts rtc
+    WHERE rtc.OwnerUserId IS NOT NULL
+    GROUP BY rtc.TagId, rtc.TagName, rtc.OwnerUserId
+),
+
+FinalResult AS (
+    SELECT
+        ts.TagName,
+        ts.TotalPosts,
+        ts.AvgViews,
+        ts.AvgScore,
+        ts.MaxScore,
+        tcp.OwnerUserId,
+        u.DisplayName AS TopContributorName,
+        tcp.PostsContributed,
+        tcp.ScoreSum,
+        rp.PostId,
+        rp.Title,
+        rp.CreationDate,
+        rp.Score AS PostScore,
+        rp.ViewCount,
+        rp.OwnerName,
+        rp.GoldBadges,
+        rp.SilverBadges,
+        rp.BronzeBadges,
+        rp.TotalBadges,
+        rp.UpVotes,
+        rp.DownVotes,
+        rp.Favorites,
+        rp.CommentId,
+        rp.CommentText,
+        CASE 
+            WHEN rp.LastClosedDate IS NOT NULL AND (rp.LastReopenedDate IS NULL OR rp.LastClosedDate > rp.LastReopenedDate)
+            THEN 'Closed'
+            ELSE 'Open'
+        END AS PostStatus,
+        rp.CloseEvents,
+        rp.UserPostRank,
+        CASE 
+            WHEN rp.PostScore > 0 THEN ROUND(CAST(rp.ViewCount AS NUMERIC) / rp.PostScore, 2)
+            ELSE NULL
+        END AS ViewsPerScoreRatio,
+        (COALESCE(u.DisplayName, 'Unknown')
+            || ' posted '
+            || COALESCE(CAST(tcp.PostsContributed AS VARCHAR), '0')
+            || ' posts with total score '
+            || COALESCE(CAST(tcp.ScoreSum AS VARCHAR), '0')
+        ) AS ContributorSummary
+    FROM TagSummary ts
+    LEFT JOIN TopContributorPerTag tcp ON tcp.TagId = ts.TagId AND tcp.ContributorRank = 1
+    LEFT JOIN Users u ON u.Id = tcp.OwnerUserId
+    LEFT JOIN RankedPosts rp ON rp.OwnerUserId = tcp.OwnerUserId
+    WHERE ts.TotalPosts > 5
+)
+
+SELECT *
+FROM FinalResult
+ORDER BY AvgScore DESC, TotalPosts DESC, PostScore DESC
+LIMIT 100;

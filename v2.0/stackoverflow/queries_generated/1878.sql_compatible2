@@ -1,0 +1,183 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COALESCE(COUNT(DISTINCT p.Id), 0) AS TotalPosts,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalComments,
+        SUM(CASE WHEN vt_received.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN vt_received.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        (
+            u.Reputation * 0.7
+            + (COALESCE(COUNT(DISTINCT p.Id), 0) * 5.0)
+            + (COALESCE(COUNT(DISTINCT c.Id), 0) * 2.0)
+            + (COALESCE(SUM(CASE WHEN vt_received.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) * 10.0)
+            - (COALESCE(SUM(CASE WHEN vt_received.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) * 3.0)
+            + (u.Views * 0.05)
+            + (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400.0 * 0.01)
+        ) AS UserEngagementScore
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    LEFT JOIN Votes AS vt_received ON p.Id = vt_received.PostId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+AvgCommentScoreByPostType AS (
+    SELECT
+        p.PostTypeId,
+        AVG(c.Score) AS AverageCommentScore
+    FROM Posts AS p
+    JOIN Comments AS c ON p.Id = c.PostId
+    GROUP BY p.PostTypeId
+),
+PostComplexMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        COALESCE(p.Title, SUBSTRING(p.Body FROM 1 FOR 100)) AS PostTitleSnippet,
+        LENGTH(p.Body) AS BodyLength,
+        SUM(CASE WHEN c.Score > 0 THEN c.Score ELSE 0 END) AS TotalPositiveCommentScore,
+        COUNT(DISTINCT CASE WHEN ph_closed.PostHistoryTypeId = 10 THEN ph_closed.PostId END) AS TimesClosed,
+        COUNT(DISTINCT CASE WHEN ph_reopened.PostHistoryTypeId = 11 THEN ph_reopened.PostId END) AS TimesReopened,
+        (SELECT COUNT(a.Id) FROM Posts AS a WHERE a.ParentId = p.Id AND a.PostTypeId = 2) AS AnswerCountActual,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostScoreRankType,
+        COALESCE(NULLIF(p.AnswerCount, 0), (SELECT COUNT(a.Id) FROM Posts AS a WHERE a.ParentId = p.Id AND a.PostTypeId = 2 AND a.AcceptedAnswerId IS NULL)) AS AdjustedAnswerCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) AND ph.UserId <> p.OwnerUserId THEN 1 ELSE 0 END) AS HasExternalEditor,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.AnswerCount > 0 THEN 'Has Answers'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM Posts AS p
+    LEFT JOIN Comments AS c ON p.Id = c.PostId
+    LEFT JOIN PostHistory AS ph_closed ON p.Id = ph_closed.PostId AND ph_closed.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory AS ph_reopened ON p.Id = ph_reopened.PostId AND ph_reopened.PostHistoryTypeId = 11
+    LEFT JOIN PostHistory AS ph ON p.Id = ph.PostId
+    GROUP BY p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.CommentCount, p.FavoriteCount, p.OwnerUserId, p.AcceptedAnswerId, p.Title, p.Body, p.Tags, p.AnswerCount, p.ClosedDate
+),
+TagProcessing AS (
+    SELECT
+        p.Id AS PostId,
+        LOWER(TRIM(value)) AS TagName
+    FROM Posts AS p,
+    LATERAL (
+      SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS value
+    ) AS t
+    WHERE p.Tags IS NOT NULL AND p.Tags <> '' AND p.PostTypeId = 1
+),
+AggregatedTagStats AS (
+    SELECT
+        t.TagName,
+        t.Count AS GlobalTagCount,
+        COUNT(DISTINCT tp.PostId) AS TaggedPostsCountInSample,
+        AVG(pm.PostScore) AS AvgPostScoreForTag,
+        AVG(pm.ViewCount) AS AvgViewCountForTag,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC, COUNT(DISTINCT tp.PostId) DESC, AVG(pm.PostScore) DESC) AS TagPopularityRank
+    FROM Tags AS t
+    LEFT JOIN TagProcessing AS tp ON LOWER(t.TagName) = tp.TagName
+    LEFT JOIN PostComplexMetrics AS pm ON tp.PostId = pm.PostId
+    GROUP BY t.TagName, t.Count
+),
+RecentActivity AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        MAX(v.CreationDate) AS LatestVoteDate,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) AND ph.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY) THEN 1 ELSE 0 END) AS RecentEdits
+    FROM Posts AS p
+    LEFT JOIN Comments AS c ON p.OwnerUserId = c.UserId
+    LEFT JOIN Votes AS v ON p.OwnerUserId = v.UserId
+    LEFT JOIN PostHistory AS ph ON p.Id = ph.PostId AND p.OwnerUserId = ph.UserId
+    GROUP BY p.OwnerUserId
+),
+PostTopTag AS (
+    SELECT
+        tp.PostId,
+        FIRST_VALUE(ats.TagName) OVER (PARTITION BY tp.PostId ORDER BY ats.TagPopularityRank) AS TopTagName,
+        FIRST_VALUE(ats.TaggedPostsCountInSample) OVER (PARTITION BY tp.PostId ORDER BY ats.TagPopularityRank) AS TopTaggedPostsCount,
+        FIRST_VALUE(ats.AvgPostScoreForTag) OVER (PARTITION BY tp.PostId ORDER BY ats.TagPopularityRank) AS TopTagAvgPostScore
+    FROM TagProcessing AS tp
+    JOIN AggregatedTagStats AS ats ON tp.TagName = ats.TagName
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.UserEngagementScore,
+    uas.TotalPosts,
+    uas.TotalComments,
+    uas.UpVotesReceived,
+    uas.DownVotesReceived,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    ra.LatestPostDate,
+    ra.LatestCommentDate,
+    ra.LatestVoteDate,
+    ra.RecentEdits,
+    pm.PostId,
+    pm.PostTitleSnippet,
+    pm.PostStatus,
+    pm.PostScore,
+    pm.ViewCount,
+    pm.CommentCount,
+    pm.FavoriteCount,
+    pm.BodyLength,
+    COALESCE(ptg.TopTagName, 'untagged') AS TopContributingTag,
+    ptg.TopTaggedPostsCount,
+    ptg.TopTagAvgPostScore,
+    acs.AverageCommentScore AS AvgCommentScoreForPostType,
+    pm.TotalPositiveCommentScore,
+    pm.TimesClosed,
+    pm.TimesReopened,
+    pm.AnswerCountActual,
+    pm.PostScoreRankType,
+    pm.AdjustedAnswerCount,
+    pm.HasExternalEditor,
+    LAG(pm.PostScore, 1, 0) OVER (PARTITION BY uas.UserId ORDER BY pm.PostCreationDate) AS PreviousPostScore,
+    (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks AS pl WHERE pl.PostId = pm.PostId AND pl.LinkTypeId = 1) AS LinkedPostCount,
+    (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks AS pl WHERE pl.PostId = pm.PostId AND pl.LinkTypeId = 3) AS DuplicatePostCount,
+    COALESCE(NULLIF(CHAR_LENGTH(pm.PostTitleSnippet), 0), 10) * ABS(CAST(pm.PostScore AS DECIMAL)) AS WeightedPostTitleScore,
+    CASE
+        WHEN uas.Reputation > 10000 AND pm.HasExternalEditor = 0 THEN 'Trusted Author'
+        WHEN uas.Reputation > 5000 AND pm.PostScore >= 50 THEN 'High Impact Contributor'
+        WHEN pm.TimesClosed > 0 AND pm.TimesReopened > 0 THEN 'Contentious Post'
+        WHEN pm.BodyLength < 100 THEN 'Short Post'
+        ELSE 'Regular Activity'
+    END AS UserPostInteractionType
+FROM UserActivitySummary AS uas
+LEFT JOIN Posts AS main_p ON uas.UserId = main_p.OwnerUserId
+LEFT JOIN PostComplexMetrics AS pm ON main_p.Id = pm.PostId
+LEFT JOIN RecentActivity AS ra ON uas.UserId = ra.UserId
+LEFT JOIN PostTopTag AS ptg ON pm.PostId = ptg.PostId
+LEFT JOIN AvgCommentScoreByPostType AS acs ON pm.PostTypeId = acs.PostTypeId
+WHERE
+    uas.UserEngagementScore > 1000
+    AND pm.PostId IS NOT NULL
+    AND (
+        (pm.PostTypeId = 1 AND pm.ViewCount > 500 AND pm.PostScore > 5)
+        OR
+        (pm.PostTypeId = 2 AND pm.BodyLength > 200 AND pm.TotalPositiveCommentScore > 10)
+    )
+ORDER BY
+    uas.UserEngagementScore DESC,
+    pm.PostScore DESC,
+    ra.LatestPostDate DESC
+LIMIT 500;

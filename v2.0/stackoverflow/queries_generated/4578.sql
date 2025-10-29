@@ -1,0 +1,122 @@
+-- {"query": "4578.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1307} 
+
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.AnswerCount,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+      COUNT(c.Id) OVER (PARTITION BY p.OwnerUserId) AS UserCommentCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.OwnerUserId) AS UserUpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.OwnerUserId) AS UserDownVoteCount
+    FROM Posts AS p
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    LEFT JOIN Votes AS v
+      ON p.Id = v.PostId
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount
+  ),
+  UserActivity AS (
+    SELECT
+      rp.OwnerUserId,
+      rp.PostId,
+      rp.PostTypeId,
+      rp.PostCreationDate,
+      rp.PostScore,
+      rp.UserCommentCount,
+      rp.UserUpVoteCount,
+      rp.UserDownVoteCount,
+      CASE
+        WHEN rp.rn = 1 THEN 'MostRecent'
+        WHEN rp.rn BETWEEN 2 AND 5 THEN 'Top5Recent'
+        ELSE 'Other'
+      END AS RecentActivityCategory,
+      CASE
+        WHEN rp.PostTypeId = 1 AND rp.PostScore > 100 THEN 'HighScoreQuestion'
+        WHEN rp.PostTypeId = 2 AND rp.PostScore > 50 THEN 'HighScoreAnswer'
+        ELSE 'Normal'
+      END AS ScoreCategory,
+      CASE
+        WHEN rp.AnswerCount IS NULL THEN 0
+        ELSE rp.AnswerCount
+      END AS EffectiveAnswerCount
+    FROM RankedPosts AS rp
+  )
+SELECT
+  u.DisplayName,
+  ua.OwnerUserId,
+  COUNT(DISTINCT ua.PostId) AS TotalPosts,
+  SUM(CASE WHEN ua.RecentActivityCategory = 'MostRecent' THEN 1 ELSE 0 END) AS MostRecentPostCount,
+  SUM(CASE WHEN ua.RecentActivityCategory = 'Top5Recent' THEN 1 ELSE 0 END) AS Top5RecentPostCount,
+  AVG(CAST(ua.UserCommentCount AS DECIMAL(10, 2))) AS AvgUserCommentCountPerPost,
+  MAX(ua.UserUpVoteCount) AS MaxUserUpVotes,
+  MIN(ua.UserDownVoteCount) AS MinUserDownVotes,
+  SUM(CASE WHEN ua.ScoreCategory = 'HighScoreQuestion' THEN 1 ELSE 0 END) AS HighScoreQuestionCount,
+  SUM(CASE WHEN ua.ScoreCategory = 'HighScoreAnswer' THEN 1 ELSE 0 END) AS HighScoreAnswerCount,
+  AVG(CAST(ua.EffectiveAnswerCount AS DECIMAL(10, 2))) AS AvgAnswersPerPost,
+  COALESCE(SUM(CASE WHEN ua.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCount,
+  COALESCE(SUM(CASE WHEN ua.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerCount,
+  COUNT(DISTINCT CASE WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '' THEN u.Id ELSE NULL END) AS UsersWithWebsite,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = u.Id AND b.Class = 1
+  ) AS GoldBadgeCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = u.Id AND b.Class = 2
+  ) AS SilverBadgeCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = u.Id AND b.Class = 3
+  ) AS BronzeBadgeCount,
+  CASE
+    WHEN u.Reputation > 100000 THEN 'Legendary'
+    WHEN u.Reputation > 50000 THEN 'Expert'
+    WHEN u.Reputation > 10000 THEN 'Advanced'
+    WHEN u.Reputation > 1000 THEN 'Intermediate'
+    ELSE 'Beginner'
+  END AS ReputationLevel,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM PostLinks AS pl
+      WHERE
+        pl.PostId = ua.PostId AND pl.LinkTypeId = 3
+    ) THEN 'HasDuplicateLink'
+    ELSE 'NoDuplicateLink'
+  END AS DuplicateLinkStatus
+FROM Users AS u
+LEFT JOIN UserActivity AS ua
+  ON u.Id = ua.OwnerUserId
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.WebsiteUrl
+HAVING
+  COUNT(DISTINCT ua.PostId) > 10 AND SUM(CASE WHEN ua.PostTypeId = 1 THEN 1 ELSE 0 END) > 5
+ORDER BY
+  (SUM(CASE WHEN ua.ScoreCategory = 'HighScoreQuestion' THEN 1 ELSE 0 END) * 10) + (SUM(CASE WHEN ua.ScoreCategory = 'HighScoreAnswer' THEN 1 ELSE 0 END) * 5) DESC,
+  u.Reputation DESC;

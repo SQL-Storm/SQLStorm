@@ -1,0 +1,126 @@
+-- {"query": "4120.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1433} 
+WITH UserPostCounts AS (
+    SELECT
+        OwnerUserId,
+        COUNT(Id) AS PostCount,
+        SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+),
+UserBadgeCounts AS (
+    SELECT
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+),
+UserCommentActivity AS (
+    SELECT
+        UserId,
+        COUNT(Id) AS CommentCount,
+        SUM(CASE WHEN Score > 5 THEN 1 ELSE 0 END) AS HighScoreCommentCount
+    FROM Comments
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+),
+UserPostHistoryActivity AS (
+    SELECT
+        UserId,
+        COUNT(CASE WHEN PostHistoryTypeId IN (2, 5) THEN 1 END) AS BodyEditCount,
+        COUNT(CASE WHEN PostHistoryTypeId IN (1, 4) THEN 1 END) AS TitleEditCount
+    FROM PostHistory
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+),
+FeaturedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (ORDER BY p.FavoriteCount DESC, p.CreationDate DESC) AS Rank
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.FavoriteCount > 1000
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COALESCE(upc.PostCount, 0) AS TotalPosts,
+    COALESCE(upc.QuestionCount, 0) AS TotalQuestions,
+    COALESCE(upc.AnswerCount, 0) AS TotalAnswers,
+    COALESCE(ubc.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubc.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubc.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(uca.CommentCount, 0) AS TotalComments,
+    COALESCE(uca.HighScoreCommentCount, 0) AS HighScoreComments,
+    COALESCE(upha.BodyEditCount, 0) AS BodyEdits,
+    COALESCE(upha.TitleEditCount, 0) AS TitleEdits,
+    CASE
+        WHEN u.Reputation > 50000 THEN 'High Rep'
+        WHEN u.Reputation > 10000 THEN 'Medium Rep'
+        ELSE 'Low Rep'
+    END AS ReputationLevel,
+    CASE
+        WHEN u.WebsiteUrl IS NULL THEN 'No Website'
+        WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'Stack Overflow Related'
+        ELSE 'External Website'
+    END AS WebsiteCategory,
+    fq.Rank AS FeaturedQuestionRank,
+    CASE
+        WHEN u.DisplayName LIKE '%[0-9]%' THEN 'Contains Numbers'
+        ELSE 'No Numbers'
+    END AS DisplayNameFormat,
+    LOWER(SUBSTRING(u.AboutMe, 1, 50)) AS AboutMeSnippet,
+    CASE
+        WHEN DATEDIFF(day, u.CreationDate, GETDATE()) > 365 THEN 'Veteran User'
+        ELSE 'Newer User'
+    END AS UserTenure,
+    COALESCE(PostLinks.LinkCount, 0) AS OutgoingLinks
+FROM Users u
+LEFT JOIN UserPostCounts upc ON u.Id = upc.OwnerUserId
+LEFT JOIN UserBadgeCounts ubc ON u.Id = ubc.UserId
+LEFT JOIN UserCommentActivity uca ON u.Id = uca.UserId
+LEFT JOIN UserPostHistoryActivity upha ON u.Id = upha.UserId
+LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS LinkCount
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL AND Tags LIKE '%<sql>%'
+    GROUP BY OwnerUserId
+) AS PostLinks ON u.Id = PostLinks.OwnerUserId
+LEFT JOIN FeaturedQuestions fq ON u.Id = fq.Rank
+WHERE u.Id > 1000000
+  AND u.Reputation BETWEEN 1000 AND 100000
+  AND u.DisplayName IS NOT NULL
+  AND u.LastAccessDate > DATEADD(month, -6, GETDATE())
+  AND (upc.PostCount > 10 OR ubc.GoldBadges > 0)
+UNION
+SELECT
+    NULL AS UserId,
+    'Community User' AS DisplayName,
+    COUNT(p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    COUNT(c.Id) AS TotalComments,
+    SUM(CASE WHEN c.Score > 5 THEN 1 ELSE 0 END) AS HighScoreComments,
+    COUNT(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE NULL END) AS BodyEdits,
+    COUNT(CASE WHEN ph.PostHistoryTypeId IN (1, 4) THEN 1 ELSE NULL END) AS TitleEdits,
+    'Community Rep' AS ReputationLevel,
+    'N/A' AS WebsiteCategory,
+    NULL AS FeaturedQuestionRank,
+    'No Numbers' AS DisplayNameFormat,
+    NULL AS AboutMeSnippet,
+    'N/A' AS UserTenure,
+    0 AS OutgoingLinks
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+WHERE u.DisplayName = 'Community'
+GROUP BY u.DisplayName
+ORDER BY UserId NULLS LAST;

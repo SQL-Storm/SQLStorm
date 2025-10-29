@@ -1,0 +1,111 @@
+-- {"query": "5788.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 734} 
+WITH ranked_users AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    ROW_NUMBER() OVER (
+      PARTITION BY u.Location
+      ORDER BY u.Reputation DESC, u.LastAccessDate DESC
+    ) AS rn_by_location
+  FROM Users u
+  WHERE u.Reputation > 1000
+),
+posts_with_tags AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2) -- questions and answers
+),
+recent_comments AS (
+  SELECT
+    c.Id AS CommentId,
+    c.PostId,
+    c.UserId,
+    c.Text,
+    c.CreationDate,
+    c.Score,
+    c.ContentLicense
+  FROM Comments c
+  WHERE c.CreationDate > NOW() - INTERVAL '14 days'
+),
+tag_wids AS (
+  SELECT
+    t.Id,
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+cross_joined AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    p.Id AS PostId,
+    p.Title AS PostTitle,
+    p.Tags,
+    p.CreationDate AS PostDate,
+    p.Score AS PostScore,
+    c.CommentId,
+    c.Text AS CommentText,
+    c.CreationDate AS CommentDate,
+    tg.TagName,
+    tg.Count AS TagCount,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.Id
+      ORDER BY c.CreationDate, c.Score DESC NULLS LAST
+    ) AS post_comment_rank
+  FROM ranked_users u
+  LEFT JOIN posts_with_tags p ON p.OwnerUserId = u.Id
+  LEFT JOIN recent_comments c ON c.PostId = p.Id
+  LEFT JOIN (
+    SELECT unnest(string_to_array(REGEXP_REPLACE(p.Tags, '<|>', '', 'g'), ',')) AS TagName, p.Id
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+  ) AS t ON t.Id = p.Id
+  LEFT JOIN tag_wids tg ON tg.ExcerptPostId = p.Id OR tg.WikiPostId = p.Id
+)
+SELECT
+  COALESCE(r.UserId, ph.UserId) AS UserOrPostId,
+  r.UserName,
+  ph.PostId,
+  ph.PostTitle,
+  ph.PostDate,
+  ph.PostScore,
+  ph.CommentId,
+  ph.CommentText,
+  ph.CommentDate,
+  ph.TagName,
+  ph.TagCount,
+  ph.post_comment_rank
+FROM cross_joined ph
+LEFT JOIN recent_comments rc ON rc.PostId = ph.PostId
+ORDER BY ph.PostDate DESC, ph.PostScore DESC, ph.TagCount DESC
+LIMIT 100;

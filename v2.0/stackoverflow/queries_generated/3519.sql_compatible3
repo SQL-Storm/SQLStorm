@@ -1,0 +1,136 @@
+WITH recent_questions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.Tags, '') AS Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY
+),
+user_aggregates AS (
+    SELECT
+        u.Id                AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b   ON b.UserId = u.Id
+    LEFT JOIN Posts p    ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v    ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+tag_statistics AS (
+    SELECT
+        t.TagName,
+        COUNT(*)                               AS TagUsage,
+        SUM(p.Score)                           AS TotalScore,
+        MAX(p.CreationDate)                    AS LatestUse
+    FROM Tags t
+    JOIN Posts p
+      ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+     AND p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+recent_votes AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+                 WHEN v.VoteTypeId = 3 THEN -1
+                 ELSE 0 END) AS VoteBalance
+    FROM Votes v
+    WHERE v.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '7' DAY
+    GROUP BY v.PostId
+),
+main_result AS (
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.UpVotes,
+    ua.DownVotes,
+    ua.LastPostDate,
+    rq.Id                     AS RecentQuestionId,
+    rq.Title                  AS RecentQuestionTitle,
+    rq.CreationDate           AS RecentQuestionDate,
+    rq.Score                  AS RecentQuestionScore,
+    rq.ViewCount              AS RecentQuestionViews,
+    COALESCE(NULLIF(rq.Tags, ''), NULL) AS RawTags,
+    lt.TagExtracted,
+    ts.TagUsage,
+    ts.TotalScore,
+    ts.LatestUse,
+    COALESCE(rv.VoteBalance,0) AS RecentVoteBalance
+FROM user_aggregates ua
+LEFT JOIN recent_questions rq
+       ON rq.OwnerUserId = ua.UserId
+      AND rq.rn = 1
+LEFT JOIN LATERAL (
+        SELECT TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM UNNEST(string_to_array(rq.Tags, '><')))) AS TagExtracted
+) lt ON TRUE
+LEFT JOIN tag_statistics ts
+       ON ts.TagName = lt.TagExtracted
+LEFT JOIN recent_votes rv
+       ON rv.PostId = rq.Id
+WHERE ua.Reputation > 1000
+  AND (ua.GoldBadges > 0 OR ua.SilverBadges > 5)
+GROUP BY
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.UpVotes,
+    ua.DownVotes,
+    ua.LastPostDate,
+    rq.Id,
+    rq.Title,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.Tags,
+    lt.TagExtracted,
+    ts.TagUsage,
+    ts.TotalScore,
+    ts.LatestUse,
+    rv.VoteBalance
+ORDER BY ua.Reputation DESC, rq.CreationDate DESC
+)
+
+SELECT * FROM main_result
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS BIGINT),
+    CAST(NULL AS VARCHAR),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS BIGINT),
+    CAST(NULL AS BIGINT),
+    CAST(NULL AS TIMESTAMP),
+    CAST(NULL AS BIGINT),
+    CAST(NULL AS VARCHAR),
+    CAST(NULL AS TIMESTAMP),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS VARCHAR),
+    CAST(NULL AS VARCHAR),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER)
+WHERE NOT EXISTS (SELECT 1 FROM Users WHERE Reputation > 1000);

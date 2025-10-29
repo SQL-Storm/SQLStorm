@@ -1,0 +1,143 @@
+with RecursiveUserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class,
+        count(b.Id) as BadgeCount
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName, b.Class
+),
+UserBadgeRanks as (
+    select
+        UserId,
+        Class,
+        BadgeCount,
+        row_number() over (partition by UserId order by BadgeCount desc) as Rank
+    from RecursiveUserBadgeCounts
+),
+TopBadgesPerUser as (
+    select
+        UserId,
+        Class,
+        BadgeCount
+    from UserBadgeRanks
+    where Rank = 1
+),
+RecentQuestionsCTE as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentRank
+    from Posts p
+    where p.PostTypeId = 1 and p.CreationDate > (cast('2024-10-01' as date) - interval '180' day)
+),
+AnswersWithScores as (
+    select
+        a.Id,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate
+    from Posts a
+    where a.PostTypeId = 2
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        count(a.Id) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore
+    from Posts q
+    left join AnswersWithScores a on q.Id = a.QuestionId
+    where q.PostTypeId = 1
+    group by q.Id
+),
+ClosedQuestionReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    join CloseReasonTypes crt on try_cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+),
+DuplicateLinks as (
+    select pl.PostId, pl.RelatedPostId
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+TagRankings as (
+    select
+        t.TagName,
+        t.Count,
+        rank() over (order by t.Count desc) as RankByCount
+    from Tags t
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct q.Id) as QuestionCount,
+        count(distinct a.Id) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        max(p.CreationDate) as LastPostDate,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesReceived,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesReceived,
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Posts q on u.Id = q.OwnerUserId and q.PostTypeId = 1
+    left join Posts a on u.Id = a.OwnerUserId and a.PostTypeId = 2
+    left join Comments c on u.Id = c.UserId
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Reputation
+)
+select distinct
+    ru.DisplayName as UserName,
+    ua.Reputation,
+    tb.Class as TopBadgeClass,
+    tb.BadgeCount as TopBadgeCount,
+    ra.RecentRank,
+    qas.AnswerCount,
+    qas.AvgAnswerScore,
+    qas.MaxAnswerScore,
+    qas.MinAnswerScore,
+    cq.CloseReasonName,
+    dt.RankByCount as TagPopularityRank,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.ReputationRank,
+    case 
+        when ru.DisplayName is not null then concat('User: ', ru.DisplayName)
+        else 'Unknown User'
+    end as UserLabel,
+    case
+        when coalesce(qas.AnswerCount,0) > 10 and ua.Reputation > 10000 then 'Expert Contributor'
+        when coalesce(qas.AnswerCount,0) between 1 and 10 then 'Active Contributor'
+        else 'Casual User'
+    end as ContributionLevel
+from RecursiveUserBadgeCounts ru
+left join TopBadgesPerUser tb on ru.UserId = tb.UserId
+left join RecentQuestionsCTE ra on ru.UserId = ra.OwnerUserId and ra.RecentRank <= 5
+left join QuestionAnswerStats qas on ra.Id = qas.QuestionId
+left join ClosedQuestionReasons cq on ra.Id = cq.PostId and cq.CloseDate > (cast('2024-10-01' as date) - interval '90' day)
+left join Tags tag on position(concat('<', tag.TagName, '>') in coalesce(ra.Tags,'')) > 0
+left join TagRankings dt on tag.TagName = dt.TagName
+left join UserActivityWindow ua on ru.UserId = ua.UserId
+where ru.UserId in (
+    select distinct OwnerUserId from Posts where PostTypeId = 1 and CreationDate > (cast('2024-10-01' as date) - interval '180' day)
+)
+order by ua.ReputationRank, qas.AnswerCount desc, tb.BadgeCount desc
+limit 100;

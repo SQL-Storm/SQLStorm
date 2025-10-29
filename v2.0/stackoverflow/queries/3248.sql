@@ -1,0 +1,125 @@
+WITH
+UserStats AS (
+    SELECT
+        u.Id                                   AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate                         AS UserSince,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount
+    FROM Users u
+    WHERE u.Reputation > 10000
+),
+
+TopRankedUsers AS (
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        UserSince,
+        GoldBadges,
+        SilverBadges,
+        BronzeBadges,
+        QuestionCount,
+        AnswerCount,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, GoldBadges DESC) AS RankByRep
+    FROM UserStats
+    WHERE (GoldBadges + SilverBadges + BronzeBadges) > 10
+),
+
+RecentActivity AS (
+    SELECT
+        p.OwnerUserId                                 AS UserId,
+        MAX(p.CreationDate)                           AS LastPostDate,
+        MAX(v.CreationDate)                           AS LastVoteDate
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+TagUse AS (
+    SELECT
+        t.TagName,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionsWithTag,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswersWithTag
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    GROUP BY t.TagName
+),
+
+BadgeTagIntersection AS (
+    SELECT
+        b.UserId,
+        t.TagName,
+        b.Name AS BadgeName
+    FROM Badges b
+    JOIN Posts p ON p.OwnerUserId = b.UserId
+    JOIN Tags t ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE b.TagBased = TRUE
+),
+
+Combined AS (
+    SELECT
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        u.QuestionCount,
+        u.AnswerCount,
+        COALESCE(a.LastPostDate, TIMESTAMP '1970-01-01') AS LastPostDate,
+        COALESCE(a.LastVoteDate, TIMESTAMP '1970-01-01') AS LastVoteDate,
+        CASE
+            WHEN u.QuestionCount = 0 THEN NULL
+            ELSE ROUND(CAST(u.AnswerCount AS numeric) / NULLIF(u.QuestionCount,0), 2)
+        END AS AnswerToQuestionRatio,
+        (SELECT STRING_AGG(DISTINCT bt.BadgeName, ', ')
+         FROM BadgeTagIntersection bt
+         WHERE bt.UserId = u.UserId) AS TagBasedBadges,
+        u.RankByRep
+    FROM TopRankedUsers u
+    LEFT JOIN RecentActivity a ON a.UserId = u.UserId
+    WHERE u.RankByRep <= 50
+)
+
+SELECT UserId,
+       DisplayName,
+       Reputation,
+       GoldBadges,
+       SilverBadges,
+       BronzeBadges,
+       QuestionCount,
+       AnswerCount,
+       LastPostDate,
+       LastVoteDate,
+       AnswerToQuestionRatio,
+       TagBasedBadges,
+       RankByRep
+FROM Combined
+WHERE (Reputation > 20000 OR GoldBadges >= 5)
+
+UNION ALL
+
+SELECT UserId,
+       DisplayName,
+       Reputation,
+       GoldBadges,
+       SilverBadges,
+       BronzeBadges,
+       QuestionCount,
+       AnswerCount,
+       LastPostDate,
+       LastVoteDate,
+       AnswerToQuestionRatio,
+       TagBasedBadges,
+       RankByRep
+FROM Combined
+WHERE TagBasedBadges IS NOT NULL
+
+ORDER BY Reputation DESC, GoldBadges DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

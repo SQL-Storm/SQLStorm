@@ -1,0 +1,314 @@
+-- {"query": "403.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3100} 
+with
+-- recent active users with stats
+recent_users as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as location,
+    count(b.id) filter (where b.class = 1) as gold_badges,
+    count(b.id) filter (where b.class = 2) as silver_badges,
+    count(b.id) filter (where b.class = 3) as bronze_badges,
+    count(distinct date_trunc('day', p.creationdate)) as active_days,
+    row_number() over (order by u.reputation desc, u.id) as rn
+  from users u
+  left join badges b on b.userid = u.id
+  left join posts p on p.owneruserid = u.id
+    and p.creationdate >= now() - interval '365 days'
+    and p.posttypeid in (1,2)
+  where u.creationdate <= now() - interval '30 days'
+    and u.lastaccessdate >= now() - interval '90 days'
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.location
+),
+-- questions and their accepted answers enriched
+qa as (
+  select
+    q.id as question_id,
+    q.title,
+    q.owneruserid as asker_id,
+    q.creationdate as q_created,
+    q.score as q_score,
+    q.viewcount,
+    q.tags,
+    q.acceptedanswerid,
+    a.id as answer_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as a_created,
+    a.score as a_score,
+    extract(epoch from (a.creationdate - q.creationdate)) as time_to_accept_sec
+  from posts q
+  left join posts a on a.id = q.acceptedanswerid
+  where q.posttypeid = 1
+),
+-- per-question vote aggregates and favorite counts with null handling
+q_votes as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites
+  from votes v
+  group by v.postid
+),
+-- per-user rolling activity using window functions
+user_activity as (
+  select
+    p.owneruserid as userid,
+    date_trunc('month', p.creationdate) as month,
+    count(*) as posts_in_month,
+    sum(case when p.posttypeid = 1 then 1 else 0 end) as questions_in_month,
+    sum(case when p.posttypeid = 2 then 1 else 0 end) as answers_in_month
+  from posts p
+  where p.owneruserid is not null and p.owneruserid > 0
+  group by p.owneruserid, date_trunc('month', p.creationdate)
+),
+user_activity_roll as (
+  select
+    ua.userid,
+    ua.month,
+    posts_in_month,
+    sum(posts_in_month) over (partition by ua.userid order by ua.month rows between 5 preceding and current row) as posts_last_6m,
+    sum(questions_in_month) over (partition by ua.userid order by ua.month rows between 5 preceding and current row) as questions_last_6m,
+    sum(answers_in_month) over (partition by ua.userid order by ua.month rows between 5 preceding and current row) as answers_last_6m
+  from user_activity ua
+),
+-- duplicate links resolution
+dupe_clusters as (
+  select
+    pl.relatedpostid as canonical_id,
+    count(*) filter (where pl.linktypeid = 3) as dup_count,
+    min(pl.creationdate) as first_dup_seen
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.relatedpostid
+),
+-- tag extraction and normalization
+question_tags as (
+  select
+    q.id as question_id,
+    unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+  from posts q
+  where q.posttypeid = 1 and q.tags is not null and length(q.tags) > 2
+),
+-- top tags per user using dense_rank over counts
+user_top_tags as (
+  select
+    p.owneruserid as userid,
+    qt.tag,
+    count(*) as uses,
+    dense_rank() over (partition by p.owneruserid order by count(*) desc, min(p.id)) as rnk
+  from posts p
+  join question_tags qt on qt.question_id = p.id
+  where p.posttypeid = 1 and p.owneruserid is not null and p.owneruserid > 0
+  group by p.owneruserid, qt.tag
+),
+-- comments toxicity proxy and recent comment activity
+comment_stats as (
+  select
+    c.userid,
+    count(*) as total_comments,
+    avg(c.score) as avg_comment_score,
+    sum(case when c.score < 0 then 1 else 0 end) as neg_comments,
+    max(c.creationdate) as last_comment_at
+  from comments c
+  where c.userid is not null
+  group by c.userid
+),
+-- post history signals (closures, reopenings, protections)
+post_moderation as (
+  select
+    ph.postid,
+    sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as closes,
+    sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopens,
+    sum(case when ph.posthistorytypeid = 19 then 1 else 0 end) as protects,
+    max(ph.creationdate) filter (where ph.posthistorytypeid in (10,11,19)) as last_mod_action_at,
+    max(case when ph.posthistorytypeid = 10 then try_cast(ph.comment as int) end) as last_close_reason_code
+  from posthistory ph
+  group by ph.postid
+),
+-- answers per question with rank and acceptance flag
+answers as (
+  select
+    a.id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.creationdate,
+    a.score,
+    row_number() over (partition by a.parentid order by a.score desc, a.creationdate asc, a.id) as rank_by_score,
+    max(case when a.id = q.acceptedanswerid then 1 else 0 end) over (partition by a.parentid) as has_accepted
+  from posts a
+  join posts q on q.id = a.parentid and q.posttypeid = 1
+  where a.posttypeid = 2
+),
+-- expensive correlated subquery: compute user's median answer score
+user_answer_median as (
+  select
+    u.id as userid,
+    percentile_cont(0.5) within group (order by a.score) as median_answer_score
+  from users u
+  left join posts a on a.owneruserid = u.id and a.posttypeid = 2
+  group by u.id
+),
+-- CTE for recent hot questions using composite predicate
+hot_questions as (
+  select
+    q.id,
+    q.title,
+    q.score,
+    q.viewcount,
+    coalesce(qv.upvotes,0) - coalesce(qv.downvotes,0) as net_votes,
+    q.lastactivitydate
+  from posts q
+  left join q_votes qv on qv.postid = q.id
+  where q.posttypeid = 1
+    and q.creationdate >= now() - interval '30 days'
+    and (
+      q.score >= 5
+      or (coalesce(qv.upvotes,0) >= 10 and coalesce(qv.downvotes,0) <= 2)
+      or q.viewcount >= 1000
+    )
+),
+-- bring it all together with set operators to stress planner
+unioned_users as (
+  select id, displayname, reputation from recent_users where rn <= 100
+  union all
+  select u.id, u.displayname, u.reputation
+  from users u
+  where u.reputation >= (select percentile_cont(0.99) within group (order by reputation) from users)
+),
+-- final scoring per user-question interaction
+user_question_metrics as (
+  select
+    ru.id as userid,
+    qa.question_id,
+    qa.title,
+    qa.q_created,
+    qa.q_score,
+    qa.viewcount,
+    qa.tags,
+    qa.acceptedanswerid,
+    coalesce(qv.upvotes,0) as upvotes,
+    coalesce(qv.downvotes,0) as downvotes,
+    coalesce(qv.favorites,0) as favorites,
+    uc.posts_last_6m,
+    uc.questions_last_6m,
+    uc.answers_last_6m,
+    ct.total_comments,
+    ct.avg_comment_score,
+    ct.neg_comments,
+    pm.closes,
+    pm.reopens,
+    pm.protects,
+    pm.last_mod_action_at,
+    pm.last_close_reason_code,
+    dc.dup_count,
+    dc.first_dup_seen,
+    ut.tag as top_tag,
+    uam.median_answer_score,
+    case
+      when qa.acceptedanswerid is null then 0
+      when exists (
+        select 1
+        from answers ax
+        where ax.id = qa.acceptedanswerid
+          and ax.answerer_id = ru.id
+      ) then 1
+      else 0
+    end as accepted_by_user,
+    case
+      when qa.tags is null then 0
+      when position(lower(coalesce(ut.tag,'')) in lower(qa.tags)) > 0 then 1
+      else 0
+    end as top_tag_matches_question,
+    case
+      when qa.viewcount is null or qa.viewcount = 0 then null
+      else round((coalesce(qv.upvotes,0)::numeric - coalesce(qv.downvotes,0)::numeric) / greatest(qa.viewcount,1) * 1000, 4)
+    end as net_votes_per_k_view,
+    rank() over (order by coalesce(qv.upvotes,0) - coalesce(qv.downvotes,0) desc, qa.viewcount desc, qa.q_created desc) as q_popularity_rank
+  from unioned_users ru
+  join qa on qa.asker_id = ru.id
+  left join q_votes qv on qv.postid = qa.question_id
+  left join dupe_clusters dc on dc.canonical_id = qa.question_id
+  left join post_moderation pm on pm.postid = qa.question_id
+  left join comment_stats ct on ct.userid = ru.id
+  left join user_answer_median uam on uam.userid = ru.id
+  left join lateral (
+    select utr.tag
+    from user_top_tags utr
+    where utr.userid = ru.id
+      and utr.rnk = 1
+    limit 1
+  ) ut on true
+  left join lateral (
+    select uar.posts_last_6m, uar.questions_last_6m, uar.answers_last_6m
+    from user_activity_roll uar
+    where uar.userid = ru.id
+    order by uar.month desc
+    limit 1
+  ) uc on true
+),
+-- compute percentile buckets and windowed ranks on the fly
+scored as (
+  select
+    uqm.*,
+    ntile(20) over (order by coalesce(uqm.net_votes_per_k_view, 0) desc nulls last) as perf_bucket,
+    dense_rank() over (partition by coalesce(uqm.top_tag, 'ZZZ') order by uqm.q_popularity_rank) as rank_within_tag
+  from user_question_metrics uqm
+)
+select
+  s.userid,
+  u.displayname,
+  u.reputation,
+  s.question_id,
+  left(coalesce(s.title, ''), 200) as title_snippet,
+  s.top_tag,
+  s.q_score,
+  s.viewcount,
+  s.upvotes,
+  s.downvotes,
+  s.favorites,
+  s.net_votes_per_k_view,
+  s.perf_bucket,
+  s.rank_within_tag,
+  s.accepted_by_user,
+  s.top_tag_matches_question,
+  s.closes,
+  s.reopens,
+  s.protects,
+  coalesce(to_char(s.q_created, 'YYYY-MM-DD'), '0000-00-00') as q_created_date,
+  coalesce(to_char(s.last_mod_action_at, 'YYYY-MM-DD HH24:MI'), 'n/a') as last_mod_action_at,
+  coalesce(s.last_close_reason_code, -1) as last_close_reason_code,
+  coalesce(s.dc, 0) as dup_count_fallback,
+  case when s.first_dup_seen is null then 'never' else to_char(s.first_dup_seen, 'YYYY-MM-DD') end as first_dup_seen,
+  coalesce(s.posts_last_6m, 0) as posts_last_6m,
+  coalesce(s.questions_last_6m, 0) as questions_last_6m,
+  coalesce(s.answers_last_6m, 0) as answers_last_6m,
+  coalesce(s.total_comments, 0) as total_comments,
+  round(coalesce(s.avg_comment_score, 0)::numeric, 3) as avg_comment_score,
+  coalesce(s.neg_comments, 0) as neg_comments,
+  coalesce(s.median_answer_score, 0) as median_answer_score
+from scored s
+join users u on u.id = s.userid
+where
+  -- stress predicate logic with mixed nulls and functions
+  (
+    s.net_votes_per_k_view is not null
+    and s.net_votes_per_k_view > 0
+    and (s.perf_bucket <= 10 or s.rank_within_tag <= 50)
+  )
+  and coalesce(s.q_score, 0) + coalesce(s.upvotes, 0) - coalesce(s.downvotes, 0) >= 5
+  and (
+    s.accepted_by_user = 1
+    or (s.closes = 0 and coalesce(s.protects,0) = 0)
+  )
+  and not exists (
+    select 1
+    from hot_questions hq
+    where hq.id = s.question_id
+      and hq.lastactivitydate < now() - interval '7 days'
+  )
+order by s.perf_bucket, s.rank_within_tag, s.net_votes_per_k_view desc
+limit 500;

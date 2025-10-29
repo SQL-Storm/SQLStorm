@@ -1,0 +1,150 @@
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.CreationDate AS EditDate,
+        pht.Name AS EditType,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+UserPostInteraction AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        MAX(p.LastActivityDate) AS LastPostActivityDate
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.OwnerUserId, p.CreationDate
+),
+UserContributionStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT upi.PostId) AS QuestionCount,
+        SUM(COALESCE(upi.UpVoteCount,0)) AS TotalUpVotesReceived,
+        SUM(COALESCE(upi.DownVoteCount,0)) AS TotalDownVotesReceived,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(b.Date) AS LastBadgeDate,
+        AVG(p.Score) AS AvgQuestionScore
+    FROM Users u
+    LEFT JOIN UserPostInteraction upi ON u.Id = upi.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagPerformance AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagPostCount,
+        AVG(p.Score) AS AvgTagQuestionScore,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedQuestionCount,
+        COUNT(p.Id) AS TotalTagQuestions
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%' AND p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+),
+UserTags AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        TRIM(tag) AS TagName
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(
+            REGEXP_REPLACE(p.Tags, '^<|>$', '', 'g'),
+            '><'
+        ) AS tag
+    ) s
+    WHERE p.PostTypeId = 1
+)
+SELECT
+    CONCAT(u.DisplayName, ' (', u.Id, ')') AS UserIdentifier,
+    u.Id,
+    u.DisplayName,
+    ucs.Reputation,
+    ucs.QuestionCount,
+    ucs.TotalUpVotesReceived,
+    ucs.TotalDownVotesReceived,
+    ucs.BadgeCount,
+    CASE
+        WHEN ucs.LastBadgeDate IS NULL THEN 'Never'
+        ELSE CAST(ucs.LastBadgeDate AS VARCHAR)
+    END AS LastBadgeEarned,
+    ucs.AvgQuestionScore,
+    COALESCE(tp.AvgTagQuestionScore, 0.0) AS AverageTagScoreForUserTags,
+    COALESCE(tp.ClosedQuestionCount, 0) AS ClosedQuestionsInUserTags,
+    COALESCE(tp.TotalTagQuestions, 0) AS TotalQuestionsInUserTags,
+    (SELECT COUNT(*) FROM Posts p_sub WHERE p_sub.OwnerUserId = u.Id AND p_sub.AnswerCount > 0) AS QuestionsWithAnswers,
+    (
+        SELECT COUNT(*)
+        FROM Posts p_parent
+        LEFT JOIN Posts p_answer ON p_parent.Id = p_answer.ParentId AND p_parent.AcceptedAnswerId = p_answer.Id
+        WHERE p_parent.OwnerUserId = u.Id
+          AND p_parent.PostTypeId = 1
+          AND p_answer.Id IS NOT NULL
+    ) AS QuestionsWithAcceptedAnswer,
+    (
+        SELECT COUNT(*)
+        FROM Comments c_sub
+        WHERE c_sub.UserId = u.Id
+          AND c_sub.Score < 0
+    ) AS CommentsWithNegativeScore,
+    (
+        SELECT MAX(rpe.EditDate)
+        FROM RankedPostEdits rpe
+        WHERE rpe.UserId = u.Id AND rpe.EditType = 'Edit Body'
+    ) AS LastBodyEditDate,
+    (
+        SELECT COUNT(*)
+        FROM PostLinks pl
+        WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1)
+          AND pl.LinkTypeId = 3
+    ) AS DuplicateLinksCreatedByAuthor,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM Badges b_check WHERE b_check.UserId = u.Id AND b_check.Name LIKE '%Expert%') THEN 'Has Expert Badge'
+        ELSE 'No Expert Badge'
+    END AS ExpertBadgeStatus
+FROM Users u
+JOIN UserContributionStats ucs ON u.Id = ucs.UserId
+LEFT JOIN (
+    SELECT
+        ut.OwnerUserId AS UserId,
+        tp.TagName,
+        tp.AvgTagQuestionScore,
+        tp.ClosedQuestionCount,
+        tp.TotalTagQuestions
+    FROM UserTags ut
+    JOIN TagPerformance tp ON tp.TagName = ut.TagName
+    GROUP BY ut.OwnerUserId, tp.TagName, tp.AvgTagQuestionScore, tp.ClosedQuestionCount, tp.TotalTagQuestions
+) tp ON tp.UserId = u.Id
+WHERE ucs.Reputation > 1000
+  AND ucs.QuestionCount > 5
+  AND u.DisplayName IS NOT NULL
+  AND u.AboutMe IS NOT NULL
+  AND CHAR_LENGTH(u.AboutMe) > 50
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    ucs.Reputation,
+    ucs.QuestionCount,
+    ucs.TotalUpVotesReceived,
+    ucs.TotalDownVotesReceived,
+    ucs.BadgeCount,
+    ucs.LastBadgeDate,
+    ucs.AvgQuestionScore,
+    tp.AvgTagQuestionScore,
+    tp.ClosedQuestionCount,
+    tp.TotalTagQuestions,
+    CONCAT(u.DisplayName, ' (', u.Id, ')')
+ORDER BY ucs.Reputation DESC, ucs.QuestionCount DESC
+LIMIT 100;

@@ -1,0 +1,296 @@
+-- {"query": "1790.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4835} 
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserGivenUpVotes,
+        u.DownVotes AS UserGivenDownVotes,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COALESCE(AVG(c.Score), 0.0) AS AvgCommentScorePerUser,
+        SUM(CASE WHEN c.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 months') THEN 1 ELSE 0 END) AS RecentCommentsCount,
+        MAX(CASE WHEN u.WebsiteUrl IS NOT NULL AND LENGTH(TRIM(u.WebsiteUrl)) > 0 THEN 1 ELSE 0 END) AS HasWebsite,
+        MAX(CASE WHEN u.AboutMe IS NOT NULL AND LENGTH(TRIM(u.AboutMe)) > 0 THEN 1 ELSE 0 END) AS HasAboutMe,
+        -- Complex calculation for user engagement score
+        (u.Reputation * 0.4) + (u.UpVotes * 0.1) - (u.DownVotes * 0.05) + (COUNT(DISTINCT b.Id) * 10) + (COUNT(DISTINCT c.Id) * 0.5) + (COALESCE(u.Views, 0) * 0.001) AS UserEngagementScore
+    FROM
+        Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE
+        u.LastAccessDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months') -- Focus on recently active users
+        AND u.Reputation > 1000 -- Filter out very low-rep users for efficiency
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostPerformanceMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.Title,
+        p.Tags,
+        p.ParentId, -- Important for answers linking to questions
+        p.AcceptedAnswerId, -- Important for questions with accepted answers
+        COALESCE(p.CommunityOwnedDate, '9999-12-31 23:59:59') AS CommunityOwnedDate_Coalesced, -- Default far future date for NULLs
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostUpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostDownVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS PostFavoriteVotes,
+        COUNT(DISTINCT pl_linked.RelatedPostId) AS LinkedPostsCount,
+        COUNT(DISTINCT pl_duplicate.RelatedPostId) AS DuplicateLinksCount,
+        -- Extract tags and count them, handling potential NULLs or empty strings
+        CASE
+            WHEN p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 2
+            THEN ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'), 1)
+            ELSE 0
+        END AS TagCount,
+        -- Check for specific tags indicating technical complexity or popular topics
+        (p.Tags ILIKE '%<sql>%' OR p.Tags ILIKE '%<database>%' OR p.Tags ILIKE '%<performance>%' OR p.Tags ILIKE '%<optimization>%') AS HasRelevantTags,
+        -- Calculate a post impact score
+        (p.Score * 0.6) + (COALESCE(p.ViewCount, 0) * 0.01) + (COALESCE(p.AnswerCount, 0) * 0.3) + (p.CommentCount * 0.2) + (COALESCE(p.FavoriteCount, 0) * 0.5) AS PostImpactScore
+    FROM
+        Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostLinks pl_linked ON p.Id = pl_linked.PostId AND pl_linked.LinkTypeId = 1 -- 'Linked' posts
+    LEFT JOIN PostLinks pl_duplicate ON p.Id = pl_duplicate.PostId AND pl_duplicate.LinkTypeId = 3 -- 'Duplicate' posts
+    WHERE
+        p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years') -- Consider recent-ish posts for dynamic content
+        AND p.Score > 0 -- Only positive scored posts
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount, p.AnswerCount,
+        p.CommentCount, p.FavoriteCount, p.ClosedDate, p.Title, p.Tags, p.ParentId, p.AcceptedAnswerId, p.CommunityOwnedDate
+),
+PostHistoryAnalysis AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId AS HistoryEditorUserId,
+        ph.Comment,
+        ph.Text AS HistoryText,
+        ph.Id AS HistoryEntryId,
+        ph.RevisionGUID,
+        ph.ContentLicense,
+        crt.Name AS CloseReasonTypeName,
+        -- Window functions for sequential analysis of post history
+        LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PrevHistoryDate,
+        LEAD(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS NextHistoryDate,
+        COUNT(ph.Id) OVER (PARTITION BY ph.PostId) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) OVER (PARTITION BY ph.PostId) AS EditCount, -- Title, Body, Tags edits
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) OVER (PARTITION BY ph.PostId) AS CloseCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) OVER (PARTITION BY ph.PostId) AS ReopenCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (12,13) THEN 1 ELSE 0 END) OVER (PARTITION BY ph.PostId) AS DeleteUndeleteCount,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn_latest_history, -- Latest history event for the post
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn_latest_history_type -- Latest event for a specific history type
+    FROM
+        PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL AND ph.Comment ~ '^[0-9]+$' AND crt.Id = ph.Comment::smallint
+    WHERE
+        ph.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 years') -- Consider significant history
+)
+-- Main Query Path 1: Impactful Questions from Highly Engaged Users
+SELECT
+    ues.UserId,
+    ues.DisplayName AS UserDisplayName,
+    ues.Reputation,
+    ues.UserEngagementScore,
+    ues.GoldBadges,
+    'Question' AS InteractionType,
+    q.PostId AS InteractionPostId,
+    q.Title AS InteractionTitle,
+    q.PostCreationDate AS InteractionCreationDate,
+    q.PostImpactScore AS InteractionImpactScore,
+    q.Score AS InteractionScore,
+    q.ViewCount AS InteractionViewCount,
+    q.AnswerCount AS InteractionAnswerCount,
+    q.CommentCount AS InteractionCommentCount,
+    q.Tags AS InteractionTags,
+    q.HasRelevantTags AS InteractionHasRelevantTags,
+    q.LinkedPostsCount AS InteractionLinkedPostsCount,
+    q.DuplicateLinksCount AS InteractionDuplicateLinksCount,
+    a.PostId AS RelatedPostId, -- Accepted Answer Id
+    a.PostCreationDate AS RelatedPostCreationDate,
+    a.Score AS RelatedPostScore,
+    aa_owner.DisplayName AS RelatedPostOwnerDisplayName,
+    q_hist.TotalHistoryEvents AS InteractionTotalHistoryEvents,
+    q_hist.EditCount AS InteractionEditCount,
+    q_hist.CloseCount AS InteractionCloseCount,
+    q_hist.ReopenCount AS InteractionReopenCount,
+    COALESCE(q_hist.CloseReasonTypeName, 'N/A') AS InteractionLatestCloseReason,
+    -- Window function: Rank questions by impact for each user
+    RANK() OVER (PARTITION BY ues.UserId ORDER BY q.PostImpactScore DESC, q.ViewCount DESC, q.PostCreationDate DESC) AS UserInteractionRank,
+    -- Correlated Subquery: Average comment score for this specific post, considering only recent comments
+    (
+        SELECT COALESCE(AVG(c_sub.Score), 0.0)
+        FROM Comments c_sub
+        WHERE c_sub.PostId = q.PostId
+          AND c_sub.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+          AND c_sub.UserId IS NOT NULL
+    ) AS AvgPostCommentScore,
+    -- Complex calculation: Ratio of Question score to Accepted Answer score, handling division by zero and NULLs
+    CASE
+        WHEN a.Score IS NOT NULL AND a.Score > 0 THEN ROUND(CAST(q.Score AS NUMERIC) / a.Score, 2)
+        WHEN a.Score IS NOT NULL AND a.Score = 0 THEN 999.99 -- Indicate question much better than 0-score answer
+        ELSE NULL -- No accepted answer or other issue
+    END AS InteractionRelatedScoreRatio,
+    -- String manipulation: Extract first tag from interaction tags, handling empty or malformed tags
+    COALESCE(TRIM(SUBSTRING(q.Tags, POSITION('<' IN q.Tags) + 1, POSITION('>' IN q.Tags) - POSITION('<' IN q.Tags) - 1)), 'N/A') AS FirstInteractionTag
+FROM
+    UserEngagementSummary ues
+INNER JOIN
+    PostPerformanceMetrics q ON ues.UserId = q.OwnerUserId
+INNER JOIN
+    PostTypes pt_q ON q.PostTypeId = pt_q.Id AND pt_q.Name = 'Question' -- Explicitly filter for questions
+LEFT JOIN
+    PostPerformanceMetrics a ON q.AcceptedAnswerId = a.PostId AND a.PostTypeId = 2 -- Link to accepted answer
+LEFT JOIN
+    Users aa_owner ON a.OwnerUserId = aa_owner.Id -- Get accepted answer owner's display name
+LEFT JOIN
+    PostHistoryAnalysis q_hist ON q.PostId = q_hist.PostId AND q_hist.rn_latest_history = 1 -- Get latest history summary for the question
+WHERE
+    ues.Reputation > 7500 -- High reputation users
+    AND ues.UserEngagementScore > 750 -- Highly engaged users
+    AND q.PostImpactScore > 150 -- Very impactful questions
+    AND q.ViewCount > 7500 -- Well-viewed questions
+    AND q.AnswerCount IS NOT NULL AND q.AnswerCount > 3 -- Questions with sufficient answers
+    AND q.AcceptedAnswerId IS NOT NULL -- Only questions with an accepted answer
+    AND q.HasRelevantTags -- Must have relevant technical tags
+    AND (
+        SELECT COUNT(c_sub.Id) -- Correlated subquery for comment count matching a specific pattern
+        FROM Comments c_sub
+        WHERE c_sub.PostId = q.PostId
+          AND c_sub.Text ILIKE '%bug%'
+          AND c_sub.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '18 months')
+          AND c_sub.UserId IS NOT NULL
+    ) > 0 -- Questions with comments discussing 'bug' recently
+GROUP BY
+    ues.UserId, ues.DisplayName, ues.Reputation, ues.UserEngagementScore, ues.GoldBadges,
+    q.PostId, q.Title, q.PostCreationDate, q.PostImpactScore, q.Score, q.ViewCount,
+    q.AnswerCount, q.CommentCount, q.Tags, q.HasRelevantTags, q.LinkedPostsCount, q.DuplicateLinksCount,
+    a.PostId, a.PostCreationDate, a.Score, aa_owner.DisplayName,
+    q_hist.TotalHistoryEvents, q_hist.EditCount, q_hist.CloseCount, q_hist.ReopenCount, q_hist.CloseReasonTypeName
+HAVING
+    COUNT(DISTINCT q.PostId) > 0 -- Ensure at least one such question
+    AND ues.RecentCommentsCount > 5 -- User must have recently commented frequently
+    -- Further filtering on post history: ensure question has been edited at least twice
+    AND (SELECT qha.EditCount FROM PostHistoryAnalysis qha WHERE qha.PostId = q.PostId AND qha.rn_latest_history = 1) >= 2
+
+UNION ALL
+
+-- Main Query Path 2: Impactful Answers from Highly Engaged Users to Popular Questions
+SELECT
+    ues.UserId,
+    ues.DisplayName AS UserDisplayName,
+    ues.Reputation,
+    ues.UserEngagementScore,
+    ues.GoldBadges,
+    'Answer' AS InteractionType,
+    ans.PostId AS InteractionPostId,
+    ans.Title AS InteractionTitle, -- Title is technically null for answers, can use Parent Question Title
+    ans.PostCreationDate AS InteractionCreationDate,
+    ans.PostImpactScore AS InteractionImpactScore,
+    ans.Score AS InteractionScore,
+    NULL AS InteractionViewCount, -- Answers do not directly have ViewCount
+    NULL AS InteractionAnswerCount, -- Answers do not directly have AnswerCount
+    ans.CommentCount AS InteractionCommentCount,
+    ans.Tags AS InteractionTags, -- Tags are technically null for answers
+    ans.HasRelevantTags AS InteractionHasRelevantTags,
+    ans.LinkedPostsCount AS InteractionLinkedPostsCount,
+    ans.DuplicateLinksCount AS InteractionDuplicateLinksCount,
+    parent_q.PostId AS RelatedPostId, -- Parent Question Id
+    parent_q.PostCreationDate AS RelatedPostCreationDate,
+    parent_q.Score AS RelatedPostScore,
+    parent_q_owner.DisplayName AS RelatedPostOwnerDisplayName,
+    ans_hist.TotalHistoryEvents AS InteractionTotalHistoryEvents,
+    ans_hist.EditCount AS InteractionEditCount,
+    ans_hist.CloseCount AS InteractionCloseCount,
+    ans_hist.ReopenCount AS InteractionReopenCount,
+    COALESCE(ans_hist.CloseReasonTypeName, 'N/A') AS InteractionLatestCloseReason,
+    -- Window function: Rank answers by impact for each user
+    RANK() OVER (PARTITION BY ues.UserId ORDER BY ans.PostImpactScore DESC, ans.Score DESC, ans.PostCreationDate DESC) AS UserInteractionRank,
+    -- Correlated Subquery: Average comment score for this specific answer, including only recent comments from different users
+    (
+        SELECT COALESCE(AVG(c_sub.Score), 0.0)
+        FROM Comments c_sub
+        WHERE c_sub.PostId = ans.PostId
+          AND c_sub.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+          AND c_sub.UserId IS NOT NULL
+          AND c_sub.UserId <> ues.UserId -- Exclude comments from the answer owner
+    ) AS AvgPostCommentScore,
+    -- Ratio of Answer score to Parent Question score, with NULL handling
+    CASE
+        WHEN parent_q.Score IS NOT NULL AND parent_q.Score > 0 THEN ROUND(CAST(ans.Score AS NUMERIC) / parent_q.Score, 2)
+        WHEN parent_q.Score IS NOT NULL AND parent_q.Score = 0 THEN 999.99 -- Indicate answer much better than 0-score question
+        ELSE NULL
+    END AS InteractionRelatedScoreRatio,
+    -- String manipulation: Extract first tag from parent question tags, handling NULL or empty
+    COALESCE(TRIM(SUBSTRING(parent_q.Tags, POSITION('<' IN parent_q.Tags) + 1, POSITION('>' IN parent_q.Tags) - POSITION('<' IN parent_q.Tags) - 1)), 'N/A') AS FirstInteractionTag
+FROM
+    UserEngagementSummary ues
+INNER JOIN
+    PostPerformanceMetrics ans ON ues.UserId = ans.OwnerUserId
+INNER JOIN
+    PostTypes pt_ans ON ans.PostTypeId = pt_ans.Id AND pt_ans.Name = 'Answer'
+INNER JOIN
+    PostPerformanceMetrics parent_q ON ans.ParentId = parent_q.PostId AND parent_q.PostTypeId = 1 -- Join to the question this answer belongs to
+LEFT JOIN
+    Users parent_q_owner ON parent_q.OwnerUserId = parent_q_owner.Id
+LEFT JOIN
+    PostHistoryAnalysis ans_hist ON ans.PostId = ans_hist.PostId AND ans_hist.rn_latest_history = 1
+WHERE
+    ues.Reputation > 7500
+    AND ues.UserEngagementScore > 750
+    AND ans.PostImpactScore > 100
+    AND ans.Score > 50 -- High scoring answers
+    AND parent_q.ViewCount > 10000 -- Answers to very popular questions
+    AND ans.CreationDate = ( -- Correlated subquery to find if this is the latest and highest scored answer by this user for its parent question
+        SELECT MAX(pp_sub.CreationDate)
+        FROM PostPerformanceMetrics pp_sub
+        WHERE pp_sub.ParentId = parent_q.PostId
+          AND pp_sub.OwnerUserId = ues.UserId
+          AND pp_sub.PostTypeId = 2
+          AND pp_sub.Score = (
+              SELECT MAX(pp_sub_inner.Score)
+              FROM PostPerformanceMetrics pp_sub_inner
+              WHERE pp_sub_inner.ParentId = parent_q.PostId
+                AND pp_sub_inner.OwnerUserId = ues.UserId
+                AND pp_sub_inner.PostTypeId = 2
+          )
+    )
+    -- NULL logic example combined with a calculation: if PostImpactScore of answer is significantly higher than user's average
+    AND ans.PostImpactScore > (
+        SELECT COALESCE(AVG(pp_sub.PostImpactScore), 0) * 2.5 -- 2.5 times the user's average answer impact
+        FROM PostPerformanceMetrics pp_sub
+        WHERE pp_sub.OwnerUserId = ues.UserId
+          AND pp_sub.PostTypeId = 2
+          AND pp_sub.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+    )
+    AND parent_q.ClosedDate IS NULL -- Ensure the parent question is still open
+GROUP BY
+    ues.UserId, ues.DisplayName, ues.Reputation, ues.UserEngagementScore, ues.GoldBadges,
+    ans.PostId, ans.Title, ans.PostCreationDate, ans.PostImpactScore, ans.Score, ans.CommentCount,
+    ans.Tags, ans.HasRelevantTags, ans.LinkedPostsCount, ans.DuplicateLinksCount,
+    parent_q.PostId, parent_q.PostCreationDate, parent_q.Score, parent_q_owner.DisplayName,
+    ans_hist.TotalHistoryEvents, ans_hist.EditCount, ans_hist.CloseCount, ans_hist.ReopenCount, ans_hist.CloseReasonTypeName
+HAVING
+    ues.HasAboutMe = 1 -- User must have an 'About Me' section
+    AND ues.TotalCommentsMade > 100 -- User must be prolific commenter
+    AND (SELECT ans_hist_sub.TotalHistoryEvents FROM PostHistoryAnalysis ans_hist_sub WHERE ans_hist_sub.PostId = ans.PostId AND ans_hist_sub.rn_latest_history = 1) >= 1
+ORDER BY
+    UserEngagementScore DESC, Reputation DESC, UserInteractionRank ASC
+LIMIT 100;

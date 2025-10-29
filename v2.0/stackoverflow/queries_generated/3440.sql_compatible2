@@ -1,0 +1,148 @@
+WITH TagPosts AS (
+    SELECT
+        t.TagName,
+        p.Id AS PostId,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.AnswerCount,
+        p.Tags
+    FROM Tags t
+    JOIN Posts p
+        ON p.PostTypeId = 1
+       AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+),
+RankedTags AS (
+    SELECT
+        TagName,
+        COUNT(*)                                   AS QuestionCount,
+        AVG(Score)                                 AS AvgScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY Score) AS MedianScore,
+        SUM(ViewCount)                             AS TotalViews,
+        SUM(FavoriteCount)                         AS TotalFavorites,
+        ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) AS TagRank
+    FROM TagPosts
+    GROUP BY TagName
+),
+TopTags AS (
+    SELECT TagName FROM RankedTags WHERE TagRank <= 10
+),
+UserStats AS (
+    SELECT
+        u.Id                                        AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END)      AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN b.Id END)      AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN b.Id END)      AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b  ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RecentEdits AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate)                                 AS LastEditDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.UserId END) AS LastEditorUserId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+    GROUP BY ph.PostId
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId                                      AS QuestionId,
+        COUNT(*)                                        AS AnswerCount,
+        AVG(a.Score)                                    AS AvgAnswerScore,
+        MAX(a.CreationDate)                             AS MostRecentAnswerDate,
+        COUNT(DISTINCT a.OwnerUserId)                   AS DistinctAnswerers
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+TagSummary AS (
+    SELECT
+        t.TagName,
+        rt.QuestionCount,
+        rt.AvgScore,
+        rt.MedianScore,
+        rt.TotalViews,
+        rt.TotalFavorites,
+        top_user.Reputation                              AS TopUserReputation,
+        top_user.DisplayName                             AS TopUserName,
+        COALESCE(a.AnswerCount,0)                        AS TotalAnswers,
+        COALESCE(a.AvgAnswerScore,0)                     AS AvgAnswerScore,
+        COALESCE(a.DistinctAnswerers,0)                  AS DistinctAnswerers,
+        re.LastEditDate,
+        COALESCE(editor_user.Reputation,0)               AS LastEditorReputation
+    FROM TopTags t
+    JOIN RankedTags rt       ON rt.TagName = t.TagName
+    LEFT JOIN LATERAL (
+        SELECT us.UserId, us.DisplayName, us.Reputation, us.QuestionsAsked, us.AnswersGiven, us.GoldBadges, us.SilverBadges, us.BronzeBadges
+        FROM UserStats us
+        ORDER BY us.Reputation DESC
+        LIMIT 1
+    ) top_user ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT a.QuestionId, a.AnswerCount, a.AvgAnswerScore, a.MostRecentAnswerDate, a.DistinctAnswerers
+        FROM AnswerStats a
+        WHERE a.QuestionId = (
+            SELECT MIN(p.Id)
+            FROM Posts p
+            WHERE p.PostTypeId = 1
+              AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+        )
+    ) a ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT re.PostId, re.LastEditDate, re.LastEditorUserId
+        FROM RecentEdits re
+        WHERE re.PostId = (
+            SELECT MIN(p.Id)
+            FROM Posts p
+            WHERE p.PostTypeId = 1
+              AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+        )
+    ) re ON TRUE
+    LEFT JOIN Users editor_user ON editor_user.Id = re.LastEditorUserId
+    GROUP BY
+        t.TagName,
+        rt.QuestionCount,
+        rt.AvgScore,
+        rt.MedianScore,
+        rt.TotalViews,
+        rt.TotalFavorites,
+        top_user.Reputation,
+        top_user.DisplayName,
+        a.AnswerCount,
+        a.AvgAnswerScore,
+        a.DistinctAnswerers,
+        re.LastEditDate,
+        editor_user.Reputation
+)
+SELECT *
+FROM TagSummary
+ORDER BY QuestionCount DESC
+
+UNION ALL
+
+SELECT
+    'TOTAL'                         AS TagName,
+    SUM(QuestionCount)              AS QuestionCount,
+    AVG(AvgScore)                   AS AvgScore,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY MedianScore) AS MedianScore,
+    SUM(TotalViews)                 AS TotalViews,
+    SUM(TotalFavorites)             AS TotalFavorites,
+    NULL                            AS TopUserReputation,
+    NULL                            AS TopUserName,
+    NULL                            AS TotalAnswers,
+    NULL                            AS AvgAnswerScore,
+    NULL                            AS DistinctAnswerers,
+    NULL                            AS LastEditDate,
+    NULL                            AS LastEditorReputation
+FROM TagSummary
+WHERE TagName <> 'TOTAL'
+ORDER BY QuestionCount DESC;

@@ -1,0 +1,60 @@
+-- {"query": "6270.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 510} 
+
+SELECT 
+    u.DisplayName, 
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.LastActivityDate) AS LastActivityDate,
+    b.Name AS LatestBadge,
+    v.Name AS MostRecentVote,
+    t.TagName AS MostFrequentTag
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+        UserId, 
+        MAX(Date) AS MaxDate
+     FROM 
+        Badges
+     GROUP BY 
+        UserId) b2 ON u.Id = b2.UserId AND b.Date = b2.MaxDate
+LEFT JOIN 
+    (SELECT 
+        PostId, 
+        UserId, 
+        MAX(CreationDate) AS MaxVoteDate
+     FROM 
+        Votes
+     GROUP BY 
+        PostId, UserId) v1 ON u.Id = (SELECT UserId FROM Votes WHERE UserId = v1.UserId AND CreationDate = v1.MaxVoteDate)
+LEFT JOIN 
+    Votes v ON u.Id = v.UserId AND v.CreationDate = (SELECT MAX(CreationDate) FROM Votes WHERE UserId = u.Id)
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    (SELECT 
+        TagName, 
+        COUNT(*) AS TagCount
+     FROM 
+        Tags
+     GROUP BY 
+        TagName
+     ORDER BY 
+        TagCount DESC
+     LIMIT 1) t ON (SELECT TagName FROM Tags WHERE TagName = t.TagName)
+WHERE 
+    u.Reputation > 10000
+    AND p.LastActivityDate >= DATEADD(month, -12, CURRENT_TIMESTAMP)
+GROUP BY 
+    u.DisplayName, u.Reputation
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    HighestScoredPost DESC, 
+    TotalPosts DESC;

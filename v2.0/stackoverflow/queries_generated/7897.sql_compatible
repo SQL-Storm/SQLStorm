@@ -1,0 +1,185 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 5000 THEN 'Veteran'
+            WHEN u.Reputation >= 1000 THEN 'Contributor'
+            ELSE 'Member'
+        END AS UserTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        COALESCE(p.Title, '') AS CleanTitle,
+        COALESCE(p.Tags, '') AS CleanTags,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Rated'
+            WHEN p.Score > 50 THEN 'Well Rated'
+            WHEN p.Score > 10 THEN 'Moderate Rated'
+            ELSE 'Low Rated'
+        END AS RatingCategory,
+        DATE_PART('day', COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate) AS AgeInDays,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN (p.Score * 1.0 / p.AnswerCount)
+            ELSE 0
+        END AS AvgScorePerAnswer,
+        CASE 
+            WHEN RIGHT(p.Tags, 1) = '>' THEN LEFT(p.Tags, LENGTH(p.Tags) - 1)
+            ELSE p.Tags
+        END AS TrimmedTags
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score IS NOT NULL
+),
+TagFrequency AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        CASE WHEN t.IsRequired = 1 THEN 'Required' ELSE 'Optional' END AS TagStatus,
+        CASE WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only' ELSE 'Public' END AS AccessLevel,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS RankByFrequency
+    FROM Tags t
+    WHERE t.Count > 100
+),
+ActivitySummary AS (
+    SELECT 
+        ps.UserId,
+        ps.UserTier,
+        ps.RepRank,
+        ps.Reputation,
+        ps.PostCount,
+        ps.CommentCount,
+        ps.BadgeCount,
+        ps.Views,
+        ps.UpVotes,
+        ps.DownVotes,
+        COUNT(pa.PostId) AS ActivePosts,
+        COUNT(CASE WHEN pa.PostTypeId = 1 THEN 1 END) AS ActiveQuestions,
+        COUNT(CASE WHEN pa.PostTypeId = 2 THEN 1 END) AS ActiveAnswers,
+        COALESCE(SUM(pa.Score), 0) AS TotalScore,
+        SUM(pa.AnswerCount) AS TotalAnswers,
+        SUM(pa.CommentCount) AS TotalComments,
+        AVG(pa.Score) AS AvgScore,
+        MAX(pa.CreationDate) AS LatestActivity,
+        DATE_PART('day', MAX(pa.CreationDate) - MIN(pa.CreationDate)) AS ActivitySpanDays,
+        CASE 
+            WHEN COUNT(pa.PostId) > 10 AND AVG(pa.Score) > 50 THEN 'Highly Active'
+            WHEN COUNT(pa.PostId) > 5 AND AVG(pa.Score) > 20 THEN 'Moderately Active'
+            ELSE 'Low Activity'
+        END AS ActivityLevel
+    FROM UserStats ps
+    LEFT JOIN PostAnalysis pa ON ps.UserId = pa.OwnerUserId
+    GROUP BY ps.UserId, ps.UserTier, ps.RepRank, ps.Reputation, ps.PostCount, ps.CommentCount, ps.BadgeCount, ps.Views, ps.UpVotes, ps.DownVotes
+)
+SELECT 
+    'Performance Benchmark Report' AS ReportName,
+    CAST('2024-10-01 12:34:56' AS TIMESTAMP) AS ReportGenerated,
+    COUNT(*) AS TotalUsers,
+    COUNT(DISTINCT CASE WHEN ps.UserTier = 'Elite' THEN ps.UserId END) AS EliteUsers,
+    COUNT(DISTINCT CASE WHEN ps.UserTier = 'Veteran' THEN ps.UserId END) AS VeteranUsers,
+    COUNT(DISTINCT CASE WHEN ps.UserTier = 'Contributor' THEN ps.UserId END) AS ContributorUsers,
+    COUNT(DISTINCT CASE WHEN ps.UserTier = 'Member' THEN ps.UserId END) AS MemberUsers,
+    
+    AVG(ac.TotalScore) AS AvgTotalScore,
+    AVG(ac.ActivePosts) AS AvgActivePosts,
+    AVG(ac.ActiveQuestions) AS AvgActiveQuestions,
+    AVG(ac.ActiveAnswers) AS AvgActiveAnswers,
+    AVG(ac.AvgScore) AS AvgPostScore,
+    AVG(ac.ActivitySpanDays) AS AvgActivitySpan,
+    
+    COUNT(CASE WHEN ac.ActivityLevel = 'Highly Active' THEN 1 END) AS HighlyActiveUsers,
+    COUNT(CASE WHEN ac.ActivityLevel = 'Moderately Active' THEN 1 END) AS ModeratelyActiveUsers,
+    COUNT(CASE WHEN ac.ActivityLevel = 'Low Activity' THEN 1 END) AS LowActivityUsers,
+    
+    MAX(CASE WHEN ps.RepRank = 1 THEN ps.DisplayName END) AS TopUser,
+    MAX(CASE WHEN ps.RepRank = 2 THEN ps.DisplayName END) AS SecondUser,
+    MAX(CASE WHEN ps.RepRank = 3 THEN ps.DisplayName END) AS ThirdUser,
+    
+    COUNT(pa.PostId) AS TotalPosts,
+    COUNT(CASE WHEN pa.PostTypeId = 1 THEN 1 END) AS TotalQuestions,
+    COUNT(CASE WHEN pa.PostTypeId = 2 THEN 1 END) AS TotalAnswers,
+    
+    COUNT(tf.TagName) AS HighFrequencyTags,
+    AVG(tf.TagCount) AS AvgTagFrequency,
+    
+    (COUNT(pa.PostId) * 1.0 / NULLIF(COUNT(ps.UserId), 0)) AS PostsPerUser,
+    (SUM(pa.ViewCount) * 1.0 / NULLIF(SUM(pa.AnswerCount), 0)) AS AvgViewsPerAnswer,
+    
+    STRING_AGG(
+        CASE 
+            WHEN ps.UserTier = 'Elite' THEN ps.DisplayName || ' (' || CAST(ps.Reputation AS VARCHAR) || ')'
+            ELSE NULL
+        END, ', '
+    ) AS EliteUserList,
+    
+    (SELECT COUNT(*) FROM Posts p1 WHERE p1.Score > 1000) AS HighScorePosts,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.Score BETWEEN 100 AND 1000) AS MediumScorePosts,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.Score < 100) AS LowScorePosts,
+    
+    (SELECT ps2.DisplayName FROM UserStats ps2 WHERE ps2.Reputation = (SELECT MAX(u2.Reputation) FROM Users u2) LIMIT 1) AS MaxReputationUser,
+    
+    MAX(ROW_NUMBER() OVER (ORDER BY ps.Reputation DESC)) AS MaxReputationRank,
+    
+    SUM(CASE WHEN pa.AnswerCount > 10 THEN 1 ELSE 0 END) AS QuestionsWithManyAnswers,
+    SUM(CASE WHEN pa.AnswerCount = 0 THEN 1 ELSE 0 END) AS QuestionsWithNoAnswers,
+    SUM(CASE WHEN pa.CommentCount > 5 THEN 1 ELSE 0 END) AS HighlyCommentedPosts
+
+FROM UserStats ps
+FULL OUTER JOIN ActivitySummary ac ON ps.UserId = ac.UserId
+LEFT JOIN PostAnalysis pa ON ps.UserId = pa.OwnerUserId
+LEFT JOIN TagFrequency tf ON tf.RankByFrequency <= 10
+WHERE ps.UserId IS NOT NULL OR ac.UserId IS NOT NULL
+GROUP BY 
+    ps.UserTier,
+    ps.RepRank,
+    ps.Reputation,
+    ps.PostCount,
+    ps.CommentCount,
+    ps.BadgeCount,
+    ps.Views,
+    ps.UpVotes,
+    ps.DownVotes,
+    tf.TagName,
+    tf.TagCount,
+    tf.TagStatus,
+    tf.AccessLevel,
+    tf.RankByFrequency
+HAVING 
+    COUNT(ps.UserId) > 0 OR COUNT(ac.UserId) > 0
+ORDER BY 
+    ps.Reputation DESC,
+    ps.PostCount DESC,
+    ac.TotalScore DESC;

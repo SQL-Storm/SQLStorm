@@ -1,0 +1,300 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as primary_location,
+           row_number() over (order by u.creationdate desc, u.id desc) as rn
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+tag_exploded as (
+    select p.id as post_id,
+           lower(trim(tg)) as tag
+    from posts p,
+    lateral (
+      select unnest_tag as tg from (
+        select
+          case
+            when p.posttypeid = 1 and p.tags is not null and length(p.tags) > 2
+              then string_to_array(substring(p.tags, 2, length(p.tags) - 2), '><')
+            else array[]::text[]
+          end as arr
+      ) t
+      cross join unnest(t.arr) as u(unnest_tag)
+    ) te
+),
+user_post_activity as (
+    select p.owneruserid as user_id,
+           count(*) filter (where p.posttypeid = 1) as q_count,
+           count(*) filter (where p.posttypeid = 2) as a_count,
+           count(*) filter (where p.posttypeid not in (1,2) or p.posttypeid is null) as other_count,
+           sum(coalesce(p.score,0)) as total_post_score,
+           avg(nullif(p.viewcount,0)) as avg_views_nonzero,
+           max(p.lastactivitydate) as last_activity
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+accepted_answerers as (
+    select distinct a.owneruserid as user_id
+    from posts q
+    join posts a on a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+      and a.owneruserid is not null
+),
+commenters as (
+    select c.userid as user_id,
+           count(*) as comment_count,
+           sum(coalesce(c.score,0)) as comment_score
+    from comments c
+    where c.userid is not null
+    group by c.userid
+),
+vote_agg as (
+    select v.userid as user_id,
+           count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+           count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+           count(*) filter (where v.votetypeid = 5) as favorites_cast,
+           count(distinct case when v.votetypeid in (8,9) then v.postid end) as bounty_posts_touched,
+           sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+    from votes v
+    where v.userid is not null
+    group by v.userid
+),
+badge_agg as (
+    select b.userid as user_id,
+           count(*) as badges_total,
+           count(*) filter (where b.class = 1) as gold_count,
+           count(*) filter (where b.class = 2) as silver_count,
+           count(*) filter (where b.class = 3) as bronze_count,
+           bool_or(b.tagbased) as has_tag_badges,
+           max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+tag_engagement as (
+    select p.owneruserid as user_id,
+           count(*) filter (where te.tag = 'sql') as sql_posts,
+           count(*) filter (where te.tag = 'postgresql') as pg_posts,
+           count(*) filter (where te.tag = 'mysql') as mysql_posts,
+           count(distinct te.tag) as distinct_tags_used
+    from posts p
+    left join tag_exploded te on te.post_id = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+question_closure as (
+    select q.owneruserid as user_id,
+           count(*) filter (where q.closeddate is not null) as closed_questions,
+           count(*) filter (where q.closeddate is null) as open_questions,
+           count(*) as total_questions
+    from posts q
+    where q.posttypeid = 1 and q.owneruserid is not null
+    group by q.owneruserid
+),
+dup_network as (
+    select q.owneruserid as user_id,
+           count(*) filter (where pl.linktypeid = 3) as dup_links_out,
+           count(*) filter (where pl.linktypeid = 1) as linked_out
+    from postlinks pl
+    join posts q on q.id = pl.postid
+    where q.owneruserid is not null
+    group by q.owneruserid
+),
+edits_cte as (
+    select ph.userid as user_id,
+           count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+           count(*) filter (where ph.posthistorytypeid in (10)) as close_votes_events,
+           count(*) filter (where ph.posthistorytypeid in (11)) as reopen_events,
+           count(*) filter (where ph.posthistorytypeid in (12,13)) as delete_restore_events
+    from posthistory ph
+    where ph.userid is not null
+    group by ph.userid
+),
+activity_rank as (
+    select u.id as user_id,
+           dense_rank() over (order by coalesce(upa.total_post_score,0) desc,
+                                      coalesce(upa.q_count + upa.a_count,0) desc,
+                                      u.reputation desc) as activity_rank
+    from users u
+    left join user_post_activity upa on upa.user_id = u.id
+),
+recent_hot_questions as (
+    select q.id as question_id,
+           q.owneruserid as user_id,
+           q.score,
+           q.viewcount,
+           q.creationdate,
+           count(ans.id) as answer_count,
+           max(ans.score) as max_answer_score
+    from posts q
+    left join posts ans on ans.parentid = q.id and ans.posttypeid = 2
+    where q.posttypeid = 1
+      and q.creationdate >= (select max(creationdate) - interval '90 days' from posts)
+    group by q.id, q.owneruserid, q.score, q.viewcount, q.creationdate
+),
+hot_rank as (
+    select rhq.user_id,
+           percentile_disc(0.9) within group (order by coalesce(rhq.score,0)) as p90_q_score,
+           max(rhq.viewcount) as max_q_views_90d,
+           avg(rhq.answer_count) as avg_ans_count_90d
+    from recent_hot_questions rhq
+    group by rhq.user_id
+),
+string_fun as (
+    select u.id as user_id,
+           length(coalesce(u.aboutme,'')) as about_len,
+           position('sql' in lower(coalesce(u.aboutme,''))) > 0 as mentions_sql,
+           case
+             when coalesce(u.websiteurl,'') like 'http%' then split_part(replace(replace(replace(lower(u.websiteurl),'https://',''),'http://',''), 'www.', ''), '/', 1)
+             else null
+           end as website_host
+    from users u
+),
+active_recent_users as (
+    select ru.*
+    from recent_users ru
+    where ru.rn <= 5000
+),
+user_baseline as (
+    select aru.user_id,
+           aru.displayname,
+           aru.reputation,
+           aru.creationdate,
+           aru.primary_location,
+           coalesce(upa.q_count,0) as q_count,
+           coalesce(upa.a_count,0) as a_count,
+           coalesce(upa.other_count,0) as other_count,
+           coalesce(upa.total_post_score,0) as total_post_score,
+           upa.last_activity,
+           coalesce(c.comment_count,0) as comment_count,
+           coalesce(c.comment_score,0) as comment_score,
+           coalesce(v.upvotes_cast,0) as upvotes_cast,
+           coalesce(v.downvotes_cast,0) as downvotes_cast,
+           coalesce(v.favorites_cast,0) as favorites_cast,
+           coalesce(v.bounty_posts_touched,0) as bounty_posts_touched,
+           coalesce(v.bounty_total,0) as bounty_total,
+           coalesce(b.badges_total,0) as badges_total,
+           coalesce(b.gold_count,0) as gold_count,
+           coalesce(b.silver_count,0) as silver_count,
+           coalesce(b.bronze_count,0) as bronze_count,
+           coalesce(b.has_tag_badges,false) as has_tag_badges,
+           b.last_badge_date,
+           coalesce(tg.sql_posts,0) as sql_posts,
+           coalesce(tg.pg_posts,0) as pg_posts,
+           coalesce(tg.mysql_posts,0) as mysql_posts,
+           coalesce(tg.distinct_tags_used,0) as distinct_tags_used,
+           coalesce(qc.closed_questions,0) as closed_questions,
+           coalesce(qc.open_questions,0) as open_questions,
+           coalesce(qc.total_questions,0) as total_questions,
+           coalesce(dn.dup_links_out,0) as dup_links_out,
+           coalesce(dn.linked_out,0) as linked_out,
+           coalesce(e.edit_events,0) as edit_events,
+           coalesce(e.close_votes_events,0) as close_votes_events,
+           coalesce(e.reopen_events,0) as reopen_events,
+           coalesce(e.delete_restore_events,0) as delete_restore_events,
+           coalesce(hr.p90_q_score,0) as p90_q_score,
+           coalesce(hr.max_q_views_90d,0) as max_q_views_90d,
+           coalesce(hr.avg_ans_count_90d,0) as avg_ans_count_90d,
+           ab.about_len,
+           ab.mentions_sql,
+           ab.website_host,
+           case when aa.user_id is not null then 1 else 0 end as has_accepted_answer,
+           ar.activity_rank
+    from active_recent_users aru
+    left join user_post_activity upa on upa.user_id = aru.user_id
+    left join commenters c on c.user_id = aru.user_id
+    left join vote_agg v on v.user_id = aru.user_id
+    left join badge_agg b on b.user_id = aru.user_id
+    left join tag_engagement tg on tg.user_id = aru.user_id
+    left join question_closure qc on qc.user_id = aru.user_id
+    left join dup_network dn on dn.user_id = aru.user_id
+    left join edits_cte e on e.user_id = aru.user_id
+    left join hot_rank hr on hr.user_id = aru.user_id
+    left join string_fun ab on ab.user_id = aru.user_id
+    left join accepted_answerers aa on aa.user_id = aru.user_id
+    left join activity_rank ar on ar.user_id = aru.user_id
+),
+percentiles as (
+    select percentile_disc(0.5) within group (order by total_post_score) as p50_score,
+           percentile_disc(0.9) within group (order by total_post_score) as p90_score,
+           percentile_disc(0.99) within group (order by total_post_score) as p99_score,
+           percentile_disc(0.9) within group (order by q_count + a_count) as p90_posts
+    from user_baseline
+),
+role_classification as (
+    select ub.*,
+           case
+             when (ub.q_count + ub.a_count) = 0 then 'lurker'
+             when ub.a_count > ub.q_count * 2 and ub.total_post_score >= (select p90_score from percentiles) then 'answerer-elite'
+             when ub.q_count > ub.a_count * 2 and (ub.closed_questions * 1.0) / nullif(ub.total_questions,0) > 0.2 then 'questioner-controversial'
+             when ub.edit_events > greatest(ub.q_count + ub.a_count,1) then 'editor-heavy'
+             when ub.distinct_tags_used >= 20 then 'polyglot'
+             else 'balanced'
+           end as role_label,
+           case when ub.mentions_sql and (ub.sql_posts + ub.pg_posts + ub.mysql_posts) > 10 then 1 else 0 end as sql_fan_flag
+    from user_baseline ub
+),
+scored as (
+    select rc.*,
+           (
+             0.35 * ln(1 + greatest(rc.q_count + rc.a_count,0)) +
+             0.25 * ln(1 + greatest(rc.total_post_score,0)) +
+             0.15 * ln(1 + greatest(rc.comment_count,0)) +
+             0.10 * ln(1 + greatest(rc.upvotes_cast,0)) -
+             0.08 * ln(1 + greatest(rc.downvotes_cast,0)) +
+             0.07 * ln(1 + greatest(rc.badges_total,0))
+           ) +
+           case when rc.has_accepted_answer = 1 then 0.2 else 0.0 end +
+           case when rc.has_tag_badges then 0.1 else 0.0 end +
+           case when rc.sql_fan_flag = 1 then 0.05 else 0.0 end
+           as composite_score
+    from role_classification rc
+),
+ranked as (
+    select s.*,
+           row_number() over (order by s.composite_score desc, s.reputation desc, s.activity_rank asc, s.user_id) as overall_rank,
+           ntile(10) over (order by s.composite_score desc) as decile
+    from scored s
+),
+top_and_bottom as (
+    select * from ranked
+    where decile in (1,10)
+)
+select
+    tb.overall_rank,
+    tb.user_id,
+    tb.displayname,
+    tb.primary_location,
+    tb.reputation,
+    tb.role_label,
+    tb.sql_fan_flag,
+    tb.q_count, tb.a_count, tb.total_post_score,
+    tb.comment_count, tb.upvotes_cast, tb.downvotes_cast,
+    tb.badges_total, tb.gold_count, tb.silver_count, tb.bronze_count,
+    tb.distinct_tags_used,
+    tb.closed_questions, tb.open_questions,
+    tb.dup_links_out, tb.linked_out,
+    tb.edit_events,
+    tb.p90_q_score, tb.max_q_views_90d, tb.avg_ans_count_90d,
+    tb.about_len, coalesce(tb.website_host, 'unknown') as website_host,
+    tb.composite_score,
+    tb.decile,
+    case when tb.decile = 1 then 'top' else 'bottom' end as segment,
+    case when lower(coalesce(tb.displayname,'')) similar to '%(sql|db|data)%' then 1 else 0 end as name_data_flag,
+    case when tb.primary_location ilike '%usa%' or tb.primary_location ilike '%united states%' then 'US'
+         when tb.primary_location ilike '%india%' then 'IN'
+         when tb.primary_location ilike '%germany%' then 'DE'
+         when tb.primary_location ilike '%uk%' or tb.primary_location ilike '%united kingdom%' or tb.primary_location ilike '%england%' then 'UK'
+         else 'OTHER'
+    end as inferred_country_group
+from top_and_bottom tb
+where (
+    (tb.q_count + tb.a_count) >= (select p90_posts from percentiles)
+    or (tb.gold_count >= 1 and tb.p90_q_score >= (select p90_score from percentiles))
+    or (tb.role_label in ('editor-heavy','answerer-elite') and tb.edit_events >= tb.q_count + tb.a_count)
+)
+and coalesce(tb.primary_location,'') not ilike '%unknown%'
+order by tb.decile asc, tb.overall_rank asc
+limit 500;

@@ -1,0 +1,99 @@
+-- {"query": "3981.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1738} 
+
+WITH q_stats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(*)                                   AS QuestionCount,
+        AVG(p.Score)                               AS AvgQuestionScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+),
+a_stats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(*)                                   AS AnswerCount,
+        AVG(p.Score)                               AS AvgAnswerScore,
+        SUM(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswers
+    FROM Posts p
+    LEFT JOIN Posts q 
+           ON q.Id = p.ParentId 
+          AND q.PostTypeId = 1
+    WHERE p.PostTypeId = 2
+    GROUP BY p.OwnerUserId
+),
+badge_counts AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+recent_votes AS (
+    SELECT 
+        v.UserId,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+top_tags AS (
+    SELECT 
+        t.TagName,
+        t.Count
+    FROM Tags t
+    ORDER BY t.Count DESC
+    LIMIT 10
+)
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(q.QuestionCount, 0)               AS QuestionsPosted,
+    COALESCE(a.AnswerCount, 0)                 AS AnswersPosted,
+    ROUND(COALESCE(q.AvgQuestionScore, 0)::numeric, 2) AS AvgQScore,
+    ROUND(COALESCE(a.AvgAnswerScore, 0)::numeric, 2)   AS AvgAScore,
+    CASE 
+        WHEN a.AnswerCount = 0 THEN NULL 
+        ELSE ROUND((a.AcceptedAnswers::decimal / a.AnswerCount) * 100, 2) 
+    END                                         AS AcceptanceRatePct,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges,
+    rv.LastVoteDate,
+    STRING_AGG(DISTINCT t.TagName, ', ') 
+        FILTER (WHERE t.TagName IS NOT NULL) 
+        OVER (PARTITION BY u.Id)               AS PopularTags,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+    EXISTS (
+        SELECT 1 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+          AND p2.PostTypeId = 1 
+          AND p2.CreationDate > (CURRENT_DATE - INTERVAL '30 days')
+    )                                          AS HasRecentQuestion,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.UserId = u.Id 
+       AND c.CreationDate > (CURRENT_DATE - INTERVAL '90 days')
+    )                                          AS RecentCommentCount
+FROM Users u
+LEFT JOIN q_stats q      ON q.UserId = u.Id
+LEFT JOIN a_stats a      ON a.UserId = u.Id
+LEFT JOIN badge_counts bc ON bc.UserId = u.Id
+LEFT JOIN recent_votes rv ON rv.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT UNNEST(string_to_array(u.Tags, '><')) AS TagName
+) utag ON TRUE
+LEFT JOIN top_tags t ON t.TagName = utag.TagName
+WHERE u.Reputation >= 1000
+ORDER BY u.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE FALSE;

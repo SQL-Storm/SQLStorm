@@ -1,0 +1,99 @@
+-- {"query": "4180.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1213} 
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.Comment,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) AND ph.UserId IS NOT NULL
+),
+UserPostActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        AVG(p.Score) AS AveragePostScore,
+        MAX(p.CreationDate) AS LatestPostDate
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+),
+UserEditFrequency AS (
+    SELECT
+        rpe.UserId,
+        COUNT(DISTINCT rpe.PostId) AS PostsEdited,
+        COUNT(*) AS TotalEdits,
+        AVG(rpe.CreationDate::date - (SELECT MIN(CreationDate) FROM PostHistory ph_inner WHERE ph_inner.PostId = rpe.PostId)) AS AvgDaysToFirstEdit
+    FROM RankedPostEdits rpe
+    GROUP BY rpe.UserId
+),
+HighReputationUsers AS (
+    SELECT
+        Id,
+        DisplayName,
+        Reputation
+    FROM Users
+    WHERE Reputation > 50000
+),
+RecentQuestions AS (
+    SELECT
+        Id,
+        Title,
+        OwnerUserId,
+        AcceptedAnswerId,
+        CreationDate,
+        Score,
+        AnswerCount,
+        FavoriteCount
+    FROM Posts
+    WHERE PostTypeId = 1 AND CreationDate >= NOW() - INTERVAL '30 days'
+)
+SELECT
+    COALESCE(u.UserName, 'Unknown User') AS DisplayName,
+    upa.TotalPostsOwned,
+    upa.TotalQuestionsOwned,
+    upa.TotalAnswersOwned,
+    upa.AveragePostScore,
+    uef.PostsEdited,
+    uef.TotalEdits,
+    CASE
+        WHEN uef.TotalEdits > 0 THEN
+            CAST(uef.TotalEdits AS REAL) / uef.PostsEdited
+        ELSE
+            0
+    END AS AvgEditsPerPost,
+    COALESCE(uef.AvgDaysToFirstEdit, -1) AS AvgDaysToFirstEdit,
+    hr.Reputation AS HighReputation,
+    rq.Title AS RecentQuestionTitle,
+    rq.Score AS RecentQuestionScore,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rq.Id AND c.UserId IS NOT NULL) AS RecentQuestionCommentCount,
+    CASE
+        WHEN rq.AcceptedAnswerId IS NOT NULL THEN
+            (SELECT Score FROM Posts WHERE Id = rq.AcceptedAnswerId)
+        ELSE
+            NULL
+    END AS AcceptedAnswerScore,
+    COALESCE(rq.AnswerCount, 0) AS RecentAnswerCount,
+    COALESCE(rq.FavoriteCount, 0) AS RecentFavoriteCount,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = rq.Id AND pl.LinkTypeId = 3) THEN 'Is Duplicate'
+        ELSE 'Not a Duplicate'
+    END AS DuplicateStatus,
+    (SELECT COUNT(DISTINCT pht.UserId) FROM PostHistory pht WHERE pht.PostId = rq.Id AND pht.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35, 36)) AS ModerationActionsCount,
+    (SELECT STRING_AGG(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(ph.Comment, '','',''), ''['',''), '']'',''), ''{'',''), ''}'',''), '''',''), '"',''), ':', ''), '<',''), '>',''), ';',''), ', ') FROM PostHistory ph WHERE ph.PostId = rq.Id AND ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL) AS CloseReasons
+FROM Users u
+LEFT JOIN UserPostActivity upa ON u.Id = upa.UserId
+LEFT JOIN UserEditFrequency uef ON u.Id = uef.UserId
+LEFT JOIN HighReputationUsers hr ON u.Id = hr.Id
+LEFT JOIN RecentQuestions rq ON u.Id = rq.OwnerUserId
+WHERE u.Id IN (SELECT DISTINCT UserId FROM Votes WHERE VoteTypeId = 2) -- Users who have upvoted
+   OR u.Id IN (SELECT DISTINCT UserId FROM Votes WHERE VoteTypeId = 3) -- Users who have downvoted
+   OR u.Id IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE PostTypeId = 1 AND CreationDate >= NOW() - INTERVAL '7 days') -- Owners of recent questions
+ORDER BY upa.TotalPostsOwned DESC NULLS LAST, u.Reputation DESC NULLS LAST
+LIMIT 100;

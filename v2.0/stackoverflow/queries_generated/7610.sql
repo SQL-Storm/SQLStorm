@@ -1,0 +1,124 @@
+-- {"query": "7610.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1629} 
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS TotalQuestionScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS TotalAnswerScore,
+    COUNT(DISTINCT b.Id) AS BadgesCount,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = u.Id 
+     AND p2.PostTypeId = 1 
+     AND p2.CreationDate >= DATEADD(MONTH, -6, GETDATE())) AS RecentQuestions,
+    (SELECT COUNT(*) 
+     FROM Posts p3 
+     WHERE p3.OwnerUserId = u.Id 
+     AND p3.PostTypeId = 2 
+     AND p3.CreationDate >= DATEADD(MONTH, -6, GETDATE())) AS RecentAnswers,
+    (SELECT AVG(p4.Score) 
+     FROM Posts p4 
+     WHERE p4.OwnerUserId = u.Id 
+     AND p4.PostTypeId = 1) AS AvgQuestionScore,
+    (SELECT AVG(p5.Score) 
+     FROM Posts p5 
+     WHERE p5.OwnerUserId = u.Id 
+     AND p5.PostTypeId = 2) AS AvgAnswerScore,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Score >= 100 THEN p.Id END) AS HighScoredQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score >= 100 THEN p.Id END) AS HighScoredAnswers,
+    COALESCE(
+        (SELECT TOP 1 p6.Title 
+         FROM Posts p6 
+         WHERE p6.OwnerUserId = u.Id 
+         AND p6.PostTypeId = 1 
+         AND p6.Score = (SELECT MAX(p7.Score) FROM Posts p7 WHERE p7.OwnerUserId = u.Id AND p7.PostTypeId = 1)
+         ORDER BY p6.CreationDate DESC), 
+        'No High Scored Questions'
+    ) AS HighestScoredQuestion,
+    COALESCE(
+        (SELECT TOP 1 p8.Title 
+         FROM Posts p8 
+         WHERE p8.OwnerUserId = u.Id 
+         AND p8.PostTypeId = 2 
+         AND p8.Score = (SELECT MAX(p9.Score) FROM Posts p9 WHERE p9.OwnerUserId = u.Id AND p9.PostTypeId = 2)
+         ORDER BY p8.CreationDate DESC), 
+        'No High Scored Answers'
+    ) AS HighestScoredAnswer,
+    DATEDIFF(DAY, u.CreationDate, GETDATE()) AS AccountAgeDays,
+    CASE 
+        WHEN u.Reputation >= 10000 THEN 'Elite'
+        WHEN u.Reputation >= 1000 THEN 'Veteran'
+        WHEN u.Reputation >= 100 THEN 'Member'
+        ELSE 'Newbie'
+    END AS ReputationTier,
+    COALESCE(
+        (SELECT STRING_AGG(t.TagName, ', ') 
+         FROM Posts p10
+         CROSS APPLY STRING_SPLIT(p10.Tags, '>') AS tag
+         JOIN Tags t ON LTRIM(RTRIM(tag.value)) = t.TagName
+         WHERE p10.OwnerUserId = u.Id 
+         AND p10.PostTypeId = 1
+         GROUP BY p10.OwnerUserId), 
+        'No Tags'
+    ) AS TopTags,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpvotesReceived,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3) AS DownvotesReceived,
+    COALESCE(
+        (SELECT TOP 1 p11.Body 
+         FROM Posts p11 
+         WHERE p11.OwnerUserId = u.Id 
+         AND p11.PostTypeId = 2 
+         AND p11.Score = (SELECT MAX(p12.Score) FROM Posts p12 WHERE p12.OwnerUserId = u.Id AND p12.PostTypeId = 2)
+         ORDER BY p11.CreationDate DESC), 
+        'No Content'
+    ) AS BestAnswerBody,
+    COALESCE(
+        (SELECT TOP 1 p13.Body 
+         FROM Posts p13 
+         WHERE p13.OwnerUserId = u.Id 
+         AND p13.PostTypeId = 1 
+         AND p13.Score = (SELECT MAX(p14.Score) FROM Posts p14 WHERE p14.OwnerUserId = u.Id AND p14.PostTypeId = 1)
+         ORDER BY p13.CreationDate DESC), 
+        'No Content'
+    ) AS BestQuestionBody,
+    (SELECT COUNT(*) FROM Posts p15 WHERE p15.OwnerUserId = u.Id AND p15.CreationDate >= DATEADD(HOUR, -24, GETDATE())) AS PostsLast24Hours,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND c.CreationDate >= DATEADD(MONTH, -1, GETDATE())) AS CommentsLastMonth,
+    (SELECT COUNT(*) FROM Posts p16 WHERE p16.OwnerUserId = u.Id AND DATEDIFF(DAY, p16.CreationDate, GETDATE()) <= 30) AS PostsLast30Days,
+    COALESCE(
+        (SELECT AVG(DATEDIFF(DAY, p17.CreationDate, p17.LastEditDate)) 
+         FROM Posts p17 
+         WHERE p17.OwnerUserId = u.Id 
+         AND p17.LastEditDate IS NOT NULL
+         AND p17.LastEditDate > p17.CreationDate), 
+        0
+    ) AS AvgDaysToEdit,
+    (SELECT COUNT(DISTINCT p18.ParentId) FROM Posts p18 WHERE p18.OwnerUserId = u.Id AND p18.PostTypeId = 2) AS AnsweredQuestions,
+    COALESCE(
+        (SELECT MAX(DATEDIFF(DAY, p19.CreationDate, p19.LastActivityDate)) 
+         FROM Posts p19 
+         WHERE p19.OwnerUserId = u.Id), 
+        0
+    ) AS MaxPostActivityDays
+FROM Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+WHERE u.Id IN (
+    SELECT u2.Id
+    FROM Users u2
+    INNER JOIN Posts p2 ON p2.OwnerUserId = u2.Id
+    GROUP BY u2.Id
+    HAVING COUNT(DISTINCT p2.PostTypeId) > 1 AND COUNT(p2.Id) >= 100
+)
+AND u.Reputation >= 1000
+AND u.AccountId IS NOT NULL
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+HAVING COUNT(DISTINCT p.Id) >= 50
+ORDER BY TotalPosts DESC, u.Reputation DESC
+OFFSET 10000 ROWS
+FETCH NEXT 1000 ROWS ONLY;

@@ -1,0 +1,219 @@
+WITH UserBasicStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(COUNT(DISTINCT p.Id), 0) AS TotalPosts,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS TotalQuestions,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalAnswers,
+        COALESCE(AVG(p.Score), 0.0) AS AvgPostScore,
+        COALESCE(AVG(p.ViewCount), 0.0) AS AvgViewCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Posts q WHERE q.AcceptedAnswerId = p.Id) THEN 1 ELSE 0 END), 0) AS AnswersAcceptedByOthers,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalComments,
+        COALESCE(AVG(c.Score), 0.0) AS AvgCommentScore,
+        GREATEST(COALESCE(MAX(p.LastActivityDate), TIMESTAMP '1900-01-01'), COALESCE(MAX(c.CreationDate), TIMESTAMP '1900-01-01')) AS LastKnownActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.CreationDate, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+UserBadgeHistoryStats AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(COUNT(DISTINCT b.Id), 0) AS TotalBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        MAX(CASE WHEN b.Class = 1 THEN b.Date ELSE NULL END) AS LatestGoldBadgeDate,
+        COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END), 0) AS TotalEdits,
+        COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId = 12 THEN 1 ELSE 0 END), 0) AS TotalPostsDeleted,
+        COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END), 0) AS TotalPostsClosed,
+        COALESCE(SUM(CASE WHEN ph.Comment ILIKE '%migrat%' THEN 1 ELSE 0 END), 0) AS TotalMigrationHistory
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id
+),
+UserTopTags AS (
+    SELECT
+        OwnerUserId AS UserId,
+        Tag AS TopTag,
+        TagCount,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY TagCount DESC, Tag) AS rn
+    FROM (
+        SELECT
+            p.OwnerUserId,
+            TRIM(t) AS Tag,
+            COUNT(*) AS TagCount
+        FROM Posts p,
+             LATERAL (
+               SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), '><')) AS t
+             ) AS tags
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 2
+        GROUP BY p.OwnerUserId, TRIM(t)
+    ) AS TaggedPosts
+    WHERE OwnerUserId IS NOT NULL
+),
+CombinedUserData AS (
+    SELECT
+        ubs.UserId,
+        ubs.DisplayName,
+        UPPER(SUBSTRING(ubs.DisplayName FROM 1 FOR 1)) || SUBSTRING(ubs.DisplayName FROM 2 FOR CHAR_LENGTH(ubs.DisplayName)) AS FormattedDisplayName,
+        u.Location,
+        u.AboutMe,
+        ubs.UserCreationDate,
+        ubs.Reputation,
+        ubs.Views,
+        ubs.UpVotes,
+        ubs.DownVotes,
+        ubs.TotalPosts,
+        ubs.TotalQuestions,
+        ubs.TotalAnswers,
+        ubs.AvgPostScore,
+        ubs.AvgViewCount,
+        COALESCE(ubs.AnswersAcceptedByOthers * 100.0 / NULLIF(ubs.TotalAnswers, 0), 0.0) AS AnswerAcceptanceRate,
+        ubs.TotalComments,
+        ubs.AvgCommentScore,
+        ubs.LastKnownActivityDate,
+        ubhs.TotalBadges,
+        ubhs.GoldBadges,
+        ubhs.SilverBadges,
+        ubhs.BronzeBadges,
+        ubhs.LatestGoldBadgeDate,
+        ubhs.TotalEdits,
+        ubhs.TotalPostsDeleted,
+        ubhs.TotalPostsClosed,
+        ubhs.TotalMigrationHistory,
+        utt.TopTag,
+        utt.TagCount AS TopTagUsageCount,
+        ubs.Reputation * 1.0 / NULLIF(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - ubs.UserCreationDate)) / (60.0 * 60.0 * 24.0), 0) AS ReputationPerDaySinceCreation,
+        (CASE WHEN u.AboutMe ILIKE '%sql%' OR u.AboutMe ILIKE '%database%' THEN 'SQL/DB Enthusiast' ELSE 'Generalist' END) AS AboutMeCategory,
+        (SELECT COUNT(p.Id)
+         FROM Posts p
+         WHERE p.OwnerUserId = ubs.UserId
+           AND p.CreationDate > COALESCE(ubhs.LatestGoldBadgeDate, ubs.UserCreationDate)
+        ) AS PostsAfterLatestGoldBadge,
+        (ubs.Reputation * 0.5) + (ubs.TotalPosts * 0.2) + (ubs.TotalComments * 0.1) + (ubhs.TotalBadges * 0.2) AS EngagementScore
+    FROM UserBasicStats ubs
+    LEFT JOIN Users u ON ubs.UserId = u.Id
+    LEFT JOIN UserBadgeHistoryStats ubhs ON ubs.UserId = ubhs.UserId
+    LEFT JOIN UserTopTags utt ON ubs.UserId = utt.UserId AND utt.rn = 1
+),
+FinalUserMetrics AS (
+    SELECT
+        cud.UserId,
+        cud.FormattedDisplayName,
+        cud.Reputation,
+        cud.Location,
+        cud.AboutMeCategory,
+        cud.TotalPosts,
+        cud.TotalQuestions,
+        cud.TotalAnswers,
+        cud.AnswerAcceptanceRate,
+        cud.TotalBadges,
+        cud.GoldBadges,
+        cud.LatestGoldBadgeDate,
+        cud.TopTag,
+        cud.ReputationPerDaySinceCreation,
+        cud.PostsAfterLatestGoldBadge,
+        cud.EngagementScore,
+        RANK() OVER (ORDER BY cud.Reputation DESC, cud.EngagementScore DESC) AS GlobalReputationRank,
+        NTILE(10) OVER (ORDER BY cud.Reputation DESC) AS ReputationDecile,
+        -- compute average reputation per decile by joining a derived table
+        cud.DisplayName,
+        cud.UpVotes,
+        cud.DownVotes,
+        cud.TotalComments,
+        cud.TotalEdits,
+        cud.TotalPostsDeleted
+    FROM CombinedUserData cud
+    WHERE cud.TotalPostsDeleted < 5
+      AND cud.TotalPosts + cud.TotalComments > 5
+      AND cud.Reputation > 100
+      AND CHAR_LENGTH(COALESCE(TRIM(cud.DisplayName), '')) > 0
+),
+DecileStats AS (
+    SELECT
+        ReputationDecile,
+        AVG(Reputation) AS AvgReputationInDecile
+    FROM FinalUserMetrics
+    GROUP BY ReputationDecile
+),
+PreviousInDecile AS (
+    SELECT
+        f.UserId,
+        f.ReputationDecile,
+        LAG(f.Reputation, 1, 0) OVER (PARTITION BY f.ReputationDecile ORDER BY f.Reputation DESC) AS PreviousUserReputationInDecile
+    FROM FinalUserMetrics f
+)
+SELECT
+    f.UserId,
+    f.FormattedDisplayName,
+    f.Reputation,
+    f.GlobalReputationRank,
+    f.ReputationDecile,
+    d.AvgReputationInDecile,
+    p.PreviousUserReputationInDecile,
+    (CASE
+            WHEN f.GoldBadges >= 3 AND f.AnswerAcceptanceRate > 75 THEN 'High-Achiever Answerer'
+            WHEN f.TotalQuestions > 100 AND f.PostsAfterLatestGoldBadge > 50 THEN 'Prolific Post-Gold User'
+            WHEN f.Reputation > 50000 AND f.TopTag ILIKE 'sql%' THEN 'SQL Guru'
+            WHEN f.TotalPostsDeleted > 10 OR CHAR_LENGTH(COALESCE(f.Location, '')) < 3 THEN 'Needs Attention'
+            ELSE 'Standard Contributor'
+        END) AS UserCategory,
+    COALESCE(INITCAP(f.Location), 'Unknown Location') AS NormalizedLocation,
+    (f.UpVotes - f.DownVotes) * 1.0 / NULLIF(f.TotalPosts + f.TotalComments + f.TotalEdits, 0) AS NetVoteEfficiency,
+    f.TotalPostsDeleted,
+    f.TotalComments,
+    f.TotalEdits,
+    f.DisplayName,
+    'Top Gold Badge / High Acceptance User Group' AS AnalysisGroupDescription,
+    NULL AS SpecialFlag
+FROM FinalUserMetrics f
+LEFT JOIN DecileStats d ON f.ReputationDecile = d.ReputationDecile
+LEFT JOIN PreviousInDecile p ON f.UserId = p.UserId
+WHERE f.GoldBadges >= 1 AND f.AnswerAcceptanceRate > 60 AND f.Reputation > 5000
+
+UNION ALL
+
+SELECT
+    f.UserId,
+    f.FormattedDisplayName,
+    f.Reputation,
+    f.GlobalReputationRank,
+    f.ReputationDecile,
+    d.AvgReputationInDecile,
+    p.PreviousUserReputationInDecile,
+    (CASE
+            WHEN f.GoldBadges >= 3 AND f.AnswerAcceptanceRate > 75 THEN 'High-Achiever Answerer'
+            WHEN f.TotalQuestions > 100 AND f.PostsAfterLatestGoldBadge > 50 THEN 'Prolific Post-Gold User'
+            WHEN f.Reputation > 50000 AND f.TopTag ILIKE 'sql%' THEN 'SQL Guru'
+            WHEN f.TotalPostsDeleted > 10 OR CHAR_LENGTH(COALESCE(f.Location, '')) < 3 THEN 'Needs Attention'
+            ELSE 'Standard Contributor'
+        END) AS UserCategory,
+    COALESCE(INITCAP(f.Location), 'Unknown Location') AS NormalizedLocation,
+    (f.UpVotes - f.DownVotes) * 1.0 / NULLIF(f.TotalPosts + f.TotalComments + f.TotalEdits, 0) AS NetVoteEfficiency,
+    f.TotalPostsDeleted,
+    f.TotalComments,
+    f.TotalEdits,
+    f.DisplayName,
+    'High Activity / Less Badges User Group' AS AnalysisGroupDescription,
+    'ActiveContributor' AS SpecialFlag
+FROM FinalUserMetrics f
+LEFT JOIN DecileStats d ON f.ReputationDecile = d.ReputationDecile
+LEFT JOIN PreviousInDecile p ON f.UserId = p.UserId
+WHERE f.TotalPosts > 200 AND f.TotalBadges < 5 AND f.Reputation > 1000 AND
+      (CASE
+            WHEN f.GoldBadges >= 3 AND f.AnswerAcceptanceRate > 75 THEN 'High-Achiever Answerer'
+            WHEN f.TotalQuestions > 100 AND f.PostsAfterLatestGoldBadge > 50 THEN 'Prolific Post-Gold User'
+            WHEN f.Reputation > 50000 AND f.TopTag ILIKE 'sql%' THEN 'SQL Guru'
+            WHEN f.TotalPostsDeleted > 10 OR CHAR_LENGTH(COALESCE(f.Location, '')) < 3 THEN 'Needs Attention'
+            ELSE 'Standard Contributor'
+        END) NOT IN ('High-Achiever Answerer', 'SQL Guru')
+
+ORDER BY Reputation DESC, AnswerAcceptanceRate DESC, AnalysisGroupDescription, SpecialFlag
+LIMIT 2000;

@@ -1,0 +1,207 @@
+WITH UserContributionSummary AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPostsContributed,
+        0 AS TotalCommentsContributed,
+        SUM(COALESCE(p.Score, 0)) AS SumContentScore,
+        MAX(p.CreationDate) AS LastContentCreationDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+
+    UNION ALL
+
+    SELECT
+        c.UserId AS UserId,
+        0 AS TotalPostsContributed,
+        COUNT(DISTINCT c.Id) AS TotalCommentsContributed,
+        SUM(COALESCE(c.Score, 0)) AS SumContentScore,
+        MAX(c.CreationDate) AS LastContentCreationDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+AggregatedUserContributions AS (
+    SELECT
+        UserId,
+        SUM(TotalPostsContributed) AS TotalPosts,
+        SUM(TotalCommentsContributed) AS TotalComments,
+        SUM(SumContentScore) AS AggregatedContentScore,
+        MAX(LastContentCreationDate) AS LastContributionDate
+    FROM UserContributionSummary
+    GROUP BY UserId
+),
+UserActivityAndReputation AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserGivenUpVotes,
+        u.DownVotes AS UserGivenDownVotes,
+        COALESCE(auc.TotalPosts, 0) AS TotalPostsOwned,
+        COALESCE(auc.TotalComments, 0) AS TotalCommentsMade,
+        COALESCE(auc.AggregatedContentScore, 0) AS TotalContentScore,
+        MAX(GREATEST(ph.CreationDate, v.CreationDate, auc.LastContributionDate, u.LastAccessDate)) AS LatestUserActivity,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceivedByPosts,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceivedByPosts,
+        SUM(COALESCE(v.BountyAmount, 0)) AS TotalBountyEarned,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN AggregatedUserContributions auc ON u.Id = auc.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2,3,8,9)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes,
+             COALESCE(auc.TotalPosts, 0), COALESCE(auc.TotalComments, 0), COALESCE(auc.AggregatedContentScore, 0)
+),
+PostTaggingAndScoreAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(p.ClosedDate, TIMESTAMP '9999-12-31 23:59:59') AS ClosedDateSentinel,
+        p.Title,
+        p.Body,
+        p.Tags,
+        TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))) AS TagName,
+        (
+            SELECT AVG(sub_p.Score)
+            FROM Posts sub_p
+            WHERE sub_p.PostTypeId = p.PostTypeId
+              AND sub_p.OwnerUserId = p.OwnerUserId
+              AND sub_p.CreationDate BETWEEN p.CreationDate - INTERVAL '90 days' AND p.CreationDate + INTERVAL '90 days'
+              AND sub_p.Id != p.Id
+              AND sub_p.Score IS NOT NULL
+        ) AS OwnerRecentSimilarPostAvgScore_Correlated
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.PostTypeId IN (1, 2)
+      AND p.Tags IS NOT NULL
+      AND LENGTH(p.Tags) > 2
+      AND p.CreationDate >= DATE '2021-01-01'
+),
+PostHistoryAndLinkedItems AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEventCount,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        ARRAY_AGG(DISTINCT cr.Name) FILTER (WHERE cr.Name IS NOT NULL) AS CloseReasonNames,
+        STRING_AGG(DISTINCT CAST(pl_linked.RelatedPostId AS text), ', ') FILTER (WHERE pl_linked.LinkTypeId = 1) AS LinkedPostIds,
+        STRING_AGG(DISTINCT CAST(pl_duplicate.RelatedPostId AS text), ', ') FILTER (WHERE pl_duplicate.LinkTypeId = 3) AS DuplicatePostIds
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes cr ON ph.PostHistoryTypeId = 10 AND cr.Id = CAST(ph.Comment AS smallint)
+    LEFT JOIN PostLinks pl_linked ON ph.PostId = pl_linked.PostId AND pl_linked.LinkTypeId = 1
+    LEFT JOIN PostLinks pl_duplicate ON ph.PostId = pl_duplicate.PostId AND pl_duplicate.LinkTypeId = 3
+    GROUP BY ph.PostId
+),
+TagPerformanceMetrics AS (
+    SELECT
+        p.TagName,
+        COUNT(DISTINCT p.PostId) AS TotalPostsInTag,
+        AVG(p.PostScore) AS AvgScoreInTag,
+        AVG(p.PostViewCount) AS AvgViewCountInTag,
+        MAX(p.PostScore) AS MaxScoreInTag,
+        MIN(p.PostScore) AS MinScoreInTag,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.PostScore) AS MedianScoreInTag,
+        (
+            SELECT AVG(sub_pde.PostScore)
+            FROM PostTaggingAndScoreAnalysis sub_pde
+            WHERE sub_pde.TagName = p.TagName
+              AND sub_pde.PostTypeId = 1
+        ) AS AvgQuestionScoreForTag
+    FROM PostTaggingAndScoreAnalysis p
+    GROUP BY p.TagName
+    HAVING COUNT(DISTINCT p.PostId) > 100
+)
+SELECT
+    uar.UserId,
+    uar.DisplayName,
+    uar.Reputation,
+    uar.UserCreationDate,
+    uar.LatestUserActivity,
+    pts.PostId,
+    pts.PostTypeId,
+    pts.Title,
+    pts.PostCreationDate,
+    pts.PostScore,
+    pts.PostViewCount,
+    pts.AnswerCount,
+    pts.CommentCount,
+    pts.FavoriteCount,
+    pts.TagName,
+    pts.OwnerRecentSimilarPostAvgScore_Correlated,
+    phl.EditCount,
+    phl.CloseEventCount,
+    phl.CloseReasonNames,
+    phl.LinkedPostIds,
+    phl.DuplicatePostIds,
+    tpm.AvgScoreInTag,
+    tpm.AvgViewCountInTag,
+    tpm.MedianScoreInTag,
+    tpm.AvgQuestionScoreForTag,
+    uar.GoldBadges,
+    uar.SilverBadges,
+    uar.BronzeBadges,
+    RANK() OVER (PARTITION BY pts.PostTypeId ORDER BY pts.PostScore DESC, pts.PostViewCount DESC) AS PostRankInType,
+    DENSE_RANK() OVER (ORDER BY uar.Reputation DESC, uar.TotalPostsOwned DESC) AS GlobalUserRank,
+    LAG(pts.PostScore, 1, 0) OVER (PARTITION BY uar.UserId, pts.PostTypeId ORDER BY pts.PostCreationDate) AS PreviousPostScoreByUserAndType,
+    NTH_VALUE(pts.Title, 2) OVER (PARTITION BY pts.TagName ORDER BY pts.PostViewCount DESC) AS SecondMostViewedPostTitleInTag,
+    AVG(pts.PostScore) OVER (
+        PARTITION BY pts.PostTypeId, pts.TagName
+        ORDER BY pts.PostCreationDate
+        RANGE BETWEEN INTERVAL '6 months' PRECEDING AND CURRENT ROW
+    ) AS RollingAvgPostScoreByTagType,
+    COALESCE(NULLIF(REPLACE(REPLACE(LOWER(SUBSTRING(pts.Title FROM 1 FOR 100)), 'sql', 'database'), 'performance', 'speed'), ''), 'TITLE_MOD_EMPTY') AS ProcessedTitleFragment,
+    CASE
+        WHEN pts.PostTypeId = 1 AND pts.AcceptedAnswerId IS NOT NULL THEN 'Question_AcceptedAnswer'
+        WHEN pts.PostTypeId = 1 AND pts.ClosedDateSentinel <> TIMESTAMP '9999-12-31 23:59:59' THEN 'Question_Closed'
+        WHEN pts.PostTypeId = 1 AND pts.AnswerCount > 0 THEN 'Question_Answered'
+        WHEN pts.PostTypeId = 2 AND pts.ParentId IS NOT NULL THEN 'Answer_ToQuestion'
+        ELSE 'Other_Uncategorized'
+    END AS DetailedPostStatus,
+    ABS(uar.Reputation - COALESCE(tpm.AvgScoreInTag * 10, 0)) AS RepVsTagPerformanceDelta,
+    EXTRACT(DOW FROM uar.LastAccessDate) AS LastAccessDayOfWeek,
+    (
+        SELECT COUNT(l.RelatedPostId)
+        FROM PostLinks l
+        WHERE l.PostId = pts.PostId AND l.LinkTypeId = 1
+    ) AS OutgoingLinkCount,
+    (
+        SELECT MAX(sub_p.Score)
+        FROM Posts sub_p
+        WHERE sub_p.OwnerUserId = uar.UserId AND sub_p.PostTypeId = 1
+    ) AS MaxQuestionScoreByUser,
+    NULLIF(LPAD(CAST(ABS(uar.TotalPostsOwned) AS text), 5, '0'), '00000') AS PaddedPostCount_OrNullIfZero,
+    (pts.Body LIKE '%<pre><code>%</pre></code>%' OR pts.Body LIKE '%`%`%') AS ContainsCodeSnippet,
+    UPPER(SUBSTRING(COALESCE(uar.Location, 'UNKNOWN') FROM 1 FOR 10)) AS UserLocationPrefix
+FROM UserActivityAndReputation uar
+INNER JOIN PostTaggingAndScoreAnalysis pts ON uar.UserId = pts.OwnerUserId
+LEFT JOIN PostHistoryAndLinkedItems phl ON pts.PostId = phl.PostId
+LEFT JOIN TagPerformanceMetrics tpm ON pts.TagName = tpm.TagName
+WHERE uar.Reputation > 7500
+  AND uar.TotalPostsOwned >= 10
+  AND pts.PostCreationDate >= DATE '2022-06-01'
+  AND pts.PostScore > (
+      SELECT AVG(p2.PostScore) FROM PostTaggingAndScoreAnalysis p2 WHERE p2.PostTypeId = pts.PostTypeId
+  )
+  AND (phl.CloseEventCount IS NULL OR phl.CloseEventCount = 0 OR 'Duplicate' = ANY(phl.CloseReasonNames))
+  AND (pts.TagName LIKE '%sql%' OR pts.TagName LIKE '%database%')
+  AND uar.DisplayName IS NOT NULL AND uar.DisplayName <> '' AND uar.DisplayName ~* '^[A-Z][a-z]+(\s[A-Z][a-z]+)*$'
+ORDER BY uar.Reputation DESC, pts.PostCreationDate DESC, pts.PostScore DESC
+LIMIT 7500;

@@ -1,0 +1,209 @@
+-- {"query": "1808.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2974} 
+
+WITH UserActivitySummary AS (
+    -- Aggregates user-level metrics including post, comment, badge counts, and reputation tiering.
+    -- Includes a calculation for 'SelfEditCount' by joining PostHistory.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes,
+        U.DownVotes,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        AVG(CAST(P.Score AS NUMERIC)) AS AvgPostScore,
+        AVG(CAST(P.ViewCount AS NUMERIC)) AS AvgPostViewCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (5, 6, 8, 9) AND PH.UserId = U.Id THEN 1 ELSE 0 END) AS SelfEditCount, -- Initial Body (2), Edit Body (5), Edit Tags (6), Rollback Body (8), Rollback Tags (9)
+        CASE
+            WHEN U.Reputation >= 50000 THEN 'Legend'
+            WHEN U.Reputation >= 10000 THEN 'Guru'
+            WHEN U.Reputation >= 5000 THEN 'Expert'
+            WHEN U.Reputation >= 1000 THEN 'Journeyman'
+            WHEN U.Reputation >= 100 THEN 'Apprentice'
+            ELSE 'Novice'
+        END AS ReputationTier,
+        COUNT(DISTINCT CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN P.Id ELSE NULL END) AS QuestionsWithAcceptedAnswer
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId AND U.Id = PH.UserId -- Join for self-edits check
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.CreationDate, U.LastAccessDate
+),
+PostDetailsExtended AS (
+    -- Extracts detailed post information, calculates post age, average comment score (correlated subquery),
+    -- total bookmarks (correlated subquery), and primary tag from string.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        P.Body,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.AcceptedAnswerId,
+        (SELECT AVG(CAST(S.Score AS NUMERIC)) FROM Comments AS S WHERE S.PostId = P.Id) AS AvgCommentScore, -- Correlated subquery for average comment score
+        (SELECT COUNT(DISTINCT V.UserId) FROM Votes AS V WHERE V.PostId = P.Id AND V.VoteTypeId = 5) AS TotalBookmarks, -- Correlated subquery for distinct users who favorited
+        EXTRACT(EPOCH FROM (NOW() - P.CreationDate)) / 86400 AS PostAgeDays, -- Calculation: post age in days
+        COALESCE(SUBSTRING(P.Tags FROM '(?<=<)[^>]+(?=>)'), 'no-tag') AS PrimaryTag, -- String expression: extracts the first tag
+        LENGTH(P.Body) AS BodyLength,
+        LENGTH(P.Title) AS TitleLength,
+        P.ContentLicense
+    FROM Posts AS P
+    INNER JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+      AND P.CreationDate BETWEEN '2019-01-01' AND '2023-12-31'
+),
+RankedPostsByActivity AS (
+    -- Ranks posts by user and by tag, calculates a running score, and checks for duplicate status.
+    SELECT
+        PDE.*,
+        ROW_NUMBER() OVER (PARTITION BY PDE.OwnerUserId ORDER BY PDE.PostScore DESC, PDE.PostViewCount DESC, PDE.PostCommentCount DESC) AS Rn_UserTopPost, -- Window function
+        RANK() OVER (PARTITION BY PDE.PrimaryTag ORDER BY PDE.PostScore DESC, PDE.PostViewCount DESC) AS Rank_TagTopPost, -- Window function
+        SUM(PDE.PostScore) OVER (PARTITION BY PDE.OwnerUserId ORDER BY PDE.PostCreationDate) AS RunningUserScore, -- Window function: running sum of score
+        LAG(PDE.PostCreationDate, 1, PDE.PostCreationDate) OVER (PARTITION BY PDE.OwnerUserId ORDER BY PDE.PostCreationDate) AS PreviousPostDate, -- Window function: previous post date
+        (SELECT EXISTS(SELECT 1 FROM PostLinks PL WHERE PL.PostId = PDE.PostId AND PL.LinkTypeId = 3)) AS IsDuplicateSource -- Correlated subquery: checks if post is a duplicate source
+    FROM PostDetailsExtended AS PDE
+    WHERE PDE.PostScore > 0 OR PDE.PostViewCount > 500 -- Complicated predicate
+),
+TagPerformance AS (
+    -- Aggregates performance metrics for tags.
+    SELECT
+        PrimaryTag,
+        COUNT(PostId) AS TagPostCount,
+        AVG(PostScore) AS AvgTagScore,
+        AVG(PostViewCount) AS AvgTagViewCount,
+        MAX(PostScore) AS MaxTagScore,
+        MIN(PostCreationDate) AS FirstTagPostDate
+    FROM PostDetailsExtended
+    WHERE PrimaryTag IS NOT NULL AND PrimaryTag != 'no-tag'
+    GROUP BY PrimaryTag
+    HAVING COUNT(PostId) > 500 AND AVG(PostScore) > 10 -- Complicated HAVING clause
+)
+-- Main query: Combines user activity, detailed post metrics, and tag performance.
+-- Features complex CASE statements, date calculations, string operations, and NULL logic.
+SELECT
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.ReputationTier,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.AvgPostScore,
+    UAS.SelfEditCount,
+    RPBA.PostId,
+    RPBA.PostTypeName,
+    RPBA.Title,
+    RPBA.PrimaryTag,
+    RPBA.PostScore,
+    RPBA.PostViewCount,
+    RPBA.PostCommentCount,
+    RPBA.TotalBookmarks,
+    RPBA.PostAgeDays,
+    RPBA.AvgCommentScore,
+    RPBA.Rn_UserTopPost,
+    RPBA.Rank_TagTopPost,
+    RPBA.RunningUserScore,
+    EXTRACT(EPOCH FROM (RPBA.PostCreationDate - RPBA.PreviousPostDate)) / 3600 AS TimeSincePreviousPostHours, -- Date calculation: time between posts in hours
+    TP.TagPostCount,
+    TP.AvgTagScore,
+    TP.MaxTagScore,
+    TP.FirstTagPostDate,
+    CASE
+        WHEN RPBA.PostScore > TP.AvgTagScore * 1.5 AND RPBA.PostAgeDays < 90 THEN 'High Impact Recent Post' -- Complex expression
+        WHEN RPBA.IsDuplicateSource THEN 'Duplicate Source Identified'
+        WHEN RPBA.ClosedDate IS NOT NULL THEN 'Closed Post'
+        WHEN RPBA.AcceptedAnswerId IS NOT NULL THEN 'Answered Question'
+        ELSE 'Standard Post'
+    END AS PostStatusFlag, -- Complex CASE expression
+    (SELECT COUNT(DISTINCT PH.Id) FROM PostHistory AS PH WHERE PH.PostId = RPBA.PostId AND PH.PostHistoryTypeId IN (10, 11)) AS CloseReopenHistoryCount, -- Correlated subquery for post close/reopen history
+    RPBA.BodyLength,
+    RPBA.TitleLength,
+    UAS.QuestionsWithAcceptedAnswer,
+    (UAS.UserViews + UAS.UpVotes - UAS.DownVotes) * (UAS.TotalPosts + UAS.TotalComments) AS UserEngagementMetric, -- Arithmetic expression
+    COALESCE(UAS.Location, 'Unknown Location') AS UserLocation, -- NULL logic
+    RPBA.ContentLicense
+FROM UserActivitySummary AS UAS
+INNER JOIN RankedPostsByActivity AS RPBA ON UAS.UserId = RPBA.OwnerUserId
+LEFT JOIN TagPerformance AS TP ON RPBA.PrimaryTag = TP.PrimaryTag
+WHERE
+    UAS.Reputation >= 1000 AND UAS.SelfEditCount >= 3 -- Complicated predicate
+    AND RPBA.Rn_UserTopPost <= 3 -- Only top 3 posts per user based on rank
+    AND (RPBA.PostScore > 20 OR RPBA.PostViewCount > 1000)
+    AND RPBA.Body LIKE '%sql query%' ESCAPE '\' -- String predicate with escape character
+    AND RPBA.PostTypeName != 'Wiki' AND RPBA.PostTypeName != 'TagWiki' -- Exclude specific post types
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Comments AS C
+        WHERE C.PostId = RPBA.PostId
+          AND C.Text ILIKE '%spam%' -- Correlated subquery with case-insensitive string match
+    )
+    AND (RPBA.AvgCommentScore IS NULL OR RPBA.AvgCommentScore >= 1) -- NULL logic combined with value check
+    AND RPBA.TotalBookmarks > 0
+    AND RPBA.PostCreationDate >= UAS.UserCreationDate -- Ensure post after user creation
+    AND RPBA.LastEditDate IS NOT NULL -- Posts must have been edited
+    AND RPBA.LastActivityDate > RPBA.PostCreationDate -- Post must have seen some activity
+    AND (RPBA.ClosedDate IS NULL OR RPBA.ClosedDate > RPBA.LastActivityDate) -- If closed, it was after last activity
+UNION ALL -- Set operator: Combines with another distinct query for high-reputation users and specific badge absence.
+SELECT
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.ReputationTier,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.AvgPostScore,
+    UAS.SelfEditCount,
+    NULL AS PostId, -- NULL for columns not applicable in this aggregated view
+    'Aggregated Tag Summary (Gurus)' AS PostTypeName,
+    'High-level performance metrics for tag: ' || TP.PrimaryTag AS Title, -- String concatenation
+    TP.PrimaryTag,
+    TP.AvgTagScore AS PostScore,
+    TP.AvgTagViewCount AS PostViewCount,
+    NULL AS PostCommentCount,
+    NULL AS TotalBookmarks,
+    NULL AS PostAgeDays,
+    NULL AS AvgCommentScore,
+    NULL AS Rn_UserTopPost,
+    NULL AS Rank_TagTopPost,
+    NULL AS RunningUserScore,
+    NULL AS TimeSincePreviousPostHours,
+    TP.TagPostCount,
+    TP.AvgTagScore,
+    TP.MaxTagScore,
+    TP.FirstTagPostDate,
+    'Tag Summary by Guru' AS PostStatusFlag,
+    NULL AS CloseReopenHistoryCount,
+    NULL AS BodyLength,
+    NULL AS TitleLength,
+    UAS.QuestionsWithAcceptedAnswer,
+    (UAS.UserViews + UAS.UpVotes - UAS.DownVotes) * (UAS.TotalPosts + UAS.TotalComments) AS UserEngagementMetric,
+    COALESCE(UAS.Location, 'Unknown Location') AS UserLocation,
+    NULL AS ContentLicense
+FROM UserActivitySummary AS UAS
+INNER JOIN TagPerformance AS TP ON UAS.ReputationTier = 'Guru' -- Only "Guru" tier users
+WHERE
+    UAS.Reputation >= 10000 -- Explicit reputation check for Gurus
+    AND UAS.TotalBadges > 100 -- Gurus with many badges
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Badges AS B
+        WHERE B.UserId = UAS.UserId
+          AND B.Name ILIKE '%suffering%' -- Correlated subquery: exclude users with "Suffering" badge (example)
+    )
+ORDER BY Reputation DESC, UserEngagementMetric DESC, PostScore DESC, PostId NULLS LAST;

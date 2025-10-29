@@ -1,0 +1,140 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END)         AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END)         AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END)         AS BronzeBadges,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END)   AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 AND p.AcceptedAnswerId IS NOT NULL THEN 1 END) AS AcceptedAnswers,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END)   AS AnswerCount,
+        AVG(v.VoteDiff) OVER (PARTITION BY u.Id)       AS AvgVoteDiff
+    FROM Users u
+    LEFT JOIN Badges b       ON b.UserId = u.Id
+    LEFT JOIN Posts p        ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1
+                     WHEN VoteTypeId = 3 THEN -1
+                     ELSE 0 END)                         AS VoteDiff
+        FROM Votes
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagStats AS (
+    SELECT
+        t.TagName,
+        t.Count                                   AS TagUseCount,
+        COALESCE(qc.TotalQuestionScore,0)         AS TagQuestionScore,
+        COALESCE(ac.AnswerCount,0)                AS TagAnswerCount,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN (
+        SELECT p.Id, SUM(p.Score) AS TotalQuestionScore
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+        GROUP BY p.Id
+    ) pq ON pq.Id = pq.Id -- dummy join to keep structure (no-op)
+    LEFT JOIN LATERAL (
+        SELECT SUM(p.Score) AS TotalQuestionScore
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+          AND ('<' || REPLACE(p.Tags, '><', '> <') || '>') LIKE '%' || '<' || t.TagName || '>' || '%'
+    ) qc ON true
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS AnswerCount
+        FROM Posts a
+        WHERE a.PostTypeId = 2
+          AND a.ParentId IN (
+              SELECT p2.Id
+              FROM Posts p2
+              WHERE p2.PostTypeId = 1
+                AND p2.Tags IS NOT NULL
+                AND ('<' || REPLACE(p2.Tags, '><', '> <') || '>') LIKE '%' || '<' || t.TagName || '>' || '%'
+          )
+    ) ac ON true
+    WHERE t.IsModeratorOnly = 0
+),
+MainResults AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.TotalQuestionScore,
+        us.QuestionCount,
+        us.AnswerCount,
+        ROUND(
+            CASE WHEN us.QuestionCount = 0 THEN NULL
+                 ELSE (CAST(us.AcceptedAnswers AS NUMERIC) / us.QuestionCount)
+            END, 3)                                 AS AcceptRate,
+        ts.TagName,
+        ts.TagUseCount,
+        ts.TagQuestionScore,
+        ts.TagAnswerCount,
+        CASE WHEN ts.TagRank <= 10 THEN 'Top10' ELSE 'Other' END AS TagTier,
+        ROW_NUMBER() OVER (PARTITION BY us.Id ORDER BY ts.TagUseCount DESC) AS RN_PerUser,
+        ((ROW_NUMBER() OVER (PARTITION BY us.Id ORDER BY ts.TagUseCount DESC) - 1) % 5) + 1 AS MappedRank
+    FROM UserStats us
+    LEFT JOIN TagStats ts
+           ON ts.TagRank = ((ROW_NUMBER() OVER (PARTITION BY us.Id ORDER BY ts.TagUseCount DESC) - 1) % 5) + 1
+    WHERE us.Reputation > 10000
+      AND (us.GoldBadges + us.SilverBadges + us.BronzeBadges) > 5
+      AND ts.TagName IS NOT NULL
+    GROUP BY
+        us.Id, us.DisplayName, us.Reputation,
+        us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+        us.TotalQuestionScore, us.QuestionCount, us.AnswerCount,
+        us.AcceptedAnswers, us.Reputation, us.DisplayName,
+        AcceptRate, ts.TagName, ts.TagUseCount,
+        ts.TagQuestionScore, ts.TagAnswerCount, ts.TagRank, TagTier, RN_PerUser, MappedRank
+)
+(
+SELECT
+    Id,
+    DisplayName,
+    Reputation,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    TotalQuestionScore,
+    QuestionCount,
+    AnswerCount,
+    AcceptRate,
+    TagName,
+    TagUseCount,
+    TagQuestionScore,
+    TagAnswerCount,
+    TagTier
+FROM MainResults
+ORDER BY Reputation DESC, TagUseCount DESC
+FETCH FIRST 100 ROWS ONLY
+)
+UNION ALL
+(
+SELECT
+    NULL AS Id,
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS TotalQuestionScore,
+    NULL AS QuestionCount,
+    NULL AS AnswerCount,
+    NULL AS AcceptRate,
+    NULL AS TagName,
+    NULL AS TagUseCount,
+    NULL AS TagQuestionScore,
+    NULL AS TagAnswerCount,
+    NULL AS TagTier
+WHERE NOT EXISTS (SELECT 1 FROM Users WHERE Reputation > 10000)
+);

@@ -1,0 +1,42 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  COALESCE(bc.Count, 0) AS BronzeBadges,
+  COALESCE(sc.Count, 0) AS SilverBadges,
+  COALESCE(gc.Count, 0) AS GoldBadges,
+  p1.PostTypeViewed AS PostTypeViewed,
+  AVG(p1.Score) OVER (PARTITION BY u.Id, p1.PostTypeViewed, p1.LastActivityDate, p1.OwnerUserId) AS AvgPostScoreByUser,
+  MAX(p1.LastActivityDate) OVER (PARTITION BY u.Id, p1.PostTypeViewed, p1.Score, p1.OwnerUserId) AS LastActivityByUser,
+  v.TotalVotes AS TotalVotesByUser,
+  t.TagNameBounds
+FROM
+  Users u
+  LEFT JOIN Badges bc ON bc.UserId = u.Id AND bc.Class = 3
+  LEFT JOIN Badges sc ON sc.UserId = u.Id AND sc.Class = 2
+  LEFT JOIN Badges gc ON gc.UserId = u.Id AND gc.Class = 1
+  LEFT JOIN (
+    SELECT OwnerUserId, MAX(PostTypeId) AS PostTypeViewed, MAX(LastActivityDate) AS LastActivityDate, MAX(Score) AS Score
+    FROM Posts
+    GROUP BY OwnerUserId
+  ) p1 ON p1.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT p.OwnerUserId, COUNT(*) AS TotalVotes
+    FROM Votes v
+    JOIN Posts p ON p.Id = v.PostId
+    WHERE v.VoteTypeId IN (2, 3)
+    GROUP BY p.OwnerUserId
+  ) v ON v.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT p.OwnerUserId,
+           STRING_AGG(DISTINCT t.TagName, ',') AS TagNameBounds
+    FROM Posts p
+    JOIN Tags t ON t.Id = CAST(p.Tags AS INTEGER) -- adjust tag extraction to standard SQL cast; ensure Tags stores a single tag id
+    GROUP BY p.OwnerUserId
+  ) t ON t.OwnerUserId = u.Id
+WHERE
+  u.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2' YEAR
+  AND u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6' MONTH
+ORDER BY
+  COALESCE(bc.Count, 0) + COALESCE(sc.Count, 0) + COALESCE(gc.Count, 0) DESC
+LIMIT 100;

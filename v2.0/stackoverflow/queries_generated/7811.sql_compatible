@@ -1,0 +1,213 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score > 0 THEN 'High_Question'
+            WHEN p.PostTypeId = 2 AND p.Score > 0 THEN 'High_Answer'
+            WHEN p.PostTypeId = 1 THEN 'Low_Question'
+            ELSE 'Other'
+        END as post_category,
+        COALESCE(p.Title, 'No Title') as title_or_default,
+        COALESCE(p.Tags, 'No Tags') as tags_or_default,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Elite'
+            WHEN p.Score >= 50 THEN 'Advanced'
+            WHEN p.Score >= 10 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as score_level
+    FROM Posts p
+    WHERE p.CreationDate >= DATE '2010-01-01'
+      AND p.CreationDate < DATE '2023-01-01'
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as post_count,
+        COUNT(DISTINCT c.Id) as comment_count,
+        COUNT(DISTINCT b.Id) as badge_count,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_post_score,
+        MAX(p.CreationDate) as last_post_date,
+        MAX(c.CreationDate) as last_comment_date
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+QuestionAnalysis AS (
+    SELECT 
+        rp.Id,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.ViewCount,
+        rp.post_category,
+        rp.score_level,
+        CASE 
+            WHEN rp.AnswerCount >= 5 THEN 'High_Response_Question'
+            WHEN rp.AnswerCount >= 1 THEN 'Medium_Response_Question'
+            ELSE 'Low_Response_Question'
+        END as response_level,
+        CAST((rp.LastActivityDate - rp.CreationDate) AS INTEGER) as activity_span_days,
+        (CAST(rp.Score AS NUMERIC) / NULLIF(rp.ViewCount, 0)) as score_per_view,
+        CASE 
+            WHEN rp.ClosedDate IS NOT NULL AND rp.Score >= 0 THEN 'Closed_High_Score'
+            WHEN rp.ClosedDate IS NOT NULL THEN 'Closed_Low_Score'
+            WHEN rp.Score >= 10 THEN 'Open_High_Score'
+            ELSE 'Open_Low_Score'
+        END as question_status,
+        ROW_NUMBER() OVER (PARTITION BY rp.OwnerUserId ORDER BY rp.Score DESC) as user_top_score_rank,
+        DENSE_RANK() OVER (ORDER BY rp.Score DESC) as global_score_rank,
+        rp.CreationDate,
+        rp.LastActivityDate
+    FROM RankedPosts rp
+    WHERE rp.PostTypeId = 1
+      AND rp.rn = 1
+),
+AnswerAnalysis AS (
+    SELECT 
+        rp.Id,
+        rp.ParentId,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.post_category,
+        rp.score_level,
+        COALESCE(rp.prev_score, 0) as prev_score,
+        (rp.Score - COALESCE(rp.prev_score, 0)) as score_change,
+        CASE 
+            WHEN rp.Score > 0 AND rp.Score >= COALESCE(rp.prev_score, 0) THEN 'Improvement'
+            WHEN rp.Score < COALESCE(rp.prev_score, 0) THEN 'Decline'
+            WHEN rp.Score > 0 AND rp.Score < COALESCE(rp.prev_score, 0) THEN 'Reverse'
+            ELSE 'Stable'
+        END as trend,
+        CAST(('2024-10-01 12:34:56'::timestamp - rp.CreationDate) AS INTEGER) as age_days,
+        CASE 
+            WHEN rp.Score >= 100 THEN 'Elite_Answer'
+            WHEN rp.Score >= 50 THEN 'Advanced_Answer'
+            ELSE 'Regular_Answer'
+        END as answer_quality,
+        rp.CreationDate
+    FROM RankedPosts rp
+    WHERE rp.PostTypeId = 2
+)
+SELECT 
+    'Post Analysis' as category,
+    COUNT(*) as total_posts,
+    COUNT(DISTINCT pa.OwnerUserId) as unique_users,
+    AVG(pa.Score) as avg_score,
+    MAX(pa.Score) as max_score,
+    MIN(pa.Score) as min_score,
+    STRING_AGG(pa.post_category, '; ') as categories,
+    STRING_AGG(pa.score_level, '; ') as score_levels,
+    NULL as dummy_col_1,
+    NULL as dummy_col_2,
+    NULL as dummy_col_3,
+    NULL as dummy_col_4,
+    NULL as dummy_col_5
+FROM QuestionAnalysis pa
+UNION ALL
+SELECT 
+    'Answer Analysis' as category,
+    COUNT(*) as total_posts,
+    COUNT(DISTINCT aa.OwnerUserId) as unique_users,
+    AVG(aa.Score) as avg_score,
+    MAX(aa.Score) as max_score,
+    MIN(aa.Score) as min_score,
+    STRING_AGG(aa.answer_quality, '; ') as categories,
+    STRING_AGG(aa.trend, '; ') as score_levels,
+    NULL as dummy_col_1,
+    NULL as dummy_col_2,
+    NULL as dummy_col_3,
+    NULL as dummy_col_4,
+    NULL as dummy_col_5
+FROM AnswerAnalysis aa
+UNION ALL
+SELECT 
+    'User Analysis' as category,
+    COUNT(*) as total_posts,
+    COUNT(DISTINCT ua.UserId) as unique_users,
+    AVG(ua.total_score) as avg_score,
+    MAX(ua.total_score) as max_score,
+    MIN(ua.total_score) as min_score,
+    STRING_AGG(CASE WHEN ua.post_count > 100 THEN 'Active' ELSE 'Regular' END, '; ') as categories,
+    STRING_AGG(CASE WHEN ua.Reputation > 10000 THEN 'Elite' ELSE 'Regular' END, '; ') as score_levels,
+    STRING_AGG(ua.DisplayName, ', ') as top_users,
+    'User Report' as report_type,
+    'Analysis Complete' as status,
+    '2023' as year,
+    'Performance Test' as test_name,
+    NULL as dummy_col_1
+FROM UserActivity ua
+WHERE ua.post_count > 0
+AND ua.last_post_date >= DATE '2022-01-01'
+AND ua.Reputation > 500
+UNION ALL
+SELECT 
+    'Combined Analysis' as category,
+    COUNT(DISTINCT ca.Id) as total_posts,
+    COUNT(DISTINCT ca.OwnerUserId) as unique_users,
+    AVG(ca.Score) as avg_score,
+    MAX(ca.Score) as max_score,
+    MIN(ca.Score) as min_score,
+    STRING_AGG(ca.question_status, '; ') as categories,
+    STRING_AGG(CASE WHEN ca.AnswerCount > 0 THEN 'HasAnswers' ELSE 'NoAnswers' END, '; ') as score_levels,
+    STRING_AGG(SUBSTRING(ca.Title FROM 1 FOR 50) || '...', ', ') as sample_titles,
+    (SELECT COUNT(*) FROM QuestionAnalysis) as question_count,
+    (SELECT COUNT(*) FROM AnswerAnalysis) as answer_count,
+    (SELECT COUNT(*) FROM UserActivity) as user_count,
+    STRING_AGG(CAST(ca.activity_span_days AS VARCHAR(10)), ', ') as activity_spans
+FROM QuestionAnalysis ca
+INNER JOIN (
+    SELECT 
+        ParentId, 
+        MAX(Score) as max_score
+    FROM AnswerAnalysis
+    GROUP BY ParentId
+) aa ON ca.Id = aa.ParentId
+WHERE ca.CreationDate >= DATE '2015-01-01'
+  AND ca.CreationDate < DATE '2022-01-01'
+  AND (ca.Score > 0 OR ca.AnswerCount > 0)
+  AND ca.ViewCount > 100
+  AND ca.score_per_view > 0.05
+  AND ca.activity_span_days > 7
+GROUP BY
+    ca.question_status,
+    ca.AnswerCount,
+    ca.Title,
+    ca.activity_span_days,
+    ca.Id,
+    ca.OwnerUserId,
+    ca.Score
+ORDER BY category DESC,
+         avg_score DESC,
+         max_score DESC,
+         total_posts DESC;

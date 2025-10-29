@@ -1,0 +1,180 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        AVG(CAST(COALESCE(p.Score, 0) AS numeric)) AS AvgPostScore,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 12, 14, 19) THEN 1 ELSE 0 END) AS ModerationActionCount,
+        RANK() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 12, 14, 19)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING COUNT(p.Id) > 5
+),
+PostDetailStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.Title,
+        p.Tags,
+        p.ClosedDate,
+        CAST(COALESCE(p.Score, 0) AS numeric) * (1.0 + COALESCE(p.CommentCount, 0) / NULLIF(COALESCE(p.ViewCount, 0), 0.1)) AS EngagementScore,
+        (SELECT COUNT(DISTINCT v.UserId)
+         FROM Votes v
+         WHERE v.PostId = p.Id
+           AND v.VoteTypeId IN (2, 3)
+           AND v.CreationDate BETWEEN p.CreationDate AND (p.CreationDate + INTERVAL '30 days')
+        ) AS InitialVoterCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN ph.Id END) AS SignificantEditCount,
+        EXTRACT(EPOCH FROM (p.LastActivityDate - COALESCE(p.LastEditDate, p.CreationDate))) / 3600 AS HoursSinceLastEditToActivity,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        LAG(p.PostTypeId, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostType,
+        p.LastEditDate,
+        p.Body
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Title, p.Tags, p.ClosedDate, p.LastEditDate, p.Body
+),
+TagPerformance AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId AS OwnerUserId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName,
+        p.Score
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.Tags LIKE '<%>%<%'
+),
+UserTagAgg AS (
+    SELECT
+        tp.OwnerUserId AS UserId,
+        tp.TagName,
+        COUNT(tp.PostId) AS PostsInTag,
+        SUM(tp.Score) AS TotalTagScore,
+        RANK() OVER (PARTITION BY tp.OwnerUserId ORDER BY SUM(tp.Score) DESC, COUNT(tp.PostId) DESC) AS TagRankForUser
+    FROM TagPerformance tp
+    GROUP BY tp.OwnerUserId, tp.TagName
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.RelatedPostId END) AS LinkedPostCount,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS DuplicatePostCount,
+        SUM(CASE WHEN p_related.Score > pl_current.Score THEN 1 ELSE 0 END) AS RelatedPostHigherScoreCount
+    FROM PostLinks pl
+    JOIN Posts pl_current ON pl.PostId = pl_current.Id
+    LEFT JOIN Posts p_related ON pl.RelatedPostId = p_related.Id
+    GROUP BY pl.PostId
+),
+PostsNeedingReview AS (
+    SELECT
+        p.Id AS PostId,
+        'StuckQuestion' AS ReviewReason,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.AnswerCount = 0
+      AND p.ViewCount > 1000
+      AND p.Score <= 0
+      AND p.CreationDate < (CAST('2024-10-01' AS date) - INTERVAL '6 months')
+    UNION ALL
+    SELECT
+        p.Id AS PostId,
+        'LowQualityAnswer' AS ReviewReason,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        0 AS AnswerCount
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+      AND p.Score < -5
+      AND p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+)
+SELECT
+    uas.UserId,
+    uas.UserName,
+    uas.Reputation,
+    uas.ReputationRank,
+    pds.PostId,
+    pds.Title,
+    pds.PostTypeId,
+    pds.PostCreationDate,
+    pds.LastActivityDate,
+    pds.Score AS PostScore,
+    pds.ViewCount,
+    pds.AnswerCount,
+    pds.CommentCount,
+    pds.FavoriteCount,
+    pds.EngagementScore,
+    pds.InitialVoterCount,
+    pds.SignificantEditCount,
+    pds.HoursSinceLastEditToActivity,
+    pds.PreviousPostScore,
+    pds.PreviousPostType,
+    pta.TagName AS TopTagForUser,
+    pta.PostsInTag AS TopTagPostsCount,
+    pta.TotalTagScore AS TopTagTotalScore,
+    pla.LinkedPostCount,
+    pla.DuplicatePostCount,
+    pla.RelatedPostHigherScoreCount,
+    COALESCE(pnr.ReviewReason, 'NoReviewNeeded') AS ReviewReason,
+    COALESCE(
+        CASE
+            WHEN pds.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN pnr.ReviewReason IS NOT NULL THEN 'FlaggedForReview'
+            WHEN pds.PostTypeId = 1 AND COALESCE(pds.AnswerCount, 0) = 0 AND pds.PostCreationDate < (CAST('2024-10-01' AS date) - INTERVAL '1 year') THEN 'StaleUnansweredQuestion'
+            WHEN pds.PostTypeId = 2 AND pds.Score < 0 AND pds.SignificantEditCount = 0 THEN 'LowQualityAnswerNoEdits'
+            ELSE 'Active'
+        END, 'Unknown'
+    ) AS PostStatus,
+    ROUND(
+        (uas.AvgPostScore * 0.25) +
+        (COALESCE(pds.EngagementScore, 0) * 0.35) +
+        (CASE WHEN pta.TagName IS NOT NULL THEN COALESCE(pta.TotalTagScore, 0) / NULLIF(COALESCE(pta.PostsInTag, 0), 0) ELSE 0 END * 0.2) +
+        (CASE WHEN COALESCE(pds.SignificantEditCount, 0) > 0 AND pds.HoursSinceLastEditToActivity IS NOT NULL THEN 100.0 / (1.0 + pds.HoursSinceLastEditToActivity) ELSE 0 END * 0.1) +
+        (CASE WHEN COALESCE(pla.DuplicatePostCount, 0) > 0 THEN -50 ELSE 0 END * 0.1)
+    , 2) AS OverallPostHealthScore,
+    CASE
+        WHEN pds.PostTypeId = 1 AND COALESCE(pds.AnswerCount, 0) = 0 AND pds.ViewCount > 500 AND pds.Score <= 5 THEN TRUE
+        ELSE FALSE
+    END AS IsStuckQuestionFlag,
+    UPPER(SUBSTR(COALESCE(pds.Title, 'No Title'), 1, 50)) AS TitleSnippet_UC,
+    LOWER(SUBSTR(COALESCE(pds.Body, 'No Body'), 1, 100)) AS BodyStartSnippet_LC,
+    (uas.Reputation / 1000.0) * (uas.TotalPosts / 10.0) AS UserInfluenceMetric
+FROM UserActivitySummary uas
+INNER JOIN PostDetailStats pds ON uas.UserId = pds.OwnerUserId
+LEFT JOIN UserTagAgg pta ON uas.UserId = pta.UserId AND pta.TagRankForUser = 1
+LEFT JOIN PostLinkAnalysis pla ON pds.PostId = pla.PostId
+LEFT JOIN PostsNeedingReview pnr ON pds.PostId = pnr.PostId
+WHERE
+    uas.Reputation >= 5000
+    AND pds.EngagementScore > 50
+    AND (pds.PostTypeId = 1 OR (pds.PostTypeId = 2 AND pds.Score > 0))
+    AND pds.PostCreationDate BETWEEN (CAST('2024-10-01' AS date) - INTERVAL '3 year') AND CAST('2024-10-01' AS date)
+    AND (pds.Title ILIKE '%database%' OR pds.Tags ILIKE '%<sql>%')
+    AND COALESCE(pds.AnswerCount, 0) >= 1
+ORDER BY
+    OverallPostHealthScore DESC,
+    UserInfluenceMetric DESC,
+    pds.LastActivityDate DESC
+LIMIT 500;

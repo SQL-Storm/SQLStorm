@@ -1,0 +1,332 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRank,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT b.Id) DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= CAST(DATEADD(YEAR, -2, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) AS TIMESTAMP)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        LastCommentDate,
+        PostRank,
+        BadgeRank,
+        CASE 
+            WHEN PostCount > 100 AND BadgeCount > 50 THEN 'Elite'
+            WHEN PostCount > 50 OR BadgeCount > 25 THEN 'Active'
+            ELSE 'Regular'
+        END AS UserCategory
+    FROM UserActivityStats
+    WHERE PostRank <= 100 OR BadgeRank <= 100
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags LIKE '%<%>%' THEN 
+                (
+                    SELECT COUNT(*) 
+                    FROM (
+                        -- emulate STRING_SPLIT for dialects without it by splitting on '><' after removing leading '<' and trailing '>'
+                        SELECT value FROM (
+                            SELECT regexp_split_to_table(
+                                substr(p.Tags, 2, char_length(p.Tags) - 2),
+                                '\>\<'
+                            ) AS value
+                        ) s
+                    ) ss
+                )
+            ELSE 0 
+        END AS TagCount,
+        COALESCE(p.OwnerUserId, -1) AS UserId,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.Score < 0 THEN 'Negative Score'
+            WHEN p.Score >= 10 THEN 'Highly Rated'
+            ELSE 'Normal'
+        END AS QuestionStatus
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate >= CAST(DATEADD(MONTH, -6, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) AS TIMESTAMP)
+),
+PostTags AS (
+    SELECT 
+        QuestionId,
+        TagCount,
+        CASE 
+            WHEN TagCount >= 3 THEN 'Multi Tagged'
+            WHEN TagCount = 1 THEN 'Single Tagged'
+            ELSE 'No Tags'
+        END AS TagCategory
+    FROM QuestionStats
+),
+AnswerStats AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        COUNT(p.Id) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.CreationDate) AS LatestAnswerDate,
+        MAX(p.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveAnswers,
+        SUM(CASE WHEN p.Score < 0 THEN 1 ELSE 0 END) AS NegativeAnswers,
+        SUM(CASE WHEN p.Score = 0 THEN 1 ELSE 0 END) AS ZeroScoreAnswers
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+      AND p.CreationDate >= CAST(DATEADD(MONTH, -6, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) AS TIMESTAMP)
+    GROUP BY p.ParentId
+),
+ComplexAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.CommentCount,
+        tu.BadgeCount,
+        tu.UserCategory,
+        qs.QuestionId,
+        qs.Title,
+        qs.Score,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.CommentCount,
+        qs.QuestionStatus,
+        qs.TagCount,
+        pt.TagCategory,
+        COALESCE(aS.AnswerCount, 0) AS AnswerCountWithAnswers,
+        COALESCE(aS.AvgAnswerScore, 0) AS AvgAnswerScore,
+        COALESCE(aS.MaxAnswerScore, 0) AS MaxAnswerScore,
+        CASE 
+            WHEN qs.AnswerCount > 0 AND aS.AvgAnswerScore > 2 THEN 'High Quality'
+            WHEN qs.AnswerCount > 0 THEN 'Moderate Quality'
+            ELSE 'No Answers'
+        END AS QuestionQuality,
+        CASE 
+            WHEN qs.Score >= 50 THEN 'Very Popular'
+            WHEN qs.Score >= 20 THEN 'Popular'
+            WHEN qs.Score >= 10 THEN 'Moderate'
+            ELSE 'Low'
+        END AS Popularity,
+        CAST(DATEDIFF(DAY, qs.CreationDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) AS INTEGER) AS DaysSinceCreation,
+        CAST(DATEDIFF(DAY, qs.CreationDate, COALESCE(aS.LatestAnswerDate, qs.CreationDate)) AS INTEGER) AS DaysToFirstAnswer,
+        ROW_NUMBER() OVER (PARTITION BY tu.UserId ORDER BY qs.Score DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY qs.ViewCount DESC) AS ViewRank,
+        LAG(qs.Score, 1) OVER (ORDER BY qs.CreationDate) AS PreviousScore,
+        (qs.Score - LAG(qs.Score, 1) OVER (ORDER BY qs.CreationDate)) AS ScoreChange,
+        CASE WHEN qs.Score >= 50 AND qs.AnswerCount > 3 THEN 1 ELSE 0 END AS HighlyRatedPopularWithAnswers
+    FROM TopUsers tu
+    INNER JOIN QuestionStats qs ON tu.UserId = qs.UserId
+    LEFT JOIN PostTags pt ON qs.QuestionId = pt.QuestionId
+    LEFT JOIN AnswerStats aS ON qs.QuestionId = aS.QuestionId
+),
+BaseResult AS (
+    SELECT 
+        ca.UserId,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.PostCount,
+        ca.CommentCount,
+        ca.BadgeCount,
+        ca.UserCategory,
+        ca.QuestionId,
+        ca.Title,
+        ca.Score,
+        ca.ViewCount,
+        ca.AnswerCount,
+        ca.CommentCount AS QuestionCommentCount,
+        ca.QuestionStatus,
+        ca.TagCount,
+        ca.TagCategory,
+        ca.AnswerCountWithAnswers,
+        ca.AvgAnswerScore,
+        ca.MaxAnswerScore,
+        ca.QuestionQuality,
+        ca.Popularity,
+        ca.DaysSinceCreation,
+        ca.DaysToFirstAnswer,
+        ca.ScoreRank,
+        ca.ViewRank,
+        ca.PreviousScore,
+        ca.ScoreChange,
+        ca.HighlyRatedPopularWithAnswers,
+        (SELECT COUNT(*) FROM ComplexAnalysis ca2 WHERE ca2.UserId = ca.UserId) AS UserQuestionCount,
+        (SELECT AVG(Score) FROM ComplexAnalysis ca3 WHERE ca3.UserId = ca.UserId) AS AvgUserScore,
+        SUM(ca.Score) OVER (PARTITION BY ca.UserId) AS UserTotalScore,
+        MAX(ca.Score) OVER (PARTITION BY ca.UserId) AS UserMaxScore,
+        AVG(ca.Score) OVER (ORDER BY ca.UserId, ca.QuestionId ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS SlidingAverageScore,
+        CASE 
+            WHEN ca.DaysToFirstAnswer <= 1 THEN 'Quick Response'
+            WHEN ca.DaysToFirstAnswer <= 7 THEN 'Quick Discussion'
+            WHEN ca.DaysToFirstAnswer <= 30 THEN 'Moderate Engagement'
+            ELSE 'Delayed Engagement'
+        END AS EngagementLevel,
+        CASE 
+            WHEN ca.AvgAnswerScore >= 5 THEN 'Excellent Answers'
+            WHEN ca.AvgAnswerScore >= 2 THEN 'Good Answers'
+            WHEN ca.AvgAnswerScore >= 0 THEN 'Average Answers'
+            ELSE 'Poor Answers'
+        END AS AnswerQuality,
+        CASE 
+            WHEN ca.QuestionQuality = 'High Quality' AND ca.QuestionStatus = 'Closed' THEN 'High Quality Closed'
+            WHEN ca.QuestionQuality = 'High Quality' THEN 'High Quality'
+            WHEN ca.QuestionStatus = 'Closed' THEN 'Regular Closed'
+            ELSE 'Regular'
+        END AS QuestionClassification,
+        CASE 
+            WHEN ca.Score >= 100 AND ca.AnswerCount >= 10 THEN 'Veteran Questioner'
+            WHEN ca.Score >= 50 THEN 'Experienced Questioner'
+            WHEN ca.PostCount >= 20 THEN 'Frequent Poster'
+            ELSE 'New Poster'
+        END AS UserClassification,
+        CASE WHEN ca.QuestionStatus IN ('Closed', 'Community Owned') THEN 0 ELSE 1 END AS StatusWeight,
+        CASE 
+            WHEN ca.ViewCount > 1000 THEN 'Viral'
+            WHEN ca.ViewCount > 100 THEN 'Popular'
+            WHEN ca.ViewCount > 10 THEN 'Moderate'
+            ELSE 'Low'
+        END AS ViewCategory,
+        CASE 
+            WHEN ca.Popularity = 'Very Popular' THEN 'Top 10% Popularity'
+            WHEN ca.Popularity = 'Popular' THEN 'Top 30% Popularity'
+            ELSE 'Moderate Popularity'
+        END AS PopularityCategory,
+        COALESCE(ca.ScoreChange, 0) AS ScoreChange,
+        (COALESCE(ca.ScoreChange, 0) * 100.0 / NULLIF(LAG(ca.Score, 1) OVER (ORDER BY ca.QuestionId), 0)) AS ScoreChangePercentage,
+        ('Post_' || ca.QuestionId) AS PostIdentifier,
+        ('User_' || ca.UserId) AS UserIdentifier,
+        repeat('=', CASE 
+            WHEN ca.Reputation >= 1000 THEN 5
+            WHEN ca.Reputation >= 500 THEN 4
+            WHEN ca.Reputation >= 100 THEN 3
+            WHEN ca.Reputation >= 10 THEN 2
+            ELSE 1 
+        END) AS ReputationStars,
+        COALESCE(ca.AnswerCountWithAnswers, 0) AS FinalAnswerCount,
+        COALESCE(ca.MaxAnswerScore, 0) AS FinalMaxAnswerScore,
+        COALESCE(ca.AvgAnswerScore, 0) AS FinalAvgAnswerScore
+    FROM ComplexAnalysis ca
+    WHERE ca.Score > 0
+      AND ca.ViewCount > 10
+      AND (ca.QuestionStatus = 'Normal' OR ca.QuestionStatus = 'Highly Rated')
+      AND ca.TagCount >= 1
+      AND ca.UserId IN (SELECT DISTINCT UserId FROM TopUsers WHERE UserCategory = 'Elite')
+      AND ca.QuestionId NOT IN (
+        SELECT DISTINCT PostId 
+        FROM PostHistory 
+        WHERE PostHistoryTypeId IN (12, 13) 
+          AND CreationDate >= CAST(DATEADD(MONTH, -3, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) AS TIMESTAMP)
+      )
+)
+SELECT * FROM BaseResult
+ORDER BY Score DESC, AnswerCount DESC, ViewCount DESC
+
+UNION ALL
+
+SELECT 
+    0 AS UserId,
+    'Overall Summary' AS DisplayName,
+    0 AS Reputation,
+    COUNT(*) AS PostCount,
+    0 AS CommentCount,
+    0 AS BadgeCount,
+    'Summary' AS UserCategory,
+    0 AS QuestionId,
+    'Overall' AS Title,
+    AVG(Score) AS Score,
+    SUM(ViewCount) AS ViewCount,
+    SUM(AnswerCountWithAnswers) AS AnswerCount,
+    SUM(QuestionCommentCount) AS CommentCount,
+    '' AS QuestionStatus,
+    AVG(TagCount) AS TagCount,
+    '' AS TagCategory,
+    0 AS AnswerCountWithAnswers,
+    AVG(AvgAnswerScore) AS AvgAnswerScore,
+    AVG(MaxAnswerScore) AS MaxAnswerScore,
+    'Overall' AS QuestionQuality,
+    'Overall' AS Popularity,
+    0 AS DaysSinceCreation,
+    AVG(DaysToFirstAnswer) AS DaysToFirstAnswer,
+    0 AS ScoreRank,
+    0 AS ViewRank,
+    NULL AS PreviousScore,
+    NULL AS ScoreChange,
+    0 AS HighlyRatedPopularWithAnswers,
+    COUNT(*) AS UserQuestionCount,
+    AVG(Score) AS AvgUserScore,
+    SUM(Score) AS UserTotalScore,
+    MAX(Score) AS UserMaxScore,
+    AVG(Score) AS SlidingAverageScore,
+    'Summary' AS EngagementLevel,
+    'Summary' AS AnswerQuality,
+    'Summary' AS QuestionClassification,
+    'Summary' AS UserClassification,
+    1 AS StatusWeight,
+    'Summary' AS ViewCategory,
+    'Summary' AS PopularityCategory,
+    0 AS ScoreChange,
+    0 AS ScoreChangePercentage,
+    'Overall' AS PostIdentifier,
+    'Overall' AS UserIdentifier,
+    '===== ' AS ReputationStars,
+    0 AS FinalAnswerCount,
+    0 AS FinalMaxAnswerScore,
+    0 AS FinalAvgAnswerScore
+FROM (
+    SELECT 
+        ca.UserId,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.PostCount,
+        ca.CommentCount,
+        ca.BadgeCount,
+        ca.UserCategory,
+        ca.QuestionId,
+        ca.Title,
+        ca.Score,
+        ca.ViewCount,
+        ca.AnswerCount,
+        ca.CommentCount AS QuestionCommentCount,
+        ca.QuestionStatus,
+        ca.TagCount,
+        ca.TagCategory,
+        ca.AnswerCountWithAnswers,
+        ca.AvgAnswerScore,
+        ca.MaxAnswerScore,
+        ca.QuestionQuality,
+        ca.Popularity,
+        ca.DaysSinceCreation,
+        ca.DaysToFirstAnswer,
+        ca.ScoreRank,
+        ca.ViewRank,
+        ca.PreviousScore,
+        ca.ScoreChange,
+        ca.HighlyRatedPopularWithAnswers
+    FROM ComplexAnalysis ca
+) t;

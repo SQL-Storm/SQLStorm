@@ -1,0 +1,362 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.location,
+        u.websiteurl,
+        u.creationdate,
+        u.lastaccessdate,
+        coalesce(nullif(trim(u.location), ''), 'Unknown') as norm_location,
+        case when lower(u.websiteurl) like 'http://github.com/%' or lower(u.websiteurl) like 'https://github.com/%' or lower(u.websiteurl) like 'www.github.com/%' or lower(u.websiteurl) like 'github.com/%' then 1 else 0 end as has_github
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_activity as (
+    select
+        p.owneruserid as user_id,
+        count(case when p.posttypeid = 1 then 1 end) as q_count,
+        count(case when p.posttypeid = 2 then 1 end) as a_count,
+        sum(coalesce(p.viewcount,0)) as total_views,
+        sum(coalesce(p.score,0)) as net_post_score,
+        avg(nullif(p.commentcount,0)) as avg_commentcount_nonzero,
+        max(p.lastactivitydate) as last_post_activity,
+        min(p.creationdate) as first_post_date
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+votes_agg as (
+    select
+        v.postid,
+        count(case when v.votetypeid = 2 then 1 end) as upvotes,
+        count(case when v.votetypeid = 3 then 1 end) as downvotes,
+        count(case when v.votetypeid = 8 then 1 end) as bounties_started,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_amount_total
+    from votes v
+    group by v.postid
+),
+post_scores as (
+    select
+        p.id,
+        p.posttypeid,
+        p.parentid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.tags,
+        p.title,
+        va.upvotes,
+        va.downvotes,
+        (coalesce(va.upvotes,0) - coalesce(va.downvotes,0)) as vote_delta,
+        case when p.score is null then (coalesce(va.upvotes,0) - coalesce(va.downvotes,0)) else p.score end as effective_score
+    from posts p
+    left join votes_agg va on va.postid = p.id
+),
+answers_w_rank as (
+    select
+        ps.*,
+        row_number() over (partition by ps.parentid order by ps.effective_score desc nulls last, ps.creationdate asc) as rank_in_question,
+        dense_rank() over (partition by ps.owneruserid order by ps.effective_score desc nulls last) as user_best_answer_rank
+    from post_scores ps
+    where ps.posttypeid = 2
+),
+question_metrics as (
+    select
+        q.id as question_id,
+        q.owneruserid as asker_id,
+        q.creationdate as q_created,
+        q.score as q_score,
+        q.viewcount as q_views,
+        q.title,
+        q.tags,
+        count(a.id) as answer_count,
+        max(a.creationdate) as last_answer_time,
+        sum(coalesce(a.effective_score,0)) as answers_net_score,
+        max(case when a.rank_in_question = 1 then a.effective_score end) as top_answer_score,
+        max(case when a.rank_in_question = 1 then a.owneruserid end) as top_answerer_id,
+        bool_or(a.rank_in_question = 1 and a.owneruserid = q.owneruserid) as self_answer_top
+    from post_scores q
+    left join answers_w_rank a on a.parentid = q.id
+    where q.posttypeid = 1
+    group by q.id, q.owneruserid, q.creationdate, q.score, q.viewcount, q.title, q.tags
+),
+tag_expanded as (
+    select
+        qm.question_id,
+        unnest(string_to_array(substring(qm.tags from 2 for length(qm.tags)-2), '><')) as tagname
+    from question_metrics qm
+    where qm.tags is not null and qm.tags like '<%>'
+),
+tag_agg as (
+    select
+        te.tagname,
+        count(distinct te.question_id) as questions_with_tag,
+        sum(qm.q_views) as views_with_tag,
+        avg(qm.q_score) as avg_q_score_with_tag,
+        percentile_disc(0.5) within group (order by qm.q_views) as median_views_with_tag
+    from tag_expanded te
+    join question_metrics qm on qm.question_id = te.question_id
+    group by te.tagname
+),
+user_badges as (
+    select
+        b.userid,
+        count(*) as badge_count,
+        count(case when b.class = 1 then 1 end) as gold_badges,
+        count(case when b.class = 2 then 1 end) as silver_badges,
+        count(case when b.class = 3 then 1 end) as bronze_badges,
+        count(case when b.tagbased = true then 1 end) as tag_badges
+    from badges b
+    group by b.userid
+),
+postlink_dupes as (
+    select
+        pl.postid,
+        pl.relatedpostid,
+        pl.creationdate,
+        pl.linktypeid,
+        case when pl.linktypeid = 3 then 1 else 0 end as is_duplicate
+    from postlinks pl
+),
+closure_events as (
+    select
+        ph.postid,
+        min(case when ph.posthistorytypeid = 10 then ph.creationdate end) as first_closed_at,
+        max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as last_reopened_at,
+        count(case when ph.posthistorytypeid = 10 then 1 end) as close_votes_count,
+        count(case when ph.posthistorytypeid = 11 then 1 end) as reopen_events
+    from posthistory ph
+    group by ph.postid
+),
+activity_window as (
+    select
+        u.id as user_id,
+        count(case when p.posttypeid = 1 then 1 end) as q_30d,
+        count(case when p.posttypeid = 2 then 1 end) as a_30d,
+        sum(coalesce(ps.effective_score,0)) filter (where p.creationdate >= (timestamp '2024-10-01 12:34:56' - interval '30 days')) as net_score_30d,
+        sum(coalesce(ps.effective_score,0)) filter (where p.creationdate >= (timestamp '2024-10-01 12:34:56' - interval '365 days')) as net_score_365d
+    from users u
+    left join posts p on p.owneruserid = u.id
+    left join post_scores ps on ps.id = p.id
+    group by u.id
+),
+qualified_questions as (
+    select
+        qm.question_id,
+        qm.asker_id,
+        qm.q_created,
+        qm.q_score,
+        qm.q_views,
+        qm.answer_count,
+        qm.answers_net_score,
+        qm.top_answer_score,
+        qm.top_answerer_id,
+        qm.self_answer_top,
+        ce.first_closed_at,
+        ce.last_reopened_at,
+        coalesce(ce.close_votes_count,0) as close_votes_count,
+        coalesce(ce.reopen_events,0) as reopen_events,
+        case when ce.first_closed_at is not null and ce.first_closed_at <= qm.q_created + interval '1 day' then 1 else 0 end as closed_quickly
+    from question_metrics qm
+    left join closure_events ce on ce.postid = qm.question_id
+    where (qm.q_views > 0 or qm.answer_count > 0)
+),
+user_rollup as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.norm_location,
+        ru.has_github,
+        ua.q_count,
+        ua.a_count,
+        ua.total_views,
+        ua.net_post_score,
+        ua.avg_commentcount_nonzero,
+        ua.last_post_activity,
+        ua.first_post_date,
+        ub.badge_count,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        ub.tag_badges,
+        aw.q_30d,
+        aw.a_30d,
+        aw.net_score_30d,
+        aw.net_score_365d,
+        case
+            when coalesce(ua.a_count,0) = 0 and coalesce(ua.q_count,0) = 0 then 'lurker'
+            when coalesce(ua.a_count,0) > coalesce(ua.q_count,0) * 2 then 'answerer'
+            when coalesce(ua.q_count,0) > coalesce(ua.a_count,0) * 2 then 'asker'
+            else 'balanced'
+        end as contributor_type
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join user_badges ub on ub.userid = ru.user_id
+    left join activity_window aw on aw.user_id = ru.user_id
+),
+user_question_interactions as (
+    select
+        qr.question_id,
+        qr.asker_id,
+        qr.q_created,
+        qr.q_score,
+        qr.q_views,
+        qr.answer_count,
+        qr.answers_net_score,
+        qr.top_answer_score,
+        qr.top_answerer_id,
+        qr.self_answer_top,
+        qr.first_closed_at,
+        qr.last_reopened_at,
+        qr.close_votes_count,
+        qr.reopen_events,
+        qr.closed_quickly,
+        case when ul.user_id is not null then 1 else 0 end as asker_in_sample
+    from qualified_questions qr
+    left join user_rollup ul on ul.user_id = qr.asker_id
+),
+dupe_clusters as (
+    select
+        q.question_id,
+        count(distinct d.relatedpostid) filter (where d.is_duplicate = 1) as dupes_of,
+        count(distinct d.postid) filter (where d.is_duplicate = 1) as has_dupe_reports
+    from qualified_questions q
+    left join postlink_dupes d on d.postid = q.question_id or d.relatedpostid = q.question_id
+    group by q.question_id
+),
+location_quality as (
+    select
+        ur.norm_location,
+        count(*) as user_count,
+        avg(coalesce(ur.net_post_score,0)) as avg_net_post_score,
+        avg(coalesce(ur.badge_count,0)) as avg_badges,
+        percentile_cont(0.9) within group (order by coalesce(ur.reputation,0)) as p90_rep
+    from user_rollup ur
+    group by ur.norm_location
+),
+final_scores as (
+    select
+        ur.user_id,
+        ur.displayname,
+        ur.reputation,
+        ur.contributor_type,
+        ur.has_github,
+        ur.norm_location,
+        lq.avg_net_post_score as loc_avg_net_score,
+        lq.p90_rep as loc_p90_rep,
+        coalesce(ur.net_post_score,0)
+          + coalesce(ur.badge_count,0) * 2
+          + case when ur.has_github = 1 then 10 else 0 end
+          + case when ur.contributor_type = 'answerer' then 5 when ur.contributor_type = 'asker' then 2 else 3 end
+          - greatest(0, floor((extract(epoch from (timestamp '2024-10-01 12:34:56' - coalesce(ur.last_post_activity, ur.first_post_date)))/86400)) - 30)
+          + coalesce(ur.net_score_30d,0) * 1.5
+          + coalesce(ur.net_score_365d,0) * 0.25
+          - abs(coalesce(ur.q_count,0) - coalesce(ur.a_count,0)) as composite_score
+    from user_rollup ur
+    left join location_quality lq on lq.norm_location = ur.norm_location
+),
+question_enrichment as (
+    select
+        uqi.*,
+        dc.dupes_of,
+        dc.has_dupe_reports,
+        ta.tagname,
+        ta.avg_q_score_with_tag,
+        ta.median_views_with_tag
+    from user_question_interactions uqi
+    left join dupe_clusters dc on dc.question_id = uqi.question_id
+    left join tag_expanded te on te.question_id = uqi.question_id
+    left join tag_agg ta on ta.tagname = te.tagname
+),
+ranked_questions as (
+    select
+        qe.question_id,
+        qe.asker_id,
+        qe.q_created,
+        qe.q_score,
+        qe.q_views,
+        qe.answer_count,
+        qe.answers_net_score,
+        qe.top_answer_score,
+        qe.top_answerer_id,
+        qe.self_answer_top,
+        qe.first_closed_at,
+        qe.last_reopened_at,
+        qe.close_votes_count,
+        qe.reopen_events,
+        qe.closed_quickly,
+        qe.dupes_of,
+        qe.has_dupe_reports,
+        coalesce(qe.avg_q_score_with_tag, 0) as avg_q_score_with_tag,
+        coalesce(qe.median_views_with_tag, 0) as median_views_with_tag,
+        row_number() over (
+            partition by qe.asker_id
+            order by
+                (coalesce(qe.q_views,0) + coalesce(qe.answers_net_score,0)*10 + coalesce(qe.top_answer_score,0)*5)
+                - coalesce(qe.close_votes_count,0)*3
+                + case when qe.closed_quickly = 1 then -15 else 0 end
+                desc,
+                qe.q_created desc
+        ) as rn_by_asker
+    from question_enrichment qe
+),
+top_questions as (
+    select *
+    from ranked_questions
+    where rn_by_asker <= 5
+),
+user_summary as (
+    select
+        fs.user_id,
+        fs.displayname,
+        fs.reputation,
+        fs.contributor_type,
+        fs.has_github,
+        fs.norm_location,
+        fs.loc_avg_net_score,
+        fs.loc_p90_rep,
+        fs.composite_score,
+        count(tq.question_id) as top_q_count,
+        sum(tq.q_views) as top_q_views,
+        avg(tq.q_score) as avg_top_q_score,
+        max(tq.top_answer_score) as best_top_answer_score,
+        sum(case when tq.closed_quickly = 1 then 1 else 0 end) as quick_closures
+    from final_scores fs
+    left join top_questions tq on tq.asker_id = fs.user_id
+    group by fs.user_id, fs.displayname, fs.reputation, fs.contributor_type, fs.has_github, fs.norm_location, fs.loc_avg_net_score, fs.loc_p90_rep, fs.composite_score
+),
+final as (
+    select
+        us.*,
+        rank() over (order by us.composite_score desc nulls last, us.avg_top_q_score desc nulls last) as overall_rank
+    from user_summary us
+)
+select
+    f.overall_rank,
+    f.user_id,
+    f.displayname,
+    f.reputation,
+    f.contributor_type,
+    f.norm_location,
+    f.has_github,
+    f.top_q_count,
+    f.top_q_views,
+    f.avg_top_q_score,
+    f.best_top_answer_score,
+    f.quick_closures,
+    round(cast(f.loc_avg_net_score as numeric), 2) as loc_avg_net_score,
+    f.loc_p90_rep,
+    round(cast(f.composite_score as numeric), 2) as composite_score,
+    coalesce(
+        (select string_agg((tq.question_id::text) || ':' || coalesce(tq.q_score::text,'0'), ', ' order by tq.q_views desc)
+         from top_questions tq
+         where tq.asker_id = f.user_id),
+        'none'
+    ) as top_q_list
+from final f
+where (f.top_q_count > 0 or f.composite_score > 0)
+order by f.overall_rank
+limit 200;

@@ -1,0 +1,221 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT c.Id) as TotalComments,
+        COUNT(DISTINCT b.Id) as TotalBadges,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) as QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as AcceptedQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Id END) as PositiveAnswers,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE NULL END) as AvgAnswersPerQuestion
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        CASE 
+            WHEN t.Count > 1000 THEN 'High'
+            WHEN t.Count > 500 THEN 'Medium'
+            ELSE 'Low'
+        END as TagLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank
+    FROM Tags t
+    WHERE t.Count > 100
+),
+PostEngagement AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        u.DisplayName as Author,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.ParentId IS NOT NULL THEN 'Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END as HasAcceptedAnswer,
+        p.Score * (1 + COALESCE(p.ViewCount, 0) / 1000.0) as EngagementScore,
+        CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate as AgeInterval,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) + 
+            (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / 86400 - FLOOR(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / 86400)) as AgeInDays_calc,
+        FLOOR(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / 86400) as AgeInDays,
+        CASE 
+            WHEN p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 day') THEN 'Active'
+            WHEN p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 day') THEN 'Recently Active'
+            ELSE 'Inactive'
+        END as ActivityStatus
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) 
+),
+ComplexQueryResults AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.TotalComments,
+        uas.TotalBadges,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.TotalScore,
+        uas.LastPostDate,
+        uas.AcceptedQuestions,
+        uas.PositiveAnswers,
+        uas.AvgAnswersPerQuestion,
+        tt.TagName,
+        tt.Count as TagCount,
+        tt.TagLevel,
+        tt.TagRank,
+        pe.PostId,
+        pe.Title,
+        pe.Score as PostScore,
+        pe.ViewCount as PostViewCount,
+        pe.CommentCount as PostCommentCount,
+        pe.PostType,
+        pe.HasAcceptedAnswer,
+        pe.EngagementScore,
+        pe.AgeInDays,
+        pe.ActivityStatus,
+        CASE 
+            WHEN uas.Reputation > 10000 THEN 'Veteran'
+            WHEN uas.Reputation > 1000 THEN 'Experienced'
+            WHEN uas.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationTier,
+        CASE 
+            WHEN uas.TotalPosts > 100 THEN 'High Productivity'
+            WHEN uas.TotalPosts > 50 THEN 'Moderate Productivity'
+            WHEN uas.TotalPosts > 10 THEN 'Low Productivity'
+            ELSE 'Minimal Activity'
+        END as ProductivityLevel,
+        CASE 
+            WHEN tt.Count > 500 AND uas.QuestionCount > 10 THEN 'Expert Level'
+            WHEN tt.Count > 100 AND uas.QuestionCount > 5 THEN 'Advanced Level'
+            WHEN uas.QuestionCount > 2 THEN 'Beginner Level'
+            ELSE 'Explorer Level'
+        END as ExpertiseLevel
+    FROM UserActivityStats uas
+    CROSS JOIN TopTags tt
+    LEFT JOIN PostEngagement pe ON uas.UserId = pe.OwnerUserId
+    WHERE uas.Reputation > 1000 
+        AND tt.Count > 1000
+        AND (uas.QuestionCount > 5 OR uas.AnswerCount > 10)
+    GROUP BY
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.TotalComments,
+        uas.TotalBadges,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.TotalScore,
+        uas.LastPostDate,
+        uas.AcceptedQuestions,
+        uas.PositiveAnswers,
+        uas.AvgAnswersPerQuestion,
+        tt.TagName,
+        tt.Count,
+        tt.TagLevel,
+        tt.TagRank,
+        pe.PostId,
+        pe.Title,
+        pe.Score,
+        pe.ViewCount,
+        pe.CommentCount,
+        pe.PostType,
+        pe.HasAcceptedAnswer,
+        pe.EngagementScore,
+        pe.AgeInDays,
+        pe.ActivityStatus
+    ORDER BY uas.Reputation DESC, tt.Count DESC
+)
+SELECT 
+    cqr.UserId,
+    cqr.DisplayName,
+    cqr.Reputation,
+    cqr.TotalPosts,
+    cqr.TotalComments,
+    cqr.TotalBadges,
+    cqr.QuestionCount,
+    cqr.AnswerCount,
+    cqr.TotalScore,
+    cqr.LastPostDate,
+    cqr.AcceptedQuestions,
+    cqr.PositiveAnswers,
+    cqr.AvgAnswersPerQuestion,
+    cqr.TagName,
+    cqr.TagCount,
+    cqr.TagLevel,
+    cqr.TagRank,
+    cqr.PostId,
+    cqr.Title,
+    cqr.PostScore,
+    cqr.PostViewCount,
+    cqr.PostCommentCount,
+    cqr.PostType,
+    cqr.HasAcceptedAnswer,
+    cqr.EngagementScore,
+    cqr.AgeInDays,
+    cqr.ActivityStatus,
+    cqr.ReputationTier,
+    cqr.ProductivityLevel,
+    cqr.ExpertiseLevel,
+    ROW_NUMBER() OVER (PARTITION BY cqr.UserId ORDER BY cqr.EngagementScore DESC) as UserPostRank,
+    LAG(cqr.DisplayName) OVER (ORDER BY cqr.Reputation DESC) as PreviousUser,
+    LEAD(cqr.ReputationTier) OVER (ORDER BY cqr.TotalScore DESC) as NextReputationTier,
+    AVG(cqr.Reputation) OVER (ORDER BY cqr.DisplayName ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) as MovingAverageReputation,
+    NTILE(4) OVER (ORDER BY cqr.TotalScore DESC) as ScoreQuartile,
+    CASE 
+        WHEN cqr.Reputation > (SELECT AVG(u.Reputation) FROM Users u WHERE u.Reputation > 100) THEN 'Above Average'
+        WHEN cqr.Reputation < (SELECT AVG(u.Reputation) FROM Users u WHERE u.Reputation > 100) THEN 'Below Average'
+        ELSE 'Average'
+    END as ReputationComparison,
+    (cqr.DisplayName || ' (' || cqr.ReputationTier || ')') as UserDetail,
+    CASE 
+        WHEN cqr.TagName LIKE '%sql%' OR cqr.TagName LIKE '%database%' THEN 'Database Focus'
+        WHEN cqr.TagName LIKE '%java%' OR cqr.TagName LIKE '%spring%' THEN 'Java Focus'
+        ELSE 'General Focus'
+    END as FocusArea,
+    ABS(cqr.TotalScore - (SELECT AVG(uas.TotalScore) FROM UserActivityStats uas)) as ScoreDeviation,
+    CASE 
+        WHEN cqr.PostId IS NOT NULL THEN 'Active Contributor'
+        ELSE 'Inactive Contributor'
+    END as ContributionStatus,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = cqr.UserId AND b.Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = cqr.UserId AND b.Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = cqr.UserId AND b.Class = 3) as BronzeBadges
+FROM ComplexQueryResults cqr
+WHERE 
+    (cqr.Reputation > 5000 OR cqr.TotalScore > 1000)
+    AND (cqr.ActivityStatus IN ('Active', 'Recently Active') OR cqr.ActivityStatus IS NULL)
+    AND (cqr.PostType = 'Question' OR cqr.PostType IS NULL)
+    AND cqr.TagLevel IN ('High', 'Medium')
+    AND cqr.AgeInDays BETWEEN 1 AND 365
+    AND cqr.ReputationTier IN ('Veteran', 'Experienced')
+    AND cqr.ProductivityLevel IN ('High Productivity', 'Moderate Productivity')
+    AND cqr.ExpertiseLevel IN ('Expert Level', 'Advanced Level')
+    AND cqr.EngagementScore > 100
+    AND (ABS(cqr.TotalScore - (SELECT AVG(uas.TotalScore) FROM UserActivityStats uas)) > 100 OR cqr.TotalScore IS NULL)
+ORDER BY cqr.Reputation DESC, cqr.TagCount DESC, cqr.EngagementScore DESC
+LIMIT 1000
+OFFSET 500;

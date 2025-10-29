@@ -1,0 +1,98 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90' DAY
+),
+
+UserStats AS (
+    SELECT 
+        u.Id                                 AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(p.Score),0)                                 AS TotalPostScore,
+        COALESCE(AVG(p.Score),0)                                 AS AvgPostScore,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS UpVoteCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS DownVoteCount,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END),0)      AS GoldBadgeCount,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END),0)      AS SilverBadgeCount,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END),0)      AS BronzeBadgeCount,
+        MAX(p.CreationDate)                                          AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts  p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes  v ON v.PostId = p.Id AND v.VoteTypeId IN (2,3)
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+
+TagFrequency AS (
+    SELECT 
+        pt.tag AS TagName,
+        COUNT(*) AS TagUseCount
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(TRIM(BOTH '><' FROM p.Tags), '><')) AS tag
+    ) pt
+    WHERE p.PostTypeId = 1
+    GROUP BY pt.tag
+),
+
+TopTags AS (
+    SELECT TagName
+    FROM TagFrequency
+    ORDER BY TagUseCount DESC
+    LIMIT 10
+)
+
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.TotalPostScore,
+    ROUND(us.AvgPostScore,2)                               AS AvgScore,
+    us.UpVoteCount,
+    us.DownVoteCount,
+    us.GoldBadgeCount,
+    us.SilverBadgeCount,
+    us.BronzeBadgeCount,
+    us.LastPostDate,
+    COALESCE(rp.Id,0)                                      AS MostRecentPostId,
+    rp.Score                                               AS MostRecentPostScore,
+    CASE 
+        WHEN us.AnswerCount = 0 THEN NULL
+        ELSE CAST(us.AnswerCount AS DECIMAL) / NULLIF(us.QuestionCount,0)
+    END                                                    AS AnswerRatio,
+    STRING_AGG(DISTINCT t.TagName, ', ')                    AS UserTopTags
+FROM UserStats us
+LEFT JOIN RecentPosts rp 
+       ON rp.OwnerUserId = us.UserId AND rp.rn = 1
+LEFT JOIN Posts p2 
+       ON p2.OwnerUserId = us.UserId
+LEFT JOIN LATERAL (
+    SELECT UNNEST(STRING_TO_ARRAY(TRIM(BOTH '><' FROM p2.Tags), '><')) AS tag
+) pt2 ON true
+LEFT JOIN (SELECT TagName FROM TopTags) t 
+       ON t.TagName = pt2.tag
+WHERE us.UserId IS NOT NULL
+GROUP BY 
+    us.UserId, us.DisplayName, us.QuestionCount, us.AnswerCount,
+    us.TotalPostScore, us.AvgPostScore, us.UpVoteCount, us.DownVoteCount,
+    us.GoldBadgeCount, us.SilverBadgeCount, us.BronzeBadgeCount,
+    us.LastPostDate, rp.Id, rp.Score
+HAVING us.TotalPostScore > 1000
+ORDER BY us.TotalPostScore DESC
+LIMIT 50
+OFFSET 0
+
+UNION ALL
+
+SELECT 
+    NULL::bigint,NULL::text,NULL::bigint,NULL::timestamp,NULL::numeric,NULL::numeric,NULL::bigint,NULL::bigint,NULL::bigint,NULL::bigint,NULL::timestamp,NULL::bigint,NULL::numeric,NULL::text,NULL::text,NULL::text
+WHERE FALSE;

@@ -1,0 +1,184 @@
+WITH RecursiveUserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, b.Class
+),
+LatestPostActivity AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+),
+RankedUserPosts AS (
+    SELECT
+        lpa.*,
+        ru.BadgeCount AS GoldBadges,
+        COALESCE(ru2.BadgeCount, 0) AS SilverBadges,
+        COALESCE(ru3.BadgeCount, 0) AS BronzeBadges
+    FROM LatestPostActivity lpa
+    LEFT JOIN RecursiveUserBadgeCounts ru ON lpa.OwnerUserId = ru.UserId AND ru.Class = 1
+    LEFT JOIN RecursiveUserBadgeCounts ru2 ON lpa.OwnerUserId = ru2.UserId AND ru2.Class = 2
+    LEFT JOIN RecursiveUserBadgeCounts ru3 ON lpa.OwnerUserId = ru3.UserId AND ru3.Class = 3
+    WHERE lpa.rn <= 5
+),
+DuplicateLinks AS (
+    SELECT pl.PostId, COUNT(pl.Id) AS DuplicateLinkCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+),
+ComplexPostMetrics AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.Tags,
+        COALESCE(dl.DuplicateLinkCount, 0) AS DuplicateReferences,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score >= 2) AS HighlyRatedComments,
+        (SELECT AVG(v.VoteTypeId::numeric) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3)) AS AvgVoteType,
+        CASE
+            WHEN p.Tags IS NULL OR p.Tags = '' THEN 'No Tags'
+            ELSE SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2)
+        END AS CleanedTags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC) AS ViewRank
+    FROM Posts p
+    LEFT JOIN DuplicateLinks dl ON p.Id = dl.PostId
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPostSummary AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(*) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgScore,
+        AVG(p.ViewCount) AS AvgViewCount,
+        AVG(p.FavoriteCount) AS AvgFavoriteCount,
+        SUM(p.DuplicateReferences) AS TotalDuplicateRefs,
+        SUM(p.HighlyRatedComments) AS TotalHighlyRatedComments,
+        AVG(p.AvgVoteType) AS AvgVoteType,
+        MAX(p.ViewRank) AS MaxViewRank
+    FROM ComplexPostMetrics p
+    GROUP BY p.OwnerUserId
+),
+UserActivityLeadLag AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        ua.TotalPosts,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.AvgScore,
+        ua.AvgViewCount,
+        ua.AvgFavoriteCount,
+        ua.TotalDuplicateRefs,
+        ua.TotalHighlyRatedComments,
+        ua.AvgVoteType,
+        ua.MaxViewRank,
+        LAG(ua.TotalPosts) OVER (ORDER BY ua.TotalPosts DESC) AS PreviousUserPostCount,
+        LEAD(ua.TotalPosts) OVER (ORDER BY ua.TotalPosts DESC) AS NextUserPostCount
+    FROM Users u
+    LEFT JOIN UserPostSummary ua ON u.Id = ua.OwnerUserId
+    WHERE ua.TotalPosts IS NOT NULL
+),
+UserBadgesCTE AS (
+    SELECT
+        b.UserId,
+        MAX(CASE WHEN b.Class = 1 THEN b.Date ELSE NULL END) AS LastGoldBadgeDate,
+        MAX(CASE WHEN b.Class = 2 THEN b.Date ELSE NULL END) AS LastSilverBadgeDate,
+        MAX(CASE WHEN b.Class = 3 THEN b.Date ELSE NULL END) AS LastBronzeBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+MainResults AS (
+    SELECT
+        ual.Id AS UserId,
+        ual.DisplayName,
+        ual.TotalPosts,
+        ual.QuestionCount,
+        ual.AnswerCount,
+        COALESCE(ub.LastGoldBadgeDate, TIMESTAMP '1970-01-01') AS LastGoldBadgeDate,
+        COALESCE(ub.LastSilverBadgeDate, TIMESTAMP '1970-01-01') AS LastSilverBadgeDate,
+        COALESCE(ub.LastBronzeBadgeDate, TIMESTAMP '1970-01-01') AS LastBronzeBadgeDate,
+        ual.AvgScore,
+        ual.AvgViewCount,
+        ual.AvgFavoriteCount,
+        ual.TotalDuplicateRefs,
+        ual.TotalHighlyRatedComments,
+        ual.AvgVoteType,
+        ual.MaxViewRank,
+        -- EngagementScore
+        (ual.TotalPosts * 0.3 + ual.AvgScore * 2 + ual.TotalHighlyRatedComments * 1.5 - ual.TotalDuplicateRefs * 1.2) /
+        NULLIF((EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - COALESCE(ub.LastGoldBadgeDate, ub.LastSilverBadgeDate, ub.LastBronzeBadgeDate))) / 86400) + 1, 0) AS EngagementScore,
+        -- SummaryText
+        COALESCE(ual.DisplayName, 'Unknown') || ' (' || CAST(ual.TotalPosts AS VARCHAR) || ' posts, ' ||
+        COALESCE(CAST(ual.AvgScore AS VARCHAR), '0') || ' avg score)' AS SummaryText,
+        -- TopAnswerId
+        (
+            SELECT pa.Id FROM Posts pa
+            WHERE pa.OwnerUserId = ual.Id AND pa.PostTypeId = 2
+            ORDER BY pa.Score DESC, pa.CreationDate DESC
+            LIMIT 1
+        ) AS TopAnswerId,
+        -- DistinctQuestionTags
+        (
+            SELECT COUNT(DISTINCT tag) FROM (
+                SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS tag
+                FROM Posts p
+                WHERE p.OwnerUserId = ual.Id AND p.PostTypeId = 1 AND p.Tags IS NOT NULL
+            ) t
+        ) AS DistinctQuestionTags
+    FROM UserActivityLeadLag ual
+    LEFT JOIN UserBadgesCTE ub ON ual.Id = ub.UserId
+    WHERE ual.TotalPosts > 10 AND ual.AvgScore IS NOT NULL AND ual.DisplayName IS NOT NULL
+)
+SELECT * FROM MainResults
+ORDER BY EngagementScore DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    ual.Id AS UserId,
+    COALESCE(ual.DisplayName, 'Deleted User') AS DisplayName,
+    COALESCE(ua.TotalPosts, 0) AS TotalPosts,
+    COALESCE(ua.QuestionCount, 0) AS QuestionCount,
+    COALESCE(ua.AnswerCount, 0) AS AnswerCount,
+    TIMESTAMP '1970-01-01' AS LastGoldBadgeDate,
+    TIMESTAMP '1970-01-01' AS LastSilverBadgeDate,
+    TIMESTAMP '1970-01-01' AS LastBronzeBadgeDate,
+    COALESCE(ua.AvgScore, 0) AS AvgScore,
+    COALESCE(ua.AvgViewCount, 0) AS AvgViewCount,
+    COALESCE(ua.AvgFavoriteCount, 0) AS AvgFavoriteCount,
+    COALESCE(ua.TotalDuplicateRefs, 0) AS TotalDuplicateRefs,
+    COALESCE(ua.TotalHighlyRatedComments, 0) AS TotalHighlyRatedComments,
+    COALESCE(ua.AvgVoteType, 0) AS AvgVoteType,
+    COALESCE(ua.MaxViewRank, 0) AS MaxViewRank,
+    0.0 AS EngagementScore,
+    'Deleted or Anonymous User' AS SummaryText,
+    NULL::bigint AS TopAnswerId,
+    0 AS DistinctQuestionTags
+FROM Users ual
+LEFT JOIN UserPostSummary ua ON ual.Id = ua.OwnerUserId
+WHERE ual.Id NOT IN (SELECT Id FROM UserActivityLeadLag)
+ORDER BY EngagementScore DESC
+LIMIT 10;

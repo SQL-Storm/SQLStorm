@@ -1,0 +1,293 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           date_trunc('month', u.creationdate) as cohort_month,
+           coalesce(nullif(trim(split_part(coalesce(u.location,''), ',', 1)), ''), 'Unknown') as region_hint
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+user_badge_agg as (
+    select b.userid,
+           count(*) as total_badges,
+           sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+           sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+           sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+           max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+questions as (
+    select p.id as post_id,
+           p.owneruserid as user_id,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.title,
+           p.tags,
+           p.answercount,
+           p.closeddate,
+           p.acceptedanswerid
+    from posts p
+    where p.posttypeid = 1
+),
+answers as (
+    select a.id as answer_id,
+           a.parentid as question_id,
+           a.owneruserid as user_id,
+           a.creationdate,
+           a.score
+    from posts a
+    where a.posttypeid = 2
+),
+votes_agg as (
+    select v.postid,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+           sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+           count(*) as total_votes,
+           min(v.creationdate) as first_vote_at,
+           max(v.creationdate) as last_vote_at
+    from votes v
+    group by v.postid
+),
+comment_agg as (
+    select c.postid,
+           count(*) as comment_count,
+           sum(greatest(c.score,0)) as comment_positive_score,
+           max(c.creationdate) as last_comment_at
+    from comments c
+    group by c.postid
+),
+tag_explode as (
+    select q.post_id,
+           unnest(string_to_array(substring(coalesce(q.tags,''), 2, greatest(length(coalesce(q.tags,'')) - 2, 0)), '><')) as tagname
+    from questions q
+),
+tag_rank as (
+    select te.post_id,
+           te.tagname,
+           t.count as tag_global_count,
+           dense_rank() over (partition by te.post_id order by coalesce(t.count,0) desc, te.tagname) as tag_rank_on_question
+    from tag_explode te
+    left join tags t on lower(t.tagname) = lower(te.tagname)
+),
+accepted_answer_age as (
+    select q.post_id,
+           q.acceptedanswerid,
+           aa.creationdate as accepted_answer_created_at,
+           q.creationdate as question_created_at,
+           cast(extract(epoch from (aa.creationdate - q.creationdate)) as bigint) as seconds_to_accept
+    from questions q
+    left join posts aa on aa.id = q.acceptedanswerid
+),
+first_answer as (
+    select a.question_id,
+           min(a.creationdate) as first_answer_at
+    from answers a
+    group by a.question_id
+),
+user_activity as (
+    select ru.user_id,
+           count(distinct case when q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year' then q.post_id end) as questions_last_year,
+           count(distinct case when a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year' then a.answer_id end) as answers_last_year,
+           count(distinct q.post_id) as total_questions,
+           count(distinct a.answer_id) as total_answers,
+           max(coalesce(q.creationdate, a.creationdate)) as last_post_at
+    from recent_users ru
+    left join questions q on q.user_id = ru.user_id
+    left join answers a on a.user_id = ru.user_id
+    group by ru.user_id
+),
+question_quality as (
+    select q.post_id,
+           q.user_id,
+           q.creationdate,
+           q.score,
+           q.viewcount,
+           q.answercount,
+           coalesce(va.upvotes,0) as upvotes,
+           coalesce(va.downvotes,0) as downvotes,
+           coalesce(va.total_votes,0) as total_votes,
+           coalesce(ca.comment_count,0) as comment_count,
+           coalesce(va.bounty_started,0) as bounty_started,
+           coalesce(va.bounty_awarded,0) as bounty_awarded,
+           coalesce(cast(extract(epoch from (fa.first_answer_at - q.creationdate)) as bigint), null) as seconds_to_first_answer,
+           coalesce(aaa.seconds_to_accept, null) as seconds_to_accept,
+           case
+             when q.closeddate is not null then 1
+             else 0
+           end as is_closed
+    from questions q
+    left join votes_agg va on va.postid = q.post_id
+    left join comment_agg ca on ca.postid = q.post_id
+    left join first_answer fa on fa.question_id = q.post_id
+    left join accepted_answer_age aaa on aaa.post_id = q.post_id
+),
+user_rank as (
+    select ru.user_id,
+           ru.displayname,
+           ru.reputation,
+           ru.cohort_month,
+           ru.region_hint,
+           coalesce(uba.total_badges,0) as total_badges,
+           coalesce(uba.gold_badges,0) as gold_badges,
+           coalesce(uba.silver_badges,0) as silver_badges,
+           coalesce(uba.bronze_badges,0) as bronze_badges,
+           ua.total_questions,
+           ua.total_answers,
+           ua.questions_last_year,
+           ua.answers_last_year,
+           ua.last_post_at,
+           row_number() over (partition by ru.cohort_month order by ru.reputation desc, coalesce(uba.total_badges,0) desc, ru.user_id) as cohort_rank
+    from recent_users ru
+    left join user_badge_agg uba on uba.userid = ru.user_id
+    left join user_activity ua on ua.user_id = ru.user_id
+),
+question_tag_summary as (
+    select qr.post_id,
+           string_agg(case when tr.tag_rank_on_question <= 3 then tr.tagname else null end, '|' order by tr.tag_rank_on_question) filter (where tr.tag_rank_on_question <= 3) as top3_tags,
+           max(case when lower(tr.tagname) in ('sql','postgresql','mysql','sqlite') then 1 else 0 end) as is_db_tagged
+    from question_quality qr
+    left join tag_rank tr on tr.post_id = qr.post_id
+    group by qr.post_id
+),
+final_scored_questions as (
+    select qq.post_id,
+           qq.user_id,
+           qq.creationdate,
+           qq.score,
+           qq.viewcount,
+           qq.answercount,
+           qq.upvotes,
+           qq.downvotes,
+           qq.total_votes,
+           qq.comment_count,
+           qq.bounty_started,
+           qq.bounty_awarded,
+           qq.seconds_to_first_answer,
+           qq.seconds_to_accept,
+           qq.is_closed,
+           qts.top3_tags,
+           qts.is_db_tagged,
+           (
+               0.5 * coalesce(qq.score,0) +
+               0.2 * ln(greatest(qq.viewcount,1)) +
+               0.3 * coalesce(qq.upvotes - qq.downvotes, 0) +
+               0.1 * case when qq.answercount >= 1 then 1 else 0 end +
+               0.05 * case when qq.seconds_to_first_answer is not null then 1 else 0 end -
+               0.2 * qq.is_closed +
+               0.1 * case when qts.is_db_tagged = 1 then 1 else 0 end
+           ) as quality_score
+    from question_quality qq
+    left join question_tag_summary qts on qts.post_id = qq.post_id
+),
+user_question_stats as (
+    select fsq.user_id,
+           count(*) as questions_count,
+           avg(fsq.quality_score) as avg_quality,
+           percentile_cont(0.9) within group (order by fsq.quality_score) as p90_quality,
+           min(fsq.creationdate) as first_question_at,
+           max(fsq.creationdate) as last_question_at
+    from final_scored_questions fsq
+    group by fsq.user_id
+),
+cross_user_comparison as (
+    select ur.user_id,
+           ur.displayname,
+           ur.reputation,
+           ur.cohort_month,
+           ur.region_hint,
+           coalesce(uqs.questions_count,0) as questions_count,
+           coalesce(uqs.avg_quality,0) as avg_quality,
+           coalesce(uqs.p90_quality,0) as p90_quality,
+           coalesce(uqs.first_question_at, ur.cohort_month) as first_question_at,
+           ur.total_answers,
+           ur.total_questions,
+           ur.total_badges,
+           ur.gold_badges,
+           ur.silver_badges,
+           ur.bronze_badges,
+           ur.cohort_rank,
+           avg(coalesce(uqs.avg_quality,0)) over (partition by ur.cohort_month) as cohort_avg_quality,
+           stddev_pop(coalesce(uqs.avg_quality,0)) over (partition by ur.cohort_month) as cohort_std_quality
+    from user_rank ur
+    left join user_question_stats uqs on uqs.user_id = ur.user_id
+),
+ranked_users as (
+    select c.*,
+           case
+             when c.cohort_std_quality is null or c.cohort_std_quality = 0 then null
+             else (c.avg_quality - c.cohort_avg_quality) / nullif(c.cohort_std_quality,0)
+           end as quality_zscore,
+           dense_rank() over (order by coalesce(c.avg_quality,0) desc, c.reputation desc, c.total_badges desc, c.user_id) as global_quality_rank
+    from cross_user_comparison c
+),
+dupe_graph as (
+    select pl.relatedpostid as canonical_id,
+           pl.postid as dupe_id,
+           pl.creationdate as link_date
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+dupe_stats as (
+    select q.post_id,
+           count(dg.dupe_id) as num_marked_duplicates_of_this,
+           min(dg.link_date) as first_dupe_link_at
+    from questions q
+    left join dupe_graph dg on dg.canonical_id = q.post_id
+    group by q.post_id
+),
+closed_reasons as (
+    select ph.postid,
+           max(case when ph.posthistorytypeid = 10 then cast(regexp_replace(ph.comment, '[^0-9]', '', 'g') as bigint) end) as close_reason_id,
+           min(case when ph.posthistorytypeid = 10 then ph.creationdate end) as first_closed_at
+    from posthistory ph
+    group by ph.postid
+),
+final as (
+    select
+      ru.user_id,
+      ru.displayname,
+      ru.region_hint,
+      ru.reputation,
+      ru.cohort_month,
+      ru.cohort_rank,
+      ru.global_quality_rank,
+      round(coalesce(ru.avg_quality,0)::numeric, 4) as avg_quality,
+      round(coalesce(ru.p90_quality,0)::numeric, 4) as p90_quality,
+      round(coalesce(ru.quality_zscore,0)::numeric, 4) as quality_zscore,
+      ru.total_questions,
+      ru.total_answers,
+      ru.total_badges,
+      coalesce(ds.num_marked_duplicates_of_this,0) as canonical_dupes_count,
+      sum(case when qq.is_closed = 1 then 1 else 0 end) as closed_questions,
+      sum(case when fsq.is_db_tagged = 1 then 1 else 0 end) as db_tagged_questions,
+      min(cr.first_closed_at) as first_closed_at_any,
+      max(cr.first_closed_at) as last_closed_at_any,
+      max(fsq.quality_score) as best_question_quality,
+      min(fsq.quality_score) as worst_question_quality,
+      bool_or(cr.close_reason_id in (101,1)) as ever_duplicate_closed,
+      count(*) as question_rows_considered
+    from ranked_users ru
+    left join final_scored_questions fsq on fsq.user_id = ru.user_id
+    left join question_quality qq on qq.post_id = fsq.post_id
+    left join dupe_stats ds on ds.post_id = fsq.post_id
+    left join closed_reasons cr on cr.postid = fsq.post_id
+    group by
+      ru.user_id, ru.displayname, ru.region_hint, ru.reputation, ru.cohort_month, ru.cohort_rank,
+      ru.global_quality_rank, ru.avg_quality, ru.p90_quality, ru.quality_zscore, ru.total_questions,
+      ru.total_answers, ru.total_badges, ds.num_marked_duplicates_of_this
+)
+select *
+from final
+where
+  (avg_quality > 0.5 or (p90_quality > 1.0 and total_answers > total_questions))
+  and coalesce(region_hint,'') is not null
+  and (coalesce(canonical_dupes_count,0) = 0 or not ever_duplicate_closed)
+  and (reputation >= 100 or total_badges >= 10 or cohort_rank <= 50)
+  and cohort_month >= date_trunc('month', cast('2024-10-01 12:34:56' as timestamp) - interval '4 years')
+order by global_quality_rank, cohort_month, user_id
+limit 250;

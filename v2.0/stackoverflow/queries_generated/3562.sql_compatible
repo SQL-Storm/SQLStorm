@@ -1,0 +1,145 @@
+WITH 
+    dup_questions AS (
+        SELECT 
+            ph.PostId                AS ClosedQuestionId,
+            CAST(ph.Comment AS integer)  AS OriginalQuestionId,
+            ph.CreationDate          AS CloseDate,
+            ph.UserId                AS ClosedByUserId
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10
+          AND ph.Comment IS NOT NULL
+          AND CAST(ph.Comment AS integer) = 101
+    ),
+    answers_to_dup AS (
+        SELECT 
+            a.Id                     AS AnswerId,
+            a.ParentId               AS QuestionId,
+            a.OwnerUserId            AS AnswererId,
+            a.CreationDate           AS AnswerDate,
+            a.Score                  AS AnswerScore,
+            EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))::bigint AS SecondsToAnswer,
+            q.Tags
+        FROM Posts a
+        JOIN Posts q ON q.Id = a.ParentId
+        WHERE a.PostTypeId = 2
+          AND EXISTS (SELECT 1 FROM dup_questions d WHERE d.ClosedQuestionId = q.Id)
+    ),
+    user_answer_agg AS (
+        SELECT 
+            ans.AnswererId,
+            COUNT(*)                              AS AnswersCount,
+            AVG(ans.AnswerScore)                  AS AvgAnswerScore,
+            AVG(EXTRACT(EPOCH FROM (ans.SecondsToAnswer))/60.0)       AS AvgMinutesToAnswer,
+            STRING_AGG(DISTINCT TRIM(BOTH '<>' FROM UNNEST(string_to_array(ans.Tags, '><'))), ',') 
+                                                  AS TagsUsed,
+            MAX(ans.AnswerDate)                   AS LastAnswerDate
+        FROM answers_to_dup ans
+        GROUP BY ans.AnswererId
+    ),
+    badge_summary AS (
+        SELECT 
+            b.UserId,
+            COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+            COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+            COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+            COUNT(*) FILTER (WHERE b.TagBased = 1) AS TagBadges,
+            MAX(b.Date)                         AS LatestBadgeDate
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    vote_stats AS (
+        SELECT 
+            p.OwnerUserId AS UserId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven,
+            COUNT(DISTINCT v.PostId)                           AS DistinctPostsVoted
+        FROM Votes v
+        JOIN Posts p ON p.Id = v.PostId
+        WHERE v.VoteTypeId IN (2,3)
+        GROUP BY p.OwnerUserId
+    ),
+    users_no_dup_answers AS (
+        SELECT 
+            u.Id               AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            NULL::integer          AS AnswersCount,
+            NULL::double precision AS AvgAnswerScore,
+            NULL::double precision AS AvgMinutesToAnswer,
+            NULL::text         AS TagsUsed,
+            NULL::timestamp    AS LastAnswerDate,
+            0                  AS GoldBadges,
+            0                  AS SilverBadges,
+            0                  AS BronzeBadges,
+            0                  AS TagBadges,
+            NULL::timestamp    AS LatestBadgeDate,
+            0                  AS UpVotesGiven,
+            0                  AS DownVotesGiven,
+            0                  AS DistinctPostsVoted
+        FROM Users u
+        WHERE NOT EXISTS (
+            SELECT 1 
+            FROM answers_to_dup a 
+            WHERE a.AnswererId = u.Id
+        )
+    )
+SELECT *
+FROM (
+    SELECT
+        u.Id                         AS UserId,
+        COALESCE(u.DisplayName, 'Anonymous') AS DisplayName,
+        u.Reputation,
+        COALESCE(ua.AnswersCount, 0)          AS AnswersCount,
+        COALESCE(ua.AvgAnswerScore, 0.0)      AS AvgAnswerScore,
+        COALESCE(ua.AvgMinutesToAnswer, 0.0)  AS AvgMinutesToAnswer,
+        ua.TagsUsed,
+        ua.LastAnswerDate,
+        bs.GoldBadges,
+        bs.SilverBadges,
+        bs.BronzeBadges,
+        bs.TagBadges,
+        bs.LatestBadgeDate,
+        vs.UpVotesGiven,
+        vs.DownVotesGiven,
+        vs.DistinctPostsVoted,
+        ROW_NUMBER() OVER (
+            ORDER BY 
+                (u.Reputation * 0.4) +
+                (COALESCE(ua.AvgAnswerScore,0) * 10) +
+                (bs.GoldBadges * 20 + bs.SilverBadges * 10 + bs.BronzeBadges * 5) -
+                (COALESCE(ua.AvgMinutesToAnswer,0) * 0.1) DESC
+        ) AS PerformanceRank
+    FROM Users u
+    LEFT JOIN user_answer_agg ua   ON ua.AnswererId = u.Id
+    LEFT JOIN badge_summary bs    ON bs.UserId = u.Id
+    LEFT JOIN vote_stats vs       ON vs.UserId = u.Id
+    WHERE u.Reputation > 1000
+      AND (ua.AnswersCount IS NOT NULL OR bs.GoldBadges > 0)
+) AS ranked_active
+
+UNION ALL
+
+SELECT *
+FROM (
+    SELECT
+        nu.UserId,
+        nu.DisplayName,
+        nu.Reputation,
+        nu.AnswersCount,
+        nu.AvgAnswerScore,
+        nu.AvgMinutesToAnswer,
+        nu.TagsUsed,
+        nu.LastAnswerDate,
+        nu.GoldBadges,
+        nu.SilverBadges,
+        nu.BronzeBadges,
+        nu.TagBadges,
+        nu.LatestBadgeDate,
+        nu.UpVotesGiven,
+        nu.DownVotesGiven,
+        nu.DistinctPostsVoted,
+        NULL::integer AS PerformanceRank
+    FROM users_no_dup_answers nu
+) AS ranked_inactive
+ORDER BY PerformanceRank NULLS LAST, Reputation DESC
+LIMIT 100;

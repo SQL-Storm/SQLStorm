@@ -1,0 +1,142 @@
+WITH UserBadgeCounts AS (
+    SELECT u.Id AS UserId,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+UserScoreAgg AS (
+    SELECT p.OwnerUserId AS UserId,
+           SUM(p.Score) AS TotalPostScore,
+           AVG(p.Score) AS AvgPostScore,
+           COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+           COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+RecentVoteStats AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes,
+           MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+    GROUP BY v.PostId
+),
+TagMentions AS (
+    SELECT p.Id AS PostId,
+           UNNEST(string_to_array(SUBSTRING(p.Tags, 2, CHAR_LENGTH(p.Tags)-2), '><')) AS TagName
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL
+),
+TagPopularity AS (
+    SELECT t.TagName,
+           COUNT(*) AS TagUseCount,
+           SUM(p.Score) AS TagScoreSum,
+           ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY COUNT(*) DESC) AS TagRank
+    FROM TagMentions tm
+    JOIN Tags t ON t.TagName = tm.TagName
+    JOIN Posts p ON p.Id = tm.PostId
+    GROUP BY t.TagName
+),
+ClosedDuplicatePairs AS (
+    SELECT ph.PostId AS QuestionId,
+           CAST(ph.Text AS INTEGER) AS DuplicateOfId,
+           ph.CreationDate AS ClosedDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+      AND ph.Comment = '101'
+      AND ph.Text ~ '^\d+$'
+),
+UserRecentActivity AS (
+    SELECT u.Id AS UserId,
+           MAX(p.LastActivityDate) AS LastPostActivity,
+           MAX(c.CreationDate)    AS LastCommentDate
+    FROM Users u
+    LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId      = u.Id
+    GROUP BY u.Id
+)
+SELECT
+    u.Id                                 AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    COALESCE(ua.LastPostActivity, ua.LastCommentDate) AS LastActivity,
+    us.TotalPostScore,
+    us.AvgPostScore,
+    us.QuestionCount,
+    us.AnswerCount,
+    CASE
+        WHEN us.QuestionCount = 0 THEN NULL
+        ELSE CAST(us.AnswerCount AS DECIMAL) / NULLIF(us.QuestionCount, 0)
+    END                                 AS AnswerRatio,
+    COALESCE(rv.UpVotes, 0) - COALESCE(rv.DownVotes, 0) AS NetRecentVotes,
+    rv.LastVoteDate,
+    STRING_AGG(DISTINCT tp.TagName, ', ') FILTER (WHERE tp.TagRank <= 5) AS TopTags,
+    CASE
+        WHEN cd.QuestionId IS NOT NULL THEN
+            'Closed as duplicate of ' || CAST(cd.DuplicateOfId AS VARCHAR)
+        ELSE 'Open'
+    END                                 AS ClosureInfo
+FROM Users u
+LEFT JOIN UserBadgeCounts      ub  ON ub.UserId = u.Id
+LEFT JOIN UserScoreAgg         us  ON us.UserId = u.Id
+LEFT JOIN UserRecentActivity   ua  ON ua.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT rv.UpVotes, rv.DownVotes, rv.LastVoteDate
+    FROM RecentVoteStats rv
+    WHERE rv.PostId = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = u.Id
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    )
+) rv ON TRUE
+LEFT JOIN LATERAL (
+    SELECT tp.TagName, tp.TagRank
+    FROM TagMentions tm
+    JOIN TagPopularity tp ON tp.TagName = tm.TagName
+    WHERE tm.PostId = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = u.Id
+        ORDER BY p.Score DESC
+        LIMIT 1
+    )
+    LIMIT 1
+) tp ON TRUE
+LEFT JOIN ClosedDuplicatePairs cd ON cd.QuestionId = (
+    SELECT p.Id
+    FROM Posts p
+    WHERE p.OwnerUserId = u.Id
+      AND p.PostTypeId = 1
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+)
+WHERE u.Reputation > 10000
+  AND (COALESCE(ub.GoldBadges, 0) > 0 OR COALESCE(us.TotalPostScore, 0) > 5000)
+  AND EXISTS (
+        SELECT 1
+        FROM Posts p
+        WHERE p.OwnerUserId = u.Id
+          AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '90' DAY)
+      )
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation,
+    ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges,
+    ua.LastPostActivity, ua.LastCommentDate,
+    us.TotalPostScore, us.AvgPostScore, us.QuestionCount, us.AnswerCount,
+    rv.UpVotes, rv.DownVotes, rv.LastVoteDate,
+    tp.TagName, tp.TagRank,
+    cd.QuestionId, cd.DuplicateOfId
+HAVING COUNT(*) FILTER (WHERE tp.TagRank = 1) > 0
+ORDER BY u.Reputation DESC
+OFFSET 0 ROWS FETCH NEXT 50 ROWS ONLY;

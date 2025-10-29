@@ -1,0 +1,200 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        array[t.TagName] as TagPath,
+        1 as Level
+    from Tags t
+    where not t.IsModeratorOnly = true
+
+    union all
+
+    select
+        c.Id,
+        c.TagName,
+        r.TagPath || c.TagName,
+        r.Level + 1
+    from Tags c
+    join RecursiveTagHierarchy r on c.WikiPostId = r.Id
+    where r.Level < 3
+),
+UserBadgeStats as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount,
+        string_agg(distinct b.Name, ', ') as Badges,
+        max(b.Date) as LatestBadgeDate
+    from Badges b
+    group by b.UserId, b.Class
+),
+PostWithVoteStats as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        coalesce(v.UpVotes, 0) as UpVotes,
+        coalesce(v.DownVotes, 0) as DownVotes,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.ParentId
+    from Posts p
+    left join (
+        select
+            PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by PostId
+    ) v on p.Id = v.PostId
+),
+QuestionAnswerPairs as (
+    select
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.Tags,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreationDate,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerId,
+        a.UpVotes as AnswerUpVotes,
+        a.DownVotes as AnswerDownVotes,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from PostWithVoteStats q
+    left join PostWithVoteStats a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+TopAnswersWithUser as (
+    select
+        qap.QuestionId,
+        qap.QuestionTitle,
+        qap.QuestionCreationDate,
+        qap.QuestionScore,
+        qap.QuestionViews,
+        qap.Tags,
+        qap.AnswerId,
+        qap.AnswerCreationDate,
+        qap.AnswerScore,
+        qap.AnswerOwnerId,
+        qap.AnswerUpVotes,
+        qap.AnswerDownVotes,
+        qap.AnswerRank,
+        u.Reputation,
+        u.DisplayName,
+        u.Location,
+        u.CreationDate as UserCreationDate
+    from QuestionAnswerPairs qap
+    left join Users u on qap.AnswerOwnerId = u.Id
+    where qap.AnswerRank = 1
+),
+AggregatedComments as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ' order by c.CreationDate desc) as RecentCommenters,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.PostId
+),
+ClosedQuestions as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as ClosedDate,
+        max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as ReopenedDate,
+        max(case when ph.PostHistoryTypeId = 10 then ph.Comment end) as CloseReasonId
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10, 11)
+    group by ph.PostId
+),
+QuestionsWithCloseInfo as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        c.ClosedDate,
+        c.ReopenedDate,
+        c.CloseReasonId
+    from Posts p
+    left join ClosedQuestions c on p.Id = c.PostId
+    where p.PostTypeId = 1
+),
+FinalComplexView as (
+    select
+        tq.Id as QuestionId,
+        tq.Title,
+        tq.CreationDate as QuestionCreationDate,
+        tq.Score as QuestionScore,
+        tq.ViewCount as QuestionViewCount,
+        (case 
+            when tq.ClosedDate is not null and (tq.ReopenedDate is null or tq.ClosedDate > tq.ReopenedDate) then 'Closed'
+            when tq.ClosedDate is not null and tq.ReopenedDate is not null and tq.ReopenedDate > tq.ClosedDate then 'Reopened'
+            else 'Open' end) as Status,
+        act.CommentCount,
+        act.RecentCommenters,
+        tq.CloseReasonId,
+        ta.AnswerId,
+        ta.AnswerCreationDate,
+        ta.AnswerScore,
+        ta.Reputation as AnswererReputation,
+        ta.DisplayName as AnswererName,
+        ta.Location as AnswererLocation,
+        rh.Level as TagHierarchyLevel,
+        string_agg(distinct rth.TagName, ' > ') over (partition by tq.Id order by rth.Level) as TagHierarchyPath,
+        (select count(*) 
+         from PostLinks pl
+         where pl.PostId = tq.Id and pl.LinkTypeId = 3) as DuplicateCount,
+        (select avg(v.Score) 
+         from Posts v 
+         where v.OwnerUserId = tq.OwnerUserId and v.PostTypeId = 1) as AverageUserQuestionScore
+    from QuestionsWithCloseInfo tq
+    left join AggregatedComments act on tq.Id = act.PostId
+    left join TopAnswersWithUser ta on ta.QuestionId = tq.Id
+    left join RecursiveTagHierarchy rth on position(rth.TagName in coalesce(tq.Tags, '')) > 0
+    left join RecursiveTagHierarchy rh on rh.Id = rth.Id
+    where (ta.AnswerScore > 0 or ta.AnswerScore is null)
+)
+select distinct
+    QuestionId,
+    Title,
+    QuestionCreationDate,
+    QuestionScore,
+    QuestionViewCount,
+    Status,
+    CloseReasonId,
+    CommentCount,
+    RecentCommenters,
+    AnswerId,
+    AnswerCreationDate,
+    AnswerScore,
+    AnswererReputation,
+    AnswererName,
+    AnswererLocation,
+    TagHierarchyLevel,
+    TagHierarchyPath,
+    DuplicateCount,
+    coalesce(AverageUserQuestionScore, 0) as AverageUserQuestionScore,
+    length(Title) as TitleLength,
+    length(coalesce(RecentCommenters, '')) as CommentersStringLength,
+    case 
+        when QuestionScore > 10 and AnswerScore > 10 then 'High Scoring Q&A'
+        when QuestionScore <= 10 and AnswerScore is null then 'Unanswered or Low Activity'
+        else 'Medium Activity'
+    end as ActivityCategory
+from FinalComplexView
+where (
+    (Status = 'Open' and AnswerScore > 5) 
+    or (Status = 'Closed' and CloseReasonId in (101, 102, 103))
+)
+and (TagHierarchyLevel is null or TagHierarchyLevel <= 3)
+order by QuestionScore desc, AnswerScore desc, CommentCount desc
+limit 50;

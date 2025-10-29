@@ -1,0 +1,224 @@
+-- {"query": "1377.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3695} 
+WITH UserPostMetrics AS (
+    -- Calculate detailed metrics for each post, including edit counts, close vote counts, and tag analysis.
+    -- This CTE also links answers back to their parent questions to identify accepted answers.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastEditDate,
+        p.ClosedDate,
+        p.ParentId, -- ParentId for answers
+        (
+            SELECT COUNT(ph.Id)
+            FROM PostHistory ph
+            WHERE ph.PostId = p.Id
+              AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+        ) AS EditCount, -- Number of significant edits to the post
+        (
+            SELECT COUNT(ph_close.Id)
+            FROM PostHistory ph_close
+            WHERE ph_close.PostId = p.Id
+              AND ph_close.PostHistoryTypeId = 10 -- Post Closed
+        ) AS CloseVoteHistoryCount, -- Number of times a post was subject to a close vote
+        CASE
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 -- Ensure tags string is not empty or just "<>"
+            THEN ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'), 1)
+            ELSE 0
+        END AS TagCount, -- Number of tags associated with the post
+        pq.AcceptedAnswerId AS ParentQuestionAcceptedAnswerId -- The AcceptedAnswerId of the parent question
+    FROM Posts p
+    LEFT JOIN Posts pq ON p.PostTypeId = 2 AND p.ParentId = pq.Id -- Join to get parent question details for answers
+    WHERE p.OwnerUserId IS NOT NULL -- Exclude posts without an owner (e.g., community wiki posts before ownership)
+),
+UserPostWindowMetrics AS (
+    -- Apply window functions over each user's posts to calculate running averages and ranks.
+    SELECT
+        upm.PostId,
+        upm.OwnerUserId,
+        upm.PostTypeId,
+        upm.Score,
+        upm.ViewCount,
+        upm.EditCount,
+        upm.TagCount,
+        upm.FavoriteCount,
+        upm.ParentQuestionAcceptedAnswerId,
+        upm.CreationDate,
+        -- Calculate the running average of post scores for each user, ordered by post creation date.
+        AVG(upm.Score) OVER (PARTITION BY upm.OwnerUserId ORDER BY upm.CreationDate) AS RunningAvgPostScoreAtTime,
+        -- Rank posts by score for each user, with ties broken by creation date (most recent first).
+        ROW_NUMBER() OVER (PARTITION BY upm.OwnerUserId ORDER BY upm.Score DESC, upm.CreationDate DESC) AS PostScoreRankByUser
+    FROM UserPostMetrics upm
+),
+UserActivitySummary AS (
+    -- Aggregate overall user activity metrics, including badge counts and link activity using correlated subqueries.
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        -- Correlated subquery to count comments made by the user.
+        (SELECT COUNT(c.Id) FROM Comments c WHERE c.UserId = u.Id) AS CommentCount,
+        -- Correlated subquery to count distinct posts linked *by* this user.
+        (
+            SELECT COUNT(DISTINCT pl_out.RelatedPostId)
+            FROM PostLinks pl_out
+            JOIN Posts p_out ON pl_out.PostId = p_out.Id
+            WHERE p_out.OwnerUserId = u.Id
+            AND pl_out.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Linked')
+        ) AS OutgoingLinksCount,
+        -- Correlated subquery to count distinct posts that link *to* this user's posts.
+        (
+            SELECT COUNT(DISTINCT pl_in.PostId)
+            FROM PostLinks pl_in
+            JOIN Posts p_in ON pl_in.RelatedPostId = p_in.Id
+            WHERE p_in.OwnerUserId = u.Id
+            AND pl_in.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Linked')
+        ) AS IncomingLinksCount
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+FinalUserPostAggregates AS (
+    -- Aggregate post-related metrics for each user, utilizing the results from UserPostWindowMetrics.
+    SELECT
+        upwm.OwnerUserId AS UserId,
+        COUNT(upwm.PostId) AS TotalPostsAuthored,
+        SUM(CASE WHEN upwm.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAuthored,
+        SUM(CASE WHEN upwm.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersAuthored,
+        SUM(CASE WHEN upwm.PostTypeId = 1 THEN upwm.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN upwm.PostTypeId = 2 THEN upwm.Score ELSE 0 END) AS TotalAnswerScore,
+        AVG(CAST(upwm.Score AS DECIMAL)) AS AvgOverallPostScore,
+        AVG(CASE WHEN upwm.PostTypeId = 1 THEN CAST(upwm.ViewCount AS DECIMAL) ELSE NULL END) AS AvgQuestionViewCount,
+        AVG(CAST(upwm.EditCount AS DECIMAL)) AS AvgPostEditCount,
+        SUM(upwm.FavoriteCount) AS TotalFavoriteCount,
+        -- Identify accepted answers authored by the user.
+        SUM(CASE WHEN upwm.PostTypeId = 2 AND upwm.ParentQuestionAcceptedAnswerId = upwm.PostId THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        MAX(upwm.Score) AS MaxSinglePostScore,
+        MAX(upwm.TagCount) AS MaxTagsOnSinglePost,
+        MIN(upwm.CreationDate) AS FirstPostDate,
+        MAX(upwm.CreationDate) AS LastPostDate,
+        -- Average of the running average scores for a user's posts.
+        AVG(upwm.RunningAvgPostScoreAtTime) AS OverallAvgRunningPostScore,
+        -- Score of the user's highest ranked post (determined by PostScoreRankByUser = 1).
+        MAX(CASE WHEN upwm.PostScoreRankByUser = 1 THEN upwm.Score ELSE NULL END) AS TopRankedPostScore
+    FROM UserPostWindowMetrics upwm
+    GROUP BY upwm.OwnerUserId
+)
+SELECT
+    u.Id AS UserIdentifier,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserRegistrationDate,
+    u.LastAccessDate,
+    -- User Activity Metrics from UserActivitySummary CTE
+    uas.UserProfileViews,
+    uas.CommentCount,
+    uas.TotalBadges,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    uas.OutgoingLinksCount,
+    uas.IncomingLinksCount,
+    -- Post-related Metrics from FinalUserPostAggregates CTE
+    fupa.TotalPostsAuthored,
+    fupa.QuestionsAuthored,
+    fupa.AnswersAuthored,
+    COALESCE(fupa.AvgOverallPostScore, 0.0) AS AveragePostScore,
+    COALESCE(fupa.AvgQuestionViewCount, 0.0) AS AverageQuestionViewCount,
+    COALESCE(fupa.AvgPostEditCount, 0.0) AS AveragePostEditCount,
+    fupa.AcceptedAnswersCount,
+    fupa.MaxSinglePostScore,
+    fupa.MaxTagsOnSinglePost,
+    COALESCE(fupa.OverallAvgRunningPostScore, 0.0) AS OverallAvgRunningPostScore,
+    COALESCE(fupa.TopRankedPostScore, 0) AS TopRankedPostScore,
+    -- String expressions and NULL logic for user profile details
+    COALESCE(u.Location, 'Unspecified Location') AS UserLocation,
+    NULLIF(u.WebsiteUrl, '') AS UserWebsite, -- Returns NULL if WebsiteUrl is an empty string
+    SUBSTRING(u.AboutMe, 1, 150) AS AboutMeExcerpt, -- First 150 characters of AboutMe
+    -- Complex calculation: A weighted 'User Impact Score' combining multiple metrics
+    (
+        (u.Reputation * 0.35) +
+        (COALESCE(fupa.TotalQuestionScore, 0) * 0.15) +
+        (COALESCE(fupa.TotalAnswerScore, 0) * 0.15) +
+        (COALESCE(fupa.AcceptedAnswersCount, 0) * 75) + -- Accepted answers heavily contribute to impact
+        (COALESCE(uas.TotalBadges, 0) * 8) +
+        (COALESCE(uas.CommentCount, 0) * 0.4) +
+        (COALESCE(fupa.AvgPostEditCount, 0) * 4) + -- Rewarding users who edit and improve posts
+        (CASE WHEN u.WebsiteUrl IS NOT NULL THEN 40 ELSE 0 END) + -- Bonus for having a public website
+        (COALESCE(fupa.OverallAvgRunningPostScore, 0.0) * 0.1) + -- Incorporating consistency in post quality
+        (COALESCE(uas.IncomingLinksCount, 0) * 5) -- Recognizing external recognition
+    ) AS UserImpactScore,
+    -- Correlated Subquery: Count how many of a user's posts are marked as duplicates.
+    (
+        SELECT COUNT(DISTINCT pl_sub.PostId)
+        FROM PostLinks pl_sub
+        JOIN Posts p_sub ON pl_sub.PostId = p_sub.Id
+        WHERE p_sub.OwnerUserId = u.Id
+          AND pl_sub.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate')
+    ) AS DuplicateLinkedPostsCount,
+    -- Window Function: Calculate a global rank for users based on their computed UserImpactScore.
+    DENSE_RANK() OVER (ORDER BY (
+        (u.Reputation * 0.35) +
+        (COALESCE(fupa.TotalQuestionScore, 0) * 0.15) +
+        (COALESCE(fupa.TotalAnswerScore, 0) * 0.15) +
+        (COALESCE(fupa.AcceptedAnswersCount, 0) * 75) +
+        (COALESCE(uas.TotalBadges, 0) * 8) +
+        (COALESCE(uas.CommentCount, 0) * 0.4) +
+        (COALESCE(fupa.AvgPostEditCount, 0) * 4) +
+        (CASE WHEN u.WebsiteUrl IS NOT NULL THEN 40 ELSE 0 END) +
+        (COALESCE(fupa.OverallAvgRunningPostScore, 0.0) * 0.1) +
+        (COALESCE(uas.IncomingLinksCount, 0) * 5)
+    ) DESC, u.CreationDate ASC, u.Id ASC) AS GlobalImpactRank,
+    -- Case expression: Categorize user activity status based on last access, reputation, and post count.
+    CASE
+        WHEN u.LastAccessDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 months') AND u.Reputation > 5000 AND COALESCE(fupa.TotalPostsAuthored, 0) > 20 THEN 'Highly Active & Prolific Veteran'
+        WHEN u.LastAccessDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months') AND u.Reputation > 1000 THEN 'Active Contributor'
+        WHEN u.LastAccessDate < (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') AND u.Reputation > 500 AND COALESCE(fupa.TotalPostsAuthored, 0) > 10 THEN 'Lapsed Veteran'
+        WHEN u.Reputation <= 500 AND COALESCE(fupa.TotalPostsAuthored, 0) < 5 THEN 'Newcomer/Casual User'
+        ELSE 'General Contributor'
+    END AS UserActivityStatus,
+    -- Complex string expression: Generate a unique composite key for the user using ID, creation date, and location.
+    'USR-' || LPAD(u.Id::text, 9, '0') || '-' || TO_CHAR(u.CreationDate, 'YYMMDDHH24MI') || '-' || UPPER(LEFT(COALESCE(u.Location, 'XX'), 2)) AS UniqueUserCompositeKey
+FROM Users u
+LEFT JOIN UserActivitySummary uas ON u.Id = uas.UserId
+LEFT JOIN FinalUserPostAggregates fupa ON u.Id = fupa.UserId
+WHERE
+    u.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '10 years') -- Filter for users registered within the last 10 years
+    AND u.Reputation >= 500 -- Require a minimum reputation score
+    AND COALESCE(fupa.TotalPostsAuthored, 0) >= 5 -- Users must have authored at least 5 posts
+    AND COALESCE(fupa.QuestionsAuthored, 0) >= 1 -- Must have asked at least one question
+    AND COALESCE(fupa.AnswersAuthored, 0) >= 1 -- Must have provided at least one answer
+    AND COALESCE(fupa.AcceptedAnswersCount, 0) >= 1 -- At least one of their answers must have been accepted
+    AND u.LastAccessDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') -- User must have been active in the last year
+    -- Complicated predicate: Select users who have relevant 'AboutMe' content (SQL, Database, Developer),
+    -- OR are very high reputation (10k+),
+    -- OR have a significant number of incoming links to their posts.
+    AND (
+        (u.AboutMe IS NOT NULL AND (u.AboutMe ILIKE '%SQL%' OR u.AboutMe ILIKE '%Database%' OR u.AboutMe ILIKE '%Developer%'))
+        OR u.Reputation >= 10000
+        OR COALESCE(uas.IncomingLinksCount, 0) > 5
+    )
+    -- Further filter: Users whose average post edit count is significantly above the recent global average for Q&A posts.
+    AND COALESCE(fupa.AvgPostEditCount, 0) > (
+        SELECT AVG(COALESCE(upm_sub.EditCount, 0))
+        FROM UserPostMetrics upm_sub
+        WHERE upm_sub.PostTypeId IN (1, 2)
+        AND upm_sub.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 years') -- Consider average edits for posts created in the last 5 years
+    ) * 0.9 -- Users' average edits must be at least 90% of this benchmark
+    -- Ensure DisplayName is valid and not a placeholder for a deleted user.
+    AND (u.DisplayName IS NOT NULL AND LENGTH(TRIM(u.DisplayName)) > 2 AND u.DisplayName NOT ILIKE '%[deleted user]%')
+ORDER BY UserImpactScore DESC, GlobalImpactRank ASC, u.LastAccessDate DESC
+LIMIT 100;

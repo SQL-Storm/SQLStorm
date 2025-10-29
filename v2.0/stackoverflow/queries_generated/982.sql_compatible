@@ -1,0 +1,392 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           u.websiteurl,
+           coalesce(u.upvotes,0) - coalesce(u.downvotes,0) as net_votes,
+           row_number() over (order by u.creationdate desc, u.id) as rn
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_activity as (
+    select
+        u.user_id,
+        count(distinct p.id) filter (where p.posttypeid in (1,2)) as total_posts,
+        count(distinct p.id) filter (where p.posttypeid = 1) as questions,
+        count(distinct p.id) filter (where p.posttypeid = 2) as answers,
+        sum(coalesce(p.score,0)) as post_score_sum,
+        avg(nullif(p.score,0)) as avg_nonzero_post_score,
+        max(p.viewcount) as max_post_views,
+        coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end),0) as votes_delta,
+        count(distinct c.id) as comments_count
+    from recent_users u
+    left join posts p
+      on p.owneruserid = u.user_id
+     and p.creationdate >= u.creationdate
+    left join votes v
+      on v.postid = p.id
+     and v.creationdate >= u.creationdate
+    left join comments c
+      on c.userid = u.user_id
+     and c.creationdate >= u.creationdate
+    group by u.user_id
+),
+accepted_answer_stats as (
+    select
+        q.owneruserid as asker_id,
+        count(*) as accepted_answers_received,
+        sum(a.score) as accepted_answers_score_sum,
+        avg(cast(a.score as numeric)) as accepted_answers_avg_score
+    from posts q
+    join posts a
+      on a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+      and a.posttypeid = 2
+    group by q.owneruserid
+),
+badge_agg as (
+    select
+        b.userid,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        sum(case when b.tagbased = true then 1 else 0 end) as tag_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+q_detail as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.closeddate is not null) as closed_questions,
+        count(*) filter (where p.favoritecount is not null and p.favoritecount > 0) as favorited_questions,
+        sum(p.viewcount) as total_views_questions,
+        count(*) filter (where position('java' in coalesce(lower(p.tags),'')) > 0) as java_tagged_qs,
+        count(*) filter (where position('python' in coalesce(lower(p.tags),'')) > 0) as python_tagged_qs
+    from posts p
+    where p.posttypeid = 1
+    group by p.owneruserid
+),
+a_detail as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.score >= 10) as high_score_answers,
+        count(*) filter (where p.score <= -2) as low_score_answers,
+        count(distinct p.parentid) as distinct_questions_answered
+    from posts p
+    where p.posttypeid = 2
+    group by p.owneruserid
+),
+hot_question_bumps as (
+    select ph.postid,
+           count(*) filter (where ph.posthistorytypeid = 50) as community_bumps,
+           count(*) filter (where ph.posthistorytypeid = 52) as selected_hot,
+           count(*) filter (where ph.posthistorytypeid = 53) as removed_hot
+    from posthistory ph
+    where ph.posthistorytypeid in (50,52,53)
+    group by ph.postid
+),
+duplicates as (
+    select pl.postid as dup_post_id,
+           count(*) as dup_refs,
+           count(distinct pl.relatedpostid) as distinct_masters
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid
+),
+activity_timeline as (
+    select
+        u.user_id,
+        date_trunc('month', p.creationdate) as month,
+        count(*) filter (where p.posttypeid = 1) as q_month_count,
+        count(*) filter (where p.posttypeid = 2) as a_month_count
+    from recent_users u
+    left join posts p
+      on p.owneruserid = u.user_id
+    group by u.user_id, date_trunc('month', p.creationdate)
+),
+activity_rank as (
+    select
+        user_id,
+        month,
+        q_month_count,
+        a_month_count,
+        rank() over (partition by user_id order by coalesce(a_month_count,0) + coalesce(q_month_count,0) desc, month desc) as month_rank
+    from activity_timeline
+),
+top_activity_month as (
+    select user_id, month as peak_month, q_month_count, a_month_count
+    from activity_rank
+    where month_rank = 1
+),
+user_latest_posts as (
+    select p.owneruserid as user_id,
+           p.id as post_id,
+           p.posttypeid,
+           p.score,
+           p.viewcount,
+           p.creationdate,
+           row_number() over (partition by p.owneruserid order by p.creationdate desc, p.id desc) as rn
+    from posts p
+),
+latest_three_posts as (
+    select ulp.user_id,
+           array_agg(ulp.post_id order by ulp.rn) filter (where ulp.rn <= 3) as last3_post_ids,
+           sum(case when ulp.rn <= 3 then coalesce(ulp.score,0) else 0 end) as last3_score_sum,
+           sum(case when ulp.rn <= 3 then coalesce(ulp.viewcount,0) else 0 end) as last3_views_sum
+    from user_latest_posts ulp
+    group by ulp.user_id
+),
+stringy as (
+    select
+        u.user_id,
+        trim(
+            both ' ' from
+            coalesce(nullif(u.displayname,''),'(no name)') || ' [' ||
+            coalesce(nullif(u.location,''),'nowhere') || ']'
+        ) as user_label,
+        lower(coalesce(u.websiteurl,'')) as website_lower,
+        case
+          when u.reputation >= 100000 then 'legend'
+          when u.reputation >= 10000 then 'expert'
+          when u.reputation >= 1000 then 'intermediate'
+          else 'newbie'
+        end as rep_band
+    from recent_users u
+),
+comment_sentiment as (
+    select
+        c.userid as user_id,
+        avg(
+            case
+                 when position('thanks' in lower(c.text)) > 0 then 1
+                 when position('thank you' in lower(c.text)) > 0 then 1
+                 when position('great' in lower(c.text)) > 0 then 0.5
+                 when position('helpful' in lower(c.text)) > 0 then 0.5
+                 when position('sorry' in lower(c.text)) > 0 then -0.25
+                 when position('bad' in lower(c.text)) > 0 then -0.5
+                 when position('hate' in lower(c.text)) > 0 then -1
+                 else 0
+            end
+        ) as avg_sentiment,
+        count(*) as comment_samples
+    from comments c
+    group by c.userid
+),
+posttype_names as (
+    select id, name from posttypes
+),
+user_top_tag as (
+    select
+        p.owneruserid as user_id,
+        tname,
+        cnt,
+        row_number() over (partition by p.owneruserid order by cnt desc, tname asc) as rn
+    from (
+        select p.owneruserid,
+               unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tname,
+               count(*) as cnt
+        from posts p
+        where p.posttypeid = 1
+          and p.tags is not null
+          and length(p.tags) > 2
+        group by p.owneruserid, unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><'))
+    ) s
+),
+final_user as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.creationdate,
+        ru.location,
+        ru.websiteurl,
+        ru.net_votes,
+        ua.total_posts,
+        ua.questions,
+        ua.answers,
+        ua.post_score_sum,
+        ua.avg_nonzero_post_score,
+        ua.max_post_views,
+        ua.votes_delta,
+        ua.comments_count,
+        coalesce(aas.accepted_answers_received,0) as accepted_answers_received,
+        coalesce(aas.accepted_answers_score_sum,0) as accepted_answers_score_sum,
+        aas.accepted_answers_avg_score,
+        coalesce(ba.gold_badges,0) as gold_badges,
+        coalesce(ba.silver_badges,0) as silver_badges,
+        coalesce(ba.bronze_badges,0) as bronze_badges,
+        coalesce(ba.tag_badges,0) as tag_badges,
+        ba.first_badge_date,
+        ba.last_badge_date,
+        coalesce(qd.closed_questions,0) as closed_questions,
+        coalesce(qd.favorited_questions,0) as favorited_questions,
+        coalesce(qd.total_views_questions,0) as total_views_questions,
+        coalesce(qd.java_tagged_qs,0) as java_tagged_qs,
+        coalesce(qd.python_tagged_qs,0) as python_tagged_qs,
+        coalesce(ad.high_score_answers,0) as high_score_answers,
+        coalesce(ad.low_score_answers,0) as low_score_answers,
+        coalesce(ad.distinct_questions_answered,0) as distinct_questions_answered,
+        tam.peak_month,
+        tam.q_month_count as peak_q_count,
+        tam.a_month_count as peak_a_count,
+        ltp.last3_post_ids,
+        ltp.last3_score_sum,
+        ltp.last3_views_sum,
+        s.user_label,
+        s.website_lower,
+        s.rep_band,
+        cs.avg_sentiment,
+        cs.comment_samples,
+        utt.tname as top_question_tag
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join accepted_answer_stats aas on aas.asker_id = ru.user_id
+    left join badge_agg ba on ba.userid = ru.user_id
+    left join q_detail qd on qd.user_id = ru.user_id
+    left join a_detail ad on ad.user_id = ru.user_id
+    left join top_activity_month tam on tam.user_id = ru.user_id
+    left join latest_three_posts ltp on ltp.user_id = ru.user_id
+    left join stringy s on s.user_id = ru.user_id
+    left join comment_sentiment cs on cs.user_id = ru.user_id
+    left join user_top_tag utt on utt.user_id = ru.user_id and utt.rn = 1
+),
+post_enriched as (
+    select
+        p.id as post_id,
+        p.posttypeid,
+        pt.name as posttype_name,
+        p.owneruserid,
+        p.parentid,
+        p.acceptedanswerid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.commentcount,
+        p.favoritecount,
+        p.closeddate,
+        p.title,
+        p.tags,
+        case when d.dup_refs is not null then 1 else 0 end as is_duplicate,
+        coalesce(d.dup_refs,0) as duplicate_references,
+        coalesce(d.distinct_masters,0) as duplicate_masters,
+        coalesce(hqb.community_bumps,0) as community_bumps,
+        coalesce(hqb.selected_hot,0) as selected_hot,
+        coalesce(hqb.removed_hot,0) as removed_hot,
+        len_trimmed.body_len,
+        len_trimmed.tag_count
+    from posts p
+    left join posttype_names pt on pt.id = p.posttypeid
+    left join duplicates d on d.dup_post_id = p.id
+    left join hot_question_bumps hqb on hqb.postid = p.id
+    left join lateral (
+        select
+            length(coalesce(p.body,'')) - length(replace(coalesce(p.body,''), ' ', '')) + 1 as body_len,
+            case
+              when p.tags is null or length(p.tags) < 3 then 0
+              else array_length(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><'), 1)
+            end as tag_count
+    ) len_trimmed on true
+),
+user_post_rollup as (
+    select
+        p.owneruserid as user_id,
+        count(*) as posts_total,
+        sum(case when p.posttypeid = 1 then 1 else 0 end) as qs_total,
+        sum(case when p.posttypeid = 2 then 1 else 0 end) as as_total,
+        sum(coalesce(p.score,0)) as score_total,
+        sum(case when p.closeddate is not null then 1 else 0 end) as closed_total
+    from posts p
+    group by p.owneruserid
+),
+scored_users as (
+    select
+        fu.*,
+        coalesce(upr.posts_total,0) as posts_total,
+        coalesce(upr.qs_total,0) as qs_total,
+        coalesce(upr.as_total,0) as as_total,
+        coalesce(upr.score_total,0) as score_total,
+        coalesce(upr.closed_total,0) as closed_total,
+        (
+            coalesce(fu.reputation,0) * 0.002 +
+            coalesce(fu.post_score_sum,0) * 0.05 +
+            coalesce(fu.accepted_answers_received,0) * 0.5 +
+            coalesce(fu.high_score_answers,0) * 0.25 +
+            coalesce(fu.distinct_questions_answered,0) * 0.05 +
+            greatest(coalesce(fu.net_votes,0),0) * 0.01 +
+            coalesce(fu.gold_badges,0) * 1.5 +
+            coalesce(fu.silver_badges,0) * 0.6 +
+            coalesce(fu.bronze_badges,0) * 0.2 +
+            coalesce(fu.last3_score_sum,0) * 0.1 +
+            coalesce(fu.avg_sentiment,0) * 2
+        ) as perf_score
+    from final_user fu
+    left join user_post_rollup upr on upr.user_id = fu.user_id
+),
+ranked as (
+    select
+        su.*,
+        row_number() over (order by perf_score desc nulls last, su.user_id) as overall_rank,
+        ntile(10) over (order by perf_score desc nulls last) as decile,
+        percentile_disc(0.5) within group (order by perf_score) over () as median_perf
+    from scored_users su
+)
+select
+    r.overall_rank,
+    r.decile,
+    r.user_id,
+    r.displayname,
+    r.user_label,
+    r.rep_band,
+    r.perf_score,
+    r.median_perf,
+    r.reputation,
+    r.net_votes,
+    r.posts_total,
+    r.qs_total,
+    r.as_total,
+    r.questions,
+    r.answers,
+    r.accepted_answers_received,
+    r.accepted_answers_score_sum,
+    r.avg_nonzero_post_score,
+    r.high_score_answers,
+    r.low_score_answers,
+    r.distinct_questions_answered,
+    r.closed_questions,
+    r.closed_total,
+    r.total_views_questions,
+    r.java_tagged_qs,
+    r.python_tagged_qs,
+    r.gold_badges,
+    r.silver_badges,
+    r.bronze_badges,
+    r.tag_badges,
+    r.first_badge_date,
+    r.last_badge_date,
+    r.peak_month,
+    r.peak_q_count,
+    r.peak_a_count,
+    r.last3_post_ids,
+    r.last3_score_sum,
+    r.last3_views_sum,
+    r.comment_samples,
+    r.avg_sentiment,
+    r.website_lower,
+    r.location,
+    r.creationdate
+from ranked r
+where (
+    (r.perf_score is not null and r.perf_score > r.median_perf)
+    or (r.gold_badges >= 1 and r.accepted_answers_received >= 3)
+    or (coalesce(r.java_tagged_qs,0) + coalesce(r.python_tagged_qs,0) >= 10 and coalesce(r.avg_sentiment,0) >= 0)
+)
+and not (
+    coalesce(r.website_lower,'') like any (array['%spam%','%casino%','%viagra%'])
+)
+order by r.overall_rank
+limit 200;

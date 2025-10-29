@@ -1,0 +1,146 @@
+with RecursiveUserBadges as (
+  select 
+    u.Id as UserId,
+    u.DisplayName,
+    b.Name as BadgeName,
+    b.Class,
+    b.Date,
+    row_number() over (partition by u.Id order by b.Date asc) as BadgeRank
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  where b.Class is not null
+),
+TopBadgedUsers as (
+  select 
+    UserId,
+    DisplayName,
+    max(BadgeRank) as MaxBadgeCount
+  from RecursiveUserBadges
+  group by UserId, DisplayName
+  having max(BadgeRank) >= 5
+),
+QuestionStats as (
+  select
+    p.OwnerUserId,
+    count(case when p.PostTypeId = 1 then 1 end) as TotalQuestions,
+    count(case when p.PostTypeId = 1 and p.AcceptedAnswerId is not null then 1 end) as QuestionsWithAcceptedAnswers,
+    avg(case when p.PostTypeId = 1 then p.Score end) as AvgQuestionScore,
+    count(distinct case when ph.PostHistoryTypeId = 10 then ph.PostId end) as QuestionsClosedCount,
+    max(case when p.PostTypeId = 1 then p.ViewCount end) as MaxQuestionViewCount
+  from Posts p
+  left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+  group by p.OwnerUserId
+),
+AnswerStats as (
+  select
+    p.OwnerUserId,
+    count(case when p.PostTypeId = 2 then 1 end) as TotalAnswers,
+    avg(case when p.PostTypeId = 2 then p.Score end) as AvgAnswerScore,
+    count(distinct case when p.ParentId in (
+        select Id from Posts where AcceptedAnswerId = p.Id
+      ) then p.Id end) as AcceptedAnswerCount
+  from Posts p
+  group by p.OwnerUserId
+),
+UserActivity as (
+  select 
+    u.Id,
+    u.DisplayName,
+    coalesce(qs.TotalQuestions, 0) as TotalQuestions,
+    coalesce(qs.QuestionsWithAcceptedAnswers, 0) as QuestionsWithAcceptedAnswers,
+    coalesce(qs.AvgQuestionScore, 0) as AvgQuestionScore,
+    coalesce(qs.QuestionsClosedCount, 0) as QuestionsClosedCount,
+    coalesce(qs.MaxQuestionViewCount, 0) as MaxQuestionViewCount,
+    coalesce(ans.TotalAnswers, 0) as TotalAnswers,
+    coalesce(ans.AvgAnswerScore, 0) as AvgAnswerScore,
+    coalesce(ans.AcceptedAnswerCount, 0) as AcceptedAnswerCount,
+    u.Reputation,
+    u.CreationDate,
+    nullif(u.Location, '') as Location,
+    u.UpVotes,
+    u.DownVotes,
+    count(distinct ph.Id) as EditsMade,
+    count(distinct case when v.VoteTypeId = 2 then v.Id end) as TotalUpVotesReceived,
+    count(distinct c.Id) as TotalCommentsMade,
+    tb.MaxBadgeCount
+  from Users u
+  left join QuestionStats qs on qs.OwnerUserId = u.Id
+  left join AnswerStats ans on ans.OwnerUserId = u.Id
+  left join PostHistory ph on ph.UserId = u.Id
+  left join Votes v on v.UserId = u.Id
+  left join Comments c on c.UserId = u.Id
+  left join TopBadgedUsers tb on tb.UserId = u.Id
+  group by u.Id, u.DisplayName, qs.TotalQuestions, qs.QuestionsWithAcceptedAnswers, 
+    qs.AvgQuestionScore, qs.QuestionsClosedCount, qs.MaxQuestionViewCount,
+    ans.TotalAnswers, ans.AvgAnswerScore, ans.AcceptedAnswerCount,
+    u.Reputation, u.CreationDate, u.Location, u.UpVotes, u.DownVotes, tb.MaxBadgeCount
+),
+LocationRankedUsers as (
+  select *,
+    dense_rank() over(partition by Location order by Reputation desc nulls last) as LocationRank
+  from UserActivity
+  where Location is not null
+),
+HighActivityUsers as (
+  select *
+  from LocationRankedUsers
+  where (TotalQuestions + TotalAnswers) > 50 and Reputation > 1000
+),
+GoldBadgesPerUser as (
+  select UserId, count(*) as GoldBadgeCount
+  from Badges
+  where Class = 1
+  group by UserId
+),
+UserPostLinks as (
+  select 
+    p.OwnerUserId,
+    pl.LinkTypeId,
+    count(*) as LinkCount
+  from PostLinks pl
+  join Posts p on p.Id = pl.PostId
+  group by p.OwnerUserId, pl.LinkTypeId
+),
+UserCommentsOnQuestions as (
+  select
+    c.UserId,
+    count(distinct c.PostId) as DistinctQuestionsCommented
+  from Comments c
+  join Posts p on p.Id = c.PostId and p.PostTypeId = 1
+  group by c.UserId
+)
+select distinct
+  u.DisplayName as User,
+  u.Reputation,
+  u.TotalQuestions,
+  u.QuestionsWithAcceptedAnswers,
+  cast(round(u.AvgQuestionScore::double precision, 2) as numeric) as AvgQuestionScore,
+  u.QuestionsClosedCount,
+  u.MaxQuestionViewCount,
+  u.TotalAnswers,
+  cast(round(u.AvgAnswerScore::double precision, 2) as numeric) as AvgAnswerScore,
+  u.AcceptedAnswerCount,
+  u.EditsMade,
+  coalesce(gb.GoldBadgeCount,0) as GoldBadgeCount,
+  coalesce(sum(case when up.LinkTypeId = 3 then up.LinkCount else 0 end), 0) as DuplicatePostLinks,
+  coalesce(ucq.DistinctQuestionsCommented,0) as QuestionsCommentedOn,
+  u.Location,
+  u.LocationRank,
+  case
+    when u.UpVotes + u.DownVotes = 0 then null
+    else round(100.0 * u.UpVotes / nullif(u.UpVotes + u.DownVotes,0),2)
+  end as UpVoteRatioPercent,
+  case when u.Reputation > 5000 then 'High rep'
+       when u.Reputation between 1000 and 5000 then 'Medium rep'
+       else 'Low rep'
+  end as ReputationCategory,
+  string_agg(distinct pht.Name, ', ') as EditTypesMade
+from HighActivityUsers u
+left join GoldBadgesPerUser gb on gb.UserId = u.Id
+left join UserPostLinks up on up.OwnerUserId = u.Id
+left join UserCommentsOnQuestions ucq on ucq.UserId = u.Id
+left join PostHistory ph on ph.UserId = u.Id
+left join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+group by u.DisplayName, u.Reputation, u.TotalQuestions, u.QuestionsWithAcceptedAnswers, u.AvgQuestionScore, u.QuestionsClosedCount, u.MaxQuestionViewCount, u.TotalAnswers, u.AvgAnswerScore, u.AcceptedAnswerCount, u.EditsMade, gb.GoldBadgeCount, ucq.DistinctQuestionsCommented, u.Location, u.LocationRank, u.UpVotes, u.DownVotes, u.Id
+order by u.Reputation desc, u.TotalQuestions desc
+limit 100;

@@ -1,0 +1,275 @@
+-- {"query": "510.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3168} 
+with
+-- Parameter seeds
+params as (
+  select
+    date_trunc('month', now()) - interval '24 months' as start_month,
+    date_trunc('month', now()) - interval '1 month'  as end_month
+),
+-- Expand months
+months as (
+  select generate_series(start_month, end_month, interval '1 month') as month_start
+  from params
+),
+-- Classify users by activity quality
+user_quality as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end), 0) as net_votes_cast,
+    coalesce(sum(case when p.posttypeid in (1,2) then p.score else 0 end), 0) as total_post_score,
+    percentile_disc(0.9) within group (order by u.reputation) over () as p90_rep,
+    case
+      when u.reputation >= 10000 then 'legend'
+      when u.reputation >= 2000 then 'veteran'
+      when u.reputation >= 200 then 'regular'
+      else 'newbie'
+    end as rep_band
+  from users u
+  left join votes v on v.userid = u.id
+  left join posts p on p.owneruserid = u.id and p.posttypeid in (1,2)
+  group by u.id, u.displayname, u.reputation
+),
+-- Monthly post aggregates with tag parsing and null-safe owner resolution
+monthly_posts as (
+  select
+    date_trunc('month', p.creationdate) as month_start,
+    p.posttypeid,
+    case when p.posttypeid = 1 then 'Question'
+         when p.posttypeid = 2 then 'Answer'
+         else 'Other' end as post_kind,
+    p.owneruserid,
+    nullif(trim(both '<>' from split_part(coalesce(p.tags, ''), '><', 1)), '') as first_tag,
+    count(*) as post_count,
+    sum(coalesce(p.score,0)) as score_sum,
+    avg(nullif(p.viewcount,0)) as avg_views_nonzero,
+    sum(case when p.closeddate is not null then 1 else 0 end) as closed_count,
+    sum(case when p.acceptedanswerid is not null then 1 else 0 end) as accepted_q_count
+  from posts p
+  where p.creationdate >= (select start_month from params)
+    and p.creationdate <  (select end_month + interval '1 month' from params)
+  group by 1,2,3,4,5
+),
+-- Find duplicate relationships and closure reasons
+dupe_and_close as (
+  select
+    ph.postid,
+    max(case when ph.posthistorytypeid = 10 then 1 else 0 end) as was_closed,
+    max(case when ph.posthistorytypeid = 10 and ph.comment ~ '^[0-9]+' then 1 else 0 end) as has_close_reason_id,
+    max(case when ph.posthistorytypeid = 10 and ph.comment = '101' then 1 else 0 end) as closed_as_duplicate,
+    max(case when ph.posthistorytypeid in (35,36) then 1 else 0 end) as migrated_flag
+  from posthistory ph
+  where ph.posthistorytypeid in (10,35,36)
+  group by ph.postid
+),
+-- Windowed user monthly contributions across posts, comments, and votes
+user_month_activity as (
+  select
+    m.month_start,
+    u.id as user_id,
+    count(distinct p.id) filter (where date_trunc('month', p.creationdate) = m.month_start) as posts_created,
+    count(distinct c.id) filter (where date_trunc('month', c.creationdate) = m.month_start) as comments_made,
+    count(*) filter (where date_trunc('month', v.creationdate) = m.month_start and v.votetypeid = 2) as upvotes_cast,
+    count(*) filter (where date_trunc('month', v.creationdate) = m.month_start and v.votetypeid = 3) as downvotes_cast,
+    sum(coalesce(p.score,0)) filter (where date_trunc('month', p.creationdate) = m.month_start) as post_score_sum,
+    row_number() over (partition by u.id order by m.month_start) as seq_month_for_user
+  from months m
+  cross join users u
+  left join posts p on p.owneruserid = u.id
+    and date_trunc('month', p.creationdate) = m.month_start
+    and p.posttypeid in (1,2)
+  left join comments c on c.userid = u.id
+    and date_trunc('month', c.creationdate) = m.month_start
+  left join votes v on v.userid = u.id
+    and date_trunc('month', v.creationdate) = m.month_start
+  group by m.month_start, u.id
+),
+-- Rank questions by multi-factor "engagement" using window functions
+question_engagement as (
+  select
+    p.id as question_id,
+    date_trunc('month', p.creationdate) as month_start,
+    p.owneruserid,
+    p.score,
+    coalesce(p.viewcount,0) as views,
+    coalesce(p.favoritecount,0) as favorites,
+    coalesce(p.answercount,0) as answers,
+    0.6*least(greatest(p.score, -10), 50) +
+    0.2*ln(greatest(coalesce(p.viewcount,0)+1,1)) +
+    0.2*least(coalesce(p.answercount,0), 10) as engagement_score,
+    rank() over (partition by date_trunc('month', p.creationdate) order by
+      0.6*least(greatest(p.score, -10), 50) +
+      0.2*ln(greatest(coalesce(p.viewcount,0)+1,1)) +
+      0.2*least(coalesce(p.answercount,0), 10) desc, p.id) as rnk
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select start_month from params)
+    and p.creationdate <  (select end_month + interval '1 month' from params)
+),
+-- Identify posts with heavy comment activity relative to score using correlated subquery
+comment_heavy_posts as (
+  select
+    p.id as post_id,
+    date_trunc('month', p.creationdate) as month_start,
+    (select count(*) from comments c where c.postid = p.id) as comment_count,
+    coalesce(p.score,0) as score,
+    case
+      when coalesce(p.score,0) = 0 then null
+      else (select count(*) from comments c where c.postid = p.id)::decimal / nullif(p.score,0)
+    end as comments_per_score
+  from posts p
+  where p.creationdate >= (select start_month from params)
+    and p.creationdate <  (select end_month + interval '1 month' from params)
+),
+-- Build tag popularity by month using set operators to compare top tags month-over-month
+tag_popularity as (
+  select
+    date_trunc('month', p.creationdate) as month_start,
+    t as tag,
+    count(*) as uses
+  from posts p
+  cross join lateral unnest(
+    case
+      when p.tags is null then array[]::varchar[]
+      when length(p.tags) <= 2 then array[]::varchar[]
+      else string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+    end
+  ) as t
+  where p.posttypeid = 1
+    and p.creationdate >= (select start_month from params)
+    and p.creationdate <  (select end_month + interval '1 month' from params)
+  group by 1,2
+),
+tag_top as (
+  select month_start, tag, uses,
+         dense_rank() over (partition by month_start order by uses desc, tag) as rnk
+  from tag_popularity
+),
+tag_trending as (
+  select
+    curr.month_start,
+    curr.tag,
+    curr.uses as curr_uses,
+    prev.uses as prev_uses,
+    (curr.uses - coalesce(prev.uses,0)) as delta_uses
+  from tag_top curr
+  left join tag_popularity prev
+    on prev.tag = curr.tag
+   and prev.month_start = curr.month_start - interval '1 month'
+  where curr.rnk <= 20
+),
+-- Join everything into a wide monthly panel
+panel as (
+  select
+    m.month_start,
+    uq.user_id,
+    uq.displayname,
+    uq.rep_band,
+    uma.posts_created,
+    uma.comments_made,
+    uma.upvotes_cast,
+    uma.downvotes_cast,
+    uma.post_score_sum,
+    mp.post_kind,
+    mp.first_tag,
+    mp.post_count,
+    mp.score_sum,
+    mp.avg_views_nonzero,
+    mp.closed_count,
+    mp.accepted_q_count,
+    sum(case when dap.was_closed = 1 then 1 else 0 end) over (
+      partition by uq.user_id, m.month_start
+    ) as user_closed_posts_in_month,
+    sum(case when dap.closed_as_duplicate = 1 then 1 else 0 end) over (
+      partition by uq.user_id, m.month_start
+    ) as user_dupe_closes_in_month,
+    count(*) filter (where qe.rnk <= 10) over (
+      partition by uq.user_id, m.month_start
+    ) as top10_questions_count_for_user_month,
+    max(qe.engagement_score) filter (where qe.rnk = 1) over (partition by m.month_start) as peak_engagement_this_month,
+    tt.tag as trending_tag,
+    tt.delta_uses as trending_delta
+  from months m
+  left join user_month_activity uma on uma.month_start = m.month_start
+  left join user_quality uq on uq.user_id = uma.user_id
+  left join monthly_posts mp on mp.month_start = m.month_start and mp.owneruserid = uq.user_id
+  left join dupe_and_close dap on dap.postid in (
+    select id from posts p
+    where p.owneruserid = uq.user_id
+      and date_trunc('month', p.creationdate) = m.month_start
+  )
+  left join question_engagement qe on qe.owneruserid = uq.user_id and qe.month_start = m.month_start
+  left join tag_trending tt on tt.month_start = m.month_start
+),
+-- Outlier detection via z-scores per rep_band and post_kind
+band_stats as (
+  select
+    rep_band, post_kind,
+    avg(coalesce(post_count,0)::decimal) as avg_count,
+    stddev_pop(coalesce(post_count,0)::decimal) as sd_count
+  from panel
+  group by rep_band, post_kind
+)
+select
+  p.month_start::date as month_start,
+  coalesce(p.displayname, '(unknown)') as user_displayname,
+  p.rep_band,
+  coalesce(p.post_kind, 'n/a') as post_kind,
+  coalesce(p.first_tag, 'n/a') as first_tag,
+  coalesce(p.post_count, 0) as post_count,
+  coalesce(p.score_sum, 0) as score_sum,
+  round(coalesce(p.avg_views_nonzero,0)::numeric, 2) as avg_views_nonzero,
+  coalesce(p.closed_count, 0) as closed_count,
+  coalesce(p.accepted_q_count, 0) as accepted_q_count,
+  coalesce(p.posts_created, 0) as posts_created,
+  coalesce(p.comments_made, 0) as comments_made,
+  coalesce(p.upvotes_cast, 0) as upvotes_cast,
+  coalesce(p.downvotes_cast, 0) as downvotes_cast,
+  coalesce(p.post_score_sum, 0) as post_score_sum,
+  coalesce(p.user_closed_posts_in_month, 0) as user_closed_posts_in_month,
+  coalesce(p.user_dupe_closes_in_month, 0) as user_dupe_closes_in_month,
+  coalesce(p.top10_questions_count_for_user_month, 0) as top10_questions_for_user_month,
+  round(coalesce(p.peak_engagement_this_month,0)::numeric, 3) as peak_engagement_this_month,
+  coalesce(p.trending_tag, 'n/a') as trending_tag,
+  coalesce(p.trending_delta, 0) as trending_delta,
+  -- Outlier score with NULL-safe handling
+  case
+    when bs.sd_count is null or bs.sd_count = 0 then null
+    else round(((coalesce(p.post_count,0) - bs.avg_count) / nullif(bs.sd_count,0))::numeric, 3)
+  end as post_count_zscore,
+  -- Composite complexity score for benchmarking
+  round((
+    0.35*coalesce(p.post_count,0) +
+    0.25*coalesce(p.score_sum,0) +
+    0.10*coalesce(p.accepted_q_count,0) +
+    0.10*coalesce(p.posts_created,0) +
+    0.05*least(coalesce(p.comments_made,0), 50) +
+    0.05*greatest(coalesce(p.upvotes_cast,0) - coalesce(p.downvotes_cast,0), -10) +
+    0.05*coalesce(p.trending_delta,0) +
+    0.05*coalesce(p.peak_engagement_this_month,0)
+  )::numeric, 3) as composite_score
+from panel p
+left join band_stats bs
+  on bs.rep_band = p.rep_band
+ and bs.post_kind = p.post_kind
+where p.month_start between (select start_month from params) and (select end_month from params)
+  and (
+    -- Complicated predicate mixing null logic and string ops
+    p.first_tag is null
+    or length(coalesce(p.first_tag,'')) between 2 and 35
+    or position('sql' in lower(coalesce(p.first_tag,''))) > 0
+  )
+  and (
+    -- Prefer active users or notable spikes
+    coalesce(p.posts_created,0) + coalesce(p.comments_made,0) + coalesce(p.upvotes_cast,0) >= 1
+    or coalesce(p.post_count,0) >= 5
+    or coalesce(p.trending_delta,0) >= 3
+  )
+order by
+  p.month_start desc,
+  composite_score desc,
+  user_displayname nulls last,
+  post_kind,
+  first_tag
+limit 500;

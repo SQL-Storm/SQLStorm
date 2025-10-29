@@ -1,0 +1,233 @@
+WITH UserStats AS (
+  SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    COUNT(DISTINCT p.Id) as PostCount,
+    COUNT(DISTINCT c.Id) as CommentCount,
+    COUNT(DISTINCT b.Id) as BadgeCount,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+    SUM(COALESCE(p.Score, 0)) as TotalScore,
+    AVG(COALESCE(p.Score, 0)) as AvgScore,
+    STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ', ') as TagsList,
+    MAX(p.CreationDate) as LastPostDate,
+    MAX(u.LastAccessDate) as LastAccessDate
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments c ON u.Id = c.UserId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+  SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    Views,
+    UpVotes,
+    DownVotes,
+    PostCount,
+    CommentCount,
+    BadgeCount,
+    QuestionCount,
+    AnswerCount,
+    TotalScore,
+    AvgScore,
+    TagsList,
+    LastPostDate,
+    LastAccessDate,
+    ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) as RankByScore,
+    DENSE_RANK() OVER (ORDER BY Reputation DESC) as RankByReputation,
+    NTILE(100) OVER (ORDER BY Reputation DESC) as RepPercentile,
+    LAG(DisplayName) OVER (ORDER BY Reputation DESC) as PrevUser,
+    LEAD(DisplayName) OVER (ORDER BY Reputation DESC) as NextUser
+  FROM UserStats
+),
+PostAnalytics AS (
+  SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Body,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.AnswerCount,
+    p.CommentCount,
+    p.Tags,
+    p.ParentId,
+    CASE 
+      WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+      WHEN p.PostTypeId = 1 THEN 'Question without Answer'
+      WHEN p.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END as PostTypeCategory,
+    CASE 
+      WHEN p.Score >= 100 THEN 'Gold'
+      WHEN p.Score >= 50 THEN 'Silver'
+      WHEN p.Score >= 10 THEN 'Bronze'
+      ELSE 'Common'
+    END as ScoreTier,
+    CHAR_LENGTH(p.Body) as BodyLength,
+    (CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN 0 ELSE CARDINALITY(string_to_array(p.Tags, '>')) END) as TagCount,
+    EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) as DaysOld,
+    CASE 
+      WHEN p.CommentCount > 0 AND p.Score = 0 THEN 'Controversial'
+      WHEN p.CommentCount > 10 AND p.Score > 20 THEN 'Highly Engaged'
+      ELSE 'Normal'
+    END as EngagementLevel,
+    STRING_AGG(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ', ') OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as CumulativeTags,
+    AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as UserAvgScore,
+    LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore
+  FROM Posts p
+  WHERE p.CreationDate >= TIMESTAMP '2015-01-01'
+),
+TopQuestions AS (
+  SELECT 
+    pa.PostId,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.OwnerUserId,
+    pa.TagCount,
+    pa.DaysOld,
+    pa.ScoreTier,
+    pa.TagCount * pa.Score as TagScoreProduct,
+    RANK() OVER (ORDER BY pa.Score DESC, pa.ViewCount DESC) as RankByScoreAndView,
+    ROW_NUMBER() OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.Score DESC) as UserPostRank
+  FROM PostAnalytics pa
+  WHERE pa.PostTypeId = 1
+),
+UserActivity AS (
+  SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    COUNT(p.Id) as PostCount,
+    COUNT(c.Id) as CommentCount,
+    COUNT(DISTINCT p.ParentId) as AnswerCount,
+    COUNT(DISTINCT p.Id) as QuestionCount,
+    AVG(COALESCE(p.Score, 0)) as AvgPostScore,
+    MAX(p.CreationDate) as LastPostDate,
+    MAX(u.LastAccessDate) as LastAccessDate,
+    CASE WHEN MAX(p.CreationDate) >= TIMESTAMP '2019-01-01' THEN TRUE ELSE FALSE END as IsActiveRecent,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) as QuestionCountRecent,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) as AnswerCountRecent,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as QuestionScoreTotal,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as AnswerScoreTotal,
+    COUNT(DISTINCT b.Id) as BadgeCount,
+    STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ', ') as Tags
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId 
+    AND p.CreationDate >= TIMESTAMP '2010-01-01'
+  LEFT JOIN Comments c ON u.Id = c.UserId 
+    AND c.CreationDate >= TIMESTAMP '2010-01-01'
+  LEFT JOIN Badges b ON u.Id = b.UserId 
+    AND b.Date >= TIMESTAMP '2010-01-01'
+  WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+)
+SELECT 
+  'User Activity Analysis' as ReportType,
+  COUNT(*) as TotalUsers,
+  AVG(Reputation) as AvgReputation,
+  AVG(Views) as AvgViews,
+  SUM(PostCount) as TotalPosts,
+  SUM(CommentCount) as TotalComments,
+  SUM(QuestionCount) as TotalQuestions,
+  SUM(AnswerCount) as TotalAnswers,
+  AVG(AvgPostScore) as AvgPostScore,
+  COUNT(DISTINCT CASE WHEN IsActiveRecent = TRUE THEN UserId ELSE NULL END) as ActiveUsers,
+  MAX(LastAccessDate) as MostRecentAccess,
+  MIN(LastPostDate) as EarliestPost,
+  STRING_AGG(DISTINCT DisplayName, ', ') as UserList
+FROM UserActivity
+WHERE Reputation > 1000
+  AND LastAccessDate >= TIMESTAMP '2020-01-01'
+  AND (QuestionCount > 0 OR AnswerCount > 0)
+
+UNION ALL
+
+SELECT 
+  'Post Performance Analysis' as ReportType,
+  COUNT(*) as TotalUsers,
+  AVG(Score) as AvgReputation,
+  AVG(ViewCount) as AvgViews,
+  SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) as TotalPosts,
+  SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) as TotalComments,
+  AVG(TagCount) as TotalQuestions,
+  SUM(Score * TagCount) as TotalAnswers,
+  AVG(DaysOld) as AvgPostScore,
+  MAX(CreationDate) as ActiveUsers,
+  MIN(CreationDate) as MostRecentAccess,
+  STRING_AGG(Title, '; ') as UserList
+FROM PostAnalytics
+WHERE Score >= 50
+  AND DaysOld <= 365
+  AND CHAR_LENGTH(Body) > 100
+
+UNION ALL
+
+SELECT 
+  'Top Questions Summary' as ReportType,
+  COUNT(*) as TotalUsers,
+  AVG(Score) as AvgReputation,
+  AVG(ViewCount) as AvgViews,
+  AVG(TagCount) as TotalPosts,
+  SUM(TagScoreProduct) as TotalComments,
+  AVG(DaysOld) as TotalQuestions,
+  MAX(Score) as TotalAnswers,
+  MIN(Score) as AvgPostScore,
+  STRING_AGG(Title, ', ') as ActiveUsers,
+  CAST(NULL AS timestamp) as MostRecentAccess,
+  STRING_AGG(Title, ', ') as UserList
+FROM TopQuestions
+WHERE RankByScoreAndView <= 100
+  AND Score > 20
+  AND DaysOld <= 180
+
+UNION ALL
+
+SELECT 
+  'Community Engagement' as ReportType,
+  COUNT(*) as TotalUsers,
+  AVG(Reputation) as AvgReputation,
+  AVG(Views) as AvgViews,
+  SUM(TotalScore) as TotalPosts,
+  AVG(Comments) as TotalComments,
+  AVG(Answers) as TotalQuestions,
+  AVG(Questions) as TotalAnswers,
+  AVG(Badges) as AvgPostScore,
+  MAX(LastAccessDate) as ActiveUsers,
+  MIN(FirstPostDate) as MostRecentAccess,
+  CONCAT('Users with ', MIN(TagCount), '+ tags') as UserList
+FROM (
+  SELECT 
+    u.Id as UserId,
+    u.Reputation,
+    u.Views,
+    SUM(COALESCE(p.Score, 0)) as TotalScore,
+    COUNT(DISTINCT c.Id) as Comments,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) as Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) as Questions,
+    COUNT(DISTINCT b.Id) as Badges,
+    MAX(u.LastAccessDate) as LastAccessDate,
+    MIN(p.CreationDate) as FirstPostDate,
+    STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ',') as TagList,
+    (CASE WHEN STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ',') IS NULL THEN 0 ELSE CARDINALITY(string_to_array(STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ','), ',')) END) as TagCount
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.CreationDate >= TIMESTAMP '2010-01-01'
+  LEFT JOIN Comments c ON u.Id = c.UserId AND c.CreationDate >= TIMESTAMP '2010-01-01'
+  LEFT JOIN Badges b ON u.Id = b.UserId AND b.Date >= TIMESTAMP '2010-01-01'
+  WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+    AND u.Reputation >= 100
+  GROUP BY u.Id, u.Reputation, u.Views
+  HAVING (CASE WHEN STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ',') IS NULL THEN 0 ELSE CARDINALITY(string_to_array(STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ','), ',')) END) >= 2
+) grouped_users;

@@ -1,0 +1,345 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as region_hint,
+        date_trunc('month', u.creationdate) as cohort_month
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+q_and_a as (
+    select
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.parentid,
+        p.acceptedanswerid
+    from posts p
+    where p.posttypeid in (1,2)
+),
+user_posts as (
+    select
+        ru.user_id,
+        count(*) filter (where qa.posttypeid = 1) as questions,
+        count(*) filter (where qa.posttypeid = 2) as answers,
+        sum(qa.score) as total_score,
+        avg(qa.score) filter (where qa.posttypeid = 1 and qa.score is not null) as avg_q_score,
+        avg(qa.score) filter (where qa.posttypeid = 2 and qa.score is not null) as avg_a_score,
+        count(*) filter (where qa.viewcount >= 1000 and qa.posttypeid = 1) as high_view_q,
+        max(qa.creationdate) as last_post_date
+    from recent_users ru
+    left join q_and_a qa
+      on qa.owneruserid = ru.user_id
+    group by ru.user_id
+),
+user_votes as (
+    select
+        ru.user_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_given,
+        count(*) filter (where v.votetypeid = 3) as downvotes_given,
+        count(*) filter (where v.votetypeid = 1) as accepts_cast,
+        count(*) filter (where v.votetypeid = 12) as spam_flags,
+        count(*) filter (where v.votetypeid = 10) as delete_votes
+    from recent_users ru
+    left join votes v
+      on v.userid = ru.user_id
+    group by ru.user_id
+),
+post_interactions as (
+    select
+        qa.id as post_id,
+        qa.owneruserid as owner_user_id,
+        count(distinct c.id) as comments_count,
+        max(c.creationdate) as last_comment_date,
+        count(distinct pl.relatedpostid) filter (where pl.linktypeid = 3) as duplicates_linked,
+        count(distinct ph.id) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edits_count
+    from q_and_a qa
+    left join comments c on c.postid = qa.id
+    left join postlinks pl on pl.postid = qa.id
+    left join posthistory ph on ph.postid = qa.id
+    group by qa.id, qa.owneruserid
+),
+user_interactions as (
+    select
+        ru.user_id,
+        sum(pi.comments_count) as total_comments_on_posts,
+        max(pi.last_comment_date) as last_commented_on_date,
+        sum(pi.duplicates_linked) as total_duplicates_marked,
+        sum(pi.edits_count) as total_edits
+    from recent_users ru
+    left join post_interactions pi
+      on pi.owner_user_id = ru.user_id
+    group by ru.user_id
+),
+tag_unpacked as (
+    select
+        p.id as post_id,
+        unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tag
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+),
+user_top_tag as (
+    select
+        qa.owneruserid as user_id,
+        tu.tag,
+        count(*) as tag_q_count,
+        row_number() over (partition by qa.owneruserid order by count(*) desc, lower(tu.tag)) as rn
+    from q_and_a qa
+    join tag_unpacked tu
+      on tu.post_id = qa.id
+    where qa.posttypeid = 1
+    group by qa.owneruserid, tu.tag
+),
+best_tag_per_user as (
+    select user_id, tag as top_tag, tag_q_count
+    from user_top_tag
+    where rn = 1
+),
+answers_to_top_tag_questions as (
+    select
+        a.owneruserid as user_id,
+        count(*) as answers_on_top_tag_q,
+        avg(a.score) as avg_score_on_top_tag_q
+    from posts a
+    join posts q on q.id = a.parentid and q.posttypeid = 1
+    join best_tag_per_user bt on bt.user_id = a.owneruserid
+    join tag_unpacked tu on tu.post_id = q.id and tu.tag = bt.top_tag
+    where a.posttypeid = 2
+    group by a.owneruserid
+),
+badge_agg as (
+    select
+        ru.user_id,
+        count(*) as badges_total,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where b.tagbased = true) as tag_badges
+    from recent_users ru
+    left join badges b on b.userid = ru.user_id
+    group by ru.user_id
+),
+question_resolution as (
+    select
+        q.owneruserid as user_id,
+        count(*) as questions_total,
+        count(*) filter (where q.acceptedanswerid is not null) as questions_with_accept,
+        count(*) filter (where q.closeddate is not null) as questions_closed,
+        avg(q.score) as avg_q_score,
+        percentile_cont(0.5) within group (order by q.viewcount) as med_q_views
+    from posts q
+    where q.posttypeid = 1
+    group by q.owneruserid
+),
+answers_quality as (
+    select
+        a.owneruserid as user_id,
+        count(*) as answers_total,
+        avg(a.score) as avg_a_score,
+        sum(case when a.score >= 5 then 1 else 0 end) as answers_scored_5_plus
+    from posts a
+    where a.posttypeid = 2
+    group by a.owneruserid
+),
+recent_activity as (
+    select
+        ru.user_id,
+        max(coalesce(qa.creationdate, ph.creationdate, c.creationdate)) as last_activity_date
+    from recent_users ru
+    left join q_and_a qa on qa.owneruserid = ru.user_id
+    left join posthistory ph on ph.userid = ru.user_id
+    left join comments c on c.userid = ru.user_id
+    group by ru.user_id
+),
+power_users as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.cohort_month,
+        up.questions,
+        up.answers,
+        ua.upvotes_given,
+        ua.downvotes_given,
+        ui.total_comments_on_posts,
+        ui.total_duplicates_marked,
+        ui.total_edits,
+        ba.badges_total,
+        ba.gold_badges,
+        ba.silver_badges,
+        ba.bronze_badges,
+        qr.questions_total,
+        qr.questions_with_accept,
+        qr.questions_closed,
+        aq.answers_total,
+        aq.answers_scored_5_plus,
+        coalesce(bt.top_tag, 'untagged') as top_tag,
+        coalesce(attq.answers_on_top_tag_q, 0) as answers_on_top_tag_q,
+        coalesce(attq.avg_score_on_top_tag_q, 0) as avg_score_on_top_tag_q,
+        ra.last_activity_date,
+        up.total_score,
+        up.avg_q_score,
+        up.avg_a_score,
+        up.high_view_q,
+        ru.region_hint
+    from recent_users ru
+    left join user_posts up on up.user_id = ru.user_id
+    left join user_votes ua on ua.user_id = ru.user_id
+    left join user_interactions ui on ui.user_id = ru.user_id
+    left join badge_agg ba on ba.user_id = ru.user_id
+    left join question_resolution qr on qr.user_id = ru.user_id
+    left join answers_quality aq on aq.user_id = ru.user_id
+    left join best_tag_per_user bt on bt.user_id = ru.user_id
+    left join answers_to_top_tag_questions attq on attq.user_id = ru.user_id
+    left join recent_activity ra on ra.user_id = ru.user_id
+),
+ranked as (
+    select
+        p.*,
+        (
+            coalesce(p.answers,0) * 2
+          + coalesce(p.questions,0)
+          + coalesce(p.total_score,0) * 0.5
+          + coalesce(p.badges_total,0) * 1.5
+          + coalesce(p.answers_scored_5_plus,0) * 1.2
+          + coalesce(p.total_duplicates_marked,0) * 0.8
+          + case when coalesce(p.questions_total,0) > 0 then (cast(coalesce(p.questions_with_accept,0) as numeric) / nullif(coalesce(p.questions_total,0),0)) * 5 else 0 end
+        ) as engagement_score,
+        row_number() over (order by
+            coalesce(p.answers,0) desc,
+            coalesce(p.total_score,0) desc,
+            coalesce(p.badges_total,0) desc,
+            p.reputation desc
+        ) as rn_global,
+        row_number() over (partition by p.region_hint order by coalesce(p.answers,0) desc, p.reputation desc) as rn_by_region,
+        ntile(10) over (order by coalesce(p.total_score,0) desc) as decile_total_score,
+        dense_rank() over (partition by p.top_tag order by coalesce(p.answers_scored_5_plus,0) desc) as dr_top_tag_quality
+    from power_users p
+),
+bench_union as (
+    select * from ranked where engagement_score > (
+        select avg(engagement_score) + stddev_pop(engagement_score)
+        from ranked
+    )
+    union all
+    select * from ranked where rn_global <= 100
+    union
+    select * from ranked where rn_by_region <= 10
+),
+final_scored as (
+    select
+        b.user_id,
+        b.displayname,
+        b.region_hint,
+        b.top_tag,
+        b.cohort_month,
+        b.reputation,
+        b.answers,
+        b.questions,
+        b.badges_total,
+        b.gold_badges,
+        b.silver_badges,
+        b.bronze_badges,
+        b.avg_q_score,
+        b.avg_a_score,
+        b.answers_scored_5_plus,
+        b.total_duplicates_marked,
+        b.total_edits,
+        b.engagement_score,
+        b.decile_total_score,
+        b.dr_top_tag_quality,
+        b.rn_global,
+        b.rn_by_region,
+        (extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(b.last_activity_date, b.cohort_month))) / 86400.0) as days_since_last_activity,
+        (
+            (b.engagement_score / nullif((select max(engagement_score) from ranked),0)) * 0.6
+          + (b.badges_total / nullif((select max(badges_total) from ranked),0)) * 0.15
+          + (coalesce(b.avg_a_score,0) / nullif((select max(coalesce(avg_a_score,0)) from ranked),0)) * 0.15
+          + (1.0 - least(1.0, ((extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(b.last_activity_date, b.cohort_month))) / 86400.0) / 365.0))) * 0.1
+        ) as normalized_score
+    from bench_union b
+),
+with_flags as (
+    select
+        f.*,
+        case
+            when coalesce(f.answers,0) >= 100 and coalesce(f.badges_total,0) >= 25 then 'Elite'
+            when coalesce(f.answers,0) >= 50 or coalesce(f.engagement_score,0) >= 75 then 'Power'
+            when coalesce(f.answers,0) >= 10 then 'Active'
+            else 'Rookie'
+        end as user_tier,
+        case when position('http' in coalesce(f.displayname,'')) > 0 then 1 else 0 end as suspicious_name_flag
+    from final_scored f
+)
+select
+    wf.user_id,
+    wf.displayname,
+    wf.region_hint,
+    wf.top_tag,
+    wf.cohort_month,
+    wf.reputation,
+    wf.answers,
+    wf.questions,
+    wf.badges_total,
+    wf.gold_badges,
+    wf.silver_badges,
+    wf.bronze_badges,
+    wf.avg_q_score,
+    wf.avg_a_score,
+    wf.answers_scored_5_plus,
+    wf.total_duplicates_marked,
+    wf.total_edits,
+    wf.engagement_score,
+    wf.normalized_score,
+    wf.decile_total_score,
+    wf.dr_top_tag_quality,
+    wf.rn_global,
+    wf.rn_by_region,
+    wf.days_since_last_activity,
+    wf.user_tier,
+    wf.suspicious_name_flag,
+    (
+        select coalesce(sum(v.bountyamount),0)
+        from votes v
+        where v.userid = wf.user_id
+          and v.votetypeid in (8,9)
+    ) as total_bounty_involvement,
+    (
+        select count(*) from comments c
+        where c.userid = wf.user_id
+          and c.score >= 10
+    ) as high_scoring_comments,
+    (
+        select count(distinct q.id)
+        from posts q
+        where q.posttypeid = 1
+          and q.owneruserid = wf.user_id
+          and exists (
+              select 1 from postlinks pl
+              where pl.postid = q.id and pl.linktypeid = 3
+          )
+    ) as questions_marked_duplicate,
+    trim(both ' ' from concat_ws(' | ',
+        coalesce(wf.displayname, 'Anonymous'),
+        case when wf.top_tag is null or wf.top_tag = '' then 'No-Tag-Focus' else upper(wf.top_tag) end,
+        'Tier:' || wf.user_tier,
+        'Score:' || to_char(coalesce(round(wf.normalized_score::numeric, 2),0), 'FM990D00')
+    )) as profile_summary
+from with_flags wf
+where
+    (
+        (wf.user_tier in ('Elite','Power') and wf.normalized_score >= 0.4)
+        or
+        (wf.user_tier in ('Active') and wf.days_since_last_activity <= 180 and wf.decile_total_score <= 5)
+    )
+    and coalesce(wf.suspicious_name_flag,0) = 0
+order by wf.normalized_score desc nulls last, wf.engagement_score desc, wf.reputation desc
+limit 500;

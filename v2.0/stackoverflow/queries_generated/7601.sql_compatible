@@ -1,0 +1,195 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC) AS rn
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            ELSE 'Unknown'
+        END AS PostType,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            ELSE 'Active'
+        END AS PostStatus,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only' ELSE 'Public' END AS TagAccess,
+        CASE WHEN t.IsRequired = 1 THEN 'Required' ELSE 'Optional' END AS TagRequirement,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+),
+CombinedData AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.AvgPostScore,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.CommentCount AS PostCommentCount,
+        pa.PostType,
+        pa.AnswerCount,
+        pa.FavoriteCount,
+        pa.PostStatus,
+        pa.ScoreRank,
+        ta.TagId,
+        ta.TagName,
+        ta.TagCount,
+        ta.TagRank,
+        CASE 
+            WHEN us.PostCount > 50 AND us.Reputation > 5000 THEN 'Veteran'
+            WHEN us.PostCount > 20 AND us.Reputation > 2000 THEN 'Experienced'
+            WHEN us.PostCount > 5 AND us.Reputation > 500 THEN 'Beginner'
+            ELSE 'Newbie'
+        END AS UserLevel,
+        CASE 
+            WHEN pa.Score > 100 THEN 'HighlyVoted'
+            WHEN pa.Score > 50 THEN 'ModeratelyVoted'
+            WHEN pa.Score > 10 THEN 'LowVoted'
+            ELSE 'Unvoted'
+        END AS VoteCategory,
+        CAST((JULIANDAY('2024-10-01 12:34:56') - JULIANDAY(pa.CreationDate)) AS INTEGER) AS DaysSincePost,
+        COALESCE(pa.PrevScore, 0) AS PrevScore,
+        COALESCE(pa.NextScore, 0) AS NextScore,
+        pa.OwnerUserId
+    FROM UserStats us
+    INNER JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON pa.Tags LIKE '%' || ta.TagName || '%'
+    WHERE us.rn = 1
+)
+SELECT 
+    cd.UserId,
+    cd.DisplayName,
+    cd.Reputation,
+    cd.PostCount,
+    cd.CommentCount,
+    cd.BadgeCount,
+    cd.AvgPostScore,
+    cd.PostId,
+    cd.Title,
+    cd.Score,
+    cd.ViewCount,
+    cd.PostCommentCount AS CommentCount,
+    cd.PostType,
+    cd.AnswerCount,
+    cd.FavoriteCount,
+    cd.PostStatus,
+    cd.ScoreRank,
+    cd.TagId,
+    cd.TagName,
+    cd.TagCount,
+    cd.TagRank,
+    cd.UserLevel,
+    cd.VoteCategory,
+    cd.DaysSincePost,
+    cd.PrevScore,
+    cd.NextScore,
+    (cd.Score * cd.ViewCount) AS ScoreViewProduct,
+    CASE 
+        WHEN cd.Score > cd.AvgPostScore THEN 'AboveAverage'
+        WHEN cd.Score < cd.AvgPostScore THEN 'BelowAverage'
+        ELSE 'Average'
+    END AS PerformanceStatus,
+    CASE 
+        WHEN cd.ScoreRank <= 10 THEN 'Top10'
+        WHEN cd.ScoreRank <= 50 THEN 'Top50'
+        ELSE 'Others'
+    END AS RankingCategory,
+    NULLIF(cd.TagCount, 0) AS SafeTagCount,
+    CASE 
+        WHEN cd.Score > 100 AND cd.ViewCount > 1000 THEN 'Popular'
+        WHEN cd.Score > 50 AND cd.ViewCount > 500 THEN 'Moderate'
+        WHEN cd.Score > 10 AND cd.ViewCount > 100 THEN 'Low'
+        ELSE 'VeryLow'
+    END AS PopularityLevel,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cd.UserId AND p.PostTypeId = 1) AS QuestionCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cd.UserId AND p.PostTypeId = 2) AS AnswerCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = cd.UserId)) AS VoteCount,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = cd.UserId AND b.Name LIKE '%Famous%') THEN 'Famous'
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = cd.UserId AND b.Name LIKE '%Popular%') THEN 'Popular'
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = cd.UserId AND b.Name LIKE '%Great%') THEN 'Great'
+        ELSE 'Regular'
+    END AS ReputationCategory,
+    ('User:' || cd.UserId || '-' || cd.DisplayName || '-Post:' || cd.PostId || '-' || cd.Title) AS ConcatenatedKey,
+    CASE WHEN cd.Score > 0 THEN 1 ELSE 0 END AS HasScore,
+    CASE WHEN cd.ViewCount > 0 THEN 1 ELSE 0 END AS HasViews,
+    CASE WHEN cd.PostCommentCount > 0 THEN 1 ELSE 0 END AS HasComments,
+    NULLIF(cd.Reputation, 0) / NULLIF(cd.PostCount, 0) AS RepPerPost,
+    CASE WHEN cd.FavoriteCount > 0 THEN 1 ELSE 0 END AS HasFavorites,
+    CASE 
+        WHEN cd.PostStatus = 'Closed' THEN 'ClosedPost'
+        WHEN cd.PostStatus = 'CommunityOwned' THEN 'CommunityPost'
+        ELSE 'ActivePost'
+    END AS PostCategory,
+    CASE 
+        WHEN cd.PrevScore > 0 AND cd.NextScore > 0 THEN 'HasNeighbors'
+        WHEN cd.PrevScore > 0 OR cd.NextScore > 0 THEN 'HasOneNeighbor'
+        ELSE 'NoNeighbors'
+    END AS NeighborStatus,
+    (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = cd.UserId) AS UserAvgScore,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = cd.UserId AND Score > 0) AS PositiveScoreCount
+FROM CombinedData cd
+WHERE cd.Reputation > 0
+    AND cd.PostCount > 0
+    AND cd.DaysSincePost > 0
+    AND (cd.PostType = 'Question' OR cd.PostType = 'Answer')
+    AND cd.Score >= 0
+    AND cd.ViewCount >= 0
+    AND cd.PostCommentCount >= 0
+    AND cd.ScoreRank BETWEEN 1 AND 100
+    AND cd.TagRank BETWEEN 1 AND 100
+    AND cd.UserLevel IN ('Veteran', 'Experienced')
+    AND cd.VoteCategory IN ('HighlyVoted', 'ModeratelyVoted')
+    AND cd.PopularityLevel IN ('Popular', 'Moderate')
+ORDER BY cd.Reputation DESC, cd.Score DESC, cd.ViewCount DESC, cd.TagCount DESC
+LIMIT 1000 OFFSET 0;

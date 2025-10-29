@@ -1,0 +1,98 @@
+-- {"query": "5013.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 778} 
+WITH TagHot AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount,
+    p.CreationDate AS PostDate,
+    p.Id AS PostId,
+    p.Title,
+    ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST) AS rn
+  FROM Tags t
+  JOIN Posts p ON t.Id = p.Tags::int -- placeholder cast compatibility
+  WHERE p.PostTypeId = 1 -- questions only
+    AND p.ClosedDate IS NULL
+),
+RecentActivity AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate AS HistoryDate,
+    ph.UserId,
+    ph.Comment
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10,11,12,13,14,15,16,37,38)
+),
+TopPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.AnswerCount,
+    p.Tags
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate > NOW() - INTERVAL '30 days'
+),
+Engagement AS (
+  SELECT
+    tp.Id AS PostId,
+    COUNT(*) AS CommentCount,
+    SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8) AS BountyTotal,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM TopPosts tp
+  LEFT JOIN Comments c ON c.PostId = tp.Id
+  LEFT JOIN Votes v ON v.PostId = tp.Id
+  GROUP BY tp.Id
+),
+Complicated AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Tags,
+    CASE
+      WHEN p.OwnerUserId IS NULL THEN 'Unknown'
+      ELSE u.DisplayName
+    END AS OwnerDisplayName,
+    CASE
+      WHEN p.AcceptedAnswerId IS NULL THEN NULL
+      ELSE a.Score
+    END AS AcceptedAnswerScore,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id) AS LinkedCount
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Posts a ON p.AcceptedAnswerId = a.Id
+  WHERE p.PostTypeId = 1
+    AND p.LastActivityDate > NOW() - INTERVAL '60 days'
+)
+SELECT
+  c.PostId,
+  c.Title,
+  c.OwnerDisplayName,
+  c.Score,
+  c.ViewCount,
+  c.CreationDate,
+  c.LastActivityDate,
+  c.Tags,
+  e.CommentCount,
+  e.BountyTotal,
+  e.UpVotes,
+  e.DownVotes,
+  t.TagName
+FROM Complicated c
+LEFT JOIN Engagement e ON e.PostId = c.Id
+LEFT JOIN TagHot t ON t.PostId = c.Id
+WHERE c.ViewCount > 100
+  AND c.Score > 0
+  AND (EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = c.Id AND v.VoteTypeId = 2) OR c.AcceptedAnswerId IS NOT NULL)
+ORDER BY c.LastActivityDate DESC, c.ViewCount DESC
+LIMIT 100;

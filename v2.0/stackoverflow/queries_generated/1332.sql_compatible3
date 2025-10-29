@@ -1,0 +1,201 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.CreationDate AS UserCreationDate,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsCreated,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersCreated,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScoreReceived,
+        COALESCE(AVG(P.Score), 0.0) AS AvgPostScoreReceived,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScoreReceived,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        MAX(P.CreationDate) AS LastPostDate,
+        MAX(C.CreationDate) AS LastCommentDate,
+        (SELECT MAX(PH.CreationDate) FROM PostHistory PH WHERE PH.UserId = U.Id) AS LastHistoryActivityDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.CreationDate, U.Reputation, U.Views, U.UpVotes, U.DownVotes
+),
+PostDetailedMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.Score AS CurrentPostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.Body AS PostBody,
+        P.Tags AS PostTagsRaw,
+        CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer,
+        (SELECT COUNT(PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4,5,6)) AS SignificantEditCount,
+        (
+            CASE WHEN EXISTS (SELECT 1 FROM PostHistory PH_Closed WHERE PH_Closed.PostId = P.Id AND PH_Closed.PostHistoryTypeId = 10)
+                 AND EXISTS (
+                     SELECT 1 FROM PostHistory PH_Reopened
+                     WHERE PH_Reopened.PostId = P.Id
+                       AND PH_Reopened.PostHistoryTypeId = 11
+                       AND PH_Reopened.CreationDate > COALESCE(
+                           (SELECT MAX(CreationDate) FROM PostHistory PH_MaxClosed WHERE PH_MaxClosed.PostId = P.Id AND PH_MaxClosed.PostHistoryTypeId = 10),
+                           TIMESTAMP '1900-01-01'
+                       )
+                 )
+            THEN TRUE ELSE FALSE END
+        ) AS WasClosedThenReopened,
+        GREATEST(
+            P.CreationDate,
+            COALESCE(P.LastEditDate, TIMESTAMP '1900-01-01'),
+            COALESCE((SELECT MAX(C.CreationDate) FROM Comments C WHERE C.PostId = P.Id), TIMESTAMP '1900-01-01'),
+            COALESCE((SELECT MAX(V.CreationDate) FROM Votes V WHERE V.PostId = P.Id), TIMESTAMP '1900-01-01')
+        ) AS LastSignificantActivityDate,
+        (P.Body LIKE '%<pre><code>%</pre></code>%' AND (P.Body LIKE '%SQL%' OR P.Body LIKE '%Python%' OR P.Body LIKE '%JavaScript%')) AS ContainsCodeAndKeywords
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE P.OwnerUserId IS NOT NULL
+),
+MonthlyUserPostFrequency AS (
+    SELECT
+        PDM.OwnerUserId AS UserId,
+        PDM.PostId,
+        PDM.PostCreationDate,
+        DATE_TRUNC('month', PDM.PostCreationDate) AS ActivityMonth,
+        PDM.CurrentPostScore,
+        ROW_NUMBER() OVER (PARTITION BY PDM.OwnerUserId, DATE_TRUNC('month', PDM.PostCreationDate) ORDER BY PDM.CurrentPostScore DESC, PDM.PostCreationDate DESC) AS MonthlyScoreRank,
+        LAG(PDM.PostCreationDate, 1, TIMESTAMP '1900-01-01') OVER (PARTITION BY PDM.OwnerUserId ORDER BY PDM.PostCreationDate) AS PreviousPostDate,
+        NULLIF(EXTRACT(EPOCH FROM (PDM.PostCreationDate - LAG(PDM.PostCreationDate, 1, TIMESTAMP '1900-01-01') OVER (PARTITION BY PDM.OwnerUserId ORDER BY PDM.PostCreationDate))) / 86400.0, 0.0) AS DaysSincePreviousPost
+    FROM PostDetailedMetrics PDM
+),
+TagAggregateMetrics AS (
+    SELECT
+        TRIM(tag) AS TagName,
+        COUNT(P.Id) AS TotalPostsWithTag,
+        AVG(P.Score) AS AvgScoreWithTag,
+        AVG(P.ViewCount) AS AvgViewsWithTag,
+        COUNT(DISTINCT P.OwnerUserId) AS UniqueUsersForTag
+    FROM Posts P,
+         UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')) AS t(tag)
+    WHERE P.Tags IS NOT NULL AND P.PostTypeId = 1
+    GROUP BY TRIM(tag)
+    HAVING COUNT(P.Id) > 50
+)
+SELECT
+    'High-Reputation Active Contributor' AS UserSegmentType,
+    U.UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.TotalPostsCreated,
+    U.TotalQuestionsCreated,
+    U.TotalAnswersCreated,
+    U.AvgPostScoreReceived,
+    U.TotalCommentsMade,
+    U.TotalBadgesEarned,
+    MAX(CASE WHEN MPF.MonthlyScoreRank = 1 THEN 1 ELSE NULL END) AS MonthlyTopPostCount,
+    AVG(MPF.DaysSincePreviousPost) AS AvgDaysBetweenPosts,
+    SUM(CASE WHEN PDM.WasClosedThenReopened THEN 1 ELSE 0 END) AS PostsReopenedCount,
+    SUM(CASE WHEN PDM.ContainsCodeAndKeywords THEN 1 ELSE 0 END) AS PostsWithCodeAndKeywordsCount,
+    SUM(CASE
+            WHEN PDM.PostTypeId = 1 AND PDM.HasAcceptedAnswer THEN 1
+            WHEN PDM.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Posts Q WHERE Q.Id = PDM.PostId AND Q.AcceptedAnswerId = PDM.PostId) THEN 1
+            ELSE 0
+        END) AS PostsAcceptedOrAnsweredAcceptedCount,
+    NTILE(10) OVER (ORDER BY U.Reputation DESC) AS ReputationDecile,
+    CUME_DIST() OVER (PARTITION BY U.UserId ORDER BY PDM.CurrentPostScore DESC) AS PostScoreCumeDist,
+    (SELECT PT.TagName FROM (
+        SELECT
+            TRIM(tag) AS TagName,
+            AVG(PDM_Inner.CurrentPostScore) AS TagAvgScore,
+            COUNT(PDM_Inner.PostId) AS cnt_posts
+        FROM PostDetailedMetrics PDM_Inner,
+             UNNEST(string_to_array(SUBSTRING(PDM_Inner.PostTagsRaw FROM 2 FOR LENGTH(PDM_Inner.PostTagsRaw) - 2), '><')) AS t(tag)
+        WHERE PDM_Inner.OwnerUserId = U.UserId AND PDM_Inner.PostTagsRaw IS NOT NULL AND PDM_Inner.PostTypeId = 1
+        GROUP BY TRIM(tag)
+        ORDER BY TagAvgScore DESC, cnt_posts DESC
+        LIMIT 1
+    ) AS PT) AS PrimaryContributionTag,
+    (U.Reputation * 0.5 + U.TotalPostScoreReceived * 0.2 + U.TotalBadgesEarned * 5 + U.TotalAnswersCreated * 0.1) AS CompositeEngagementScore,
+    'Reputation: ' || U.Reputation || ', Posts: ' || U.TotalPostsCreated || ', Comments: ' || U.TotalCommentsMade AS UserSummaryString
+FROM UserEngagementSummary U
+JOIN PostDetailedMetrics PDM ON U.UserId = PDM.OwnerUserId
+LEFT JOIN MonthlyUserPostFrequency MPF ON U.UserId = MPF.UserId AND PDM.PostId = MPF.PostId
+WHERE
+    U.Reputation > 50000
+    AND U.TotalPostsCreated >= 50
+    AND U.LastPostDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months')
+    AND PDM.ViewCount > 1000
+GROUP BY
+    U.UserId, U.DisplayName, U.Reputation, U.TotalPostsCreated, U.TotalQuestionsCreated,
+    U.TotalAnswersCreated, U.AvgPostScoreReceived, U.TotalCommentsMade, U.TotalBadgesEarned,
+    U.TotalPostScoreReceived,
+    U.UserProfileViews, U.UserUpVotesGiven, U.UserDownVotesGiven, U.UserCreationDate, U.LastPostDate, U.LastCommentDate, U.LastHistoryActivityDate,
+    PDM.CurrentPostScore, U.TotalPostScoreReceived
+HAVING
+    COUNT(DISTINCT PDM.PostId) > 5
+    AND SUM(PDM.SignificantEditCount) > U.TotalPostsCreated * 0.5
+UNION ALL
+SELECT
+    'New-to-Mid Reputation & Active User' AS UserSegmentType,
+    U.UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.TotalPostsCreated,
+    U.TotalQuestionsCreated,
+    U.TotalAnswersCreated,
+    U.AvgPostScoreReceived,
+    U.TotalCommentsMade,
+    U.TotalBadgesEarned,
+    MAX(CASE WHEN MPF.MonthlyScoreRank = 1 THEN 1 ELSE NULL END) AS MonthlyTopPostCount,
+    AVG(MPF.DaysSincePreviousPost) AS AvgDaysBetweenPosts,
+    SUM(CASE WHEN PDM.WasClosedThenReopened THEN 1 ELSE 0 END) AS PostsReopenedCount,
+    SUM(CASE WHEN PDM.ContainsCodeAndKeywords THEN 1 ELSE 0 END) AS PostsWithCodeAndKeywordsCount,
+    SUM(CASE
+            WHEN PDM.PostTypeId = 1 AND PDM.HasAcceptedAnswer THEN 1
+            WHEN PDM.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Posts Q WHERE Q.Id = PDM.PostId AND Q.AcceptedAnswerId = PDM.PostId) THEN 1
+            ELSE 0
+        END) AS PostsAcceptedOrAnsweredAcceptedCount,
+    NTILE(10) OVER (ORDER BY U.Reputation DESC) AS ReputationDecile,
+    CUME_DIST() OVER (PARTITION BY U.UserId ORDER BY PDM.CurrentPostScore DESC) AS PostScoreCumeDist,
+    (SELECT PT.TagName FROM (
+        SELECT
+            TRIM(tag) AS TagName,
+            AVG(PDM_Inner.CurrentPostScore) AS TagAvgScore,
+            COUNT(PDM_Inner.PostId) AS cnt_posts
+        FROM PostDetailedMetrics PDM_Inner,
+             UNNEST(string_to_array(SUBSTRING(PDM_Inner.PostTagsRaw FROM 2 FOR LENGTH(PDM_Inner.PostTagsRaw) - 2), '><')) AS t(tag)
+        WHERE PDM_Inner.OwnerUserId = U.UserId AND PDM_Inner.PostTagsRaw IS NOT NULL AND PDM_Inner.PostTypeId = 1
+        GROUP BY TRIM(tag)
+        ORDER BY TagAvgScore DESC, cnt_posts DESC
+        LIMIT 1
+    ) AS PT) AS PrimaryContributionTag,
+    (U.Reputation * 0.7 + U.TotalPostScoreReceived * 0.1 + U.TotalBadgesEarned * 3 + U.TotalQuestionsCreated * 0.1) AS CompositeEngagementScore,
+    'Reputation: ' || U.Reputation || ', Posts: ' || U.TotalPostsCreated || ', Comments: ' || U.TotalCommentsMade AS UserSummaryString
+FROM UserEngagementSummary U
+JOIN PostDetailedMetrics PDM ON U.UserId = PDM.OwnerUserId
+LEFT JOIN MonthlyUserPostFrequency MPF ON U.UserId = MPF.UserId AND PDM.PostId = MPF.PostId
+WHERE
+    U.Reputation BETWEEN 1000 AND 50000
+    AND U.TotalPostsCreated BETWEEN 10 AND 100
+    AND U.UserCreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years')
+    AND PDM.CurrentPostScore > 5
+GROUP BY
+    U.UserId, U.DisplayName, U.Reputation, U.TotalPostsCreated, U.TotalQuestionsCreated,
+    U.TotalAnswersCreated, U.AvgPostScoreReceived, U.TotalCommentsMade, U.TotalBadgesEarned,
+    U.TotalPostScoreReceived,
+    U.UserProfileViews, U.UserUpVotesGiven, U.UserDownVotesGiven, U.UserCreationDate, U.LastPostDate, U.LastCommentDate, U.LastHistoryActivityDate,
+    PDM.CurrentPostScore, U.TotalPostScoreReceived
+HAVING
+    COUNT(DISTINCT PDM.PostId) > 3
+    AND AVG(NULLIF(PDM.FavoriteCount, 0)) > 10
+ORDER BY
+    CompositeEngagementScore DESC, Reputation DESC
+LIMIT 500;

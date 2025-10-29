@@ -1,0 +1,89 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.DisplayName AS OwnerDisplayName,
+        U.Reputation,
+        P.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    RP.Id, 
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.OwnerDisplayName,
+    RP.Reputation,
+    BC.BadgeCount,
+    CASE 
+        WHEN RP.Rank <= 3 THEN 'Top'
+        WHEN RP.Rank <= 10 THEN 'Top 10'
+        ELSE 'Other'
+    END AS RankCategory,
+    (
+        SELECT 
+            STRING_AGG(T.TagName, ', ')
+        FROM 
+            UNNEST(
+                -- convert tags like '<tag1><tag2>' into array ['tag1','tag2']
+                regexp_split_to_array(trim(both '<' from P.Tags), '><')
+            ) AS TagName
+        JOIN 
+            Tags T ON cast(TagName AS integer) = T.Id
+    ) AS Tags,
+    (
+        SELECT 
+            COUNT(*) 
+        FROM 
+            Votes V
+        WHERE 
+            V.PostId = RP.Id AND V.VoteTypeId IN (2, 15)
+    ) AS PositiveVotes
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerUserId = BC.UserId
+WHERE 
+    BC.BadgeCount > (
+        SELECT 
+            AVG(BadgeCount) 
+        FROM 
+            BadgeCounts
+    )
+GROUP BY
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.OwnerDisplayName,
+    RP.Reputation,
+    RP.OwnerUserId,
+    RP.Rank,
+    BC.BadgeCount
+ORDER BY 
+    RP.Rank;

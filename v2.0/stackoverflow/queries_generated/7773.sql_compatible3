@@ -1,0 +1,227 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        COALESCE(p.Tags, '') AS CleanTags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeDescription,
+        CASE 
+            WHEN p.Score > 10 THEN 'Highly Upvoted'
+            WHEN p.Score > 0 THEN 'Moderately Upvoted'
+            WHEN p.Score < 0 THEN 'Downvoted'
+            ELSE 'Neutral'
+        END AS ScoreCategory,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS INTEGER) AS DaysSinceCreation,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS UserPostSequence,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS UserAvgScore,
+        NTILE(4) OVER (ORDER BY p.Score) AS ScoreQuartile
+    FROM Posts p
+    WHERE p.Score IS NOT NULL AND p.CreationDate IS NOT NULL
+),
+-- Compute average days between edits per post without nesting window inside aggregate
+PostHistoryIntervals AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PrevCreationDate
+    FROM PostHistory ph
+),
+PostHistorySummary AS (
+    SELECT 
+        phi.PostId,
+        COUNT(*) AS EditCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (1, 4, 6, 10, 11, 12, 13) THEN 1 END) AS MajorEditCount,
+        MIN(ph.CreationDate) AS FirstEditDate,
+        MAX(ph.CreationDate) AS LastEditDate,
+        AVG(
+            CASE 
+                WHEN phi.PrevCreationDate IS NOT NULL THEN (EXTRACT(EPOCH FROM (phi.CreationDate - phi.PrevCreationDate)) / 86400.0)
+                ELSE NULL
+            END
+        ) AS AvgDaysBetweenEdits,
+        CASE 
+            WHEN COUNT(*) > 10 THEN 'Highly Edited'
+            WHEN COUNT(*) > 5 THEN 'Moderately Edited'
+            ELSE 'Low Activity'
+        END AS EditActivityLevel
+    FROM PostHistory ph
+    JOIN PostHistoryIntervals phi
+      ON ph.PostId = phi.PostId AND ph.CreationDate = phi.CreationDate
+    GROUP BY phi.PostId
+),
+ComplexTagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS PopularityCategory,
+        CASE 
+            WHEN t.IsRequired = TRUE THEN 'Required Tag'
+            WHEN t.IsModeratorOnly = TRUE THEN 'Moderator Only'
+            ELSE 'Regular Tag'
+        END AS TagType,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) - t.Count AS CountDifferenceFromPrevious,
+        RANK() OVER (ORDER BY t.Count DESC) AS TagRank,
+        COALESCE(SUBSTRING(t.TagName FROM 1 FOR 1), 'X') AS FirstLetter
+    FROM Tags t
+    WHERE t.Count > 0
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    us.AvgPostScore,
+    us.PostActivityRank,
+    pa.PostId,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.PostTypeDescription,
+    pa.ScoreCategory,
+    pa.DaysSinceCreation,
+    pa.UserPostSequence,
+    pa.ScoreQuartile,
+    pa.PreviousPostScore,
+    pa.NextPostScore,
+    pa.UserAvgScore,
+    cta.TagName,
+    cta.TagCount,
+    cta.PopularityCategory,
+    cta.TagType,
+    phs.EditCount,
+    phs.MajorEditCount,
+    phs.EditActivityLevel,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 2) AS UpvotesForPost,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 3) AS DownvotesForPost,
+    CASE 
+        WHEN pa.Score > (SELECT AVG(Score) FROM Posts) THEN 'Above Average'
+        WHEN pa.Score < (SELECT AVG(Score) FROM Posts) THEN 'Below Average'
+        ELSE 'Average'
+    END AS ScoreVsAverage,
+    CASE 
+        WHEN cta.TagCount > (SELECT AVG(Count) FROM Tags) THEN 'Above Average Popularity'
+        WHEN cta.TagCount < (SELECT AVG(Count) FROM Tags) THEN 'Below Average Popularity'
+        ELSE 'Average Popularity'
+    END AS TagPopularityVsAverage,
+    (CASE WHEN us.Reputation > 10000 THEN 1 ELSE 0 END + 
+     CASE WHEN us.PostCount > 100 THEN 1 ELSE 0 END + 
+     CASE WHEN us.BadgeCount > 20 THEN 1 ELSE 0 END + 
+     CASE WHEN pa.Score > 50 THEN 1 ELSE 0 END) AS EngagementScore,
+    CASE 
+        WHEN pa.DaysSinceCreation <= 30 THEN 'New Post'
+        WHEN pa.DaysSinceCreation <= 365 THEN 'Established Post'
+        ELSE 'Legacy Post'
+    END AS PostAgeCategory,
+    CAST(CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - pa.CreationDate)) / 86400 AS INTEGER) AS VARCHAR) || ' days old' AS PostAgeDescription,
+    COALESCE(us.Views, 0) + COALESCE(us.UpVotes, 0) - COALESCE(us.DownVotes, 0) AS UserActivityScore,
+    CASE 
+        WHEN CHAR_LENGTH(COALESCE(pa.Tags, '')) > 0 AND POSITION('<' IN COALESCE(pa.Tags, '')) > 0 THEN 
+            'Tags: ' || SUBSTRING(pa.Tags FROM 2 FOR CHAR_LENGTH(pa.Tags) - 2)
+        ELSE 'No Tags'
+    END AS TagListDescription,
+    CASE 
+        WHEN pa.Score > 0 AND pa.ViewCount > 0 THEN 
+            ROUND(pa.Score * 100.0 / CAST(pa.ViewCount AS double precision), 2)
+        ELSE 0
+    END AS ScoreToViewRatio,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = pa.PostId AND pl.LinkTypeId = 3) THEN 'Duplicate Post'
+        ELSE 'Original Post'
+    END AS DuplicateStatus,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = pa.PostId AND ph.PostHistoryTypeId = 10) AS CloseCount,
+    CASE 
+        WHEN pa.UserAvgScore > 10 THEN 'High Scoring User'
+        WHEN pa.UserAvgScore > 0 THEN 'Moderate Scoring User'
+        ELSE 'Low Scoring User'
+    END AS UserPerformanceLevel,
+    CASE 
+        WHEN pa.ViewCount > 1000 THEN 'High Traffic'
+        WHEN pa.ViewCount > 100 THEN 'Medium Traffic'
+        ELSE 'Low Traffic'
+    END AS TrafficCategory
+FROM UserStats us
+JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+LEFT JOIN ComplexTagAnalysis cta ON cta.TagRank = (pa.PostId % 100) + 1
+LEFT JOIN PostHistorySummary phs ON pa.PostId = phs.PostId
+WHERE pa.DaysSinceCreation < 365 
+  AND pa.PostTypeDescription IN ('Question', 'Answer')
+  AND pa.ViewCount > 0
+  AND us.Reputation > 5000
+  AND pa.Score > -5
+GROUP BY
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    us.AvgPostScore,
+    us.PostActivityRank,
+    pa.PostId,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.PostTypeDescription,
+    pa.ScoreCategory,
+    pa.DaysSinceCreation,
+    pa.UserPostSequence,
+    pa.ScoreQuartile,
+    pa.PreviousPostScore,
+    pa.NextPostScore,
+    pa.UserAvgScore,
+    cta.TagName,
+    cta.TagCount,
+    cta.PopularityCategory,
+    cta.TagType,
+    phs.EditCount,
+    phs.MajorEditCount,
+    phs.EditActivityLevel,
+    pa.CreationDate
+ORDER BY us.Reputation DESC, pa.Score DESC, pa.CreationDate DESC
+LIMIT 1000;

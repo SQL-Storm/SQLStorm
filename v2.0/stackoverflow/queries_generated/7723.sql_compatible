@@ -1,0 +1,289 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400 AS INTEGER) as AccountAgeDays,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Active'
+            ELSE 'Newbie'
+        END as ReputationTier,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        PERCENT_RANK() OVER (ORDER BY u.Reputation) as ReputationPercentile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostPerformance AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 3600 AS INTEGER) as HoursSinceCreation,
+        CASE 
+            WHEN p.Score > 100 THEN 'Hot'
+            WHEN p.Score > 20 THEN 'Popular'
+            WHEN p.Score > 0 THEN 'Moderate'
+            ELSE 'Low'
+        END as Popularity,
+        CASE 
+            WHEN p.ViewCount > 5000 THEN 'Viral'
+            WHEN p.ViewCount > 1000 THEN 'Trending'
+            WHEN p.ViewCount > 100 THEN 'Noticeable'
+            ELSE 'Obscure'
+        END as Reach,
+        COALESCE(p.Score, 0) + COALESCE(p.ViewCount, 0) * 0.1 + COALESCE(p.AnswerCount, 0) * 5 as PerformanceScore,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgScorePerUser,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as UserPostRank
+    FROM Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+TopUsers AS (
+    SELECT UserId, ReputationTier
+    FROM UserActivityStats
+    WHERE ReputationTier IN ('Elite', 'Veteran')
+    AND TotalPosts > 100
+),
+UserComplexity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore,
+        COUNT(DISTINCT p.ParentId) as QuestionsAnswered,
+        STRING_AGG(DISTINCT p.Tags, ', ') as AllTags,
+        MAX(LENGTH(p.Title)) as MaxTitleLength,
+        COUNT(DISTINCT CASE WHEN c.Id IS NOT NULL THEN c.Id END) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IN (SELECT UserId FROM TopUsers)
+    GROUP BY u.Id, u.DisplayName
+),
+CombinedAnalysis AS (
+    SELECT 
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.TotalPosts,
+        u.Questions,
+        u.Answers,
+        u.Comments,
+        u.Badges,
+        u.LastPostDate,
+        u.AccountAgeDays,
+        u.ReputationTier,
+        u.ReputationRank,
+        u.ReputationPercentile,
+        p.PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.PostTypeName,
+        p.HoursSinceCreation,
+        p.Popularity,
+        p.Reach,
+        p.PerformanceScore,
+        p.PreviousScore,
+        p.AvgScorePerUser,
+        u2.QuestionCount,
+        u2.AnswerCount as UC_AnswerCount,
+        u2.AvgQuestionScore,
+        u2.AvgAnswerScore,
+        u2.QuestionsAnswered,
+        u2.AllTags,
+        u2.MaxTitleLength,
+        u2.CommentCount as UC_CommentCount,
+        u2.BadgeCount,
+        CASE 
+            WHEN p.PerformanceScore > (SELECT AVG(PerformanceScore) FROM PostPerformance) THEN 1
+            ELSE 0
+        END as AboveAveragePerformance,
+        CASE 
+            WHEN p.HoursSinceCreation < 24 THEN 'New'
+            WHEN p.HoursSinceCreation < 168 THEN 'Recent'
+            WHEN p.HoursSinceCreation < 720 THEN 'Stable'
+            ELSE 'Legacy'
+        END as PostAgeCategory,
+        CASE 
+            WHEN p.Score > 0 AND p.AnswerCount > 0 THEN CAST(p.Score AS DOUBLE PRECISION) / CAST(p.AnswerCount AS DOUBLE PRECISION)
+            ELSE 0
+        END as ScorePerAnswer,
+        CASE 
+            WHEN u.Views > 0 THEN CAST(u.UpVotes AS DOUBLE PRECISION) / CAST(u.Views AS DOUBLE PRECISION)
+            ELSE 0
+        END as UpvoteRatio
+    FROM UserActivityStats u
+    LEFT JOIN PostPerformance p ON u.UserId = p.OwnerUserId AND p.UserPostRank = 1
+    LEFT JOIN UserComplexity u2 ON u.UserId = u2.UserId
+    WHERE u.TotalPosts > 0
+    AND (u.ReputationTier IN ('Elite', 'Veteran') OR u.TotalPosts > 50)
+),
+FinalAnalysis AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        UpVotes,
+        DownVotes,
+        TotalPosts,
+        Questions,
+        Answers,
+        Comments,
+        Badges,
+        LastPostDate,
+        AccountAgeDays,
+        ReputationTier,
+        ReputationRank,
+        ReputationPercentile,
+        PostId,
+        Title,
+        Score,
+        ViewCount,
+        AnswerCount,
+        CommentCount,
+        FavoriteCount,
+        CreationDate,
+        PostTypeName,
+        HoursSinceCreation,
+        Popularity,
+        Reach,
+        PerformanceScore,
+        PreviousScore,
+        AvgScorePerUser,
+        QuestionCount,
+        UC_AnswerCount,
+        AvgQuestionScore,
+        AvgAnswerScore,
+        QuestionsAnswered,
+        AllTags,
+        MaxTitleLength,
+        UC_CommentCount,
+        BadgeCount,
+        AboveAveragePerformance,
+        PostAgeCategory,
+        ScorePerAnswer,
+        UpvoteRatio,
+        CASE 
+            WHEN ReputationTier = 'Elite' AND TotalPosts > 500 THEN 'Hall of Fame'
+            WHEN ReputationTier = 'Veteran' AND TotalPosts > 200 THEN 'Veteran Achiever'
+            WHEN TotalPosts > 1000 THEN 'Super Contributor'
+            ELSE 'Regular Contributor'
+        END as ContributorTier,
+        DENSE_RANK() OVER (ORDER BY PerformanceScore DESC, Score DESC) as PerformanceRank,
+        PERCENT_RANK() OVER (ORDER BY PerformanceScore DESC) as PerformancePercentile,
+        ROW_NUMBER() OVER (PARTITION BY ReputationTier ORDER BY PerformanceScore DESC) as RankInTier
+    FROM CombinedAnalysis
+    WHERE Reputation > 0
+    AND (Score IS NOT NULL OR ViewCount IS NOT NULL OR AnswerCount IS NOT NULL)
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    Views,
+    UpVotes,
+    DownVotes,
+    TotalPosts,
+    Questions,
+    Answers,
+    Comments,
+    Badges,
+    LastPostDate,
+    AccountAgeDays,
+    ReputationTier,
+    ReputationRank,
+    ReputationPercentile,
+    PostId,
+    Title,
+    Score,
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    CreationDate,
+    PostTypeName,
+    HoursSinceCreation,
+    Popularity,
+    Reach,
+    PerformanceScore,
+    PreviousScore,
+    AvgScorePerUser,
+    QuestionCount,
+    UC_AnswerCount as AnswerCountFromComplexity,
+    AvgQuestionScore,
+    AvgAnswerScore,
+    QuestionsAnswered,
+    AllTags,
+    MaxTitleLength,
+    UC_CommentCount as UserCommentCount,
+    BadgeCount,
+    CASE 
+        WHEN AboveAveragePerformance = 1 THEN 'Yes'
+        ELSE 'No'
+    END as AboveAveragePerformance,
+    PostAgeCategory,
+    ScorePerAnswer,
+    UpvoteRatio,
+    ContributorTier,
+    PerformanceRank,
+    PerformancePercentile,
+    RankInTier,
+    CASE 
+        WHEN PerformanceScore > (SELECT AVG(PerformanceScore) FROM FinalAnalysis) * 1.5 THEN 'Exceptional'
+        WHEN PerformanceScore > (SELECT AVG(PerformanceScore) FROM FinalAnalysis) THEN 'Above Average'
+        WHEN PerformanceScore > (SELECT AVG(PerformanceScore) FROM FinalAnalysis) * 0.7 THEN 'Average'
+        ELSE 'Below Average'
+    END as PerformanceCategory
+FROM FinalAnalysis
+WHERE 
+    (Reputation > 1000 OR TotalPosts > 10 OR ViewCount > 100)
+    AND (
+        (Reputation > 5000 AND Questions > 50)
+        OR 
+        (Reputation > 2000 AND Answers > 100)
+        OR
+        (Reputation > 1000 AND TotalPosts > 200)
+    )
+ORDER BY 
+    Reputation DESC,
+    PerformanceScore DESC,
+    TotalPosts DESC
+OFFSET 50 ROWS FETCH NEXT 100 ROWS ONLY;

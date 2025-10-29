@@ -1,0 +1,179 @@
+WITH RECURSIVE RecursiveUserPosts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        1 AS Depth
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 500
+),
+UserPostHierarchy AS (
+    SELECT * FROM RecursiveUserPosts
+    UNION ALL
+    SELECT
+        r.UserId,
+        r.DisplayName,
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        COALESCE(p.ViewCount, 0),
+        p.Tags,
+        p.AcceptedAnswerId,
+        r.Depth + 1
+    FROM UserPostHierarchy r
+    JOIN Posts p ON p.ParentId = r.PostId
+    WHERE r.Depth < 5
+),
+UserBadgeCounts AS (
+    SELECT 
+        b.UserId, 
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(DISTINCT CASE WHEN b.TagBased = TRUE THEN b.Name END) AS TagBasedBadgeCount,
+        COUNT(DISTINCT CASE WHEN b.TagBased = FALSE THEN b.Name END) AS NamedBadgeCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COUNT(DISTINCT c.Id) FILTER (WHERE c.CreationDate > p.CreationDate) AS SubsequentCommentsCount,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseVoteCount,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (10,11)) AS LastCloseOrReopen,
+        STRING_AGG(DISTINCT lt.Name, ',' ORDER BY lt.Name) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedPostTypes,
+        (CASE WHEN EXISTS(
+            SELECT 1 FROM Votes v 
+            WHERE v.PostId = p.Id AND v.VoteTypeId = 2 AND v.CreationDate > (p.CreationDate + INTERVAL '30 days')
+        ) THEN TRUE ELSE FALSE END) AS HasLateUpvotes,
+        (
+            SELECT AVG(v2.BountyAmount) 
+            FROM Votes v2 
+            WHERE v2.PostId = p.Id AND v2.VoteTypeId = 8
+        ) AS AvgBountyAwarded
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags
+),
+RankedAnswers AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        p.Id AS AnswerId,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate) AS AnswerRank,
+        COUNT(*) OVER (PARTITION BY p.ParentId) AS AnswerCount,
+        SUM(p.Score) OVER (PARTITION BY p.ParentId) AS TotalAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+QuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        r.AnswerCount,
+        r.TotalAnswerScore,
+        r.AnswerRank,
+        r.AnswerId
+    FROM Posts q
+    LEFT JOIN RankedAnswers r ON r.QuestionId = q.Id
+    WHERE q.PostTypeId = 1
+),
+TopContributors AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ubc.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubc.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubc.BronzeBadges, 0) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COALESCE(ubc.GoldBadges,0) DESC, COALESCE(ubc.SilverBadges,0) DESC) AS Rank
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = u.Id
+    WHERE u.Reputation > 10000
+),
+FinalSelection AS (
+    SELECT DISTINCT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ubc.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubc.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubc.BronzeBadges, 0) AS BronzeBadges,
+        p.PostId AS PostId,
+        p.PostTypeId,
+        p.Score AS PostScore,
+        p.ViewCount,
+        COALESCE(NULLIF(p.Tags, ''), '<no tags>') AS Tags,
+        p.SubsequentCommentsCount,
+        p.CloseVoteCount,
+        p.LastCloseOrReopen,
+        p.LinkedPostTypes,
+        p.HasLateUpvotes,
+        COALESCE(p.AvgBountyAwarded, 0) AS AvgBountyAwarded,
+        q.AnswerCount,
+        q.TotalAnswerScore,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC) AS PostRank
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = u.Id
+    LEFT JOIN PostStats p ON p.OwnerUserId = u.Id
+    LEFT JOIN QuestionsWithAnswers q ON q.QuestionId = p.PostId
+    WHERE u.Reputation > 1000
+)
+SELECT
+    f.UserId,
+    f.DisplayName,
+    f.Reputation,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    f.PostId,
+    CASE f.PostTypeId
+        WHEN 1 THEN 'Question'
+        WHEN 2 THEN 'Answer'
+        WHEN 3 THEN 'Wiki'
+        WHEN 4 THEN 'TagWikiExcerpt'
+        WHEN 5 THEN 'TagWiki'
+        WHEN 6 THEN 'ModeratorNomination'
+        WHEN 7 THEN 'WikiPlaceholder'
+        WHEN 8 THEN 'PrivilegeWiki'
+        ELSE 'Other'
+    END AS PostType,
+    f.PostScore,
+    f.ViewCount,
+    f.Tags,
+    f.SubsequentCommentsCount,
+    f.CloseVoteCount,
+    f.LastCloseOrReopen,
+    f.LinkedPostTypes,
+    f.HasLateUpvotes,
+    f.AvgBountyAwarded,
+    f.AnswerCount,
+    f.TotalAnswerScore,
+    CASE 
+        WHEN f.PostRank = 1 THEN 'Top Post'
+        ELSE 'Other Post'
+    END AS PostRankStatus
+FROM FinalSelection f
+WHERE f.PostRank <= 3
+ORDER BY f.Reputation DESC, f.GoldBadges DESC, f.PostScore DESC, f.ViewCount DESC
+LIMIT 100;

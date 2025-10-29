@@ -1,0 +1,259 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC) as RecentPostRank,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN AVG(p.Score) 
+            ELSE 0 
+        END as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName
+),
+TagComplexityAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'High'
+            WHEN t.Count > 100 THEN 'Medium' 
+            ELSE 'Low'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) - t.Count as PopularityDifference
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName <> ''
+),
+PostComplexityMetrics AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CHAR_LENGTH(p.Body) as BodyLength,
+        CHAR_LENGTH(p.Title) as TitleLength,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                (SELECT COUNT(*) FROM UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS x)
+            ELSE 0 
+        END as TagCount,
+        CASE 
+            WHEN p.ParentId IS NOT NULL THEN 'Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            ELSE 'Other'
+        END as PostCategory,
+        DATE_PART('day', (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) as AgeInDays,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 10 THEN 'ModeratelyVoted'
+            ELSE 'LowVoted'
+        END as VoteLevel,
+        CASE 
+            WHEN ABS(p.Score) > 50 THEN ABS(p.Score) 
+            ELSE NULL 
+        END as SignificantScore
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2015-01-01'
+),
+UserEngagementScores AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) as NetVotes,
+        COALESCE(u.Views, 0) as TotalViews,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 1000 THEN 'Veteran'
+            ELSE 'Regular'
+        END as RepStatus,
+        ROW_NUMBER() OVER (ORDER BY (COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0)) DESC) as RepRank,
+        NTILE(10) OVER (ORDER BY (COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0))) as RepQuartile,
+        COUNT(DISTINCT v.Id) as TotalVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as UpVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) as DownVotes
+    FROM Users u
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.Reputation, u.UpVotes, u.DownVotes, u.Views
+),
+TemporalPostAnalysis AS (
+    SELECT 
+        p.Id,
+        p.ParentId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        DATE_PART('year', p.CreationDate) as PostYear,
+        DATE_PART('month', p.CreationDate) as PostMonth,
+        (FLOOR((DATE_PART('month', p.CreationDate)-1)/3)+1) as PostQuarter,
+        CASE 
+            WHEN p.CreationDate >= TIMESTAMP '2020-01-01' THEN 'Recent'
+            WHEN p.CreationDate >= TIMESTAMP '2015-01-01' THEN 'Mid'
+            ELSE 'Legacy'
+        END as TimePeriod,
+        ROW_NUMBER() OVER (PARTITION BY DATE_PART('year', p.CreationDate), DATE_PART('month', p.CreationDate) ORDER BY p.CreationDate) as MonthlyPostSequence,
+        LAG(p.Score) OVER (PARTITION BY DATE_PART('year', p.CreationDate), DATE_PART('month', p.CreationDate) ORDER BY p.CreationDate) as PreviousScoreInMonth
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2014-01-01'
+)
+SELECT 
+    'Performance Benchmark Report' as ReportHeader,
+    COUNT(DISTINCT u.Id) as TotalUsers,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT c.Id) as TotalComments,
+    COUNT(DISTINCT b.Id) as TotalBadges,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.PostTypeId = 1 AND p2.CreationDate >= TIMESTAMP '2020-01-01') as RecentQuestions,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.PostTypeId = 2 AND p3.CreationDate >= TIMESTAMP '2020-01-01') as RecentAnswers,
+    (SELECT AVG(SignificantScore) FROM PostComplexityMetrics WHERE SignificantScore IS NOT NULL) as AvgHighValueScore,
+    (SELECT AVG(
+        (SELECT COUNT(*) FROM UNNEST(string_to_array(SUBSTRING(p4.Tags FROM 2 FOR CHAR_LENGTH(p4.Tags)-2), '><')) AS x)
+     ) FROM Posts p4 WHERE p4.Tags IS NOT NULL AND p4.Tags <> '') as AvgTagCount,
+    (SELECT AVG(CHAR_LENGTH(p5.Body)) FROM Posts p5 WHERE p5.Body IS NOT NULL) as AvgPostBodyLength,
+    (SELECT COUNT(*) FROM Posts p6 WHERE p6.ViewCount > 10000 AND p6.Score > 50) as HighTrafficHighVotedPosts,
+    (SELECT COUNT(*) FROM Users u2 WHERE u2.Reputation > 10000) as EliteUsers,
+    (SELECT COUNT(*) FROM Users u3 WHERE u3.Reputation BETWEEN 1000 AND 10000) as VeteranUsers,
+    (SELECT MAX(CreationDate) FROM Posts) as LatestPostDate,
+    (SELECT MIN(CreationDate) FROM Posts) as EarliestPostDate,
+    (SELECT COUNT(*) FROM Tags t WHERE t.Count > 1000) as PopularTags,
+    (SELECT COUNT(*) FROM Tags t2 WHERE t2.Count BETWEEN 100 AND 1000) as ModerateTags,
+    (SELECT COUNT(*) FROM Tags t3 WHERE t3.Count < 100) as LessPopularTags,
+    
+    (SELECT COUNT(*) 
+     FROM Users u2 
+     WHERE u2.Reputation > (
+         SELECT AVG(u3.Reputation) 
+         FROM Users u3 
+         WHERE u3.Id IN (
+             SELECT v.UserId 
+             FROM Votes v 
+             WHERE v.VoteTypeId IN (2, 3)
+         )
+     )
+    ) as UsersAboveReputationAverage,
+    
+    (SELECT COUNT(*) 
+     FROM (
+         SELECT 
+             u4.Id,
+             u4.Reputation,
+             ROW_NUMBER() OVER (PARTITION BY u4.Reputation ORDER BY u4.CreationDate DESC) as RepRank,
+             DENSE_RANK() OVER (ORDER BY u4.Reputation DESC) as RepDenseRank,
+             NTILE(4) OVER (ORDER BY u4.Reputation DESC) as RepQuartile,
+             LAG(u4.Reputation) OVER (ORDER BY u4.Reputation DESC) as PreviousRep
+         FROM Users u4
+         WHERE u4.Reputation > 10000
+     ) ranked_users 
+     WHERE ranked_users.RepRank = 1
+    ) as TopRankedUsers,
+    
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT u5.Id FROM Users u5 JOIN Posts p7 ON u5.Id = p7.OwnerUserId WHERE p7.CreationDate >= TIMESTAMP '2019-01-01'
+        EXCEPT
+        SELECT DISTINCT u6.Id FROM Users u6 JOIN Posts p8 ON u6.Id = p8.OwnerUserId WHERE p8.CreationDate < TIMESTAMP '2019-01-01'
+    ) users_with_new_posts) as ActiveUsersInRecentPeriod,
+    
+    (SELECT COUNT(*) 
+     FROM Posts p9 
+     WHERE COALESCE(p9.ClosedDate, TIMESTAMP '1900-01-01') = TIMESTAMP '1900-01-01' 
+       AND COALESCE(p9.CommunityOwnedDate, TIMESTAMP '1900-01-01') = TIMESTAMP '1900-01-01'
+       AND p9.PostTypeId IN (1, 2)
+    ) as OpenPostsCount,
+    
+    (SELECT STRING_AGG(t.TagName || ':' || CAST(t.Count AS VARCHAR), '; ') 
+     FROM Tags t 
+     WHERE t.Count > 1000
+    ) as PopularTagsConcatenated,
+    
+    (SELECT COUNT(DISTINCT u7.Id) 
+     FROM Users u7
+     INNER JOIN Posts p10 ON u7.Id = p10.OwnerUserId
+     INNER JOIN PostHistory ph ON p10.Id = ph.PostId
+     INNER JOIN Badges b2 ON u7.Id = b2.UserId
+     WHERE p10.CreationDate BETWEEN TIMESTAMP '2018-01-01' AND TIMESTAMP '2020-12-31'
+       AND b2.Date BETWEEN TIMESTAMP '2018-01-01' AND TIMESTAMP '2020-12-31'
+       AND ph.CreationDate BETWEEN TIMESTAMP '2018-01-01' AND TIMESTAMP '2020-12-31'
+    ) as MultiActivityUsers,
+    
+    (SELECT AVG(DATE_PART('day', (TIMESTAMP '2024-10-01 12:34:56' - p11.CreationDate))) 
+     FROM Posts p11 
+     WHERE p11.PostTypeId = 1 
+       AND p11.CreationDate >= TIMESTAMP '2016-01-01'
+       AND p11.CreationDate <= TIMESTAMP '2020-12-31'
+    ) as AvgQuestionAge,
+    
+    (SELECT COUNT(*) 
+     FROM (
+         SELECT u8.Id 
+         FROM Users u8
+         LEFT JOIN Posts p12 ON u8.Id = p12.OwnerUserId
+         LEFT JOIN Comments c2 ON u8.Id = c2.UserId
+         WHERE p12.Id IS NULL 
+           AND c2.Id IS NULL
+           AND u8.CreationDate >= TIMESTAMP '2019-01-01'
+         GROUP BY u8.Id
+     ) inactive_users
+    ) as InactiveUsers,
+    
+    (SELECT MAX(RepStatus) 
+     FROM UserEngagementScores) as TopRepStatus,
+    
+    (SELECT SUBSTRING(
+        (SELECT STRING_AGG(t4.TagName, '; ' ORDER BY t4.Count DESC) FROM Tags t4 WHERE t4.Count > 500),
+        1, 1000
+    )) as TopTagList,
+    
+    (SELECT COUNT(*) 
+     FROM (
+         SELECT p13.Id 
+         FROM Posts p13
+         WHERE p13.Score > (SELECT AVG(p_avg.Score) FROM Posts p_avg)
+           AND p13.AnswerCount > 1
+           AND EXISTS (
+               SELECT 1 
+               FROM PostHistory ph2 
+               WHERE ph2.PostId = p13.Id 
+                 AND ph2.PostHistoryTypeId IN (1, 2, 3)
+           )
+           AND NOT EXISTS (
+               SELECT 1 
+               FROM Comments c3 
+               WHERE c3.PostId = p13.Id 
+                 AND c3.Score < 0
+           )
+         INTERSECT
+         SELECT p14.Id 
+         FROM Posts p14
+         WHERE p14.PostTypeId = 1 
+           AND LOWER(p14.Title) LIKE '%question%'
+           AND p14.ViewCount > 1000
+     ) qualified_posts
+    ) as QualifiedPostsCount,
+    
+    TIMESTAMP '2024-10-01 12:34:56' as BenchmarkTimestamp
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+GROUP BY ReportHeader;

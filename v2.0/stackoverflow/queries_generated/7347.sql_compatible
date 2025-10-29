@@ -1,0 +1,285 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) AS HighViewQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 10 THEN p.Id END) AS HighScoreAnswers,
+    COUNT(DISTINCT b.Id) AS Badges,
+    STRING_AGG(DISTINCT b.Name, ', ') AS BadgeNames,
+    MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+    MAX(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS HasSilverBadge,
+    MAX(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS HasBronzeBadge,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT ph.Id) AS HistoryCount,
+    COUNT(DISTINCT pl.Id) AS LinkCount,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+          AND p2.PostTypeId = 1 
+          AND p2.AnswerCount > 0
+    ) AS QuestionWithAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p3 
+        WHERE p3.OwnerUserId = u.Id 
+          AND p3.PostTypeId = 1 
+          AND p3.Score > 100
+    ) AS HighScoreQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p4 
+        WHERE p4.OwnerUserId = u.Id 
+          AND p4.PostTypeId = 2 
+          AND p4.ParentId IN (
+              SELECT Id FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1
+          )
+    ) AS AnswerToOwnQuestions,
+    (
+        SELECT STRING_AGG(x.post_text, ' | ')
+        FROM (
+            SELECT 
+                CASE 
+                    WHEN p5.PostTypeId = 1 THEN 'Q:' || p5.Title
+                    WHEN p5.PostTypeId = 2 THEN 'A:' || COALESCE(p5.Body, '')
+                    ELSE 'Other'
+                END AS post_text,
+                p5.CreationDate
+            FROM Posts p5 
+            WHERE p5.OwnerUserId = u.Id 
+            ORDER BY p5.CreationDate DESC
+            LIMIT 5
+        ) x
+    ) AS RecentPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.UserId = u.Id 
+          AND v.VoteTypeId IN (2, 3)
+    ) AS VoteCount,
+    (
+        SELECT AVG(v.Score) 
+        FROM Votes v 
+        JOIN Posts p6 ON v.PostId = p6.Id 
+        WHERE v.UserId = u.Id 
+          AND v.VoteTypeId IN (2, 3)
+          AND p6.PostTypeId = 1
+    ) AS AvgQuestionScore,
+    (
+        SELECT STRING_AGG(t.TagName, ' ')
+        FROM (
+            SELECT DISTINCT p7.Id AS post_id, TRIM(tag) AS TagName
+            FROM Posts p7
+            CROSS JOIN LATERAL (
+                SELECT UNNEST(string_to_array(REPLACE(REPLACE(p7.Tags, '<', ''), '>', ','), ',')) AS tag
+            ) tags
+            WHERE p7.OwnerUserId = u.Id
+              AND p7.Tags IS NOT NULL
+        ) t
+        ORDER BY t.TagName
+    ) AS TagInterests,
+    (
+        SELECT MAX(CASE WHEN p8.PostTypeId = 1 THEN p8.Score ELSE 0 END)
+        FROM Posts p8 
+        WHERE p8.OwnerUserId = u.Id
+    ) AS MaxQuestionScore,
+    (
+        SELECT MAX(CASE WHEN p9.PostTypeId = 2 THEN p9.Score ELSE 0 END)
+        FROM Posts p9 
+        WHERE p9.OwnerUserId = u.Id
+    ) AS MaxAnswerScore,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p10 
+        WHERE p10.OwnerUserId = u.Id 
+          AND p10.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 day')
+    ) AS RecentPostsLast30Days,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c2 
+        WHERE c2.UserId = u.Id
+    ) AS CommentsInLast30Days,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph2 
+        WHERE ph2.UserId = u.Id
+    ) AS HistoryEventsInLast30Days,
+    (
+        SELECT COUNT(DISTINCT ph3.PostId) 
+        FROM PostHistory ph3 
+        WHERE ph3.UserId = u.Id 
+          AND ph3.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+    ) AS EditedPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Users u2 
+        WHERE u2.Reputation > u.Reputation
+    ) AS UsersWithHigherReputation,
+    (
+        SELECT STRING_AGG(x.ptype, '')
+        FROM (
+            SELECT 
+                CASE 
+                    WHEN p11.PostTypeId = 1 THEN 'Q'
+                    WHEN p11.PostTypeId = 2 THEN 'A'
+                    ELSE 'Other'
+                END AS ptype,
+                p11.CreationDate
+            FROM Posts p11 
+            WHERE p11.OwnerUserId = u.Id
+            ORDER BY p11.CreationDate
+            LIMIT 10
+        ) x
+    ) AS PostTypeSequence,
+    (
+        SELECT AVG(EXTRACT(EPOCH FROM (p12.LastActivityDate - p12.CreationDate)) / 86400.0)
+        FROM Posts p12 
+        WHERE p12.OwnerUserId = u.Id 
+          AND p12.PostTypeId = 1
+    ) AS AvgDaysBetweenCreationAndActivity,
+    (
+        SELECT COUNT(DISTINCT p13.Id) 
+        FROM Posts p13 
+        WHERE p13.OwnerUserId = u.Id 
+          AND p13.Tags IS NOT NULL
+          AND p13.Tags LIKE '%<%'
+    ) AS QuestionsWithTags,
+    (
+        SELECT STRING_AGG(COALESCE(b2.Name, 'No Badge'), ' | ')
+        FROM (
+            SELECT b2.Name, b2.Class
+            FROM Badges b2
+            WHERE b2.UserId = u.Id
+              AND b2.Date >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+            ORDER BY b2.Date DESC
+            LIMIT 5
+        ) b2
+    ) AS RecentBadges,
+    (
+        SELECT COUNT(DISTINCT p14.Id) 
+        FROM Posts p14
+        LEFT JOIN (
+            SELECT DISTINCT PostId 
+            FROM PostLinks 
+            WHERE LinkTypeId = 3
+        ) pl2 ON p14.Id = pl2.PostId
+        WHERE p14.OwnerUserId = u.Id AND pl2.PostId IS NOT NULL
+    ) AS DuplicateQuestions,
+    (
+        SELECT COUNT(DISTINCT ph4.Id) 
+        FROM PostHistory ph4 
+        WHERE ph4.UserId = u.Id 
+          AND ph4.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15)
+    ) AS ModerationEvents,
+    (
+        SELECT STRING_AGG(x.et, '')
+        FROM (
+            SELECT 
+                CASE 
+                    WHEN ph5.PostHistoryTypeId = 1 THEN 'T'
+                    WHEN ph5.PostHistoryTypeId = 2 THEN 'B'
+                    WHEN ph5.PostHistoryTypeId = 3 THEN 'T'
+                    WHEN ph5.PostHistoryTypeId = 4 THEN 'T'
+                    WHEN ph5.PostHistoryTypeId = 5 THEN 'B'
+                    WHEN ph5.PostHistoryTypeId = 6 THEN 'T'
+                    ELSE 'O'
+                END AS et,
+                ph5.CreationDate
+            FROM PostHistory ph5 
+            WHERE ph5.UserId = u.Id
+            ORDER BY ph5.CreationDate
+            LIMIT 10
+        ) x
+    ) AS EditTypeSequence,
+    (
+        SELECT COUNT(DISTINCT p15.Id) 
+        FROM Posts p15 
+        WHERE p15.OwnerUserId = u.Id 
+          AND p15.Score >= 0
+          AND p15.Score <= 5
+    ) AS LowScorePosts,
+    (
+        SELECT COUNT(DISTINCT p16.Id) 
+        FROM Posts p16 
+        WHERE p16.OwnerUserId = u.Id 
+          AND p16.Score >= 100
+          AND p16.ViewCount >= 1000
+    ) AS HighlyRatedHighViewPosts,
+    (
+        SELECT COUNT(DISTINCT p17.Id) 
+        FROM Posts p17 
+        WHERE p17.OwnerUserId = u.Id 
+          AND p17.ParentId IS NOT NULL
+          AND p17.PostTypeId = 2
+          AND (
+              SELECT COUNT(*) 
+              FROM Votes v2 
+              WHERE v2.PostId = p17.Id 
+                AND v2.VoteTypeId = 1
+          ) > 0
+    ) AS AcceptedAnswers,
+    (
+        SELECT AVG(p18.Score) 
+        FROM Posts p18 
+        WHERE p18.OwnerUserId = u.Id 
+          AND p18.PostTypeId = 2
+          AND p18.Score > 0
+    ) AS AvgAnswerScore,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT p19.OwnerUserId 
+            FROM Posts p19 
+            WHERE p19.OwnerUserId = u.Id
+            GROUP BY p19.OwnerUserId
+            HAVING COUNT(p19.Id) > 100
+        ) sub1
+    ) AS HighActivityUser,
+    (
+        SELECT COUNT(DISTINCT p20.Id) 
+        FROM Posts p20 
+        WHERE p20.OwnerUserId = u.Id 
+          AND p20.CreationDate BETWEEN (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 month') AND TIMESTAMP '2024-10-01 12:34:56'
+    ) AS RecentPostsLast6Months,
+    (
+        SELECT COUNT(DISTINCT p21.Id) 
+        FROM Posts p21 
+        WHERE p21.OwnerUserId = u.Id 
+          AND p21.CreationDate BETWEEN (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '12 month') AND TIMESTAMP '2024-10-01 12:34:56'
+    ) AS RecentPostsLastYear,
+    (
+        SELECT STRING_AGG(x.t, ' && ')
+        FROM (
+            SELECT COALESCE(p22.Title, 'No Title') AS t, p22.CreationDate
+            FROM Posts p22 
+            WHERE p22.OwnerUserId = u.Id 
+              AND p22.PostTypeId = 1
+            ORDER BY p22.CreationDate DESC
+            LIMIT 3
+        ) x
+    ) AS RecentQuestionTitles
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN PostLinks pl ON pl.PostId = (
+    SELECT p_local.Id 
+    FROM Posts p_local
+    WHERE p_local.Id = pl.PostId
+    LIMIT 1
+)
+WHERE u.Id > 0
+  AND u.Reputation > 0
+  AND (
+      SELECT COUNT(*) 
+      FROM Posts p23 
+      WHERE p23.OwnerUserId = u.Id
+  ) >= 1
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) >= 5
+ORDER BY u.Reputation DESC
+LIMIT 100;

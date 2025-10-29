@@ -1,0 +1,139 @@
+WITH RecursiveUserActivity AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        coalesce(u.Reputation, 0) AS Reputation,
+        count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        count(DISTINCT p2.Id) FILTER (WHERE p2.PostTypeId = 2) AS AnswerCount,
+        count(DISTINCT b.Id) AS BadgeCount,
+        row_number() OVER (ORDER BY u.Reputation DESC NULLS LAST, u.CreationDate) AS ActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopUsersCTE AS (
+    SELECT *
+    FROM RecursiveUserActivity
+    WHERE Reputation > (SELECT avg(Reputation) FROM RecursiveUserActivity)
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        count(DISTINCT pl.RelatedPostId) AS RelatedPostCount,
+        string_agg(DISTINCT lt.Name, ', ') AS LinkTypesUsed
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+PostRankedAnswers AS (
+    SELECT
+        a.Id,
+        a.ParentId,
+        a.OwnerUserId,
+        a.Score,
+        row_number() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+UserTopAnswerScores AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        coalesce(sum(a.Score), 0) AS TotalTopAnswerScore
+    FROM Users u
+    LEFT JOIN PostRankedAnswers a ON a.OwnerUserId = u.Id AND a.AnswerRank = 1
+    GROUP BY u.Id, u.DisplayName
+),
+PostsWithCloseInfo AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        cht.Name AS CloseReason,
+        ph.CreationDate AS CloseDate,
+        p.Tags,
+        p.AnswerCount,
+        p.Score
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes cht ON cast(cht.Id AS integer) = cast(ph.Comment AS integer)
+    WHERE p.PostTypeId = 1
+),
+FilteredQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        coalesce(p.AnswerCount, 0) AS AnswerCount,
+        coalesce(p.Score, 0) AS Score,
+        p.CloseReason,
+        p.CloseDate,
+        p.Tags
+    FROM PostsWithCloseInfo p
+    WHERE (p.CloseDate IS NULL OR p.CloseDate > (cast('2024-10-01 12:34:56' AS timestamp) - interval '1 year'))
+      AND (p.Tags IS NOT NULL AND p.Tags <> '')
+),
+UserQnsAndAnsStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        fq.AnswerCount,
+        fq.Score AS QuestionScore,
+        (SELECT count(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 2) AS AnswerCountTotal,
+        (SELECT avg(p3.score) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2) AS AvgAnswerScore
+    FROM Users u
+    LEFT JOIN FilteredQuestions fq ON fq.OwnerUserId = u.Id
+)
+SELECT
+    tu.DisplayName AS TopUserName,
+    tu.Reputation,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.BadgeCount,
+    ul.LinkedPosts,
+    ul.DuplicatePosts,
+    string_agg(DISTINCT t.TagName, ', ') AS UserPopularTags,
+    coalesce(utsa.AnswerCountTotal, 0) AS TotalAnswers,
+    coalesce(utsa.AvgAnswerScore, 0) AS AverageAnswerScore,
+    coalesce(uts.TotalTopAnswerScore, 0) AS TopAnswerScores,
+    fq.CloseReason,
+    fq.CloseDate,
+    concat(
+        CASE WHEN fq.CloseReason IS NOT NULL THEN ('Closed reason: ' || fq.CloseReason) ELSE 'Not Closed' END,
+        ' | ',
+        CASE WHEN fq.AnswerCount > 0 THEN (cast(fq.AnswerCount AS varchar) || ' answers') ELSE 'No answers' END
+    ) AS QuestionSummary
+FROM TopUsersCTE tu
+LEFT JOIN UserQnsAndAnsStats utsa ON utsa.UserId = tu.Id
+LEFT JOIN UserTopAnswerScores uts ON uts.UserId = tu.Id
+LEFT JOIN (
+    SELECT
+        p.OwnerUserId,
+        sum(CASE WHEN lt.Name = 'Linked' THEN 1 ELSE 0 END) AS LinkedPosts,
+        sum(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicatePosts
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    JOIN Posts p ON pl.PostId = p.Id
+    GROUP BY p.OwnerUserId
+) ul ON ul.OwnerUserId = tu.Id
+LEFT JOIN (
+    SELECT
+        p.OwnerUserId,
+        t.TagName
+    FROM Posts p,
+         LATERAL (
+           SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS TagName
+         ) t
+    GROUP BY p.OwnerUserId, t.TagName
+    ORDER BY count(*) DESC
+    LIMIT 5
+) t ON t.OwnerUserId = tu.Id
+LEFT JOIN FilteredQuestions fq ON fq.OwnerUserId = tu.Id
+GROUP BY tu.DisplayName, tu.Reputation, tu.QuestionCount, tu.AnswerCount, tu.BadgeCount, ul.LinkedPosts, ul.DuplicatePosts,
+         utsa.AnswerCountTotal, utsa.AvgAnswerScore, uts.TotalTopAnswerScore, fq.CloseReason, fq.CloseDate, fq.AnswerCount, tu.Id
+ORDER BY tu.Reputation DESC NULLS LAST
+FETCH FIRST 50 ROWS ONLY;

@@ -1,0 +1,172 @@
+-- {"query": "2587.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1783} 
+with recursive TagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = 1 and t.IsModeratorOnly = 0
+
+    union all
+
+    select
+        child.Id,
+        child.TagName,
+        th.Level + 1,
+        th.Path || child.Id
+    from Tags child
+    join TagHierarchy th on child.Id != all(th.Path)
+    where child.IsRequired = 0 and child.IsModeratorOnly = 0
+    and child.Count > 10
+),
+UserBadgeRanks as (
+    select
+        ub.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    join Users ub on ub.Id = b.UserId
+    where b.Date > current_date - interval '1 year'
+    group by ub.UserId, b.Class
+),
+PostScoreWindow as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        row_number() over (partition by p.OwnerUserId, p.PostTypeId order by p.Score desc, p.CreationDate desc) as rn,
+        lag(p.Score) over (partition by p.OwnerUserId, p.PostTypeId order by p.Score desc, p.CreationDate desc) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId, p.PostTypeId order by p.Score desc, p.CreationDate desc) as NextScore,
+        coalesce(p.Title,'') as TitleNormalized,
+        p.Tags
+    from Posts p
+    where p.PostTypeId in (1, 2)
+    and p.CreationDate >= current_date - interval '2 year'
+),
+TopUserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(sum(case when p.PostTypeId = 1 then 1 else 0 end),0) as QuestionsCount,
+        coalesce(sum(case when p.PostTypeId = 2 then 1 else 0 end),0) as AnswersCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        count(distinct c.Id) as TotalComments,
+        coalesce(sum(vt.QUpVotes),0) as ReceivedUpVotes,
+        coalesce(sum(vt.QDownVotes),0) as ReceivedDownVotes,
+        max(b1.BadgeCount) filter (where b1.Class = 1) as GoldBadges,
+        max(b2.BadgeCount) filter (where b2.Class = 2) as SilverBadges,
+        max(b3.BadgeCount) filter (where b3.Class = 3) as BronzeBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate >= current_date - interval '1 year'
+    left join Comments c on c.UserId = u.Id and c.CreationDate >= current_date - interval '1 year'
+    left join (
+        select
+            p.OwnerUserId,
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as QUpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as QDownVotes
+        from Posts p
+        left join Votes v on v.PostId = p.Id
+        where p.CreationDate >= current_date - interval '1 year' and p.OwnerUserId is not null
+        group by p.OwnerUserId
+    ) vt on vt.OwnerUserId = u.Id
+    left join UserBadgeRanks b1 on b1.UserId = u.Id and b1.Class = 1
+    left join UserBadgeRanks b2 on b2.UserId = u.Id and b2.Class = 2
+    left join UserBadgeRanks b3 on b3.UserId = u.Id and b3.Class = 3
+    group by u.Id, u.DisplayName, u.Reputation
+    having coalesce(sum(p.Score),0) > 100
+),
+DuplicateQuestionsCTE as (
+    select distinct
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        q.Title as DuplicateTitle,
+        o.Title as OriginalTitle,
+        q.OwnerUserId as DuplicateUser,
+        o.OwnerUserId as OriginalUser,
+        pl.CreationDate as DuplicateLinkDate
+    from PostLinks pl
+    join Posts q on q.Id = pl.PostId and q.PostTypeId = 1
+    join Posts o on o.Id = pl.RelatedPostId and o.PostTypeId = 1
+    where pl.LinkTypeId = 3 -- Duplicates
+),
+AnswerAcceptanceStats as (
+    select
+        p.OwnerUserId,
+        count(p.Id) as TotalAnswers,
+        count(pa.Id) as AcceptedAnswers,
+        avg(coalesce(p.Score, 0)) as AvgAnswerScore,
+        avg(coalesce((select max(vote.Value) from (select 1 as Value) vote), 0)) as DummyColumn -- Complex aggregate with correlated subquery placeholder
+    from Posts p
+    left join Posts pa on pa.Id = p.AcceptedAnswerId and pa.OwnerUserId = p.OwnerUserId
+    where p.PostTypeId = 2
+    group by p.OwnerUserId
+),
+FinalResult as (
+    select
+        tu.Id as UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.QuestionsCount,
+        tu.AnswersCount,
+        tu.TotalPostScore,
+        tu.TotalComments,
+        tu.ReceivedUpVotes,
+        tu.ReceivedDownVotes,
+        coalesce(aa.AcceptedAnswers, 0) as AcceptedAnswers,
+        coalesce(tu.GoldBadges, 0) as GoldBadges,
+        coalesce(tu.SilverBadges, 0) as SilverBadges,
+        coalesce(tu.BronzeBadges, 0) as BronzeBadges,
+        string_agg(distinct concat_ws(' - ', dh.TagName, 'Lvl:', th.Level::text), '; ') as TagsAndLevels,
+        count(distinct dq.DuplicateQuestionId) as DuplicateQuestions,
+        min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as FirstCloseDate,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenDate
+    from TopUserActivity tu
+    left join AnswerAcceptanceStats aa on aa.OwnerUserId = tu.Id
+    left join LATERAL (
+        select distinct th.TagName, th.Level
+        from TagHierarchy th
+        join Posts p on p.OwnerUserId = tu.Id and p.Tags like concat('%', th.TagName, '%')
+        limit 5
+    ) dh on true
+    left join DuplicateQuestionsCTE dq on dq.DuplicateUser = tu.Id
+    left join PostHistory ph on ph.PostId in (
+        select p.Id from Posts p where p.OwnerUserId = tu.Id
+    )
+    group by tu.Id, tu.DisplayName, tu.Reputation, tu.QuestionsCount, tu.AnswersCount, tu.TotalPostScore,
+             tu.TotalComments, tu.ReceivedUpVotes, tu.ReceivedDownVotes, aa.AcceptedAnswers,
+             tu.GoldBadges, tu.SilverBadges, tu.BronzeBadges
+)
+select
+    UserId,
+    DisplayName,
+    Reputation,
+    QuestionsCount,
+    AnswersCount,
+    TotalPostScore,
+    TotalComments,
+    ReceivedUpVotes,
+    ReceivedDownVotes,
+    AcceptedAnswers,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    TagsAndLevels,
+    DuplicateQuestions,
+    FirstCloseDate,
+    LastReopenDate,
+    case
+        when Reputation > 50000 and GoldBadges >= 5 then 'Legendary'
+        when Reputation > 20000 and GoldBadges >= 2 then 'Expert'
+        when Reputation > 5000 then 'Intermediate'
+        else 'Beginner'
+    end as UserTier,
+    coalesce(AnswersCount::float / nullif(QuestionsCount,0),0) as AnswerToQuestionRatio,
+    coalesce(DuplicateQuestions::float / nullif(QuestionsCount,0),0) as DuplicateQuestionRatio
+from FinalResult
+order by Reputation desc, TotalPostScore desc
+limit 100;

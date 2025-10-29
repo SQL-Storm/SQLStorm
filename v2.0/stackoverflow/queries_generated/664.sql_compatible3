@@ -1,0 +1,304 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           coalesce(nullif(trim(u.location), ''), 'Unknown') as norm_location,
+           case when lower(coalesce(u.websiteurl, '')) like '%github%' then 1 else 0 end as has_github,
+           row_number() over (order by u.creationdate desc, u.id) as rn
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+top_recent_users as (
+    select *
+    from recent_users
+    where rn <= 500
+),
+user_posts as (
+    select p.id,
+           p.owneruserid as user_id,
+           p.posttypeid,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.answercount,
+           p.favoritecount,
+           p.commentcount,
+           p.closeddate,
+           p.acceptedanswerid,
+           p.parentid,
+           p.tags,
+           p.title,
+           p.lastactivitydate
+    from posts p
+    where p.owneruserid in (select user_id from top_recent_users)
+),
+question_tags as (
+    select p.id as post_id,
+           lower(trim(tg)) as tag
+    from user_posts p,
+         lateral (
+            select unnest(
+                case
+                    when p.posttypeid = 1 and p.tags is not null and length(p.tags) >= 2
+                         then string_to_array(substring(p.tags from 2 for length(p.tags)-2), '><')
+                    else array[]::text
+                end
+            ) as tg
+         ) ut
+),
+agg_user_metrics as (
+    select
+        up.user_id,
+        count(*) filter (where up.posttypeid = 1) as q_count,
+        count(*) filter (where up.posttypeid = 2) as a_count,
+        avg(nullif(up.score,0)) filter (where up.posttypeid = 1) as avg_q_score_nonzero,
+        avg(nullif(up.score,0)) filter (where up.posttypeid = 2) as avg_a_score_nonzero,
+        sum(greatest(up.score,0)) as sum_pos_scores,
+        sum(case when up.closeddate is null then 0 else 1 end) as closed_posts,
+        count(distinct case when up.posttypeid = 1 then up.id end) as distinct_questions,
+        count(distinct case when up.posttypeid = 2 then up.parentid end) as distinct_answered_questions,
+        max(up.lastactivitydate) as last_activity
+    from user_posts up
+    group by up.user_id
+),
+badge_classes as (
+    select b.userid as user_id,
+           sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+           sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+           sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+           sum(case when b.tagbased = true then 1 else 0 end) as tag_badges
+    from badges b
+    where b.userid in (select user_id from top_recent_users)
+    group by b.userid
+),
+vote_agg as (
+    select v.postid,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+           sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_flow
+    from votes v
+    where v.postid in (select id from user_posts)
+    group by v.postid
+),
+post_quality as (
+    select
+        p.id as post_id,
+        p.user_id,
+        p.posttypeid,
+        coalesce(va.upvotes,0) as upvotes,
+        coalesce(va.downvotes,0) as downvotes,
+        coalesce(va.favorites,0) as favorites,
+        coalesce(va.bounty_flow,0) as bounty_flow,
+        p.score,
+        p.viewcount,
+        case
+            when p.viewcount is null or p.viewcount = 0 then null
+            else round((cast(p.score as numeric) + coalesce(va.upvotes,0) - coalesce(va.downvotes,0)) / nullif(p.viewcount,0), 6)
+        end as engagement_ratio
+    from user_posts p
+    left join vote_agg va on va.postid = p.id
+),
+tag_pref as (
+    select qt.post_id, qt.tag
+    from question_tags qt
+),
+user_tag_stats as (
+    select up.user_id,
+           t.tag,
+           count(*) as tag_posts,
+           avg(pq.engagement_ratio) as avg_engagement_ratio
+    from user_posts up
+    join post_quality pq on pq.post_id = up.id
+    join tag_pref t on t.post_id = up.id
+    group by up.user_id, t.tag
+),
+top_tag_per_user as (
+    select uts.user_id,
+           (array_agg(uts.tag order by uts.tag_posts desc, uts.avg_engagement_ratio desc, uts.tag asc))[1] as top_tag,
+           max(uts.tag_posts) as top_tag_posts
+    from user_tag_stats uts
+    group by uts.user_id
+),
+history_events as (
+    select ph.postid,
+           count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+           count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20)) as mod_events,
+           count(*) filter (where ph.posthistorytypeid in (35,36,37,38)) as migration_events,
+           min(ph.creationdate) as first_event_at,
+           max(ph.creationdate) as last_event_at
+    from posthistory ph
+    where ph.postid in (select id from user_posts)
+    group by ph.postid
+),
+link_rel as (
+    select pl.postid,
+           sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_refs,
+           sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_refs
+    from postlinks pl
+    where pl.postid in (select id from user_posts)
+    group by pl.postid
+),
+post_rollup as (
+    select
+        pq.user_id,
+        count(*) as posts_total,
+        count(*) filter (where pq.posttypeid = 1) as questions_total,
+        count(*) filter (where pq.posttypeid = 2) as answers_total,
+        avg(pq.engagement_ratio) as avg_engagement_ratio,
+        sum(coalesce(hr.edit_events,0)) as total_edits,
+        sum(coalesce(hr.mod_events,0)) as total_mod_events,
+        sum(coalesce(hr.migration_events,0)) as total_migrations,
+        sum(coalesce(lr.linked_refs,0)) as total_linked_refs,
+        sum(coalesce(lr.duplicate_refs,0)) as total_duplicate_refs
+    from post_quality pq
+    left join history_events hr on hr.postid = pq.post_id
+    left join link_rel lr on lr.postid = pq.post_id
+    group by pq.user_id
+),
+scored_users as (
+    select
+        tru.user_id,
+        tru.displayname,
+        tru.norm_location,
+        tru.has_github,
+        tru.reputation,
+        coalesce(au.q_count,0) as q_count,
+        coalesce(au.a_count,0) as a_count,
+        coalesce(au.avg_q_score_nonzero, 0) as avg_q_score_nonzero,
+        coalesce(au.avg_a_score_nonzero, 0) as avg_a_score_nonzero,
+        coalesce(au.sum_pos_scores,0) as sum_pos_scores,
+        coalesce(au.closed_posts,0) as closed_posts,
+        coalesce(au.distinct_questions,0) as distinct_questions,
+        coalesce(au.distinct_answered_questions,0) as distinct_answered_questions,
+        au.last_activity,
+        coalesce(bc.gold_badges,0) as gold_badges,
+        coalesce(bc.silver_badges,0) as silver_badges,
+        coalesce(bc.bronze_badges,0) as bronze_badges,
+        coalesce(bc.tag_badges,0) as tag_badges,
+        coalesce(pr.posts_total,0) as posts_total,
+        coalesce(pr.questions_total,0) as questions_total,
+        coalesce(pr.answers_total,0) as answers_total,
+        coalesce(pr.avg_engagement_ratio,0) as avg_engagement_ratio,
+        coalesce(pr.total_edits,0) as total_edits,
+        coalesce(pr.total_mod_events,0) as total_mod_events,
+        coalesce(pr.total_migrations,0) as total_migrations,
+        coalesce(pr.total_linked_refs,0) as total_linked_refs,
+        coalesce(pr.total_duplicate_refs,0) as total_duplicate_refs,
+        ttu.top_tag,
+        ttu.top_tag_posts,
+        dense_rank() over (order by coalesce(pr.avg_engagement_ratio,0) desc, coalesce(au.sum_pos_scores,0) desc, tru.reputation desc) as perf_rank,
+        ntile(10) over (order by coalesce(pr.avg_engagement_ratio,0) desc) as eng_ntile,
+        percent_rank() over (order by coalesce(au.a_count,0) desc) as ans_prank
+    from top_recent_users tru
+    left join agg_user_metrics au on au.user_id = tru.user_id
+    left join badge_classes bc on bc.user_id = tru.user_id
+    left join post_rollup pr on pr.user_id = tru.user_id
+    left join top_tag_per_user ttu on ttu.user_id = tru.user_id
+),
+final_scores as (
+    select
+        su.*,
+        (
+            0.35 * coalesce(nullif(su.avg_engagement_ratio,0), 0.0001) +
+            0.25 * ln(1 + greatest(su.sum_pos_scores,0)) +
+            0.15 * ln(1 + su.answers_total) +
+            0.10 * ln(1 + su.questions_total) +
+            0.05 * least(su.gold_badges * 3 + su.silver_badges * 1.5 + su.bronze_badges * 0.5, 50) +
+            0.10 * case when su.has_github = 1 then 1 else 0 end
+        ) as composite_score,
+        case
+            when su.total_duplicate_refs > 0 then 'HasDuplicates'
+            when su.closed_posts > 3 then 'OftenClosed'
+            when su.eng_ntile <= 2 then 'HighEngagement'
+            else 'Normal'
+        end as behavior_flag
+    from scored_users su
+),
+peer_groups as (
+    select fs.user_id, fs.displayname, fs.top_tag, fs.norm_location, fs.composite_score
+    from final_scores fs
+    where fs.top_tag is not null
+    intersect
+    select fs2.user_id, fs2.displayname, fs2.top_tag, fs2.norm_location, fs2.composite_score
+    from final_scores fs2
+    where fs2.norm_location in (
+        select norm_location
+        from final_scores
+        group by norm_location
+        having count(*) >= 3
+    )
+),
+best_post as (
+    select up.user_id,
+           (
+               select p2.title
+               from posts p2
+               left join votes v2 on v2.postid = p2.id
+               where p2.owneruserid = up.user_id
+               group by p2.id, p2.title, p2.viewcount, p2.score
+               order by (coalesce(p2.score,0) + (
+                          select count(*) from votes vv where vv.postid = p2.id and vv.votetypeid = 2
+                         )) desc nulls last,
+                        p2.viewcount desc nulls last
+               limit 1
+           ) as best_title
+    from user_posts up
+    group by up.user_id
+),
+peer_ranking as (
+    select
+        fs.user_id,
+        fs.displayname,
+        fs.reputation,
+        fs.norm_location,
+        coalesce(fs.top_tag, 'untagged') as top_tag,
+        fs.posts_total,
+        fs.questions_total,
+        fs.answers_total,
+        fs.avg_engagement_ratio,
+        fs.gold_badges, fs.silver_badges, fs.bronze_badges,
+        fs.total_edits, fs.total_mod_events, fs.total_linked_refs, fs.total_duplicate_refs,
+        fs.perf_rank, fs.eng_ntile, fs.ans_prank,
+        fs.composite_score,
+        fs.behavior_flag,
+        bp.best_title,
+        (fs.composite_score - avg(fs.composite_score) over (partition by coalesce(fs.top_tag,'untagged'), fs.norm_location))
+        / nullif(stddev_samp(fs.composite_score) over (partition by coalesce(fs.top_tag,'untagged'), fs.norm_location), 0) as peer_zscore,
+        row_number() over (partition by fs.norm_location order by fs.composite_score desc, fs.perf_rank, fs.user_id) as loc_rownum
+    from final_scores fs
+    left join best_post bp on bp.user_id = fs.user_id
+)
+select
+    pr.user_id,
+    pr.displayname,
+    pr.reputation,
+    pr.norm_location,
+    pr.top_tag,
+    pr.posts_total,
+    pr.questions_total,
+    pr.answers_total,
+    round(cast(pr.avg_engagement_ratio as numeric), 6) as avg_engagement_ratio,
+    pr.gold_badges, pr.silver_badges, pr.bronze_badges,
+    pr.total_edits, pr.total_mod_events, pr.total_linked_refs, pr.total_duplicate_refs,
+    pr.perf_rank,
+    pr.eng_ntile,
+    round(cast(pr.ans_prank as numeric), 4) as ans_percentile,
+    round(cast(pr.composite_score as numeric), 6) as composite_score,
+    round(cast(coalesce(pr.peer_zscore, 0) as numeric), 6) as peer_zscore,
+    pr.behavior_flag,
+    coalesce(substr(pr.best_title, 1, 120), '(no title)') as best_title_snippet
+from peer_ranking pr
+where (
+    pr.behavior_flag <> 'OftenClosed'
+    or pr.gold_badges >= 1
+)
+and (
+    pr.top_tag is null
+    or pr.top_tag not in (
+        select tagname from tags where (case when ismoderatoronly is true then 1 else 0 end) = 1 or (case when isrequired is true then 1 else 0 end) = 1
+    )
+)
+and pr.loc_rownum <= 50
+order by pr.composite_score desc, pr.perf_rank, pr.user_id;

@@ -1,0 +1,203 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score END) AS AvgAnswerScore,
+        MAX(P.CreationDate) AS LatestPostDate,
+        MIN(P.CreationDate) AS EarliestPostDate,
+        CAST(FLOOR(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - U.CreationDate)) / (60 * 60 * 24)) AS integer) AS AccountAgeDays
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostLifeCycle AS (
+    SELECT
+        P.Id AS PostId,
+        COUNT(DISTINCT PH_Edit.Id) AS TotalEditEvents,
+        MAX(CASE WHEN PH_Edit.PostHistoryTypeId IN (4,5,6) THEN PH_Edit.CreationDate ELSE NULL END) AS LastActualEditDate,
+        MIN(PH_Edit.CreationDate) AS FirstEditDate,
+        COUNT(DISTINCT PH_Close.Id) AS CloseVoteEvents,
+        MAX(PH_Close.CreationDate) AS LastCloseVoteDate,
+        MAX(CASE WHEN PH_Close.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) = 1 AS WasClosed,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+        SUM(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswersReceived,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS LegacyFavoritesCount
+    FROM Posts P
+    LEFT JOIN PostHistory PH_Edit ON P.Id = PH_Edit.PostId AND PH_Edit.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 24)
+    LEFT JOIN PostHistory PH_Close ON P.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId IN (10, 11)
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    GROUP BY P.Id
+),
+PopularTags AS (
+    SELECT
+        TRIM(tag) AS TagName,
+        COUNT(P.Id) AS QuestionCount,
+        AVG(P.Score) AS AvgQuestionScoreByTag,
+        MAX(P.ViewCount) AS MaxViewCountForTag,
+        MIN(P.CreationDate) AS FirstQuestionDateForTag
+    FROM Posts P,
+         unnest(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS tag
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY TRIM(tag)
+    HAVING COUNT(P.Id) > 100 AND AVG(P.Score) > 0
+),
+TopPopularTags AS (
+    SELECT
+        TagName,
+        QuestionCount,
+        AvgQuestionScoreByTag,
+        DENSE_RANK() OVER (ORDER BY QuestionCount DESC, AvgQuestionScoreByTag DESC) AS TagRank
+    FROM PopularTags
+    WHERE TagName IS NOT NULL AND LENGTH(TagName) > 0
+),
+ModeratorActivitySummary AS (
+    SELECT DISTINCT
+        PH.UserId
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (10, 11, 14, 15, 19, 20, 33, 34)
+      AND PH.UserId IS NOT NULL
+)
+SELECT
+    P.Id AS PostId,
+    P.PostTypeId,
+    PT.Name AS PostTypeName,
+    P.Title,
+    P.CreationDate AS PostCreationDate,
+    P.Score AS PostScore,
+    P.ViewCount,
+    P.AnswerCount,
+    P.CommentCount AS OriginalCommentCount,
+    P.FavoriteCount AS CurrentFavoriteCount,
+    P.LastActivityDate,
+    P.ClosedDate,
+    P.CommunityOwnedDate,
+    P.ContentLicense,
+    U.Id AS OwnerUserId,
+    U.DisplayName AS OwnerDisplayName,
+    U.Reputation AS OwnerReputation,
+    UE.TotalPostsCreated AS OwnerTotalPosts,
+    UE.TotalCommentsMade AS OwnerTotalCommentsMade,
+    UE.GoldBadges AS OwnerGoldBadges,
+    UE.SilverBadges AS OwnerSilverBadges,
+    UE.AvgQuestionScore AS OwnerAvgQuestionScore,
+    COALESCE(U.Location, 'Unspecified Location') AS OwnerLocation,
+    NULLIF(U.WebsiteUrl, '') AS OwnerWebsiteUrl,
+    UE.AccountAgeDays,
+    (U.AboutMe IS NOT NULL) AS HasAboutMeDescription,
+    PL.TotalEditEvents,
+    PL.LastActualEditDate,
+    PL.WasClosed,
+    PL.TotalUpVotes,
+    PL.TotalDownVotes,
+    PL.AcceptedAnswersReceived,
+    PL.LegacyFavoritesCount,
+    CAST(EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) / 3600.0 AS numeric(10,2)) AS HoursSinceCreationToLastActivity,
+    (P.ClosedDate - P.CreationDate) AS TimeToClose,
+    P.LastEditorUserId,
+    COALESCE((SELECT LEU.Reputation FROM Users LEU WHERE LEU.Id = P.LastEditorUserId), 0) AS LastEditorReputation,
+    (
+        SELECT COUNT(DISTINCT C_corr.UserId)
+        FROM Comments C_corr
+        WHERE C_corr.PostId = P.Id
+          AND C_corr.CreationDate > COALESCE(PL.LastActualEditDate, P.CreationDate)
+          AND C_corr.UserId IS NOT NULL
+          AND C_corr.UserId <> P.OwnerUserId
+    ) AS DistinctCommentersAfterLastEdit,
+    P.Tags,
+    REPLACE(TRIM(BOTH '<>' FROM P.Tags), '><', ', ') AS FormattedTags,
+    TPT.TagName AS PrimaryAssociatedTagName,
+    TPT.QuestionCount AS PrimaryTagQuestionCount,
+    TPT.AvgQuestionScoreByTag AS PrimaryTagAvgScore,
+    TPT.TagRank,
+    LENGTH(P.Body) AS BodyLength,
+    LENGTH(COALESCE(P.Title, '')) AS TitleLength,
+    CASE WHEN P.Body ILIKE '%sql%' OR P.Title ILIKE '%sql%' OR P.Tags ILIKE '%<sql>%' THEN TRUE ELSE FALSE END AS ContainsSQLKeyword,
+    CASE
+        WHEN P.ViewCount > 50000 AND P.AnswerCount > 10 AND P.FavoriteCount > 50 AND PL.TotalEditEvents > 2 THEN 'Viral_HighlyEngaged'
+        WHEN P.ViewCount > 10000 AND P.AnswerCount > 3 AND P.Score > 10 THEN 'Popular_Active'
+        WHEN P.ClosedDate IS NOT NULL AND PL.TotalEditEvents > 0 THEN 'Closed_Edited'
+        WHEN P.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+        ELSE 'Standard'
+    END AS PostEngagementCategory,
+    ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS PostRankInType,
+    AVG(P.Score) OVER (PARTITION BY U.Id ORDER BY P.CreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS OwnerAvgScorePrev2Posts,
+    LAG(P.Score, 1, 0) OVER (PARTITION BY U.Id ORDER BY P.CreationDate) AS OwnerPrevPostScore,
+    (LEAD(P.ViewCount, 1, P.ViewCount) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) - P.ViewCount) AS ViewCountDeltaToNextPostByOwner,
+    NTILE(10) OVER (ORDER BY P.ViewCount DESC, P.CreationDate) AS ViewCountDecile,
+    COUNT(C.Id) OVER (PARTITION BY P.Id) AS CurrentTotalComments,
+    SUM(C.Score) OVER (PARTITION BY P.Id) AS TotalCommentScore,
+    COALESCE(P.AcceptedAnswerId, -1) AS AcceptedAnswerIdOrDefault,
+    (U.AccountId IS NOT NULL) AS HasAssociatedAccountId,
+    (P.ClosedDate IS NOT NULL AND P.CommunityOwnedDate IS NOT NULL) AS ClosedAndCommunityOwned,
+    NULLIF(P.AnswerCount, 0) AS NonZeroAnswerCount,
+    CASE
+        WHEN P.PostTypeId = 1 AND (P.LastActivityDate - P.CreationDate) > INTERVAL '30 days' AND P.AnswerCount = 0 THEN 'StaleQuestion'
+        WHEN U.Location IS NULL OR U.Location = '' THEN 'UnlocalizedUser'
+        WHEN P.Title IS NULL THEN 'MissingTitle'
+        ELSE 'Normal'
+    END AS DiagnosticFlag,
+    (
+        SELECT
+            CASE WHEN EXISTS (
+                SELECT 1
+                FROM PostHistory ph_debated
+                WHERE ph_debated.PostId = P.Id
+                  AND ph_debated.PostHistoryTypeId IN (4,5,6)
+                GROUP BY ph_debated.PostId
+                HAVING COUNT(ph_debated.Id) > 5
+            ) AND EXISTS (
+                SELECT 1
+                FROM Comments c_debated
+                WHERE c_debated.PostId = P.Id
+                GROUP BY c_debated.PostId
+                HAVING COUNT(DISTINCT c_debated.UserId) > 3
+            ) THEN TRUE ELSE FALSE END
+    ) AS IsHighlyDebated,
+    MAS.UserId IS NOT NULL AS OwnerHasModeratorActivityHistory,
+    PLK.RelatedPostId AS LinkedPostId,
+    PLK.LinkTypeId AS LinkedPostType,
+    LKT.Name AS LinkedPostTypeName
+FROM Posts P
+INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+INNER JOIN Users U ON P.OwnerUserId = U.Id
+LEFT JOIN UserEngagement UE ON U.Id = UE.UserId
+LEFT JOIN PostLifeCycle PL ON P.Id = PL.PostId
+LEFT JOIN TopPopularTags TPT ON P.Tags ILIKE '%' || TPT.TagName || '%' AND TPT.TagRank <= 5
+LEFT JOIN ModeratorActivitySummary MAS ON P.OwnerUserId = MAS.UserId
+LEFT JOIN PostLinks PLK ON P.Id = PLK.PostId AND PLK.LinkTypeId = 1
+LEFT JOIN LinkTypes LKT ON PLK.LinkTypeId = LKT.Id
+LEFT JOIN Comments C ON P.Id = C.PostId
+WHERE
+    P.CreationDate >= DATE '2021-01-01'
+    AND P.ViewCount IS NOT NULL AND P.ViewCount > 0
+    AND U.Reputation > 500
+    AND P.PostTypeId IN (1, 2)
+    AND (
+        P.Score > 0 OR
+        (P.AnswerCount IS NOT NULL AND P.AnswerCount > 0 AND P.AcceptedAnswerId IS NOT NULL) OR
+        (COALESCE(PL.TotalEditEvents, 0) > 1 AND PL.LastActualEditDate IS NOT NULL AND P.LastEditorUserId IS NOT NULL)
+    )
+    AND (U.Location IS NOT NULL AND U.Location <> '')
+GROUP BY
+    P.Id, P.PostTypeId, PT.Name, P.Title, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.LastActivityDate, P.ClosedDate, P.CommunityOwnedDate, P.ContentLicense,
+    U.Id, U.DisplayName, U.Reputation, U.Location, U.WebsiteUrl, U.CreationDate, U.AboutMe, P.LastEditorUserId,
+    UE.TotalPostsCreated, UE.TotalCommentsMade, UE.GoldBadges, UE.SilverBadges, UE.AvgQuestionScore, UE.AccountAgeDays,
+    PL.TotalEditEvents, PL.LastActualEditDate, PL.WasClosed, PL.TotalUpVotes, PL.TotalDownVotes, PL.AcceptedAnswersReceived, PL.LegacyFavoritesCount,
+    TPT.TagName, TPT.QuestionCount, TPT.AvgQuestionScoreByTag, TPT.TagRank, MAS.UserId,
+    PLK.RelatedPostId, PLK.LinkTypeId, LKT.Name, P.Tags, P.Body, P.AcceptedAnswerId, U.AccountId
+HAVING COUNT(C.Id) > 0
+ORDER BY
+    P.LastActivityDate DESC,
+    PostRankInType ASC,
+    P.Score DESC
+LIMIT 1000;

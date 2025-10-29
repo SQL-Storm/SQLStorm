@@ -1,0 +1,216 @@
+-- {"query": "1748.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2886} 
+
+WITH UserExpertise AS (
+    -- CTE 1: Identify "expert" users with high reputation and at least one Gold badge,
+    -- and calculate an arbitrary "ExpertScore" based on their profile metrics.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes,
+        U.Views AS UserViews,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge, -- Gold (Class 1)
+        COUNT(B.Id) AS TotalBadges,
+        -- Complex calculation for ExpertScore, casting to numeric for precision
+        (CAST(U.Reputation AS numeric) * 0.1) + (CAST(U.UpVotes AS numeric) * 0.5) + (CAST(U.Views AS numeric) * 0.01) AS ExpertScore
+    FROM
+        Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.Views
+    HAVING
+        U.Reputation > 10000 -- Filter for high-reputation users
+        AND MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) = 1 -- Must have at least one Gold badge
+),
+QuestionHistoryAnalysis AS (
+    -- CTE 2: Analyze post history for questions to count edits, close/reopen events, and determine last close reason.
+    SELECT
+        PH.PostId,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edits
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS ClosedHistoryCount, -- Post Closed
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenedHistoryCount, -- Post Reopened
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        MAX(PH.CreationDate) AS LastHistoryDate,
+        -- Correlated subquery to fetch the name of the most recent close reason
+        (SELECT
+            CR.Name
+         FROM
+            PostHistory PH_Close_Inner
+         INNER JOIN CloseReasonTypes CR ON CR.Id = CAST(PH_Close_Inner.Comment AS int)
+         WHERE
+            PH_Close_Inner.PostId = PH.PostId
+            AND PH_Close_Inner.PostHistoryTypeId = 10 -- Only consider close history entries
+         ORDER BY
+            PH_Close_Inner.CreationDate DESC
+         LIMIT 1
+        ) AS LastCloseReason
+    FROM
+        PostHistory PH
+    GROUP BY
+        PH.PostId
+    HAVING
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) >= 3 -- At least 3 edits
+        AND SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) >= 1 -- Was closed at least once
+        AND SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) >= 1 -- Was reopened at least once
+),
+QuestionStats AS (
+    -- CTE 3: Aggregate main statistics for qualifying questions, including derived metrics and NULL logic.
+    SELECT
+        P.Id AS QuestionId,
+        P.Title,
+        P.CreationDate AS QuestionCreationDate,
+        P.LastActivityDate,
+        P.Score AS QuestionScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS QuestionCommentCount,
+        P.OwnerUserId,
+        P.AcceptedAnswerId,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.Tags,
+        -- Count approximate number of code blocks using string manipulation and NULLIF for division by zero safety
+        COALESCE(LENGTH(P.Body) - LENGTH(REPLACE(P.Body, '<code>', '')), 0) / NULLIF(LENGTH('<code>'), 0) AS CodeBlockCount,
+        COALESCE(LENGTH(P.Title), 0) AS TitleLength,
+        -- Complex CASE expression for question status with NULL logic
+        CASE
+            WHEN P.ClosedDate IS NOT NULL AND P.AcceptedAnswerId IS NULL THEN 'Closed_NoAccepted'
+            WHEN P.ClosedDate IS NOT NULL AND P.AcceptedAnswerId IS NOT NULL THEN 'Closed_Accepted'
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 'Open_Accepted'
+            ELSE 'Open_NoAccepted'
+        END AS QuestionStatus,
+        QHA.EditCount,
+        QHA.ClosedHistoryCount,
+        QHA.ReopenedHistoryCount,
+        QHA.UniqueEditors,
+        QHA.LastHistoryDate,
+        QHA.LastCloseReason
+    FROM
+        Posts P
+    INNER JOIN QuestionHistoryAnalysis QHA ON P.Id = QHA.PostId
+    WHERE
+        P.PostTypeId = 1 -- Only questions
+        AND P.ViewCount > 5000 AND P.Score > 100 -- High view and score questions
+),
+TagExplosion AS (
+    -- CTE 4: Unnest tags from the 'Tags' string column into individual rows.
+    SELECT
+        QS.QuestionId,
+        LOWER(TRIM(tag_val)) AS TagName -- Normalize tags to lowercase and trim whitespace
+    FROM
+        QuestionStats QS,
+        -- Use string_to_array and UNNEST for tag parsing as per schema hint
+        UNNEST(string_to_array(SUBSTRING(QS.Tags, 2, LENGTH(QS.Tags) - 2), '><')) AS tag_val
+    WHERE QS.Tags IS NOT NULL
+),
+TopAnswersPerQuestion AS (
+    -- CTE 5: Determine the highest-scoring answer for each question and gather its metrics.
+    SELECT
+        P_A.Id AS AnswerId,
+        P_A.ParentId AS QuestionId,
+        P_A.Score AS AnswerScore,
+        P_A.CreationDate AS AnswerCreationDate,
+        P_A.OwnerUserId AS AnswerOwnerUserId,
+        P_A.CommentCount AS AnswerCommentCount,
+        P_A.Body AS AnswerBody,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount, -- UpMod
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount, -- DownMod
+        COUNT(C.Id) AS TotalComments,
+        -- Weighted composite score for answer ranking
+        (CAST(P_A.Score AS numeric) * 0.7) + (CAST(COUNT(C.Id) AS numeric) * 0.3) AS AnswerRankScore,
+        -- Window function to rank answers by score within each question
+        ROW_NUMBER() OVER (PARTITION BY P_A.ParentId ORDER BY P_A.Score DESC, P_A.CreationDate ASC) AS rn
+    FROM
+        Posts P_A
+    LEFT JOIN Votes V ON P_A.Id = V.PostId AND V.VoteTypeId IN (2, 3)
+    LEFT JOIN Comments C ON P_A.Id = C.PostId
+    WHERE
+        P_A.PostTypeId = 2 -- Only answers
+    GROUP BY
+        P_A.Id, P_A.ParentId, P_A.Score, P_A.CreationDate, P_A.OwnerUserId, P_A.CommentCount, P_A.Body
+),
+TopAnswerCommentStats AS (
+    -- CTE 6: Aggregate statistics for comments on the top answer of each question.
+    SELECT
+        TAQ.QuestionId,
+        TAQ.AnswerId,
+        AVG(COALESCE(C.Score, 0)) AS AvgCommentScore,
+        MAX(C.CreationDate) AS LatestCommentDate,
+        COUNT(DISTINCT C.UserId) AS UniqueCommentersOnAnswer,
+        -- String pattern matching for "positive" comments
+        SUM(CASE WHEN C.Text LIKE '%thank%' OR C.Text LIKE '%good answer%' THEN 1 ELSE 0 END) AS PositiveCommentCount
+    FROM
+        TopAnswersPerQuestion TAQ
+    INNER JOIN Comments C ON TAQ.AnswerId = C.PostId
+    WHERE TAQ.rn = 1 -- Only consider the top-ranked answer
+    GROUP BY
+        TAQ.QuestionId, TAQ.AnswerId
+),
+QuestionLinkAnalysis AS (
+    -- CTE 7: Analyze linked and duplicate posts for each question.
+    SELECT
+        PL.PostId AS QuestionId,
+        COUNT(DISTINCT PL.RelatedPostId) AS LinkedQuestionsCount,
+        MAX(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS HasDuplicateLink, -- Duplicate link type
+        MAX(PL.CreationDate) AS LastLinkDate
+    FROM
+        PostLinks PL
+    WHERE
+        PL.LinkTypeId IN (1, 3) -- Linked or Duplicate
+    GROUP BY
+        PL.PostId
+)
+-- Main Query: Combine all CTEs and tables to produce a comprehensive report
+SELECT
+    QS.QuestionId,
+    QS.Title,
+    UE_Q.DisplayName AS QuestionOwnerDisplayName,
+    UE_Q.Reputation AS QuestionOwnerReputation,
+    UE_Q.ExpertScore AS QuestionOwnerExpertScore,
+    QS.QuestionCreationDate,
+    QS.QuestionScore,
+    QS.ViewCount,
+    QS.AnswerCount,
+    QS.EditCount,
+    QS.ClosedHistoryCount,
+    QS.ReopenedHistoryCount,
+    QS.QuestionStatus,
+    QS.LastCloseReason,
+    QS.CodeBlockCount,
+    QS.TitleLength,
+    TAQ.AnswerId AS BestAnswerId,
+    AnswerOwner.DisplayName AS BestAnswerOwnerDisplayName,
+    AnswerOwner.Reputation AS BestAnswerOwnerReputation,
+    TAQ.AnswerScore AS BestAnswerScore,
+    TAQ.AnswerRankScore AS BestAnswerCombinedScore,
+    TAQ.UpVoteCount AS BestAnswerUpVotes,
+    TAQ.DownVoteCount AS BestAnswerDownVotes,
+    TAC.AvgCommentScore AS BestAnswerAvgCommentScore,
+    TAC.PositiveCommentCount AS BestAnswerPositiveComments,
+    QLA.LinkedQuestionsCount,
+    QLA.HasDuplicateLink,
+    -- Aggregate tags back into a comma-separated string
+    STRING_AGG(TE.TagName, ', ' ORDER BY TE.TagName) AS TagsList,
+    -- Window function: Average score of all questions posted by the current question's expert owner
+    AVG(P_Sibling.Score) OVER (PARTITION BY UE_Q.UserId) AS AvgScoreByQuestionOwner,
+    -- Window function: Assign each question to a quintile based on its score
+    NTILE(5) OVER (ORDER BY QS.QuestionScore DESC) AS QuestionScoreQuintile
+FROM
+    QuestionStats QS
+INNER JOIN UserExpertise UE_Q ON QS.OwnerUserId = UE_Q.UserId -- Join with expert question owners
+LEFT JOIN TopAnswersPerQuestion TAQ ON QS.QuestionId = TAQ.QuestionId AND TAQ.rn = 1 -- Get the top answer
+LEFT JOIN Users AnswerOwner ON TAQ.AnswerOwnerUserId = AnswerOwner.Id -- Get details for the top answer's owner
+LEFT JOIN TopAnswerCommentStats TAC ON TAQ.AnswerId = TAC.AnswerId
+LEFT JOIN QuestionLinkAnalysis QLA ON QS.QuestionId = QLA.QuestionId
+LEFT JOIN TagExplosion TE ON QS.QuestionId = TE.QuestionId
+LEFT JOIN Posts P_Sibling ON UE_Q.UserId = P_Sibling.OwnerUserId AND P_Sibling.PostTypeId = 1 -- For the window function calculation
+GROUP BY
+    QS.QuestionId, QS.Title, UE_Q.DisplayName, UE_Q.Reputation, UE_Q.ExpertScore, QS.QuestionCreationDate,
+    QS.QuestionScore, QS.ViewCount, QS.AnswerCount, QS.EditCount, QS.ClosedHistoryCount,
+    QS.ReopenedHistoryCount, QS.QuestionStatus, QS.LastCloseReason, QS.CodeBlockCount, QS.TitleLength,
+    TAQ.AnswerId, AnswerOwner.DisplayName, AnswerOwner.Reputation, TAQ.AnswerScore, TAQ.AnswerRankScore,
+    TAQ.UpVoteCount, TAQ.DownVoteCount, TAC.AvgCommentScore, TAC.PositiveCommentCount,
+    QLA.LinkedQuestionsCount, QLA.HasDuplicateLink, UE_Q.UserId -- UE_Q.UserId needed for Partition By
+ORDER BY
+    QS.QuestionScore DESC, QS.LastActivityDate DESC
+LIMIT 1000;

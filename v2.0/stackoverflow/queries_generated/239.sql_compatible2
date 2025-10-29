@@ -1,0 +1,424 @@
+WITH recent_users AS (
+  SELECT
+    u.id AS user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    COALESCE(NULLIF(TRIM(u.websiteurl), ''), 'unknown') AS websiteurl_norm,
+    date_trunc('month', u.creationdate) AS cohort_month
+  FROM users u
+  WHERE u.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+),
+q_posts AS (
+  SELECT
+    p.id AS question_id,
+    p.creationdate,
+    p.owneruserid,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    p.tags,
+    p.title,
+    p.acceptedanswerid,
+    CASE WHEN p.closeddate IS NULL THEN 0 ELSE 1 END AS is_closed
+  FROM posts p
+  WHERE p.posttypeid = 1
+),
+a_posts AS (
+  SELECT
+    p.id AS answer_id,
+    p.parentid AS question_id,
+    p.owneruserid,
+    p.score AS answer_score,
+    p.creationdate AS answer_creationdate
+  FROM posts p
+  WHERE p.posttypeid = 2
+),
+edits AS (
+  SELECT
+    ph.postid,
+    MIN(CASE WHEN ph.posthistorytypeid IN (4,5,6) THEN ph.creationdate END) AS first_edit_date,
+    SUM(CASE WHEN ph.posthistorytypeid IN (4,5,6) THEN 1 ELSE 0 END) AS edit_count,
+    MAX(CASE WHEN ph.posthistorytypeid = 10 THEN ph.creationdate END) AS last_closed_vote,
+    SUM(CASE WHEN ph.posthistorytypeid = 10 THEN 1 ELSE 0 END) AS close_votes
+  FROM posthistory ph
+  GROUP BY ph.postid
+),
+votes_agg AS (
+  SELECT
+    v.postid,
+    SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS upvotes,
+    SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) AS downvotes,
+    SUM(CASE WHEN v.votetypeid IN (8,9) THEN COALESCE(v.bountyamount,0) ELSE 0 END) AS bounty_total,
+    MIN(CASE WHEN v.votetypeid = 2 THEN v.creationdate END) AS first_upvote_at,
+    MAX(CASE WHEN v.votetypeid = 2 THEN v.creationdate END) AS last_upvote_at
+  FROM votes v
+  GROUP BY v.postid
+),
+comments_agg AS (
+  SELECT
+    c.postid,
+    COUNT(*) AS comment_count,
+    MAX(c.score) AS max_comment_score,
+    MAX(c.creationdate) AS last_comment_at
+  FROM comments c
+  GROUP BY c.postid
+),
+dup_links AS (
+  SELECT
+    pl.postid AS duplicate_id,
+    pl.relatedpostid AS original_id,
+    pl.creationdate AS dup_link_date
+  FROM postlinks pl
+  WHERE pl.linktypeid = 3
+),
+linked_pairs AS (
+  SELECT
+    pl.postid,
+    pl.relatedpostid,
+    pl.creationdate,
+    pl.linktypeid
+  FROM postlinks pl
+  WHERE pl.linktypeid IN (1,3)
+),
+tags_expanded AS (
+  SELECT
+    qp.question_id,
+    unnest(string_to_array(substring(qp.tags FROM 2 FOR char_length(qp.tags)-2), '><')) AS tag
+  FROM q_posts qp
+  WHERE qp.tags IS NOT NULL AND char_length(qp.tags) >= 2
+),
+tag_density AS (
+  SELECT
+    te.tag,
+    COUNT(*) AS tag_q_count,
+    NULL AS approx_global
+  FROM tags_expanded te
+  GROUP BY te.tag
+),
+answer_ranks AS (
+  SELECT
+    ap.question_id,
+    ap.answer_id,
+    ap.owneruserid,
+    ap.answer_score,
+    ap.answer_creationdate,
+    rank() OVER (PARTITION BY ap.question_id ORDER BY ap.answer_score DESC NULLS LAST, ap.answer_creationdate ASC) AS score_rank,
+    row_number() OVER (PARTITION BY ap.question_id ORDER BY ap.answer_creationdate ASC) AS time_rank
+  FROM a_posts ap
+),
+first_response AS (
+  SELECT
+    ar.question_id,
+    ar.answer_id AS first_answer_id,
+    ar.owneruserid AS first_answerer_id,
+    ar.answer_creationdate AS first_answer_date,
+    ar.answer_score AS first_answer_score
+  FROM (
+    SELECT *,
+      ROW_NUMBER() OVER (PARTITION BY question_id ORDER BY time_rank) rn
+    FROM answer_ranks
+  ) ar
+  WHERE ar.rn = 1
+),
+accepted_vs_rank AS (
+  SELECT
+    qp.question_id,
+    CASE WHEN qp.acceptedanswerid IS NOT NULL THEN 1 ELSE 0 END AS has_accepted,
+    ar.score_rank AS accepted_score_rank,
+    ar.time_rank AS accepted_time_rank
+  FROM q_posts qp
+  LEFT JOIN answer_ranks ar
+    ON qp.acceptedanswerid = ar.answer_id
+),
+user_activity AS (
+  SELECT
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.cohort_month,
+    COUNT(DISTINCT qp.question_id) AS questions_asked,
+    COUNT(DISTINCT ap.answer_id) AS answers_given,
+    SUM(COALESCE(va.upvotes,0)) AS total_post_upvotes,
+    SUM(COALESCE(va.downvotes,0)) AS total_post_downvotes
+  FROM recent_users ru
+  LEFT JOIN q_posts qp ON qp.owneruserid = ru.user_id
+  LEFT JOIN a_posts ap ON ap.owneruserid = ru.user_id
+  LEFT JOIN votes_agg va ON va.postid IN (
+    SELECT p.id FROM posts p WHERE p.owneruserid = ru.user_id
+  )
+  GROUP BY ru.user_id, ru.displayname, ru.reputation, ru.cohort_month
+),
+question_quality AS (
+  SELECT
+    qp.question_id,
+    qp.owneruserid,
+    qp.creationdate,
+    qp.score,
+    qp.viewcount,
+    qp.answercount,
+    qp.favoritecount,
+    qp.is_closed,
+    COALESCE(va.upvotes,0) AS q_upvotes,
+    COALESCE(va.downvotes,0) AS q_downvotes,
+    COALESCE(va.bounty_total,0) AS q_bounty,
+    COALESCE(ca.comment_count,0) AS q_comment_count,
+    ed.edit_count,
+    ed.first_edit_date,
+    ed.close_votes,
+    fp.first_answer_date,
+    EXTRACT(EPOCH FROM (fp.first_answer_date - qp.creationdate)) AS seconds_to_first_answer,
+    CASE
+      WHEN qp.viewcount IS NULL OR qp.viewcount = 0 THEN NULL
+      ELSE ROUND( (CAST(qp.score AS numeric)) / NULLIF(qp.viewcount,0), 6)
+    END AS score_per_view,
+    CASE
+      WHEN qp.answercount IS NULL OR qp.answercount = 0 THEN 0
+      ELSE CAST(qp.favoritecount AS numeric) / qp.answercount
+    END AS fav_per_answer
+  FROM q_posts qp
+  LEFT JOIN votes_agg va ON va.postid = qp.question_id
+  LEFT JOIN comments_agg ca ON ca.postid = qp.question_id
+  LEFT JOIN edits ed ON ed.postid = qp.question_id
+  LEFT JOIN first_response fp ON fp.question_id = qp.question_id
+),
+dup_enrichment AS (
+  SELECT
+    qq.question_id,
+    d.duplicate_id,
+    d.original_id,
+    d.dup_link_date,
+    CASE WHEN d.duplicate_id IS NOT NULL THEN 1 ELSE 0 END AS is_marked_duplicate
+  FROM question_quality qq
+  LEFT JOIN dup_links d
+    ON d.duplicate_id = qq.question_id
+),
+tag_scored AS (
+  SELECT
+    qq.question_id,
+    te.tag,
+    dense_rank() OVER (PARTITION BY qq.question_id ORDER BY COALESCE(ts.tag_q_count,0) DESC, te.tag) AS tag_pop_rank
+  FROM question_quality qq
+  LEFT JOIN tags_expanded te ON te.question_id = qq.question_id
+  LEFT JOIN (
+    SELECT te2.tag, COUNT(*) AS tag_q_count
+    FROM tags_expanded te2
+    GROUP BY te2.tag
+  ) ts ON ts.tag = te.tag
+),
+question_norms AS (
+  SELECT
+    qq.question_id,
+    qq.owneruserid,
+    qq.creationdate,
+    qq.score,
+    qq.viewcount,
+    qq.answercount,
+    qq.favoritecount,
+    qq.q_upvotes,
+    qq.q_downvotes,
+    qq.q_bounty,
+    qq.q_comment_count,
+    qq.edit_count,
+    qq.seconds_to_first_answer,
+    qq.score_per_view,
+    qq.fav_per_answer,
+    de.is_marked_duplicate,
+    COALESCE(AVG(qq.score) OVER (PARTITION BY date_trunc('month', qq.creationdate)), 0) AS month_avg_score,
+    COALESCE(percent_rank() OVER (ORDER BY qq.score), 0) AS score_percentile,
+    COALESCE(ntile(10) OVER (ORDER BY COALESCE(qq.score,0) DESC), 10) AS score_decile
+  FROM question_quality qq
+  LEFT JOIN dup_enrichment de ON de.question_id = qq.question_id
+),
+complex_predicates AS (
+  SELECT
+    qn.question_id,
+    qn.owneruserid,
+    qn.creationdate,
+    qn.score,
+    qn.viewcount,
+    qn.answercount,
+    qn.favoritecount,
+    qn.q_upvotes,
+    qn.q_downvotes,
+    qn.q_bounty,
+    qn.q_comment_count,
+    qn.edit_count,
+    qn.seconds_to_first_answer,
+    qn.score_per_view,
+    qn.fav_per_answer,
+    qn.is_marked_duplicate,
+    qn.month_avg_score,
+    qn.score_percentile,
+    qn.score_decile,
+    CASE
+      WHEN qn.is_marked_duplicate = 1 AND COALESCE(qn.answercount,0) = 0 THEN 'dup_no_answers'
+      WHEN qn.score >= 5 AND qn.viewcount >= 1000 AND COALESCE(qn.seconds_to_first_answer,999999) < 3600 THEN 'fast_popular'
+      WHEN qn.score < 0 AND qn.q_downvotes > qn.q_upvotes THEN 'controversial_negative'
+      WHEN qn.edit_count >= 3 AND qn.fav_per_answer IS NOT NULL AND qn.fav_per_answer > 2 THEN 'heavily_edited_faved'
+      ELSE 'other'
+    END AS bucket,
+    CASE
+      WHEN qn.score_per_view IS NULL THEN 'unknown'
+      WHEN qn.score_per_view >= 0.01 THEN 'high_efficiency'
+      WHEN qn.score_per_view >= 0 THEN 'moderate_efficiency'
+      ELSE 'low_efficiency'
+    END AS efficiency_band
+  FROM question_norms qn
+),
+top_tags_per_q AS (
+  SELECT
+    ts.question_id,
+    string_agg(ts.tag, ',' ORDER BY ts.tag_pop_rank ASC) FILTER (WHERE ts.tag_pop_rank <= 3) AS top3_tags
+  FROM tag_scored ts
+  GROUP BY ts.question_id
+),
+user_badge_stats AS (
+  SELECT
+    u.id AS user_id,
+    COUNT(b.userid) AS badges_total,
+    SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+    SUM(CASE WHEN b.class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+    SUM(CASE WHEN b.class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+    MIN(b.date) AS first_badge_date,
+    MAX(b.date) AS last_badge_date
+  FROM users u
+  LEFT JOIN badges b ON b.userid = u.id
+  GROUP BY u.id
+),
+final_union AS (
+  SELECT
+    qn.owneruserid AS user_id,
+    qn.question_id AS entity_id,
+    'question' AS entity_type,
+    qn.creationdate AS activity_date,
+    qn.score AS primary_score,
+    qn.score_decile,
+    qn.score_percentile,
+    qn.viewcount,
+    qn.answercount,
+    qn.q_upvotes AS upvotes,
+    qn.q_downvotes AS downvotes,
+    qn.q_bounty AS bounty_total,
+    qn.q_comment_count AS comment_count,
+    qn.seconds_to_first_answer,
+    qn.bucket,
+    qn.efficiency_band,
+    COALESCE(tt.top3_tags, '') AS tags_summary
+  FROM complex_predicates qn
+  LEFT JOIN top_tags_per_q tt ON tt.question_id = qn.question_id
+
+  UNION ALL
+
+  SELECT
+    ap.owneruserid AS user_id,
+    ap.answer_id AS entity_id,
+    'answer' AS entity_type,
+    ap.answer_creationdate AS activity_date,
+    ap.answer_score AS primary_score,
+    ntile(10) OVER (ORDER BY COALESCE(ap.answer_score,0) DESC) AS score_decile,
+    percent_rank() OVER (ORDER BY COALESCE(ap.answer_score,0)) AS score_percentile,
+    NULL::integer AS viewcount,
+    NULL::integer AS answercount,
+    COALESCE(va.upvotes,0) AS upvotes,
+    COALESCE(va.downvotes,0) AS downvotes,
+    COALESCE(va.bounty_total,0) AS bounty_total,
+    COALESCE(ca.comment_count,0) AS comment_count,
+    NULL::numeric AS seconds_to_first_answer,
+    CASE WHEN ar.score_rank = 1 THEN 'top_answer' ELSE 'other_answer' END AS bucket,
+    CASE WHEN ap.answer_score >= 5 THEN 'efficient' ELSE 'normal' END AS efficiency_band,
+    '' AS tags_summary
+  FROM a_posts ap
+  LEFT JOIN votes_agg va ON va.postid = ap.answer_id
+  LEFT JOIN comments_agg ca ON ca.postid = ap.answer_id
+  LEFT JOIN answer_ranks ar ON ar.answer_id = ap.answer_id
+),
+user_rollup AS (
+  SELECT
+    fu.user_id,
+    MIN(fu.activity_date) AS first_activity,
+    MAX(fu.activity_date) AS last_activity,
+    COUNT(*) AS total_activities,
+    SUM(CASE WHEN fu.entity_type = 'question' THEN 1 ELSE 0 END) AS questions_count,
+    SUM(CASE WHEN fu.entity_type = 'answer' THEN 1 ELSE 0 END) AS answers_count,
+    SUM(COALESCE(fu.primary_score,0)) AS sum_scores,
+    AVG(COALESCE(fu.primary_score,0)) AS avg_score,
+    SUM(COALESCE(fu.upvotes,0)) AS sum_upvotes,
+    SUM(COALESCE(fu.downvotes,0)) AS sum_downvotes,
+    SUM(COALESCE(fu.bounty_total,0)) AS sum_bounty,
+    MAX(fu.comment_count) AS max_comment_count,
+    SUM(CASE WHEN fu.bucket IN ('fast_popular','top_answer') THEN 1 ELSE 0 END) AS high_perf_events
+  FROM final_union fu
+  GROUP BY fu.user_id
+),
+cohort_vs_perf AS (
+  SELECT
+    ra.user_id,
+    ra.displayname,
+    ra.reputation,
+    ra.cohort_month,
+    ua.first_activity,
+    ua.last_activity,
+    ua.total_activities,
+    ua.questions_count,
+    ua.answers_count,
+    ua.sum_scores,
+    ua.avg_score,
+    ua.sum_upvotes,
+    ua.sum_downvotes,
+    ua.sum_bounty,
+    ua.max_comment_count,
+    ua.high_perf_events,
+    ubs.badges_total,
+    ubs.gold_badges,
+    ubs.silver_badges,
+    ubs.bronze_badges
+  FROM recent_users ra
+  LEFT JOIN user_rollup ua ON ua.user_id = ra.user_id
+  LEFT JOIN user_badge_stats ubs ON ubs.user_id = ra.user_id
+),
+ranked_users AS (
+  SELECT
+    cvp.*,
+    row_number() OVER (PARTITION BY cvp.cohort_month ORDER BY COALESCE(cvp.sum_scores,0) DESC, COALESCE(cvp.sum_upvotes,0) DESC) AS cohort_rank_by_score,
+    dense_rank() OVER (ORDER BY COALESCE(cvp.high_perf_events,0) DESC, COALESCE(cvp.sum_bounty,0) DESC) AS global_rank_high_perf
+  FROM cohort_vs_perf cvp
+)
+SELECT
+  ru.cohort_month,
+  ru.cohort_rank_by_score,
+  ru.global_rank_high_perf,
+  ru.user_id,
+  ru.displayname,
+  ru.reputation,
+  ru.badges_total,
+  ru.gold_badges,
+  ru.silver_badges,
+  ru.bronze_badges,
+  COALESCE(ru.total_activities,0) AS total_activities,
+  COALESCE(ru.questions_count,0) AS questions_count,
+  COALESCE(ru.answers_count,0) AS answers_count,
+  COALESCE(ru.sum_scores,0) AS sum_scores,
+  COALESCE(ru.avg_score,0) AS avg_score,
+  COALESCE(ru.sum_upvotes,0) AS sum_upvotes,
+  COALESCE(ru.sum_downvotes,0) AS sum_downvotes,
+  COALESCE(ru.sum_bounty,0) AS sum_bounty,
+  COALESCE(ru.max_comment_count,0) AS max_comment_count,
+  ru.first_activity,
+  ru.last_activity
+FROM ranked_users ru
+WHERE
+  (
+    ru.cohort_rank_by_score <= 50
+    OR ru.global_rank_high_perf <= 200
+    OR (ru.badges_total IS NOT NULL AND ru.badges_total >= 10)
+  )
+  AND (
+    ru.sum_downvotes IS NULL
+    OR ru.sum_upvotes IS NULL
+    OR (ru.sum_upvotes - ru.sum_downvotes) >= 0
+  )
+ORDER BY ru.cohort_month DESC, ru.cohort_rank_by_score ASC, ru.global_rank_high_perf ASC, ru.user_id
+LIMIT 1000;

@@ -1,0 +1,117 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1)         AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2)         AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3)         AS BronzeBadges,
+        COALESCE(SUM(v2.Score), 0)                     AS TotalVotesReceived,
+        MAX(p.CreationDate)                            AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b      ON b.UserId = u.Id
+    LEFT JOIN Posts p       ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v2      ON v2.PostId = p.Id AND v2.VoteTypeId = 2
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+TopUsers AS (
+    SELECT *
+    FROM UserStats
+    WHERE Reputation > 10000
+    ORDER BY Reputation DESC
+    LIMIT 50
+),
+
+UserTagInfo AS (
+    SELECT 
+        ut.UserId,
+        t.TagName,
+        COUNT(*)                                         AS TagCount,
+        ROW_NUMBER() OVER (PARTITION BY ut.UserId 
+                           ORDER BY COUNT(*) DESC)      AS rn
+    FROM (
+        SELECT 
+            p.OwnerUserId AS UserId,
+            UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1 
+          AND p.Tags IS NOT NULL
+    ) ut
+    JOIN Tags t ON t.TagName = ut.Tag
+    GROUP BY ut.UserId, t.TagName
+),
+
+RecentClosedQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        ph.CreationDate                     AS ClosedDate,
+        CAST(ph.Comment AS INTEGER)         AS CloseReasonId,
+        cr.Name                             AS CloseReason
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id 
+                       AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes cr ON cr.Id = CAST(ph.Comment AS INTEGER)
+    WHERE p.PostTypeId = 1
+      AND ph.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '30 days')
+),
+
+UserActivity AS (
+    SELECT 
+        u.Id                                                AS UserId,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COUNT(DISTINCT c.Id)                                 AS CommentsMade,
+        SUM(CASE 
+                WHEN v.VoteTypeId = 2 THEN 1 
+                WHEN v.VoteTypeId = 3 THEN -1 
+                ELSE 0 
+            END)                                            AS NetVotesCast
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v   ON v.UserId = u.Id
+    GROUP BY u.Id
+)
+
+SELECT 
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.TotalVotesReceived,
+    tu.LastPostDate,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.CommentsMade,
+    ua.NetVotesCast,
+    STRING_AGG(DISTINCT ut.TagName || ':' || CAST(ut.TagCount AS VARCHAR), ', ') 
+        FILTER (WHERE ut.rn <= 3)                        AS TopTags,
+    rcq.Title                                           AS RecentClosedQuestion,
+    rcq.CloseReason
+FROM TopUsers tu
+LEFT JOIN UserActivity ua      ON ua.UserId = tu.Id
+LEFT JOIN UserTagInfo ut       ON ut.UserId = tu.Id AND ut.rn <= 3
+LEFT JOIN LATERAL (
+    SELECT rcq.Title, rcq.CloseReason
+    FROM RecentClosedQuestions rcq
+    WHERE rcq.Id = (
+        SELECT p2.Id
+        FROM Posts p2
+        WHERE p2.OwnerUserId = tu.Id
+          AND p2.PostTypeId = 1
+        ORDER BY p2.CreationDate DESC
+        LIMIT 1
+    )
+    LIMIT 1
+) rcq ON TRUE
+GROUP BY 
+    tu.Id, tu.DisplayName, tu.Reputation, tu.GoldBadges, tu.SilverBadges,
+    tu.BronzeBadges, tu.TotalVotesReceived, tu.LastPostDate,
+    ua.QuestionsPosted, ua.AnswersPosted, ua.CommentsMade, ua.NetVotesCast,
+    rcq.Title, rcq.CloseReason
+ORDER BY tu.Reputation DESC;

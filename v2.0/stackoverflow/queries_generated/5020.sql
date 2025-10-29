@@ -1,0 +1,106 @@
+-- {"query": "5020.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 866} 
+WITH ranked_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.Tags,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.CreationDate AS OwnerCreationDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.WebsiteUrl,
+    u.LastAccessDate,
+    p.Body,
+    COALESCE(b.Name, 'NoBadge') AS BadgesOwned,
+    COALESCE(pg.TagBased, 0) AS TagBasedBadge
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN (SELECT UserId, 1 AS TagBased FROM Badges WHERE TagBased = 1 GROUP BY UserId) pg ON pg.UserId = u.Id
+  WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+recent_activity AS (
+  SELECT
+    rp.PostId,
+    rp.OwnerUserId,
+    rp.Title,
+    rp.ViewCount,
+    rp.Score,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    ROW_NUMBER() OVER (PARTITION BY rp.OwnerUserId ORDER BY rp.LastActivityDate DESC) AS rn
+  FROM ranked_posts rp
+),
+correlated AS (
+  SELECT
+    ra.PostId,
+    ra.OwnerUserId,
+    ra.Title,
+    ra.ViewCount,
+    ra.Score,
+    ra.CreationDate,
+    ra.LastActivityDate,
+    ra.rn,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ra.PostId AND v.VoteTypeId = 2) AS UpvotesAgainst,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ra.PostId AND v.VoteTypeId = 3) AS DownvotesAgainst,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = ra.PostId) AS LinkCount,
+    (SELECT MAX(BountyAmount) FROM Votes v WHERE v.PostId = ra.PostId AND v.VoteTypeId = 8) AS MaxBountyStart
+  FROM recent_activity ra
+  WHERE ra.rn <= 5
+),
+windowed AS (
+  SELECT
+    c.PostId,
+    c.OwnerUserId,
+    c.Title,
+    c.ViewCount,
+    c.Score,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.UpvotesAgainst,
+    c.DownvotesAgainst,
+    c.LinkCount,
+    c.MaxBountyStart,
+    SUM(c.Score) OVER (PARTITION BY c.OwnerUserId ORDER BY c.LastActivityDate ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS RollingScore30d,
+    AVG(c.ViewCount) OVER (PARTITION BY c.OwnerUserId) AS AvgViewsPerUser,
+    ROW_NUMBER() OVER (ORDER BY c.LastActivityDate DESC, c.Score DESC) AS global_rn
+  FROM correlated c
+)
+SELECT
+  w.global_rn,
+  w.PostId,
+  w.OwnerUserId,
+  w.Title,
+  w.ViewCount,
+  w.Score,
+  w.CreationDate,
+  w.LastActivityDate,
+  w.RollingScore30d,
+  w.AvgViewsPerUser,
+  w.UpvotesAgainst,
+  w.DownvotesAgainst,
+  w.LinkCount,
+  w.MaxBountyStart,
+  CASE
+    WHEN w.ViewCount > 1000 THEN 'Hot'
+    WHEN w.Score >= 10 THEN 'Trending'
+    ELSE 'Normal'
+  END AS TrendLabel,
+  CONCAT('[', w.OwnerUserId, '] ', COALESCE((SELECT DisplayName FROM Users WHERE Id = w.OwnerUserId), 'Unknown')) AS OwnerLabel
+FROM windowed w
+WHERE w.RollingScore30d IS NOT NULL
+ORDER BY w.global_rn
+LIMIT 100;

@@ -1,0 +1,177 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        pt.Name AS PostType,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL
+),
+UserPostActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT rp.PostId) AS TotalPosts,
+        SUM(CASE WHEN rp.PostType = 'Question' THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN rp.PostType = 'Answer' THEN 1 ELSE 0 END) AS AnswerCount,
+        MAX(CASE WHEN rp.rn = 1 THEN rp.Title ELSE NULL END) AS LatestPostTitle,
+        MAX(CASE WHEN rp.rn = 1 THEN rp.PostCreationDate ELSE NULL END) AS LatestPostDate
+    FROM Users u
+    LEFT JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+),
+TagCounts AS (
+    SELECT
+        t.TagName,
+        SUM(p.AnswerCount) AS TotalAnswersForTag,
+        AVG(CAST(p.Score AS NUMERIC)) AS AverageScoreForTag,
+        COUNT(DISTINCT p.Id) AS NumberOfQuestionsForTag
+    FROM Tags t
+    JOIN Posts p ON ',' || REPLACE(p.Tags, '><', ',') || ',' LIKE '%,' || t.TagName || ',%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+UserContributions AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveComments,
+        AVG(CAST(c.Score AS NUMERIC)) AS AverageCommentScore
+    FROM Users u
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+ModeratorActions AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN 1 ELSE 0 END) AS ModerationEvents
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    upa.UserId,
+    upa.DisplayName,
+    upa.TotalPosts,
+    upa.QuestionCount,
+    upa.AnswerCount,
+    upa.LatestPostTitle,
+    upa.LatestPostDate,
+    uc.CommentCount,
+    uc.PositiveComments,
+    uc.AverageCommentScore,
+    ma.PostHistoryCount,
+    ma.ModerationEvents,
+    COALESCE(t.TagName, 'N/A') AS TopTag,
+    COALESCE(t.NumberOfQuestionsForTag, 0) AS TopTagQuestions,
+    COALESCE(t.AverageScoreForTag, 0.0) AS TopTagAvgScore,
+    CASE
+        WHEN upa.TotalPosts > 1000 THEN 'Veteran'
+        WHEN upa.TotalPosts > 100 THEN 'Experienced'
+        WHEN upa.TotalPosts > 0 THEN 'Novice'
+        ELSE 'New'
+    END AS UserTier,
+    CASE
+        WHEN uc.AverageCommentScore > 5 THEN 'Highly Engaged'
+        WHEN uc.AverageCommentScore > 1 THEN 'Moderately Engaged'
+        ELSE 'Less Engaged'
+    END AS CommentEngagement,
+    CASE
+        WHEN ma.ModerationEvents > 50 THEN 'Active Moderator'
+        WHEN ma.ModerationEvents > 10 THEN 'Occasional Moderator'
+        ELSE 'No Moderation Actions'
+    END AS ModeratorStatus,
+    CASE
+        WHEN upa.LatestPostDate IS NULL THEN 'No Posts'
+        WHEN upa.LatestPostDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR THEN 'Inactive'
+        ELSE 'Active Recently'
+    END AS ActivityStatus,
+    (upa.QuestionCount + upa.AnswerCount) AS TotalQuestionAnswerCount,
+    LENGTH(upa.DisplayName) AS DisplayNameLength,
+    CASE WHEN upa.DisplayName LIKE '% %' THEN 'Has Space' ELSE 'No Space' END AS DisplayNameFormat,
+    upa.TotalPosts * 100.0 / NULLIF(upa.TotalPosts + COALESCE(uc.CommentCount,0), 0) AS PostToCommentRatio,
+    COALESCE(LENGTH(u.AboutMe), 0) AS AboutMeLength,
+    CASE WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website' ELSE 'Has Website' END AS WebsitePresence,
+    CASE WHEN u.Location IS NOT NULL AND u.Location != '' THEN 'Has Location' ELSE 'No Location' END AS LocationPresence,
+    CASE WHEN u.UpVotes > COALESCE(u.DownVotes,0) * 2 THEN 'Positive Feedback Bias' ELSE 'Neutral or Negative Bias' END AS VoteBias,
+    upa.TotalPosts + COALESCE(uc.CommentCount,0) + COALESCE(ma.PostHistoryCount,0) AS CombinedActivityScore,
+    CASE
+        WHEN rp1.PostId IS NOT NULL THEN 'Has Accepted Answer'
+        ELSE 'No Accepted Answer'
+    END AS HasAcceptedAnswer,
+    CASE
+        WHEN u.CreationDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5' YEAR THEN 'Long Tenure'
+        ELSE 'Shorter Tenure'
+    END AS TenureStatus,
+    t2.TagName AS SecondTag,
+    t3.TagName AS ThirdTag
+FROM UserPostActivity upa
+LEFT JOIN UserContributions uc ON upa.UserId = uc.UserId
+LEFT JOIN ModeratorActions ma ON upa.UserId = ma.UserId
+LEFT JOIN (
+    SELECT
+        TagName,
+        NumberOfQuestionsForTag,
+        AverageScoreForTag
+    FROM TagCounts
+    ORDER BY NumberOfQuestionsForTag DESC
+    LIMIT 1
+) AS t ON 1 = 1
+LEFT JOIN (
+    SELECT
+        TagName,
+        NumberOfQuestionsForTag,
+        AverageScoreForTag
+    FROM TagCounts
+    ORDER BY NumberOfQuestionsForTag DESC
+    OFFSET 1
+    LIMIT 1
+) AS t2 ON 1 = 1
+LEFT JOIN (
+    SELECT
+        TagName,
+        NumberOfQuestionsForTag,
+        AverageScoreForTag
+    FROM TagCounts
+    ORDER BY NumberOfQuestionsForTag DESC
+    OFFSET 2
+    LIMIT 1
+) AS t3 ON 1 = 1
+LEFT JOIN Users u ON upa.UserId = u.Id
+LEFT JOIN Posts rp1 ON upa.UserId = rp1.OwnerUserId AND rp1.Id = u.AcceptedAnswerId
+WHERE COALESCE(upa.TotalPosts,0) > 0 OR COALESCE(uc.CommentCount,0) > 0 OR COALESCE(ma.ModerationEvents,0) > 0
+GROUP BY
+    upa.UserId,
+    upa.DisplayName,
+    upa.TotalPosts,
+    upa.QuestionCount,
+    upa.AnswerCount,
+    upa.LatestPostTitle,
+    upa.LatestPostDate,
+    uc.CommentCount,
+    uc.PositiveComments,
+    uc.AverageCommentScore,
+    ma.PostHistoryCount,
+    ma.ModerationEvents,
+    t.TagName,
+    t.NumberOfQuestionsForTag,
+    t.AverageScoreForTag,
+    uc.AverageCommentScore,
+    rp1.PostId,
+    u.AboutMe,
+    u.WebsiteUrl,
+    u.Location,
+    u.UpVotes,
+    u.DownVotes,
+    u.CreationDate,
+    t2.TagName,
+    t3.TagName
+ORDER BY upa.TotalPosts DESC, upa.AnswerCount DESC
+LIMIT 1000;

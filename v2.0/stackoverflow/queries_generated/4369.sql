@@ -1,0 +1,85 @@
+-- {"query": "4369.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 972} 
+
+WITH RankedQuestions AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.CreationDate ASC) AS rn_score,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS dr_user_recent,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) AS comment_count_analytic,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.FavoriteCount > 100 THEN 'Popular'
+            ELSE 'Active'
+        END AS PostStatus
+    FROM Posts AS p
+    LEFT JOIN Comments AS c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+    GROUP BY
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.ClosedDate,
+        p.FavoriteCount
+),
+UserPostActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 END) AS TitleEdits,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 END) AS BodyEdits,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+        MAX(p.CreationDate) AS LatestPostDate
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory AS ph ON u.Id = ph.UserId AND p.Id = ph.PostId
+    LEFT JOIN Votes AS v ON u.Id = v.UserId AND p.Id = v.PostId
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation
+),
+TopUsers AS (
+    SELECT
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.TotalUpVotes,
+        upa.TotalDownVotes,
+        ROW_NUMBER() OVER (ORDER BY upa.Reputation DESC, upa.TotalUpVotes DESC) AS rn_user_rep
+    FROM UserPostActivity AS upa
+    WHERE upa.Reputation > 5000 AND upa.LatestPostDate >= DATE('now', '-1 year')
+)
+SELECT
+    rq.PostId,
+    rq.Title AS QuestionTitle,
+    rq.PostStatus,
+    rq.Score AS QuestionScore,
+    rq.AnswerCount AS QuestionAnswerCount,
+    rq.comment_count_analytic AS AnalyticCommentCount,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    COALESCE(tu.TotalUpVotes, 0) AS OwnerTotalUpVotes,
+    COALESCE(tu.TotalDownVotes, 0) AS OwnerTotalDownVotes,
+    CASE
+        WHEN rq.rn_score <= 10 THEN 'Top 10 by Score'
+        WHEN rq.dr_user_recent = 1 THEN 'Most Recent Question by Owner'
+        ELSE 'Other'
+    END AS QuestionCategorization,
+    (SELECT COUNT(*) FROM PostLinks AS pl WHERE pl.PostId = rq.PostId AND pl.LinkTypeId = 3) AS DuplicateLinkCount,
+    (SELECT COUNT(*) FROM Comments AS c2 WHERE c2.PostId = rq.PostId AND LOWER(c2.Text) LIKE '%interesting%' AND c2.UserId IS NOT NULL) AS InterestingCommentCount
+FROM RankedQuestions AS rq
+JOIN Users AS u ON rq.OwnerUserId = u.Id
+LEFT JOIN TopUsers AS tu ON rq.OwnerUserId = tu.UserId
+WHERE rq.rn_score <= 100 OR rq.dr_user_recent <= 5
+ORDER BY rq.Score DESC, rq.CreationDate ASC
+LIMIT 50;

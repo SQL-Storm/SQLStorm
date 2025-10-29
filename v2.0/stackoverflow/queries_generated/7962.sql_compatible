@@ -1,0 +1,249 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT c.Id) as TotalComments,
+        COUNT(DISTINCT b.Id) as TotalBadges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Contributor'
+            ELSE 'Member'
+        END as ReputationTier,
+        COALESCE(SUM(p.Score), 0) as TotalPostScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) as WikiCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 4 THEN p.Id END) as TagWikiExcerptCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 5 THEN p.Id END) as TagWikiCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 6 THEN p.Id END) as ModeratorNominationCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 7 THEN p.Id END) as WikiPlaceholderCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 8 THEN p.Id END) as PrivilegeWikiCount,
+        STRING_AGG(DISTINCT p.Title, '; ') as RecentTitles
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate
+),
+PostScoreAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.LastActivityDate,
+        p.LastEditDate,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementCount,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Engaging'
+            WHEN p.Score > 50 THEN 'Engaging'
+            WHEN p.Score > 10 THEN 'Moderately Engaging'
+            ELSE 'Low Engagement'
+        END as EngagementLevel,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextPostScore,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousPostScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgUserScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as UserPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) as GlobalScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as GlobalScoreDenseRank,
+        NTILE(10) OVER (ORDER BY p.Score DESC) as ScoreDecile,
+        CASE 
+            WHEN p.Score > 0 AND p.ViewCount > 1000 AND p.AnswerCount > 5 THEN 'Popular Question'
+            WHEN p.Score < 0 AND p.ViewCount > 500 THEN 'Controversial Post'
+            WHEN p.Score > 100 AND p.ViewCount > 5000 THEN 'Viral Content'
+            ELSE 'Regular Post'
+        END as ContentCategory,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags LIKE '%<c>%<%' THEN 'C++ Related'
+            WHEN p.Tags IS NOT NULL AND p.Tags LIKE '%<java>%<%' THEN 'Java Related'
+            WHEN p.Tags IS NOT NULL AND p.Tags LIKE '%<python>%<%' THEN 'Python Related'
+            WHEN p.Tags IS NOT NULL AND p.Tags LIKE '%<javascript>%<%' THEN 'JavaScript Related'
+            ELSE 'Generic'
+        END as LanguageCategory,
+        EXTRACT(YEAR FROM p.CreationDate) as PostYear,
+        EXTRACT(MONTH FROM p.CreationDate) as PostMonth,
+        EXTRACT(DAY FROM p.CreationDate) as PostDay,
+        CASE 
+            WHEN p.Score > 0 AND p.CreationDate IS NOT NULL AND p.LastActivityDate IS NOT NULL 
+            THEN EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400 
+            ELSE 0 
+        END as DaysToLastActivity
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+CombinedAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.Reputation,
+        uas.DisplayName,
+        uas.CreationDate,
+        uas.TotalPosts,
+        uas.TotalComments,
+        uas.TotalBadges,
+        uas.LastPostDate,
+        uas.LastCommentDate,
+        uas.LastBadgeDate,
+        uas.ReputationTier,
+        uas.TotalPostScore,
+        uas.TotalViews,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.WikiCount,
+        uas.TagWikiExcerptCount,
+        uas.TagWikiCount,
+        uas.ModeratorNominationCount,
+        uas.WikiPlaceholderCount,
+        uas.PrivilegeWikiCount,
+        uas.RecentTitles,
+        psa.PostId,
+        psa.Title,
+        psa.PostTypeId,
+        psa.Score,
+        psa.ViewCount,
+        psa.CreationDate as PostCreationDate,
+        psa.ParentId,
+        psa.AnswerCount as PostAnswerCount,
+        psa.CommentCount,
+        psa.FavoriteCount,
+        psa.Tags,
+        psa.LastActivityDate,
+        psa.LastEditDate,
+        psa.EngagementCount,
+        psa.EngagementLevel,
+        psa.NextPostScore,
+        psa.PreviousPostScore,
+        psa.AvgUserScore,
+        psa.UserPostRank,
+        psa.GlobalScoreRank,
+        psa.GlobalScoreDenseRank,
+        psa.ScoreDecile,
+        psa.ContentCategory,
+        psa.LanguageCategory,
+        psa.PostYear,
+        psa.PostMonth,
+        psa.PostDay,
+        psa.DaysToLastActivity,
+        (psa.Score - psa.AvgUserScore) / NULLIF(psa.AvgUserScore, 0) * 100 as ScoreVsAvgPercent,
+        SUM(CASE WHEN psa.PostTypeId = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY uas.UserId) as UserQuestionCount,
+        SUM(CASE WHEN psa.PostTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY uas.UserId) as UserAnswerCount,
+        RANK() OVER (PARTITION BY psa.PostTypeId ORDER BY psa.Score DESC) as PostTypeRank,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = uas.UserId AND p2.PostTypeId = 1) as UserQuestionCountFromSubquery,
+        CASE 
+            WHEN psa.Score > 100 AND psa.ViewCount > 5000 THEN 'VIP_POST'
+            WHEN psa.Score > 50 AND psa.AnswerCount > 3 THEN 'ENGAGING_POST'
+            ELSE 'REGULAR_POST'
+        END as PostClassification
+    FROM UserActivityStats uas
+    INNER JOIN PostScoreAnalysis psa ON uas.UserId = psa.OwnerUserId
+    WHERE psa.Score IS NOT NULL
+),
+FinalAnalysis AS (
+    SELECT 
+        CombinedAnalysis.*,
+        CASE 
+            WHEN TotalPostScore > 10000 AND TotalViews > 100000 THEN 'Highly Active Contributor'
+            WHEN TotalPostScore > 5000 AND TotalViews > 50000 THEN 'Active Contributor'
+            WHEN TotalPostScore > 1000 AND TotalViews > 10000 THEN 'Moderate Contributor'
+            ELSE 'Regular Participant'
+        END as ContributorTier,
+        COALESCE(RecentTitles, 'No Recent Titles') as ProcessedRecentTitles,
+        (QuestionCount * 1.5 + AnswerCount * 2.0 + WikiCount * 0.5 + 
+         TagWikiCount * 1.2 + TagWikiExcerptCount * 0.8 + 
+         ModeratorNominationCount * 2.5) as ActivityScore,
+        AVG(
+            (QuestionCount * 1.5 + AnswerCount * 2.0 + WikiCount * 0.5 + 
+             TagWikiCount * 1.2 + TagWikiExcerptCount * 0.8 + 
+             ModeratorNominationCount * 2.5)
+        ) OVER (PARTITION BY ReputationTier) as TierAverageActivityScore,
+        SUM(CASE WHEN ContentCategory = 'Popular Question' THEN 1 ELSE 0 END) as PopularQuestions,
+        SUM(CASE WHEN ContentCategory = 'Viral Content' THEN 1 ELSE 0 END) as ViralContent,
+        SUM(CASE WHEN ContentCategory = 'Controversial Post' THEN 1 ELSE 0 END) as ControversialPosts,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = CombinedAnalysis.UserId) AND v.VoteTypeId IN (2, 3)) as PostVotes,
+        CASE 
+            WHEN TotalPostScore > 0 THEN LOG(10, TotalPostScore)
+            ELSE 0 
+        END as LogScore,
+        CASE 
+            WHEN UPPER(DisplayName) LIKE '%ADMIN%' OR UPPER(DisplayName) LIKE '%MODERATOR%' THEN 'Administrator'
+            WHEN UPPER(DisplayName) LIKE '%GOLD%' OR UPPER(DisplayName) LIKE '%SILVER%' THEN 'Named Contributor'
+            ELSE 'Regular User'
+        END as UserRole,
+        EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - CreationDate)) as DaysSinceJoin,
+        SUM(Score) OVER (PARTITION BY UserId ORDER BY PostCreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as MovingAverageScore10Posts
+    FROM CombinedAnalysis
+)
+
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    CreationDate,
+    TotalPosts,
+    TotalComments,
+    TotalBadges,
+    TotalPostScore,
+    TotalViews,
+    QuestionCount,
+    AnswerCount,
+    ContributorTier,
+    ActivityScore,
+    TierAverageActivityScore,
+    PopularQuestions,
+    ViralContent,
+    ControversialPosts,
+    LogScore,
+    DaysSinceJoin,
+    MovingAverageScore10Posts,
+    CASE 
+        WHEN TotalPostScore > 1000 AND QuestionCount > 100 AND AnswerCount > 500 
+        THEN 'Elite Contributor'
+        WHEN TotalPostScore > 500 AND QuestionCount > 50 AND AnswerCount > 200 
+        THEN 'Veteran Contributor'
+        WHEN TotalPostScore > 100 AND QuestionCount > 10 AND AnswerCount > 50 
+        THEN 'Active Contributor'
+        ELSE 'Regular Participant'
+    END as ExpertiseLevel,
+    STRING_AGG(DISTINCT Title, ', ') as AllPostTitles,
+    STRING_AGG(DISTINCT ContentCategory, ' | ') as PostCategories,
+    COUNT(*) as AnalysisCount,
+    MAX(Score) as MaxScore,
+    MIN(Score) as MinScore,
+    AVG(Score) as AverageScore
+FROM FinalAnalysis
+WHERE Score > 0 
+    AND CreationDate > TIMESTAMP '2015-01-01'
+    AND (ContentCategory IS NOT NULL AND ContentCategory != '')
+    AND (Reputation > 100 OR TotalPosts > 10)
+GROUP BY 
+    UserId, DisplayName, Reputation, CreationDate, 
+    TotalPosts, TotalComments, TotalBadges, 
+    TotalPostScore, TotalViews, QuestionCount, AnswerCount,
+    ContributorTier, ActivityScore, TierAverageActivityScore,
+    PopularQuestions, ViralContent, ControversialPosts, LogScore,
+    DaysSinceJoin, MovingAverageScore10Posts
+HAVING 
+    COUNT(*) > 5
+    OR MAX(Score) > 100
+    OR MIN(Score) > 10
+ORDER BY 
+    TotalPostScore DESC,
+    ActivityScore DESC,
+    Reputation DESC
+LIMIT 1000;

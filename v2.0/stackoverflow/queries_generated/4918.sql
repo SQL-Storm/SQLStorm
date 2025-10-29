@@ -1,0 +1,77 @@
+-- {"query": "4918.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 935} 
+
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        pht.Name AS EditType,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+),
+UserEditSummary AS (
+    SELECT
+        rpe.UserId,
+        COUNT(DISTINCT rpe.PostId) AS PostsEditedCount,
+        SUM(CASE WHEN rpe.EditType = 'Edit Body' THEN 1 ELSE 0 END) AS BodyEdits,
+        MAX(rpe.CreationDate) AS LatestEditDate,
+        AVG(strftime('%s', rpe.CreationDate) - strftime('%s', u.CreationDate)) AS AvgEditLagSeconds -- Calculate average time between user creation and their edit
+    FROM RankedPostEdits rpe
+    JOIN Users u ON rpe.UserId = u.Id
+    GROUP BY rpe.UserId
+    HAVING COUNT(DISTINCT rpe.PostId) > 5 -- Users who have edited more than 5 distinct posts
+),
+QuestionAnswerStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.AnswerCount,
+        p.FavoriteCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 5) AS HighScoreCommentCount,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        strftime('%Y', p.CreationDate) AS QuestionYear,
+        CASE WHEN UPPER(p.Tags) LIKE '%<sql>%' THEN 1 ELSE 0 END AS IsSqlRelated
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Questions
+),
+TopAnswerers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS AnswerCount,
+        SUM(p.Score) AS TotalScore
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 2 -- Answers
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(p.Id) > 10 -- Top answerers with more than 10 answers
+)
+SELECT
+    qas.Title AS QuestionTitle,
+    qas.QuestionYear,
+    qas.IsSqlRelated,
+    qas.AnswerCount,
+    qas.FavoriteCount,
+    qas.HighScoreCommentCount,
+    qas.HasAcceptedAnswer,
+    ues.UserId AS MostActiveEditorId,
+    ues.PostsEditedCount,
+    ues.BodyEdits,
+    ues.AvgEditLagSeconds,
+    ta.DisplayName AS TopAnswererName,
+    ta.TotalScore AS TopAnswererScore,
+    CASE
+        WHEN qas.FavoriteCount > 100 THEN 'Very Popular'
+        WHEN qas.FavoriteCount > 50 THEN 'Popular'
+        ELSE 'Standard'
+    END AS PopularityBucket,
+    COALESCE(qas.AnswerCount, 0) + COALESCE(qas.FavoriteCount, 0) AS CombinedMetric
+FROM QuestionAnswerStats qas
+LEFT JOIN UserEditSummary ues ON qas.QuestionYear = strftime('%Y', ues.LatestEditDate) AND ues.PostsEditedCount > 5 -- Join based on year and significant editing activity
+LEFT JOIN TopAnswerers ta ON ta.TotalScore > (SELECT AVG(TotalScore) FROM TopAnswerers) -- Join with answerers whose score is above the average
+WHERE qas.QuestionYear BETWEEN '2010' AND '2023'
+  AND qas.AnswerCount >= 0 -- Ensure AnswerCount is not null for comparison
+ORDER BY qas.FavoriteCount DESC, qas.AnswerCount DESC
+LIMIT 1000;

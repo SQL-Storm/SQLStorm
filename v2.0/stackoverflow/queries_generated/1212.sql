@@ -1,0 +1,270 @@
+-- {"query": "1212.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3860} 
+
+WITH UserActivitySummary AS (
+    -- Aggregates overall user activity, including post/comment counts, scores, and access patterns
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersOwned,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScoreOwned,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalViewsOnPostsOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsOwned,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScoreOwned,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(c.CreationDate) AS LastCommentActivity,
+        DATE_PART('day', NOW() - u.LastAccessDate) AS DaysSinceLastActivity,
+        NTILE(5) OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationQuintile
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    WHERE u.CreationDate BETWEEN '2010-01-01' AND '2023-01-01'
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostContentAndEditDetails AS (
+    -- Extracts relevant post details, parses tags, and summarizes basic edit history
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Body,
+        p.Tags,
+        p.ClosedDate,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><') AS TagArray,
+        (
+            SELECT COUNT(DISTINCT ph.UserId)
+            FROM PostHistory AS ph
+            WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+        ) AS DistinctEditorsCount,
+        (
+            SELECT COUNT(*)
+            FROM PostHistory AS ph
+            WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6)
+        ) AS TotalEditEvents,
+        (
+            SELECT COALESCE(MAX(cr.Name), 'Not Closed')
+            FROM PostHistory AS ph_close
+            LEFT JOIN CloseReasonTypes AS cr ON ph_close.Comment = cr.Id::text
+            WHERE ph_close.PostId = p.Id AND ph_close.PostHistoryTypeId = 10
+        ) AS FinalCloseReason,
+        LAG(p.LastEditDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostEditDate
+    FROM Posts AS p
+    WHERE p.PostTypeId IN (1, 2) -- Questions (1) and Answers (2)
+),
+PostTagAnalysis AS (
+    -- Further analysis for questions with parsed tags, including tag-specific performance metrics
+    SELECT
+        pc.PostId,
+        pc.PostTypeId,
+        pc.OwnerUserId,
+        pc.PostCreationDate,
+        pc.PostScore,
+        pc.ViewCount,
+        pc.AnswerCount,
+        pc.FavoriteCount,
+        pc.DistinctEditorsCount,
+        pc.TotalEditEvents,
+        pc.FinalCloseReason,
+        UNNEST(pc.TagArray) AS TagName,
+        AVG(pc.PostScore) OVER (PARTITION BY UNNEST(pc.TagArray)) AS AverageScoreForTag,
+        DENSE_RANK() OVER (PARTITION BY pc.OwnerUserId ORDER BY pc.PostScore DESC, pc.ViewCount DESC) AS RankByScoreForUserInTag,
+        SUM(pc.ViewCount) OVER (PARTITION BY UNNEST(pc.TagArray)) AS TotalTagViews,
+        (pc.PostScore * 1.0 / NULLIF(pc.ViewCount, 0)) AS ScoreToViewRatio
+    FROM PostContentAndEditDetails AS pc
+    WHERE pc.PostTypeId = 1 AND pc.Tags IS NOT NULL -- Only process questions with tags
+),
+DetailedVoteAndCommentEngagement AS (
+    -- Gathers detailed vote and comment statistics for each post
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+        COUNT(DISTINCT c.UserId) AS DistinctCommenters,
+        SUM(CASE WHEN c.Score > 0 THEN c.Score ELSE 0 END) AS PositiveCommentScore,
+        MAX(v.CreationDate) AS LastVoteDate,
+        (
+            SELECT COUNT(DISTINCT pl.RelatedPostId)
+            FROM PostLinks AS pl
+            WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1 -- Linked posts
+        ) AS LinkedQuestionCount,
+        (
+            SELECT COUNT(DISTINCT pl.RelatedPostId)
+            FROM PostLinks AS pl
+            WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3 -- Duplicate posts
+        ) AS DuplicateOfCount,
+        (
+            SELECT AVG(v_bounty.BountyAmount)
+            FROM Votes AS v_bounty
+            WHERE v_bounty.PostId = p.Id AND v_bounty.VoteTypeId = 8 AND v_bounty.BountyAmount IS NOT NULL
+        ) AS AverageBountyOnPost
+    FROM Posts AS p
+    LEFT JOIN Votes AS v ON p.Id = v.PostId
+    LEFT JOIN Comments AS c ON p.Id = c.PostId
+    GROUP BY p.Id, p.OwnerUserId
+)
+-- Main query combining all CTEs, applying complex logic, window functions, and a set operator
+SELECT
+    uas.UserId,
+    uas.UserName,
+    uas.Reputation,
+    uas.ReputationQuintile,
+    uas.QuestionsOwned,
+    uas.AnswersOwned,
+    uas.TotalPostScoreOwned,
+    uas.TotalCommentsOwned,
+    uas.DaysSinceLastActivity,
+    COALESCE(b.GoldBadges, 0) AS UserGoldBadges,
+    COALESCE(b.SilverBadges, 0) AS UserSilverBadges,
+    COALESCE(b.BronzeBadges, 0) AS UserBronzeBadges,
+    pta.PostId AS QuestionId,
+    pc.Title AS QuestionTitle,
+    pc.Body AS QuestionBodySnippet, -- Full body content for inspection
+    pta.TagName,
+    pta.PostCreationDate,
+    pta.PostScore AS QuestionScore,
+    pta.ViewCount AS QuestionViews,
+    pta.AnswerCount AS QuestionAnswerCount,
+    pta.FavoriteCount AS QuestionFavoriteCount,
+    pta.DistinctEditorsCount AS QuestionDistinctEditors,
+    pta.TotalEditEvents AS QuestionTotalEditEvents,
+    pta.FinalCloseReason,
+    pta.AverageScoreForTag,
+    pta.ScoreToViewRatio AS QuestionScorePerView,
+    LAG(pta.PostScore, 1, 0) OVER (PARTITION BY uas.UserId ORDER BY pta.PostCreationDate) AS PrevQuestionScoreByOwner,
+    DVE.UpvotesReceived AS QuestionUpvotesReceived,
+    DVE.DownvotesReceived AS QuestionDownvotesReceived,
+    DVE.DistinctCommenters AS QuestionDistinctCommenters,
+    DVE.PositiveCommentScore AS QuestionPositiveCommentScore,
+    DVE.LinkedQuestionCount,
+    DVE.DuplicateOfCount,
+    DVE.AverageBountyOnPost,
+    (uas.TotalUpVotesGiven * 1.0 / NULLIF(uas.TotalUpVotesGiven + uas.TotalDownVotesGiven, 0)) AS UserGivenVoteRatio,
+    (
+        SELECT COUNT(DISTINCT p_ans.OwnerUserId)
+        FROM Posts AS p_ans
+        WHERE p_ans.ParentId = pta.PostId AND p_ans.PostTypeId = 2
+    ) AS CountDistinctAnswerers,
+    CASE
+        WHEN pta.PostScore >= 100 AND pta.ViewCount >= 5000 THEN 'Highly Engaged & Visible'
+        WHEN pta.PostScore >= 20 AND pta.ViewCount >= 1000 THEN 'Moderately Engaged'
+        WHEN pta.PostScore >= 5 AND pta.ViewCount >= 100 THEN 'Low Engagement'
+        ELSE 'Minimal Impact'
+    END AS QuestionImpactLevel,
+    COALESCE(NULLIF(REPLACE(REPLACE(LOWER(SUBSTRING(pc.Body, 1, 200)), 'index', 'idx'), 'database', 'db_sys'), ''), 'No body preview available') AS ProcessedBodyExcerpt,
+    RANK() OVER (ORDER BY pta.PostScore DESC, pta.ViewCount DESC, pta.PostCreationDate DESC) AS GlobalQuestionRank,
+    (
+        SELECT AVG(DATE_PART('day', ph.CreationDate - pc.CreationDate))
+        FROM PostHistory AS ph
+        WHERE ph.PostId = pc.PostId AND ph.PostHistoryTypeId = 4 -- First Title Edit
+        GROUP BY ph.PostId
+    ) AS DaysToFirstTitleEdit
+FROM UserActivitySummary AS uas
+INNER JOIN PostTagAnalysis AS pta ON uas.UserId = pta.OwnerUserId
+INNER JOIN PostContentAndEditDetails AS pc ON pta.PostId = pc.PostId AND pta.OwnerUserId = pc.OwnerUserId
+LEFT JOIN DetailedVoteAndCommentEngagement AS DVE ON pta.PostId = DVE.PostId AND pta.OwnerUserId = DVE.OwnerUserId
+LEFT JOIN (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+) AS b ON uas.UserId = b.UserId
+WHERE
+    pta.PostCreationDate BETWEEN (NOW() - INTERVAL '4 year') AND (NOW() - INTERVAL '1 year') -- Recent active period
+    AND pta.PostScore >= 5
+    AND pta.ViewCount >= 50
+    AND (
+        pta.TagName IN ('sql', 'postgresql', 'mysql', 'performance', 'optimization')
+        OR pta.Title LIKE '%index%'
+        OR pc.Body LIKE '%query%'
+    )
+    AND uas.Reputation >= 500
+    AND uas.DaysSinceLastActivity <= 90 -- Users active recently
+    AND pta.FinalCloseReason = 'Not Closed' -- Only open questions
+
+UNION ALL
+
+-- This branch retrieves answers to highly-viewed questions by specific users
+SELECT
+    uas.UserId,
+    uas.UserName,
+    uas.Reputation,
+    uas.ReputationQuintile,
+    uas.QuestionsOwned,
+    uas.AnswersOwned,
+    uas.TotalPostScoreOwned,
+    uas.TotalCommentsOwned,
+    uas.DaysSinceLastActivity,
+    COALESCE(b.GoldBadges, 0) AS UserGoldBadges,
+    COALESCE(b.SilverBadges, 0) AS UserSilverBadges,
+    COALESCE(b.BronzeBadges, 0) AS UserBronzeBadges,
+    pc_ans.PostId AS QuestionId, -- This will be the AnswerId
+    pc_ans.Title AS QuestionTitle, -- Answer's title (often NULL)
+    pc_ans.Body AS QuestionBodySnippet, -- Answer's body
+    NULL AS TagName, -- Answers don't have direct tags
+    pc_ans.PostScore AS QuestionScore, -- Answer's score
+    p_parent.ViewCount AS QuestionViews, -- Parent question's view count
+    p_parent.AnswerCount AS QuestionAnswerCount, -- Parent question's answer count
+    pc_ans.FavoriteCount AS QuestionFavoriteCount, -- Answer's favorite count
+    pc_ans.DistinctEditorsCount AS QuestionDistinctEditors, -- Answer's distinct editors
+    pc_ans.TotalEditEvents AS QuestionTotalEditEvents, -- Answer's total edit events
+    'N/A for Answers' AS FinalCloseReason,
+    NULL AS AverageScoreForTag,
+    (pc_ans.PostScore * 1.0 / NULLIF(p_parent.ViewCount, 0)) AS QuestionScorePerView, -- Answer score relative to parent's views
+    LAG(pc_ans.PostScore, 1, 0) OVER (PARTITION BY uas.UserId ORDER BY pc_ans.PostCreationDate) AS PrevQuestionScoreByOwner,
+    DVE_ans.UpvotesReceived AS QuestionUpvotesReceived, -- Answer upvotes
+    DVE_ans.DownvotesReceived AS QuestionDownvotesReceived, -- Answer downvotes
+    DVE_ans.DistinctCommenters AS QuestionDistinctCommenters, -- Answer distinct commenters
+    DVE_ans.PositiveCommentScore AS QuestionPositiveCommentScore, -- Answer positive comment score
+    DVE_ans.LinkedQuestionCount, -- Answer linked posts
+    DVE_ans.DuplicateOfCount, -- Answer duplicates
+    DVE_ans.AverageBountyOnPost, -- Answer bounty
+    (uas.TotalUpVotesGiven * 1.0 / NULLIF(uas.TotalUpVotesGiven + uas.TotalDownVotesGiven, 0)) AS UserGivenVoteRatio,
+    NULL AS CountDistinctAnswerers, -- Not applicable for answers
+    CASE
+        WHEN pc_ans.PostScore >= 50 AND p_parent.ViewCount >= 10000 THEN 'Exceptional Answer'
+        WHEN pc_ans.PostScore >= 10 AND p_parent.ViewCount >= 1000 THEN 'Good Answer'
+        ELSE 'Basic Answer'
+    END AS QuestionImpactLevel, -- Impact for the answer
+    COALESCE(NULLIF(REPLACE(REPLACE(LOWER(SUBSTRING(pc_ans.Body, 1, 200)), 'bug', 'issue'), 'fix', 'resolve'), ''), 'No answer body preview') AS ProcessedBodyExcerpt,
+    RANK() OVER (ORDER BY pc_ans.PostScore DESC, p_parent.ViewCount DESC, pc_ans.PostCreationDate DESC) AS GlobalQuestionRank,
+    NULL AS DaysToFirstTitleEdit -- Not applicable for answers
+FROM UserActivitySummary AS uas
+INNER JOIN PostContentAndEditDetails AS pc_ans ON uas.UserId = pc_ans.OwnerUserId AND pc_ans.PostTypeId = 2 -- Answers
+INNER JOIN Posts AS p_parent ON pc_ans.ParentId = p_parent.Id
+LEFT JOIN DetailedVoteAndCommentEngagement AS DVE_ans ON pc_ans.PostId = DVE_ans.PostId AND pc_ans.OwnerUserId = DVE_ans.OwnerUserId
+LEFT JOIN (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+) AS b ON uas.UserId = b.UserId
+WHERE
+    p_parent.ViewCount >= 2000 -- Parent question must be highly viewed
+    AND pc_ans.PostScore >= 2 -- Answers with positive scores
+    AND pc_ans.PostCreationDate BETWEEN (NOW() - INTERVAL '3 year') AND NOW()
+    AND uas.ReputationQuintile IN (1, 2) -- Top 40% reputation users
+    AND (pc_ans.Body LIKE '%solution%' OR pc_ans.Body LIKE '%approach%')
+ORDER BY GlobalQuestionRank ASC, QuestionId ASC, TagName ASC;

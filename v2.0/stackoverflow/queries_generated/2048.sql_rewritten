@@ -1,0 +1,189 @@
+-- {"query": "2048.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1888} 
+WITH RecursiveBadgeCounts AS (
+    SELECT 
+        UserId,
+        Class,
+        Count(*) AS BadgeCount
+    FROM Badges
+    GROUP BY UserId, Class
+), UserReputationWithBadgeRank AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(rb_gold.BadgeCount,0) AS GoldBadges,
+        COALESCE(rb_silver.BadgeCount,0) AS SilverBadges,
+        COALESCE(rb_bronze.BadgeCount,0) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COALESCE(rb_gold.BadgeCount,0) DESC, u.CreationDate ASC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN RecursiveBadgeCounts rb_gold ON u.Id = rb_gold.UserId AND rb_gold.Class = 1
+    LEFT JOIN RecursiveBadgeCounts rb_silver ON u.Id = rb_silver.UserId AND rb_silver.Class = 2
+    LEFT JOIN RecursiveBadgeCounts rb_bronze ON u.Id = rb_bronze.UserId AND rb_bronze.Class = 3
+), UserQuestionAnswerStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionsPosted,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswersPosted,
+        AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score::numeric ELSE NULL END) AS AvgPostScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY p.OwnerUserId
+), LatestPostActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Tags,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC NULLS LAST) AS LastPostRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+), RecentQuestionCommentsCounts AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) as RecentCommentsCount
+    FROM Comments c
+    JOIN Posts p ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND c.CreationDate > cast('2024-10-01' as date) - interval '30 days'
+    GROUP BY c.PostId
+), QuestionCloseReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        MAX(ph.CreationDate) AS LastCloseDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON TRY_CAST(ph.Comment AS INT) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+    GROUP BY ph.PostId, crt.Name
+), DuplicateLinks AS (
+    SELECT 
+        pl.PostId,
+        COUNT(pl.Id) AS DuplicateCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+), ComplexUserPostOverview AS (
+    SELECT
+        ur.UserId,
+        ur.DisplayName,
+        ur.Reputation,
+        ur.GoldBadges,
+        ur.SilverBadges,
+        ur.BronzeBadges,
+        ur.ReputationRank,
+        COALESCE(uqas.QuestionsPosted,0) AS QuestionsPosted,
+        COALESCE(uqas.AnswersPosted,0) AS AnswersPosted,
+        COALESCE(uqas.AvgPostScore,0) AS AvgPostScore,
+        COALESCE(uqas.TotalQuestionViews,0) AS TotalQuestionViews,
+        lpa.PostId AS LastActivePostId,
+        lpa.Title AS LastActivePostTitle,
+        lpa.Tags AS LastActivePostTags,
+        lpa.PostTypeId AS LastActivePostType,
+        lpa.CreationDate AS LastActivePostCreation,
+        lpa.Score AS LastActivePostScore,
+        lpa.ViewCount AS LastActivePostViewCount,
+        lpa.AnswerCount AS LastActivePostAnswers,
+        lpa.CommentCount AS LastActivePostComments,
+        lpa.FavoriteCount AS LastActivePostFavorites,
+        lpa.ClosedDate AS LastActivePostClosedDate,
+        COALESCE(rqcc.RecentCommentsCount, 0) AS LastActivePostRecentComments,
+        COALESCE(qcr.CloseReasonName, 'Not Closed') AS LastActivePostCloseReason,
+        COALESCE(dl.DuplicateCount, 0) AS LastActivePostDuplicateCount
+    FROM UserReputationWithBadgeRank ur
+    LEFT JOIN UserQuestionAnswerStats uqas ON ur.UserId = uqas.OwnerUserId
+    LEFT JOIN LatestPostActivity lpa ON ur.UserId = lpa.OwnerUserId AND lpa.LastPostRank = 1
+    LEFT JOIN RecentQuestionCommentsCounts rqcc ON lpa.PostId = rqcc.PostId
+    LEFT JOIN QuestionCloseReasons qcr ON lpa.PostId = qcr.PostId
+    LEFT JOIN DuplicateLinks dl ON lpa.PostId = dl.PostId
+    WHERE ur.ReputationRank <= 100
+)
+SELECT
+    cbo.UserId,
+    cbo.DisplayName,
+    cbo.Reputation,
+    cbo.GoldBadges,
+    cbo.SilverBadges,
+    cbo.BronzeBadges,
+    cbo.QuestionsPosted,
+    cbo.AnswersPosted,
+    ROUND(cbo.AvgPostScore,2) AS AvgPostScore,
+    cbo.TotalQuestionViews,
+    cbo.LastActivePostId,
+    cbo.LastActivePostTitle,
+    -- Show tags exploded as array and also as concatenated string with '#' prefix, handling NULL and empty edge cases
+    CASE 
+        WHEN cbo.LastActivePostTags IS NOT NULL AND length(trim(cbo.LastActivePostTags)) > 0 THEN 
+            array_to_string(string_to_array(substring(cbo.LastActivePostTags from 2 for length(cbo.LastActivePostTags)-2),'><'), ' #')
+        ELSE 'No Tags' 
+    END AS LastActivePostTagsFormatted,
+    CASE cbo.LastActivePostType
+        WHEN 1 THEN 'Question'
+        WHEN 2 THEN 'Answer'
+        ELSE 'Other'
+    END AS LastActivePostType,
+    cbo.LastActivePostCreation,
+    cbo.LastActivePostScore,
+    cbo.LastActivePostViewCount,
+    cbo.LastActivePostAnswers,
+    cbo.LastActivePostComments,
+    cbo.LastActivePostFavorites,
+    CASE WHEN cbo.LastActivePostClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS LastActivePostStatus,
+    cbo.LastActivePostCloseReason,
+    cbo.LastActivePostDuplicateCount,
+    cbo.LastActivePostRecentComments,
+    -- Correlated subquery: count of distinct users commenting on user's last active post
+    (
+        SELECT COUNT(DISTINCT coalesce(c.UserId, -1))
+        FROM Comments c
+        WHERE c.PostId = cbo.LastActivePostId
+    ) AS DistinctCommenters,
+    -- Window function: Rank users by combined metric of reputation + gold badges weighted + question count weighted
+    RANK() OVER (
+        ORDER BY (cbo.Reputation + cbo.GoldBadges * 500 + cbo.QuestionsPosted * 10) DESC, cbo.UserId
+    ) AS CombinedReputationRank
+FROM ComplexUserPostOverview cbo
+ORDER BY CombinedReputationRank
+LIMIT 50
+
+UNION ALL
+
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0 AS QuestionsPosted,
+    0 AS AnswersPosted,
+    0.0 AS AvgPostScore,
+    0 AS TotalQuestionViews,
+    NULL AS LastActivePostId,
+    NULL AS LastActivePostTitle,
+    'No Tags' AS LastActivePostTagsFormatted,
+    'None' AS LastActivePostType,
+    NULL AS LastActivePostCreation,
+    0 AS LastActivePostScore,
+    0 AS LastActivePostViewCount,
+    0 AS LastActivePostAnswers,
+    0 AS LastActivePostComments,
+    0 AS LastActivePostFavorites,
+    'No Posts' AS LastActivePostStatus,
+    'N/A' AS LastActivePostCloseReason,
+    0 AS LastActivePostDuplicateCount,
+    0 AS LastActivePostRecentComments,
+    0 AS DistinctCommenters,
+    NULL AS CombinedReputationRank
+FROM Users u
+WHERE u.Id NOT IN (SELECT UserId FROM ComplexUserPostOverview)
+ORDER BY Reputation DESC
+LIMIT 10;

@@ -1,0 +1,116 @@
+WITH agg AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.AnswerCount,
+    p.LastActivityDate,
+    u.Reputation,
+    u.DisplayName,
+    u.Location,
+    COUNT(DISTINCT cl.Id) AS CloseVotesCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    MAX(CASE WHEN h.PostHistoryTypeId = 10 THEN h.CreationDate END) AS LastCloseVoteDate,
+    STRING_AGG(bl.Name, ',') FILTER (WHERE bl.Name IS NOT NULL) AS RelatedBadges
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN PostLinks pl2 ON pl2.PostId = p.Id AND pl2.RelatedPostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Badges b ON b.UserId = p.OwnerUserId
+  LEFT JOIN Badges bl ON bl.Id = b.Id
+  LEFT JOIN PostHistory h ON h.PostId = p.Id
+  LEFT JOIN CloseVotes cl ON cl.PostId = p.Id
+  WHERE p.PostTypeId IN (1,2)
+    AND p.LastActivityDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)
+  GROUP BY
+    p.Id, p.PostTypeId, p.CreationDate, p.Title, p.Tags, p.OwnerUserId,
+    p.ViewCount, p.Score, p.CommentCount, p.AnswerCount, p.LastActivityDate,
+    u.Reputation, u.DisplayName, u.Location
+),
+ratios AS (
+  SELECT
+    PostId,
+    PostTypeId,
+    CreationDate,
+    Title,
+    Tags,
+    OwnerUserId,
+    ViewCount,
+    Score,
+    CommentCount,
+    LastActivityDate,
+    Reputation,
+    DisplayName,
+    Location,
+    CloseVotesCount,
+    UpVotes,
+    DownVotes,
+    LastCloseVoteDate,
+    RelatedBadges,
+    (COALESCE(Score,0) * 2.0
+     + COALESCE(ViewCount,0) * 0.5
+     + COALESCE(UpVotes,0) * 1.5
+     - COALESCE(DownVotes,0) * 1.5
+     + COALESCE(CommentCount,0) * 0.8
+     + COALESCE(Reputation,0) * 0.01) AS BenchmarkScore
+  FROM agg
+),
+final AS (
+  SELECT
+    r.PostId,
+    r.PostTypeId,
+    r.CreationDate,
+    r.Title,
+    r.Tags,
+    r.OwnerUserId,
+    r.ViewCount,
+    r.Score,
+    r.CommentCount,
+    r.LastActivityDate,
+    r.Reputation,
+    r.DisplayName,
+    r.Location,
+    r.CloseVotesCount,
+    r.UpVotes,
+    r.DownVotes,
+    r.LastCloseVoteDate,
+    r.RelatedBadges,
+    r.BenchmarkScore,
+    RANK() OVER (
+      PARTITION BY CAST(r.CreationDate AS DATE)
+      ORDER BY r.BenchmarkScore DESC, r.PostId ASC
+    ) AS DayRank
+  FROM ratios r
+)
+SELECT
+  PostId,
+  PostTypeId,
+  CreationDate,
+  Title,
+  Tags,
+  OwnerUserId,
+  ViewCount,
+  Score,
+  CommentCount,
+  LastActivityDate,
+  Reputation,
+  DisplayName,
+  Location,
+  CloseVotesCount,
+  UpVotes,
+  DownVotes,
+  LastCloseVoteDate,
+  RelatedBadges,
+  BenchmarkScore,
+  DayRank
+FROM final
+WHERE DayRank <= 100
+ORDER BY CreationDate DESC, DayRank ASC;

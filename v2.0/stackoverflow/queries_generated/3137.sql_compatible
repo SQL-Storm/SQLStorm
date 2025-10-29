@@ -1,0 +1,107 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Views, 0)                          AS TotalViews,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(COALESCE(p.Score, 0))                     AS TotalScore,
+        MAX(p.CreationDate)                           AS LastPostDate,
+        COUNT(b.Id)                                   AS BadgeCount,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END)       AS GoldBadgeCount,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END)       AS SilverBadgeCount,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END)       AS BronzeBadgeCount
+    FROM Users u
+    LEFT JOIN Posts  p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+
+RecentVotes AS (
+    SELECT
+        v.PostId,
+        MAX(v.CreationDate)                               AS LastVoteDate,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END)        AS UpVoteCount,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END)        AS DownVoteCount
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+
+TagUsage AS (
+    SELECT
+        p.OwnerUserId                               AS UserId,
+        TRIM(BOTH '><' FROM value)                   AS Tag,
+        COUNT(*)                                     AS TagPostCount
+    FROM Posts p,
+         LATERAL (
+           SELECT regexp_split_to_table(p.Tags, '><') AS value
+         ) s
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, TRIM(BOTH '><' FROM value)
+),
+
+RankedUsers AS (
+    SELECT
+        us.*,
+        RANK()   OVER (ORDER BY us.Reputation DESC, us.TotalScore DESC) AS ReputationRank,
+        ROW_NUMBER() OVER (PARTITION BY us.Id ORDER BY us.LastPostDate DESC) AS RecentActivitySeq
+    FROM UserStats us
+)
+
+SELECT
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.TotalViews,
+    ru.QuestionCount,
+    ru.AnswerCount,
+    ru.TotalScore,
+    ru.BadgeCount,
+    ru.GoldBadgeCount,
+    ru.SilverBadgeCount,
+    ru.BronzeBadgeCount,
+    ru.ReputationRank,
+    COALESCE(rv.UpVoteCount,   0)                      AS RecentUpVotes,
+    COALESCE(rv.DownVoteCount, 0)                      AS RecentDownVotes,
+    COALESCE(rv.LastVoteDate, ru.LastPostDate)         AS MostRecentActivity,
+    STRING_AGG(DISTINCT tu.Tag, ',')                   FILTER (WHERE tu.TagPostCount > 5) AS PopularTags
+FROM RankedUsers ru
+LEFT JOIN LATERAL (
+    SELECT p.Id
+    FROM Posts p
+    WHERE p.OwnerUserId = ru.Id
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+) latest_post ON TRUE
+LEFT JOIN RecentVotes rv ON rv.PostId = latest_post.Id
+LEFT JOIN TagUsage tu ON tu.UserId = ru.Id
+GROUP BY
+    ru.Id, ru.DisplayName, ru.Reputation, ru.TotalViews,
+    ru.QuestionCount, ru.AnswerCount, ru.TotalScore,
+    ru.BadgeCount, ru.GoldBadgeCount, ru.SilverBadgeCount,
+    ru.BronzeBadgeCount, ru.ReputationRank,
+    rv.UpVoteCount, rv.DownVoteCount, rv.LastVoteDate, ru.LastPostDate
+
+UNION ALL
+
+SELECT
+    NULL                                            AS Id,
+    'Overall Statistics'                            AS DisplayName,
+    NULL                                            AS Reputation,
+    SUM(TotalViews)                                 AS TotalViews,
+    SUM(QuestionCount)                              AS QuestionCount,
+    SUM(AnswerCount)                                AS AnswerCount,
+    SUM(TotalScore)                                 AS TotalScore,
+    SUM(BadgeCount)                                 AS BadgeCount,
+    SUM(GoldBadgeCount)                             AS GoldBadgeCount,
+    SUM(SilverBadgeCount)                           AS SilverBadgeCount,
+    SUM(BronzeBadgeCount)                           AS BronzeBadgeCount,
+    NULL                                            AS ReputationRank,
+    NULL                                            AS RecentUpVotes,
+    NULL                                            AS RecentDownVotes,
+    NULL                                            AS MostRecentActivity,
+    NULL                                            AS PopularTags
+FROM RankedUsers;

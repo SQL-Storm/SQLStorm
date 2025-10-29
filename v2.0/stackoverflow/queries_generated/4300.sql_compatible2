@@ -1,0 +1,115 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        MAX(p.CreationDate) AS LatestPostDate,
+        AVG(p.Score) AS AveragePostScore,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount,
+        u.AboutMe,
+        u.WebsiteUrl,
+        COALESCE(u.UpVotes, 0) AS UpVotes,
+        COALESCE(u.DownVotes, 0) AS DownVotes
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.AboutMe, u.WebsiteUrl, u.UpVotes, u.DownVotes
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        pt.Name AS PostType,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        COALESCE(ua.DisplayName, p.OwnerDisplayName) AS OriginalOwnerDisplayName,
+        COALESCE(ua.Reputation, 0) AS OriginalOwnerReputation,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateLinkCount,
+        (SELECT STRING_AGG(c2.UserDisplayName || ':' || CAST(c2.Score AS VARCHAR), '; ')
+         FROM Comments c2 WHERE c2.PostId = p.Id) AS CommentSummary
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN UserActivity ua ON p.OwnerUserId = ua.UserId
+    WHERE p.PostTypeId IN (1, 2)
+),
+PostPerformance AS (
+    SELECT
+        pe.PostId,
+        pe.Title,
+        pe.PostType,
+        pe.CreationDate,
+        pe.Score,
+        pe.ViewCount,
+        pe.AnswerCount,
+        pe.CommentCount,
+        pe.IsClosed,
+        pe.OriginalOwnerDisplayName,
+        pe.OriginalOwnerReputation,
+        pe.DuplicateLinkCount,
+        pe.CommentSummary,
+        ROW_NUMBER() OVER (PARTITION BY pe.PostType ORDER BY pe.Score DESC) AS ScoreRank,
+        AVG(pe.Score) OVER (PARTITION BY pe.PostType) AS AvgScoreByType,
+        SUM(pe.ViewCount) OVER (PARTITION BY pe.PostType) AS TotalViewsByType,
+        (
+            SELECT COUNT(DISTINCT ph.UserId)
+            FROM PostHistory ph
+            WHERE ph.PostId = pe.PostId
+              AND ph.PostHistoryTypeId IN (4, 5, 6)
+              AND ph.UserId IS NOT NULL
+        ) AS EditorCount
+    FROM PostEngagement pe
+)
+SELECT
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.GoldBadgeCount,
+    ua.SilverBadgeCount,
+    ua.BronzeBadgeCount,
+    pp.Title AS TopPostTitle,
+    pp.Score AS TopPostScore,
+    pp.ViewCount AS TopPostViewCount,
+    pp.AvgScoreByType AS AverageScoreForUserPostType,
+    pp.TotalViewsByType AS TotalViewsForUserPostType,
+    pp.EditorCount AS EditorsOfTopPost,
+    CASE
+        WHEN ua.LatestPostDate IS NULL THEN 'Never Posted'
+        WHEN ua.LatestPostDate < (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR) THEN 'Inactive'
+        ELSE 'Active'
+    END AS UserActivityStatus,
+    COALESCE(ua.DisplayName, 'Anonymous') AS SanitizedDisplayName,
+    CASE WHEN ua.AboutMe IS NULL THEN 0 ELSE LENGTH(ua.AboutMe) END AS AboutMeLength,
+    CASE WHEN ua.WebsiteUrl IS NULL OR ua.WebsiteUrl = '' THEN 'No Website' ELSE 'Has Website' END AS WebsiteStatus,
+    (ua.UpVotes - ua.DownVotes) AS NetVotes,
+    pp.CommentSummary
+FROM UserActivity ua
+LEFT JOIN (
+    /* find top question posts by owner to join per user */
+    SELECT pp_inner.*
+    FROM PostPerformance pp_inner
+    WHERE pp_inner.ScoreRank = 1
+      AND pp_inner.PostType = 'Question'
+) pp
+    ON ua.UserId = (
+        SELECT p2.OwnerUserId
+        FROM Posts p2
+        WHERE p2.Id = pp.PostId
+        FETCH FIRST 1 ROW ONLY
+    )
+WHERE ua.Reputation > 1000
+ORDER BY ua.Reputation DESC, ua.TotalPosts DESC;

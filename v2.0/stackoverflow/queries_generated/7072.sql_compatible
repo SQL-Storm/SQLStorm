@@ -1,0 +1,104 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    COUNT(DISTINCT b.Id) AS TotalBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    COALESCE(
+        (SELECT bt.Name
+         FROM Badges b2
+         JOIN BadgeTypes bt ON b2.Class = bt.Id
+         WHERE b2.UserId = u.Id
+         ORDER BY b2.Date DESC
+         LIMIT 1
+        ),
+        'No Badge'
+    ) AS RecentBadgeType,
+    COALESCE(
+        (SELECT STRING_AGG(t2.TagName, ', ')
+         FROM Posts p3
+         CROSS JOIN LATERAL (
+             SELECT TRIM(value) AS tagname
+             FROM UNNEST(string_to_array(REGEXP_REPLACE(p3.Tags, '^<|>$', ''), '><')) AS value
+         ) AS tag_split
+         JOIN Tags t2 ON t2.TagName = tag_split.tagname
+         WHERE p3.OwnerUserId = u.Id
+           AND p3.PostTypeId = 1
+           AND p3.Tags IS NOT NULL
+        ),
+        'No Tags'
+    ) AS TopTags,
+    (SELECT COUNT(*) FROM PostHistory ph2 WHERE ph2.UserId = u.Id AND ph2.PostHistoryTypeId IN (1,2,3,4,5,6)) AS EditCount,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.UserId = u.Id AND v2.VoteTypeId IN (2,3) AND v2.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '1 year') AS RecentVotes,
+    ROW_NUMBER() OVER (
+        ORDER BY 
+            SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) + SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) DESC
+    ) AS UserRank,
+    DENSE_RANK() OVER (
+        PARTITION BY 
+            CASE WHEN u.Reputation > 10000 THEN 'High' WHEN u.Reputation > 1000 THEN 'Medium' ELSE 'Low' END
+        ORDER BY 
+            SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) + SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) DESC
+    ) AS ReputationRank,
+    CASE 
+        WHEN u.Reputation > 100000 THEN 'Elite'
+        WHEN u.Reputation > 50000 THEN 'Expert'
+        WHEN u.Reputation > 10000 THEN 'Advanced'
+        WHEN u.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS ReputationLevel,
+    EXISTS (
+        SELECT 1 FROM Posts p4 WHERE p4.OwnerUserId = u.Id AND p4.Score > 100
+    ) AS HasHighScoringPosts,
+    CASE WHEN u.LastAccessDate >= (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '7 day' THEN 'Active' ELSE 'Inactive' END AS UserStatus,
+    (SELECT COUNT(*) FROM Posts p5 WHERE p5.OwnerUserId = u.Id AND p5.PostTypeId = 1 AND p5.AcceptedAnswerId IS NOT NULL) AS QuestionsWithAcceptedAnswers,
+    (SELECT COUNT(*) FROM Posts p6 WHERE p6.OwnerUserId = u.Id AND p6.PostTypeId = 2 AND p6.Score > 0) AS PositiveAnswerCount,
+    (SELECT SUM(v3.BountyAmount) FROM Votes v3 WHERE v3.UserId = u.Id AND v3.VoteTypeId = 8) AS TotalBountyAwarded,
+    (SELECT AVG(p1.Score) FROM Posts p1 WHERE p1.OwnerUserId = u.Id AND p1.PostTypeId = 1) AS AverageQuestionScore,
+    (SELECT MAX(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 2) AS MaxAnswerScore,
+    (SELECT STRING_AGG(
+              CASE WHEN v4.VoteTypeId = 2 THEN 'Upvote' WHEN v4.VoteTypeId = 3 THEN 'Downvote' ELSE 'Other' END,
+              ', ')
+     FROM Votes v4
+     WHERE v4.UserId = u.Id AND v4.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '6 month'
+    ) AS RecentVoteTypes,
+    (SELECT COUNT(DISTINCT ph1.PostId) FROM PostHistory ph1 WHERE ph1.UserId = u.Id AND ph1.PostHistoryTypeId IN (10,11,12,13)) AS ModerationActions,
+    (SELECT COUNT(DISTINCT p7.Id) FROM Posts p7 INNER JOIN PostLinks pl2 ON p7.Id = pl2.PostId WHERE p7.OwnerUserId = u.Id AND pl2.LinkTypeId = 3) AS DuplicateLinksCreated,
+    (SELECT COUNT(DISTINCT p8.Id) FROM Posts p8 WHERE p8.OwnerUserId = u.Id AND p8.ViewCount > 1000) AS PopularPostsCount
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.PostId
+-- removed incorrect join to Tags by u.Id = t.Id (tags unrelated); Tags used in subquery instead
+WHERE u.Reputation > 0
+  AND u.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '5 year'
+  AND (
+        p.Id IS NULL OR (p.Id IS NOT NULL AND (p.PostTypeId IN (1,2) OR p.PostTypeId IS NULL))
+      )
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.LastAccessDate,
+    u.CreationDate
+HAVING 
+    COUNT(DISTINCT COALESCE(p.Id, 0)) > 0
+    AND COUNT(DISTINCT COALESCE(c.Id, 0)) >= 0
+    AND COUNT(DISTINCT CASE WHEN b.Id IS NOT NULL THEN b.Id ELSE 0 END) >= 0
+ORDER BY 
+    TotalQuestionScore DESC,
+    TotalAnswerScore DESC,
+    TotalPosts DESC;

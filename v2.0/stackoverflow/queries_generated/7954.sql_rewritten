@@ -1,0 +1,390 @@
+-- {"query": "7954.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3803} 
+WITH PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.Body,
+        COALESCE(p.ParentId, p.Id) AS ThreadId,
+        ROW_NUMBER() OVER (PARTITION BY COALESCE(p.ParentId, p.Id) ORDER BY p.CreationDate) AS PostSequence,
+        LAG(p.Score) OVER (PARTITION BY COALESCE(p.ParentId, p.Id) ORDER BY p.CreationDate) AS PrevScore,
+        LAG(p.CreationDate) OVER (PARTITION BY COALESCE(p.ParentId, p.Id) ORDER BY p.CreationDate) AS PrevCreationDate,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        NTILE(100) OVER (ORDER BY p.Score) AS ScorePercentile,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 10 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'None'
+        END AS ScoreCategory,
+        COALESCE(p.Tags, '') AS CleanTags,
+        LENGTH(p.Body) AS BodyLength,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'QuestionWithAcceptedAnswer'
+            WHEN p.PostTypeId = 1 THEN 'QuestionWithoutAcceptedAnswer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeCategory
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+      AND p.CreationDate >= '2022-01-01'
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT ps.PostId) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN ps.PostTypeId = 1 THEN ps.PostId END) AS Questions,
+        COUNT(DISTINCT CASE WHEN ps.PostTypeId = 2 THEN ps.PostId END) AS Answers,
+        SUM(ps.Score) AS TotalScore,
+        AVG(ps.Score) AS AvgScore,
+        MAX(ps.LastActivityDate) AS LastActivity,
+        COUNT(DISTINCT CASE WHEN ps.PostTypeId = 1 AND ps.Score >= 10 THEN ps.PostId END) AS HighScoreQuestions,
+        COUNT(DISTINCT CASE WHEN ps.PostTypeId = 2 AND ps.Score >= 10 THEN ps.PostId END) AS HighScoreAnswers,
+        RANK() OVER (ORDER BY SUM(ps.Score) DESC) AS UserScoreRank,
+        CASE 
+            WHEN COUNT(DISTINCT ps.PostId) > 100 THEN 'Veteran'
+            WHEN COUNT(DISTINCT ps.PostId) > 50 THEN 'Experienced'
+            WHEN COUNT(DISTINCT ps.PostId) > 10 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS ExperienceLevel
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    WHERE u.Reputation >= 100
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TagFrequency AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE 
+            WHEN t.Count >= 1000 THEN 'Popular'
+            WHEN t.Count >= 100 THEN 'ModeratelyPopular'
+            WHEN t.Count >= 10 THEN 'LessPopular'
+            ELSE 'Rare'
+        END AS PopularityLevel
+    FROM Tags t
+    WHERE t.Count > 0
+),
+PostAnalysis AS (
+    SELECT 
+        ps.PostId,
+        ps.PostTypeId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate,
+        ps.LastActivityDate,
+        ps.Title,
+        ps.Tags,
+        ps.BodyLength,
+        ps.ScoreCategory,
+        ps.ScoreRank,
+        ps.ScorePercentile,
+        ps.PostSequence,
+        ps.PrevScore,
+        ps.PrevCreationDate,
+        ps.ThreadId,
+        ps.PostTypeCategory,
+        CASE 
+            WHEN ps.PrevCreationDate IS NOT NULL THEN 
+                EXTRACT(EPOCH FROM (ps.CreationDate - ps.PrevCreationDate)) / 3600.0
+            ELSE NULL 
+        END AS HoursSincePrevPost,
+        CASE 
+            WHEN ps.PrevScore IS NOT NULL THEN ps.Score - ps.PrevScore
+            ELSE 0 
+        END AS ScoreChange,
+        CASE 
+            WHEN ps.Score > 50 THEN 'VeryHigh'
+            WHEN ps.Score > 25 THEN 'High'
+            WHEN ps.Score > 10 THEN 'Medium'
+            WHEN ps.Score > 0 THEN 'Low'
+            ELSE 'Negative'
+        END AS ScoreTier
+    FROM PostStats ps
+),
+AnswerQuality AS (
+    SELECT 
+        pa.PostId,
+        pa.OwnerUserId,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.CreationDate,
+        pa.Title,
+        pa.Tags,
+        pa.BodyLength,
+        pa.ScoreCategory,
+        pa.ScoreTier,
+        pa.ScorePercentile,
+        pa.PostSequence,
+        pa.HoursSincePrevPost,
+        pa.ScoreChange,
+        pa.ThreadId,
+        pa.PostTypeCategory,
+        ROW_NUMBER() OVER (PARTITION BY pa.ThreadId ORDER BY pa.Score DESC) AS AnswerRank,
+        COUNT(*) OVER (PARTITION BY pa.ThreadId) AS TotalAnswersInThread
+    FROM PostAnalysis pa
+    WHERE pa.PostTypeId = 2
+),
+QuestionAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.OwnerUserId,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.CreationDate,
+        pa.Title,
+        pa.Tags,
+        pa.BodyLength,
+        pa.ScoreCategory,
+        pa.ScoreTier,
+        pa.ScorePercentile,
+        pa.ThreadId,
+        pa.PostTypeCategory,
+        pa.PostSequence,
+        pa.HoursSincePrevPost,
+        pa.ScoreChange,
+        CASE 
+            WHEN pa.AnswerCount IS NULL OR pa.AnswerCount = 0 THEN 'Unanswered'
+            WHEN pa.AnswerCount = 1 THEN 'SingleAnswer'
+            WHEN pa.AnswerCount > 1 THEN 'MultipleAnswers'
+        END AS AnswerStatus,
+        CASE 
+            WHEN pa.AcceptedAnswerId IS NOT NULL THEN 'AnswerAccepted'
+            ELSE 'NoAnswerAccepted'
+        END AS AnswerAcceptanceStatus,
+        AVG(pa.Score) OVER (PARTITION BY pa.ThreadId) AS AvgThreadScore,
+        COUNT(pa.PostId) OVER (PARTITION BY pa.ThreadId) AS ThreadSize
+    FROM PostAnalysis pa
+    WHERE pa.PostTypeId = 1
+),
+ActivityPatterns AS (
+    SELECT 
+        ua.UserId,
+        ua.Reputation,
+        ua.DisplayName,
+        ua.Views,
+        ua.UpVotes,
+        ua.DownVotes,
+        ua.AccountId,
+        ua.TotalPosts,
+        ua.Questions,
+        ua.Answers,
+        ua.TotalScore,
+        ua.AvgScore,
+        ua.LastActivity,
+        ua.HighScoreQuestions,
+        ua.HighScoreAnswers,
+        ua.UserScoreRank,
+        ua.ExperienceLevel,
+        COUNT(pa.PostId) AS PostsInLast30Days,
+        COUNT(DISTINCT CASE WHEN pa.PostTypeId = 1 THEN pa.PostId END) AS QuestionsInLast30Days,
+        COUNT(DISTINCT CASE WHEN pa.PostTypeId = 2 THEN pa.PostId END) AS AnswersInLast30Days,
+        SUM(pa.Score) AS ScoreLast30Days,
+        MIN(pa.LastActivityDate) AS FirstActivity,
+        MAX(pa.LastActivityDate) AS LastActivity30Days,
+        AVG(pa.Score) AS AvgScore30Days,
+        STRING_AGG(COALESCE(pa.Title, ''), ' | ') AS RecentTitles,
+        STRING_AGG(CASE WHEN pa.PostTypeId = 1 THEN pa.Title ELSE NULL END, ' | ') AS RecentQuestions,
+        STRING_AGG(CASE WHEN pa.PostTypeId = 2 THEN pa.Title ELSE NULL END, ' | ') AS RecentAnswers
+    FROM UserActivity ua
+    LEFT JOIN PostAnalysis pa ON ua.UserId = pa.OwnerUserId
+        AND pa.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    GROUP BY 
+        ua.UserId, ua.Reputation, ua.DisplayName, ua.Views, ua.UpVotes, ua.DownVotes,
+        ua.AccountId, ua.TotalPosts, ua.Questions, ua.Answers, ua.TotalScore,
+        ua.AvgScore, ua.LastActivity, ua.HighScoreQuestions, ua.HighScoreAnswers,
+        ua.UserScoreRank, ua.ExperienceLevel
+)
+SELECT 
+    'Top Performed Posts' AS AnalysisCategory,
+    'All' AS FilterType,
+    COUNT(*) AS TotalPosts,
+    SUM(CASE WHEN pa.Score > 0 THEN 1 ELSE 0 END) AS PositiveScorePosts,
+    AVG(pa.Score) AS AvgScore,
+    MAX(pa.Score) AS MaxScore,
+    MIN(pa.Score) AS MinScore,
+    SUM(pa.ViewCount) AS TotalViews,
+    AVG(pa.ViewCount) AS AvgViews,
+    COUNT(pa.Title) AS PostsHavingTitles,
+    COUNT(pa.Tags) AS PostsHavingTags,
+    STRING_AGG(DISTINCT CASE WHEN pa.Title IS NOT NULL THEN pa.Title ELSE '' END, ' | ') AS SampleTitles,
+    STRING_AGG(DISTINCT CASE WHEN pa.Tags IS NOT NULL THEN pa.Tags ELSE '' END, ' | ') AS SampleTags
+FROM PostAnalysis pa
+WHERE pa.Score >= 10
+    AND pa.BodyLength > 100
+    AND pa.PostTypeCategory IN ('QuestionWithAcceptedAnswer', 'QuestionWithoutAcceptedAnswer', 'Answer')
+    AND pa.CreationDate >= '2022-01-01'
+    AND pa.CreationDate <= '2024-12-31'
+    AND pa.ThreadId IN (
+        SELECT ThreadId
+        FROM PostAnalysis pa2
+        WHERE pa2.Score >= 50
+        GROUP BY ThreadId
+        HAVING COUNT(*) >= 2
+    )
+    AND pa.ScorePercentile >= 90
+    AND EXISTS (
+        SELECT 1
+        FROM Votes v
+        WHERE v.PostId = pa.PostId
+            AND v.VoteTypeId IN (1, 2, 3)
+            AND v.CreationDate >= pa.CreationDate - INTERVAL '7 days'
+    )
+UNION ALL
+SELECT 
+    'User Performance Analysis' AS AnalysisCategory,
+    'Top Users by Reputation' AS FilterType,
+    COUNT(*) AS TotalUsers,
+    SUM(CASE WHEN ua.TotalScore > 0 THEN 1 ELSE 0 END) AS UsersWithPositiveScore,
+    AVG(ua.TotalScore) AS AvgUserScore,
+    MAX(ua.TotalScore) AS MaxUserScore,
+    MIN(ua.TotalScore) AS MinUserScore,
+    SUM(ua.Views) AS TotalUserViews,
+    AVG(ua.Views) AS AvgUserViews,
+    AVG(ua.Reputation) AS AvgReputation,
+    COUNT(ua.DisplayName) AS UsersWithDisplayNames,
+    STRING_AGG(DISTINCT ua.DisplayName, ' | ') AS TopUserNames,
+    STRING_AGG(DISTINCT ua.ExperienceLevel, ' | ') AS ExperienceLevelBreakdown
+FROM UserActivity ua
+WHERE ua.Reputation >= 5000
+    AND ua.TotalPosts >= 100
+    AND ua.LastActivity >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    AND ua.HighScoreQuestions >= 10
+    AND ua.HighScoreAnswers >= 10
+    AND EXISTS (
+        SELECT 1
+        FROM Posts p
+        WHERE p.OwnerUserId = ua.UserId
+            AND p.Score >= 50
+            AND p.CreationDate >= '2022-01-01'
+    )
+UNION ALL
+SELECT 
+    'Tag Analysis' AS AnalysisCategory,
+    'Popular Tags' AS FilterType,
+    COUNT(*) AS TotalTags,
+    SUM(CASE WHEN tf.Count > 100 THEN 1 ELSE 0 END) AS PopularTags,
+    AVG(tf.Count) AS AvgTagCount,
+    MAX(tf.Count) AS MaxTagCount,
+    MIN(tf.Count) AS MinTagCount,
+    SUM(tf.Count) AS TotalTagReferences,
+    AVG(tf.Count) AS AvgTagReference,
+    STRING_AGG(DISTINCT CASE WHEN tf.Count >= 1000 THEN tf.TagName ELSE NULL END, ' | ') AS MostPopularTags,
+    STRING_AGG(DISTINCT CASE WHEN tf.Count >= 100 THEN tf.TagName ELSE NULL END, ' | ') AS ModeratelyPopularTags,
+    COUNT(CASE WHEN tf.IsModeratorOnly = 1 THEN 1 END) AS ModeratorOnlyTags,
+    COUNT(CASE WHEN tf.IsRequired = 1 THEN 1 END) AS RequiredTags
+FROM TagFrequency tf
+WHERE tf.Count >= 10
+    AND tf.PopularityLevel IN ('Popular', 'ModeratelyPopular')
+    AND tf.TagName IS NOT NULL
+    AND LENGTH(tf.TagName) > 2
+    AND EXISTS (
+        SELECT 1
+        FROM Posts p
+        WHERE p.Tags LIKE '%' || tf.TagName || '%'
+            AND p.CreationDate >= '2022-01-01'
+            AND p.PostTypeId = 1
+    )
+UNION ALL
+SELECT 
+    'Question Quality Metrics' AS AnalysisCategory,
+    'High-Value Questions' AS FilterType,
+    COUNT(*) AS TotalQuestions,
+    COUNT(CASE WHEN qa.AnswerStatus = 'AnswerAccepted' THEN 1 END) AS QuestionsWithAcceptedAnswer,
+    AVG(qa.AnswerCount) AS AvgAnswerCount,
+    MAX(qa.AnswerCount) AS MaxAnswerCount,
+    MIN(qa.AnswerCount) AS MinAnswerCount,
+    AVG(qa.ViewCount) AS AvgViewCount,
+    MAX(qa.ViewCount) AS MaxViewCount,
+    MIN(qa.ViewCount) AS MinViewCount,
+    AVG(qa.CommentCount) AS AvgCommentCount,
+    MAX(qa.CommentCount) AS MaxCommentCount,
+    MIN(qa.CommentCount) AS MinCommentCount,
+    AVG(qa.FavoriteCount) AS AvgFavoriteCount,
+    MAX(qa.FavoriteCount) AS MaxFavoriteCount,
+    MIN(qa.FavoriteCount) AS MinFavoriteCount,
+    STRING_AGG(DISTINCT CASE WHEN qa.AnswerStatus = 'AnswerAccepted' THEN qa.Title ELSE NULL END, ' | ') AS QuestionsWithAnswers,
+    STRING_AGG(DISTINCT qa.Title, ' | ') AS SampleQuestionTitles,
+    STRING_AGG(DISTINCT CASE WHEN qa.AnswerStatus = 'Unanswered' THEN qa.Title ELSE NULL END, ' | ') AS UnansweredQuestions
+FROM QuestionAnalysis qa
+WHERE qa.AnswerStatus IN ('SingleAnswer', 'MultipleAnswers', 'Unanswered')
+    AND qa.Score >= 25
+    AND qa.ViewCount >= 100
+    AND qa.ThreadSize >= 2
+    AND qa.CreationDate >= '2022-01-01'
+    AND qa.CreationDate <= '2024-12-31' 
+    AND EXISTS (
+        SELECT 1
+        FROM Posts p
+        WHERE p.Id = qa.PostId
+            AND p.ParentId IS NULL
+            AND p.PostTypeId = 1
+    )
+UNION ALL
+SELECT 
+    'Answer Quality' AS AnalysisCategory,
+    'High-Rated Answers' AS FilterType,
+    COUNT(*) AS TotalAnswers,
+    COUNT(CASE WHEN aa.ScoreTier IN ('High', 'VeryHigh') THEN 1 END) AS HighRatedAnswers,
+    AVG(aa.Score) AS AvgAnswerScore,
+    MAX(aa.Score) AS MaxAnswerScore,
+    MIN(aa.Score) AS MinAnswerScore,
+    AVG(aa.ViewCount) AS AvgAnswerViews,
+    MAX(aa.ViewCount) AS MaxAnswerViews,
+    MIN(aa.ViewCount) AS MinAnswerViews,
+    AVG(aa.CommentCount) AS AvgAnswerComments,
+    AVG(aa.FavoriteCount) AS AvgAnswerFavorites,
+    COUNT(CASE WHEN aa.AnswerRank = 1 THEN 1 END) AS TopRankedAnswers,
+    STRING_AGG(DISTINCT aa.Title, ' | ') AS SampleAnswerTitles,
+    STRING_AGG(DISTINCT CASE WHEN aa.ScoreTier = 'VeryHigh' THEN aa.Title ELSE NULL END, ' | ') AS TopScoredAnswers,
+    STRING_AGG(DISTINCT CASE WHEN aa.ThreadId IN (SELECT ThreadId FROM AnswerQuality WHERE ScoreTier = 'VeryHigh' LIMIT 100) THEN aa.Title ELSE NULL END, ' | ') AS SampleThreadAnswers
+FROM AnswerQuality aa
+WHERE aa.Score >= 10
+    AND aa.BodyLength > 50
+    AND aa.ScoreTier IN ('High', 'VeryHigh')
+    AND aa.CreationDate >= '2022-01-01'
+    AND aa.CreationDate <= '2024-12-31'
+    AND aa.ThreadId NOT IN (
+        SELECT DISTINCT ThreadId
+        FROM AnswerQuality
+        WHERE ScoreTier = 'VeryHigh'
+        GROUP BY ThreadId
+        HAVING COUNT(*) = 1
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM Posts p
+        WHERE p.Id = aa.PostId
+            AND p.PostTypeId = 2
+    )
+    AND NOT (aa.AnswerRank = 1 AND aa.TotalAnswersInThread = 1)
+ORDER BY AnalysisCategory;

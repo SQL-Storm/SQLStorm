@@ -1,0 +1,213 @@
+-- {"query": "1302.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3278} 
+WITH UserContributionSummary AS (
+    -- Aggregates various user activities to summarize their overall engagement and contribution profile.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN COALESCE(P.ViewCount, 0) ELSE 0 END) AS TotalQuestionViews,
+        SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL AND P.PostTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswerCountForQuestions,
+        MAX(U.LastAccessDate) AS UserLastActivity,
+        (
+            SELECT COUNT(V.Id)
+            FROM Votes AS V
+            WHERE V.UserId = U.Id AND V.VoteTypeId = 5 -- Favorite votes (as cast by user)
+        ) AS TotalFavoriteVotesCast
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    WHERE U.Id IS NOT NULL -- Exclude community user (-1) if it slips through joins
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+    HAVING COUNT(DISTINCT P.Id) > 5 -- Filter for users with a minimum number of posts
+),
+PostDetailsExtended AS (
+    -- Enriches post data with derived attributes and includes the most recent editor's information.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.Title,
+        P.Tags,
+        P.LastActivityDate,
+        P.ClosedDate,
+        PH_LatestEdit.CreationDate AS LastEditDate,
+        PH_LatestEdit.UserId AS LastEditorUserId,
+        PH_LatestEdit.UserDisplayName AS LastEditorDisplayName,
+        COALESCE(P.Score, 0) + COALESCE(P.FavoriteCount, 0) * 2 + COALESCE(P.ViewCount, 0) / 10 + COALESCE(P.CommentCount, 0) * 0.5 AS PostEngagementScore,
+        CASE
+            WHEN P.PostTypeId = 1 AND P.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+            WHEN P.PostTypeId = 1 AND P.AnswerCount > 0 THEN 'Answered'
+            WHEN P.PostTypeId = 1 AND P.AnswerCount = 0 THEN 'Unanswered'
+            ELSE 'N/A'
+        END AS QuestionStatus,
+        (SELECT COUNT(DISTINCT PH2.Id) FROM PostHistory AS PH2 WHERE PH2.PostId = P.Id AND PH2.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        LENGTH(P.Body) - LENGTH(REPLACE(P.Body, ' ', '')) AS WordCountEstimate -- Rough word count
+    FROM Posts AS P
+    INNER JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+    LEFT JOIN (
+        SELECT
+            Id, PostId, UserId, UserDisplayName, CreationDate,
+            ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY CreationDate DESC) AS rn
+        FROM PostHistory
+        WHERE PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+    ) AS PH_LatestEdit ON P.Id = PH_LatestEdit.PostId AND PH_LatestEdit.rn = 1 -- Get only the latest edit info
+    WHERE P.CreationDate >= '2019-01-01' -- Focus on more recent posts
+),
+RankedUserContributions AS (
+    -- Ranks users based on their contribution metrics and assigns them to performance deciles.
+    SELECT
+        UCS.UserId,
+        UCS.DisplayName,
+        UCS.Reputation,
+        UCS.TotalPosts,
+        UCS.TotalQuestions,
+        UCS.TotalAnswers,
+        UCS.TotalComments,
+        UCS.TotalBadges,
+        UCS.TotalPostScore,
+        UCS.TotalQuestionViews,
+        UCS.AcceptedAnswerCountForQuestions,
+        UCS.UserLastActivity,
+        UCS.TotalFavoriteVotesCast,
+        RANK() OVER (ORDER BY UCS.TotalPostScore DESC, UCS.TotalQuestions DESC, UCS.TotalBadges DESC) AS RankByOverallContribution,
+        NTILE(10) OVER (ORDER BY UCS.TotalBadges DESC, UCS.TotalPosts DESC, UCS.Reputation DESC) AS UserPerformanceDecile
+    FROM UserContributionSummary AS UCS
+    WHERE UCS.Reputation > 2000 AND UCS.TotalPosts > 10
+),
+HighlyInteractedPosts AS (
+    -- Identifies posts with significant user interactions (comments, views, favorites) and calculates comment sentiment.
+    SELECT
+        PDX.PostId,
+        PDX.PostTypeId,
+        PDX.PostTypeName,
+        PDX.OwnerUserId,
+        PDX.PostCreationDate,
+        PDX.Score,
+        PDX.ViewCount,
+        PDX.CommentCount,
+        PDX.FavoriteCount,
+        PDX.QuestionStatus,
+        PDX.PostEngagementScore,
+        PDX.Title,
+        AVG(C.Score) AS AverageCommentScore,
+        MAX(C.CreationDate) AS LastCommentDate,
+        LAG(PDX.PostEngagementScore, 1, 0) OVER (PARTITION BY PDX.OwnerUserId ORDER BY PDX.PostCreationDate) AS PreviousPostEngagementScore,
+        LEAD(PDX.PostEngagementScore, 1, 0) OVER (PARTITION BY PDX.OwnerUserId ORDER BY PDX.PostCreationDate) AS NextPostEngagementScore,
+        COUNT(DISTINCT C.Id) AS DistinctCommenters
+    FROM PostDetailsExtended AS PDX
+    LEFT JOIN Comments AS C ON PDX.PostId = C.PostId
+    WHERE (PDX.Score > 25 OR PDX.ViewCount > 500 OR PDX.FavoriteCount > 3 OR PDX.CommentCount > 5)
+    GROUP BY PDX.PostId, PDX.PostTypeId, PDX.PostTypeName, PDX.OwnerUserId, PDX.PostCreationDate, PDX.Score, PDX.ViewCount, PDX.CommentCount, PDX.FavoriteCount, PDX.QuestionStatus, PDX.PostEngagementScore, PDX.Title
+    HAVING COUNT(C.Id) > 0 OR PDX.PostTypeId = 1 -- Ensure comments exist or it's a question
+),
+PostLinkAndMigrationInfo AS (
+    -- Gathers information about linked posts, duplicates, and migration events.
+    SELECT
+        P.Id AS PostId,
+        STRING_AGG(DISTINCT LT.Name || '->' || PL.RelatedPostId::text, '; ') AS RelatedPostsSummary,
+        MAX(CASE WHEN PL.LinkTypeId = 3 THEN TRUE ELSE FALSE END) AS IsDuplicateSource,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 35 THEN 'Migrated Away' WHEN PH.PostHistoryTypeId = 36 THEN 'Migrated Here' ELSE NULL END) AS MigrationStatus,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 35 OR PH.PostHistoryTypeId = 36 THEN PH.CreationDate ELSE NULL END) AS MigrationDate
+    FROM Posts AS P
+    LEFT JOIN PostLinks AS PL ON P.Id = PL.PostId
+    LEFT JOIN LinkTypes AS LT ON PL.LinkTypeId = LT.Id
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId IN (35, 36)
+    GROUP BY P.Id
+)
+SELECT
+    RUC.UserId,
+    RUC.DisplayName,
+    RUC.Reputation,
+    RUC.RankByOverallContribution,
+    RUC.UserPerformanceDecile,
+    HIP.PostId AS HighEngagementPostId,
+    HIP.PostTypeName,
+    HIP.PostCreationDate,
+    HIP.Score AS PostScore,
+    HIP.ViewCount AS PostViewCount,
+    HIP.CommentCount AS PostCommentCount,
+    HIP.FavoriteCount AS PostFavoriteCount,
+    HIP.QuestionStatus,
+    HIP.Title AS PostTitle,
+    HIP.PreviousPostEngagementScore,
+    HIP.NextPostEngagementScore,
+    (HIP.PostEngagementScore - COALESCE(HIP.PreviousPostEngagementScore, 0)) AS EngagementScoreDelta,
+    COALESCE(HIP.AverageCommentScore, 0.0) AS AvgCommentScore,
+    HIP.LastCommentDate,
+    PDX.EditCount AS PostTotalEditCount,
+    PDX.LastEditorDisplayName,
+    PDX.WordCountEstimate,
+    PLMI.RelatedPostsSummary,
+    PLMI.IsDuplicateSource,
+    PLMI.MigrationStatus,
+    PLMI.MigrationDate,
+    (
+        -- Correlated subquery: Calculates the average score of other questions by the same user, created within a year of this post.
+        SELECT AVG(P_OTHER.Score)
+        FROM Posts AS P_OTHER
+        WHERE P_OTHER.OwnerUserId = RUC.UserId
+          AND P_OTHER.PostTypeId = 1 -- Only questions
+          AND P_OTHER.Id != HIP.PostId
+          AND P_OTHER.CreationDate BETWEEN HIP.PostCreationDate - INTERVAL '1 year' AND HIP.PostCreationDate + INTERVAL '1 year'
+    ) AS AvgSiblingQuestionScore,
+    (
+        -- Correlated subquery: Checks if the user received any gold badges *after* the creation of this specific post.
+        SELECT MAX(CASE WHEN B_GOLD.Class = 1 THEN TRUE ELSE FALSE END)
+        FROM Badges AS B_GOLD
+        WHERE B_GOLD.UserId = RUC.UserId
+          AND B_GOLD.Date > HIP.PostCreationDate
+    ) AS HasGoldBadgeAfterPost,
+    (
+        -- Correlated subquery: Finds the number of distinct users who voted 'Up' on this post (excluding the owner).
+        SELECT COUNT(DISTINCT V_UP.UserId)
+        FROM Votes AS V_UP
+        WHERE V_UP.PostId = HIP.PostId
+          AND V_UP.VoteTypeId = 2 -- UpMod (upvote)
+          AND V_UP.UserId != HIP.OwnerUserId
+    ) AS DistinctUpVoters,
+    UPPER(LEFT(COALESCE(HIP.Title, 'NO TITLE PROVIDED'), 1)) AS FirstLetterOfTitle, -- String expression & NULL logic
+    EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - HIP.PostCreationDate)) / (60*60*24*365.25)::numeric(10,2) AS PostAgeYears, -- Complex calculation
+    COALESCE(TRIM(UNNEST(string_to_array(SUBSTRING(PDX.Tags, 2, LENGTH(PDX.Tags) - 2), '><'))), 'untagged') AS PrimaryTag, -- PostgreSQL specific tag extraction
+    (SELECT T.Count FROM Tags AS T WHERE T.TagName = TRIM(UNNEST(string_to_array(SUBSTRING(PDX.Tags, 2, LENGTH(PDX.Tags) - 2), '><')))) AS TagPopularityCount -- Join to Tags table to get count for the first tag
+FROM RankedUserContributions AS RUC
+INNER JOIN PostDetailsExtended AS PDX ON RUC.UserId = PDX.OwnerUserId
+INNER JOIN HighlyInteractedPosts AS HIP ON PDX.PostId = HIP.PostId AND PDX.PostTypeId = HIP.PostTypeId AND PDX.OwnerUserId = HIP.OwnerUserId
+LEFT JOIN PostLinkAndMigrationInfo AS PLMI ON HIP.PostId = PLMI.PostId
+WHERE RUC.UserPerformanceDecile <= 3 -- Focus on top 30% most performant users
+  AND HIP.PostScore > 50
+  AND (PDX.QuestionStatus IN ('Answered & Accepted', 'Answered') OR PDX.PostTypeId = 2) -- Valid questions or answers
+  AND (HIP.Title LIKE '%sql%' OR HIP.Title LIKE '%database%' OR HIP.Title IS NULL) -- Complex predicate with NULL logic
+  AND HIP.PostCreationDate > RUC.UserCreationDate + INTERVAL '6 months' -- Post after user established for 6 months
+  AND NOT EXISTS (
+        -- Correlated subquery: Excludes posts that were closed as exact duplicates of another highly-scored post.
+        SELECT 1
+        FROM PostHistory AS PH_CLOSED
+        INNER JOIN CloseReasonTypes AS CRT ON PH_CLOSED.Comment = CRT.Id::text -- Assuming Comment stores CloseReasonId
+        INNER JOIN PostLinks AS PL_DUP ON PH_CLOSED.PostId = PL_DUP.PostId AND PL_DUP.LinkTypeId = 3 -- Duplicate link
+        INNER JOIN Posts AS P_DUP ON PL_DUP.RelatedPostId = P_DUP.Id
+        WHERE PH_CLOSED.PostId = HIP.PostId
+          AND PH_CLOSED.PostHistoryTypeId = 10 -- Post Closed
+          AND CRT.Name LIKE '%Duplicate%' -- Covers both 'Exact Duplicate' and 'Duplicate'
+          AND P_DUP.Score > 150
+          AND P_DUP.CreationDate < HIP.PostCreationDate -- Original duplicate post created earlier
+    )
+ORDER BY RUC.Reputation DESC, HIP.PostEngagementScore DESC, RUC.UserPerformanceDecile ASC
+LIMIT 1000 OFFSET 200;

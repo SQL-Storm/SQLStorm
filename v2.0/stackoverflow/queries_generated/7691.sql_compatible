@@ -1,0 +1,271 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        AVG(COALESCE(p.Score, 0)) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(p.Title, ' | ' ORDER BY p.CreationDate) AS PostTitles
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        ups.*,
+        ROW_NUMBER() OVER (ORDER BY ups.TotalScore DESC) AS ScoreRank,
+        RANK() OVER (ORDER BY ups.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY ups.QuestionCount DESC) AS QuestionRank,
+        NTILE(10) OVER (ORDER BY ups.TotalPosts DESC) AS PostDistribution
+    FROM UserPostStats ups
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(AVG(p.ViewCount), 0) AS AvgViewCount,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        STRING_AGG(p.Title, ' | ' ORDER BY p.CreationDate) AS RelatedTitles
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE t.TagName IS NOT NULL AND t.TagName <> ''
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+ComplexVotes AS (
+    SELECT 
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        v.CreationDate,
+        COUNT(*) OVER (PARTITION BY v.PostId ORDER BY v.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeVotes,
+        LAG(v.CreationDate, 1) OVER (PARTITION BY v.PostId ORDER BY v.CreationDate) AS PrevVoteDate,
+        CASE 
+            WHEN v.VoteTypeId IN (2, 3) THEN 'Scoring'
+            WHEN v.VoteTypeId IN (1, 5, 8, 9) THEN 'Special'
+            ELSE 'Other'
+        END AS VoteCategory,
+        EXTRACT(EPOCH FROM (v.CreationDate - LAG(v.CreationDate, 1) OVER (PARTITION BY v.PostId ORDER BY v.CreationDate))) / 3600.0 AS HoursSincePrevVote
+    FROM Votes v
+    WHERE v.PostId IS NOT NULL
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastEditDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        COALESCE(COUNT(DISTINCT v.Id), 0) AS VoteCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END), 0) AS FavoriteVotes,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN CONCAT('Question: ', p.Title)
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostTypeDesc,
+        (CAST(p.LastEditDate AS timestamp) - CAST(p.CreationDate AS timestamp)) / INTERVAL '1 day' AS DaysSinceCreation,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High'
+            WHEN p.ViewCount > 100 THEN 'Medium'
+            WHEN p.ViewCount > 0 THEN 'Low'
+            ELSE 'None'
+        END AS ViewLevel,
+        COALESCE(STRING_AGG(CAST(v.UserId AS VARCHAR), ', '), 'No votes') AS Voters
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY 
+        p.Id, 
+        p.Title, 
+        p.Score, 
+        p.ViewCount, 
+        p.CreationDate, 
+        p.LastEditDate, 
+        p.OwnerUserId, 
+        p.ParentId, 
+        p.PostTypeId, 
+        p.Tags, 
+        p.AnswerCount, 
+        p.CommentCount, 
+        p.FavoriteCount
+),
+FinalAnalysis AS (
+    SELECT 
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.TotalPosts,
+        r.QuestionCount,
+        r.AnswerCount,
+        r.TotalScore,
+        r.AvgScore,
+        r.ScoreRank,
+        r.ReputationRank,
+        r.QuestionRank,
+        r.PostDistribution,
+        ta.Count AS TagCount,
+        ta.PostCount AS TagPostCount,
+        ta.RelatedTitles AS TagRelatedTitles,
+        CASE 
+            WHEN r.TotalPosts > 1000 THEN 'Elite'
+            WHEN r.TotalPosts > 500 THEN 'Veteran'
+            WHEN r.TotalPosts > 100 THEN 'Experienced'
+            WHEN r.TotalPosts > 10 THEN 'Active'
+            ELSE 'Beginning'
+        END AS PostingStatus,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = r.UserId AND CAST(p.CreationDate AS date) = DATE '2024-10-01'),
+            0
+        ) AS PostsToday,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.UserId = r.UserId AND CAST(c.CreationDate AS date) = DATE '2024-10-01'),
+            0
+        ) AS CommentsToday,
+        LAG(r.TotalScore, 1) OVER (ORDER BY r.TotalScore DESC) - r.TotalScore AS ScoreDifferenceFromPrev,
+        CASE 
+            WHEN r.Reputation > 10000 OR r.TotalScore > 5000 THEN 'Power User'
+            WHEN r.Reputation > 5000 OR r.TotalScore > 2500 THEN 'Regular User'
+            WHEN r.Reputation > 1000 OR r.TotalScore > 500 THEN 'Contributor'
+            ELSE 'New User'
+        END AS CommunityRole,
+        CASE 
+            WHEN r.QuestionCount > r.AnswerCount THEN 'Question-focused'
+            WHEN r.AnswerCount > r.QuestionCount THEN 'Answer-focused'
+            WHEN r.QuestionCount = 0 OR r.AnswerCount = 0 THEN 'Unbalanced'
+            ELSE 'Balanced'
+        END AS UserFocusType,
+        COALESCE(
+            (SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = r.UserId),
+            'No badges'
+        ) AS UserBadges
+    FROM RankedUsers r
+    LEFT JOIN TagAnalysis ta ON (
+        (ta.TagName LIKE CONCAT('%', SUBSTRING(r.DisplayName FROM 1 FOR 2), '%') OR ta.TagName LIKE CONCAT('%', RIGHT(r.DisplayName, 2), '%'))
+        OR (ta.TagName LIKE '%C++%' OR ta.TagName LIKE '%SQL%' OR ta.TagName LIKE '%Python%' OR ta.TagName LIKE '%JavaScript%')
+    )
+    WHERE r.Reputation > 0
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.TotalPosts,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.TotalScore,
+    fa.AvgScore,
+    fa.ScoreRank,
+    fa.ReputationRank,
+    fa.QuestionRank,
+    fa.PostDistribution,
+    fa.TagCount,
+    fa.TagPostCount,
+    fa.TagRelatedTitles,
+    fa.PostingStatus,
+    fa.PostsToday,
+    fa.CommentsToday,
+    fa.ScoreDifferenceFromPrev,
+    fa.CommunityRole,
+    fa.UserFocusType,
+    fa.UserBadges,
+    RANK() OVER (ORDER BY fa.Reputation DESC, fa.TotalScore DESC) AS OverallRank,
+    DENSE_RANK() OVER (ORDER BY fa.Reputation DESC) AS ReputationDenseRank,
+    NTILE(5) OVER (ORDER BY fa.TotalScore DESC) AS ScoreQuintile,
+    ROW_NUMBER() OVER (PARTITION BY fa.PostDistribution ORDER BY fa.TotalScore DESC) AS PostsInDistribution,
+    CASE 
+        WHEN fa.TagCount > 50 THEN 'Expert'
+        WHEN fa.TagCount > 20 THEN 'Advanced'
+        WHEN fa.TagCount > 5 THEN 'Intermediate'
+        WHEN fa.TagCount > 0 THEN 'Beginner'
+        ELSE 'None'
+    END AS TagExpertiseLevel,
+    COALESCE(
+        (SELECT COUNT(*) FROM Users u WHERE u.Reputation > fa.Reputation AND u.Id <> fa.UserId),
+        0
+    ) AS UsersWithHigherReputation,
+    COALESCE(
+        (SELECT COUNT(*) FROM Users u WHERE u.Reputation < fa.Reputation AND u.Id <> fa.UserId),
+        0
+    ) AS UsersWithLowerReputation,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM Posts p 
+            JOIN PostHistory ph ON p.Id = ph.PostId 
+            WHERE p.OwnerUserId = fa.UserId 
+            AND ph.PostHistoryTypeId = 10 
+            AND ph.CreationDate > DATE '2024-10-01' - INTERVAL '7 DAY'
+        ) THEN 'RecentlyClosed'
+        ELSE 'NotRecentlyClosed'
+    END AS RecentActivityStatus,
+    (SELECT 
+        STRING_AGG(
+            CONCAT('Post ID: ', CAST(pa.PostId AS VARCHAR), ' Title: ', pa.Title, ' Score: ', CAST(pa.Score AS VARCHAR)),
+            ' | '
+        ORDER BY pa.Score DESC)
+     FROM PostAnalysis pa 
+     WHERE pa.OwnerUserId = fa.UserId 
+     AND pa.Score > 100) AS HighScoringPosts,
+    COALESCE(
+        (SELECT COUNT(*) FROM Badges b 
+         WHERE b.UserId = fa.UserId 
+         AND b.Date > DATE '2024-10-01' - INTERVAL '30 DAY'),
+        0
+    ) AS RecentBadges,
+    CASE 
+        WHEN fa.QuestionCount > 0 THEN (CAST(fa.AnswerCount AS numeric) / CAST(fa.QuestionCount AS numeric)) * 100
+        ELSE 0
+    END AS AnswerToQuestionRatio
+FROM FinalAnalysis fa
+WHERE fa.ReputationRank > 0
+  AND fa.ScoreRank > 0
+  AND fa.Reputation IS NOT NULL
+  AND (fa.PostingStatus IS NOT NULL OR fa.UserFocusType IS NOT NULL)
+GROUP BY
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.TotalPosts,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.TotalScore,
+    fa.AvgScore,
+    fa.ScoreRank,
+    fa.ReputationRank,
+    fa.QuestionRank,
+    fa.PostDistribution,
+    fa.TagCount,
+    fa.TagPostCount,
+    fa.TagRelatedTitles,
+    fa.PostingStatus,
+    fa.PostsToday,
+    fa.CommentsToday,
+    fa.ScoreDifferenceFromPrev,
+    fa.CommunityRole,
+    fa.UserFocusType,
+    fa.UserBadges,
+    fa.TagExpertiseLevel,
+    fa.UsersWithHigherReputation,
+    fa.UsersWithLowerReputation,
+    fa.RecentActivityStatus,
+    fa.HighScoringPosts,
+    fa.RecentBadges,
+    fa.AnswerToQuestionRatio
+HAVING COUNT(*) > 0
+ORDER BY fa.TotalScore DESC, fa.Reputation DESC, fa.QuestionCount DESC
+LIMIT 5000;

@@ -1,0 +1,201 @@
+-- {"query": "7034.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1819} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS TotalAnswerScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate) AS AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Beginner'
+            ELSE 'Newbie'
+        END AS ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+TopQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        u.DisplayName AS OwnerName,
+        DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), p.CreationDate) AS AgeInDays,
+        CASE 
+            WHEN p.Score > 100 THEN 'Hot'
+            WHEN p.Score > 50 THEN 'Popular'
+            WHEN p.Score > 10 THEN 'Normal'
+            ELSE 'Low'
+        END AS PopularityLevel,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS RankWithinUser
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= DATEADD(YEAR, -1, cast('2024-10-01 12:34:56' as timestamp))
+),
+QuestionTags AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Tags,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><') AS TagArray,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags != ''
+    GROUP BY p.Id, p.Title, p.Tags
+),
+TagFrequency AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Trending'
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 10 THEN 'Common'
+            ELSE 'Niche'
+        END AS TagCategory
+    FROM Tags t
+),
+UserPerformance AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.TotalQuestionScore,
+        us.TotalAnswerScore,
+        us.BadgeCount,
+        us.CommentCount,
+        us.PostHistoryCount,
+        us.AccountAgeDays,
+        us.ReputationTier,
+        CASE 
+            WHEN us.TotalQuestionScore + us.TotalAnswerScore > 1000 THEN 'High Performer'
+            WHEN us.TotalQuestionScore + us.TotalAnswerScore > 500 THEN 'Medium Performer'
+            WHEN us.TotalQuestionScore + us.TotalAnswerScore > 100 THEN 'Low Performer'
+            ELSE 'Beginner'
+        END AS PerformanceLevel
+    FROM UserStats us
+)
+SELECT 
+    up.UserId,
+    up.DisplayName,
+    up.Reputation,
+    up.QuestionCount,
+    up.AnswerCount,
+    up.TotalQuestionScore,
+    up.TotalAnswerScore,
+    up.BadgeCount,
+    up.CommentCount,
+    up.PostHistoryCount,
+    up.AccountAgeDays,
+    up.ReputationTier,
+    up.PerformanceLevel,
+    CASE 
+        WHEN up.QuestionCount > 0 THEN ROUND((up.TotalQuestionScore * 1.0 / up.QuestionCount), 2)
+        ELSE 0
+    END AS AvgQuestionScore,
+    CASE 
+        WHEN up.AnswerCount > 0 THEN ROUND((up.TotalAnswerScore * 1.0 / up.AnswerCount), 2)
+        ELSE 0
+    END AS AvgAnswerScore,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM TopQuestions tq 
+         WHERE tq.QuestionId IN (
+             SELECT p.Id 
+             FROM Posts p 
+             WHERE p.OwnerUserId = up.UserId AND p.PostTypeId = 1
+         ) 
+         AND tq.RankWithinUser <= 5), 0
+    ) AS Top5Questions,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM QuestionTags qt 
+         WHERE qt.QuestionId IN (
+             SELECT p.Id 
+             FROM Posts p 
+             WHERE p.OwnerUserId = up.UserId AND p.PostTypeId = 1
+         )), 0
+    ) AS TagsCount,
+    (SELECT 
+        STRING_AGG(
+            CONCAT(tq.Title, ' (Score: ', tq.Score, ')'), 
+            '; '
+            ORDER BY tq.Score DESC
+        ) 
+     FROM TopQuestions tq 
+     WHERE tq.QuestionId IN (
+         SELECT p.Id 
+         FROM Posts p 
+         WHERE p.OwnerUserId = up.UserId AND p.PostTypeId = 1
+     ) 
+     AND tq.RankWithinUser <= 3
+    ) AS Top3Questions,
+    CASE 
+        WHEN up.Reputation > 10000 AND up.AnswerCount > 100 THEN 'Expert Contributor'
+        WHEN up.Reputation > 5000 AND up.QuestionCount > 50 THEN 'Active Contributor'
+        WHEN up.Reputation > 1000 THEN 'Regular Contributor'
+        ELSE 'Contributor'
+    END AS ContributionLevel,
+    COUNT(DISTINCT ph.PostId) AS UniquePostEdited,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p1 
+        WHERE p1.OwnerUserId = up.UserId AND p1.PostTypeId = 1
+        AND EXISTS (
+            SELECT 1 
+            FROM Posts p2 
+            WHERE p2.ParentId = p1.Id AND p2.PostTypeId = 2
+        )
+    ) AS QuestionsWithAnswers,
+    (
+        SELECT AVG(p.Score) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = up.UserId AND p.PostTypeId IN (1, 2)
+    ) AS AvgPostScore,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = up.UserId AND p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL
+    ) AS ClosedQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = up.UserId AND p.PostTypeId = 1 AND p.CommunityOwnedDate IS NOT NULL
+    ) AS CommunityOwnedQuestions
+FROM UserPerformance up
+LEFT JOIN PostHistory ph ON up.UserId = ph.UserId AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+GROUP BY 
+    up.UserId, up.DisplayName, up.Reputation, up.QuestionCount, up.AnswerCount,
+    up.TotalQuestionScore, up.TotalAnswerScore, up.BadgeCount, up.CommentCount,
+    up.PostHistoryCount, up.AccountAgeDays, up.ReputationTier, up.PerformanceLevel
+HAVING 
+    up.QuestionCount > 0 OR up.AnswerCount > 0
+ORDER BY 
+    up.Reputation DESC, 
+    up.TotalQuestionScore DESC,
+    up.TotalAnswerScore DESC
+LIMIT 100;

@@ -1,0 +1,153 @@
+with RecursiveTags as (
+  select
+    p.Id as PostId,
+    unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag
+  from Posts p
+  where p.PostTypeId = 1 and p.Tags is not null
+),
+TopUsers as (
+  select
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    row_number() over (order by u.Reputation desc nulls last) as Rnk
+  from Users u
+  where u.Reputation is not null
+),
+UserBadgesRanked as (
+  select
+    b.UserId,
+    b.Name,
+    b.Class,
+    row_number() over (partition by b.UserId order by b.Class, b.Date desc) as BadgeRank
+  from Badges b
+),
+UserVoteAgg as (
+  select
+    v.UserId,
+    sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotesCount,
+    sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotesCount,
+    count(*) as TotalVotes
+  from Votes v
+  join VoteTypes vt on vt.Id = v.VoteTypeId
+  where v.UserId is not null
+  group by v.UserId
+),
+PostAnswerStats as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    count(a.Id) filter (where a.Score > 5) as HighScoreAnswers,
+    avg(coalesce(a.Score, 0)) as AvgAnswerScore,
+    max(a.CreationDate) as LastAnswerDate,
+    count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateLinksCount
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  left join PostLinks pl on pl.PostId = q.Id
+  left join LinkTypes lt on lt.Id = pl.LinkTypeId
+  where q.PostTypeId = 1
+  group by q.Id, q.Title
+),
+UserActivityWindow as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    count(distinct p.Id) as PostsCount,
+    sum(p.Score) as TotalPostScore,
+    max(p.CreationDate) as LastPostDate,
+    lag(max(p.CreationDate)) over (order by u.Id) as PrevUserLastPost,
+    count(distinct ph.Id) filter (where ph.PostHistoryTypeId in (10,12)) as NumCloseOrDeleteEvents
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join PostHistory ph on ph.PostId = p.Id and ph.UserId = u.Id
+  group by u.Id, u.DisplayName
+),
+ComplexPosts as (
+  select
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.CreationDate,
+    case
+      when p.AcceptedAnswerId is not null then 'HasAcceptedAnswer'
+      else 'NoAcceptedAnswer'
+    end as AcceptedStatus,
+    length(p.Body) as BodyLength,
+    coalesce(p.FavoriteCount, 0) + coalesce(p.CommentCount, 0) as InteractionCount,
+    (select count(*) from PostHistory ph where ph.PostId = p.Id and ph.PostHistoryTypeId = 24) as SuggestEditAppliedCount,
+    (select sum(v.BountyAmount) from Votes v where v.PostId = p.Id and v.VoteTypeId in (8,9)) as TotalBountyAmount,
+    (select count(*) from Comments c where c.PostId = p.Id and c.Score > 0) as PositiveCommentsCount
+  from Posts p
+  where p.PostTypeId = 1
+),
+CombinedResults as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.Score,
+    q.ViewCount,
+    q.Tags,
+    u.DisplayName as Owner,
+    u.Reputation as OwnerReputation,
+    coalesce(ub.Class, 4) as TopBadgeClass,
+    ua.UpVotesCount,
+    ua.DownVotesCount,
+    pas.HighScoreAnswers,
+    pas.AvgAnswerScore,
+    pas.DuplicateLinksCount,
+    ca.SuggestEditAppliedCount,
+    ca.TotalBountyAmount,
+    ca.PositiveCommentsCount,
+    ua.TotalVotes,
+    ua.UpVotesCount - ua.DownVotesCount as VoteBalance,
+    case when ua.TotalVotes = 0 or ua.TotalVotes is null then null else ua.UpVotesCount * 1.0 / ua.TotalVotes end as UpVoteRatio,
+    row_number() over (partition by u.Id order by q.Score desc) as UserTopQuestionRank,
+    lag(q.Score) over (partition by u.Id order by q.Score desc) as PreviousQuestionScore,
+    (case when pas.LastAnswerDate is not null then timestamp '2024-10-01 12:34:56' - pas.LastAnswerDate else null end) as TimeSinceLastAnswer,
+    (select count(distinct ph2.Id)
+     from PostHistory ph2
+     where ph2.PostId = q.Id and ph2.PostHistoryTypeId = 10 and ph2.Comment is not null) as CloseVotesCount,
+    (select count(distinct ph3.Id)
+     from PostHistory ph3
+     where ph3.PostId = q.Id and ph3.PostHistoryTypeId = 6) as ReopenVotesCount
+  from Posts q
+  left join Users u on u.Id = q.OwnerUserId
+  left join UserBadgesRanked ub on ub.UserId = u.Id and ub.BadgeRank = 1
+  left join UserVoteAgg ua on ua.UserId = u.Id
+  left join PostAnswerStats pas on pas.QuestionId = q.Id
+  left join ComplexPosts ca on ca.Id = q.Id
+  where q.PostTypeId = 1
+)
+select
+  cr.QuestionId,
+  cr.Title,
+  cr.Score,
+  cr.ViewCount,
+  cr.Tags,
+  cr.Owner,
+  cr.OwnerReputation,
+  cr.TopBadgeClass,
+  cr.UpVotesCount,
+  cr.DownVotesCount,
+  cr.VoteBalance,
+  round(cr.UpVoteRatio, 3) as UpVoteRatio,
+  cr.HighScoreAnswers,
+  round(cr.AvgAnswerScore, 2) as AvgAnswerScore,
+  cr.DuplicateLinksCount,
+  cr.SuggestEditAppliedCount,
+  coalesce(cr.TotalBountyAmount, 0) as TotalBountyAmount,
+  cr.PositiveCommentsCount,
+  cr.UserTopQuestionRank,
+  cr.PreviousQuestionScore,
+  cr.TimeSinceLastAnswer,
+  cr.CloseVotesCount,
+  cr.ReopenVotesCount
+from CombinedResults cr
+where cr.Score > 10
+  and coalesce(cr.UpVotesCount, 0) > coalesce(cr.DownVotesCount, 0)
+  and cr.OwnerReputation > 1000
+  and cr.UserTopQuestionRank <= 5
+order by cr.OwnerReputation desc, cr.Score desc, cr.ViewCount desc
+limit 100;

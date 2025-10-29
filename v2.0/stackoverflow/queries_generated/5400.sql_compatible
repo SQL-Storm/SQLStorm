@@ -1,0 +1,143 @@
+WITH ranked_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    p.PostTypeId,
+    ph.CloseReasonName,
+    p.LastActivityDate,
+    p.FavoriteCount,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN (
+    SELECT h.PostId,
+           CASE
+             WHEN h.Id IS NULL THEN NULL
+             ELSE (SELECT Name FROM PostHistoryTypes pht WHERE pht.Id = h.PostHistoryTypeId)
+           END AS CloseReasonName
+    FROM PostHistory h
+  ) ph ON ph.PostId = p.Id
+  WHERE p.PostTypeId IN (1,2)
+),
+complex_qual AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.CreationDate AS OwnerCreationDate,
+    u.LastAccessDate AS OwnerLastAccessDate,
+    COALESCE(pv.TotalVotes, 0) AS TotalVotes,
+    COALESCE(a.AnswerCount, 0) AS AnswerCount,
+    COALESCE(vs.TotalBounties, 0) AS TotalBounties,
+    CASE
+      WHEN u.Reputation > 10000 THEN 'high'
+      WHEN u.Reputation > 1000 THEN 'medium'
+      ELSE 'low'
+    END AS ReputationBand,
+    (SELECT STRING_AGG(CONCAT('[', vl.Name, ']'), ',')
+     FROM Votes v2
+     JOIN VoteTypes vl ON vl.Id = v2.VoteTypeId
+     WHERE v2.PostId = rp.PostId) AS VoteTypesSummary,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.PostId) AS CommentCount,
+    rp.CreationDate
+  FROM ranked_posts rp
+  JOIN Users u ON u.Id = rp.OwnerUserId
+  LEFT JOIN (
+    SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalVotes
+    FROM Votes
+    GROUP BY PostId
+  ) pv ON pv.PostId = rp.PostId
+  LEFT JOIN (
+    SELECT ParentId AS PostId, COUNT(*) AS AnswerCount
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+  ) a ON a.PostId = rp.PostId
+  LEFT JOIN (
+    SELECT PostId, SUM(BountyAmount) AS TotalBounties
+    FROM Votes
+    WHERE VoteTypeId IN (8,9)
+    GROUP BY PostId
+  ) vs ON vs.PostId = rp.PostId
+  WHERE rp.rn = 1
+  GROUP BY
+    rp.PostId,
+    rp.Title,
+    rp.OwnerUserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.CreationDate,
+    u.LastAccessDate,
+    pv.TotalVotes,
+    a.AnswerCount,
+    vs.TotalBounties,
+    rp.CreationDate
+),
+tag_aggregate AS (
+  SELECT
+    cp.PostId,
+    STRING_AGG(t.TagName, ',') AS TagsList,
+    STRING_AGG(LOWER(t.TagName) || ':' || CAST(t.Count AS VARCHAR), ',') AS TagCountMap
+  FROM complex_qual cp
+  JOIN Posts p ON p.Id = cp.PostId
+  JOIN Tags t ON t.Id = (
+    SELECT CAST(value AS INT)
+    FROM UNNEST(string_to_array(p.Tags, '>')) AS value
+    WHERE value <> ''
+    LIMIT 1
+  )
+  GROUP BY cp.PostId
+),
+final_set AS (
+  SELECT
+    cq.PostId,
+    cq.Title,
+    cq.OwnerUserId,
+    cq.OwnerDisplayName,
+    cq.Reputation,
+    cq.ReputationBand,
+    cq.TotalVotes,
+    cq.AnswerCount,
+    cq.TotalBounties,
+    cq.CommentCount,
+    tq.TagsList,
+    tq.TagCountMap,
+    cq.VoteTypesSummary,
+    cq.OwnerCreationDate,
+    cq.OwnerLastAccessDate,
+    cq.CreationDate
+  FROM complex_qual cq
+  LEFT JOIN tag_aggregate tq ON tq.PostId = cq.PostId
+)
+SELECT
+  fs.PostId,
+  fs.Title,
+  fs.OwnerDisplayName,
+  fs.Reputation,
+  fs.ReputationBand,
+  fs.TotalVotes,
+  fs.AnswerCount,
+  fs.TotalBounties,
+  fs.CommentCount,
+  fs.TagsList,
+  fs.TagCountMap,
+  fs.VoteTypesSummary,
+  fs.OwnerCreationDate,
+  fs.OwnerLastAccessDate,
+  fs.CreationDate
+FROM final_set fs
+ORDER BY fs.CreationDate DESC, fs.TotalVotes DESC, fs.AnswerCount DESC
+LIMIT 100;

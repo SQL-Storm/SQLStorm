@@ -1,0 +1,124 @@
+-- {"query": "4293.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1534} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.AnswerCount,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_desc,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ASC) AS rn_asc,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PreviousPostScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS NextPostScore,
+        SUM(p.AnswerCount) OVER (ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeAnswerCount
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.Score > 50
+),
+UserPostEngagement AS (
+    SELECT
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS PostHistoryCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 2 THEN 1 ELSE 0 END) AS BodyEdits,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 1 THEN 1 ELSE 0 END) AS TitleEdits,
+        AVG(COALESCE(c.Score, 0)) AS AvgCommentScore
+    FROM PostHistory ph
+    LEFT JOIN Comments c ON ph.PostId = c.PostId AND ph.UserId = c.UserId
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+TopUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(upe.PostHistoryCount, 0) AS TotalPostHistoryEdits,
+        COALESCE(upe.BodyEdits, 0) AS TotalBodyEdits,
+        COALESCE(upe.TitleEdits, 0) AS TotalTitleEdits,
+        COALESCE(upu.AvgCommentScore, 0) AS AverageUserCommentScore,
+        (u.UpVotes - u.DownVotes) AS NetVotes
+    FROM Users u
+    LEFT JOIN UserPostEngagement upe ON u.Id = upe.UserId
+    LEFT JOIN (
+        SELECT
+            UserId,
+            AVG(Score) AS AvgCommentScore
+        FROM Comments
+        WHERE UserId IS NOT NULL
+        GROUP BY UserId
+    ) AS upu ON u.Id = upu.UserId
+    WHERE u.Id IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE OwnerUserId IS NOT NULL)
+)
+SELECT
+    rp.PostId,
+    rp.Title,
+    rp.PostTypeName,
+    rp.PostCreationDate,
+    rp.PostScore,
+    rp.AnswerCount,
+    rp.rn_desc AS RankDescByCreation,
+    rp.rn_asc AS RankAscByCreation,
+    rp.PreviousPostScore,
+    rp.NextPostScore,
+    rp.CumulativeAnswerCount,
+    tu.DisplayName AS OwnerDisplayName,
+    tu.Reputation AS OwnerReputation,
+    tu.NetVotes AS OwnerNetVotes,
+    tu.TotalPostHistoryEdits AS OwnerTotalHistoryEdits,
+    tu.AverageUserCommentScore AS OwnerAvgCommentScore,
+    CASE
+        WHEN rp.PostScore > 100 AND rp.AnswerCount > 10 THEN 'High Engagement Question'
+        WHEN rp.PostScore < 0 THEN 'Low Score Post'
+        ELSE 'Standard Post'
+    END AS PostCategory,
+    CONCAT(tu.DisplayName, ' (', tu.Reputation, ')') AS OwnerInfo,
+    (rp.PostScore * rp.AnswerCount) AS ScoreAnswerProduct,
+    IIF(rp.PostScore > rp.PreviousPostScore AND rp.PostScore > rp.NextPostScore, 'Peak Score', 'Non-Peak Score') AS ScoreTrend,
+    pl.Id AS PostLinkId,
+    pl.LinkTypeId,
+    COALESCE(lt.Name, 'Unknown') AS LinkTypeName,
+    CASE WHEN rp.PostScore IS NULL THEN 'No Score' ELSE CAST(rp.PostScore AS VARCHAR) END AS ScoreAsString
+FROM RankedPosts rp
+LEFT JOIN TopUsers tu ON rp.OwnerUserId = tu.UserId
+LEFT JOIN PostLinks pl ON rp.PostId = pl.PostId
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+WHERE rp.rn_desc <= 100 OR rp.rn_asc <= 100
+UNION
+SELECT
+    rp.PostId,
+    rp.Title,
+    rp.PostTypeName,
+    rp.PostCreationDate,
+    rp.PostScore,
+    rp.AnswerCount,
+    rp.rn_desc AS RankDescByCreation,
+    rp.rn_asc AS RankAscByCreation,
+    rp.PreviousPostScore,
+    rp.NextPostScore,
+    rp.CumulativeAnswerCount,
+    tu.DisplayName AS OwnerDisplayName,
+    tu.Reputation AS OwnerReputation,
+    tu.NetVotes AS OwnerNetVotes,
+    tu.TotalPostHistoryEdits AS OwnerTotalHistoryEdits,
+    tu.AverageUserCommentScore AS OwnerAvgCommentScore,
+    CASE
+        WHEN rp.PostScore > 100 AND rp.AnswerCount > 10 THEN 'High Engagement Question'
+        WHEN rp.PostScore < 0 THEN 'Low Score Post'
+        ELSE 'Standard Post'
+    END AS PostCategory,
+    CONCAT(tu.DisplayName, ' (', tu.Reputation, ')') AS OwnerInfo,
+    (rp.PostScore * rp.AnswerCount) AS ScoreAnswerProduct,
+    IIF(rp.PostScore > rp.PreviousPostScore AND rp.PostScore > rp.NextPostScore, 'Peak Score', 'Non-Peak Score') AS ScoreTrend,
+    pl.Id AS PostLinkId,
+    pl.LinkTypeId,
+    COALESCE(lt.Name, 'Unknown') AS LinkTypeName,
+    CASE WHEN rp.PostScore IS NULL THEN 'No Score' ELSE CAST(rp.PostScore AS VARCHAR) END AS ScoreAsString
+FROM RankedPosts rp
+LEFT JOIN TopUsers tu ON rp.OwnerUserId = tu.UserId
+LEFT JOIN PostLinks pl ON rp.PostId = pl.RelatedPostId
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+WHERE rp.rn_desc <= 100 OR rp.rn_asc <= 100;

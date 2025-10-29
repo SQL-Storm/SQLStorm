@@ -1,0 +1,232 @@
+-- {"query": "1872.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3565} 
+
+WITH UserEngagement AS (
+    -- CTE 1: Aggregates user-specific metrics, including badge counts, average post scores, and calculates a 'UserTier' based on reputation and badge achievements.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.UpVotes,
+        U.DownVotes,
+        COALESCE(COUNT(DISTINCT B.Id), 0) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBadges,
+        -- Conditional aggregation for average question score, handling cases where a user might not have questions.
+        COALESCE(AVG(P.Score) FILTER (WHERE P.PostTypeId = 1), 0) AS AvgQuestionScore,
+        COALESCE(COUNT(P.Id) FILTER (WHERE P.PostTypeId = 1), 0) AS TotalQuestions,
+        COALESCE(COUNT(C.Id), 0) AS TotalComments,
+        (U.UpVotes - U.DownVotes) AS NetVotes,
+        -- Complex CASE expression for defining user tiers
+        CASE
+            WHEN U.Reputation >= 15000 AND SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) >= 10 THEN 'Legend'
+            WHEN U.Reputation >= 7500 AND COUNT(DISTINCT B.Id) >= 20 THEN 'Guru'
+            WHEN U.Reputation >= 2000 AND COALESCE(COUNT(P.Id) FILTER (WHERE P.PostTypeId = 1), 0) >= 10 THEN 'Contributor'
+            ELSE 'Apprentice'
+        END AS UserTier,
+        U.Location,
+        U.WebsiteUrl
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.UpVotes, U.DownVotes, U.Location, U.WebsiteUrl
+),
+PostMetrics AS (
+    -- CTE 2: Gathers extensive metrics for 'Question' posts, including answer aggregates, edit history, and uses window functions for ranking.
+    SELECT
+        PQ.Id AS QuestionId,
+        PQ.OwnerUserId AS QuestionOwnerId,
+        PQ.CreationDate AS QuestionCreationDate,
+        PQ.Score AS QuestionScore,
+        PQ.ViewCount,
+        PQ.AnswerCount AS DeclaredAnswerCount,
+        PQ.FavoriteCount,
+        PQ.Title,
+        PQ.Tags,
+        SUM(PA.Score) FILTER (WHERE PA.Id IS NOT NULL) AS TotalAnswersScore,
+        COUNT(PA.Id) FILTER (WHERE PA.Id IS NOT NULL) AS ActualAnswerCount,
+        MIN(PA.CreationDate) FILTER (WHERE PA.Id IS NOT NULL) AS FirstAnswerDate,
+        MAX(PA.CreationDate) FILTER (WHERE PA.Id IS NOT NULL) AS LatestAnswerDate,
+        SUM(CASE WHEN PA.Id = PQ.AcceptedAnswerId THEN PA.Score ELSE 0 END) AS AcceptedAnswerScore,
+        -- Correlated subquery to count distinct editors for a question
+        (SELECT COUNT(DISTINCT PH.UserId)
+         FROM PostHistory PH
+         WHERE PH.PostId = PQ.Id
+           AND PH.PostHistoryTypeId IN (4, 5, 6, 8, 9) -- Edit Title, Body, Tags, Rollback Body, Rollback Tags
+           AND PH.CreationDate > PQ.CreationDate) AS EditorCount,
+        -- Correlated subquery to find the first closure date
+        (SELECT MIN(PH.CreationDate)
+         FROM PostHistory PH
+         WHERE PH.PostId = PQ.Id
+           AND PH.PostHistoryTypeId = 10 -- Post Closed
+        ) AS FirstClosedDate,
+        -- Correlated subqueries for the very first and last history event dates
+        (SELECT MIN(PH_Min.CreationDate) FROM PostHistory PH_Min WHERE PH_Min.PostId = PQ.Id) AS FirstHistoryEventDate,
+        (SELECT MAX(PH_Max.CreationDate) FROM PostHistory PH_Max WHERE PH_Max.PostId = PQ.Id) AS LastHistoryEventDate,
+        -- Window function: Rank questions by creation date for each owner (descending)
+        ROW_NUMBER() OVER (PARTITION BY PQ.OwnerUserId ORDER BY PQ.CreationDate DESC) AS UserQuestionRankDesc,
+        -- Window function: Global rank based on view count and score
+        DENSE_RANK() OVER (ORDER BY PQ.ViewCount DESC, PQ.Score DESC) AS GlobalViewRank,
+        -- Window function: Rank questions by score for each owner
+        RANK() OVER (PARTITION BY PQ.OwnerUserId ORDER BY PQ.Score DESC) AS UserScoreRank
+    FROM Posts PQ
+    LEFT JOIN Posts PA ON PQ.Id = PA.ParentId AND PA.PostTypeId = 2 -- Join to get answers
+    WHERE PQ.PostTypeId = 1 -- Filter for questions only
+    GROUP BY PQ.Id, PQ.OwnerUserId, PQ.CreationDate, PQ.Score, PQ.ViewCount, PQ.AnswerCount, PQ.FavoriteCount, PQ.Title, PQ.Tags
+),
+PostInteractionTimeline AS (
+    -- CTE 3: Analyzes post history for timeline events using window functions like LAG for sequential analysis.
+    SELECT
+        PH.PostId,
+        PH.PostHistoryTypeId,
+        PHT.Name AS HistoryTypeName,
+        PH.CreationDate AS EventDate,
+        PH.UserId AS EventUserId,
+        -- Window function: Get the creation date of the previous history event for the same post
+        LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousEventDate,
+        -- Calculate time difference in hours between consecutive events
+        EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate))) / 3600.0 AS HoursSincePreviousEvent,
+        -- Rank events within a post to identify the last and second-to-last events
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS LastEventForPostRank,
+        -- Rank events by type to find the latest of a specific type (e.g., latest close)
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId, PH.PostHistoryTypeId ORDER BY PH.CreationDate DESC) AS LatestEventTypeRank,
+        -- Correlated subquery to get close reason name directly from PostHistory.Comment
+        (SELECT Name FROM CloseReasonTypes WHERE Id = CAST(PH.Comment AS SMALLINT) AND PH.PostHistoryTypeId = 10) AS CloseReasonName
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 16, 35, 36) -- Select specific history types for analysis
+),
+QuestionTagAnalysis AS (
+    -- CTE 4: Extracts and analyzes tags associated with questions.
+    SELECT
+        PM.QuestionId,
+        -- Aggregate popular tags (count > 5000) into an array
+        ARRAY_AGG(T.TagName) FILTER (WHERE T.Count > 5000) AS PopularTagsOnQuestion,
+        COUNT(T.Id) AS TotalTagsOnQuestion,
+        SUM(T.Count) AS SumOfTagCounts,
+        SUM(CASE WHEN T.IsRequired = TRUE THEN 1 ELSE 0 END) AS RequiredTagCount
+    FROM PostMetrics PM
+    -- Join Posts.Tags by splitting the string into an array and checking against TagName
+    JOIN Tags T ON T.TagName = ANY(string_to_array(SUBSTRING(PM.Tags, 2, LENGTH(PM.Tags)-2), '><'))
+    GROUP BY PM.QuestionId
+)
+-- Main query: Joins all CTEs and additional tables, applies complex filters, and calculates various metrics.
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.UserTier,
+    PM.QuestionId,
+    PM.QuestionCreationDate,
+    PM.Title,
+    PM.QuestionScore,
+    PM.ViewCount,
+    PM.ActualAnswerCount AS RealAnswerCount,
+    PM.TotalAnswersScore,
+    PM.AcceptedAnswerScore,
+    PM.EditorCount,
+    PM.GlobalViewRank,
+    PM.UserQuestionRankDesc,
+    PM.UserScoreRank,
+    COALESCE(PL.DuplicateCount, 0) AS NumberOfDuplicates,
+    COALESCE(PIT_Closed.CloseReasonName, 'N/A') AS QuestionCloseReason,
+    -- Calculation: Time from question creation to its first answer, handling NULLs with COALESCE.
+    COALESCE(EXTRACT(EPOCH FROM (PM.FirstAnswerDate - PM.QuestionCreationDate)) / 3600.0, 0.0) AS TimeToFirstAnswerHours,
+    -- Calculation: Up-to-down vote ratio for users, preventing division by zero with NULLIF.
+    NULLIF(UE.UpVotes, 0) / NULLIF(UE.DownVotes, 0) AS UpDownVoteRatio,
+    -- String expression: Uppercase and truncate user location.
+    UPPER(LEFT(COALESCE(UE.Location, 'Unknown'), 15)) AS UserLocationPrefix,
+    -- String expression: Create a URL-friendly slug from the question title.
+    LOWER(REPLACE(TRIM(PM.Title), ' ', '-')) AS SlugifiedTitle,
+    -- String expression: Count the number of tags on a question using array functions.
+    ARRAY_LENGTH(string_to_array(SUBSTRING(PM.Tags, 2, LENGTH(PM.Tags)-2), '><'), 1) AS TagCount,
+    QTA.PopularTagsOnQuestion,
+    QTA.TotalTagsOnQuestion AS PostTagVariety,
+    COALESCE(QTA.RequiredTagCount, 0) AS CriticalTagsPresent,
+    -- NULL logic and string pattern matching for WebsiteUrl.
+    CASE
+        WHEN UE.WebsiteUrl IS NOT NULL AND UE.WebsiteUrl LIKE 'http%' THEN TRUE
+        ELSE FALSE
+    END AS HasWebsite,
+    -- Correlated subquery: Count upvotes received *before* the first answer (with a small buffer).
+    (
+        SELECT COUNT(V.Id)
+        FROM Votes V
+        WHERE V.PostId = PM.QuestionId
+          AND V.VoteTypeId = 2 -- UpMod
+          AND V.CreationDate >= PM.QuestionCreationDate
+          AND V.CreationDate < (PM.FirstAnswerDate - INTERVAL '1 hour') -- Check upvotes strictly before the first answer
+    ) AS UpvotesBeforeFirstAnswer,
+    -- Correlated subquery: Get the date of the latest edit (title, body, or tags).
+    (
+        SELECT
+            MAX(PIT_Edit.EventDate)
+        FROM PostInteractionTimeline PIT_Edit
+        WHERE PIT_Edit.PostId = PM.QuestionId
+          AND PIT_Edit.PostHistoryTypeId IN (4, 5, 6) -- Edit events
+          AND PIT_Edit.LatestEventTypeRank = 1
+    ) AS LatestEditDate,
+    -- Time since the event before the very last one for a post.
+    COALESCE(PIT_LatestEvent.HoursSincePreviousEvent, 0.0) AS HoursSincePenultimateEvent,
+    -- Calculate total days span of post history.
+    EXTRACT(DAY FROM (PM.LastHistoryEventDate - PM.FirstHistoryEventDate)) AS DaysSpanOfHistory,
+    -- Correlated subquery with nested correlated subquery: List Gold badges held by the question owner or the accepted answer's owner.
+    (
+        SELECT STRING_AGG(B.Name, '; ')
+        FROM Badges B
+        WHERE B.UserId = PM.QuestionOwnerId
+           OR (PM.AcceptedAnswerId IS NOT NULL AND B.UserId = (SELECT A.OwnerUserId FROM Posts A WHERE A.Id = PM.AcceptedAnswerId))
+           AND B.Class = 1
+    ) AS GoldBadgesFromQuestionContributors,
+    -- Correlated subquery: Sum of comment scores from high-reputation users on a specific question.
+    (
+        SELECT SUM(C.Score)
+        FROM Comments C
+        JOIN Users CU ON C.UserId = CU.Id
+        WHERE C.PostId = PM.QuestionId AND CU.Reputation > 5000
+    ) AS HighRepUserCommentScore,
+    -- Complex conditional calculation for an "Engagement Metric" combining multiple factors.
+    CASE
+        WHEN PM.AcceptedAnswerScore > 0 AND PM.TotalAnswersScore > 0 THEN
+            (PM.AcceptedAnswerScore * 1.0 / PM.TotalAnswersScore) * PM.QuestionScore + (PM.ViewCount / 100.0)
+        WHEN PM.TotalAnswersScore > 0 THEN
+            (PM.TotalAnswersScore * 0.5 + PM.QuestionScore) / NULLIF(PM.ViewCount, 0)
+        ELSE
+            PM.QuestionScore * 0.1 + PM.ViewCount * 0.01
+    END AS CalculatedEngagementMetric
+FROM UserEngagement UE
+JOIN PostMetrics PM ON UE.UserId = PM.QuestionOwnerId
+LEFT JOIN (
+    SELECT PostId, COUNT(DISTINCT RelatedPostId) AS DuplicateCount
+    FROM PostLinks
+    WHERE LinkTypeId = 3 -- Duplicate posts
+    GROUP BY PostId
+) PL ON PM.QuestionId = PL.PostId
+LEFT JOIN (
+    SELECT PostId, CloseReasonName
+    FROM PostInteractionTimeline
+    WHERE LatestEventTypeRank = 1 AND PostHistoryTypeId = 10 -- Get the latest close reason
+) PIT_Closed ON PM.QuestionId = PIT_Closed.PostId
+LEFT JOIN (
+    SELECT PostId, HoursSincePreviousEvent
+    FROM PostInteractionTimeline
+    WHERE LastEventForPostRank = 2 -- Get metrics for the second-to-last event
+) PIT_LatestEvent ON PM.QuestionId = PIT_LatestEvent.PostId
+LEFT JOIN QuestionTagAnalysis QTA ON PM.QuestionId = QTA.QuestionId
+WHERE
+    UE.Reputation > 750
+    AND PM.QuestionScore > 10
+    AND PM.ViewCount > 500
+    AND PM.ActualAnswerCount > 0
+    AND PM.UserQuestionRankDesc <= 3 -- Only consider the 3 most recent questions by each user
+    AND PM.UserScoreRank <= 5 -- Only consider the 5 highest-scoring questions by each user
+    AND PM.QuestionCreationDate >= '2021-01-01'
+    AND PM.Title IS NOT NULL
+    AND PM.Tags LIKE '%<sql>%' -- String pattern matching for questions tagged with 'sql'
+    AND UE.UserTier = 'Guru' -- Filter by the computed 'Guru' tier
+    AND COALESCE(UE.Location, '') <> 'London' -- NULL-safe comparison for location
+    AND (PM.FavoriteCount IS NULL OR PM.FavoriteCount >= 2) -- NULL logic: either no favorites or at least 2
+ORDER BY
+    UE.Reputation DESC, PM.GlobalViewRank ASC, PM.QuestionCreationDate DESC, CalculatedEngagementMetric DESC
+LIMIT 2000;

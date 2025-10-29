@@ -1,0 +1,270 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(p.Score) AS AvgPostScore,
+        STRING_AGG(DISTINCT CAST(p.PostTypeId AS VARCHAR), ',') AS PostTypes,
+        COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) AS PositiveScorePosts,
+        COUNT(DISTINCT CASE WHEN p.Score < 0 THEN p.Id END) AS NegativeScorePosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        COALESCE(SUM(CASE WHEN p.Score < 0 THEN 1 ELSE 0 END), 0) AS DownvoteCount,
+        COALESCE(SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END), 0) AS UpvoteCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        AvgPostScore,
+        PostTypes,
+        PositiveScorePosts,
+        NegativeScorePosts,
+        QuestionCount,
+        AnswerCount,
+        TotalViews,
+        DownvoteCount,
+        UpvoteCount,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) AS RankByReputation,
+        ROW_NUMBER() OVER (ORDER BY PostCount DESC, Reputation DESC) AS RankByPostCount,
+        DENSE_RANK() OVER (ORDER BY AvgPostScore DESC) AS RankByAvgScore
+    FROM UserStats
+),
+QuestionAnalysis AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.CreationDate,
+        q.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        string_to_array(trim(both '<' FROM q.Tags), '><') AS TagsArray,
+        COUNT(a.Id) AS AnswerCountByOwner,
+        COALESCE(SUM(a.Score), 0) AS TotalAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.CreationDate) AS LatestAnswerDate,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpvoteCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownvoteCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END), 0) AS FavoriteCount,
+        CASE 
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Yes'
+            WHEN q.AnswerCount > 0 THEN 'No'
+            ELSE 'N/A'
+        END AS HasAcceptedAnswer,
+        CASE 
+            WHEN q.AnswerCount = 0 THEN 'Open'
+            WHEN q.AnswerCount > 0 AND q.AcceptedAnswerId IS NULL THEN 'Answered'
+            ELSE 'Accepted'
+        END AS QuestionStatus
+    FROM Posts q
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN Votes v ON q.Id = v.PostId AND v.VoteTypeId IN (2, 3, 5)
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.Score, q.ViewCount, q.AnswerCount, q.CommentCount, q.CreationDate, q.OwnerUserId, u.DisplayName, q.Tags, q.AcceptedAnswerId
+),
+AnswerAnalysis AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        STRING_AGG(DISTINCT CAST(v.VoteTypeId AS VARCHAR), ',') AS VoteTypes,
+        COUNT(v.Id) AS VoteCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpvoteCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownvoteCount,
+        CASE 
+            WHEN a.Score > 0 THEN 'High'
+            WHEN a.Score = 0 THEN 'Neutral'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - a.CreationDate)) / 86400 AS INTEGER) AS DaysSinceCreation
+    FROM Posts a
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON a.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id, a.ParentId, a.Score, a.CreationDate, a.OwnerUserId, u.DisplayName
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(p.Views, 0) AS WikiViews,
+        COALESCE(p.Score, 0) AS WikiScore,
+        COALESCE(SUBSTRING(p.Body FROM 1 FOR 200), '') AS WikiExcerpt,
+        COUNT(pt.Id) AS QuestionCountWithTag,
+        AVG(q.Score) AS AvgScoreOfTaggedQuestions,
+        SUM(q.ViewCount) AS TotalViewsOfTaggedQuestions,
+        MIN(q.CreationDate) AS FirstTaggedQuestionDate,
+        MAX(q.CreationDate) AS LastTaggedQuestionDate
+    FROM Tags t
+    LEFT JOIN Posts p ON t.WikiPostId = p.Id
+    LEFT JOIN PostTags pt ON t.Id = pt.TagId
+    LEFT JOIN Posts q ON pt.PostId = q.Id AND q.PostTypeId = 1
+    GROUP BY t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, p.Views, p.Score, p.Body
+),
+PerformanceMetrics AS (
+    SELECT 
+        'User Engagement Metrics' AS MetricGroup,
+        'Top User Statistics' AS MetricName,
+        CONCAT('Top user: ', MAX(CASE WHEN RankByReputation = 1 THEN DisplayName END), 
+               ' | Post Count: ', MAX(CASE WHEN RankByReputation = 1 THEN PostCount END)) AS MetricValue,
+        'User' AS Category,
+        NULL AS SubCategory
+    FROM TopUsers
+    UNION ALL
+    SELECT 
+        'Question Analysis' AS MetricGroup,
+        'Most Active Questions' AS MetricName,
+        CONCAT('Question: ', MAX(CASE WHEN RowNum = 1 THEN Title END), ' | Views: ', MAX(CASE WHEN RowNum = 1 THEN ViewCount END)) AS MetricValue,
+        'Question' AS Category,
+        'View Count' AS SubCategory
+    FROM (
+        SELECT 
+            Title, 
+            ViewCount,
+            ROW_NUMBER() OVER (ORDER BY ViewCount DESC) AS RowNum
+        FROM QuestionAnalysis
+    ) ranked
+    WHERE RowNum <= 1
+    UNION ALL
+    SELECT 
+        'Answer Analysis' AS MetricGroup,
+        'Best Answer Quality' AS MetricName,
+        CONCAT('Answer Score: ', MAX(CASE WHEN RowNum = 1 THEN Score END), ' | Owner: ', MAX(CASE WHEN RowNum = 1 THEN OwnerName END)) AS MetricValue,
+        'Answer' AS Category,
+        'Score Quality' AS SubCategory
+    FROM (
+        SELECT 
+            Score,
+            OwnerName,
+            ROW_NUMBER() OVER (ORDER BY Score DESC) AS RowNum
+        FROM AnswerAnalysis
+        WHERE Score IS NOT NULL
+    ) ranked
+    WHERE RowNum <= 1
+    UNION ALL
+    SELECT 
+        'Tag Analysis' AS MetricGroup,
+        'Most Popular Tag' AS MetricName,
+        CONCAT('Tag: ', MAX(CASE WHEN RowNum = 1 THEN TagName END), ' | Count: ', MAX(CASE WHEN RowNum = 1 THEN Count END)) AS MetricValue,
+        'Tag' AS Category,
+        'Popularity' AS SubCategory
+    FROM (
+        SELECT 
+            TagName,
+            Count,
+            ROW_NUMBER() OVER (ORDER BY Count DESC) AS RowNum
+        FROM TagAnalysis
+    ) ranked
+    WHERE RowNum <= 1
+),
+ComplexQueryResults AS (
+    SELECT 
+        t.UserId,
+        t.DisplayName,
+        t.Reputation,
+        t.PostCount,
+        t.CommentCount,
+        t.BadgeCount,
+        t.LastPostDate,
+        t.AvgPostScore,
+        t.PostTypes,
+        t.PositiveScorePosts,
+        t.NegativeScorePosts,
+        t.QuestionCount,
+        t.AnswerCount,
+        t.TotalViews,
+        t.DownvoteCount,
+        t.UpvoteCount,
+        t.RankByReputation,
+        t.RankByPostCount,
+        t.RankByAvgScore,
+        COALESCE(q.QuestionId, 0) AS MostRecentQuestionId,
+        COALESCE(q.Title, 'No Questions') AS MostRecentQuestionTitle,
+        COALESCE(q.Score, 0) AS MostRecentQuestionScore,
+        COALESCE(q.ViewCount, 0) AS MostRecentQuestionViews,
+        COALESCE(q.AnswerCount, 0) AS MostRecentQuestionAnswerCount,
+        COALESCE(q.QuestionStatus, 'N/A') AS MostRecentQuestionStatus,
+        COALESCE(a.AnswerId, 0) AS BestAnswerId,
+        COALESCE(a.Score, 0) AS BestAnswerScore,
+        COALESCE(a.DaysSinceCreation, 0) AS DaysSinceBestAnswer,
+        COALESCE(ta.TagName, 'No Tags') AS PopularTag,
+        COALESCE(ta.Count, 0) AS TagCount,
+        COALESCE(pm.MetricValue, 'No Metrics') AS PerformanceMetric,
+        CASE 
+            WHEN t.Reputation > 10000 THEN 'Elite'
+            WHEN t.Reputation > 1000 THEN 'Expert'
+            WHEN t.Reputation > 100 THEN 'Advanced'
+            ELSE 'Beginner' 
+        END AS ReputationTier
+    FROM TopUsers t
+    LEFT JOIN (
+        SELECT 
+            QuestionId,
+            OwnerUserId,
+            Title,
+            Score,
+            ViewCount,
+            AnswerCount,
+            QuestionStatus,
+            CreationDate,
+            ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY CreationDate DESC) AS RowNum
+        FROM QuestionAnalysis
+    ) q ON t.UserId = q.OwnerUserId AND q.RowNum = 1
+    LEFT JOIN (
+        SELECT 
+            AnswerId,
+            OwnerUserId,
+            Score,
+            DaysSinceCreation,
+            ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY Score DESC) AS RowNum
+        FROM AnswerAnalysis
+    ) a ON t.UserId = a.OwnerUserId AND a.RowNum = 1
+    LEFT JOIN (
+        SELECT 
+            TagName,
+            Count,
+            ROW_NUMBER() OVER (ORDER BY Count DESC) AS RowNum
+        FROM TagAnalysis
+    ) ta ON ta.RowNum = 1
+    LEFT JOIN PerformanceMetrics pm ON pm.MetricGroup = 'User Engagement Metrics'
+    WHERE t.RankByReputation <= 10 OR t.RankByPostCount <= 10 OR t.RankByAvgScore <= 10
+)
+SELECT 
+    COUNT(*) AS TotalResults,
+    COUNT(DISTINCT UserId) AS UniqueUsers,
+    COUNT(DISTINCT CASE WHEN RankByReputation <= 10 THEN UserId END) AS Top10Reputation,
+    COUNT(DISTINCT CASE WHEN RankByPostCount <= 10 THEN UserId END) AS Top10PostCount,
+    COUNT(DISTINCT CASE WHEN RankByAvgScore <= 10 THEN UserId END) AS Top10AvgScore,
+    AVG(Reputation) AS AvgReputation,
+    AVG(PostCount) AS AvgPostCount,
+    AVG(AvgPostScore) AS AvgAvgScore,
+    STRING_AGG(DISTINCT ReputationTier, ',') AS ReputationTiers,
+    STRING_AGG(DISTINCT PerformanceMetric, '; ') AS AllPerformanceMetrics
+FROM ComplexQueryResults
+WHERE UserId IS NOT NULL;

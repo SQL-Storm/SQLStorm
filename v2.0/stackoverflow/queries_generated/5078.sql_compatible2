@@ -1,0 +1,55 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS PostCount,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+  MAX(p.CreationDate) AS MostRecentPost,
+  MAX(CASE WHEN v.VoteTypeId = 2 THEN v.CreationDate END) AS MostRecentUpVoteOnPost,
+  ARRAY_AGG(t.Name) AS TagNames,
+  COALESCE(NULLIF(u.Location, ''), 'Unknown') AS LocationGroup,
+  CASE
+    WHEN u.Reputation >= 20000 THEN 'Legendary'
+    WHEN u.Reputation >= 1000 THEN 'Pro'
+    WHEN u.Reputation >= 100 THEN 'Established'
+    ELSE 'New'
+  END AS ReputationTier,
+  COUNT(*) OVER () AS TotalRows
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN LATERAL (
+    SELECT TRIM(BOTH '<>' FROM tval) AS tag_text
+    FROM UNNEST(
+      regexp_split_to_array(
+        regexp_replace(COALESCE(p.Tags, ''), '^<|>$', '', 'g'),
+        '><'
+      )
+    ) AS tval
+  ) tn ON p.Id IS NOT NULL
+  LEFT JOIN Tags t ON t.TagName = tn.tag_text
+WHERE
+  1 = 1
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.Location,
+  MAX(p.CreationDate),
+  MAX(CASE WHEN v.VoteTypeId = 2 THEN v.CreationDate END),
+  COALESCE(NULLIF(u.Location, ''), 'Unknown'),
+  CASE
+    WHEN u.Reputation >= 20000 THEN 'Legendary'
+    WHEN u.Reputation >= 1000 THEN 'Pro'
+    WHEN u.Reputation >= 100 THEN 'Established'
+    ELSE 'New'
+  END,
+  COUNT(*) OVER ()
+HAVING
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 0
+ORDER BY
+  u.Reputation DESC,
+  MostRecentPost DESC
+LIMIT 100;

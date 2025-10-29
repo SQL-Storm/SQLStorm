@@ -1,0 +1,270 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        EXTRACT(YEAR FROM u.CreationDate) AS UserCreationYear,
+        EXTRACT(YEAR FROM u.LastAccessDate) AS LastAccessYear,
+        COALESCE(LENGTH(u.AboutMe), 0) AS AboutMeLength,
+        CASE WHEN u.Location IS NOT NULL AND LENGTH(TRIM(u.Location)) > 0 THEN TRUE ELSE FALSE END AS HasLocation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        AVG(p.Score) FILTER (WHERE p.Id IS NOT NULL) AS AvgPostScore,
+        AVG(c.Score) FILTER (WHERE c.Id IS NOT NULL) AS AvgCommentScore
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.AboutMe, u.Location
+),
+PostActivitySummary AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount AS PostFavoriteCount,
+        COALESCE(p.LastEditDate, p.CreationDate) AS EffectiveLastEditDate,
+        LENGTH(p.Body) AS BodyLength,
+        LENGTH(p.Title) AS TitleLength,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.ClosedDate IS NOT NULL AS IsClosed,
+        ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'), 1) AS TagCount,
+        string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><') AS TagArray,
+        COUNT(DISTINCT ph.Id) AS EditHistoryEntries,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS MajorEditCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVoteCount
+    FROM Posts AS p
+    LEFT JOIN PostHistory AS ph ON p.Id = ph.PostId
+    LEFT JOIN Votes AS v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 2
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.LastEditDate, p.Body, p.Title, p.Tags, p.AcceptedAnswerId, p.ParentId, p.ClosedDate
+),
+QuestionAnswerAnalysis AS (
+    SELECT
+        qa.PostId AS QuestionId,
+        qa.OwnerUserId AS QuestionOwnerUserId,
+        qa.PostCreationDate AS QuestionCreationDate,
+        qa.Title AS QuestionTitle,
+        qa.BodyLength AS QuestionBodyLength,
+        qa.ViewCount AS QuestionViewCount,
+        qa.PostScore AS QuestionScore,
+        qa.TagArray AS QuestionTags,
+        qa.TagCount AS QuestionTagCount,
+        qa.IsClosed AS QuestionIsClosed,
+        qa.MajorEditCount AS QuestionMajorEditCount,
+        qa.UpVoteCount AS QuestionUpVoteCount,
+        qa.DownVoteCount AS QuestionDownVoteCount,
+        acc_ans.PostId AS AcceptedAnswerId,
+        acc_ans.OwnerUserId AS AcceptedAnswerOwnerUserId,
+        acc_ans.PostCreationDate AS AcceptedAnswerCreationDate,
+        acc_ans.PostScore AS AcceptedAnswerScore,
+        acc_ans.BodyLength AS AcceptedAnswerBodyLength,
+        CASE
+            WHEN qa.AcceptedAnswerId IS NOT NULL AND acc_ans.PostId IS NOT NULL
+            THEN EXTRACT(EPOCH FROM (acc_ans.PostCreationDate - qa.PostCreationDate)) / 3600.0
+            ELSE NULL
+        END AS TimeToAcceptAnswerHours,
+        (SELECT COUNT(DISTINCT c.Id) FROM Comments AS c WHERE c.PostId = qa.PostId) AS QuestionTotalCommentCount,
+        EXISTS (
+            SELECT 1
+            FROM Badges AS b
+            WHERE b.UserId = qa.OwnerUserId
+              AND b.Class = 1
+              AND b.Date <= qa.PostCreationDate
+        ) AS QuestionOwnerHasEarlyGoldBadge
+    FROM PostActivitySummary AS qa
+    LEFT JOIN PostActivitySummary AS acc_ans ON qa.AcceptedAnswerId = acc_ans.PostId
+    WHERE qa.PostTypeId = 1
+),
+UserTagContributions AS (
+    SELECT
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        unnest_tags.tag_name,
+        SUM(pas.PostScore) AS TotalScoreInTag,
+        COUNT(pas.PostId) AS TotalPostsInTag
+    FROM PostActivitySummary AS pas
+    JOIN UserEngagement AS ue ON pas.OwnerUserId = ue.UserId
+    JOIN UNNEST(pas.TagArray) AS unnest_tags(tag_name) ON TRUE
+    GROUP BY ue.UserId, ue.DisplayName, ue.Reputation, unnest_tags.tag_name
+),
+TopTagContributors AS (
+    SELECT
+        tag_name,
+        DisplayName AS TopContributorDisplayName,
+        Reputation AS TopContributorReputation,
+        TotalScoreInTag
+    FROM (
+        SELECT
+            utc.tag_name,
+            utc.DisplayName,
+            utc.Reputation,
+            utc.TotalScoreInTag,
+            ROW_NUMBER() OVER (PARTITION BY utc.tag_name ORDER BY utc.TotalScoreInTag DESC, utc.Reputation DESC) AS rn
+        FROM UserTagContributions AS utc
+    ) AS ranked_utc
+    WHERE rn = 1
+),
+TagPerformanceMetricsFinal AS (
+    SELECT
+        unnest_tags.tag_name,
+        COUNT(DISTINCT pas.PostId) AS TotalPostsWithTag,
+        COUNT(DISTINCT qaa.QuestionId) AS TotalQuestionsWithTag,
+        AVG(qaa.QuestionScore) FILTER (WHERE qaa.QuestionId IS NOT NULL) AS AvgQuestionScoreForTag,
+        AVG(qaa.QuestionViewCount) FILTER (WHERE qaa.QuestionId IS NOT NULL) AS AvgQuestionViewCountForTag,
+        SUM(qaa.AcceptedAnswerScore) FILTER (WHERE qaa.AcceptedAnswerId IS NOT NULL) AS TotalAcceptedAnswerScoreForTag,
+        ttc.TopContributorDisplayName,
+        ttc.TopContributorReputation,
+        SUM(CASE WHEN qaa.QuestionOwnerHasEarlyGoldBadge THEN 1 ELSE 0 END) FILTER (WHERE qaa.QuestionId IS NOT NULL) AS QuestionsByGoldBadgeOwners
+    FROM PostActivitySummary AS pas
+    JOIN UNNEST(pas.TagArray) AS unnest_tags(tag_name) ON TRUE
+    LEFT JOIN QuestionAnswerAnalysis AS qaa ON pas.PostId = qaa.QuestionId
+    LEFT JOIN TopTagContributors AS ttc ON unnest_tags.tag_name = ttc.tag_name
+    GROUP BY unnest_tags.tag_name, ttc.TopContributorDisplayName, ttc.TopContributorReputation
+),
+RankedQuestions AS (
+    SELECT
+        qaa.QuestionId,
+        qaa.QuestionOwnerUserId,
+        qaa.QuestionCreationDate,
+        qaa.QuestionTitle,
+        qaa.QuestionBodyLength,
+        qaa.QuestionViewCount,
+        qaa.QuestionScore,
+        qaa.QuestionTags,
+        qaa.QuestionTagCount,
+        qaa.QuestionIsClosed,
+        qaa.AcceptedAnswerId,
+        qaa.AcceptedAnswerScore,
+        qaa.TimeToAcceptAnswerHours,
+        qaa.QuestionOwnerHasEarlyGoldBadge,
+        ue.DisplayName AS QuestionOwnerDisplayName,
+        ue.Reputation AS QuestionOwnerReputation,
+        ue.TotalQuestions AS QuestionOwnerTotalQuestions,
+        ue.TotalAnswers AS QuestionOwnerTotalAnswers,
+        ue.GoldBadges AS QuestionOwnerGoldBadges,
+        RANK() OVER (PARTITION BY qaa.QuestionOwnerUserId ORDER BY qaa.QuestionScore DESC, qaa.QuestionViewCount DESC) AS RankByOwnerScoreAndViews,
+        ROW_NUMBER() OVER (PARTITION BY qaa.QuestionOwnerUserId ORDER BY qaa.QuestionCreationDate DESC) AS RowNumByOwnerCreationDate
+    FROM QuestionAnswerAnalysis AS qaa
+    JOIN UserEngagement AS ue ON qaa.QuestionOwnerUserId = ue.UserId
+),
+HighImpactQuestions AS (
+    SELECT
+        rq.QuestionId,
+        rq.QuestionOwnerUserId,
+        rq.QuestionOwnerDisplayName,
+        rq.QuestionOwnerReputation,
+        rq.QuestionTitle,
+        rq.QuestionCreationDate,
+        rq.QuestionViewCount,
+        rq.QuestionScore,
+        rq.AcceptedAnswerId,
+        rq.AcceptedAnswerScore,
+        rq.TimeToAcceptAnswerHours,
+        rq.QuestionOwnerHasEarlyGoldBadge,
+        'High Impact' AS QuestionCategory,
+        rq.RankByOwnerScoreAndViews,
+        rq.QuestionOwnerTotalAnswers,
+        rq.QuestionIsClosed,
+        rq.QuestionTags
+    FROM RankedQuestions AS rq
+    WHERE rq.QuestionOwnerReputation >= 50000
+      AND rq.QuestionViewCount >= 5000
+      AND rq.QuestionScore >= 50
+      AND rq.RankByOwnerScoreAndViews <= 5
+      AND rq.QuestionOwnerTotalAnswers >= 100
+      AND rq.QuestionIsClosed = FALSE
+      AND rq.AcceptedAnswerId IS NOT NULL
+      AND COALESCE(rq.TimeToAcceptAnswerHours, 99999) <= 48
+      AND EXISTS (
+            SELECT 1
+            FROM TagPerformanceMetricsFinal AS tpm
+            WHERE tpm.AvgQuestionViewCountForTag > 10000
+              AND tpm.tag_name = ANY(rq.QuestionTags)
+        )
+),
+NewUserGoodQuestions AS (
+    SELECT
+        rq.QuestionId,
+        rq.QuestionOwnerUserId,
+        rq.QuestionOwnerDisplayName,
+        rq.QuestionOwnerReputation,
+        rq.QuestionTitle,
+        rq.QuestionCreationDate,
+        rq.QuestionViewCount,
+        rq.QuestionScore,
+        rq.AcceptedAnswerId,
+        rq.AcceptedAnswerScore,
+        rq.TimeToAcceptAnswerHours,
+        rq.QuestionOwnerHasEarlyGoldBadge,
+        'New User Good Question' AS QuestionCategory
+    FROM RankedQuestions AS rq
+    WHERE rq.QuestionOwnerReputation BETWEEN 1000 AND 5000
+      AND rq.QuestionViewCount >= 1000
+      AND rq.QuestionScore >= 20
+      AND rq.RowNumByOwnerCreationDate <= 3
+      AND rq.QuestionCreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+      AND rq.AcceptedAnswerId IS NOT NULL
+      AND COALESCE(rq.TimeToAcceptAnswerHours, 99999) < 24
+      AND NOT EXISTS (
+            SELECT 1
+            FROM Posts AS p
+            WHERE p.Id = rq.QuestionId
+              AND LOWER(p.Body) LIKE '%deprecated%'
+        )
+)
+SELECT
+    hi.QuestionId,
+    hi.QuestionOwnerUserId,
+    hi.QuestionOwnerDisplayName,
+    hi.QuestionOwnerReputation,
+    hi.QuestionTitle,
+    hi.QuestionCreationDate,
+    hi.QuestionViewCount,
+    hi.QuestionScore,
+    hi.AcceptedAnswerId,
+    hi.AcceptedAnswerScore,
+    hi.TimeToAcceptAnswerHours,
+    hi.QuestionCategory,
+    'GoldBadgeOwner: ' || CAST(hi.QuestionOwnerHasEarlyGoldBadge AS VARCHAR) AS ExtraInfo
+FROM HighImpactQuestions AS hi
+WHERE hi.QuestionOwnerDisplayName IS NOT NULL AND LENGTH(TRIM(hi.QuestionOwnerDisplayName)) > 0
+  AND hi.QuestionTitle IS NOT NULL AND POSITION('?' IN hi.QuestionTitle) > 0
+  AND hi.AcceptedAnswerId IS NOT NULL
+UNION ALL
+SELECT
+    nu.QuestionId,
+    nu.QuestionOwnerUserId,
+    nu.QuestionOwnerDisplayName,
+    nu.QuestionOwnerReputation,
+    nu.QuestionTitle,
+    nu.QuestionCreationDate,
+    nu.QuestionViewCount,
+    nu.QuestionScore,
+    nu.AcceptedAnswerId,
+    nu.AcceptedAnswerScore,
+    nu.TimeToAcceptAnswerHours,
+    nu.QuestionCategory,
+    'EarlyGoldBadge: ' || CAST(nu.QuestionOwnerHasEarlyGoldBadge AS VARCHAR) AS ExtraInfo
+FROM NewUserGoodQuestions AS nu
+WHERE nu.QuestionOwnerDisplayName IS NOT NULL
+  AND nu.QuestionTitle IS NOT NULL
+  AND nu.QuestionOwnerReputation < 5000
+ORDER BY QuestionCategory, QuestionOwnerReputation DESC, QuestionViewCount DESC;

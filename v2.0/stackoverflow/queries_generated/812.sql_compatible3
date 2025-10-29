@@ -1,0 +1,112 @@
+select
+        s.post_id,
+        s.user_id,
+        s.displayname,
+        s.reputation,
+        s.location,
+        s.website_domain,
+        s.quality_percentile,
+        s.creationdate,
+        s.score,
+        s.viewcount,
+        s.upvotes,
+        s.downvotes,
+        s.vote_ratio,
+        s.engagement_score,
+        s.engagement_per_view,
+        s.gold_badges,
+        s.silver_badges,
+        s.bronze_badges,
+        s.max_tag_decile,
+        s.min_tag_decile,
+        s.top100_tag_hits,
+        s.dup_links,
+        s.linked_in_count,
+        s.dup_of_count,
+        s.close_count,
+        s.reopen_count,
+        s.first_close_date,
+        s.last_reopen_date,
+        s.last_close_reason_name,
+        s.composite_score,
+        row_number() over (order by s.composite_score desc, s.viewcount desc, s.score desc, s.post_id) as rk,
+        rank() over (order by s.composite_score desc) as rnk_ties,
+        dense_rank() over (order by s.composite_score desc) as drnk,
+        ntile(20) over (order by s.composite_score desc) as quantile20
+    from scored s
+),
+percentile_values as (
+    select
+        max(case when p = 0.95 then val end) as p95,
+        max(case when p = 0.80 then val end) as p80,
+        max(case when p = 0.60 then val end) as p60,
+        max(case when p = 0.40 then val end) as p40,
+        max(case when p = 0.20 then val end) as p20
+    from (
+        select
+            composite_score as val,
+            ntile(1000) over (order by composite_score) as bucket,
+            (ntile(1000) over (order by composite_score) / 1000.0) as p
+        from ranked
+    ) t
+),
+banded as (
+    select
+        r.*,
+        case
+            when r.composite_score >= coalesce(pv.p95, 1) then 'A+'
+            when r.composite_score >= coalesce(pv.p80, 0.8) then 'A'
+            when r.composite_score >= coalesce(pv.p60, 0.6) then 'B'
+            when r.composite_score >= coalesce(pv.p40, 0.4) then 'C'
+            when r.composite_score >= coalesce(pv.p20, 0.2) then 'D'
+            else 'E'
+        end as perf_band
+    from ranked r
+    cross join percentile_values pv
+),
+final_set as (
+    select * from banded where perf_band in ('A+','A')
+    union all
+    select * from banded where perf_band = 'B' and max_tag_decile <= 5
+    union all
+    select * from banded where perf_band in ('C','D','E') and composite_score > (
+        select avg(composite_score) from banded
+    )
+)
+select
+    fs.rk,
+    fs.post_id,
+    fs.displayname,
+    fs.reputation,
+    fs.location,
+    fs.website_domain,
+    fs.creationdate,
+    fs.score,
+    fs.viewcount,
+    fs.upvotes,
+    fs.downvotes,
+    round(cast(fs.vote_ratio as numeric), 4) as vote_ratio,
+    round(cast(fs.engagement_per_view as numeric), 4) as engagement_per_view,
+    fs.gold_badges,
+    fs.silver_badges,
+    fs.bronze_badges,
+    fs.max_tag_decile,
+    fs.min_tag_decile,
+    fs.top100_tag_hits,
+    fs.dup_links,
+    fs.linked_in_count,
+    fs.dup_of_count,
+    fs.close_count,
+    fs.reopen_count,
+    coalesce(to_char(cast(fs.first_close_date as timestamp without time zone), 'YYYY-MM-DD"T"HH24:MI:SS'), 'N/A') as first_close_date,
+    coalesce(to_char(cast(fs.last_reopen_date as timestamp without time zone), 'YYYY-MM-DD"T"HH24:MI:SS'), 'N/A') as last_reopen_date,
+    fs.last_close_reason_name,
+    round(cast(fs.composite_score as numeric), 6) as composite_score,
+    fs.perf_band,
+    fs.quantile20
+from final_set fs
+where not (
+    fs.location is null and fs.website_domain = 'unknown.domain'
+)
+order by fs.composite_score desc, fs.viewcount desc, fs.score desc, fs.post_id
+limit 250;

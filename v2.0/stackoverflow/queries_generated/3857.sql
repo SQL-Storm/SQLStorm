@@ -1,0 +1,132 @@
+-- {"query": "3857.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2906} 
+
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+           COALESCE(SUM(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END),0) AS TotalScore,
+           MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeAgg AS (
+    SELECT b.UserId,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+           COUNT(*) AS TotalBadges,
+           STRING_AGG(DISTINCT b.Name, ';') FILTER (WHERE b.TagBased = 0) AS NamedBadges,
+           STRING_AGG(DISTINCT b.Name, ';') FILTER (WHERE b.TagBased = 1) AS TagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TagInfo AS (
+    SELECT t.TagName,
+           t.Count AS TagUseCount,
+           COALESCE(p.Title, '') AS ExcerptTitle,
+           COALESCE(w.Title, '') AS WikiTitle,
+           CASE WHEN t.IsModeratorOnly = 1 THEN 'ModOnly' ELSE 'Public' END AS Visibility
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+),
+RecentVotes AS (
+    SELECT v.PostId,
+           COUNT(*) FILTER (WHERE vt.Id = 2) AS UpVotes,
+           COUNT(*) FILTER (WHERE vt.Id = 3) AS DownVotes,
+           MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE vt.Id IN (2,3)
+    GROUP BY v.PostId
+),
+QuestionClosure AS (
+    SELECT ph.PostId,
+           MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN CAST(ph.Comment AS int) END) AS CloseReasonId,
+           MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS ClosedOn,
+           MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS ReopenedOn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10,11)
+    GROUP BY ph.PostId
+),
+PivotVotes AS (
+    SELECT p.OwnerUserId,
+           SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+           SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+           PERCENT_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS ScorePercentile
+    FROM Posts p
+    JOIN Votes v ON v.PostId = p.Id
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY p.OwnerUserId, p.Score
+)
+SELECT us.Id,
+       us.DisplayName,
+       us.Reputation,
+       us.QuestionCount,
+       us.AnswerCount,
+       us.TotalScore,
+       us.LastPostDate,
+       ba.GoldBadges,
+       ba.SilverBadges,
+       ba.BronzeBadges,
+       ba.TotalBadges,
+       ba.NamedBadges,
+       ba.TagBadges,
+       COALESCE(pv.TotalUpVotes,0)      AS UserUpVotes,
+       COALESCE(pv.TotalDownVotes,0)    AS UserDownVotes,
+       ROUND(pv.ScorePercentile*100,2)  AS ScorePercentilePct,
+       COALESCE(rv.UpVotes,0)           AS RecentPostUpVotes,
+       COALESCE(rv.DownVotes,0)         AS RecentPostDownVotes,
+       qc.CloseReasonId,
+       cr.Name                           AS CloseReasonName,
+       qc.ClosedOn,
+       qc.ReopenedOn,
+       STRING_AGG(DISTINCT ti.TagName, ',')
+           FILTER (WHERE ti.Visibility = 'Public')     AS PublicTagsUsed,
+       STRING_AGG(DISTINCT ti.TagName, ',')
+           FILTER (WHERE ti.Visibility = 'ModOnly')    AS ModOnlyTagsUsed,
+       CASE
+           WHEN us.Reputation IS NULL      THEN 'NoReputation'
+           WHEN us.Reputation < 100        THEN 'Newbie'
+           WHEN us.Reputation < 1000       THEN 'Intermediate'
+           ELSE                                   'Veteran'
+       END AS ReputationBand
+FROM UserStats us
+LEFT JOIN BadgeAgg ba          ON ba.UserId = us.Id
+LEFT JOIN PivotVotes pv       ON pv.OwnerUserId = us.Id
+LEFT JOIN RecentVotes rv      ON rv.PostId = (
+                                   SELECT p2.Id
+                                   FROM Posts p2
+                                   WHERE p2.OwnerUserId = us.Id
+                                   ORDER BY p2.CreationDate DESC
+                                   LIMIT 1
+                                 )
+LEFT JOIN QuestionClosure qc  ON qc.PostId = (
+                                   SELECT p3.Id
+                                   FROM Posts p3
+                                   WHERE p3.PostTypeId = 1
+                                     AND p3.OwnerUserId = us.Id
+                                   ORDER BY p3.CreationDate DESC
+                                   LIMIT 1
+                                 )
+LEFT JOIN CloseReasonTypes cr ON cr.Id = qc.CloseReasonId
+LEFT JOIN (
+    SELECT pt.OwnerUserId,
+           UNNEST(string_to_array(pt.Tags, '><')) AS TagName
+    FROM Posts pt
+    WHERE pt.PostTypeId = 1
+) AS post_tags               ON post_tags.OwnerUserId = us.Id
+LEFT JOIN TagInfo ti          ON ti.TagName = post_tags.TagName
+GROUP BY us.Id, us.DisplayName, us.Reputation,
+         us.QuestionCount, us.AnswerCount, us.TotalScore, us.LastPostDate,
+         ba.GoldBadges, ba.SilverBadges, ba.BronzeBadges, ba.TotalBadges,
+         ba.NamedBadges, ba.TagBadges,
+         pv.TotalUpVotes, pv.TotalDownVotes, pv.ScorePercentile,
+         rv.UpVotes, rv.DownVotes,
+         qc.CloseReasonId, cr.Name, qc.ClosedOn, qc.ReopenedOn
+HAVING COUNT(*) > 0
+ORDER BY us.Reputation DESC NULLS LAST
+LIMIT 1000;

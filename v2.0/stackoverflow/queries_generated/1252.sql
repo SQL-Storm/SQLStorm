@@ -1,0 +1,205 @@
+-- {"query": "1252.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3517} 
+
+WITH UserActivitySummary AS (
+    -- Summarizes core user activity: post counts, scores, view counts, and profile metrics.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P_Q.Id) AS QuestionCount,
+        COUNT(DISTINCT P_A.Id) AS AnswerCount,
+        COUNT(DISTINCT C.Id) AS CommentCount,
+        COALESCE(SUM(P_All.Score), 0) AS TotalPostsScore,
+        COALESCE(AVG(P_Q.ViewCount) FILTER (WHERE P_Q.PostTypeId = 1), 0) AS AvgQuestionViewCount,
+        MAX(P_All.LastActivityDate) AS LastPostActivityDate,
+        U.Views AS ProfileViews,
+        U.Location
+    FROM Users U
+    LEFT JOIN Posts P_All ON U.Id = P_All.OwnerUserId
+    LEFT JOIN Posts P_Q ON U.Id = P_Q.OwnerUserId AND P_Q.PostTypeId = 1
+    LEFT JOIN Posts P_A ON U.Id = P_A.OwnerUserId AND P_A.PostTypeId = 2
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.Location
+),
+PostLinkDuplicateAnalysis AS (
+    -- Analyzes posts for their linking and duplication characteristics, assigning an overall rank.
+    SELECT
+        P.Id AS PostId,
+        P.Title,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.Tags,
+        COUNT(DISTINCT PL_Linked.RelatedPostId) AS LinkedToCount,
+        COUNT(DISTINCT PL_Dupe.RelatedPostId) AS DuplicateOfCount,
+        MAX(CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS HasAcceptedAnswer,
+        -- Window function to rank posts by combined link/duplicate activity and view/score
+        RANK() OVER (ORDER BY COUNT(DISTINCT PL_Linked.RelatedPostId) DESC, COUNT(DISTINCT PL_Dupe.RelatedPostId) DESC, P.ViewCount DESC, P.Score DESC) AS LinkDupeOverallRank
+    FROM Posts P
+    LEFT JOIN PostLinks PL_Linked ON P.Id = PL_Linked.PostId AND PL_Linked.LinkTypeId = 1
+    LEFT JOIN PostLinks PL_Dupe ON P.Id = PL_Dupe.RelatedPostId AND PL_Dupe.LinkTypeId = 3
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+    GROUP BY P.Id, P.Title, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.Tags, P.AcceptedAnswerId
+),
+UserEditBehavior AS (
+    -- Quantifies user editing patterns, including average time between edits and rapid successive edits on posts.
+    SELECT
+        PH.UserId AS EditorUserId,
+        PH.PostId,
+        COUNT(PH.Id) AS TotalEditsOnPost,
+        -- Calculate average time in hours between consecutive edits on the same post by the same user
+        COALESCE(AVG(EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId, PH.UserId ORDER BY PH.CreationDate)))) / 3600, 0) AS AvgHoursBetweenEdits,
+        -- Count rapid edits (within 5 minutes of a previous edit on the same post by the same user)
+        COUNT(CASE WHEN EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId, PH.UserId ORDER BY PH.CreationDate))) / 60 <= 5 THEN 1 END) AS RapidEditCount
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+    GROUP BY PH.UserId, PH.PostId
+    HAVING COUNT(PH.Id) > 1 -- Only consider posts with multiple edits by this user
+),
+BadgeCategorization AS (
+    -- Categorizes users by their badge counts, and identifies if they hold specific popular tag badges.
+    SELECT
+        B.UserId,
+        COUNT(B.Id) FILTER (WHERE B.Class = 1) AS GoldBadges,
+        COUNT(B.Id) FILTER (WHERE B.Class = 2) AS SilverBadges,
+        COUNT(B.Id) FILTER (WHERE B.Class = 3) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeAwardDate,
+        -- Correlated subquery: checks if the user has any tag-based badge for common programming/database tags.
+        (SELECT
+            CASE WHEN EXISTS (
+                SELECT 1
+                FROM Badges B_sub
+                WHERE B_sub.UserId = B.UserId
+                  AND B_sub.TagBased = TRUE
+                  AND B_sub.Name IN ('sql', 'javascript', 'python', 'c#', 'java', '.net', 'html', 'css', 'database', 'azure')
+            ) THEN TRUE ELSE FALSE END
+        ) AS HasPopularTagBadge,
+        -- Window function to rank users by total badge count (descending)
+        ROW_NUMBER() OVER (ORDER BY COUNT(B.Id) DESC, MAX(B.Date) DESC, B.UserId) AS UserBadgeRank
+    FROM Badges B
+    GROUP BY B.UserId
+),
+TopQuestionForUser AS (
+    -- Identifies each user's single top-performing question based on score and view count.
+    SELECT
+        PLDA.OwnerUserId AS UserId,
+        PLDA.PostId AS TopQuestionId,
+        PLDA.Title AS TopQuestionTitle,
+        PLDA.PostScore AS TopQuestionScore,
+        PLDA.ViewCount AS TopQuestionViewCount,
+        PLDA.LinkedToCount AS TopQuestionLinkedCount,
+        PLDA.DuplicateOfCount AS TopQuestionDupeCount,
+        PLDA.Tags AS TopQuestionTags,
+        ROW_NUMBER() OVER(PARTITION BY PLDA.OwnerUserId ORDER BY PLDA.PostScore DESC, PLDA.ViewCount DESC, PLDA.PostId) AS rn_q
+    FROM PostLinkDuplicateAnalysis PLDA
+    WHERE PLDA.PostTypeId = 1
+      AND PLDA.LinkDupeOverallRank <= 500 -- Include a broader set of top questions
+      AND PLDA.PostScore > 20
+),
+TopAnswerForUser AS (
+    -- Identifies each user's single top-performing answer, also fetching its parent question's score.
+    SELECT
+        PLDA.OwnerUserId AS UserId,
+        PLDA.PostId AS TopAnswerId,
+        PLDA.Title AS TopAnswerTitle,
+        PLDA.PostScore AS TopAnswerScore,
+        PLDA.ViewCount AS TopAnswerViewCount,
+        PLDA.LinkedToCount AS TopAnswerLinkedCount,
+        PLDA.DuplicateOfCount AS TopAnswerDupeCount,
+        PLDA.Tags AS TopAnswerTags,
+        -- Correlated subquery to fetch the score of the parent question for the answer
+        (SELECT P_Parent.Score FROM Posts P_Parent WHERE P_Parent.Id = PLDA.ParentId) AS ParentQuestionScoreForAnswer,
+        ROW_NUMBER() OVER(PARTITION BY PLDA.OwnerUserId ORDER BY PLDA.PostScore DESC, PLDA.ViewCount DESC, PLDA.PostId) AS rn_a
+    FROM PostLinkDuplicateAnalysis PLDA
+    WHERE PLDA.PostTypeId = 2
+      AND PLDA.LinkDupeOverallRank <= 1000 -- Include a broader set of top answers
+      AND PLDA.PostScore > 10
+)
+-- Main query: Combines all the CTEs to provide a comprehensive user profile with performance indicators.
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.QuestionCount,
+    UAS.AnswerCount,
+    UAS.CommentCount,
+    UAS.TotalPostsScore,
+    UAS.AvgQuestionViewCount,
+    UAS.ProfileViews,
+    BC.GoldBadges,
+    BC.SilverBadges,
+    BC.BronzeBadges,
+    BC.HasPopularTagBadge,
+    BC.UserBadgeRank,
+    -- Aggregate edit behavior from UserEditBehavior CTE
+    COALESCE(SUM(UEB.TotalEditsOnPost), 0) AS TotalEditsAcrossPosts,
+    COALESCE(AVG(UEB.AvgHoursBetweenEdits), 0) AS AvgHoursBetweenEditsOverall,
+    COALESCE(SUM(UEB.RapidEditCount), 0) AS TotalRapidEdits,
+    TQU.TopQuestionTitle,
+    TQU.TopQuestionScore,
+    TQU.TopQuestionViewCount,
+    TQU.TopQuestionLinkedCount,
+    TQU.TopQuestionDupeCount,
+    -- Correlated subquery: counts relevant tags in the top question's tags string
+    (SELECT COUNT(T.Id) FROM Tags T WHERE TQU.TopQuestionTags ILIKE '%<' || T.TagName || '>%' AND T.TagName IN ('sql', 'database', 'performance', 'indexing', 'query')) AS RelevantTagsInTopQuestion,
+    TAF.TopAnswerTitle,
+    TAF.TopAnswerScore,
+    TAF.ParentQuestionScoreForAnswer,
+    TAF.TopAnswerLinkedCount,
+    TAF.TopAnswerDupeCount,
+    -- Correlated subquery: counts relevant tags in the top answer's tags string
+    (SELECT COUNT(T.Id) FROM Tags T WHERE TAF.TopAnswerTags ILIKE '%<' || T.TagName || '>%' AND T.TagName IN ('sql', 'database', 'performance', 'optimization', 'query-optimization')) AS RelevantTagsInTopAnswer,
+    -- Complex CASE expression to categorize users based on multiple performance metrics and badge status
+    CASE
+        WHEN UAS.Reputation > 20000 AND BC.GoldBadges >= 10 THEN 'Elite Contributor'
+        WHEN UAS.QuestionCount > 100 AND UAS.AvgQuestionViewCount > 10000 THEN 'Prolific Questioner'
+        WHEN UAS.AnswerCount > 200 AND UAS.TotalPostsScore > 2000 THEN 'Master Answerer'
+        WHEN BC.HasPopularTagBadge = TRUE AND COALESCE(SUM(UEB.RapidEditCount), 0) > 0 THEN 'Active Niche Editor'
+        WHEN UAS.Reputation > 5000 AND UAS.LastPostActivityDate >= CURRENT_DATE - INTERVAL '3 months' THEN 'Recently Active Veteran'
+        ELSE 'General Contributor'
+    END AS UserCategory,
+    -- Elaborate string expression to generate a unique hash/alias for the user
+    LOWER(SUBSTRING(UAS.DisplayName, 1, 5)) || '_' || REPLACE(TRIM(REPLACE(COALESCE(UAS.DisplayName, 'anonymous_user'), ' ', '_')), '.', '') || '_' || (UAS.UserId % 10000) AS UserAliasHash,
+    -- Date calculation for user's tenure
+    (EXTRACT(YEAR FROM CURRENT_DATE) - EXTRACT(YEAR FROM UAS.UserCreationDate)) * 12 + (EXTRACT(MONTH FROM CURRENT_DATE) - EXTRACT(MONTH FROM UAS.UserCreationDate)) AS MonthsSinceCreation,
+    -- NULL logic: provides an effective last activity date considering different timestamps
+    COALESCE(UAS.LastPostActivityDate, UAS.LastAccessDate, UAS.UserCreationDate) AS EffectiveLastActivityDate,
+    -- NULL logic: handles missing location data
+    COALESCE(UAS.Location, 'Unknown Location') AS UserLocationStatus,
+    -- NULL logic: indicates the presence of top questions and answers for the user
+    CASE
+        WHEN TQU.TopQuestionId IS NULL AND TAF.TopAnswerId IS NULL THEN 'No Top Posts Found'
+        WHEN TQU.TopQuestionId IS NOT NULL AND TAF.TopAnswerId IS NULL THEN 'Only Top Question'
+        WHEN TQU.TopQuestionId IS NULL AND TAF.TopAnswerId IS NOT NULL THEN 'Only Top Answer'
+        ELSE 'Both Top Question and Answer'
+    END AS TopPostStatus
+FROM UserActivitySummary UAS
+LEFT JOIN BadgeCategorization BC ON UAS.UserId = BC.UserId
+LEFT JOIN UserEditBehavior UEB ON UAS.UserId = UEB.EditorUserId
+LEFT JOIN TopQuestionForUser TQU ON UAS.UserId = TQU.UserId AND TQU.rn_q = 1 -- Join only the single top question
+LEFT JOIN TopAnswerForUser TAF ON UAS.UserId = TAF.UserId AND TAF.rn_a = 1 -- Join only the single top answer
+WHERE
+    UAS.Reputation >= 1000 -- Filter for users with at least 1000 reputation
+    AND (UAS.QuestionCount + UAS.AnswerCount + UAS.CommentCount) > 15 -- Users with significant contribution volume
+    AND (UAS.LastAccessDate >= CURRENT_DATE - INTERVAL '1 year' OR UAS.LastPostActivityDate >= CURRENT_DATE - INTERVAL '6 months') -- Recently active users
+    AND (BC.GoldBadges >= 1 OR BC.HasPopularTagBadge = TRUE OR UAS.ProfileViews > 500) -- Users with some recognition or profile visibility
+    AND (COALESCE(UAS.AvgQuestionViewCount, 0) > 50 OR UAS.CommentCount > 10) -- Engaging content or active commenting
+    AND (
+        -- Correlated subquery: ensures user hasn't had too many posts closed, deleted, or locked (moderator actions)
+        (SELECT COUNT(DISTINCT PH_sub.PostId) FROM PostHistory PH_sub WHERE PH_sub.UserId = UAS.UserId AND PH_sub.PostHistoryTypeId IN (10, 12, 14)) <= 10
+    )
+GROUP BY
+    UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.QuestionCount, UAS.AnswerCount, UAS.CommentCount, UAS.TotalPostsScore, UAS.AvgQuestionViewCount, UAS.ProfileViews,
+    BC.GoldBadges, BC.SilverBadges, BC.BronzeBadges, BC.HasPopularTagBadge, BC.UserBadgeRank,
+    UAS.UserCreationDate, UAS.LastAccessDate, UAS.LastPostActivityDate, UAS.Location,
+    TQU.TopQuestionId, TQU.TopQuestionTitle, TQU.TopQuestionScore, TQU.TopQuestionViewCount, TQU.TopQuestionLinkedCount, TQU.TopQuestionDupeCount, TQU.TopQuestionTags,
+    TAF.TopAnswerId, TAF.TopAnswerTitle, TAF.TopAnswerScore, TAF.ParentQuestionScoreForAnswer, TAF.TopAnswerLinkedCount, TAF.TopAnswerDupeCount, TAF.TopAnswerTags
+ORDER BY
+    UAS.Reputation DESC,
+    EffectiveLastActivityDate DESC
+LIMIT 1000;

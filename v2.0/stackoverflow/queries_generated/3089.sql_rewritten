@@ -1,0 +1,117 @@
+-- {"query": "3089.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2444} 
+WITH TopGoldUsers AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rn
+    FROM Users u
+    WHERE EXISTS (
+        SELECT 1
+        FROM Badges b
+        WHERE b.UserId = u.Id
+          AND b.Class = 1          -- gold badge
+    )
+),
+RecentPosts AS (
+    SELECT p.Id,
+           p.OwnerUserId,
+           p.PostTypeId,
+           p.Score,
+           p.CreationDate,
+           p.AcceptedAnswerId,
+           p.Tags,
+           v.UpVotes,
+           v.DownVotes
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId,
+               SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+               SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        WHERE CreationDate >= cast('2024-10-01' as date) - INTERVAL '365 days'
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '365 days'
+),
+UserTagStats AS (
+    SELECT rp.OwnerUserId AS UserId,
+           UNNEST(string_to_array(TRIM(BOTH '<>' FROM rp.Tags), '><')) AS Tag,
+           COUNT(*) AS TagUseCount
+    FROM RecentPosts rp
+    WHERE rp.Tags IS NOT NULL
+    GROUP BY rp.OwnerUserId, Tag
+),
+RankedUserTags AS (
+    SELECT uts.UserId,
+           uts.Tag,
+           uts.TagUseCount,
+           ROW_NUMBER() OVER (PARTITION BY uts.UserId ORDER BY uts.TagUseCount DESC) AS TagRank
+    FROM UserTagStats uts
+),
+UserPostAggregates AS (
+    SELECT tg.Id AS UserId,
+           COUNT(CASE WHEN rp.PostTypeId = 1 THEN 1 END)                       AS QuestionCount,
+           COUNT(CASE WHEN rp.PostTypeId = 2 THEN 1 END)                       AS AnswerCount,
+           AVG(CASE WHEN rp.PostTypeId = 1 THEN rp.Score END)                 AS AvgQuestionScore,
+           PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rp.Score)
+               FILTER (WHERE rp.PostTypeId = 1)                               AS MedianQuestionScore,
+           SUM(COALESCE(rp.UpVotes, 0))                                      AS TotalUpVotes,
+           SUM(COALESCE(rp.DownVotes, 0))                                    AS TotalDownVotes,
+           COUNT(CASE WHEN rp.PostTypeId = 1 AND rp.AcceptedAnswerId IS NOT NULL THEN 1 END)
+                                                                          AS QuestionsWithAccepted,
+           MAX(rp.CreationDate)                                              AS LastPostDate
+    FROM TopGoldUsers tg
+    LEFT JOIN RecentPosts rp ON rp.OwnerUserId = tg.Id
+    GROUP BY tg.Id
+),
+FinalResult AS (
+    SELECT tgu.Id,
+           tgu.DisplayName,
+           tgu.Reputation,
+           upa.QuestionCount,
+           upa.AnswerCount,
+           upa.AvgQuestionScore,
+           upa.MedianQuestionScore,
+           upa.TotalUpVotes,
+           upa.TotalDownVotes,
+           upa.QuestionsWithAccepted,
+           upa.LastPostDate,
+           CASE 
+               WHEN upa.QuestionCount = 0 THEN NULL
+               ELSE ROUND(upa.QuestionsWithAccepted::numeric / upa.QuestionCount, 2)
+           END AS AcceptedAnswerRatio,
+           STRING_AGG(CASE WHEN rut.TagRank <= 3 THEN rut.Tag END, ', ')
+               FILTER (WHERE rut.TagRank <= 3)                               AS TopThreeTags
+    FROM TopGoldUsers tgu
+    LEFT JOIN UserPostAggregates upa ON upa.UserId = tgu.Id
+    LEFT JOIN RankedUserTags rut   ON rut.UserId = tgu.Id
+    GROUP BY tgu.Id, tgu.DisplayName, tgu.Reputation,
+             upa.QuestionCount, upa.AnswerCount, upa.AvgQuestionScore,
+             upa.MedianQuestionScore, upa.TotalUpVotes, upa.TotalDownVotes,
+             upa.QuestionsWithAccepted, upa.LastPostDate
+)
+SELECT *
+FROM FinalResult
+WHERE rn <= 10
+
+UNION ALL
+
+SELECT u.Id,
+       u.DisplayName,
+       u.Reputation,
+       0                                 AS QuestionCount,
+       0                                 AS AnswerCount,
+       NULL                              AS AvgQuestionScore,
+       NULL                              AS MedianQuestionScore,
+       0                                 AS TotalUpVotes,
+       0                                 AS TotalDownVotes,
+       0                                 AS QuestionsWithAccepted,
+       NULL                              AS LastPostDate,
+       NULL                              AS AcceptedAnswerRatio,
+       NULL                              AS TopThreeTags
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1)
+  AND u.Reputation > (SELECT MAX(Reputation) FROM TopGoldUsers)
+ORDER BY Reputation DESC
+LIMIT 10;

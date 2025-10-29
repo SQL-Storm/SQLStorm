@@ -1,0 +1,179 @@
+WITH
+UserPostAgg AS (
+    SELECT
+        u.Id                              AS UserId,
+        COUNT(p.Id)                       AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score)                      AS AvgScore,
+        MAX(p.CreationDate)               AS LastPostDate,
+        MIN(p.CreationDate)               AS FirstPostDate
+    FROM Users u
+    LEFT JOIN Posts p
+        ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+
+UserBadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(*)                                 AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ')        AS BadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+UserTopTag AS (
+    SELECT
+        q.OwnerUserId                                          AS UserId,
+        tag,
+        cnt,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY cnt DESC) AS rn
+    FROM (
+        SELECT
+            p.OwnerUserId,
+            UNNEST(
+                CASE
+                    WHEN p.Tags IS NULL THEN ARRAY[]::text[]
+                    ELSE regexp_split_to_array(
+                             substring(p.Tags FROM 2 FOR char_length(p.Tags)-2),
+                             '><')
+                END
+            ) AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ) q
+    JOIN LATERAL (
+        SELECT tag, COUNT(*) AS cnt
+        FROM (
+            SELECT UNNEST(
+                CASE
+                    WHEN p.Tags IS NULL THEN ARRAY[]::text[]
+                    ELSE regexp_split_to_array(
+                             substring(p.Tags FROM 2 FOR char_length(p.Tags)-2),
+                             '><')
+                END
+            ) AS tag
+            FROM Posts p
+            WHERE p.PostTypeId = 1 AND p.OwnerUserId = q.OwnerUserId
+        ) t
+        GROUP BY tag
+    ) tg ON tg.tag = q.tag
+    GROUP BY q.OwnerUserId, tag, cnt
+),
+
+UserLatestActivity AS (
+    SELECT
+        u.Id                                             AS UserId,
+        GREATEST(
+            COALESCE(p.LastActivityDate, TIMESTAMP '1970-01-01'),
+            COALESCE(c.CreationDate,      TIMESTAMP '1970-01-01'),
+            COALESCE(v.CreationDate,      TIMESTAMP '1970-01-01')
+        )                                                AS LastActivity
+    FROM Users u
+    LEFT JOIN LATERAL (
+        SELECT MAX(LastActivityDate) AS LastActivityDate
+        FROM Posts
+        WHERE OwnerUserId = u.Id
+    ) p ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT MAX(CreationDate) AS CreationDate
+        FROM Comments
+        WHERE UserId = u.Id
+    ) c ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT MAX(CreationDate) AS CreationDate
+        FROM Votes
+        WHERE UserId = u.Id
+    ) v ON TRUE
+),
+
+BadgeOnlyUsers AS (
+    SELECT
+        u.Id                                            AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(b.TotalBadges,0)                        AS BadgeCount
+    FROM Users u
+    LEFT JOIN UserBadgeAgg b
+        ON b.UserId = u.Id
+    WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+      AND COALESCE(b.TotalBadges,0) > 0
+),
+
+ScoreExtremes AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        up.AvgScore,
+        NTILE(20) OVER (ORDER BY up.AvgScore DESC) AS Decile
+    FROM Users u
+    JOIN UserPostAgg up
+        ON up.UserId = u.Id
+)
+
+SELECT
+    u.Id                                 AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(pa.TotalPosts,0)            AS TotalPosts,
+    COALESCE(pa.QuestionCount,0)        AS Questions,
+    COALESCE(pa.AnswerCount,0)          AS Answers,
+    COALESCE(pa.AvgScore,0)             AS AvgScore,
+    COALESCE(bb.TotalBadges,0)           AS BadgesEarned,
+    COALESCE(bb.GoldBadges,0)            AS GoldBadges,
+    COALESCE(bb.SilverBadges,0)          AS SilverBadges,
+    COALESCE(bb.BronzeBadges,0)          AS BronzeBadges,
+    COALESCE(bb.BadgeList,'')           AS BadgeNames,
+    COALESCE(tt.tag,'<none>')            AS TopTag,
+    COALESCE(la.LastActivity, u.CreationDate) AS LastSeen,
+    CASE
+        WHEN se.Decile = 1 THEN 'Bottom 5%'
+        WHEN se.Decile = 20 THEN 'Top 5%'
+        ELSE NULL
+    END                                 AS ScoreTier
+FROM Users u
+LEFT JOIN UserPostAgg pa
+    ON pa.UserId = u.Id
+LEFT JOIN UserBadgeAgg bb
+    ON bb.UserId = u.Id
+LEFT JOIN (
+    SELECT UserId, tag
+    FROM UserTopTag
+    WHERE rn = 1
+) tt
+    ON tt.UserId = u.Id
+LEFT JOIN UserLatestActivity la
+    ON la.UserId = u.Id
+LEFT JOIN ScoreExtremes se
+    ON se.Id = u.Id
+WHERE u.AccountId IS NOT NULL
+   AND u.Reputation > 1000
+   AND (se.Decile = 1 OR se.Decile = 20)
+
+UNION ALL
+
+SELECT
+    bo.UserId,
+    bo.DisplayName,
+    bo.Reputation,
+    0                                   AS TotalPosts,
+    0                                   AS Questions,
+    0                                   AS Answers,
+    NULL                                AS AvgScore,
+    bo.BadgeCount                       AS BadgesEarned,
+    0                                   AS GoldBadges,
+    0                                   AS SilverBadges,
+    0                                   AS BronzeBadges,
+    NULL                                AS BadgeNames,
+    '<none>'                            AS TopTag,
+    u.CreationDate                      AS LastSeen,
+    'BadgeOnly'                         AS ScoreTier
+FROM BadgeOnlyUsers bo
+JOIN Users u
+    ON u.Id = bo.UserId
+WHERE bo.BadgeCount > 5;

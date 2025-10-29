@@ -1,0 +1,223 @@
+-- {"query": "7199.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2153} 
+WITH RankedPosts AS (
+  SELECT 
+    p.Id,
+    p.PostTypeId,
+    p.ParentId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.Title,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+    LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+    SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as cumulative_score
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= '2019-01-01'
+),
+UserStats AS (
+  SELECT 
+    u.Id as UserId,
+    u.Reputation,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) as total_posts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+    SUM(COALESCE(p.Score, 0)) as total_score,
+    AVG(COALESCE(p.Score, 0)) as avg_score,
+    MAX(p.CreationDate) as last_post_date,
+    CASE 
+      WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Heavy Poster'
+      WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Moderate Poster'
+      WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Light Poster'
+      ELSE 'Newbie'
+    END as posting_level
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE p.CreationDate >= '2019-01-01' OR p.Id IS NULL
+  GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+TagAnalysis AS (
+  SELECT 
+    t.TagName,
+    t.Count as tag_count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    CASE WHEN t.ExcerptPostId IS NOT NULL THEN 1 ELSE 0 END as has_excerpt,
+    CASE WHEN t.WikiPostId IS NOT NULL THEN 1 ELSE 0 END as has_wiki,
+    DENSE_RANK() OVER (ORDER BY t.Count DESC) as popularity_rank,
+    AVG(CAST(SUBSTRING(t.TagName, 1, 1) AS INTEGER)) as avg_first_char_value
+  FROM Tags t
+  WHERE t.Count > 10
+),
+ComplexPostAnalysis AS (
+  SELECT 
+    rp.Id as PostId,
+    rp.PostTypeId,
+    rp.Title,
+    rp.Tags,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.CreationDate,
+    CASE 
+      WHEN rp.Tags IS NOT NULL AND rp.Tags != '' THEN 
+        ARRAY_LENGTH(string_to_array(SUBSTRING(rp.Tags, 2, LENGTH(rp.Tags)-2), '><'), 1)
+      ELSE 0 
+    END as tag_count,
+    COALESCE(rp.prev_score, 0) as previous_score,
+    CASE 
+      WHEN rp.prev_score IS NOT NULL AND rp.prev_score > 0 THEN 
+        (rp.Score - rp.prev_score) * 100.0 / rp.prev_score
+      ELSE 0 
+    END as score_change_percent,
+    rp.cumulative_score,
+    CASE 
+      WHEN rp.cumulative_score > 1000 THEN 'Highly Valued'
+      WHEN rp.cumulative_score > 500 THEN 'Valued'
+      WHEN rp.cumulative_score > 100 THEN 'Moderately Valued'
+      ELSE 'Low Value'
+    END as value_category,
+    DATEDIFF('DAY', rp.CreationDate, CURRENT_TIMESTAMP) as days_since_creation,
+    CASE 
+      WHEN rp.AnswerCount IS NULL OR rp.AnswerCount = 0 THEN 'No Answers'
+      WHEN rp.AnswerCount <= 3 THEN 'Few Answers'
+      WHEN rp.AnswerCount <= 10 THEN 'Moderate Answers'
+      ELSE 'Many Answers'
+    END as answer_level,
+    ROW_NUMBER() OVER (ORDER BY rp.Score DESC) as top_score_rank
+  FROM RankedPosts rp
+  WHERE rp.rn = 1 OR rp.rn IS NULL
+)
+SELECT 
+  'Post Analytics Summary' as analysis_type,
+  COUNT(*) as total_posts_analyzed,
+  AVG(ca.score) as avg_score,
+  MAX(ca.score) as max_score,
+  MIN(ca.score) as min_score,
+  SUM(ca.score) as total_score,
+  AVG(CASE WHEN ca.answer_level = 'Many Answers' THEN 1 ELSE 0 END) * 100 as percentage_with_many_answers,
+  AVG(ca.score_change_percent) as avg_score_change_percent,
+  COUNT(DISTINCT CASE WHEN ca.value_category = 'Highly Valued' THEN ca.PostId END) as highly_valued_posts,
+  COUNT(DISTINCT CASE WHEN ca.value_category = 'Valued' THEN ca.PostId END) as valued_posts,
+  COUNT(*) - COUNT(DISTINCT ca.value_category) as posts_with_missing_category_info,
+  (
+    SELECT COUNT(*) 
+    FROM UserStats us 
+    WHERE us.posting_level = 'Heavy Poster'
+  ) as heavy_posters_count,
+  (
+    SELECT COUNT(*) 
+    FROM UserStats us 
+    WHERE us.posting_level = 'Moderate Poster' 
+  ) as moderate_posters_count,
+  (
+    SELECT COUNT(*) 
+    FROM UserStats us 
+    WHERE us.posting_level = 'Light Poster' 
+  ) as light_posters_count,
+  (
+    SELECT COUNT(*) 
+    FROM UserStats us 
+    WHERE us.posting_level = 'Newbie' 
+  ) as newbie_count,
+  (
+    SELECT COUNT(*) 
+    FROM TagAnalysis ta 
+    WHERE ta.has_excerpt = 1
+  ) as tags_with_excerpts,
+  (
+    SELECT COUNT(*) 
+    FROM TagAnalysis ta 
+    WHERE ta.has_wiki = 1
+  ) as tags_with_wikis,
+  (
+    SELECT AVG(tag_count) 
+    FROM TagAnalysis ta
+  ) as avg_tags_per_tag,
+  (
+    SELECT COUNT(*) 
+    FROM Posts p 
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= '2020-01-01'
+  ) as questions_2020,
+  (
+    SELECT COUNT(*) 
+    FROM Posts p 
+    WHERE p.PostTypeId = 2 AND p.CreationDate >= '2020-01-01'
+  ) as answers_2020,
+  CONCAT('Results from ', CURRENT_TIMESTAMP) as generated_at,
+  CASE 
+    WHEN COUNT(*) > 1000 THEN 'Large Dataset'
+    WHEN COUNT(*) > 100 THEN 'Medium Dataset'
+    ELSE 'Small Dataset'
+  END as dataset_size_category
+FROM ComplexPostAnalysis ca
+WHERE ca.PostId IS NOT NULL AND ca.PostId > 0
+UNION ALL
+SELECT 
+  'User Activity Summary' as analysis_type,
+  COUNT(*) as total_posts_analyzed,
+  AVG(us.total_score) as avg_score,
+  MAX(us.total_score) as max_score,
+  MIN(us.total_score) as min_score,
+  SUM(us.total_score) as total_score,
+  0 as percentage_with_many_answers,
+  0 as avg_score_change_percent,
+  0 as highly_valued_posts,
+  0 as valued_posts,
+  0 as posts_with_missing_category_info,
+  COUNT(DISTINCT CASE WHEN us.posting_level = 'Heavy Poster' THEN us.UserId END) as heavy_posters_count,
+  COUNT(DISTINCT CASE WHEN us.posting_level = 'Moderate Poster' THEN us.UserId END) as moderate_posters_count,
+  COUNT(DISTINCT CASE WHEN us.posting_level = 'Light Poster' THEN us.UserId END) as light_posters_count,
+  COUNT(DISTINCT CASE WHEN us.posting_level = 'Newbie' THEN us.UserId END) as newbie_count,
+  0 as tags_with_excerpts,
+  0 as tags_with_wikis,
+  0 as avg_tags_per_tag,
+  0 as questions_2020,
+  0 as answers_2020,
+  CONCAT('Results from ', CURRENT_TIMESTAMP) as generated_at,
+  CASE 
+    WHEN COUNT(*) > 100 THEN 'Large Dataset'
+    WHEN COUNT(*) > 10 THEN 'Medium Dataset'
+    ELSE 'Small Dataset'
+  END as dataset_size_category
+FROM UserStats us
+WHERE us.UserId IS NOT NULL AND us.UserId > 0
+UNION ALL
+SELECT 
+  'Tag Statistics Summary' as analysis_type,
+  COUNT(*) as total_posts_analyzed,
+  0 as avg_score,
+  0 as max_score,
+  0 as min_score,
+  0 as total_score,
+  0 as percentage_with_many_answers,
+  0 as avg_score_change_percent,
+  0 as highly_valued_posts,
+  0 as valued_posts,
+  0 as posts_with_missing_category_info,
+  0 as heavy_posters_count,
+  0 as moderate_posters_count,
+  0 as light_posters_count,
+  0 as newbie_count,
+  COUNT(DISTINCT CASE WHEN ta.has_excerpt = 1 THEN ta.TagName END) as tags_with_excerpts,
+  COUNT(DISTINCT CASE WHEN ta.has_wiki = 1 THEN ta.TagName END) as tags_with_wikis,
+  AVG(ta.tag_count) as avg_tags_per_tag,
+  0 as questions_2020,
+  0 as answers_2020,
+  CONCAT('Results from ', CURRENT_TIMESTAMP) as generated_at,
+  CASE 
+    WHEN COUNT(*) > 100 THEN 'Large Dataset'
+    WHEN COUNT(*) > 10 THEN 'Medium Dataset'
+    ELSE 'Small Dataset'
+  END as dataset_size_category
+FROM TagAnalysis ta
+WHERE ta.TagName IS NOT NULL AND ta.TagName != ''
+ORDER BY analysis_type;

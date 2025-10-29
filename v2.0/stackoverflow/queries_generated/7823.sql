@@ -1,0 +1,248 @@
+-- {"query": "7823.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2385} 
+WITH UserEngagementStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        DATEDIFF(CURRENT_TIMESTAMP, MAX(p.CreationDate)) as DaysSinceLastPost,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0 / COUNT(DISTINCT p.Id))
+            ELSE 0 
+        END as QuestionPercentage,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as ActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE OwnerUserId IS NOT NULL)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+HighValueUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Comments,
+        Badges,
+        LastPostDate,
+        DaysSinceLastPost,
+        QuestionPercentage,
+        ReputationRank,
+        ActivityRank,
+        CASE 
+            WHEN Reputation > 10000 AND TotalPosts > 50 AND (UpVotes - DownVotes) > 100 THEN 'HighValue'
+            WHEN Reputation > 5000 AND TotalPosts > 25 THEN 'MediumValue' 
+            WHEN Reputation > 1000 THEN 'LowValue'
+            ELSE 'Inactive'
+        END as UserTier
+    FROM UserEngagementStats
+),
+PostQualityScores AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.Body,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                CASE 
+                    WHEN p.Score >= 100 THEN 'Gold'
+                    WHEN p.Score >= 50 THEN 'Silver'
+                    WHEN p.Score >= 10 THEN 'Bronze'
+                    ELSE 'Regular'
+                END
+            WHEN p.PostTypeId = 2 THEN 
+                CASE 
+                    WHEN p.Score >= 50 THEN 'Excellent'
+                    WHEN p.Score >= 25 THEN 'Good'
+                    WHEN p.Score >= 5 THEN 'Average'
+                    ELSE 'Poor'
+                END
+            ELSE 'Other'
+        END as QualityTier,
+        DATEDIFF(CURRENT_TIMESTAMP, p.CreationDate) as AgeInDays,
+        COALESCE(p.ViewCount, 0) * 0.1 + COALESCE(p.Score, 0) * 2.0 + COALESCE(p.AnswerCount, 0) * 5.0 + 
+        CASE 
+            WHEN p.CommentCount > 10 THEN 100 
+            WHEN p.CommentCount > 5 THEN 50 
+            ELSE 0 
+        END as EngagementScore,
+        SUBSTRING(p.Body, 1, 100) as Snippet,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 THEN
+                (SELECT COUNT(*) FROM unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS tag 
+                 WHERE tag != '')
+            ELSE 0 
+        END as TagCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPostStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(p.Id) as UserTotalPosts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) as UserQuestions,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) as UserAnswers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as UserQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as UserAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore,
+        MAX(p.CreationDate) as UserLastPostDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) as PostRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) - t.Count as PopularityDifference,
+        AVG(t.Count) OVER () as AverageTagCount,
+        t.Count - AVG(t.Count) OVER () as TagDeviation,
+        CONCAT('https://stackoverflow.com/questions/tagged/', t.TagName) as TagUrl
+    FROM Tags t
+),
+PostActivityTimeline AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other' 
+        END as PostType,
+        DATEDIFF(p.LastActivityDate, p.CreationDate) as ActivityDuration,
+        DATEDIFF(CURRENT_TIMESTAMP, p.CreationDate) as PostAge,
+        CASE 
+            WHEN p.Score >= 100 THEN 'TopRated'
+            WHEN p.Score >= 50 THEN 'HighRated'
+            WHEN p.Score >= 10 THEN 'MedRated'
+            ELSE 'LowRated'
+        END as RatingCategory,
+        ROW_NUMBER() OVER (ORDER BY p.LastActivityDate DESC) as RecentActivityRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        NTILE(10) OVER (ORDER BY Score DESC) as ScoreDecile,
+        SUM(p.Score) OVER (ORDER BY p.CreationDate) as CumulativeScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+)
+SELECT 
+    hvu.UserId,
+    hvu.DisplayName,
+    hvu.Reputation,
+    hvu.TotalPosts,
+    hvu.Questions,
+    hvu.Answers,
+    hvu.Comments,
+    hvu.Badges,
+    hvu.ReputationRank,
+    hvu.ActivityRank,
+    hvu.UserTier,
+    pqs.PostId as TopPostId,
+    pqs.Title as TopPostTitle,
+    pqs.Score as PostScore,
+    pqs.QualityTier,
+    pqs.EngagementScore,
+    pqs.AgeInDays,
+    pqs.TagCount,
+    ptl.PostType,
+    ptl.ActivityDuration,
+    ptl.PostAge,
+    ptl.RatingCategory,
+    ta.TagName,
+    ta.PopularityLevel,
+    ta.PopularityRank,
+    CASE 
+        WHEN hvu.UserTier = 'HighValue' THEN 
+            CASE 
+                WHEN pqs.EngagementScore > 1000 THEN 'Elite'
+                WHEN pqs.EngagementScore > 500 THEN 'Premium'
+                ELSE 'HighQuality'
+            END
+        WHEN hvu.UserTier = 'MediumValue' THEN 
+            CASE 
+                WHEN pqs.EngagementScore > 300 THEN 'Good'
+                ELSE 'Standard'
+            END
+        ELSE 'Basic'
+    END as UserPostCategory,
+    COUNT(*) OVER () as TotalResults,
+    CASE 
+        WHEN pqs.TagCount > 0 THEN 'TaggedContent'
+        ELSE 'UntaggedContent'
+    END as ContentTagStatus,
+    CONCAT('https://stackoverflow.com/users/', hvu.UserId) as UserProfileUrl,
+    CASE 
+        WHEN hvu.DaysSinceLastPost > 180 THEN 'InactiveUser'
+        WHEN hvu.DaysSinceLastPost > 30 THEN 'OccasionalUser'
+        ELSE 'ActiveUser'
+    END as UserStatus,
+    ABS(hvu.Reputation - AVG(hvu.Reputation) OVER ()) as ReputationDeviation,
+    AVG(pqs.EngagementScore) OVER (PARTITION BY hvu.UserTier) as TierAvgEngagement,
+    CASE 
+        WHEN hvu.Answers > 0 THEN (hvu.Answers * 100.0 / NULLIF(hvu.Questions, 0))
+        ELSE NULL
+    END as AnswerToQuestionRatio,
+    NULLIF(hvu.Comments, 0) * NULLIF(hvu.Badges, 0) as EngagementMultiplier,
+    COALESCE(pqs.Snippet, 'No content available') as ContentPreview,
+    CASE 
+        WHEN ptl.RecentActivityRank <= 10 THEN 'RecentlyActive'
+        WHEN ptl.RecentActivityRank <= 100 THEN 'Active'
+        ELSE 'Inactive'
+    END as PostActiveStatus,
+    STRING_AGG(ta.TagName, ', ') WITHIN GROUP (ORDER BY ta.PopularityRank) as TopTags,
+    CONCAT('Profile Rank: ', hvu.ReputationRank, ' / ', COUNT(*) OVER(), ' | Activity Rank: ', hvu.ActivityRank, ' / ', COUNT(*) OVER()) as RankingInfo
+FROM HighValueUsers hvu
+LEFT JOIN PostQualityScores pqs ON hvu.UserId = pqs.OwnerUserId
+LEFT JOIN PostActivityTimeline ptl ON pqs.PostId = ptl.PostId
+LEFT JOIN TagAnalysis ta ON ta.TagName IN (
+    SELECT TRIM(tag) 
+    FROM unnest(string_to_array(SUBSTRING(pqs.Tags, 2, LENGTH(pqs.Tags)-2), '><')) AS tag 
+    WHERE tag != ''
+    LIMIT 5
+)
+WHERE hvu.UserId IN (
+    SELECT DISTINCT OwnerUserId 
+    FROM Posts 
+    WHERE OwnerUserId IS NOT NULL 
+    AND CreationDate >= DATEADD(YEAR, -1, CURRENT_TIMESTAMP)
+)
+ORDER BY hvu.Reputation DESC, pqs.EngagementScore DESC
+LIMIT 1000 OFFSET 0
+HAVING COUNT(*) > 0;

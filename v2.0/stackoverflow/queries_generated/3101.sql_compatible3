@@ -1,0 +1,136 @@
+WITH
+    UserBadgeCounts AS (
+        SELECT
+            u.Id                                 AS UserId,
+            u.DisplayName,
+            COUNT(CASE WHEN b.Class = 1 THEN 1 END)  AS GoldBadges,
+            COUNT(CASE WHEN b.Class = 2 THEN 1 END)  AS SilverBadges,
+            COUNT(CASE WHEN b.Class = 3 THEN 1 END)  AS BronzeBadges,
+            SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadges
+        FROM Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName
+    ),
+
+    RecentQuestionActivity AS (
+        SELECT
+            p.Id                                   AS QuestionId,
+            p.Title,
+            p.CreationDate,
+            COALESCE(p.Score, 0)                   AS QuestionScore,
+            COALESCE(p.ViewCount, 0)               AS Views,
+            COALESCE(p.FavoriteCount, 0)           AS Favorites,
+            (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2) AS AnswerCount,
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id)                      AS CommentCount,
+            ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC)                            AS RecentRank
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+    ),
+
+    TagCooccurrence AS (
+        SELECT
+            t1.tag   AS TagA,
+            t2.tag   AS TagB,
+            COUNT(*) AS CooccurCount
+        FROM Posts p,
+             regexp_split_to_table(p.Tags, '[><]') AS t1(tag),
+             regexp_split_to_table(p.Tags, '[><]') AS t2(tag)
+        WHERE p.PostTypeId = 1
+          AND t1.tag <> '' AND t2.tag <> ''
+          AND t1.tag < t2.tag
+        GROUP BY t1.tag, t2.tag
+        HAVING COUNT(*) > 10
+    ),
+
+    VoteAggregates AS (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+            MAX(v.CreationDate)                               AS LastVoteDate
+        FROM Votes v
+        GROUP BY v.PostId
+    ),
+
+    ClosedReasons AS (
+        SELECT
+            ph.PostId,
+            MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS CloseReasonId
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10
+        GROUP BY ph.PostId
+    )
+
+SELECT
+    rq.QuestionId,
+    rq.Title,
+    rq.CreationDate,
+    rq.QuestionScore,
+    rq.Views,
+    rq.Favorites,
+    rq.AnswerCount,
+    rq.CommentCount,
+    COALESCE(va.UpVotes, 0)   AS TotalUpVotes,
+    COALESCE(va.DownVotes, 0) AS TotalDownVotes,
+    cr.CloseReasonId,
+    ub.DisplayName,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBasedBadges,
+    CASE
+        WHEN (rq.QuestionScore + COALESCE(va.UpVotes,0) - COALESCE(va.DownVotes,0)) > 100 THEN 'Hot'
+        WHEN rq.Views > 1000                                                       THEN 'Popular'
+        ELSE 'Normal'
+    END AS ActivityTier,
+    STRING_AGG(DISTINCT t.TagName, ', ')          AS TagsList,
+    STRING_AGG(DISTINCT tc.TagB, ', ')            AS RelatedTags
+FROM RecentQuestionActivity rq
+LEFT JOIN VoteAggregates      va ON va.PostId = rq.QuestionId
+LEFT JOIN ClosedReasons       cr ON cr.PostId = rq.QuestionId
+LEFT JOIN Users               u  ON u.Id = (SELECT OwnerUserId FROM Posts WHERE Id = rq.QuestionId)
+LEFT JOIN UserBadgeCounts    ub  ON ub.UserId = u.Id
+LEFT JOIN (
+        SELECT p.Id AS PostId, tag AS TagName
+        FROM Posts p,
+             regexp_split_to_table(p.Tags, '[><]') AS tag
+    ) t ON t.PostId = rq.QuestionId
+LEFT JOIN TagCooccurrence tc ON tc.TagA = t.TagName
+WHERE (ub.GoldBadges > 0 OR ub.SilverBadges > 0)
+  AND t.TagName IS NOT NULL
+  AND (tc.CooccurCount IS NULL OR tc.CooccurCount > 20)
+GROUP BY
+    rq.QuestionId, rq.Title, rq.CreationDate, rq.QuestionScore, rq.Views,
+    rq.Favorites, rq.AnswerCount, rq.CommentCount,
+    va.UpVotes, va.DownVotes, cr.CloseReasonId,
+    ub.DisplayName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TagBasedBadges
+
+UNION ALL
+
+SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    COALESCE(p.Score,0),
+    COALESCE(p.ViewCount,0),
+    COALESCE(p.FavoriteCount,0),
+    (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2),
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id),
+    COALESCE(vu.UpVotes, 0),
+    COALESCE(vu.DownVotes, 0),
+    NULL,
+    u.DisplayName,
+    0, 0, 0, 0,
+    'Legacy',
+    NULL,
+    NULL
+FROM Posts p
+LEFT JOIN VoteAggregates vu ON vu.PostId = p.Id
+LEFT JOIN Users u          ON u.Id = p.OwnerUserId
+WHERE p.PostTypeId = 1
+  AND p.CreationDate < (CAST('2024-10-01' AS DATE) - INTERVAL '365' DAY)
+  AND (p.Score IS NULL OR p.Score < 0)
+
+ORDER BY QuestionId DESC
+LIMIT 100;

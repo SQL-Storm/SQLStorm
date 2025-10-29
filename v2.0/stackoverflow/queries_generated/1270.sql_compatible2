@@ -1,0 +1,211 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT V.Id) FILTER (WHERE V.UserId IS NOT NULL) AS TotalVotesCast,
+        SUM(CASE WHEN VT.Name = 'UpMod' AND V.UserId IS NOT NULL THEN 1 ELSE 0 END) AS TotalUpVotesCast,
+        SUM(CASE WHEN VT.Name = 'DownMod' AND V.UserId IS NOT NULL THEN 1 ELSE 0 END) AS TotalDownVotesCast,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(U.LastAccessDate, U.CreationDate) AS UserLastAccessDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN VoteTypes VT ON V.VoteTypeId = VT.Id
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostHistoryAndStatus AS (
+    SELECT
+        PH.PostId,
+        MIN(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS FirstEditDate,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS LastEditDate,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS TotalEdits,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 'Closed'
+                 WHEN PH.PostHistoryTypeId = 11 THEN 'Reopened'
+                 WHEN PH.PostHistoryTypeId = 12 THEN 'Deleted'
+                 WHEN PH.PostHistoryTypeId = 13 THEN 'Undeleted'
+                 WHEN PH.PostHistoryTypeId = 35 THEN 'Migrated Away'
+                 WHEN PH.PostHistoryTypeId = 36 THEN 'Migrated Here'
+                 ELSE NULL END) AS LatestStatusChangeType,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId = 10) AS ClosedEventDate,
+        COALESCE(CAST(MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Comment END) AS SMALLINT), -1) AS CloseReasonTypeId,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId = 10) AS CloseVoteCount,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId = 11) AS ReopenVoteCount
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+QuestionAnswerEngagement AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.AcceptedAnswerId,
+        COUNT(A.Id) AS TotalAnswersReceived,
+        MIN(A.CreationDate) AS FirstAnswerDate,
+        AVG(A.Score) FILTER (WHERE A.Score IS NOT NULL) AS AvgAnswerScore,
+        SUM(CASE WHEN V_Q.VoteTypeId = 2 THEN 1 ELSE 0 END) AS QuestionUpVotes,
+        SUM(CASE WHEN V_Q.VoteTypeId = 3 THEN 1 ELSE 0 END) AS QuestionDownVotes,
+        MAX(Q.FavoriteCount) AS QuestionFavoriteCount,
+        MAX(Q.ViewCount) AS QuestionViewCount,
+        bool_or(Q.AcceptedAnswerId IS NOT NULL) AS HasAcceptedAnswer
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN Votes V_Q ON Q.Id = V_Q.PostId AND V_Q.VoteTypeId IN (2, 3, 5)
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id, Q.CreationDate, Q.AcceptedAnswerId
+),
+TagPerformanceMetrics AS (
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><'))) AS TagName,
+        P.Id AS PostId,
+        P.Score AS PostScore,
+        P.CreationDate AS PostCreationDate,
+        P.ViewCount AS PostViewCount
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+),
+AggregatedTagMetrics AS (
+    SELECT
+        TPM.TagName,
+        COUNT(DISTINCT TPM.PostId) AS QuestionsUsingTag,
+        AVG(TPM.PostScore) AS AvgQuestionScoreForTag,
+        AVG(TPM.PostViewCount) AS AvgQuestionViewCountForTag,
+        MAX(T.WikiPostId) AS TagWikiPostId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesForTag,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesForTag,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesForTag
+    FROM TagPerformanceMetrics TPM
+    LEFT JOIN Tags T ON TPM.TagName = T.TagName
+    LEFT JOIN Badges B ON T.TagName = B.Name AND B.TagBased IS TRUE
+    GROUP BY TPM.TagName
+),
+MostImpactfulQuestions AS (
+    SELECT
+        Q.OwnerUserId,
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.CommentCount AS QuestionCommentCount,
+        QAE.TotalAnswersReceived,
+        QAE.AvgAnswerScore,
+        (Q.Score * 1.5 + Q.ViewCount / 100.0 + QAE.TotalAnswersReceived * 5 + COALESCE(QAE.QuestionFavoriteCount, 0) * 10 + COALESCE(Q.CommentCount, 0) * 2) AS ImpactScore,
+        ROW_NUMBER() OVER (PARTITION BY Q.OwnerUserId ORDER BY (Q.Score * 1.5 + Q.ViewCount / 100.0 + QAE.TotalAnswersReceived * 5 + COALESCE(QAE.QuestionFavoriteCount, 0) * 10 + COALESCE(Q.CommentCount, 0) * 2) DESC, Q.CreationDate DESC) AS rn,
+        QAE.QuestionUpVotes,
+        QAE.QuestionDownVotes,
+        QAE.FirstAnswerDate,
+        QAE.QuestionCreationDate,
+        QAE.HasAcceptedAnswer,
+        QAE.QuestionFavoriteCount,
+        QAE.TotalAnswersReceived AS QAE_TotalAnswersReceived
+    FROM Posts Q
+    JOIN QuestionAnswerEngagement QAE ON Q.Id = QAE.QuestionId
+    WHERE Q.PostTypeId = 1 AND Q.OwnerUserId IS NOT NULL
+),
+MostImpactfulAnswers AS (
+    SELECT
+        A.OwnerUserId,
+        A.Id AS AnswerId,
+        A.ParentId AS ParentQuestionId,
+        A.Score AS AnswerScore,
+        A.CreationDate AS AnswerCreationDate,
+        Q.AcceptedAnswerId AS ParentAcceptedAnswerId,
+        (CASE WHEN Q.AcceptedAnswerId = A.Id THEN 100 ELSE 0 END + A.Score * 2 + COALESCE(A.CommentCount,0) * 1.5) AS AnswerImpactScore,
+        ROW_NUMBER() OVER (PARTITION BY A.OwnerUserId ORDER BY (CASE WHEN Q.AcceptedAnswerId = A.Id THEN 100 ELSE 0 END + A.Score * 2 + COALESCE(A.CommentCount,0) * 1.5) DESC, A.CreationDate DESC) AS rn
+    FROM Posts A
+    JOIN Posts Q ON A.ParentId = Q.Id
+    WHERE A.PostTypeId = 2 AND A.OwnerUserId IS NOT NULL
+)
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.TotalPosts,
+    UES.TotalQuestions,
+    UES.TotalAnswers,
+    UES.GoldBadges,
+    UES.SilverBadges,
+    UES.BronzeBadges,
+    UES.UserLastAccessDate,
+    AGE(TIMESTAMP '2024-10-01 12:34:56', UES.UserCreationDate) AS UserAccountAge,
+    MIQ.QuestionId AS MostImpactfulQuestionId,
+    MIQ.QuestionTitle AS MostImpactfulQuestionTitle,
+    MIQ.QuestionScore AS MIQ_Score,
+    MIQ.QuestionViewCount AS MIQ_ViewCount,
+    MIQ.TotalAnswersReceived AS MIQ_TotalAnswers,
+    MIQ.AvgAnswerScore AS MIQ_AvgAnswerScore,
+    PEH_Q.TotalEdits AS MIQ_TotalEdits,
+    PEH_Q.LatestStatusChangeType AS MIQ_LatestStatus,
+    CR.Name AS MIQ_CloseReason,
+    (COALESCE(MIQ.QuestionUpVotes,0) - COALESCE(MIQ.QuestionDownVotes,0)) AS MIQ_NetVotes,
+    (EXTRACT(EPOCH FROM (MIQ.FirstAnswerDate - MIQ.QuestionCreationDate)) / 3600.0) AS MIQ_TimeToFirstAnswerHours,
+    MIA.AnswerId AS MostImpactfulAnswerId,
+    MIA.AnswerScore AS MIA_Score,
+    PEH_A.TotalEdits AS MIA_TotalEdits,
+    MIA.ParentQuestionId AS MIA_ParentQuestionId,
+    EXISTS (
+        SELECT 1
+        FROM Comments C_MIQ
+        WHERE C_MIQ.PostId = MIQ.QuestionId
+          AND C_MIQ.UserId = UES.UserId
+          AND LENGTH(C_MIQ.Text) > 75
+          AND C_MIQ.CreationDate > (MIQ.QuestionCreationDate - INTERVAL '1 day')
+    ) AS HasUserSelfCommentedOnMIQ_Long,
+    RANK() OVER (ORDER BY UES.Reputation DESC, UES.TotalPosts DESC) AS UserOverallRank,
+    NTILE(10) OVER (ORDER BY UES.Reputation DESC) AS ReputationDecile,
+    (
+        SELECT STRING_AGG(DISTINCT atm.TagName || ' (Q:' || atm.QuestionsUsingTag || ', G:' || atm.GoldBadgesForTag || ')', '; ')
+        FROM TagPerformanceMetrics tpm_sub
+        JOIN AggregatedTagMetrics atm ON tpm_sub.TagName = atm.TagName
+        WHERE tpm_sub.PostId = MIQ.QuestionId
+    ) AS MIQ_RelatedTagsWithStats,
+    COALESCE(
+        MIQ.QuestionViewCount / NULLIF(CASE WHEN MIQ.HasAcceptedAnswer THEN MIQ.TotalAnswersReceived ELSE 0 END, 0),
+        0.0
+    ) AS MIQ_ViewsPerAcceptedAnswer,
+    EXISTS (
+        SELECT 1
+        FROM PostLinks PL
+        WHERE (PL.PostId = MIQ.QuestionId AND PL.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate'))
+           OR (PL.RelatedPostId = MIQ.QuestionId AND PL.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate'))
+    ) AS MIQ_HasDuplicateLink,
+    UPPER(SUBSTRING(COALESCE(MIQ.QuestionTitle, 'N/A') FROM 1 FOR 10)) AS TitlePrefixUpper,
+    CASE
+        WHEN UES.Reputation > 10000 AND UES.GoldBadges >= 3 AND MIQ.TotalAnswersReceived > 10 AND MIQ.AvgAnswerScore > 5 THEN 'Highly Influential Expert'
+        WHEN UES.Reputation > 5000 AND MIQ.ImpactScore > 500 AND MIA.AnswerImpactScore IS NOT NULL AND MIA.AnswerScore > 50 THEN 'Proactive Contributor & Problem Solver'
+        WHEN UES.TotalAnswers > UES.TotalQuestions * 3 AND UES.TotalAnswers > 50 THEN 'Dedicated Answerer'
+        WHEN UES.TotalQuestions > UES.TotalAnswers * 3 AND UES.TotalQuestions > 20 THEN 'Prolific Questioner'
+        WHEN UES.TotalComments > 100 AND UES.TotalPosts > 50 THEN 'Engaged Community Member'
+        ELSE 'General Participant'
+    END AS UserProfileCategory,
+    AVG(Q_User.Score) OVER (PARTITION BY UES.UserId) AS UserAvgQuestionScore,
+    (
+        SELECT AVG(AU.Reputation)
+        FROM Posts A_Sub
+        JOIN Users AU ON A_Sub.OwnerUserId = AU.Id
+        WHERE A_Sub.ParentId = MIQ.QuestionId AND A_Sub.PostTypeId = 2
+    ) AS AvgAnswererReputationOnMIQ,
+    (SELECT COUNT(*) FROM PostHistory ph_r WHERE ph_r.UserId = UES.UserId AND ph_r.PostHistoryTypeId = 11) > 3 AS IsFrequentReopener
+FROM UserEngagementSummary UES
+LEFT JOIN MostImpactfulQuestions MIQ ON UES.UserId = MIQ.OwnerUserId AND MIQ.rn = 1
+LEFT JOIN PostHistoryAndStatus PEH_Q ON MIQ.QuestionId = PEH_Q.PostId
+LEFT JOIN CloseReasonTypes CR ON PEH_Q.CloseReasonTypeId = CR.Id
+LEFT JOIN MostImpactfulAnswers MIA ON UES.UserId = MIA.OwnerUserId AND MIA.rn = 1
+LEFT JOIN PostHistoryAndStatus PEH_A ON MIA.AnswerId = PEH_A.PostId
+LEFT JOIN Posts Q_User ON UES.UserId = Q_User.OwnerUserId AND Q_User.PostTypeId = 1
+WHERE UES.UserId IN (
+    SELECT UQ.OwnerUserId FROM Posts UQ WHERE UQ.PostTypeId = 1 AND UQ.OwnerUserId IS NOT NULL
+    INTERSECT
+    SELECT UA.OwnerUserId FROM Posts UA WHERE UA.PostTypeId = 2 AND UA.OwnerUserId IS NOT NULL
+)
+ORDER BY UES.Reputation DESC, MIQ.ImpactScore DESC NULLS LAST
+LIMIT 100;

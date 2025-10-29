@@ -1,0 +1,226 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(p.Tags, '; ') AS AllTags,
+        COUNT(DISTINCT p.ParentId) AS AnsweredQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS QuestionsWithAcceptedAnswer,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotes
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE u.Id > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostStatus,
+        CASE WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 1 ELSE 0 END AS HasTags,
+        LENGTH(p.Body) AS BodyLength,
+        CAST((CAST(COALESCE(p.ClosedDate, p.LastActivityDate, TIMESTAMP '2024-10-01 12:34:56') AS timestamp) 
+              - CAST(p.CreationDate AS timestamp)) AS interval) AS AgeInterval,
+        EXTRACT(EPOCH FROM (CAST(COALESCE(p.ClosedDate, p.LastActivityDate, TIMESTAMP '2024-10-01 12:34:56') AS timestamp) 
+              - CAST(p.CreationDate AS timestamp)))/86400.0 AS AgeInDays,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+        ROW_NUMBER() OVER (ORDER BY (p.Score + p.ViewCount) DESC) AS CombinedRank,
+        NTILE(10) OVER (ORDER BY p.Score) AS ScoreQuartile,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) AS NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS UserAvgScore,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS UserPostCount,
+        CASE 
+            WHEN AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) > 10 THEN 'High'
+            WHEN AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) > 5 THEN 'Medium'
+            ELSE 'Low'
+        END AS UserPerformanceLevel,
+        p.Tags
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate > DATE '2020-01-01'
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        QuestionCount,
+        AnswerCount,
+        TotalScore,
+        AvgScore,
+        LastPostDate,
+        AllTags,
+        AnsweredQuestions,
+        QuestionsWithAcceptedAnswer,
+        TotalVotes,
+        UpVotes,
+        DownVotes,
+        RANK() OVER (ORDER BY TotalScore DESC) AS ScoreRank
+    FROM UserPostStats
+    WHERE TotalPosts > 0
+),
+ComplexAnalysis AS (
+    SELECT 
+        ta.PostId,
+        ta.Title,
+        ta.Score,
+        ta.ViewCount,
+        ta.AnswerCount,
+        ta.CommentCount,
+        ta.CreationDate,
+        ta.OwnerUserId,
+        ta.PostTypeId,
+        ta.HasAcceptedAnswer,
+        ta.PostStatus,
+        ta.HasTags,
+        ta.BodyLength,
+        ta.AgeInDays,
+        ta.ScoreRank,
+        ta.ViewRank,
+        ta.CombinedRank,
+        ta.ScoreQuartile,
+        ta.PrevScore,
+        ta.NextScore,
+        ta.UserAvgScore,
+        ta.UserPostCount,
+        ta.UserPerformanceLevel,
+        tu.DisplayName AS OwnerDisplayName,
+        tu.Reputation AS OwnerReputation,
+        tu.TotalPosts AS OwnerTotalPosts,
+        tu.QuestionCount AS OwnerQuestions,
+        tu.AnswerCount AS OwnerAnswers,
+        tu.TotalScore AS OwnerTotalScore,
+        tu.AvgScore AS OwnerAvgScore,
+        tu.ScoreRank AS OwnerScoreRank,
+        CASE 
+            WHEN ta.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1 AND p2.CreationDate > DATE '2021-01-01') THEN 'AboveAverage'
+            WHEN ta.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1 AND p2.CreationDate > DATE '2021-01-01') * 0.8 THEN 'NearAverage'
+            ELSE 'BelowAverage'
+        END AS PostPerformance,
+        CASE 
+            WHEN ta.AnswerCount > 0 AND 0 = 0 THEN 'PureAnswerer'
+            WHEN 0 > 0 AND ta.AnswerCount = 0 THEN 'PureQuestioner'
+            WHEN 0 > 0 AND ta.AnswerCount > 0 THEN 'Hybrid'
+            ELSE 'Neither'
+        END AS ContributionType,
+        COALESCE(tu.AllTags, '') AS OwnerTags,
+        CASE WHEN tu.AllTags IS NOT NULL AND ta.Tags IS NOT NULL THEN 
+            (SELECT COUNT(*) FROM (
+                SELECT unnest(string_to_array(tu.AllTags, '; ')) AS tag1
+            ) t1 WHERE tag1 IN (
+                SELECT unnest(string_to_array(ta.Tags, '; '))
+            )) 
+            ELSE 0 END AS TagOverlapCount,
+        (CASE WHEN ta.HasTags = 1 THEN 1 ELSE 0 END + CASE WHEN ta.HasAcceptedAnswer = 1 THEN 1 ELSE 0 END + 
+         CASE WHEN ta.AnswerCount > 0 THEN 1 ELSE 0 END + CASE WHEN ta.ViewCount > 100 THEN 1 ELSE 0 END) AS EngagementScore,
+        CASE 
+            WHEN ta.Score > 0 AND ta.ViewCount >= 1000 THEN 'Viral'
+            WHEN ta.Score > 0 AND ta.ViewCount >= 500 THEN 'Popular'
+            WHEN ta.Score > 0 AND ta.ViewCount >= 100 THEN 'Moderate'
+            ELSE 'Low'
+        END AS Popularity,
+        DENSE_RANK() OVER (PARTITION BY ta.OwnerUserId ORDER BY ta.Score DESC) AS OwnerPostRank,
+        DENSE_RANK() OVER (ORDER BY ta.ViewCount DESC) AS GlobalViewRank,
+        MAX(ta.Score) OVER (PARTITION BY ta.OwnerUserId) AS OwnerMaxScore,
+        MIN(ta.Score) OVER (PARTITION BY ta.OwnerUserId) AS OwnerMinScore,
+        SUM(ta.Score) OVER (PARTITION BY ta.OwnerUserId) AS OwnerTotalScoreSum,
+        PERCENT_RANK() OVER (ORDER BY ta.Score) AS ScorePercentile,
+        ta.Tags
+    FROM PostAnalysis ta
+    LEFT JOIN TopUsers tu ON ta.OwnerUserId = tu.UserId
+    WHERE ta.OwnerUserId IS NOT NULL
+)
+SELECT 
+    ca.PostId,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.AnswerCount,
+    ca.CommentCount,
+    ca.CreationDate,
+    ca.OwnerUserId,
+    ca.PostTypeId,
+    ca.HasAcceptedAnswer,
+    ca.PostStatus,
+    ca.HasTags,
+    ca.BodyLength,
+    ca.AgeInDays,
+    ca.ScoreRank,
+    ca.ViewRank,
+    ca.CombinedRank,
+    ca.ScoreQuartile,
+    ca.PrevScore,
+    ca.NextScore,
+    ca.UserAvgScore,
+    ca.UserPostCount,
+    ca.UserPerformanceLevel,
+    ca.OwnerDisplayName,
+    ca.OwnerReputation,
+    ca.OwnerTotalPosts,
+    ca.OwnerQuestions,
+    ca.OwnerAnswers,
+    ca.OwnerTotalScore,
+    ca.OwnerAvgScore,
+    ca.OwnerScoreRank,
+    ca.PostPerformance,
+    ca.ContributionType,
+    ca.OwnerTags,
+    ca.TagOverlapCount,
+    ca.EngagementScore,
+    ca.Popularity,
+    ca.OwnerPostRank,
+    ca.GlobalViewRank,
+    ca.OwnerMaxScore,
+    ca.OwnerMinScore,
+    ca.OwnerTotalScoreSum,
+    ca.ScorePercentile,
+    CASE 
+        WHEN ca.OwnerReputation >= 10000 THEN 'Expert'
+        WHEN ca.OwnerReputation >= 5000 THEN 'Advanced'
+        WHEN ca.OwnerReputation >= 1000 THEN 'Intermediate'
+        WHEN ca.OwnerReputation >= 100 THEN 'Beginner'
+        ELSE 'New'
+    END AS ReputationLevel,
+    CASE WHEN ca.OwnerAvgScore > 5 THEN 1 ELSE 0 END AS HighScoringUser,
+    CASE WHEN ca.AnswerCount > 5 THEN 1 ELSE 0 END AS HighAnswerer,
+    CASE WHEN ca.CommentCount > 10 THEN 1 ELSE 0 END AS HighCommenter,
+    CASE WHEN COALESCE(ca.TotalVotes, 0) > 0 THEN (COALESCE(ca.UpVotes, 0) * 100.0 / NULLIF(COALESCE(ca.TotalVotes, 0), 0)) ELSE 0 END AS UpVotePercentage,
+    CASE WHEN COALESCE(ca.OwnerTotalScore, 0) > 0 THEN (ca.OwnerTotalScore - ca.OwnerMinScore) / NULLIF((ca.OwnerMaxScore - ca.OwnerMinScore), 0) ELSE 0 END AS ScoreNormalization,
+    ROW_NUMBER() OVER (ORDER BY ca.OwnerTotalScore DESC, ca.Score DESC) AS OverallRank,
+    RANK() OVER (PARTITION BY ca.PostTypeId ORDER BY ca.Score DESC) AS TypeSpecificRank
+FROM ComplexAnalysis ca
+WHERE ca.OwnerReputation > 100
+  AND ca.PostPerformance IN ('AboveAverage', 'NearAverage')
+  AND ca.Popularity IN ('Viral', 'Popular')
+  AND (ca.OwnerTotalPosts > 10 OR ca.OwnerAvgScore > 2)
+  AND ca.CreationDate >= DATE '2021-01-01'
+  AND ca.CreationDate < DATE '2023-01-01'
+ORDER BY ca.OwnerTotalScore DESC, 
+         ca.Score DESC,
+         ca.ViewCount DESC
+LIMIT 1000;

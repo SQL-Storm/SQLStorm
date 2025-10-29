@@ -1,0 +1,278 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Tags END, '|') as AllQuestionTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        uas.*,
+        ROW_NUMBER() OVER (ORDER BY TotalQuestionScore DESC, TotalAnswerScore DESC) as RankByScore,
+        RANK() OVER (ORDER BY Reputation DESC) as RankByReputation,
+        DENSE_RANK() OVER (ORDER BY PostCount DESC) as RankByPostCount
+    FROM UserActivityStats uas
+),
+TopPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.PostTypeId,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as RankByScorePerType,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score > 0
+),
+UserEngagement AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId IN (2, 3) THEN v.PostId END) as VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as DownVoteCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.PostId END) as FavoriteCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId IN (6, 7) THEN v.PostId END) as CloseReopenCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN p.Score ELSE 0 END) as ScoreFromUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN p.Score ELSE 0 END) as ScoreFromDownvotes
+    FROM Users u
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Posts p ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.PostTypeId,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            WHEN p.Score > 10 THEN 'Low'
+            ELSE 'Very Low'
+        END as ScoreCategory,
+        CAST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / 86400 AS INTEGER) as AgeInDays,
+        CASE 
+            WHEN p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 month') THEN 'Recent'
+            WHEN p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months') THEN 'Last 6 Months'
+            WHEN p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year') THEN 'Last Year'
+            ELSE 'Older'
+        END as PostAgeGroup,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as TotalEngagement,
+        CASE 
+            WHEN p.Score > 0 AND p.ViewCount > 0 THEN (p.Score * 1.0 / p.ViewCount) 
+            ELSE 0 
+        END as ScoreToViewRatio
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score > 0
+),
+ComprehensiveAnalysis AS (
+    SELECT 
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.PostCount,
+        r.CommentCount,
+        r.BadgeCount,
+        r.QuestionCount,
+        r.AnswerCount,
+        r.TotalQuestionScore,
+        r.TotalAnswerScore,
+        r.AvgQuestionScore,
+        r.AvgAnswerScore,
+        r.AllQuestionTags,
+        r.RankByScore,
+        r.RankByReputation,
+        r.RankByPostCount,
+        u.VoteCount,
+        u.UpVoteCount,
+        u.DownVoteCount,
+        u.FavoriteCount,
+        u.CloseReopenCount,
+        u.ScoreFromUpvotes,
+        u.ScoreFromDownvotes,
+        pm.PostId,
+        pm.Title,
+        pm.Score as PostScore,
+        pm.ViewCount as PostViewCount,
+        pm.CreationDate as PostCreationDate,
+        pm.Tags as PostTags,
+        pm.AnswerCount as PostAnswerCount,
+        pm.CommentCount as PostCommentCount,
+        pm.FavoriteCount as PostFavoriteCount,
+        pm.PostTypeId,
+        pm.ScoreCategory,
+        pm.AgeInDays,
+        pm.PostAgeGroup,
+        pm.TotalEngagement,
+        pm.ScoreToViewRatio,
+        pm.RankByScorePerType,
+        pm.ScorePercentile
+    FROM RankedUsers r
+    JOIN UserEngagement u ON r.UserId = u.UserId
+    LEFT JOIN PostMetrics pm ON r.UserId = pm.OwnerUserId
+    WHERE r.Reputation > 1000 OR (r.QuestionCount > 5 AND r.AnswerCount > 10)
+),
+TagAnalysis AS (
+    SELECT 
+        p.Tags,
+        string_to_array(replace(replace(p.Tags, '<', ''), '>', ''), '<>') as TagArray,
+        COUNT(*) as PostCountPerTagSet,
+        SUM(p.Score) as TotalScorePerTagSet
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+    GROUP BY p.Tags
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        pa.UserId,
+        pa.DisplayName,
+        pa.Reputation,
+        pa.PostCount,
+        pa.QuestionCount,
+        pa.AnswerCount,
+        pa.TotalQuestionScore,
+        pa.TotalAnswerScore,
+        pa.AvgQuestionScore,
+        pa.AvgAnswerScore,
+        pa.PostId,
+        pa.Title,
+        pa.PostScore,
+        pa.PostViewCount,
+        pa.PostCreationDate,
+        pa.PostTags,
+        pa.ScoreCategory,
+        pa.AgeInDays,
+        pa.PostAgeGroup,
+        pa.TotalEngagement,
+        pa.ScoreToViewRatio,
+        pa.RankByScorePerType,
+        pa.ScorePercentile,
+        CASE 
+            WHEN pa.TotalEngagement > 30 THEN 'High Engagement'
+            WHEN pa.TotalEngagement > 15 THEN 'Medium Engagement'
+            WHEN pa.TotalEngagement > 5 THEN 'Low Engagement'
+            ELSE 'Very Low Engagement'
+        END as EngagementLevel,
+        CASE 
+            WHEN pa.ScoreToViewRatio > 0.1 THEN 'High Engagement Rate'
+            WHEN pa.ScoreToViewRatio > 0.05 THEN 'Medium Engagement Rate'
+            ELSE 'Low Engagement Rate'
+        END as EngagementRate,
+        COUNT(*) OVER (PARTITION BY pa.UserId) as UserPostCount,
+        AVG(pa.PostScore) OVER (PARTITION BY pa.UserId) as AvgUserPostScore,
+        ROW_NUMBER() OVER (PARTITION BY pa.UserId ORDER BY pa.PostScore DESC) as UserTopPostRank,
+        CASE 
+            WHEN pa.ScorePercentile >= 0.9 THEN 'Top 10%'
+            WHEN pa.ScorePercentile >= 0.75 THEN 'Top 25%'
+            WHEN pa.ScorePercentile >= 0.5 THEN 'Top 50%'
+            ELSE 'Below Average'
+        END as PerformanceTier
+    FROM ComprehensiveAnalysis pa
+    WHERE pa.PostScore IS NOT NULL
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.PostCount,
+    ca.QuestionCount,
+    ca.AnswerCount,
+    ca.TotalQuestionScore,
+    ca.TotalAnswerScore,
+    ca.AvgQuestionScore,
+    ca.AvgAnswerScore,
+    ca.PostId,
+    ca.Title,
+    ca.PostScore,
+    ca.PostViewCount,
+    ca.PostCreationDate,
+    ca.PostTags,
+    ca.ScoreCategory,
+    ca.AgeInDays,
+    ca.PostAgeGroup,
+    ca.TotalEngagement,
+    ca.ScoreToViewRatio,
+    ca.RankByScorePerType,
+    ca.ScorePercentile,
+    ca.EngagementLevel,
+    ca.EngagementRate,
+    ca.UserPostCount,
+    ca.AvgUserPostScore,
+    ca.UserTopPostRank,
+    ca.PerformanceTier,
+    CASE 
+        WHEN ca.Reputation >= 10000 AND ca.PostCount >= 100 THEN 'Elite Contributor'
+        WHEN ca.Reputation >= 5000 AND ca.PostCount >= 50 THEN 'Active Contributor'
+        WHEN ca.Reputation >= 1000 AND ca.PostCount >= 10 THEN 'Regular Contributor'
+        ELSE 'New Contributor'
+    END as ContributorTier,
+    COALESCE(ca.TotalQuestionScore, 0) + COALESCE(ca.TotalAnswerScore, 0) as TotalScore,
+    CASE 
+        WHEN ca.PerformanceTier IN ('Top 10%', 'Top 25%') AND ca.EngagementLevel = 'High Engagement' THEN 'High Performer'
+        WHEN ca.PerformanceTier IN ('Top 50%', 'Below Average') AND ca.EngagementLevel IN ('Medium Engagement', 'High Engagement') THEN 'Mid Performer'
+        ELSE 'Lower Performer'
+    END as PerformanceCategory,
+    ('User ' || ca.UserId || ' - ' || ca.DisplayName || ' - ' || ca.PostCount || ' posts, ' || ca.Reputation || ' reputation') as UserSummary,
+    CASE 
+        WHEN ca.TotalEngagement > (SELECT AVG(TotalEngagement) FROM ComplexPostAnalysis) THEN 'Above Average Engagement'
+        ELSE 'Below Average Engagement'
+    END as EngagementComparison,
+    ROUND(
+        CASE 
+            WHEN ca.PostViewCount > 0 THEN (ca.PostScore * 100.0 / ca.PostViewCount)
+            ELSE 0
+        END, 2
+    ) as ScorePerViewPercentage,
+    COALESCE(
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 1 AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')), 
+        0
+    ) as RecentQuestions,
+    COALESCE(
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 2 AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')), 
+        0
+    ) as RecentAnswers
+FROM ComplexPostAnalysis ca
+WHERE ca.PostScore > (
+    SELECT AVG(PostScore) 
+    FROM ComplexPostAnalysis 
+    WHERE PerformanceTier IN ('Top 10%', 'Top 25%')
+)
+ORDER BY 
+    ca.TotalScore DESC,
+    ca.PostScore DESC,
+    ca.UserPostCount DESC,
+    ca.Reputation DESC
+LIMIT 1000;

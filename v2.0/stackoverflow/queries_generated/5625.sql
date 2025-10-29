@@ -1,0 +1,114 @@
+-- {"query": "5625.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 836} 
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.Location
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= NOW() - INTERVAL '180 days'
+),
+top_tags AS (
+  SELECT
+    unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS tag,
+    AVG(p.Score) AS avg_score,
+    COUNT(*) AS questions_count
+  FROM recent_questions p
+  GROUP BY 1
+),
+tag_trends AS (
+  SELECT
+    t.tag,
+    t.avg_score,
+    t.questions_count,
+    ROW_NUMBER() OVER (ORDER BY t.questions_count DESC, t.avg_score DESC) AS rn
+  FROM top_tags t
+),
+activity_by_user AS (
+  SELECT
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes_received,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes_received,
+    SUM(p.ViewCount) AS total_views_by_user,
+    MAX(p.LastActivityDate) AS last_activity
+  FROM Posts p
+  INNER JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.PostTypeId = 1
+  GROUP BY p.OwnerUserId, u.DisplayName
+),
+complex_post AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.LastEditorUserId,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerName,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS total_comments,
+    (SELECT MAX(CreationDate) FROM Votes v WHERE v.PostId = p.Id) AS last_vote_date,
+    CASE
+      WHEN p.Score IS NULL THEN 0
+      ELSE p.Score
+    END AS computed_score
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId IN (1,2) -- Questions and Answers
+),
+filtered AS (
+  SELECT
+    c.*,
+    ROW_NUMBER() OVER (PARTITION BY c.OwnerUserId ORDER BY c.CreationDate DESC, c.Score DESC) AS rn_owner
+  FROM complex_post c
+  WHERE c.LastActivityDate >= NOW() - INTERVAL '90 days'
+)
+SELECT
+  r.PostId,
+  r.Title,
+  r.Tags,
+  r.CreationDate,
+  r.Score,
+  r.ViewCount,
+  r.OwnerUserId,
+  r.OwnerDisplayName,
+  r.LastActivityDate,
+  r.CommentCount,
+  r.AnswerCount,
+  r.FavoriteCount,
+  r.ContentLicense,
+  r.Reputation,
+  r.OwnerDisplayName AS OwnerName,
+  a.total_views_by_user,
+  a.last_activity,
+  t.tag AS top_tag,
+  t.avg_score AS top_tag_avg_score,
+  t.questions_count AS top_tag_questions
+FROM recent_questions r
+LEFT JOIN activity_by_user a ON r.OwnerUserId = a.OwnerUserId
+LEFT JOIN tag_trends t ON true
+WHERE t.rn IS NULL OR t.rn = 1
+ORDER BY r.LastActivityDate DESC
+LIMIT 100;

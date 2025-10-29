@@ -1,0 +1,114 @@
+-- {"query": "4226.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1408} 
+
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.Title IS NOT NULL
+),
+UserPostEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT COALESCE(c.Id, 0)) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5) THEN ph.PostId ELSE NULL END) AS EditedPostCount,
+        MAX(p.Score) AS MaxPostScore,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS AnswerCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.PostHistoryTypeId IN (4, 5)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+HighEngagementUsers AS (
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        UserCreationDate,
+        CommentCount,
+        UpVoteCount,
+        DownVoteCount,
+        EditedPostCount,
+        MaxPostScore,
+        AvgPostScore,
+        TotalPostsOwned,
+        QuestionCount,
+        AnswerCount,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, UpVoteCount DESC) as UserRank
+    FROM UserPostEngagement
+    WHERE TotalPostsOwned > 1000 AND Reputation > 10000
+),
+RecentActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) as RecentActivityRank
+    FROM Posts p
+    WHERE p.LastActivityDate > DATE('now', '-7 day')
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate AS LinkCreationDate,
+        'Duplicate' AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id AND lt.Name = 'Duplicate'
+)
+SELECT
+    u.DisplayName AS UserName,
+    u.Reputation,
+    u.UserCreationDate,
+    COALESCE(u.TotalPostsOwned, 0) AS TotalPostsOwned,
+    COALESCE(u.QuestionCount, 0) AS TotalQuestions,
+    COALESCE(u.AnswerCount, 0) AS TotalAnswers,
+    COALESCE(u.CommentCount, 0) AS TotalComments,
+    COALESCE(u.UpVoteCount, 0) AS TotalUpvotesGiven,
+    COALESCE(u.DownVoteCount, 0) AS TotalDownvotesGiven,
+    COALESCE(u.EditedPostCount, 0) AS PostsEdited,
+    COALESCE(u.MaxPostScore, 0) AS HighestPostScore,
+    COALESCE(u.AvgPostScore, 0.0) AS AveragePostScore,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.UserId AND b.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.UserId AND b.Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.UserId AND b.Class = 3) AS BronzeBadges,
+    CASE
+        WHEN rp.rn = 1 THEN rp.Title
+        ELSE NULL
+    END AS MostRecentPostTitle,
+    CASE
+        WHEN ra.RecentActivityRank = 1 THEN ra.Title
+        ELSE NULL
+    END AS LastActivePostTitle,
+    COALESCE(dl.LinkTypeName, 'Not Applicable') AS HasDuplicateLink,
+    CASE
+        WHEN u.Reputation > 100000 AND u.TotalPostsOwned > 5000 THEN 'High Authority'
+        WHEN u.Reputation BETWEEN 10000 AND 100000 AND u.TotalPostsOwned BETWEEN 1000 AND 5000 THEN 'Mid Authority'
+        ELSE 'Lower Authority'
+    END AS AuthorityLevel,
+    LOWER(SUBSTRING(u.DisplayName, 1, 3)) AS FirstThreeCharsDisplayName,
+    UPPER(u.DisplayName) AS UppercaseDisplayName,
+    CASE WHEN u.Location LIKE '%USA%' OR u.Location LIKE '%United States%' THEN 'USA' ELSE 'Other' END AS GeoOrigin,
+    CASE WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website' ELSE 'Has Website' END AS WebsiteStatus
+FROM HighEngagementUsers u
+LEFT JOIN RankedPosts rp ON u.UserId = rp.OwnerUserId AND rp.rn = 1
+LEFT JOIN RecentActivity ra ON u.UserId = ra.OwnerUserId AND ra.RecentActivityRank = 1
+LEFT JOIN DuplicateLinks dl ON u.UserId = dl.PostId
+WHERE u.UserRank <= 50
+ORDER BY u.UserRank;

@@ -1,0 +1,236 @@
+-- {"query": "7105.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2507} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        AVG(CAST(p.Score AS FLOAT)) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        DATEDIFF(day, MIN(p.CreationDate), MAX(p.CreationDate)) AS ActiveDays,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadgeCount,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), ', ') AS AllTags,
+        STRING_AGG(DISTINCT p.Title, ', ') AS AllTitles
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) AS RankByScore,
+        RANK() OVER (ORDER BY BadgeCount DESC, Reputation DESC) AS RankByBadges,
+        DENSE_RANK() OVER (ORDER BY AVG(AvgScore) DESC) AS RankByAvgScore
+    FROM UserStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'LowVoted'
+            ELSE 'NoVotes'
+        END AS VoteCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'Popular'
+            WHEN p.ViewCount > 500 THEN 'ModeratelyPopular'
+            WHEN p.ViewCount > 100 THEN 'LowPopular'
+            ELSE 'Rare'
+        END AS PopularityCategory,
+        ISNULL(p.AcceptedAnswerId, 0) AS HasAcceptedAnswer,
+        ISNULL(p.ParentId, 0) AS IsAnswer,
+        COUNT(c.Id) AS CommentCountActual,
+        DATEDIFF(day, p.CreationDate, GETDATE()) AS AgeInDays,
+        CASE 
+            WHEN DATEDIFF(day, p.CreationDate, GETDATE()) < 30 THEN 'New'
+            WHEN DATEDIFF(day, p.CreationDate, GETDATE()) < 365 THEN 'Medium'
+            WHEN DATEDIFF(day, p.CreationDate, GETDATE()) < 730 THEN 'Old'
+            ELSE 'VeryOld'
+        END AS AgeCategory
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.DeletedDate IS NULL
+    GROUP BY p.Id, p.Title, p.Body, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId, p.PostTypeId, p.Tags, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ParentId, p.AcceptedAnswerId
+),
+ComplexCalculations AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Body,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.PostType,
+        pa.VoteCategory,
+        pa.PopularityCategory,
+        pa.HasAcceptedAnswer,
+        pa.IsAnswer,
+        pa.CommentCountActual,
+        pa.AgeInDays,
+        pa.AgeCategory,
+        CASE 
+            WHEN pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND DeletedDate IS NULL) 
+                AND pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1 AND DeletedDate IS NULL)
+            THEN 'Outstanding'
+            WHEN pa.Score > 0 AND pa.ViewCount > 0
+            THEN 'Standard'
+            ELSE 'Underperforming'
+        END AS PerformanceCategory,
+        CASE 
+            WHEN pa.PostType = 'Question' AND pa.AnswerCount > 0 
+                THEN CAST(pa.AnswerCount AS FLOAT) / NULLIF(pa.ViewCount, 0) * 100
+            ELSE 0
+        END AS AnswerViewRatio,
+        CASE 
+            WHEN pa.PostType = 'Question' AND pa.Score > 0 
+                THEN CAST(pa.CommentCountActual AS FLOAT) / NULLIF(pa.Score, 0)
+            ELSE 0
+        END AS CommentToVotesRatio,
+        DENSE_RANK() OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.Score DESC) AS UserPostRank,
+        DENSE_RANK() OVER (ORDER BY pa.Score DESC, pa.ViewCount DESC) AS GlobalPostRank
+    FROM PostAnalysis pa
+),
+FinalAnalysis AS (
+    SELECT 
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.PostCount,
+        rua.QuestionCount,
+        rua.AnswerCount,
+        rua.TotalScore,
+        rua.AvgScore,
+        rua.BadgeCount,
+        rua.GoldBadgeCount,
+        rua.SilverBadgeCount,
+        rua.BronzeBadgeCount,
+        rua.ActiveDays,
+        MAX(ca.Score) AS MaxPostScore,
+        MIN(ca.Score) AS MinPostScore,
+        AVG(ca.Score) AS AvgPostScore,
+        SUM(ca.CommentCountActual) AS TotalComments,
+        COUNT(ca.PostId) AS TotalPosts,
+        STRING_AGG(ISNULL(ca.Title, ''), ' | ') AS AllPostTitles,
+        STRING_AGG(CONCAT(ca.PostType, ': ', ca.Title), ' | ') AS PostTypeTitles,
+        STRING_AGG(CAST(ca.ViewCount AS VARCHAR), ', ') AS ViewCounts,
+        SUM(CASE WHEN ca.PostType = 'Question' THEN 1 ELSE 0 END) AS QuestionCountAnalysis,
+        SUM(CASE WHEN ca.PostType = 'Answer' THEN 1 ELSE 0 END) AS AnswerCountAnalysis,
+        AVG(CASE WHEN ca.PostType = 'Question' THEN ca.Score ELSE NULL END) AS AvgQuestionScore,
+        AVG(CASE WHEN ca.PostType = 'Answer' THEN ca.Score ELSE NULL END) AS AvgAnswerScore,
+        STRING_AGG(CASE WHEN ca.AgeCategory = 'New' THEN ca.Title ELSE NULL END, ', ') AS NewPosts,
+        STRING_AGG(CASE WHEN ca.AgeCategory = 'Old' THEN ca.Title ELSE NULL END, ', ') AS OldPosts,
+        STRING_AGG(CASE WHEN ca.AgeCategory = 'Medium' THEN ca.Title ELSE NULL END, ', ') AS MediumPosts,
+        STRING_AGG(CASE WHEN ca.VoteCategory = 'HighlyVoted' THEN ca.Title ELSE NULL END, ', ') AS HighlyVotedPosts,
+        STRING_AGG(CASE WHEN ca.PopularityCategory = 'Popular' THEN ca.Title ELSE NULL END, ', ') AS PopularPosts,
+        MAX(ca.ViewCount) AS MaxViews,
+        MIN(ca.ViewCount) AS MinViews,
+        AVG(ca.ViewCount) AS AvgViews,
+        COUNT(CASE WHEN ca.CommentCountActual > 0 THEN 1 END) AS PostsWithComments,
+        COUNT(CASE WHEN ca.AnswerViewRatio > 0 THEN 1 END) AS PostsHavingAnswerViewRatio,
+        STRING_AGG(CASE WHEN ca.PerformanceCategory = 'Outstanding' THEN ca.Title ELSE NULL END, ', ') AS OutstandingPosts
+    FROM RankedUsers rua
+    JOIN ComplexCalculations ca ON rua.UserId = ca.OwnerUserId
+    WHERE rua.RankByScore <= 100
+    GROUP BY rua.UserId, rua.DisplayName, rua.Reputation, rua.PostCount, rua.QuestionCount, rua.AnswerCount, rua.TotalScore, rua.AvgScore, rua.BadgeCount, rua.GoldBadgeCount, rua.SilverBadgeCount, rua.BronzeBadgeCount, rua.ActiveDays
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    PostCount,
+    QuestionCount,
+    AnswerCount,
+    TotalScore,
+    AvgScore,
+    BadgeCount,
+    MaxPostScore,
+    MinPostScore,
+    AvgPostScore,
+    TotalComments,
+    TotalPosts,
+    AllPostTitles,
+    PostTypeTitles,
+    ViewCounts,
+    QuestionCountAnalysis,
+    AnswerCountAnalysis,
+    AvgQuestionScore,
+    AvgAnswerScore,
+    NewPosts,
+    OldPosts,
+    MediumPosts,
+    HighlyVotedPosts,
+    PopularPosts,
+    MaxViews,
+    MinViews,
+    AvgViews,
+    PostsWithComments,
+    PostsHavingAnswerViewRatio,
+    OutstandingPosts,
+    CASE 
+        WHEN BadgeCount >= 50 AND TotalScore > 10000 THEN 'Elite'
+        WHEN BadgeCount >= 20 AND TotalScore > 5000 THEN 'Veteran'
+        WHEN BadgeCount >= 5 AND TotalScore > 1000 THEN 'Regular'
+        ELSE 'Beginner'
+    END AS UserCategory,
+    CASE 
+        WHEN AvgScore > 10 THEN 'HighlyActive'
+        WHEN AvgScore > 5 THEN 'Active'
+        WHEN AvgScore > 0 THEN 'Moderate'
+        ELSE 'Inactive'
+    END AS ActivityLevel,
+    CASE 
+        WHEN BadgeCount > SilverBadgeCount AND BadgeCount > BronzeBadgeCount THEN 'GoldMinded'
+        WHEN BadgeCount > BronzeBadgeCount THEN 'SilverMinded'
+        ELSE 'BronzeMinded'
+    END AS BadgeFocus,
+    ISNULL(CAST((BadgeCount * 1.0 / NULLIF(PostCount, 0)) AS DECIMAL(5,2)), 0) AS BadgeEfficiency,
+    ISNULL(CAST((TotalScore * 1.0 / NULLIF(ActiveDays, 0)) AS DECIMAL(5,2)), 0) AS DailyScore,
+    CONCAT('User_', UserId) AS UserIdAlias,
+    REPLICATE('*', 10) AS StarDecoration,
+    CAST(GETDATE() AS VARCHAR) AS QueryDateTime,
+    DATEDIFF(day, '1900-01-01', GETDATE()) AS DaysSinceEpoch,
+    CASE WHEN BadgeCount > 0 THEN 'HasBadges' ELSE 'NoBadges' END AS BadgeStatus,
+    CASE WHEN QuestionCount > 0 THEN 'HasQuestions' ELSE 'NoQuestions' END AS QuestionStatus,
+    CASE WHEN AnswerCount > 0 THEN 'HasAnswers' ELSE 'NoAnswers' END AS AnswerStatus,
+    CASE 
+        WHEN MAX(AnswerCount) OVER () = AnswerCount THEN 'TopAnswerer'
+        ELSE 'NormalAnswerer'
+    END AS AnswererRanking
+FROM FinalAnalysis
+WHERE PostCount > 0
+ORDER BY TotalScore DESC, BadgeCount DESC, Reputation DESC
+OFFSET 0 ROWS
+FETCH NEXT 1000 ROWS ONLY;

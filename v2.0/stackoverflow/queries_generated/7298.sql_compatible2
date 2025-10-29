@@ -1,0 +1,255 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        AVG(p.Score) as AvgPostScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as AcceptedQuestions,
+        STRING_AGG(DISTINCT p.Tags, '; ') as AllTags,
+        STRING_AGG(DISTINCT b.Name, ', ') as BadgeNames
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.PostTypeId,
+        u.DisplayName as OwnerName,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        RANK() OVER (ORDER BY p.Score DESC) as OverallRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        NTILE(4) OVER (ORDER BY p.Score DESC) as ScoreQuartile,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) as PreviousScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.Score DESC) as NextScore,
+        AVG(p.Score) OVER (ORDER BY p.Score DESC ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) as MovingAverage,
+        CASE WHEN LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) IS NULL THEN NULL
+             WHEN LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) = 0 THEN NULL
+             ELSE (p.Score - LAG(p.Score, 1) OVER (ORDER BY p.Score DESC)) * 100.0 / LAG(p.Score, 1) OVER (ORDER BY p.Score DESC)
+        END as ScoreChangePercent,
+        COUNT(*) OVER () as TotalPosts,
+        (COUNT(*) OVER (ORDER BY p.Score DESC) * 100.0 / NULLIF(COUNT(*) OVER (),0)) as PercentileRank
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.Score > 0
+),
+ComplexBadges AS (
+    SELECT 
+        b.UserId,
+        b.Name,
+        b.Date,
+        b.Class,
+        b.TagBased,
+        COUNT(*) OVER (PARTITION BY b.UserId) as TotalBadgesByUser,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date) as BadgeSequence,
+        DENSE_RANK() OVER (ORDER BY b.Date) as AllBadgesTimeRank,
+        CASE 
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver'
+            ELSE 'Bronze'
+        END as BadgeTier,
+        CASE 
+            WHEN (b.TagBased IS TRUE) OR (b.TagBased = 1) OR (CAST(b.TagBased AS VARCHAR) IN ('t','true','1')) THEN 'Tag-Based'
+            ELSE 'Named Badge'
+        END as BadgeType,
+        CASE 
+            WHEN LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) IS NULL THEN NULL
+            ELSE EXTRACT(DAY FROM (b.Date - LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date)))
+        END as DaysSinceLastBadge
+    FROM Badges b
+),
+UserPerformance AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.TotalScore,
+        us.LastPostDate,
+        us.AvgPostScore,
+        us.AcceptedQuestions,
+        us.AllTags,
+        us.BadgeNames,
+        CASE 
+            WHEN us.Reputation > 10000 THEN 'Expert'
+            WHEN us.Reputation > 5000 THEN 'Advanced'
+            WHEN us.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationLevel,
+        CASE 
+            WHEN us.PostCount > 1000 THEN 'Veteran'
+            WHEN us.PostCount > 500 THEN 'Experienced'
+            WHEN us.PostCount > 100 THEN 'Active'
+            ELSE 'Casual'
+        END as ActivityLevel,
+        CASE 
+            WHEN us.BadgeCount >= 20 THEN 'Award-Winning'
+            WHEN us.BadgeCount >= 10 THEN 'Achieved'
+            ELSE 'Learning'
+        END as BadgeLevel,
+        CASE 
+            WHEN us.AcceptedQuestions > 10 THEN 'Accepted Expert'
+            WHEN us.AcceptedQuestions > 5 THEN 'Accepted User'
+            ELSE 'Regular User'
+        END as AcceptanceLevel,
+        (us.QuestionCount * 100.0 / NULLIF(us.PostCount, 0)) as QuestionPercentage,
+        (us.AnswerCount * 100.0 / NULLIF(us.PostCount, 0)) as AnswerPercentage,
+        (us.UpVotes * 100.0 / NULLIF(us.UpVotes + us.DownVotes, 0)) as UpvotePercentage
+    FROM UserStats us
+),
+TopTaggedQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        regexp_split_to_array(p.Tags, '>') as TagArray,
+        array_length(regexp_split_to_array(p.Tags, '>'), 1) as TagCount,
+        ARRAY_AGG(DISTINCT t.TagName) as TagNames,
+        STRING_AGG(DISTINCT t.TagName, ', ') as TagList,
+        COUNT(DISTINCT p.Id) OVER () as TotalQuestionCount,
+        PERCENT_RANK() OVER (ORDER BY p.Score DESC) as ScorePercentile,
+        CUME_DIST() OVER (ORDER BY p.ViewCount DESC) as ViewCumulativePercent,
+        VARIANCE(p.Score) OVER () as ScoreVariance,
+        STDDEV(p.Score) OVER () as ScoreStandardDeviation
+    FROM Posts p
+    JOIN Tags t ON t.TagName = ANY(regexp_split_to_array(p.Tags, '>'))
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId, p.Tags
+)
+
+SELECT 
+    up.UserId,
+    up.DisplayName,
+    up.Reputation,
+    up.PostCount,
+    up.CommentCount,
+    up.BadgeCount,
+    up.QuestionCount,
+    up.AnswerCount,
+    up.TotalScore,
+    up.LastPostDate,
+    up.AvgPostScore,
+    up.AcceptedQuestions,
+    up.ReputationLevel,
+    up.ActivityLevel,
+    up.BadgeLevel,
+    up.AcceptanceLevel,
+    up.QuestionPercentage,
+    up.AnswerPercentage,
+    up.UpvotePercentage,
+    tp.Score as TopPostScore,
+    tp.Title as TopPostTitle,
+    tp.ViewCount as TopPostViewCount,
+    tp.PostType as TopPostType,
+    tp.ScoreRank,
+    tp.OverallRank,
+    tp.ViewRank,
+    tp.ScoreQuartile,
+    tp.ScoreChangePercent,
+    tp.PercentileRank,
+    cb.BadgeTier,
+    cb.BadgeType,
+    cb.TotalBadgesByUser,
+    cb.BadgeSequence,
+    cb.DaysSinceLastBadge,
+    ttq.Title as MostTaggedTitle,
+    ttq.TagList,
+    ttq.TagCount,
+    ttq.ScorePercentile,
+    ttq.ViewCumulativePercent,
+    CASE 
+        WHEN up.Reputation > (SELECT AVG(u2.Reputation) FROM Users u2) THEN 'Above Average'
+        WHEN up.Reputation < (SELECT AVG(u3.Reputation) FROM Users u3) THEN 'Below Average'
+        ELSE 'Average'
+    END as ReputationStatus,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = up.UserId AND p.Score > 1000) THEN 'High Scoring'
+        ELSE 'Regular Scoring'
+    END as ScoringStatus,
+    CASE 
+        WHEN up.BadgeCount > (SELECT AVG(us2.BadgeCount) FROM UserStats us2) THEN 'Above Average Badges'
+        WHEN up.BadgeCount < (SELECT AVG(us3.BadgeCount) FROM UserStats us3) THEN 'Below Average Badges'
+        ELSE 'Average Badges'
+    END as BadgeStatus,
+    CASE 
+        WHEN up.QuestionCount > 0 AND up.AnswerCount > 0 THEN 'Active Contributor'
+        WHEN up.QuestionCount > 0 THEN 'Questioner'
+        WHEN up.AnswerCount > 0 THEN 'Answerer'
+        ELSE 'Inactive'
+    END as ContributionType,
+    COALESCE(STRING_AGG(DISTINCT up.AllTags, '; '), 'No Tags') as UserTagSummary,
+    COALESCE(STRING_AGG(DISTINCT up.BadgeNames, ', '), 'No Badges') as UserBadgeSummary,
+    CASE 
+        WHEN (up.QuestionCount * 100.0 / NULLIF(up.PostCount, 0)) > 50 THEN 'Question Focused'
+        WHEN (up.AnswerCount * 100.0 / NULLIF(up.PostCount, 0)) > 50 THEN 'Answer Focused'
+        ELSE 'Balanced'
+    END as FocusCategory,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = up.UserId AND p.CreationDate > DATE '2020-01-01') as RecentPostCount,
+    (SELECT COALESCE(SUM(p.Score), 0) FROM Posts p WHERE p.OwnerUserId = up.UserId AND p.CreationDate > DATE '2020-01-01') as RecentScore,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = up.UserId AND p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL) as RecentAcceptedCount,
+    CASE 
+        WHEN up.PostCount > 0 THEN CAST((up.TotalScore * 100.0 / up.PostCount) AS NUMERIC(10,2))
+        ELSE 0
+    END as ScorePerPost,
+    CASE 
+        WHEN up.Views > 0 THEN CAST((up.TotalScore * 100.0 / up.Views) AS NUMERIC(10,2))
+        ELSE 0
+    END as ScorePerView
+FROM UserPerformance up
+LEFT JOIN TopPosts tp ON up.UserId = tp.OwnerUserId AND tp.ScoreRank = 1
+LEFT JOIN ComplexBadges cb ON up.UserId = cb.UserId
+LEFT JOIN TopTaggedQuestions ttq ON up.UserId = ttq.OwnerUserId
+WHERE 
+    up.Reputation > 1000 
+    AND (up.PostCount > 10 OR up.CommentCount > 10 OR up.BadgeCount > 5)
+    AND up.LastPostDate >= DATE '2019-01-01'
+    AND (tp.Score IS NOT NULL OR cb.UserId IS NOT NULL OR ttq.Id IS NOT NULL)
+GROUP BY 
+    up.UserId, up.DisplayName, up.Reputation, up.PostCount, up.CommentCount, up.BadgeCount,
+    up.QuestionCount, up.AnswerCount, up.TotalScore, up.LastPostDate, up.AvgPostScore,
+    up.AcceptedQuestions, up.ReputationLevel, up.ActivityLevel, up.BadgeLevel,
+    up.AcceptanceLevel, up.QuestionPercentage, up.AnswerPercentage, up.UpvotePercentage,
+    tp.Score, tp.Title, tp.ViewCount, tp.PostType, tp.ScoreRank, tp.OverallRank,
+    tp.ViewRank, tp.ScoreQuartile, tp.ScoreChangePercent, tp.PercentileRank,
+    cb.BadgeTier, cb.BadgeType, cb.TotalBadgesByUser, cb.BadgeSequence,
+    cb.DaysSinceLastBadge, ttq.Title, ttq.TagList, ttq.TagCount, ttq.ScorePercentile,
+    ttq.ViewCumulativePercent, up.AllTags, up.BadgeNames, up.Views, tp.OwnerName, tp.Id, ttq.Id
+HAVING
+    COUNT(*) > 0
+ORDER BY 
+    up.TotalScore DESC,
+    up.PostCount DESC,
+    up.Reputation DESC,
+    up.BadgeCount DESC
+LIMIT 1000;

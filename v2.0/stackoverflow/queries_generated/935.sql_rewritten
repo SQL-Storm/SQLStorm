@@ -1,0 +1,344 @@
+-- {"query": "935.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3306} 
+with recent_posts as (
+    select
+        p.id as post_id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        coalesce(p.answercount, 0) as answercount,
+        extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - p.creationdate)) / 3600.0 as age_hours
+    from posts p
+    where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+),
+user_activity as (
+    select
+        u.id as user_id,
+        u.reputation,
+        u.creationdate as user_created,
+        u.lastaccessdate,
+        u.displayname,
+        u.location,
+        u.upvotes,
+        u.downvotes,
+        u.views,
+        count(distinct b.id) filter (where b.class = 1) as gold_badges,
+        count(distinct b.id) filter (where b.class = 2) as silver_badges,
+        count(distinct b.id) filter (where b.class = 3) as bronze_badges,
+        count(distinct p2.id) as total_posts,
+        sum(case when p2.posttypeid = 1 then 1 else 0 end) as q_count,
+        sum(case when p2.posttypeid = 2 then 1 else 0 end) as a_count,
+        max(p2.creationdate) as last_post_date
+    from users u
+    left join badges b on b.userid = u.id
+    left join posts p2 on p2.owneruserid = u.id
+    group by u.id, u.reputation, u.creationdate, u.lastaccessdate, u.displayname, u.location, u.upvotes, u.downvotes, u.views
+),
+post_votes as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount, 0) else 0 end) as bounty_started,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount, 0) else 0 end) as bounty_paid,
+        count(*) filter (where v.votetypeid in (10,11,12)) as mod_votes
+    from votes v
+    where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1095 days'
+    group by v.postid
+),
+post_comments as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        max(c.creationdate) as last_comment_date,
+        sum(case when c.score > 0 then 1 else 0 end) as pos_comments,
+        sum(case when c.score < 0 then 1 else 0 end) as neg_comments
+    from comments c
+    group by c.postid
+),
+dup_links as (
+    select
+        pl.postid as dup_postid,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+        count(*) filter (where pl.linktypeid = 1) as linked_links,
+        max(pl.creationdate) as last_link_date
+    from postlinks pl
+    group by pl.postid
+),
+closures as (
+    select
+        ph.postid,
+        min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_at,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_at,
+        max(case
+            when ph.posthistorytypeid = 10 then
+                nullif(regexp_replace(ph.comment, '[^0-9]', '', 'g'), '')::int
+            else null
+        end) as last_close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+tag_expansion as (
+    select
+        rp.post_id,
+        unnest(string_to_array(substring(rp.tags, 2, length(rp.tags) - 2), '><')) as tagname
+    from recent_posts rp
+    where rp.posttypeid = 1
+),
+tag_stats as (
+    select
+        te.post_id,
+        array_agg(te.tagname order by te.tagname) as tag_list,
+        count(*) as tag_count,
+        sum(t.count) as tag_popularity,
+        sum(case when t.ismoderaToronly = 1 then 1 else 0 end) as mod_tag_count,
+        sum(case when t.isrequired = 1 then 1 else 0 end) as required_tag_count
+    from tag_expansion te
+    left join tags t on lower(t.tagname) = lower(te.tagname)
+    group by te.post_id
+),
+answers as (
+    select
+        p.id as answer_id,
+        p.parentid as question_id,
+        p.owneruserid as answerer_id,
+        p.creationdate as answer_date,
+        p.score as answer_score
+    from posts p
+    where p.posttypeid = 2
+),
+answer_ranks as (
+    select
+        a.question_id,
+        a.answer_id,
+        a.answerer_id,
+        a.answer_date,
+        a.answer_score,
+        row_number() over (partition by a.question_id order by a.answer_score desc, a.answer_date asc, a.answer_id asc) as answer_rank,
+        rank() over (partition by a.question_id order by a.answer_score desc) as dense_score_rank,
+        count(*) over (partition by a.question_id) as total_answers
+    from answers a
+),
+accepted as (
+    select
+        p.id as question_id,
+        p.acceptedanswerid as accepted_answer_id
+    from posts p
+    where p.posttypeid = 1 and p.acceptedanswerid is not null
+),
+hot_candidates as (
+    select
+        rp.post_id,
+        rp.score,
+        rp.viewcount,
+        rp.answercount,
+        pv.upvotes,
+        pv.downvotes,
+        coalesce(pv.upvotes,0) - coalesce(pv.downvotes,0) as net_votes,
+        pc.comment_count,
+        rp.age_hours,
+        case
+            when rp.age_hours <= 48 and (coalesce(pv.upvotes,0) >= 5 or rp.viewcount >= 500) then 1
+            when rp.age_hours <= 168 and (coalesce(pv.upvotes,0) >= 20 or rp.viewcount >= 5000) then 1
+            else 0
+        end as is_potentially_hot
+    from recent_posts rp
+    left join post_votes pv on pv.postid = rp.post_id
+    left join post_comments pc on pc.postid = rp.post_id
+),
+user_quality as (
+    select
+        ua.user_id,
+        ua.reputation,
+        ua.upvotes,
+        ua.downvotes,
+        ua.q_count,
+        ua.a_count,
+        (ua.upvotes - ua.downvotes)::numeric / nullif((ua.upvotes + ua.downvotes), 0) as vote_ratio,
+        case
+            when ua.reputation >= 100000 then 'legend'
+            when ua.reputation >= 25000 then 'expert'
+            when ua.reputation >= 5000 then 'advanced'
+            when ua.reputation >= 1000 then 'intermediate'
+            when ua.reputation is null then 'unknown'
+            else 'novice'
+        end as user_tier
+    from user_activity ua
+),
+question_quality as (
+    select
+        rp.post_id,
+        rp.owneruserid,
+        rp.score,
+        rp.viewcount,
+        coalesce(pv.upvotes,0) as upvotes,
+        coalesce(pv.downvotes,0) as downvotes,
+        coalesce(pc.comment_count,0) as comment_count,
+        coalesce(ds.duplicate_links,0) as duplicate_links,
+        coalesce(ds.linked_links,0) as linked_links,
+        coalesce(ts.tag_popularity,0) as tag_popularity,
+        coalesce(ts.tag_count,0) as tag_count,
+        coalesce(ts.mod_tag_count,0) as mod_tag_count,
+        coalesce(ts.required_tag_count,0) as required_tag_count,
+        coalesce(cl.last_close_reason_id,0) as last_close_reason_id,
+        case when cl.first_closed_at is not null then 1 else 0 end as was_closed,
+        case when cl.last_reopened_at is not null then 1 else 0 end as was_reopened,
+        coalesce(hc.is_potentially_hot,0) as is_potentially_hot,
+        rp.age_hours
+    from recent_posts rp
+    left join post_votes pv on pv.postid = rp.post_id
+    left join post_comments pc on pc.postid = rp.post_id
+    left join dup_links ds on ds.dup_postid = rp.post_id
+    left join tag_stats ts on ts.post_id = rp.post_id
+    left join closures cl on cl.postid = rp.post_id
+    left join hot_candidates hc on hc.post_id = rp.post_id
+    where rp.posttypeid = 1
+),
+answer_summary as (
+    select
+        ar.question_id,
+        count(*) as answers_total,
+        sum(case when ar.answer_rank = 1 then 1 else 0 end) as top_answers,
+        sum(case when ar.answer_score > 0 then 1 else 0 end) as positive_answers,
+        min(ar.answer_date) as first_answer_date,
+        max(ar.answer_date) as last_answer_date,
+        max(case when ac.accepted_answer_id = ar.answer_id then 1 else 0 end) as has_accepted
+    from answer_ranks ar
+    left join accepted ac on ac.question_id = ar.question_id
+    group by ar.question_id
+),
+question_scores as (
+    select
+        qq.post_id,
+        qq.owneruserid,
+        qq.score,
+        qq.viewcount,
+        qq.upvotes,
+        qq.downvotes,
+        qq.comment_count,
+        qq.duplicate_links,
+        qq.linked_links,
+        qq.tag_popularity,
+        qq.tag_count,
+        qq.mod_tag_count,
+        qq.required_tag_count,
+        qq.was_closed,
+        qq.was_reopened,
+        qq.last_close_reason_id,
+        qq.is_potentially_hot,
+        qq.age_hours,
+        coalesce(asum.answers_total, 0) as answers_total,
+        coalesce(asum.positive_answers, 0) as positive_answers,
+        coalesce(asum.top_answers, 0) as top_answers,
+        coalesce(asum.has_accepted, 0) as has_accepted,
+        extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(asum.first_answer_date, qq.age_hours::text::timestamp))) / 3600.0 as hours_since_first_answer,
+        extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(asum.last_answer_date, qq.age_hours::text::timestamp))) / 3600.0 as hours_since_last_answer
+    from question_quality qq
+    left join answer_summary asum on asum.question_id = qq.post_id
+),
+scored as (
+    select
+        qs.post_id,
+        qs.owneruserid,
+        qs.score,
+        qs.viewcount,
+        qs.upvotes,
+        qs.downvotes,
+        qs.comment_count,
+        qs.duplicate_links,
+        qs.linked_links,
+        qs.tag_popularity,
+        qs.tag_count,
+        qs.mod_tag_count,
+        qs.required_tag_count,
+        qs.was_closed,
+        qs.was_reopened,
+        qs.last_close_reason_id,
+        qs.is_potentially_hot,
+        qs.answers_total,
+        qs.positive_answers,
+        qs.top_answers,
+        qs.has_accepted,
+        qs.age_hours,
+        greatest(1.0, qs.age_hours) as norm_age_hours,
+        -- composite score mixing activity, quality, and engagement with nonlinear penalties
+        (
+            0.30 * ln(1 + coalesce(qs.viewcount,0))
+          + 0.40 * (coalesce(qs.upvotes,0) - 0.9 * coalesce(qs.downvotes,0))
+          + 0.20 * coalesce(qs.comment_count,0)
+          + 0.35 * coalesce(qs.tag_popularity,0) / nullif(qs.tag_count,0)
+          + 2.0  * coalesce(qs.has_accepted,0)
+          + 0.15 * coalesce(qs.top_answers,0)
+          + 0.10 * coalesce(qs.positive_answers,0)
+          + case when qs.was_closed = 1 then -5.0 else 0 end
+          + case when qs.last_close_reason_id in (101,1) then -2.0 else 0 end
+          + case when qs.mod_tag_count > 0 then -1.0 else 0 end
+          + case when qs.required_tag_count > 0 then 0.5 else 0 end
+        )
+        /
+        (
+            1.0
+            + 0.002 * greatest(0, qs.duplicate_links - qs.linked_links)
+            + 0.05 * ln(1.0 + greatest(0, qs.age_hours - 24))
+        ) as composite_score
+    from question_scores qs
+),
+final_rank as (
+    select
+        s.*,
+        uq.user_tier,
+        uq.vote_ratio,
+        row_number() over (
+            partition by uq.user_tier
+            order by s.composite_score desc, s.upvotes desc, s.viewcount desc, s.post_id asc
+        ) as tier_rank,
+        percent_rank() over (order by s.composite_score) as global_percentile,
+        ntile(20) over (order by s.composite_score desc) as vigintile
+    from scored s
+    left join user_quality uq on uq.user_id = s.owneruserid
+)
+select
+    fr.post_id,
+    fr.owneruserid as author_id,
+    fr.user_tier,
+    fr.vote_ratio,
+    fr.score as raw_score,
+    fr.viewcount,
+    fr.upvotes,
+    fr.downvotes,
+    fr.comment_count,
+    fr.answers_total,
+    fr.positive_answers,
+    fr.top_answers,
+    fr.has_accepted,
+    fr.tag_popularity,
+    fr.tag_count,
+    fr.duplicate_links,
+    fr.linked_links,
+    fr.was_closed,
+    fr.was_reopened,
+    fr.last_close_reason_id,
+    fr.is_potentially_hot,
+    round(fr.composite_score::numeric, 4) as composite_score,
+    fr.tier_rank,
+    round(fr.global_percentile::numeric, 4) as global_percentile,
+    fr.vigintile
+from final_rank fr
+where
+    -- demonstrate complicated predicates and null logic
+    (
+        (fr.is_potentially_hot = 1 and fr.was_closed = 0)
+        or
+        (fr.has_accepted = 1 and (fr.duplicate_links is null or fr.duplicate_links = 0))
+        or
+        (fr.vote_ratio is not null and fr.vote_ratio >= 0.6 and coalesce(fr.upvotes,0) >= 10)
+    )
+    and coalesce(fr.tag_count, 0) between 1 and 5
+    and (fr.composite_score > 0 or (fr.upvotes - fr.downvotes) >= 0)
+    and not (fr.was_closed = 1 and fr.was_reopened = 0 and fr.duplicate_links > 2)
+order by fr.composite_score desc, fr.upvotes desc, fr.viewcount desc, fr.post_id
+limit 250;

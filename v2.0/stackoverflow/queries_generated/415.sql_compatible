@@ -1,0 +1,325 @@
+with
+params as (
+  select
+    timestamp '2014-01-01' as start_date,
+    timestamp '2016-12-31' as end_date
+),
+question_tags as (
+  select
+    p.Id as QuestionId,
+    lower(trim(tg)) as tag
+  from Posts p
+  cross join lateral unnest(
+    case
+      when p.PostTypeId = 1 and p.Tags is not null and length(p.Tags) >= 2
+        then string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')
+      else array[]::varchar[]
+    end
+  ) as tg
+  where p.PostTypeId = 1
+),
+active_users as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.Location,
+    coalesce(nullif(trim(u.WebsiteUrl), ''), 'n/a') as WebsiteUrl,
+    case when u.Views is null or u.Views < 0 then 0 else u.Views end as Views,
+    u.UpVotes,
+    u.DownVotes
+  from Users u
+),
+posts_in_range as (
+  select
+    p.*,
+    case p.PostTypeId when 1 then 'Q' when 2 then 'A' else 'O' end as role
+  from Posts p
+  join params d on p.CreationDate between d.start_date and d.end_date
+  where p.PostTypeId in (1,2)
+),
+post_engagement as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.ParentId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.AcceptedAnswerId,
+    p.Title,
+    p.Tags,
+    count(*) filter (where v.VoteTypeId = 2) over (partition by p.Id) as upvotes,
+    count(*) filter (where v.VoteTypeId = 3) over (partition by p.Id) as downvotes,
+    count(*) filter (where v.VoteTypeId = 5) over (partition by p.Id) as favorites_legacy,
+    sum(v.BountyAmount) filter (where v.VoteTypeId in (8,9)) over (partition by p.Id) as bounty_sum
+  from posts_in_range p
+  left join Votes v on v.PostId = p.Id
+),
+acceptance as (
+  select
+    q.Id as QuestionId,
+    q.AcceptedAnswerId,
+    case when q.AcceptedAnswerId is not null then 1 else 0 end as has_accepted,
+    a.OwnerUserId as AcceptedAnswerOwnerId
+  from posts_in_range q
+  left join Posts a on a.Id = q.AcceptedAnswerId
+  where q.PostTypeId = 1
+),
+comment_activity as (
+  select
+    c.PostId,
+    count(*) as comment_count,
+    max(c.CreationDate) as last_comment_at,
+    coalesce(sum(case when c.Score >= 3 then 1 else 0 end),0) as helpful_comments
+  from Comments c
+  join params d on c.CreationDate between d.start_date and d.end_date
+  group by c.PostId
+),
+link_rel as (
+  select
+    pl.PostId,
+    sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as dup_links,
+    sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as ref_links
+  from PostLinks pl
+  join params d on pl.CreationDate between d.start_date and d.end_date
+  group by pl.PostId
+),
+closure as (
+  select
+    ph.PostId,
+    min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as first_closed_at,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as last_reopened_at,
+    count(*) filter (where ph.PostHistoryTypeId = 10) as close_events,
+    count(*) filter (where ph.PostHistoryTypeId = 11) as reopen_events,
+    max(
+      case
+        when ph.PostHistoryTypeId = 10 then
+          nullif(trim(ph.Comment), '')
+        else null
+      end
+    ) as last_close_reason_id_raw
+  from PostHistory ph
+  join params d on ph.CreationDate between d.start_date and d.end_date
+  group by ph.PostId
+),
+close_reason as (
+  select
+    c.PostId,
+    crt.Name as CloseReasonName
+  from closure c
+  left join CloseReasonTypes crt
+    on CAST(crt.Id AS varchar) = c.last_close_reason_id_raw
+),
+badge_stats as (
+  select
+    b.UserId,
+    count(*) as badges_total,
+    count(*) filter (where b.Class = 1) as gold_badges,
+    count(*) filter (where b.Class = 2) as silver_badges,
+    count(*) filter (where b.Class = 3) as bronze_badges,
+    count(*) filter (where CAST(b.TagBased AS integer) = 1) as tag_badges,
+    max(b.Date) as last_badge_at
+  from Badges b
+  group by b.UserId
+),
+user_posts as (
+  select
+    pe.OwnerUserId as UserId,
+    count(*) filter (where pe.PostTypeId = 1) as questions,
+    count(*) filter (where pe.PostTypeId = 2) as answers,
+    sum(pe.Score) as total_post_score,
+    avg(pe.Score) as avg_post_score,
+    sum(pe.ViewCount) filter (where pe.PostTypeId = 1) as question_views,
+    sum(coalesce(pe.upvotes,0)) as total_upvotes,
+    sum(coalesce(pe.downvotes,0)) as total_downvotes,
+    sum(coalesce(pe.favorites_legacy,0)) as total_favorites,
+    sum(coalesce(pe.bounty_sum,0)) as total_bounty
+  from post_engagement pe
+  group by pe.OwnerUserId
+),
+question_enriched as (
+  select
+    q.Id as QuestionId,
+    q.OwnerUserId,
+    q.CreationDate,
+    coalesce(q.Score,0) as Score,
+    coalesce(q.ViewCount,0) as ViewCount,
+    coalesce(q.CommentCount,0) as CommentCount,
+    coalesce(q.FavoriteCount,0) as FavoriteCount,
+    a.has_accepted,
+    a.AcceptedAnswerId,
+    a.AcceptedAnswerOwnerId,
+    coalesce(ca.comment_count,0) as CommentEvents,
+    ca.last_comment_at,
+    coalesce(lr.dup_links,0) as DuplicateLinks,
+    coalesce(lr.ref_links,0) as ReferenceLinks,
+    cl.first_closed_at,
+    cl.last_reopened_at,
+    cl.close_events,
+    cl.reopen_events,
+    cr.CloseReasonName
+  from post_engagement q
+  left join acceptance a on a.QuestionId = q.Id
+  left join comment_activity ca on ca.PostId = q.Id
+  left join link_rel lr on lr.PostId = q.Id
+  left join closure cl on cl.PostId = q.Id
+  left join close_reason cr on cr.PostId = q.Id
+  where q.PostTypeId = 1
+),
+tag_summary as (
+  select
+    qt.QuestionId,
+    string_agg(distinct qt.tag, ', ' order by qt.tag) as tags_csv,
+    count(*) as tag_count
+  from question_tags qt
+  group by qt.QuestionId
+),
+user_activity_roll as (
+  select
+    pe.OwnerUserId as UserId,
+    CAST(pe.CreationDate AS date) as day,
+    count(*) as posts_day,
+    sum(pe.Score) as score_day,
+    sum(coalesce(pe.upvotes,0)) as up_day
+  from post_engagement pe
+  group by pe.OwnerUserId, CAST(pe.CreationDate AS date)
+),
+user_activity_enriched as (
+  select
+    uar.UserId,
+    uar.day,
+    uar.posts_day,
+    uar.score_day,
+    uar.up_day,
+    sum(posts_day) over (partition by UserId order by day rows between 6 preceding and current row) as posts_7d,
+    sum(score_day) over (partition by UserId order by day rows between 29 preceding and current row) as score_30d,
+    avg(CAST(up_day AS numeric)) over (partition by UserId order by day rows between 13 preceding and current row) as avg_up_14d
+  from user_activity_roll uar
+),
+top_related as (
+  select
+    q.Id as QuestionId,
+    rp.RelatedPostId,
+    rp.LinkTypeId,
+    rp.CreationDate,
+    row_number() over (partition by q.Id order by rp.CreationDate desc, rp.RelatedPostId) as rn
+  from Posts q
+  left join LATERAL (
+    select pl.RelatedPostId, pl.LinkTypeId, pl.CreationDate
+    from PostLinks pl
+    where pl.PostId = q.Id
+    order by pl.CreationDate desc
+    limit 5
+  ) rp on true
+  where q.PostTypeId = 1
+),
+user_question_features as (
+  select
+    qe.QuestionId,
+    qe.OwnerUserId as AskerId,
+    au.DisplayName as AskerName,
+    au.Reputation as AskerRep,
+    coalesce(bs.badges_total,0) as AskerBadges,
+    coalesce(bs.gold_badges,0) as AskerGold,
+    coalesce(bs.silver_badges,0) as AskerSilver,
+    coalesce(bs.bronze_badges,0) as AskerBronze,
+    coalesce(up.questions,0) as AskerQuestions,
+    coalesce(up.answers,0) as AskerAnswers,
+    coalesce(up.avg_post_score,0) as AskerAvgScore,
+    qe.Score as QScore,
+    qe.ViewCount as QViews,
+    qe.CommentEvents as QCommentEvents,
+    qe.DuplicateLinks,
+    qe.ReferenceLinks,
+    qe.has_accepted,
+    case
+      when qe.first_closed_at is not null then 1 else 0
+    end as was_closed,
+    coalesce(qs.tags_csv, '') as TagsCsv,
+    coalesce(qs.tag_count, 0) as TagCount
+  from question_enriched qe
+  left join active_users au on au.UserId = qe.OwnerUserId
+  left join badge_stats bs on bs.UserId = qe.OwnerUserId
+  left join user_posts up on up.UserId = qe.OwnerUserId
+  left join tag_summary qs on qs.QuestionId = qe.QuestionId
+),
+fast_accept as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId as AnswererId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreated,
+    q.CreationDate as QuestionCreated,
+    extract(epoch from (a.CreationDate - q.CreationDate))/3600.0 as hours_to_answer,
+    CAST((q.AcceptedAnswerId is not null and a.Id = q.AcceptedAnswerId) AS integer) as is_accepted_flag
+  from posts_in_range a
+  join posts_in_range q on q.Id = a.ParentId and a.PostTypeId = 2 and q.PostTypeId = 1
+),
+answerer_stats as (
+  select
+    a.AnswererId as UserId,
+    count(*) as answers_total,
+    avg(a.AnswerScore) as avg_answer_score,
+    percentile_cont(0.5) within group (order by a.hours_to_answer) as p50_hours_to_answer
+  from fast_accept a
+  group by a.AnswererId
+),
+qa_matrix as (
+  select
+    uqf.*,
+    coalesce(ans.answers_total,0) as TopAnswererAnswers,
+    coalesce(ans.avg_answer_score,0) as TopAnswererAvgScore,
+    coalesce(ans.p50_hours_to_answer,0) as TopAnswererP50Hrs
+  from user_question_features uqf
+  left join answerer_stats ans on ans.UserId = uqf.AskerId
+),
+scored as (
+  select
+    m.*,
+    case
+      when m.TagCount = 0 then 0
+      else least(1.0, log(1 + m.QViews) / nullif(m.TagCount,0))
+    end as view_norm,
+    case when m.AskerRep <= 1 then 0 else ln(CAST(m.AskerRep AS numeric)) end as rep_log,
+    (coalesce(m.QScore,0) * 0.5
+     + coalesce(m.AskerAvgScore,0) * 0.3
+     + coalesce(m.TopAnswererAvgScore,0) * 0.2
+    ) as blended_score,
+    case
+      when lower(m.TagsCsv) like '%sql%' or lower(m.TagsCsv) like any(array['%postgres%','%mysql%','%tsql%'])
+        then 1 else 0 end as is_db_related
+  from qa_matrix m
+),
+ranked as (
+  select
+    s.*,
+    dense_rank() over (
+      partition by s.is_db_related
+      order by s.blended_score desc, s.view_norm desc, s.QCommentEvents desc, s.DuplicateLinks asc
+    ) as rank_in_group,
+    row_number() over (order by s.blended_score desc, s.view_norm desc, s.QViews desc) as global_rownum
+  from scored s
+)
+select *
+from ranked
+where
+  (
+    rank_in_group <= 50
+  )
+union all
+select *
+from ranked
+where
+  (
+    was_closed = 1
+    and QViews > 1000
+    and coalesce(QScore,0) <= 0
+  )
+order by global_rownum nulls last, rank_in_group, QuestionId
+limit 300;

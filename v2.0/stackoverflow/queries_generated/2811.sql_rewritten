@@ -1,0 +1,115 @@
+-- {"query": "2811.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1084} 
+WITH RecursiveTaggedQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation,
+        COALESCE(p.Tags, '') AS Tags,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.Tags LIKE '%<sql>%'
+      AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+),
+TopQuestionsPerUser AS (
+    SELECT *
+    FROM RecursiveTaggedQuestions
+    WHERE rn <= 3
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        COUNT(a.Id) AS AnswerCount
+    FROM Posts a
+    LEFT JOIN Votes v ON a.Id = v.PostId
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+BadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+CloseReasonCounts AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseVotes,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS DistinctCloseReasons
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+QuestionDetails AS (
+    SELECT
+        tq.Id AS QuestionId,
+        tq.Title,
+        tq.CreationDate,
+        tq.Score,
+        tq.ViewCount,
+        tq.OwnerName,
+        tq.OwnerReputation,
+        COALESCE(as.AnswerCount, 0) AS AnswerCount,
+        COALESCE(as.UpVotes, 0) AS AnswerUpVotes,
+        COALESCE(as.DownVotes, 0) AS AnswerDownVotes,
+        COALESCE(as.AvgAnswerScore, 0) AS AvgAnswerScore,
+        COALESCE(as.MaxAnswerScore, 0) AS MaxAnswerScore,
+        ba.GoldBadges,
+        ba.SilverBadges,
+        ba.BronzeBadges,
+        ba.BadgeNames,
+        crc.CloseVotes,
+        crc.DistinctCloseReasons,
+        LENGTH(tq.Tags) - LENGTH(REPLACE(tq.Tags, '<', '')) AS TagCount,
+        CASE
+            WHEN crc.CloseVotes > 0 THEN 'Closed'
+            ELSE 'Open'
+        END AS PostStatus,
+        -- Complex string expression: concatenate TagNames with OwnerName reversed and Reputation
+        CONCAT_WS(' | ',
+            REPLACE(tq.Tags, '><', ', '),
+            REVERSE(COALESCE(tq.OwnerName, 'unknown')),
+            'Rep:' || COALESCE(tq.OwnerReputation::text, '0')
+        ) AS TagOwnerSummary
+    FROM TopQuestionsPerUser tq
+    LEFT JOIN AnswerStats as ON tq.Id = as.QuestionId
+    LEFT JOIN BadgeAgg ba ON ba.UserId = (SELECT Id FROM Users WHERE DisplayName = tq.OwnerName LIMIT 1)
+    LEFT JOIN CloseReasonCounts crc ON tq.Id = crc.PostId
+)
+SELECT
+    qd.*,
+    -- Window function: rank questions by score partitioned by OwnerReputation descending
+    RANK() OVER (PARTITION BY qd.OwnerReputation ORDER BY qd.Score DESC, qd.ViewCount DESC) AS ScoreRankByReputation,
+    -- Correlated subquery: number of comments on the question
+    (
+        SELECT COUNT(*)
+        FROM Comments c
+        WHERE c.PostId = qd.QuestionId
+          AND (c.Text ~* 'performance|benchmark|optimization')
+    ) AS RelevantCommentCount,
+    -- Set operator example (UNION ALL): include users who never posted questions with tag 'sql' along with TopQuestion owners
+    (
+      SELECT u.Id FROM Users u
+      WHERE NOT EXISTS (
+        SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.Tags LIKE '%<sql>%'
+      )
+      LIMIT 3
+      UNION ALL
+      SELECT DISTINCT OwnerUserId FROM Posts WHERE OwnerUserId IS NOT NULL AND Tags LIKE '%<sql>%'
+      ORDER BY 1
+      LIMIT 3
+    )::text AS UsersWithOrWithoutSqlTag
+FROM QuestionDetails qd
+ORDER BY qd.OwnerReputation DESC, qd.Score DESC, qd.CreationDate DESC;

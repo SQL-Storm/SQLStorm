@@ -1,0 +1,331 @@
+with
+-- Recent active users with rank by activity and badge diversity
+recent_users as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl,
+    count(distinct b.name) filter (where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days') as recent_badge_variety,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges,
+    sum(coalesce(u.upvotes,0) - coalesce(u.downvotes,0)) over () as site_net_votes_total,
+    row_number() over (order by u.lastaccessdate desc, u.id) as rn_recent_access
+  from users u
+  left join badges b on b.userid = u.id
+  where u.lastaccessdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.websiteurl, u.upvotes, u.downvotes, u.lastaccessdate
+),
+-- Posts in the last year with engagement metrics and tag parsing
+recent_posts as (
+  select
+    p.id,
+    p.posttypeid,
+    p.owneruserid,
+    p.score,
+    p.viewcount,
+    p.creationdate,
+    p.lastactivitydate,
+    p.title,
+    p.tags,
+    p.answercount,
+    coalesce(p.commentcount, 0) as commentcount,
+    string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2, 0)), '><') as tag_array,
+    sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes,
+    count(*) filter (where v.votetypeid = 5) as favorites_legacy,
+    max(v.creationdate) filter (where v.votetypeid in (2,3)) as last_vote_at
+  from posts p
+  left join votes v on v.postid = p.id
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    and p.posttypeid in (1,2) -- questions and answers
+  group by p.id, p.posttypeid, p.owneruserid, p.score, p.viewcount, p.creationdate, p.lastactivitydate, p.title, p.tags, p.answercount, p.commentcount
+),
+-- Derive question/answer linkage and accepted-answer flags
+qa as (
+  select
+    q.id as question_id,
+    q.owneruserid as question_owner_id,
+    q.score as question_score,
+    q.viewcount as question_views,
+    q.creationdate as question_created,
+    q.lastactivitydate as question_last_activity,
+    q.title as question_title,
+    q.tags as question_tags,
+    q.tag_array,
+    q.answercount,
+    q.net_votes as q_net_votes,
+    a.id as answer_id,
+    a.owneruserid as answer_owner_id,
+    a.score as answer_score,
+    a.net_votes as a_net_votes,
+    (case when q.id = pa.parentid and q.id = pqa.id then 1 else 0 end) as dummy
+  from recent_posts q
+  left join posts pa on pa.parentid = q.id and pa.posttypeid = 2
+  left join recent_posts a on a.id = pa.id
+  left join posts pqa on pqa.id = q.id
+  where q.posttypeid = 1
+),
+-- Post closures and reasons with JSON text awareness
+closures as (
+  select
+    ph.postid,
+    min(ph.creationdate) as first_closed_at,
+    max(ph.creationdate) as last_closed_at,
+    count(*) as close_events,
+    array_agg(distinct crt.name order by crt.name) as close_reason_names
+  from posthistory ph
+  join posthistorytypes pht on pht.id = ph.posthistorytypeid and pht.name in ('Post Closed')
+  left join closereasontypes crt
+    on cast(crt.id as varchar) = nullif(trim(ph.comment), '')
+  group by ph.postid
+),
+-- Post links indicating duplicates and relateds
+link_rollup as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+    count(*) filter (where pl.linktypeid = 1) as related_links,
+    max(pl.creationdate) as last_linked_at,
+    array_agg(distinct pl.relatedpostid) filter (where pl.linktypeid = 3) as dup_to_ids
+  from postlinks pl
+  group by pl.postid
+),
+-- Tag stats for tags observed in the recent period
+tag_stats as (
+  select
+    t.tagname,
+    t.count as historical_count,
+    t.ismoderatoronly,
+    t.isrequired,
+    sum(case when rp.posttypeid = 1 then 1 else 0 end) as recent_questions_with_tag
+  from tags t
+  left join recent_posts rp
+    on rp.posttypeid = 1
+   and (t.tagname = any(rp.tag_array))
+  group by t.tagname, t.count, t.ismoderatoronly, t.isrequired
+),
+-- User activity aggregates joining comments and votes with null-handling
+user_activity as (
+  select
+    u.id as user_id,
+    coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end), 0) as net_votes_cast,
+    coalesce(sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end), 0) as bounties_started,
+    coalesce(sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end), 0) as bounties_awarded,
+    count(c.id) as comments_made,
+    max(c.creationdate) as last_commented_at
+  from users u
+  left join votes v on v.userid = u.id
+  left join comments c on c.userid = u.id
+  group by u.id
+),
+-- Identify "engaged" recent questions based on composite predicates
+engaged_questions as (
+  select
+    qa.question_id,
+    qa.question_owner_id,
+    qa.question_score,
+    qa.question_views,
+    qa.question_created,
+    qa.question_last_activity,
+    qa.question_title,
+    qa.question_tags,
+    qa.tag_array,
+    qa.answercount,
+    qa.q_net_votes,
+    coalesce(cl.first_closed_at, timestamp '1970-01-01') as first_closed_at,
+    coalesce(lr.duplicate_links, 0) as duplicate_links,
+    coalesce(lr.related_links, 0) as related_links,
+    case
+      when qa.question_score >= 5 and qa.answercount >= 2 then 'Hot'
+      when qa.question_score < 0 and coalesce(cl.close_events,0) > 0 then 'Controversial'
+      when qa.question_views >= 1000 then 'Popular'
+      else 'Normal'
+    end as engagement_bucket,
+    (select count(*)
+     from comments c
+     where c.postid = qa.question_id
+       and c.creationdate >= qa.question_created) as total_comments_since_post,
+    (select count(distinct c.userid)
+     from comments c
+     where c.postid = qa.question_id
+       and c.userid is not null) as distinct_commenters,
+    (select count(*)
+     from votes v
+     where v.postid = qa.question_id
+       and v.votetypeid in (2,3)) as total_votes
+  from qa
+  left join closures cl on cl.postid = qa.question_id
+  left join link_rollup lr on lr.postid = qa.question_id
+),
+-- Expand engaged questions per tag
+engaged_question_tags as (
+  select
+    eq.*,
+    lower(trim(t)) as tag
+  from engaged_questions eq
+  cross join lateral unnest(eq.tag_array) as t
+),
+-- Rank users by their contribution to engaged questions
+user_contrib as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    count(distinct eq.question_id) filter (where eq.engagement_bucket = 'Hot') as hot_questions_authored,
+    count(distinct eq.question_id) as engaged_questions_authored,
+    sum(eq.total_votes) as votes_on_engaged,
+    sum(eq.total_comments_since_post) as comments_on_engaged,
+    max(eq.question_last_activity) as last_activity_on_engaged
+  from users u
+  join engaged_questions eq on eq.question_owner_id = u.id
+  group by u.id, u.displayname, u.reputation
+),
+-- Windowed tag performance across engaged questions
+tag_performance as (
+  select
+    egt.tag,
+    count(distinct egt.question_id) as engaged_q_count,
+    sum(case when egt.engagement_bucket = 'Hot' then 1 else 0 end) as hot_q_count,
+    avg(egt.question_score) as avg_q_score,
+    percentile_cont(0.9) within group (order by egt.question_views) as p90_views,
+    min(egt.first_closed_at) filter (where egt.first_closed_at > timestamp '1970-01-01') as earliest_closure,
+    max(egt.related_links) as max_related_links
+  from engaged_question_tags egt
+  group by egt.tag
+),
+-- Build dense ranks for tags and users
+ranks as (
+  select
+    tp.tag,
+    dense_rank() over (order by tp.hot_q_count desc, tp.engaged_q_count desc, tp.avg_q_score desc) as tag_rank,
+    tp.engaged_q_count,
+    tp.hot_q_count
+  from tag_performance tp
+),
+-- Correlate tag stats with tag ranks
+tag_summary as (
+  select
+    ts.tagname as tag,
+    ts.historical_count,
+    ts.ismoderatoronly,
+    ts.isrequired,
+    coalesce(ts.recent_questions_with_tag, 0) as recent_q_with_tag,
+    coalesce(tp.engaged_q_count, 0) as engaged_q_count,
+    coalesce(tp.hot_q_count, 0) as hot_q_count,
+    tp.avg_q_score,
+    tp.p90_views,
+    tp.earliest_closure,
+    tp.max_related_links,
+    r.tag_rank
+  from tag_stats ts
+  left join tag_performance tp on tp.tag = lower(trim(ts.tagname))
+  left join ranks r on r.tag = lower(trim(ts.tagname))
+),
+-- Prepare final user metrics with recent_users and activity joined
+final_users as (
+  select
+    ru.id as user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.location,
+    ru.websiteurl,
+    ru.recent_badge_variety,
+    ru.gold_badges,
+    ru.silver_badges,
+    ru.bronze_badges,
+    ua.net_votes_cast,
+    ua.bounties_started,
+    ua.bounties_awarded,
+    ua.comments_made,
+    ua.last_commented_at,
+    uc.hot_questions_authored,
+    uc.engaged_questions_authored,
+    uc.votes_on_engaged,
+    uc.comments_on_engaged,
+    uc.last_activity_on_engaged,
+    ru.rn_recent_access
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.id
+  left join user_contrib uc on uc.user_id = ru.id
+),
+-- Build a complex expression for a "score"
+user_score as (
+  select
+    fu.*,
+    (
+      coalesce(fu.reputation,0) * 0.001
+      + coalesce(fu.hot_questions_authored,0) * 3
+      + coalesce(fu.engaged_questions_authored,0) * 1.5
+      + greatest(coalesce(fu.votes_on_engaged,0) - coalesce(fu.comments_on_engaged,0) * 0.1, 0)
+      + coalesce(fu.recent_badge_variety,0) * 0.5
+      + least(coalesce(fu.bounties_started,0) * 0.001, 25)
+      - case when nullif(fu.location, '') is null then 1 else 0 end
+    ) as composite_user_score
+  from final_users fu
+),
+-- Window and set operator example: pick top users and union with tag top
+top_users as (
+  select *
+  from (
+    select
+      us.*,
+      row_number() over (order by composite_user_score desc nulls last, rn_recent_access asc) as rn
+    from user_score us
+  ) s
+  where s.rn <= 50
+),
+top_tags as (
+  select *
+  from (
+    select
+      ts.*,
+      row_number() over (order by coalesce(ts.hot_q_count,0) desc, coalesce(ts.engaged_q_count,0) desc, coalesce(ts.avg_q_score, -1) desc) as rn
+    from tag_summary ts
+    where coalesce(ts.engaged_q_count,0) > 0
+  ) s
+  where s.rn <= 50
+)
+select
+  'user' as entity_type,
+  cast(tu.user_id as varchar) as key_id,
+  tu.displayname as label,
+  to_char(coalesce(tu.last_activity_on_engaged, cast('2024-10-01 12:34:56' as timestamp)), 'YYYY-MM-DD"T"HH24:MI:SS') as last_engaged_activity_iso,
+  json_build_object(
+    'reputation', tu.reputation,
+    'location', nullif(tu.location,''),
+    'website', nullif(tu.websiteurl,'n/a'),
+    'badges', json_build_object('gold', tu.gold_badges, 'silver', tu.silver_badges, 'bronze', tu.bronze_badges),
+    'recentBadgeVariety', tu.recent_badge_variety,
+    'netVotesCast', tu.net_votes_cast,
+    'bounties', json_build_object('started', tu.bounties_started, 'awarded', tu.bounties_awarded),
+    'commentsMade', tu.comments_made,
+    'hotQuestionsAuthored', tu.hot_questions_authored,
+    'engagedQuestionsAuthored', tu.engaged_questions_authored,
+    'votesOnEngaged', tu.votes_on_engaged,
+    'commentsOnEngaged', tu.comments_on_engaged,
+    'score', round(cast(tu.composite_user_score as numeric), 3)
+  ) as metrics_json
+from top_users tu
+union all
+select
+  'tag' as entity_type,
+  tt.tag as key_id,
+  tt.tag as label,
+  to_char(coalesce(tt.earliest_closure, cast('2024-10-01 12:34:56' as timestamp)), 'YYYY-MM-DD"T"HH24:MI:SS') as last_engaged_activity_iso,
+  json_build_object(
+    'historicalCount', tt.historical_count,
+    'isModeratorOnly', coalesce(cast(tt.ismoderatoronly as int), 0),
+    'isRequired', coalesce(cast(tt.isrequired as int), 0),
+    'recentQuestions', tt.recent_q_with_tag,
+    'engagedQuestions', tt.engaged_q_count,
+    'hotQuestions', tt.hot_q_count,
+    'avgQuestionScore', round(coalesce(cast(tt.avg_q_score as numeric),0), 3),
+    'p90Views', tt.p90_views,
+    'maxRelatedLinks', tt.max_related_links,
+    'rank', tt.tag_rank
+  ) as metrics_json
+from top_tags tt
+order by entity_type asc, label asc;

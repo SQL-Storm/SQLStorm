@@ -1,0 +1,177 @@
+with RecursiveBadgesCTE as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        b.Date,
+        1 as BadgeCount
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+
+    union all
+
+    select
+        r.UserId,
+        r.DisplayName,
+        r.BadgeName,
+        r.BadgeClass,
+        r.Date,
+        r.BadgeCount + 1
+    from RecursiveBadgesCTE r
+    join Badges b2 on r.UserId = b2.UserId and b2.Date > r.Date
+    where b2.Date < r.Date + interval '1 month'
+),
+TopUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) as UpVotesCount,
+        coalesce(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) as DownVotesCount,
+        count(distinct b.Id) as TotalBadges,
+        -- replace FILTER with conditional SUMs for compatibility
+        coalesce(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) as QuestionCount,
+        coalesce(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) as AnswerCount
+    from Users u
+    left join Votes v on v.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostStats as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        u.DisplayName as OwnerName,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+        lag(p.Score) over (partition by p.PostTypeId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.PostTypeId order by p.CreationDate) as NextScore,
+        length(p.Body) as BodyLength,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        (select string_agg(distinct ph.Name, ', ')
+         from PostHistory phistory
+         join PostHistoryTypes ph on ph.Id = phistory.PostHistoryTypeId
+         where phistory.PostId = p.Id and ph.Name like '%Edit%'
+        ) as EditTypes,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCountTotal
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+),
+DuplicatePostPairs as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pt1.Name as PostTypeName,
+        pt2.Name as RelatedPostTypeName,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    join PostTypes pt1 on pt1.Id = p1.PostTypeId
+    join PostTypes pt2 on pt2.Id = p2.PostTypeId
+    where lt.Name = 'Duplicate'
+),
+UserBadgeSummary as (
+    select
+        UserId,
+        BadgeClass,
+        count(*) as BadgeCount
+    from Badges
+    group by UserId, BadgeClass
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate) as PostSeqNum,
+        lag(p.CreationDate) over (partition by p.OwnerUserId order by p.CreationDate) as PreviousPostDate,
+        extract(epoch from (p.CreationDate - lag(p.CreationDate) over (partition by p.OwnerUserId order by p.CreationDate)))/3600.0 as HoursBetweenPosts
+    from Posts p
+    where p.OwnerUserId is not null
+),
+UserPostGaps as (
+    select
+        OwnerUserId,
+        -- replace FILTER with conditional aggregates
+        avg(case when HoursBetweenPosts is not null then HoursBetweenPosts end) as AvgHoursBetweenPosts,
+        min(case when HoursBetweenPosts is not null then HoursBetweenPosts end) as MinHoursBetweenPosts,
+        max(case when HoursBetweenPosts is not null then HoursBetweenPosts end) as MaxHoursBetweenPosts,
+        count(*) as TotalPosts
+    from PostActivityWindow
+    group by OwnerUserId
+),
+RecursiveTagSearch(tag, level) as (
+    select
+        lower(trim(unnest(string_to_array(substring(Tags from 2 for char_length(Tags)-2), '><')))) as tag,
+        1
+    from Posts
+    where PostTypeId = 1 and Tags is not null
+
+    union all
+
+    select
+        lower(trim(unnest(string_to_array(substring(Tags from 2 for char_length(Tags)-2), '><')))),
+        level + 1
+    from Posts p
+    join RecursiveTagSearch r on r.tag = any(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'))
+    where p.PostTypeId = 1 and p.Tags is not null and level < 3
+)
+select distinct
+    tu.DisplayName as UserDisplayName,
+    tu.Reputation,
+    tu.UpVotesCount,
+    tu.DownVotesCount,
+    tu.TotalBadges,
+    -- emulate FILTER by conditional MAX on aggregated BadgeCount per class
+    coalesce(MAX(case when ubs.BadgeClass = 1 then ubs.BadgeCount end), 0) as GoldBadges,
+    coalesce(MAX(case when ubs.BadgeClass = 2 then ubs.BadgeCount end), 0) as SilverBadges,
+    coalesce(MAX(case when ubs.BadgeClass = 3 then ubs.BadgeCount end), 0) as BronzeBadges,
+    ps.Id as PostId,
+    ps.Title as PostTitle,
+    ps.PostTypeId,
+    ps.Score,
+    ps.ViewCount,
+    ps.IsClosed,
+    ps.EditTypes,
+    ps.CommentCountTotal,
+    dup.LinkTypeName as DuplicateType,
+    dup.RelatedPostId,
+    dup.RelatedPostTitle,
+    gap.AvgHoursBetweenPosts,
+    gap.MinHoursBetweenPosts,
+    gap.MaxHoursBetweenPosts,
+    gap.TotalPosts,
+    string_agg(distinct rts.tag, ', ') as RelatedTags
+from TopUsers tu
+join PostStats ps on ps.OwnerUserId = tu.Id
+left join DuplicatePostPairs dup on dup.PostId = ps.Id
+left join UserBadgeSummary ubs on ubs.UserId = tu.Id
+left join UserPostGaps gap on gap.OwnerUserId = tu.Id
+left join RecursiveTagSearch rts on rts.tag = any(string_to_array(substring(ps.Tags from 2 for char_length(ps.Tags)-2), '><'))
+where tu.Reputation > 1500
+and (ps.Score > 10 or ps.ViewCount > 1000 or ps.IsClosed = 1)
+group by
+    tu.DisplayName, tu.Reputation, tu.UpVotesCount, tu.DownVotesCount, tu.TotalBadges,
+    ps.Id, ps.Title, ps.PostTypeId, ps.Score, ps.ViewCount,
+    ps.IsClosed, ps.EditTypes, ps.CommentCountTotal, dup.LinkTypeName, dup.RelatedPostId,
+    dup.RelatedPostTitle, gap.AvgHoursBetweenPosts, gap.MinHoursBetweenPosts,
+    gap.MaxHoursBetweenPosts, gap.TotalPosts
+order by tu.Reputation desc, ps.Score desc
+limit 100;

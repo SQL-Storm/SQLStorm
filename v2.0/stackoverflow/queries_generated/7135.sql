@@ -1,0 +1,318 @@
+-- {"query": "7135.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3454} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as QuestionWithAcceptedAnswerCount,
+        AVG(p.Score) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) as TotalQuestionViews,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.ViewCount ELSE 0 END) as TotalAnswerViews,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) FILTER (WHERE p.Tags IS NOT NULL), ', ') as AllTags,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) as ClosedQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.CommunityOwnedDate IS NOT NULL THEN p.Id END) as CommunityOwnedQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN p.Id END) as AnsweredQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.Id END) as QuestionsWithAnswers,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN p.Id END) as QuestionsWithoutAnswers,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount END) as AvgAnswersPerQuestion,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId IN (1,2) AND p.Score > 0 THEN p.Id END) as PositiveScorePosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId IN (1,2) AND p.Score < 0 THEN p.Id END) as NegativeScorePosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId IN (1,2) AND p.Score = 0 THEN p.Id END) as ZeroScorePosts
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        MAX(p.CreationDate) as LastPostDate,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') as TagUsers
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired
+),
+UserQuestionPerformance AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.QuestionCount,
+        uas.QuestionWithAcceptedAnswerCount,
+        uas.AvgQuestionScore,
+        uas.TotalQuestionViews,
+        CASE 
+            WHEN uas.QuestionCount > 0 THEN uas.QuestionWithAcceptedAnswerCount * 100.0 / uas.QuestionCount 
+            ELSE 0 
+        END as AcceptanceRate,
+        CASE 
+            WHEN uas.QuestionCount > 0 THEN (uas.TotalQuestionViews * 1.0 / uas.QuestionCount) 
+            ELSE 0 
+        END as AvgViewsPerQuestion,
+        DENSE_RANK() OVER (ORDER BY uas.TotalQuestionViews DESC) as ViewRank,
+        DENSE_RANK() OVER (ORDER BY uas.AvgQuestionScore DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY uas.QuestionCount DESC) as QuestionRank
+    FROM UserActivityStats uas
+    WHERE uas.QuestionCount > 0
+),
+AdvancedUserStats AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.BadgeCount,
+        uas.CommentCount,
+        uas.LastPostDate,
+        uas.LastCommentDate,
+        uas.AvgQuestionScore,
+        uas.AvgAnswerScore,
+        uas.TotalQuestionViews,
+        uas.TotalAnswerViews,
+        uas.AllTags,
+        uas.ClosedQuestions,
+        uas.CommunityOwnedQuestions,
+        uas.AnsweredQuestions,
+        uas.QuestionsWithAnswers,
+        uas.QuestionsWithoutAnswers,
+        uas.AvgAnswersPerQuestion,
+        uas.PositiveScorePosts,
+        uas.NegativeScorePosts,
+        uas.ZeroScorePosts,
+        CASE 
+            WHEN uas.QuestionCount > 0 THEN uas.QuestionWithAcceptedAnswerCount * 100.0 / uas.QuestionCount 
+            ELSE 0 
+        END as AcceptanceRate,
+        CASE 
+            WHEN (uas.PositiveScorePosts + uas.NegativeScorePosts + uas.ZeroScorePosts) > 0 
+            THEN (uas.PositiveScorePosts * 100.0 / (uas.PositiveScorePosts + uas.NegativeScorePosts + uas.ZeroScorePosts)) 
+            ELSE 0 
+        END as PositiveScorePercentage,
+        CASE 
+            WHEN (uas.PostCount > 0 AND uas.CommentCount > 0) 
+            THEN (uas.CommentCount * 1.0 / uas.PostCount) 
+            ELSE 0 
+        END as CommentsPerPostRatio,
+        CASE 
+            WHEN uas.PostCount > 0 THEN uas.BadgeCount * 1.0 / uas.PostCount 
+            ELSE 0 
+        END as BadgesPerPostRatio,
+        CASE 
+            WHEN uas.Reputation > 0 THEN uas.BadgeCount * 1.0 / uas.Reputation 
+            ELSE 0 
+        END as BadgesPerReputation,
+        ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC) as RepRank,
+        ROW_NUMBER() OVER (ORDER BY uas.BadgeCount DESC) as BadgeRank,
+        ROW_NUMBER() OVER (ORDER BY uas.QuestionCount DESC) as QuestionRank,
+        ROW_NUMBER() OVER (ORDER BY uas.AnswerCount DESC) as AnswerRank
+    FROM UserActivityStats uas
+),
+FinalUserAnalysis AS (
+    SELECT 
+        aus.UserId,
+        aus.DisplayName,
+        aus.Reputation,
+        aus.PostCount,
+        aus.QuestionCount,
+        aus.AnswerCount,
+        aus.BadgeCount,
+        aus.CommentCount,
+        aus.LastPostDate,
+        aus.LastCommentDate,
+        aus.AvgQuestionScore,
+        aus.AvgAnswerScore,
+        aus.TotalQuestionViews,
+        aus.TotalAnswerViews,
+        aus.AllTags,
+        aus.ClosedQuestions,
+        aus.CommunityOwnedQuestions,
+        aus.AnsweredQuestions,
+        aus.QuestionsWithAnswers,
+        aus.QuestionsWithoutAnswers,
+        aus.AvgAnswersPerQuestion,
+        aus.PositiveScorePosts,
+        aus.NegativeScorePosts,
+        aus.ZeroScorePosts,
+        aus.AcceptanceRate,
+        aus.PositiveScorePercentage,
+        aus.CommentsPerPostRatio,
+        aus.BadgesPerPostRatio,
+        aus.BadgesPerReputation,
+        aus.RepRank,
+        aus.BadgeRank,
+        aus.QuestionRank,
+        aus.AnswerRank,
+        -- Window function usage
+        AVG(aus.Reputation) OVER (ORDER BY aus.RepRank ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) as MovingAvgReputation,
+        LAG(aus.Reputation, 1) OVER (ORDER BY aus.RepRank) as PrevRep,
+        LEAD(aus.Reputation, 1) OVER (ORDER BY aus.RepRank) as NextRep,
+        -- Correlated subquery for ranking analysis
+        (SELECT COUNT(*) FROM AdvancedUserStats aus2 WHERE aus2.Reputation > aus.Reputation) as HigherRepCount,
+        -- Complex string expression and pattern matching
+        CASE 
+            WHEN (LENGTH(aus.AllTags) > 0) 
+            THEN LEFT(aus.AllTags, 50) || '...' || RIGHT(aus.AllTags, 50)
+            ELSE 'No tags'
+        END as TagPreview,
+        -- NULL handling and calculation
+        COALESCE(aus.AvgQuestionScore, 0) as SafeAvgQuestionScore,
+        COALESCE(aus.AvgAnswerScore, 0) as SafeAvgAnswerScore,
+        -- Set operator equivalent for filtering
+        CASE 
+            WHEN aus.QuestionCount > 100 AND aus.AnswerCount > 100 THEN 'Veteran'
+            WHEN aus.QuestionCount > 50 AND aus.AnswerCount > 50 THEN 'Active'
+            WHEN aus.QuestionCount > 10 OR aus.AnswerCount > 10 THEN 'Regular'
+            ELSE 'New'
+        END as UserCategory,
+        -- Conditional complex predicate
+        CASE 
+            WHEN (aus.NegativeScorePosts + aus.ZeroScorePosts) * 1.0 / NULLIF(aus.PostCount, 0) > 0.3 THEN 'Low Engagement'
+            WHEN aus.QuestionCount * 1.0 / NULLIF(aus.Reputation, 0) < 0.1 THEN 'Low Productivity'
+            WHEN aus.BadgesPerPostRatio > 0.5 THEN 'Highly Recognized'
+            ELSE 'Standard'
+        END as ActivityStatus
+    FROM AdvancedUserStats aus
+),
+StackOverflowTrends AS (
+    SELECT 
+        'Questions by year' as Metric,
+        EXTRACT(YEAR FROM p.CreationDate) as Year,
+        COUNT(*) as Count,
+        AVG(p.Score) as AvgScore,
+        AVG(p.ViewCount) as AvgViews,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') as TopUsers,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY COUNT(*) DESC) as Ranking
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY EXTRACT(YEAR FROM p.CreationDate)
+    HAVING COUNT(*) > 100
+    
+    UNION ALL
+    
+    SELECT 
+        'Answers by year' as Metric,
+        EXTRACT(YEAR FROM p.CreationDate) as Year,
+        COUNT(*) as Count,
+        AVG(p.Score) as AvgScore,
+        AVG(p.ViewCount) as AvgViews,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') as TopUsers,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY COUNT(*) DESC) as Ranking
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 2
+    GROUP BY EXTRACT(YEAR FROM p.CreationDate)
+    HAVING COUNT(*) > 1000
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.PostCount,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.BadgeCount,
+    fa.CommentCount,
+    fa.LastPostDate,
+    fa.LastCommentDate,
+    fa.AvgQuestionScore,
+    fa.AvgAnswerScore,
+    fa.TotalQuestionViews,
+    fa.TotalAnswerViews,
+    fa.AllTags,
+    fa.ClosedQuestions,
+    fa.CommunityOwnedQuestions,
+    fa.AnsweredQuestions,
+    fa.QuestionsWithAnswers,
+    fa.QuestionsWithoutAnswers,
+    fa.AvgAnswersPerQuestion,
+    fa.PositiveScorePosts,
+    fa.NegativeScorePosts,
+    fa.ZeroScorePosts,
+    fa.AcceptanceRate,
+    fa.PositiveScorePercentage,
+    fa.CommentsPerPostRatio,
+    fa.BadgesPerPostRatio,
+    fa.BadgesPerReputation,
+    fa.RepRank,
+    fa.BadgeRank,
+    fa.QuestionRank,
+    fa.AnswerRank,
+    fa.MovingAvgReputation,
+    fa.PrevRep,
+    fa.NextRep,
+    fa.HigherRepCount,
+    fa.TagPreview,
+    fa.SafeAvgQuestionScore,
+    fa.SafeAvgAnswerScore,
+    fa.UserCategory,
+    fa.ActivityStatus,
+    -- Complex nested subquery
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = fa.UserId AND p.CreationDate > '2022-01-01' AND p.PostTypeId IN (1,2)) as RecentPosts,
+    -- Correlated subquery with joins
+    (SELECT COUNT(DISTINCT c.Id) FROM Comments c INNER JOIN Posts p ON c.PostId = p.Id WHERE p.OwnerUserId = fa.UserId AND p.CreationDate > '2023-01-01') as RecentComments,
+    -- Subquery with aggregation
+    (SELECT AVG(v.Score) FROM Votes v INNER JOIN Posts p ON v.PostId = p.Id WHERE p.OwnerUserId = fa.UserId) as AvgVoteScore,
+    -- Window calculation
+    PERCENT_RANK() OVER (ORDER BY fa.Reputation) as RepPercentile,
+    -- Aggregation functions
+    COUNT(*) OVER() as TotalUsers,
+    SUM(fa.PostCount) OVER() as TotalPosts,
+    AVG(fa.Reputation) OVER() as AvgReputation,
+    -- CASE expression with complex conditions
+    CASE 
+        WHEN fa.RepRank <= 10 THEN 'Top 10'
+        WHEN fa.RepRank <= 50 THEN 'Top 50'
+        WHEN fa.RepRank <= 100 THEN 'Top 100'
+        WHEN fa.RepRank <= 500 THEN 'Top 500'
+        ELSE 'Beyond Top 500'
+    END as RepBracket,
+    -- String manipulation functions
+    UPPER(LEFT(fa.DisplayName, 1)) || LOWER(SUBSTRING(fa.DisplayName, 2)) as FormattedName,
+    -- Pattern matching and filtering
+    CASE 
+        WHEN fa.TotalQuestionViews > 100000 THEN 'High Visibility'
+        WHEN fa.TotalQuestionViews > 10000 THEN 'Medium Visibility'
+        WHEN fa.TotalQuestionViews > 1000 THEN 'Low Visibility'
+        ELSE 'No Visibility'
+    END as VisibilityLevel,
+    -- Complex mathematical calculations
+    CASE 
+        WHEN fa.QuestionCount > 0 THEN (fa.QuestionCount + 1) * (fa.AnswerCount + 1)
+        ELSE 0
+    END as ActivityScore,
+    -- NULL handling for complex expressions
+    COALESCE(fa.AvgAnswersPerQuestion, 0) * COALESCE(fa.QuestionCount, 0) as TotalAnswerActivity
+FROM FinalUserAnalysis fa
+WHERE fa.RepRank <= 1000
+AND fa.Reputation > 100
+AND (fa.QuestionCount > 5 OR fa.AnswerCount > 5)
+AND fa.LastPostDate > '2020-01-01'
+ORDER BY fa.RepRank;

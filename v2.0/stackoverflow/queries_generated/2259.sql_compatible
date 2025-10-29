@@ -1,0 +1,156 @@
+with RecursiveTagCTE as (
+    select 
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        p.Id as PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        array_length(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'),1) as TagCount,
+        rank() over (partition by p.Id order by p.Score desc) as PostRank
+    from Tags t
+    join Posts p 
+      on p.PostTypeId = 1 
+      and p.Tags like '%<' || t.TagName || '>%'
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        array_length(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'),1),
+        rank() over (partition by p.Id order by p.Score desc)
+    from Tags t
+    join Posts p on p.ParentId in (
+        select PostId from RecursiveTagCTE where TagId = t.Id
+    )
+    where p.PostTypeId = 2
+),
+UserEngagement as (
+    select 
+      u.Id as UserId,
+      u.DisplayName,
+      u.Reputation,
+      coalesce(sum(case when b.Class = 1 then 1 else 0 end),0) as GoldBadges,
+      coalesce(sum(case when b.Class = 2 then 1 else 0 end),0) as SilverBadges,
+      coalesce(sum(case when b.Class = 3 then 1 else 0 end),0) as BronzeBadges,
+      coalesce(max(ph.CreationDate), u.CreationDate) as LastEditDate,
+      count(distinct c.Id) as CommentCount,
+      count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesReceived,
+      count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesReceived
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+LatestPostActivity as (
+    select
+      p.Id as PostId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.LastActivityDate,
+      dense_rank() over (partition by p.OwnerUserId order by p.LastActivityDate desc) as ActivityRank,
+      coalesce(pl.PostId,0) as LinkedPostId,
+      coalesce(pl.RelatedPostId,0) as RelatedPostId,
+      pl.LinkTypeId
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    where p.PostTypeId in (1,2)
+),
+PostScoresWithWindow as (
+    select 
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.Score,
+      avg(p.Score) over (partition by p.OwnerUserId) as AvgUserPostScore,
+      count(*) over (partition by p.OwnerUserId) as UserPostCount,
+      row_number() over (partition by p.OwnerUserId order by p.Score desc) as UserPostRank
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+FilteredPosts as (
+    select 
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.Score,
+      p.ViewCount,
+      u.Reputation,
+      ue.GoldBadges,
+      ue.SilverBadges,
+      ue.BronzeBadges,
+      ue.CommentCount,
+      ue.UpVotesReceived,
+      ue.DownVotesReceived,
+      psw.AvgUserPostScore,
+      psw.UserPostCount,
+      psw.UserPostRank,
+      case 
+        when p.ClosedDate is not null then 'Closed'
+        else 'Open'
+      end as PostStatus,
+      case 
+        when p.Tags is null then ''
+        else array_to_string(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), ',')
+      end as TagList,
+      length(p.Body) as BodyLength,
+      (p.LastEditorUserId is not null and p.LastEditorUserId <> -1) as HasEditor
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join UserEngagement ue on ue.UserId = p.OwnerUserId
+    left join PostScoresWithWindow psw on psw.Id = p.Id
+    where p.PostTypeId = 1 and p.Score >= 0 and p.ViewCount > 100
+)
+select 
+  fp.Id as QuestionId,
+  fp.Title,
+  fp.OwnerUserId,
+  fp.Reputation,
+  fp.GoldBadges,
+  fp.SilverBadges,
+  fp.BronzeBadges,
+  fp.CommentCount,
+  fp.UpVotesReceived,
+  fp.DownVotesReceived,
+  fp.Score,
+  fp.ViewCount,
+  fp.AvgUserPostScore,
+  fp.UserPostCount,
+  fp.UserPostRank,
+  fp.PostStatus,
+  fp.TagList,
+  fp.BodyLength,
+  fp.HasEditor,
+  coalesce(
+    (select count(*) from Posts a where a.ParentId = fp.Id and a.Score > fp.Score * 0.75),
+    0
+  ) as HighScoringAnswers,
+  coalesce(
+    (select avg(v.Score) from Votes v join Posts po on v.PostId = po.Id where po.OwnerUserId = fp.OwnerUserId and v.VoteTypeId = 2),
+    0
+  ) as AvgUpvoteScoreOnUserPosts,
+  case 
+    when fp.BodyLength > 500 then 'LongBody'
+    when fp.BodyLength between 200 and 500 then 'MediumBody'
+    else 'ShortBody'
+  end as BodyLengthType
+from FilteredPosts fp
+where (fp.GoldBadges + fp.SilverBadges + fp.BronzeBadges) >= 5
+  and fp.UpVotesReceived > fp.DownVotesReceived
+  and exists (
+      select 1 from PostLinks pl2 where pl2.PostId = fp.Id and pl2.LinkTypeId = 3
+  )
+order by fp.Score desc, fp.ViewCount desc
+limit 100;

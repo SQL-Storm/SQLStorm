@@ -1,0 +1,271 @@
+WITH RankedPosts AS (
+  SELECT 
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.Title,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ClosedDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+    LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+    AVG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as avg_score_10posts
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= DATE '2020-01-01'
+),
+UserActivity AS (
+  SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    COUNT(DISTINCT p.Id) as total_posts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+    COUNT(DISTINCT b.Id) as badges,
+    COALESCE(SUM(p.Score), 0) as total_score,
+    ROUND(COALESCE(SUM(p.Score), 0)::numeric / NULLIF(COUNT(p.Id), 0), 2) as avg_score_per_post,
+    MAX(p.CreationDate) as last_activity,
+    STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), ', ') as all_tags
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  WHERE u.CreationDate >= DATE '2018-01-01'
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+  HAVING COUNT(DISTINCT p.Id) > 0
+    AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0
+),
+TopUsers AS (
+  SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    Views,
+    UpVotes,
+    DownVotes,
+    total_posts,
+    questions,
+    answers,
+    badges,
+    total_score,
+    avg_score_per_post,
+    last_activity,
+    all_tags,
+    ROW_NUMBER() OVER (ORDER BY total_score DESC, Reputation DESC) as rank_by_score
+  FROM UserActivity
+  WHERE Reputation > 1000
+),
+TagFrequency AS (
+  SELECT 
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'), 0) as tag_usage_count,
+    (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') - t.Count as usage_variance,
+    CASE 
+      WHEN t.Count > 100 THEN 'High'
+      WHEN t.Count > 50 THEN 'Medium'
+      ELSE 'Low'
+    END as frequency_level
+  FROM Tags t
+  WHERE t.TagName IS NOT NULL AND t.TagName <> ''
+),
+ComplexPosts AS (
+  SELECT 
+    p.Id as PostId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    CASE 
+      WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+      WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+      ELSE 'Open'
+    END as post_status,
+    CASE 
+      WHEN p.Score >= 100 THEN 'High'
+      WHEN p.Score >= 10 THEN 'Medium'
+      ELSE 'Low'
+    END as score_category,
+    CASE 
+      WHEN p.ViewCount >= 1000 THEN 'Popular'
+      WHEN p.ViewCount >= 100 THEN 'Moderate'
+      ELSE 'Low'
+    END as popularity_level,
+    EXTRACT(YEAR FROM p.CreationDate) as creation_year,
+    EXTRACT(MONTH FROM p.CreationDate) as creation_month,
+    EXTRACT(DAY FROM p.CreationDate) as creation_day,
+    COALESCE(SUBSTRING(p.Title FROM 1 FOR 50), 'No Title') as title_truncated,
+    COALESCE(SUBSTRING(p.Tags FROM 1 FOR 50), 'No Tags') as tags_truncated,
+    CASE 
+      WHEN p.Tags IS NOT NULL AND POSITION('>' IN p.Tags) > 0 THEN
+        (SELECT COUNT(*) FROM UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), '><')) AS tag)
+      ELSE 0
+    END as tag_count
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= DATE '2020-01-01'
+    AND p.Score IS NOT NULL
+),
+UserPostHistory AS (
+  SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    COUNT(DISTINCT ph.PostId) as total_edits,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1, 4, 5, 6) THEN ph.PostId END) as title_body_edits,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.PostId END) as status_changes,
+    COUNT(DISTINCT CASE WHEN ph.UserId IS NULL THEN ph.PostId END) as anonymous_edits,
+    STRING_AGG(DISTINCT ph.Comment, ', ') as edit_comments,
+    MAX(ph.CreationDate) as last_edit_date,
+    COALESCE(COUNT(DISTINCT CASE WHEN ph.Comment LIKE '%improvement%' OR ph.Comment LIKE '%fix%' THEN ph.PostId END), 0) as improvement_edits,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 24 THEN ph.PostId END) as suggested_edits_applied
+  FROM Users u
+  LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+  WHERE ph.CreationDate >= DATE '2020-01-01'
+  GROUP BY u.Id, u.DisplayName
+),
+PostAnalysis AS (
+  SELECT 
+    cp.PostId,
+    cp.OwnerUserId,
+    cp.Score,
+    cp.ViewCount,
+    cp.AnswerCount,
+    cp.CommentCount,
+    cp.FavoriteCount,
+    cp.post_status,
+    cp.score_category,
+    cp.popularity_level,
+    cp.creation_year,
+    cp.creation_month,
+    cp.creation_day,
+    cp.title_truncated,
+    cp.tags_truncated,
+    cp.tag_count,
+    CASE 
+      WHEN cp.AnswerCount > 0 AND cp.Score > 5 THEN 'Engaging'
+      WHEN cp.AnswerCount = 0 AND cp.Score > 10 THEN 'Interesting'
+      ELSE 'Average'
+    END as engagement_level,
+    CASE 
+      WHEN cp.Score > 100 AND cp.ViewCount > 1000 THEN 'Viral'
+      WHEN cp.Score > 50 AND cp.ViewCount > 500 THEN 'Notable'
+      ELSE 'Standard'
+    END as viral_potential,
+    CASE 
+      WHEN EXISTS (SELECT 1 FROM Posts p2 WHERE p2.ParentId = cp.PostId AND p2.PostTypeId = 2) THEN
+        (SELECT COUNT(*) FROM Posts WHERE ParentId = cp.PostId AND PostTypeId = 2)
+      ELSE 0
+    END as answer_count_calc,
+    CASE 
+      WHEN cp.ViewCount > 500 AND cp.Score > 20 THEN
+        (SELECT AVG(Score) FROM Posts p3 WHERE p3.OwnerUserId = cp.OwnerUserId AND p3.CreationDate > cp.CreationDate)
+      ELSE NULL
+    END as avg_post_score_after,
+    ROUND(
+      (CAST(cp.Score as numeric)) * 
+      (1.0 + 
+       COALESCE((SELECT CAST(COUNT(*) as numeric) FROM Votes v1 WHERE v1.PostId = cp.PostId AND v1.VoteTypeId = 2) / 1000.0, 0) +
+       COALESCE((SELECT CAST(COUNT(*) as numeric) FROM Comments c WHERE c.PostId = cp.PostId) / 100.0, 0)
+      ), 2
+    ) as adjusted_score
+  FROM ComplexPosts cp
+)
+SELECT 
+  COUNT(*) as total_records,
+  COUNT(DISTINCT pa.OwnerUserId) as distinct_users,
+  COUNT(DISTINCT CASE WHEN pa.post_status = 'Closed' THEN pa.OwnerUserId END) as users_with_closed_posts,
+  COUNT(DISTINCT CASE WHEN pa.score_category = 'High' THEN pa.OwnerUserId END) as users_with_high_score_posts,
+  COUNT(DISTINCT CASE WHEN pa.post_status = 'Answered' THEN pa.OwnerUserId END) as users_with_answered_questions,
+  AVG(pa.Score) as average_score,
+  AVG(pa.ViewCount) as average_views,
+  AVG(pa.AnswerCount) as average_answers,
+  AVG(pa.CommentCount) as average_comments,
+  AVG(pa.FavoriteCount) as average_favorites,
+  COUNT(CASE WHEN pa.engagement_level = 'Engaging' THEN 1 END) as engaging_posts,
+  COUNT(CASE WHEN pa.viral_potential = 'Viral' THEN 1 END) as viral_posts,
+  COUNT(CASE WHEN pa.viral_potential = 'Notable' THEN 1 END) as notable_posts,
+  MAX(pa.adjusted_score) as max_adjusted_score,
+  MIN(pa.adjusted_score) as min_adjusted_score,
+  STDDEV(pa.adjusted_score) as stddev_adjusted_score,
+  COUNT(CASE WHEN pa.answer_count_calc > 0 THEN 1 END) as posts_with_answers,
+  COUNT(CASE WHEN pa.answer_count_calc = 0 THEN 1 END) as posts_without_answers,
+  COUNT(DISTINCT CASE WHEN pa.creation_year = 2023 THEN pa.OwnerUserId END) as users_with_2023_posts,
+  COUNT(DISTINCT CASE WHEN pa.creation_year = 2022 THEN pa.OwnerUserId END) as users_with_2022_posts,
+  COUNT(DISTINCT CASE WHEN pa.creation_month IN (12, 1, 2) THEN pa.OwnerUserId END) as winter_posts_users,
+  COUNT(DISTINCT CASE WHEN pa.creation_month IN (6, 7, 8) THEN pa.OwnerUserId END) as summer_posts_users,
+  ROUND(AVG(CASE WHEN pa.creation_month IN (12, 1, 2) THEN pa.adjusted_score END)::numeric, 2) as avg_winter_score,
+  ROUND(AVG(CASE WHEN pa.creation_month IN (6, 7, 8) THEN pa.adjusted_score END)::numeric, 2) as avg_summer_score,
+  STRING_AGG(DISTINCT pa.title_truncated, ', ') as top_titles,
+  STRING_AGG(DISTINCT pa.tags_truncated, ', ') as top_tags,
+  ROUND(COALESCE(COUNT(DISTINCT pa.OwnerUserId),0)::numeric / NULLIF(COUNT(pa.PostId), 0), 4) as user_post_ratio,
+  COUNT(DISTINCT CASE WHEN pa.tag_count > 3 THEN pa.OwnerUserId END) as users_with_many_tags,
+  COUNT(DISTINCT CASE WHEN pa.tag_count = 0 THEN pa.OwnerUserId END) as users_with_no_tags,
+  ROUND(AVG(pa.tag_count)::numeric, 2) as avg_tags_per_post,
+  COUNT(DISTINCT CASE WHEN pa.creation_day <= 15 THEN pa.OwnerUserId END) as early_posts_users,
+  COUNT(DISTINCT CASE WHEN pa.creation_day > 15 THEN pa.OwnerUserId END) as later_posts_users,
+  COUNT(DISTINCT CASE WHEN pa.creation_day = 1 THEN pa.OwnerUserId END) as first_day_posts_users,
+  COUNT(DISTINCT CASE WHEN pa.creation_day = 15 THEN pa.OwnerUserId END) as mid_month_posts_users
+FROM PostAnalysis pa
+LEFT JOIN TopUsers tu ON pa.OwnerUserId = tu.UserId
+LEFT JOIN UserPostHistory uph ON pa.OwnerUserId = uph.UserId
+LEFT JOIN TagFrequency tf ON pa.tags_truncated LIKE '%' || tf.TagName || '%'
+WHERE pa.post_status IN ('Open', 'Answered', 'Closed')
+  AND pa.score_category IN ('High', 'Medium', 'Low')
+  AND pa.popularity_level IN ('Popular', 'Moderate', 'Low')
+  AND pa.creation_year >= 2020
+  AND pa.creation_year <= 2023
+  AND EXISTS (
+    SELECT 1 FROM Posts p 
+    WHERE p.Id = pa.PostId 
+      AND p.Score > 0 
+      AND p.ViewCount IS NOT NULL
+  )
+  AND EXISTS (
+    SELECT 1 FROM Users u 
+    WHERE u.Id = pa.OwnerUserId 
+      AND u.Reputation > 0 
+      AND u.Views IS NOT NULL
+  )
+  AND (
+    (pa.score_category = 'High' AND pa.Score >= 50)
+    OR (pa.score_category = 'Medium' AND pa.Score BETWEEN 10 AND 49)
+    OR (pa.score_category NOT IN ('High','Medium') AND pa.Score < 10)
+  )
+  AND (
+    (pa.engagement_level = 'Engaging') 
+    OR (pa.viral_potential IN ('Viral', 'Notable'))
+    OR (pa.creation_year = 2023 AND pa.creation_month IN (12, 1, 2))
+  )
+  AND CAST(pa.adjusted_score AS INTEGER) > 0
+  AND (
+    pa.answer_count_calc > 0 
+    OR pa.CommentCount > 0 
+    OR pa.FavoriteCount > 0
+  )
+  AND CHAR_LENGTH(pa.title_truncated) > 10
+  AND CHAR_LENGTH(pa.tags_truncated) > 5
+  AND pa.tag_count IS NOT NULL
+  AND pa.creation_month IS NOT NULL
+  AND pa.creation_day IS NOT NULL
+  AND pa.creation_year IS NOT NULL
+  AND pa.post_status IS NOT NULL
+  AND pa.score_category IS NOT NULL
+  AND pa.popularity_level IS NOT NULL
+  AND pa.engagement_level IS NOT NULL
+  AND pa.viral_potential IS NOT NULL
+  AND pa.title_truncated IS NOT NULL
+  AND pa.tags_truncated IS NOT NULL
+  AND pa.OwnerUserId IS NOT NULL
+  AND pa.PostId IS NOT NULL;

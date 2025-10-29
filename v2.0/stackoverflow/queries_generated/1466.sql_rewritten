@@ -1,0 +1,200 @@
+-- {"query": "1466.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3069} 
+WITH InitialUserActivities AS (
+    -- Gathers initial creation dates for posts and comments for each user
+    SELECT
+        OwnerUserId AS UserId,
+        CreationDate AS ActivityDate,
+        'Post' AS ActivityType
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    UNION ALL
+    SELECT
+        UserId AS UserId,
+        CreationDate AS ActivityDate,
+        'Comment' AS ActivityType
+    FROM Comments
+    WHERE UserId IS NOT NULL
+),
+UserActivitySummary AS (
+    -- Summarizes various post and comment activities for each user
+    SELECT
+        U.Id AS UserId,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE 0 END), 0) AS TotalQuestionViews,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        MIN(IA.ActivityDate) AS FirstActivityDate -- Demonstrates set operator (UNION ALL) usage
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN InitialUserActivities IA ON U.Id = IA.UserId
+    GROUP BY U.Id
+),
+PostEditTimeDiffs AS (
+    -- Calculates time differences between consecutive edits for each post
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS CurrentEditDate,
+        LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousEditDate
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, Tags
+),
+QuestionPerformance AS (
+    -- Gathers detailed performance metrics for questions, including edit history
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.Title AS QuestionTitle,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.ClosedDate,
+        Q.CommunityOwnedDate,
+        LENGTH(Q.Body) AS QuestionBodyLength,
+        COUNT(DISTINCT PH_Edit.Id) AS PostEditCount,
+        SUM(CASE WHEN PH_Close.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEvents,
+        SUM(CASE WHEN PH_Reopen.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEvents,
+        -- Window function: Calculate the average difference in days between consecutive edits for a question
+        COALESCE(AVG(EXTRACT(EPOCH FROM (PETD.CurrentEditDate - PETD.PreviousEditDate)) / (60 * 60 * 24)), 0.0) AS AvgDaysBetweenEdits,
+        MAX(CASE WHEN PH_Close.PostHistoryTypeId = 10 THEN PH_Close.CreationDate END) AS LastClosedDate,
+        MAX(CASE WHEN PH_Reopen.PostHistoryTypeId = 11 THEN PH_Reopen.CreationDate END) AS LastReopenedDate,
+        STRING_AGG(DISTINCT SUBSTRING(TRIM(T.TagName), 1, 30), ';') AS QuestionTagsList
+    FROM Posts Q
+    LEFT JOIN PostHistory PH_Edit ON Q.Id = PH_Edit.PostId AND PH_Edit.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN PostHistory PH_Close ON Q.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory PH_Reopen ON Q.Id = PH_Reopen.PostId AND PH_Reopen.PostHistoryTypeId = 11
+    LEFT JOIN PostEditTimeDiffs PETD ON Q.Id = PETD.PostId AND PETD.PreviousEditDate IS NOT NULL -- Join to get time differences for calculating AVG
+    LEFT JOIN Tags T ON POSITION('<' || T.TagName || '>' IN COALESCE(Q.Tags, '')) > 0 -- Complex tag matching predicate
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id, Q.OwnerUserId, Q.Title, Q.CreationDate, Q.Score, Q.ViewCount, Q.AnswerCount, Q.FavoriteCount, Q.ClosedDate, Q.CommunityOwnedDate, Q.Body
+),
+UserAnswerStats AS (
+    -- Calculates accepted answer counts and average scores for answers provided by each user
+    SELECT
+        A.OwnerUserId AS UserId,
+        COUNT(A.Id) AS TotalAnswersProvided,
+        COALESCE(SUM(CASE WHEN Q.AcceptedAnswerId = A.Id THEN 1 ELSE 0 END), 0) AS AcceptedAnswersCount,
+        COALESCE(AVG(A.Score), 0.0) AS AvgAnswerScore,
+        COUNT(DISTINCT A.ParentId) AS AnsweredQuestionCount
+    FROM Posts A
+    INNER JOIN Posts Q ON A.ParentId = Q.Id AND Q.PostTypeId = 1
+    WHERE A.PostTypeId = 2
+    GROUP BY A.OwnerUserId
+),
+UserBadgeSummary AS (
+    -- Finds the latest badge for each user using a window function
+    SELECT
+        B.UserId,
+        B.Name AS LatestBadgeName,
+        B.Class AS LatestBadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY B.UserId ORDER BY B.Date DESC, B.Id DESC) as rn
+    FROM Badges B
+)
+-- Main Query: Identifies highly engaged and successful users based on multiple criteria
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    U.LastAccessDate,
+    UPA.FirstActivityDate,
+    U.WebsiteUrl,
+    U.Location,
+    SUBSTRING(COALESCE(U.AboutMe, 'No "About Me" provided.'), 1, 500) AS AboutMeExcerpt, -- String expressions and NULL logic
+    U.Views AS ProfileViews,
+    U.UpVotes,
+    U.DownVotes,
+    UPA.TotalPosts,
+    UPA.TotalQuestions,
+    UPA.TotalAnswers,
+    UPA.TotalPostScore,
+    UPA.TotalQuestionViews,
+    UPA.TotalCommentsMade,
+    UAS.TotalAnswersProvided,
+    UAS.AcceptedAnswersCount,
+    UAS.AvgAnswerScore,
+    UBS.LatestBadgeName,
+    UBS.LatestBadgeClass,
+    COUNT(QP.QuestionId) AS PopularQuestionsAsked,
+    COALESCE(SUM(CASE WHEN QP.QuestionScore > 100 AND QP.ViewCount > 5000 AND QP.AnswerCount > 5 THEN 1 ELSE 0 END), 0) AS HighlyEngagedQuestionsCount,
+    -- Correlated subquery: Fetches the most recent comment text by the user
+    (SELECT COALESCE(C.Text, 'No recent comment') FROM Comments C WHERE C.UserId = U.Id ORDER BY C.CreationDate DESC LIMIT 1) AS LatestCommentText,
+    -- Window function: Ranks users by a composite score involving reputation and accepted answers
+    RANK() OVER (ORDER BY U.Reputation DESC, UAS.AcceptedAnswersCount DESC, UPA.TotalPostScore DESC) AS UserOverallRank,
+    -- Window function: Calculates average reputation for users within the same specified location (NULL logic for partitioning)
+    AVG(U.Reputation) OVER (PARTITION BY COALESCE(U.Location, 'Unspecified')) AS AvgReputationInLocation,
+    -- Complicated calculation: Ratio of accepted answers, handling division by zero
+    CASE
+        WHEN UAS.TotalAnswersProvided > 0 THEN CAST(UAS.AcceptedAnswersCount AS DECIMAL) / UAS.TotalAnswersProvided
+        ELSE 0.0
+    END AS AcceptedAnswerRatio,
+    -- Complex predicate/expression: Categorizes user's location
+    CASE
+        WHEN U.Location IS NULL OR TRIM(U.Location) = '' THEN 'Location Unknown'
+        WHEN LOWER(U.Location) LIKE '%london%' THEN 'Based in London'
+        WHEN LOWER(U.Location) LIKE '%usa%' OR LOWER(U.Location) LIKE '%united states%' OR LOWER(U.Location) LIKE '%america%' THEN 'Based in USA'
+        ELSE 'Other Location'
+    END AS UserLocationStatus,
+    -- Complicated predicate/expression: Categorizes user's engagement level
+    CASE
+        WHEN U.Reputation >= 10000 AND UPA.TotalPosts >= 50 AND UAS.AcceptedAnswersCount >= 10 AND UPA.TotalQuestions >= 5 THEN 'Highly Engaged Veteran'
+        WHEN U.Reputation >= 1000 AND UPA.TotalPosts >= 10 AND UAS.AcceptedAnswersCount >= 3 THEN 'Active Contributor'
+        WHEN U.Reputation >= 100 AND UPA.TotalPosts >= 1 THEN 'New Contributor'
+        ELSE 'Passive User'
+    END AS UserEngagementLevel,
+    -- Calculation: Sum of edit counts for questions that were closed and then reopened
+    COALESCE(SUM(CASE WHEN QP.CloseEvents > 0 AND QP.ReopenEvents > 0 THEN QP.PostEditCount ELSE 0 END), 0) AS TotalEditsOnClosedReopenedQuestions,
+    -- Calculation: Average body length of their highly viewed questions
+    COALESCE(AVG(CASE WHEN QP.QuestionScore > 100 AND QP.ViewCount > 5000 THEN QP.QuestionBodyLength END), 0) AS AvgPopularQuestionBodyLength,
+    -- Calculation: Average days between edits for questions they authored that have been edited more than once
+    COALESCE(AVG(CASE WHEN QP.PostEditCount > 1 THEN QP.AvgDaysBetweenEdits END), 0.0) AS UserAvgDaysBetweenQuestionEdits,
+    -- String aggregation: Lists unique tags from their "hot" questions
+    STRING_AGG(DISTINCT HotQTags.TagName, ', ') AS HotQuestionTagList
+FROM Users U
+LEFT JOIN UserActivitySummary UPA ON U.Id = UPA.UserId
+LEFT JOIN UserAnswerStats UAS ON U.Id = UAS.UserId
+LEFT JOIN UserBadgeSummary UBS ON U.Id = UBS.UserId AND UBS.rn = 1
+LEFT JOIN QuestionPerformance QP ON U.Id = QP.OwnerUserId
+LEFT JOIN LATERAL ( -- Lateral join for complex string parsing (tags) and filtering
+    SELECT DISTINCT TRIM(unnest(string_to_array(SUBSTRING(HotQ.Tags, 2, LENGTH(HotQ.Tags)-2), '><'))) AS TagName
+    FROM Posts HotQ
+    WHERE HotQ.OwnerUserId = U.Id AND HotQ.PostTypeId = 1 AND HotQ.Score > 50 AND HotQ.ViewCount > 1000 AND HotQ.Tags IS NOT NULL AND LENGTH(HotQ.Tags) > 2
+) AS HotQTags ON TRUE
+WHERE
+    U.Reputation >= 100
+    AND U.LastAccessDate >= (cast('2024-10-01' as date) - INTERVAL '2 year') -- Filter for recently active users
+    AND UPA.TotalPosts > 0 -- Ensure user has contributed at least one post
+    AND (
+        -- Correlated subquery (EXISTS): At least one popular question with a specific history of edits, closure, and reopening
+        EXISTS (
+            SELECT 1
+            FROM QuestionPerformance InnerQP
+            WHERE InnerQP.OwnerUserId = U.Id
+              AND InnerQP.QuestionScore > 75
+              AND InnerQP.QuestionViewCount > 3000
+              AND InnerQP.AnswerCount > 3
+              AND InnerQP.PostEditCount > 2
+              AND InnerQP.CloseEvents > 0
+              AND InnerQP.ReopenEvents > 0
+        )
+        OR
+        -- OR (NULL logic): A significant number of accepted answers with a high average score
+        (UAS.AcceptedAnswersCount >= 5 AND UAS.AvgAnswerScore >= 10.0 AND UAS.TotalAnswersProvided > 0)
+    )
+GROUP BY
+    U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.WebsiteUrl, U.Location, U.AboutMe, U.Views, U.UpVotes, U.DownVotes,
+    UPA.TotalPosts, UPA.TotalQuestions, UPA.TotalAnswers, UPA.TotalPostScore, UPA.TotalQuestionViews, UPA.TotalCommentsMade, UPA.FirstActivityDate,
+    UAS.TotalAnswersProvided, UAS.AcceptedAnswersCount, UAS.AvgAnswerScore,
+    UBS.LatestBadgeName, UBS.LatestBadgeClass
+HAVING
+    COUNT(QP.QuestionId) > 0 -- Ensure they have at least one question that passed the QuestionPerformance filter implicitly
+    OR (UAS.AcceptedAnswersCount >= 5 AND UAS.AvgAnswerScore >= 10.0 AND UAS.TotalAnswersProvided > 0)
+ORDER BY
+    UserOverallRank ASC, U.Reputation DESC
+LIMIT 200;

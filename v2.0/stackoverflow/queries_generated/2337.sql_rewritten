@@ -1,0 +1,147 @@
+-- {"query": "2337.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1660} 
+with RecursiveTagPaths as (
+    select t.Id, t.TagName, array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0
+    union all
+    select t.Id, t.TagName, p.Path || t.TagName
+    from Tags t
+    join RecursiveTagPaths p on t.Id > p.Id and t.IsModeratorOnly = 0 and array_length(p.Path,1) < 3
+), QualifiedPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        u.Id as OwnerUserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        case 
+            when p.AcceptedAnswerId is not null then (select count(*) from Posts ans where ans.ParentId = p.Id)
+            else 0
+        end as AnswerCount,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc nulls last) as ScoreRank,
+        count(*) over (partition by p.PostTypeId) as TotalPostsPerType
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1,2)
+), LatestPostHistories as (
+    select ph.PostId, ph.PostHistoryTypeId, ph.CreationDate, ph.UserId, ph.Comment,
+        row_number() over (partition by ph.PostId, ph.PostHistoryTypeId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11)
+), PostCloseReopens as (
+    select lph.PostId, lph.PostHistoryTypeId, lph.CreationDate, lph.UserId, lph.Comment
+    from LatestPostHistories lph
+    where lph.rn = 1
+), UserBadgeCounts as (
+    select b.UserId, b.Class, count(*) as BadgeCount
+    from Badges b
+    where b.Date > cast('2024-10-01' as date) - interval '365 day'
+    group by b.UserId, b.Class
+), UserBadgeSummary as (
+    select ubc.UserId,
+        coalesce(max(case when ubc.Class = 1 then ubc.BadgeCount end), 0) as GoldBadges,
+        coalesce(max(case when ubc.Class = 2 then ubc.BadgeCount end), 0) as SilverBadges,
+        coalesce(max(case when ubc.Class = 3 then ubc.BadgeCount end), 0) as BronzeBadges
+    from UserBadgeCounts ubc
+    group by ubc.UserId
+), UserReputationGrowth as (
+    select u.Id,
+        (select count(*) from Posts p where p.OwnerUserId = u.Id and p.CreationDate >= u.CreationDate and p.CreationDate < u.CreationDate + interval '30 day') as PostsInFirstMonth,
+        (select count(*) from Comments c where c.UserId = u.Id and c.CreationDate >= u.CreationDate and c.CreationDate < u.CreationDate + interval '30 day') as CommentsInFirstMonth,
+        (select sum(v.BountyAmount) from Votes v join Posts p on v.PostId = p.Id where p.OwnerUserId = u.Id and v.CreationDate >= u.CreationDate and v.CreationDate < u.CreationDate + interval '30 day' and v.VoteTypeId = 8) as BountyEarnedInFirstMonth
+    from Users u
+), PostCommentsCount as (
+    select c.PostId, count(c.Id) as CommentCount
+    from Comments c
+    group by c.PostId
+), LinkedDuplicates as (
+    select pl.PostId, count(*) as DuplicateCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId
+), PostsWithDetails as (
+    select q.*,
+        coalesce(pcm.CommentCount, 0) as TotalComments,
+        coalesce(ld.DuplicateCount, 0) as DuplicateLinks,
+        coalesce(ubs.GoldBadges, 0) as OwnerGoldBadges,
+        coalesce(ubs.SilverBadges, 0) as OwnerSilverBadges,
+        coalesce(ubs.BronzeBadges, 0) as OwnerBronzeBadges,
+        ur.PostsInFirstMonth,
+        ur.CommentsInFirstMonth,
+        ur.BountyEarnedInFirstMonth,
+        pcr.PostHistoryTypeId,
+        pcr.Comment as CloseReason
+    from QualifiedPosts q
+    left join PostCommentsCount pcm on q.Id = pcm.PostId
+    left join LinkedDuplicates ld on q.Id = ld.PostId
+    left join UserBadgeSummary ubs on q.OwnerUserId = ubs.UserId
+    left join UserReputationGrowth ur on q.OwnerUserId = ur.Id
+    left join PostCloseReopens pcr on q.Id = pcr.PostId and pcr.PostHistoryTypeId = 10
+), HighScoringQuestions as (
+    select * from PostsWithDetails
+    where PostTypeId = 1 and ScoreRank <= 50 and Score > 10
+), HighScoringAnswers as (
+    select * from PostsWithDetails
+    where PostTypeId = 2 and ScoreRank <= 50 and Score > 10
+), CombinedPosts as (
+    select 'Question' as PostCategory, * from HighScoringQuestions
+    union all
+    select 'Answer' as PostCategory, * from HighScoringAnswers
+), ComplexRanking as (
+    select cp.*,
+        rank() over (
+            partition by cp.PostCategory
+            order by
+                (cp.Score * 0.6 + cp.ViewCount * 0.3 + cp.TotalComments * 0.1) desc,
+                (cp.OwnerGoldBadges * 3 + cp.OwnerSilverBadges * 2 + cp.OwnerBronzeBadges) desc,
+                cp.AnswerCount desc nulls last,
+                cp.DuplicateLinks asc nulls last,
+                cp.CreationDate desc
+            ) as ComplexRank,
+        case
+            when cp.CloseReason is not null then 'Closed: ' || coalesce(
+                (select Name from CloseReasonTypes crt where crt.Id::text = cp.CloseReason), 'Unknown Reason')
+            else 'Open'
+        end as StatusDescription,
+        length(coalesce(cp.Title, '')) as TitleLength,
+        regexp_replace(cp.Tags, '[<>]', ',', 'g') as TagsCommaSeparated
+    from CombinedPosts cp
+)
+select 
+    cr.PostCategory,
+    cr.Id as PostId,
+    cr.Title,
+    cr.TagsCommaSeparated,
+    cr.Score,
+    cr.ViewCount,
+    cr.TotalComments,
+    cr.AnswerCount,
+    cr.OwnerUserId,
+    cr.DisplayName,
+    cr.Reputation,
+    cr.UserCreationDate,
+    cr.StatusDescription,
+    cr.ComplexRank,
+    cr.OwnerGoldBadges,
+    cr.OwnerSilverBadges,
+    cr.OwnerBronzeBadges,
+    cr.PostsInFirstMonth,
+    cr.CommentsInFirstMonth,
+    cr.BountyEarnedInFirstMonth,
+    cr.TitleLength,
+    (select string_agg(bl.Name, ', ') from LinkTypes bl where bl.Id in (
+        select pl.LinkTypeId from PostLinks pl where pl.PostId = cr.Id limit 5
+    )) as TopLinkTypes,
+    case
+        when cr.ViewCount > 10000 then 'Highly Viewed'
+        when cr.ViewCount between 1000 and 10000 then 'Moderately Viewed'
+        else 'Low Views'
+    end as ViewCategory
+from ComplexRanking cr
+order by cr.PostCategory, cr.ComplexRank
+limit 100;

@@ -1,0 +1,150 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.CreationDate AS UserCreationDate,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserTotalUpVotesGiven,
+        U.DownVotes AS UserTotalDownVotesGiven,
+        COALESCE(U.Location, 'Unknown') AS UserLocation,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersProvided,
+        SUM(COALESCE(P.Score, 0)) AS SumOfPostScores,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        (SELECT COUNT(DISTINCT B.Name) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) AS GoldBadges,
+        (SELECT COUNT(DISTINCT B.Name) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 2) AS SilverBadges,
+        MAX(P.LastActivityDate) AS LastContentActivity,
+        DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - U.CreationDate) AS DaysSinceRegistration
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.CreationDate, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.Location
+),
+QuestionDetailedMetrics AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionNetScore,
+        Q.ViewCount,
+        Q.AnswerCount AS DeclaredAnswerCount,
+        Q.CommentCount AS DeclaredCommentCount,
+        Q.FavoriteCount,
+        Q.AcceptedAnswerId,
+        Q.ClosedDate,
+        Q.LastActivityDate,
+        Q.Tags,
+        COUNT(A.Id) AS ActualAnswersCount,
+        SUM(A.Score) AS TotalAnswerScoreSum,
+        COUNT(DISTINCT V.Id) AS TotalVotesOnQuestion,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        (SELECT COUNT(DISTINCT SubPH.UserId) FROM PostHistory SubPH WHERE SubPH.PostId = Q.Id AND SubPH.PostHistoryTypeId IN (4,5,6,7,8,9,10,11)) AS DistinctModifierCount,
+        (SELECT MAX(SubPH_MaxDate.CreationDate) FROM PostHistory SubPH_MaxDate WHERE SubPH_MaxDate.PostId = Q.Id) AS LatestHistoryEventDate,
+        STRING_AGG(DISTINCT TRIM(T.TagName), '; ') FILTER (WHERE T.TagName IS NOT NULL) AS QuestionTagsListAggregated
+    FROM
+        Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN Votes V ON Q.Id = V.PostId
+    LEFT JOIN Tags T ON T.TagName = ANY(string_to_array(substring(Q.Tags, 2, length(Q.Tags)-2), '><'))
+    WHERE
+        Q.PostTypeId = 1
+        AND Q.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 year')
+    GROUP BY
+        Q.Id, Q.Title, Q.OwnerUserId, Q.CreationDate, Q.Score, Q.ViewCount, Q.AnswerCount, Q.CommentCount, Q.FavoriteCount, Q.AcceptedAnswerId, Q.ClosedDate, Q.LastActivityDate, Q.Tags
+),
+PostHistoryTimeline AS (
+    SELECT
+        PH.PostId,
+        PH.Id AS HistoryEventId,
+        PH.PostHistoryTypeId,
+        PHT.Name AS HistoryTypeName,
+        PH.CreationDate AS HistoryEventDate,
+        PH.UserId AS EditorId,
+        PH.Comment,
+        LEAD(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS NextEventDate,
+        LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousEventDate,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS EventSequenceNum
+    FROM
+        PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE
+        PH.PostId IN (SELECT QuestionId FROM QuestionDetailedMetrics WHERE ActualAnswersCount >= 5 AND QuestionNetScore > 10)
+),
+FrequentTagContributors AS (
+    SELECT
+        UA.UserId,
+        TRIM(UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><'))) AS TagName,
+        COUNT(P.Id) AS TaggedQuestionsCount,
+        SUM(P.Score) AS TaggedQuestionsScoreSum
+    FROM
+        UserActivitySummary UA
+    JOIN Posts P ON UA.UserId = P.OwnerUserId
+    WHERE
+        P.PostTypeId = 1 AND P.Tags IS NOT NULL AND P.Tags != ''
+    GROUP BY
+        UA.UserId, TRIM(UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')))
+    HAVING COUNT(P.Id) > 5
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.UserProfileViews,
+    UAS.TotalQuestionsAsked,
+    UAS.TotalAnswersProvided,
+    QDM.QuestionId,
+    QDM.QuestionTitle,
+    QDM.QuestionNetScore,
+    QDM.ViewCount AS QuestionViewCount,
+    QDM.ActualAnswersCount,
+    QDM.DeclaredCommentCount,
+    QDM.FavoriteCount,
+    QDM.UpVotesReceived AS QuestionUpvotes,
+    QDM.DownVotesReceived AS QuestionDownvotes,
+    QDM.DistinctModifierCount,
+    QDM.QuestionTagsListAggregated,
+    (QDM.UpVotesReceived - QDM.DownVotesReceived) AS NetQuestionVoteDifference,
+    COALESCE(CAST(QDM.UpVotesReceived AS NUMERIC) / NULLIF(QDM.DownVotesReceived, 0), 0.0) AS UpvoteToDownvoteRatio,
+    COALESCE(CAST(QDM.ActualAnswersCount AS NUMERIC) / NULLIF(QDM.ViewCount, 0) * 100, 0.0) AS AnswerViewRatePercent,
+    COALESCE(DATE_PART('day', PHT.NextEventDate - PHT.HistoryEventDate), 0) AS DaysToNextHistoryEvent,
+    COUNT(CASE WHEN PHT.HistoryTypeName LIKE '%Rollback%' THEN 1 END) OVER (PARTITION BY QDM.QuestionId) AS RollbacksOnQuestion,
+    MAX(UAS.Reputation) OVER (PARTITION BY UAS.UserLocation) AS MaxReputationInLocation,
+    AVG(QDM.QuestionNetScore) OVER (PARTITION BY FTS.TagName) AS AvgScoreForTagAcrossAllQuestions,
+    SUM(FTS.TaggedQuestionsScoreSum) OVER (PARTITION BY UAS.UserId ORDER BY FTS.TaggedQuestionsCount DESC) AS UserCumulativeTagScoreByFrequency,
+    NULLIF(UAS.UserProfileViews, 0) AS ProfileViewsIfNotNull,
+    CASE
+        WHEN QDM.ClosedDate IS NOT NULL AND QDM.QuestionNetScore < 0 THEN 'Closed and Downvoted'
+        WHEN QDM.AcceptedAnswerId IS NOT NULL AND QDM.ActualAnswersCount = 1 THEN 'Single Accepted Answer'
+        WHEN QDM.QuestionNetScore > 50 AND QDM.ActualAnswersCount > 10 THEN 'Highly Engaged Question'
+        ELSE 'General Question'
+    END AS QuestionEngagementCategory,
+    'https://stackoverflow.com/questions/' || QDM.QuestionId AS QuestionURL,
+    REPLACE(REPLACE(TRIM(LOWER(UAS.UserLocation)), ' ', '-'), ',', '') AS NormalizedUserLocationString,
+    (CAST(QDM.QuestionCreationDate AS DATE) - CAST(UAS.UserCreationDate AS DATE)) AS DaysFromUserRegToQuestion
+FROM
+    UserActivitySummary UAS
+INNER JOIN QuestionDetailedMetrics QDM ON UAS.UserId = QDM.QuestionOwnerId
+LEFT JOIN PostHistoryTimeline PHT ON QDM.QuestionId = PHT.PostId AND PHT.EventSequenceNum = 1
+LEFT JOIN FrequentTagContributors FTS ON UAS.UserId = FTS.UserId
+WHERE
+    UAS.Reputation > 5000
+    AND QDM.ActualAnswersCount >= 2
+    AND QDM.QuestionNetScore >= 5
+    AND (UAS.UserLocation ILIKE '%london%' OR UAS.UserLocation ILIKE '%new york%')
+    AND QDM.ViewCount > 100
+    AND QDM.FavoriteCount IS NOT NULL
+GROUP BY
+    UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.UserProfileViews, UAS.TotalQuestionsAsked, UAS.TotalAnswersProvided,
+    QDM.QuestionId, QDM.QuestionTitle, QDM.QuestionNetScore, QDM.ViewCount, QDM.ActualAnswersCount, QDM.DeclaredCommentCount,
+    QDM.FavoriteCount, QDM.UpVotesReceived, QDM.DownVotesReceived, QDM.DistinctModifierCount, QDM.QuestionTagsListAggregated,
+    PHT.HistoryEventDate, PHT.NextEventDate, UAS.UserLocation, QDM.ClosedDate, QDM.AcceptedAnswerId,
+    FTS.TagName, FTS.TaggedQuestionsCount, FTS.TaggedQuestionsScoreSum, UAS.UserCreationDate, PHT.HistoryTypeName
+ORDER BY
+    UAS.Reputation DESC, NetQuestionVoteDifference DESC, AnswerViewRatePercent DESC
+LIMIT 5000;

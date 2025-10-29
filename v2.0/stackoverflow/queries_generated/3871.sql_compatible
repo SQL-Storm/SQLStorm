@@ -1,0 +1,119 @@
+WITH RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                           ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+),
+UserBadgeCounts AS (
+    SELECT
+        u.Id               AS UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(b.Id)                           AS TotalBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+TagUsage AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id)                     AS QuestionCount,
+        SUM(p.Score)                    AS TotalScore,
+        MAX(p.CreationDate)             AS LastUsed
+    FROM Tags t
+    JOIN Posts p
+      ON p.PostTypeId = 1
+     AND p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')
+    GROUP BY t.TagName
+),
+PostVotes AS (
+    SELECT
+        p.Id                                            AS PostId,
+        COALESCE(SUM(CASE
+                        WHEN v.VoteTypeId = 2 THEN 1
+                        WHEN v.VoteTypeId = 3 THEN -1
+                        ELSE 0
+                     END),0)                           AS NetScore,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END)       AS FavoriteCount
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id
+),
+MainUsers AS (
+    SELECT
+        u.Id                                    AS UserId,
+        COALESCE(u.DisplayName,'Anonymous')     AS DisplayName,
+        u.Reputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalBadges,
+        rq.Title,
+        rq.CreationDate                         AS QuestionDate,
+        pv.NetScore,
+        pv.FavoriteCount,
+        CASE WHEN rq.rn = 1 THEN 'MostRecent' ELSE 'Earlier' END AS RecencyFlag,
+        (SELECT STRING_AGG(t, ';')
+           FROM UNNEST(string_to_array(rq.Tags, '><')) AS t
+           WHERE t <> '')                         AS TagList,
+        rq.Tags
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ub
+           ON ub.UserId = u.Id
+    LEFT JOIN RecentQuestions rq
+           ON rq.OwnerUserId = u.Id AND rq.rn <= 3
+    LEFT JOIN PostVotes pv
+           ON pv.PostId = rq.Id
+    FULL OUTER JOIN (
+        SELECT TagName FROM TagUsage WHERE QuestionCount > 1000
+    ) AS heavy_tags
+           ON heavy_tags.TagName = ANY (string_to_array(COALESCE(rq.Tags, ''), '><'))
+    WHERE u.CreationDate < (CAST('2024-10-01' AS date) - INTERVAL '365 days')
+       OR u.Reputation > 10000
+)
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    TotalBadges,
+    Title,
+    QuestionDate,
+    NetScore,
+    FavoriteCount,
+    RecencyFlag,
+    TagList
+FROM MainUsers
+ORDER BY Reputation DESC NULLS LAST, TotalBadges DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL                                    AS UserId,
+    '--- Tag Summary ---'                   AS DisplayName,
+    NULL                                    AS Reputation,
+    NULL                                    AS GoldBadges,
+    NULL                                    AS SilverBadges,
+    NULL                                    AS BronzeBadges,
+    NULL                                    AS TotalBadges,
+    tu.TagName                               AS Title,
+    tu.LastUsed                              AS QuestionDate,
+    tu.TotalScore                            AS NetScore,
+    tu.QuestionCount                         AS FavoriteCount,
+    NULL                                    AS RecencyFlag,
+    NULL                                    AS TagList
+FROM TagUsage tu
+WHERE tu.QuestionCount > 5000
+ORDER BY tu.QuestionCount DESC
+LIMIT 20;

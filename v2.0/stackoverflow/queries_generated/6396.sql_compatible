@@ -1,0 +1,43 @@
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.AboutMe,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS QuestionsAsked,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS AnswersGiven,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.LastActivityDate) AS FirstPostActivity,
+    MAX(ph.CreationDate) AS LastEdit,
+    b.Name AS LatestBadge,
+    b.Date AS BadgeEarnedDate
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON u.Id = v.UserId
+LEFT JOIN 
+    PostHistory ph ON u.Id = ph.UserId
+WHERE 
+    u.Reputation > 100
+    AND p.LastActivityDate IS NOT NULL
+    AND p.PostTypeId IN (1, 2)
+    AND b.Date = (SELECT MAX(b2.Date) FROM Badges b2 WHERE b2.UserId = u.Id)
+    AND p.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId IN (1, 2))
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.AboutMe,
+    b.Name,
+    b.Date
+HAVING 
+    COUNT(DISTINCT v.PostId) > 5
+ORDER BY 
+    b.Name DESC,
+    HighestScoredPost DESC;

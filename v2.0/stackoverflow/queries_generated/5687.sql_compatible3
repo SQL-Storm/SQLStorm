@@ -1,0 +1,172 @@
+WITH ranked_posts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    p.LastActivityDate,
+    p.PostTypeId,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.LastEditDate,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.WebsiteUrl,
+    COALESCE(u.emailhash, u.EmailHash) AS EmailHash,
+    u.AccountId,
+    SUM(p.Score) OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY p.CreationDate
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS cumulative_score,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY 
+        p.Score * CASE WHEN p.Tags LIKE '%<sql>%'
+                       THEN 2
+                       ELSE 1
+                  END
+        + (
+            (EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate))) / 86400
+          ) DESC
+    ) AS rn,
+    CASE
+      WHEN p.Tags IS NULL THEN NULL
+      ELSE (
+        SELECT AVG(CAST(t2.Count AS DECIMAL))
+        FROM Tags t2
+        WHERE t2.TagName = ANY(
+          string_to_array(
+            replace(replace(p.Tags, '<', ''), '>', ''),
+            '><'
+          )
+        )
+      )
+    END AS avg_tag_count
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId IN (1, 2)
+),
+filtered AS (
+  SELECT
+    r.Id,
+    r.Title,
+    r.CreationDate,
+    r.Score,
+    r.ViewCount,
+    r.OwnerUserId,
+    r.Tags,
+    r.LastActivityDate,
+    r.PostTypeId,
+    r.AcceptedAnswerId,
+    r.ParentId,
+    r.LastEditDate,
+    r.CommentCount,
+    r.FavoriteCount,
+    r.ContentLicense,
+    r.Reputation,
+    r.DisplayName,
+    r.LastAccessDate,
+    r.Location,
+    r.Views,
+    r.UpVotes,
+    r.DownVotes,
+    r.WebsiteUrl,
+    r.EmailHash,
+    r.AccountId,
+    r.cumulative_score,
+    r.rn,
+    r.avg_tag_count,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = r.Id AND c.Score > 0) AS positive_comments,
+    (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.PostId = r.Id) AS last_vote_date
+  FROM ranked_posts r
+  WHERE r.cumulative_score > 1000
+    AND (r.LastActivityDate IS NOT NULL AND r.LastActivityDate > (r.CreationDate - INTERVAL '180 days'))
+),
+complex AS (
+  SELECT
+    f.Id,
+    f.Title,
+    f.CreationDate,
+    f.Score,
+    f.ViewCount,
+    f.OwnerUserId,
+    f.Tags,
+    f.LastActivityDate,
+    f.PostTypeId,
+    f.AcceptedAnswerId,
+    f.ParentId,
+    f.LastEditDate,
+    f.CommentCount,
+    f.FavoriteCount,
+    f.ContentLicense,
+    f.Reputation,
+    f.DisplayName,
+    f.LastAccessDate,
+    f.Location,
+    f.Views,
+    f.UpVotes,
+    f.DownVotes,
+    f.WebsiteUrl,
+    f.EmailHash,
+    f.AccountId,
+    f.cumulative_score,
+    f.rn,
+    f.avg_tag_count,
+    f.positive_comments,
+    f.last_vote_date,
+    pl.RelatedPostId,
+    pl2.PostTypeId AS RelatedPostTypeId,
+    CASE WHEN f.ViewCount * 0.5 + f.Score * 20 > 5000 THEN TRUE ELSE FALSE END AS IsHot
+  FROM filtered f
+  LEFT JOIN PostLinks pl ON pl.PostId = f.Id
+  LEFT JOIN Posts pl2 ON pl.RelatedPostId = pl2.Id
+)
+SELECT
+  c.Id,
+  c.Title,
+  c.CreationDate,
+  c.Score,
+  c.ViewCount,
+  c.OwnerUserId,
+  c.Tags,
+  c.LastActivityDate,
+  c.PostTypeId,
+  c.AcceptedAnswerId,
+  c.ParentId,
+  c.LastEditDate,
+  c.CommentCount,
+  c.FavoriteCount,
+  c.ContentLicense,
+  c.Reputation,
+  c.DisplayName,
+  c.LastAccessDate,
+  c.Location,
+  c.Views,
+  c.UpVotes,
+  c.DownVotes,
+  c.WebsiteUrl,
+  c.EmailHash,
+  c.AccountId,
+  c.cumulative_score,
+  c.rn,
+  c.avg_tag_count,
+  c.positive_comments,
+  c.last_vote_date,
+  c.RelatedPostId,
+  c.RelatedPostTypeId,
+  c.IsHot
+FROM complex c
+ORDER BY c.IsHot DESC, c.cumulative_score DESC, c.LastActivityDate DESC
+LIMIT 200;

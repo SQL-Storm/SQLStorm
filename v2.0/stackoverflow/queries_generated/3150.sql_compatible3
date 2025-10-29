@@ -1,0 +1,128 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 
+            ELSE 0 
+        END AS HasAccepted,
+        COALESCE(p.Tags, '') AS Tags
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY
+),
+UserAgg AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(u.Reputation, 0) AS Reputation,
+        COUNT(CASE WHEN rp.PostTypeId = 1 THEN 1 END) AS QuestionCount30d,
+        COUNT(CASE WHEN rp.PostTypeId = 2 THEN 1 END) AS AnswerCount30d,
+        SUM(rp.Score) AS TotalScore30d,
+        AVG(CASE WHEN rp.PostTypeId = 2 THEN rp.Score END) AS AvgAnswerScore,
+        SUM(CASE WHEN rp.PostTypeId = 1 THEN rp.HasAccepted ELSE 0 END) AS AcceptedAnswerCount,
+        MAX(rp.CreationDate) AS LastPostDate,
+        COALESCE(u.Location, '[Unknown]') AS Location,
+        COALESCE(u.WebsiteUrl, '') AS Website
+    FROM Users u
+    LEFT JOIN RecentPosts rp ON u.Id = rp.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.WebsiteUrl
+),
+BadgeAgg AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount,
+        STRING_AGG(DISTINCT b.Name, ', ') AS GoldBadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TagAgg AS (
+    SELECT 
+        u.Id AS UserId,
+        TRIM(lt.t) AS TagName,
+        COUNT(*) AS TagUseCount
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id 
+                 AND p.PostTypeId = 1 
+                 AND p.Tags IS NOT NULL
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS t
+    ) lt
+    GROUP BY u.Id, TRIM(lt.t)
+),
+TopTagPerUser AS (
+    SELECT 
+        ta.UserId,
+        ta.TagName,
+        ta.TagUseCount,
+        ROW_NUMBER() OVER (PARTITION BY ta.UserId ORDER BY ta.TagUseCount DESC) AS rn
+    FROM TagAgg ta
+),
+MainRows AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionCount30d,
+        ua.AnswerCount30d,
+        ua.TotalScore30d,
+        ROUND(CAST(ua.AvgAnswerScore AS NUMERIC), 2)        AS AvgAnswerScore,
+        ua.AcceptedAnswerCount,
+        ua.LastPostDate,
+        COALESCE(ba.GoldBadgeCount, 0)              AS GoldBadgeCount,
+        COALESCE(ba.SilverBadgeCount, 0)            AS SilverBadgeCount,
+        COALESCE(ba.BronzeBadgeCount, 0)            AS BronzeBadgeCount,
+        COALESCE(ba.GoldBadgeNames, '')             AS GoldBadgeNames,
+        tt.TagName                                   AS TopTag,
+        tt.TagUseCount                               AS TopTagUseCount,
+        CASE 
+            WHEN ua.AnswerCount30d = 0 THEN NULL 
+            ELSE CAST(ua.AcceptedAnswerCount AS DOUBLE PRECISION) / ua.AnswerCount30d 
+        END                                          AS AcceptanceRate,
+        CASE 
+            WHEN ua.Reputation >= 20000 THEN 'Elite'
+            WHEN ua.Reputation >= 10000 THEN 'Trusted'
+            WHEN ua.Reputation >= 1000  THEN 'Contributor'
+            ELSE 'Newbie'
+        END                                          AS ReputationTier
+    FROM UserAgg ua
+    LEFT JOIN BadgeAgg ba      ON ua.UserId = ba.UserId
+    LEFT JOIN TopTagPerUser tt ON ua.UserId = tt.UserId AND tt.rn = 1
+    WHERE ua.Reputation IS NOT NULL
+),
+TotalsRow AS (
+    SELECT
+        CAST(NULL AS BIGINT) AS UserId,
+        'TOTAL'                                      AS DisplayName,
+        SUM(ua.Reputation)                           AS Reputation,
+        SUM(ua.QuestionCount30d)                     AS QuestionCount30d,
+        SUM(ua.AnswerCount30d)                       AS AnswerCount30d,
+        SUM(ua.TotalScore30d)                        AS TotalScore30d,
+        ROUND(CAST(AVG(ua.AvgAnswerScore) AS NUMERIC), 2) AS AvgAnswerScore,
+        SUM(ua.AcceptedAnswerCount)                  AS AcceptedAnswerCount,
+        CAST(NULL AS TIMESTAMP)                              AS LastPostDate,
+        SUM(COALESCE(ba.GoldBadgeCount, 0))          AS GoldBadgeCount,
+        SUM(COALESCE(ba.SilverBadgeCount, 0))        AS SilverBadgeCount,
+        SUM(COALESCE(ba.BronzeBadgeCount, 0))        AS BronzeBadgeCount,
+        CAST(NULL AS VARCHAR(4000))                  AS GoldBadgeNames,
+        CAST(NULL AS VARCHAR(4000))                  AS TopTag,
+        CAST(NULL AS INTEGER)                        AS TopTagUseCount,
+        CAST(NULL AS DOUBLE PRECISION)               AS AcceptanceRate,
+        CAST(NULL AS VARCHAR(20))                    AS ReputationTier
+    FROM UserAgg ua
+    LEFT JOIN BadgeAgg ba ON ua.UserId = ba.UserId
+    HAVING COUNT(*) > 1
+)
+SELECT *
+FROM MainRows
+ORDER BY Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT *
+FROM TotalsRow;

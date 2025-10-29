@@ -1,0 +1,196 @@
+WITH UserMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        COALESCE(U.DisplayName, 'Anonymous User #' || U.Id) AS DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(P.Score) AS TotalPostsScore,
+        AVG(CASE WHEN P.PostTypeId IN (1,2) THEN P.Score END) AS AvgPostScore,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        (SELECT COUNT(DISTINCT Q.Id)
+         FROM Posts Q
+         WHERE Q.OwnerUserId = U.Id AND Q.AcceptedAnswerId IS NOT NULL AND Q.PostTypeId = 1
+        ) AS QuestionsWithAcceptedAnswersByOwner,
+        (SELECT COUNT(DISTINCT A.Id)
+         FROM Posts A
+         WHERE A.ParentId IS NOT NULL AND A.PostTypeId = 2 AND A.OwnerUserId = U.Id
+           AND EXISTS (SELECT 1 FROM Posts Q WHERE Q.Id = A.ParentId AND Q.AcceptedAnswerId = A.Id)
+        ) AS AnswersAcceptedCount,
+        DENSE_RANK() OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS ReputationRank,
+        (CAST(U.Reputation AS numeric) * 0.5 + CAST(U.UpVotes AS numeric) * 0.2 + CAST(SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS numeric) * 10 + CAST(SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS numeric) * 5 + CAST(COUNT(DISTINCT P.Id) AS numeric) * 0.1) AS InfluenceScore
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostDetails AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        COALESCE(U_PostOwner.DisplayName, 'Community') AS PostOwnerDisplayName,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.CommentCount,
+        COALESCE(P.FavoriteCount, 0) AS FavoriteCount,
+        P.ClosedDate,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        CASE
+            WHEN P.Title IS NOT NULL AND LENGTH(P.Title) > 0 THEN P.Title
+            ELSE 'No Title: ' || SUBSTRING(P.Body, 1, LEAST(50, LENGTH(P.Body))) || '...'
+        END AS PostTitleOrSnippet,
+        P.Tags,
+        LENGTH(P.Body) AS BodyCharacterCount,
+        (CAST(P.Score AS numeric) * 5 + CAST(P.CommentCount AS numeric) * 2 + CAST(COALESCE(P.FavoriteCount, 0) AS numeric) * 10 + CAST(P.ViewCount AS numeric) * 0.01) AS EngagementMetric,
+        AVG(P.Score) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS AvgScoreLast30DaysByOwner,
+        (LOWER(P.Tags) LIKE '%<sql>%' OR LOWER(P.Tags) LIKE '%<database>%') AS HasSqlOrDatabaseTag,
+        CASE WHEN P.Tags IS NOT NULL AND POSITION('>' IN P.Tags) > 1 THEN SUBSTRING(P.Tags FROM 2 FOR (POSITION('>' IN P.Tags) - 2)) ELSE NULL END AS FirstTag,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - P.CreationDate)) / (60 * 60 * 24) AS PostAgeDays,
+        (SELECT COUNT(PH_sub.Id) FROM PostHistory PH_sub WHERE PH_sub.PostId = P.Id AND PH_sub.PostHistoryTypeId IN (4,5,6,7,8,9)) AS EditAndRollbackCount,
+        EXISTS (SELECT 1 FROM PostHistory PH_sub WHERE PH_sub.PostId = P.Id AND PH_sub.PostHistoryTypeId = 10) AS WasClosed
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN Users U_PostOwner ON P.OwnerUserId = U_PostOwner.Id
+    WHERE P.CreationDate >= '2022-01-01'
+      AND P.PostTypeId IN (1, 2)
+),
+PostHistorySummary AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEvents,
+        MAX(PH.CreationDate) AS LatestHistoryEventDate,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Id END) AS CloseEvents,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.Id END) AS ReopenEvents,
+        COUNT(DISTINCT CASE WHEN PH.UserId IS NOT NULL THEN PH.UserId END) AS UniqueEditors,
+        MAX(
+            CASE
+                WHEN PH.PostHistoryTypeId IN (4,5,6) THEN EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate)))
+                ELSE NULL
+            END
+        ) AS MaxTimeBetweenEditsSec
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (1,2,4,5,6,7,8,9,10,11,12,13)
+    GROUP BY PH.PostId
+),
+TagInfluence AS (
+    SELECT
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS PostsTaggedCount,
+        SUM(P.Score) AS TotalTagScore,
+        AVG(P.Score) AS AvgTagScore,
+        MAX(P.CreationDate) AS LatestTagPostDate,
+        RANK() OVER (ORDER BY AVG(P.Score) DESC, COUNT(DISTINCT P.Id) DESC) AS TagScoreRank
+    FROM Tags T
+    LEFT JOIN Posts P ON P.Tags LIKE '%' || '<' || T.TagName || '>' || '%'
+    GROUP BY T.TagName
+    HAVING COUNT(DISTINCT P.Id) >= 20 AND AVG(P.Score) > 0
+),
+CombinedUserPostMetrics AS (
+    SELECT
+        UM.UserId,
+        UM.DisplayName,
+        UM.Reputation,
+        UM.TotalPostsCreated,
+        UM.TotalCommentsMade,
+        UM.GoldBadges,
+        UM.InfluenceScore,
+        PD.PostId,
+        PD.PostTypeName,
+        PD.PostTitleOrSnippet,
+        PD.PostScore,
+        PD.ViewCount,
+        PD.FavoriteCount,
+        PD.EngagementMetric,
+        PD.PostAgeDays,
+        PD.EditAndRollbackCount AS PostEditCount,
+        PD.WasClosed,
+        PD.HasSqlOrDatabaseTag,
+        COALESCE(PHS.TotalHistoryEvents, 0) AS PostTotalHistoryEvents,
+        COALESCE(PHS.CloseEvents, 0) AS PostCloseEvents,
+        COALESCE(PHS.ReopenEvents, 0) AS PostReopenEvents,
+        COALESCE(TI.AvgTagScore, 0) AS FirstTagAvgScore,
+        CAST(
+            CASE
+                WHEN UM.TotalPostsCreated > 0 AND UM.TotalCommentsMade > 0
+                THEN (CAST(UM.TotalPostsScore AS numeric) / NULLIF(UM.TotalPostsCreated, 0)) * 0.7 + (UM.AvgPostScore * 0.3)
+                WHEN UM.TotalPostsCreated > 0 THEN (CAST(UM.TotalPostsScore AS numeric) / NULLIF(UM.TotalPostsCreated, 0))
+                ELSE 0
+            END AS numeric
+        ) AS CalculatedUserPostQualityScore,
+        CASE
+            WHEN PD.PostScore >= 100 AND PD.FavoriteCount >= 10 AND PD.EngagementMetric > 1000 THEN 'Highly Viral'
+            WHEN PD.PostScore >= 50 AND PD.ViewCount >= 5000 AND PD.PostAgeDays < 90 THEN 'Trending Popular'
+            WHEN PD.PostAgeDays > 730 AND PD.EditAndRollbackCount = 0 THEN 'Stagnant Old Post'
+            WHEN PHS.CloseEvents > 0 AND PHS.ReopenEvents > 0 THEN 'Controversial Post'
+            WHEN PD.AcceptedAnswerId IS NULL AND PD.PostTypeId = 1 AND PD.PostAgeDays > 30 THEN 'Unanswered Question'
+            WHEN PD.OwnerUserId IS NULL THEN 'Community Post'
+            ELSE 'Regular Activity'
+        END AS PostStatusCategory
+    FROM UserMetrics UM
+    INNER JOIN PostDetails PD ON UM.UserId = PD.OwnerUserId
+    LEFT JOIN PostHistorySummary PHS ON PD.PostId = PHS.PostId
+    LEFT JOIN TagInfluence TI ON PD.FirstTag = TI.TagName
+    WHERE UM.Reputation >= 500
+      AND PD.PostAgeDays < 1095
+      AND (PD.HasSqlOrDatabaseTag = TRUE OR UM.GoldBadges >= 1)
+      AND PD.BodyCharacterCount > 150
+      AND (PD.ClosedDate IS NULL OR PHS.ReopenEvents > 0)
+),
+CommunityOrUnownedPosts AS (
+    SELECT
+        NULL AS UserId,
+        'Community/Unassigned' AS DisplayName,
+        0 AS Reputation,
+        0 AS TotalPostsCreated,
+        0 AS TotalCommentsMade,
+        0 AS GoldBadges,
+        0 AS InfluenceScore,
+        PD.PostId,
+        PD.PostTypeName,
+        PD.PostTitleOrSnippet,
+        PD.PostScore,
+        PD.ViewCount,
+        PD.FavoriteCount,
+        PD.EngagementMetric,
+        PD.PostAgeDays,
+        PD.EditAndRollbackCount AS PostEditCount,
+        PD.WasClosed,
+        PD.HasSqlOrDatabaseTag,
+        COALESCE(PHS.TotalHistoryEvents, 0) AS PostTotalHistoryEvents,
+        COALESCE(PHS.CloseEvents, 0) AS PostCloseEvents,
+        COALESCE(PHS.ReopenEvents, 0) AS PostReopenEvents,
+        COALESCE(TI.AvgTagScore, 0) AS FirstTagAvgScore,
+        0 AS CalculatedUserPostQualityScore,
+        'Community-Driven Post' AS PostStatusCategory
+    FROM PostDetails PD
+    LEFT JOIN PostHistorySummary PHS ON PD.PostId = PHS.PostId
+    LEFT JOIN TagInfluence TI ON PD.FirstTag = TI.TagName
+    WHERE (PD.OwnerUserId IS NULL AND PD.PostScore >= 5)
+       OR (PD.OwnerUserId IS NOT NULL AND PD.LastActivityDate IS NOT NULL AND PD.PostScore >= 10)
+       OR (PD.AcceptedAnswerId IS NULL AND PD.PostTypeId = 1 AND PD.PostAgeDays > 180 AND PD.CommentCount > 5)
+)
+SELECT *
+FROM (
+    SELECT * FROM CombinedUserPostMetrics
+    WHERE CalculatedUserPostQualityScore > 5 OR PostScore > 50
+    UNION ALL
+    SELECT * FROM CommunityOrUnownedPosts
+    WHERE PostScore > 10 OR PostTotalHistoryEvents > 5
+) t
+ORDER BY InfluenceScore DESC NULLS LAST, EngagementMetric DESC, PostId
+LIMIT 2000;

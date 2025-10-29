@@ -1,0 +1,168 @@
+WITH UserStats AS (
+    SELECT
+        u.Id                                          AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown')               AS Location,
+        COUNT(DISTINCT b.Id)                          AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)  AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)  AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)  AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id)                         AS TotalPosts,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1)    AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2)    AS AnswerCount,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id)                    AS AvgPostScore,
+        MAX(p.CreationDate)                                                            AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b   ON b.UserId = u.Id
+    LEFT JOIN Posts  p   ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+),
+
+TopUsers AS (
+    SELECT *, ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS rn
+    FROM UserStats
+    WHERE Reputation > 10000
+),
+
+TagInfo AS (
+    SELECT
+        t.TagName,
+        t.Count                      AS TagUseCount,
+        COALESCE(p.Title, '')        AS TagExcerptTitle,
+        COALESCE(wt.Title, '')       AS TagWikiTitle,
+        CASE WHEN t.IsModeratorOnly = 1 THEN 'ModOnly' ELSE 'Public' END AS Visibility
+    FROM Tags t
+    LEFT JOIN Posts p  ON p.Id = t.ExcerptPostId
+    LEFT JOIN Posts wt ON wt.Id = t.WikiPostId
+),
+
+RecentVotes AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        vt.Name                     AS VoteTypeName,
+        v.CreationDate,
+        v.UserId,
+        u.DisplayName               AS VoterName,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    LEFT JOIN Users u ON u.Id = v.UserId
+    WHERE v.CreationDate >= DATEADD(day, -30, CAST('2024-10-01 12:34:56' AS TIMESTAMP))
+),
+
+PostDetails AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        pt.Name                              AS PostType,
+        u.DisplayName                        AS OwnerName,
+        COALESCE(
+            STRING_AGG(t.TagName, ', ' ORDER BY t.TagName),
+            ''
+        )                                    AS TagList,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL        THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            ELSE 'Open'
+        END                                 AS Status,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id)                        AS CommentCount,
+        (SELECT COUNT(*) FROM PostHistory ph
+         WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10)                        AS CloseVoteCount
+    FROM Posts p
+    JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory phc
+        ON phc.PostId = p.Id AND phc.PostHistoryTypeId = 10
+    LEFT JOIN (
+        SELECT
+            ph.PostId,
+            -- convert something like '<tag1><tag2>' into array by removing leading/trailing <> and splitting on '><'
+            STRING_TO_ARRAY(SUBSTRING(ph.Text FROM 2 FOR LENGTH(ph.Text)-2), '><') AS TagArray
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 3
+    ) th ON th.PostId = p.Id
+    LEFT JOIN LATERAL (
+        SELECT t.TagName
+        FROM UNNEST(th.TagArray) AS ta(tag)
+        JOIN Tags t ON t.TagName = ta.tag
+    ) t ON TRUE
+    GROUP BY
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount,
+        pt.Name, u.DisplayName, p.ClosedDate, p.CommunityOwnedDate
+),
+
+Combined AS (
+    SELECT
+        tu.rn,
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.Location,
+        tu.BadgeCount,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        tu.TotalPosts,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.AvgPostScore,
+        tu.LastPostDate,
+        pd.Id                               AS PostId,
+        pd.Title                            AS PostTitle,
+        pd.PostType,
+        pd.Status,
+        pd.TagList,
+        pd.Score                            AS PostScore,
+        pd.ViewCount,
+        pd.AnswerCount                      AS PostAnswerCount,
+        pd.CommentCount,
+        pd.CloseVoteCount,
+        rv.VoteTypeName,
+        rv.CreationDate                     AS VoteDate,
+        rv.VoterName
+    FROM TopUsers tu
+    LEFT JOIN LATERAL (
+        SELECT *
+        FROM PostDetails pd
+        WHERE pd.OwnerName = tu.DisplayName
+        ORDER BY pd.CreationDate DESC
+        LIMIT 1
+    ) pd ON TRUE
+    LEFT JOIN RecentVotes rv
+        ON rv.PostId = pd.Id AND rv.rn = 1
+    WHERE tu.rn <= 50
+)
+
+SELECT *
+FROM Combined
+WHERE Reputation IS NOT NULL
+ORDER BY Reputation DESC, PostScore DESC
+
+UNION ALL
+
+SELECT
+    NULL::integer AS rn,
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(u.Location,'Unknown'),
+    0 AS BadgeCount,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0 AS TotalPosts,
+    0 AS QuestionCount,
+    0 AS AnswerCount,
+    NULL::numeric AS AvgPostScore,
+    NULL::timestamp AS LastPostDate,
+    NULL::integer, NULL::text, NULL::text, NULL::text, NULL::text, NULL::integer, NULL::integer, NULL::integer, NULL::integer, NULL::integer, NULL::integer, NULL::text, NULL::timestamp, NULL::text
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM TopUsers tu WHERE tu.UserId = u.Id)
+  AND u.Reputation BETWEEN 5000 AND 10000
+ORDER BY Reputation DESC;

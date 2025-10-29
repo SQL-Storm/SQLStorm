@@ -1,0 +1,154 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(b.Date) AS LastBadgeDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                (COUNT(DISTINCT p.Id) * 100.0 / NULLIF((SELECT COUNT(*) FROM Posts), 0))
+            ELSE 0 
+        END AS PostPercentage,
+        CASE 
+            WHEN COUNT(DISTINCT b.Id) > 0 THEN 
+                AVG(CAST(b.Class AS DECIMAL)) 
+            ELSE NULL 
+        END AS AvgBadgeClass
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        uas.*,
+        ROW_NUMBER() OVER (ORDER BY uas.TotalPosts DESC, uas.Reputation DESC) AS PostRank,
+        DENSE_RANK() OVER (ORDER BY uas.AvgBadgeClass ASC, uas.TotalBadges DESC) AS BadgeRank,
+        NTILE(10) OVER (ORDER BY uas.Reputation DESC) AS ReputationDecile
+    FROM UserActivityStats uas
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+        (CAST(COALESCE(p.ClosedDate, p.LastActivityDate, p.CreationDate) AS TIMESTAMP)
+               - CAST(p.CreationDate AS TIMESTAMP)) AS _post_interval,
+        EXTRACT(EPOCH FROM (CAST(COALESCE(p.ClosedDate, p.LastActivityDate, p.CreationDate) AS TIMESTAMP)
+               - CAST(p.CreationDate AS TIMESTAMP)))/86400 AS PostDurationDays,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score >= 10 THEN 'HighValueQuestion'
+            WHEN p.PostTypeId = 1 AND p.Score < 10 THEN 'LowValueQuestion'
+            WHEN p.PostTypeId = 2 AND p.Score >= 5 THEN 'HighValueAnswer'
+            WHEN p.PostTypeId = 2 AND p.Score < 5 THEN 'LowValueAnswer'
+            ELSE 'Other'
+        END AS PostValueCategory,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountActual,
+        COALESCE(p.Tags, '') AS Tags,
+        STRING_AGG(TRIM(BOTH '<>' FROM p.Tags), ',') AS AllTagList
+    FROM Posts p
+    WHERE p.CreationDate >= DATE '2015-01-01'
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, 
+             p.CreationDate, p.OwnerUserId, p.PostTypeId, p.AcceptedAnswerId, 
+             p.ClosedDate, p.CommunityOwnedDate, p.LastActivityDate, p.Tags
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > (SELECT AVG(t2.Count) FROM Tags t2) THEN 'Popular'
+            WHEN t.Count < (SELECT AVG(t2.Count) FROM Tags t2) THEN 'LessPopular'
+            ELSE 'Average'
+        END AS TagPopularity,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) - t.Count AS PopularityDifference,
+        AVG(t.Count) OVER (ORDER BY t.Count ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS MovingAverageCount
+    FROM Tags t
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.TotalPosts,
+        ru.TotalComments,
+        ru.TotalBadges,
+        ru.PostPercentage,
+        ru.AvgBadgeClass,
+        ru.PostRank,
+        ru.BadgeRank,
+        ru.ReputationDecile,
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 1 AND p.Score >= 100) THEN 'TopQuestionCreator'
+            WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 2 AND p.Score >= 50) THEN 'TopAnswerer'
+            WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = ru.UserId AND b.Class = 1) THEN 'GoldBadgeHolder'
+            ELSE 'RegularUser'
+        END AS UserCategory,
+        CASE 
+            WHEN (ru.TotalBadges > 50 AND ru.AvgBadgeClass < 2.0) THEN 'Achiever'
+            WHEN (ru.TotalPosts > 1000 AND ru.Reputation > 100000) THEN 'Veteran'
+            WHEN (ru.TotalComments > 100 AND ru.TotalPosts > 50) THEN 'Engaged'
+            ELSE 'Standard'
+        END AS CommunityRole
+    FROM RankedUsers ru
+)
+SELECT 
+    COUNT(*) AS TotalRecords,
+    COUNT(DISTINCT CASE WHEN ca.UserCategory = 'TopQuestionCreator' THEN ca.UserId END) AS TopQuestionCreators,
+    COUNT(DISTINCT CASE WHEN ca.UserCategory = 'TopAnswerer' THEN ca.UserId END) AS TopAnswerers,
+    COUNT(DISTINCT CASE WHEN ca.UserCategory = 'GoldBadgeHolder' THEN ca.UserId END) AS GoldBadgeHolders,
+    COUNT(DISTINCT CASE WHEN ca.CommunityRole = 'Veteran' THEN ca.UserId END) AS VeteranUsers,
+    ROUND(AVG(CAST(ca.Reputation AS DECIMAL)), 2) AS AvgReputation,
+    SUM(CASE WHEN pa.IsClosed = 1 THEN 1 ELSE 0 END) AS ClosedPosts,
+    AVG(pa.Score) AS AvgPostScore,
+    SUM(pa.AnswerCount) AS TotalAnswers,
+    COUNT(*) AS TotalPosts,
+    ROUND(AVG(CAST(pa.ViewCount AS DECIMAL)), 2) AS AvgViewCount,
+    COUNT(DISTINCT ta.TagName) AS TotalTags,
+    AVG(ta.TagCount) AS AvgTagCount,
+    STRING_AGG(DISTINCT CASE WHEN ta.TagPopularity = 'Popular' THEN ta.TagName END, ', ') AS PopularTags,
+    COUNT(DISTINCT CASE WHEN pa.PostValueCategory LIKE '%HighValue%' THEN pa.PostId END) AS HighValuePosts,
+    COUNT(DISTINCT CASE WHEN pa.PostValueCategory LIKE '%LowValue%' THEN pa.PostId END) AS LowValuePosts,
+    STRING_AGG(DISTINCT ca.DisplayName, ', ') AS UserNames,
+    STRING_AGG(DISTINCT pa.Title, ', ') AS PostTitles,
+    CASE 
+        WHEN COUNT(*) > 0 THEN 
+            (COUNT(DISTINCT CASE WHEN pa.IsClosed = 1 THEN pa.PostId END) * 100.0 / COUNT(*))
+        ELSE 0 
+    END AS ClosedPercentage,
+    MAX(EXTRACT(EPOCH FROM (CAST(COALESCE(pa.CreationDate, pa.CreationDate) AS TIMESTAMP) 
+        - CAST(pa.CreationDate AS TIMESTAMP)))/86400) AS MaxPostDuration,
+    MIN(EXTRACT(EPOCH FROM (CAST(COALESCE(pa.CreationDate, pa.CreationDate) AS TIMESTAMP) 
+        - CAST(pa.CreationDate AS TIMESTAMP)))/86400) AS MinPostDuration,
+    ROUND(AVG(CAST(pa.PostDurationDays AS DECIMAL)), 2) AS AvgPostDuration,
+    STRING_AGG(DISTINCT TRIM(BOTH '<>' FROM pa.Tags), ',') AS AllTagsList,
+    COUNT(DISTINCT CASE WHEN ca.ReputationDecile = 1 THEN ca.UserId END) AS TopDecileUsers,
+    COUNT(DISTINCT CASE WHEN ca.ReputationDecile = 10 THEN ca.UserId END) AS BottomDecileUsers,
+    (SELECT COUNT(*) FROM Posts WHERE LastActivityDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY)) AS RecentActivityCount,
+    (SELECT AVG(CAST(t.Count AS DECIMAL)) FROM Tags t WHERE t.Count > 0) AS OverallTagAverage
+FROM ComplexUserAnalysis ca
+LEFT JOIN PostAnalysis pa ON ca.UserId = pa.OwnerUserId
+LEFT JOIN TagAnalysis ta ON pa.Tags LIKE '%' || ta.TagName || '%'
+WHERE (ca.UserId IS NOT NULL OR pa.PostId IS NOT NULL OR ta.TagName IS NOT NULL)
+GROUP BY ca.UserId, ca.DisplayName, ca.Reputation, ca.TotalPosts, ca.TotalComments, ca.TotalBadges, ca.PostPercentage, ca.AvgBadgeClass, ca.PostRank, ca.BadgeRank, ca.ReputationDecile, ca.UserCategory, ca.CommunityRole, pa.PostId, pa.Title, pa.Score, pa.ViewCount, pa.AnswerCount, pa.CommentCount, pa.CreationDate, pa.OwnerUserId, pa.PostTypeId, pa.HasAcceptedAnswer, pa.IsClosed, pa.IsCommunityOwned, pa.PostDurationDays, pa.PostValueCategory, pa.CommentCountActual, pa.Tags, pa.AllTagList, ta.TagName, ta.TagCount, ta.ExcerptPostId, ta.WikiPostId, ta.TagPopularity, ta.TagRank, ta.PopularityDifference, ta.MovingAverageCount
+HAVING COUNT(*) > 0
+ORDER BY ca.Reputation DESC NULLS LAST, pa.Score DESC NULLS LAST;

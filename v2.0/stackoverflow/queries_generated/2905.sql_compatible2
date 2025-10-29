@@ -1,0 +1,143 @@
+WITH QuestionStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        COALESCE(p.Score, 0) AS Score,
+        array_agg(DISTINCT pt.Name) FILTER (WHERE pt.Name IS NOT NULL) AS PostHistoryTypesEdited,
+        max(ph.CreationDate) AS LastEditDate,
+        sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        count(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS OwnerGoldBadges,
+        count(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS OwnerSilverBadges,
+        count(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS OwnerBronzeBadges,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS PostState
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN PostHistoryTypes pt ON ph.PostHistoryTypeId = pt.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Badges b ON b.UserId = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.CreationDate, p.OwnerUserId, u.DisplayName, p.AnswerCount, p.ViewCount, p.Score, p.ClosedDate
+), AnswerInfo AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Score,
+        a.Body,
+        a.LastActivityDate,
+        u.DisplayName AS AnswererName,
+        row_number() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+), TopAnswers AS (
+    SELECT
+        AnswerId,
+        QuestionId,
+        OwnerUserId,
+        CreationDate,
+        Score,
+        Body,
+        LastActivityDate,
+        AnswererName,
+        AnswerRank
+    FROM AnswerInfo
+    WHERE AnswerRank <= 3
+), DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        u.DisplayName AS RelOwnerName,
+        p.Score AS RelScore,
+        p.CreationDate AS RelCreationDate
+    FROM PostLinks pl
+    JOIN Posts p ON pl.RelatedPostId = p.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE pl.LinkTypeId = 3
+), UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        count(DISTINCT c.Id) AS CommentsMade,
+        count(DISTINCT b.Id) AS BadgesEarned,
+        rank() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING count(DISTINCT p.Id) > 10 OR count(DISTINCT c.Id) > 20
+), QuestionCloseReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        count(*) AS CloseCount
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, crt.Name
+), RecursiveRelatedPosts AS (
+    SELECT p.Id AS RootQuestionId, pl.RelatedPostId AS RelatedPostId, 1 AS Depth
+    FROM Posts p
+    JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 1
+    WHERE p.PostTypeId = 1
+    UNION ALL
+    SELECT rr.RootQuestionId, pl.RelatedPostId, rr.Depth + 1
+    FROM RecursiveRelatedPosts rr
+    JOIN PostLinks pl ON pl.PostId = rr.RelatedPostId AND pl.LinkTypeId = 1
+    WHERE rr.Depth < 3
+)
+SELECT
+    qs.QuestionId,
+    qs.Title,
+    qs.CreationDate,
+    qs.OwnerName,
+    qs.AnswerCount,
+    qs.ViewCount,
+    qs.Score,
+    qs.UpVotes,
+    qs.DownVotes,
+    qs.OwnerGoldBadges,
+    qs.OwnerSilverBadges,
+    qs.OwnerBronzeBadges,
+    qs.PostState,
+    COALESCE(qcr.CloseReasonName, 'Not Closed') AS CloseReason,
+    ta.AnswerId,
+    ta.Score AS AnswerScore,
+    ta.AnswererName,
+    substring(regexp_replace(ta.Body, '<[^>]+>', '', 'g') FROM 1 FOR 100) AS AnswerSnippet,
+    ul.RelatedPostId AS DuplicateOf,
+    ul.RelOwnerName AS DuplicateOwner,
+    ur.UserId AS TopUserId,
+    ur.DisplayName AS TopUserName,
+    ur.Reputation,
+    ur.QuestionsAsked,
+    ur.AnswersGiven,
+    ur.CommentsMade,
+    ur.BadgesEarned,
+    rr.Depth AS RelatedDepth
+FROM QuestionStats qs
+LEFT JOIN QuestionCloseReasons qcr ON qcr.PostId = qs.QuestionId
+LEFT JOIN TopAnswers ta ON ta.QuestionId = qs.QuestionId AND ta.AnswerRank = 1
+LEFT JOIN DuplicateLinks ul ON ul.PostId = qs.QuestionId
+LEFT JOIN UserActivity ur ON ur.UserId = qs.OwnerUserId
+LEFT JOIN RecursiveRelatedPosts rr ON rr.RootQuestionId = qs.QuestionId
+WHERE qs.ViewCount > 1000
+  AND (qs.Score > 5 OR qs.PostState = 'Closed')
+  AND (ta.Score IS NULL OR ta.Score > 0)
+ORDER BY qs.ViewCount DESC, qs.Score DESC, ta.Score DESC
+LIMIT 50;

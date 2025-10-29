@@ -1,0 +1,42 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  COUNT(DISTINCT p.Id) AS PostCount,
+  AVG(p.Score) AS AvgPostScore,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN COALESCE(p.ViewCount, 0) ELSE 0 END) AS TotalQuestionViews,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN COALESCE(p.ViewCount, 0) ELSE 0 END) AS TotalAnswerViews,
+  MAX(p.LastActivityDate) AS LastActivity,
+  STRING_AGG(DISTINCT tt.Name, ',') FILTER (WHERE p.PostTypeId = 1) AS TopTags,
+  COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvotesReceived,
+  COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownvotesReceived,
+  COUNT(DISTINCT CASE WHEN v.VoteTypeId = 16 THEN v.Id END) AS ModeratorReviews,
+  COUNT(DISTINCT b.Id) AS BadgesEarned
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.UserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN (
+    SELECT p2.Id AS PostId, trim(tag_raw) AS tag
+    FROM Posts p2
+    CROSS JOIN LATERAL (
+      SELECT regexp_split_to_table(p2.Tags, '>\s*<|^<|>\s*$') AS tag_raw
+    ) rt
+  ) t ON t.PostId = p.Id
+  LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+  LEFT JOIN PostHistoryTypes h ON h.Id = p.Id
+  LEFT JOIN Tags tt ON tt.Id = (
+    SELECT Id FROM Tags WHERE Name = t.tag LIMIT 1
+  )
+WHERE
+  u.AccountId IS NOT NULL
+  AND u.Reputation > 0
+GROUP BY
+  u.Id,
+  u.DisplayName
+HAVING
+  COUNT(p.Id) > 0
+ORDER BY
+  AvgPostScore DESC,
+  PostCount DESC
+LIMIT 100;

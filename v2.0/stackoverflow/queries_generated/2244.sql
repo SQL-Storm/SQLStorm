@@ -1,0 +1,149 @@
+-- {"query": "2244.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1471} 
+
+WITH RecursiveTagDepth AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        1 AS Depth,
+        COALESCE(p.ViewCount, 0) AS Views
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId AND p.PostTypeId = 1
+    WHERE t.Id IS NOT NULL
+    UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        r.Depth + 1,
+        r.Views + COALESCE(p.ViewCount, 0)
+    FROM Tags t
+    JOIN RecursiveTagDepth r ON t.WikiPostId = r.Id
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId AND p.PostTypeId = 1
+    WHERE r.Depth < 3
+),
+UserBadgeAgg AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(COALESCE(p.Score,0)) AS TotalPostScore,
+        AVG(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+RecentCloseReasons AS (
+    SELECT
+        ph.PostId,
+        c.Name AS CloseReasonName,
+        ph.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    JOIN CloseReasonTypes c ON CAST(ph.Comment AS SMALLINT) = c.Id
+    WHERE ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^\d+$' -- close reason ids are numeric strings
+),
+TopVotedPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.PostTypeId,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankWithinType
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+AnswerStats AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        COUNT(*) AS TotalAnswers,
+        AVG(COALESCE(p.Score, 0)) AS AvgAnswerScore,
+        MAX(COALESCE(p.Score, 0)) AS MaxAnswerScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCount
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        COUNT(*) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativePosts,
+        SUM(COALESCE(p.Score, 0)) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate IS NOT NULL
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.TotalPostScore,
+    COALESCE(u.AvgQuestionScore,0) AS AvgQuestionScore,
+    COALESCE(u.AvgAnswerScore,0) AS AvgAnswerScore,
+    u.LastPostDate,
+    a.TotalAnswers,
+    a.AvgAnswerScore,
+    a.MaxAnswerScore,
+    a.UpVotesCount,
+    a.DownVotesCount,
+    t.Id AS TagId,
+    t.TagName,
+    t.Depth AS TagDepth,
+    t.Views AS TagAggregateViews,
+    rc.CloseReasonName,
+    tp.Title AS TopPostTitle,
+    tp.Score AS TopPostScore,
+    tp.ViewCount AS TopPostViews,
+    ua.PostId AS LatestUserPostId,
+    ua.PostTypeId AS LatestUserPostType,
+    ua.CumulativePosts,
+    ua.CumulativeScore,
+    CASE 
+        WHEN u.LastPostDate IS NULL THEN 'No posts'
+        WHEN u.LastPostDate > NOW() - INTERVAL '30 day' THEN 'Active in last 30 days'
+        ELSE 'Inactive'
+    END AS UserActivityStatus,
+    CASE
+        WHEN tp.PostTypeId = 1 AND a.TotalAnswers > 0 THEN ROUND(a.AvgAnswerScore::numeric,2)
+        ELSE NULL
+    END AS AvgAnswerScoreForTopQuestions
+FROM UserBadgeAgg u
+LEFT JOIN AnswerStats a ON a.QuestionId = (
+    SELECT p.Id FROM Posts p
+    WHERE p.OwnerUserId = u.UserId
+      AND p.PostTypeId = 1
+    ORDER BY p.Score DESC NULLS LAST
+    LIMIT 1
+)
+LEFT JOIN RecursiveTagDepth t ON POSITION(CONCAT('<', t.TagName, '>') IN COALESCE(
+    (SELECT p.Tags FROM Posts p WHERE p.OwnerUserId = u.UserId AND p.PostTypeId = 1 ORDER BY p.CreationDate DESC LIMIT 1),
+    ''
+)) > 0
+LEFT JOIN RecentCloseReasons rc ON rc.PostId = (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.UserId AND p.PostTypeId = 1 ORDER BY p.CreationDate DESC LIMIT 1
+) AND rc.rn = 1
+LEFT JOIN TopVotedPosts tp ON tp.OwnerUserId = u.UserId AND tp.RankWithinType = 1
+LEFT JOIN LATERAL (
+    SELECT ua.PostId, ua.PostTypeId, ua.CumulativePosts, ua.CumulativeScore
+    FROM UserActivityWindow ua
+    WHERE ua.UserId = u.UserId
+    ORDER BY ua.CreationDate DESC
+    LIMIT 1
+) ua ON TRUE
+WHERE u.TotalPostScore IS NOT NULL
+ORDER BY u.TotalPostScore DESC, u.GoldBadges DESC, u.SilverBadges DESC
+LIMIT 100;

@@ -1,0 +1,180 @@
+-- {"query": "2654.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1636} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        t.ExcerptPostId, 
+        t.WikiPostId, 
+        1 AS Level,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT 
+        child.Id, 
+        child.TagName, 
+        child.ExcerptPostId, 
+        child.WikiPostId,
+        parent.Level + 1 AS Level,
+        parent.TagPath || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy parent ON child.Id <> parent.Id AND child.TagName LIKE parent.TagName || '%'
+    WHERE child.IsModeratorOnly = 0 AND child.IsRequired = 0 AND array_length(parent.TagPath,1) < 3
+),
+QuestionAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.OwnerUserId,
+        q.Tags,
+        a.Id AS AnswerId,
+        a.CreationDate AS AnswerCreation,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+AnswerBadges AS (
+    SELECT 
+        a.AnswerId,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM QuestionAnswers a
+    LEFT JOIN Badges b ON b.UserId = a.AnswerOwnerUserId
+    GROUP BY a.AnswerId
+),
+PostCommentsCount AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(c.Id) AS CommentCount,
+        SUM(COALESCE(c.Score,0)) AS CommentScoreSum,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    GROUP BY p.Id
+),
+AggregatedVotes AS (
+    SELECT
+        p.Id AS PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        COUNT(DISTINCT v.UserId) FILTER (WHERE v.UserId IS NOT NULL) AS UniqueVoters
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id
+),
+FinalSelection AS (
+    SELECT 
+        q.QuestionId,
+        q.Title,
+        q.QuestionCreation,
+        q.QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        COALESCE(pb.GoldBadges,0) + COALESCE(pb.SilverBadges,0)/10.0 + COALESCE(pb.BronzeBadges,0)/100.0 AS BadgeWeightedScore,
+        q.AnswerId,
+        q.AnswerCreation,
+        q.AnswerScore,
+        ab.GoldBadges AS AnswererGoldBadges,
+        ab.SilverBadges AS AnswererSilverBadges,
+        ab.BronzeBadges AS AnswererBronzeBadges,
+        pc.CommentCount,
+        pc.CommentScoreSum,
+        av.UpVotes,
+        av.DownVotes,
+        av.UniqueVoters,
+        CASE 
+            WHEN q.QuestionScore = 0 THEN NULL
+            ELSE ROUND((q.AnswerScore::numeric / NULLIF(q.QuestionScore,0))*100, 2)
+        END AS AnswerToQuestionScorePercent,
+        ROW_NUMBER() OVER (PARTITION BY q.QuestionId ORDER BY q.AnswerScore DESC, q.AnswerCreation) AS AnswerRank,
+        STRING_AGG(DISTINCT ut.Name, ', ') FILTER (WHERE ut.Name IS NOT NULL) OVER (PARTITION BY q.QuestionId) AS PostHistoryTypesInQ,
+        LAG(q.AnswerScore) OVER (PARTITION BY q.QuestionId ORDER BY q.AnswerCreation) AS PrevAnswerScore,
+        LEAD(q.AnswerScore) OVER (PARTITION BY q.QuestionId ORDER BY q.AnswerCreation) AS NextAnswerScore,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = q.QuestionId AND pl.LinkTypeId = 3) AS DuplicateLinkCount,
+        COALESCE(q.LastActivityDate, q.QuestionCreation) AS LastActivityDate
+    FROM QuestionAnswers q
+    LEFT JOIN AnswerBadges ab ON ab.AnswerId = q.AnswerId
+    LEFT JOIN PostCommentsCount pc ON pc.PostId = COALESCE(q.AnswerId, q.QuestionId)
+    LEFT JOIN AggregatedVotes av ON av.PostId = COALESCE(q.AnswerId, q.QuestionId)
+    LEFT JOIN PostHistoryTypes ut ON EXISTS (
+        SELECT 1 FROM PostHistory ph WHERE ph.PostId = q.QuestionId AND ph.PostHistoryTypeId = ut.Id
+    )
+    LEFT JOIN Badges pb ON pb.UserId = q.OwnerUserId AND pb.Class = 1
+    WHERE q.AnswerRank <= 3
+)
+SELECT 
+    fs.QuestionId,
+    fs.Title,
+    fs.QuestionCreation,
+    fs.QuestionScore,
+    fs.ViewCount,
+    fs.Tags,
+    fs.BadgeWeightedScore,
+    fs.AnswerId,
+    fs.AnswerCreation,
+    fs.AnswerScore,
+    fs.AnswererGoldBadges,
+    fs.AnswererSilverBadges,
+    fs.AnswererBronzeBadges,
+    fs.CommentCount,
+    fs.CommentScoreSum,
+    fs.UpVotes,
+    fs.DownVotes,
+    fs.UniqueVoters,
+    fs.AnswerToQuestionScorePercent,
+    fs.AnswerRank,
+    fs.PostHistoryTypesInQ,
+    fs.PrevAnswerScore,
+    fs.NextAnswerScore,
+    fs.DuplicateLinkCount,
+    fs.LastActivityDate
+FROM FinalSelection fs
+WHERE fs.QuestionScore > 10
+  AND fs.AnswerScore IS NOT NULL
+  AND (
+      (fs.AnswerScore > fs.PrevAnswerScore OR fs.PrevAnswerScore IS NULL)
+      OR (fs.NextAnswerScore IS NOT NULL AND fs.AnswerScore > fs.NextAnswerScore)
+  )
+ORDER BY fs.QuestionScore DESC, fs.AnswerScore DESC, fs.LastActivityDate DESC
+LIMIT 100
+UNION
+SELECT 
+    u.Id AS QuestionId,
+    u.DisplayName AS Title,
+    u.CreationDate AS QuestionCreation,
+    u.Reputation AS QuestionScore,
+    NULL AS ViewCount,
+    NULL AS Tags,
+    NULL AS BadgeWeightedScore,
+    NULL AS AnswerId,
+    NULL AS AnswerCreation,
+    NULL AS AnswerScore,
+    NULL AS AnswererGoldBadges,
+    NULL AS AnswererSilverBadges,
+    NULL AS AnswererBronzeBadges,
+    NULL AS CommentCount,
+    NULL AS CommentScoreSum,
+    NULL AS UpVotes,
+    NULL AS DownVotes,
+    NULL AS UniqueVoters,
+    NULL AS AnswerToQuestionScorePercent,
+    NULL AS AnswerRank,
+    NULL AS PostHistoryTypesInQ,
+    NULL AS PrevAnswerScore,
+    NULL AS NextAnswerScore,
+    NULL AS DuplicateLinkCount,
+    u.LastAccessDate AS LastActivityDate
+FROM Users u
+WHERE u.Reputation > 5000
+ORDER BY LastActivityDate DESC
+LIMIT 50;

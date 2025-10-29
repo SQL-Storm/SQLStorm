@@ -1,0 +1,170 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        CAST(ARRAY[t.TagName] AS VARCHAR[]) AS Path,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        rth.Path || t2.TagName,
+        rth.Level + 1
+    FROM Tags t2
+    JOIN Tags t1 ON t2.Count < t1.Count
+    JOIN RecursiveTagHierarchy rth ON t1.TagName = rth.TagName
+    WHERE rth.Level < 3
+),
+TopUsersByScore AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        COUNT(p.Id) AS PostCount,
+        STRING_AGG(DISTINCT b.Name || '(' || CASE b.Class WHEN 1 THEN 'Gold' WHEN 2 THEN 'Silver' ELSE 'Bronze' END || ')', ', ') AS Badges,
+        RANK() OVER (ORDER BY SUM(COALESCE(p.Score, 0)) DESC, u.Reputation DESC) AS ScoreRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(p.Id) > 10
+),
+PostActivityDetails AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.OwnerUserId,
+        COALESCE(u.DisplayName, 'Anonymous') AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankWithinType,
+        COUNT(c.Id) AS CommentCount,
+        MAX(ph.CreationDate) AS LastEditDate,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            ELSE 'Open'
+        END AS PostStatus,
+        STRING_AGG(DISTINCT lt.Name, ', ') FILTER (WHERE pl.LinkTypeId = 1) AS LinkedPosts,
+        STRING_AGG(DISTINCT lt.Name, ', ') FILTER (WHERE pl.LinkTypeId = 3) AS DuplicatePosts
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE p.PostTypeId IN (1,2)
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.AcceptedAnswerId, p.OwnerUserId, u.DisplayName, p.ClosedDate, p.PostTypeId
+),
+CorrelatedAnswersStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        (SELECT COUNT(DISTINCT v.UserId) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2) AS UpVotesOnQuestion,
+        (SELECT COUNT(DISTINCT v.UserId) FROM Votes v WHERE v.PostId IN (SELECT Id FROM Posts WHERE ParentId = q.Id) AND v.VoteTypeId = 2) AS UpVotesOnAnswers
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+),
+CombinedPostsAndUsers AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        pad.AnswerCount,
+        pad.AvgAnswerScore,
+        pad.MaxAnswerScore,
+        tusr.DisplayName AS OwnerDisplayName,
+        tusr.Reputation AS OwnerReputation,
+        tusr.TotalPostScore AS OwnerTotalPostScore,
+        (p.ClosedDate IS NOT NULL) AS IsClosed,
+        p.CreationDate,
+        CASE 
+            WHEN p.ViewCount > 10000 THEN 'HighView'
+            WHEN p.ViewCount BETWEEN 1000 AND 10000 THEN 'MediumView'
+            ELSE 'LowView'
+        END AS ViewCategory,
+        CASE 
+            WHEN p.Score >= 10 THEN 'Hot'
+            WHEN p.Score BETWEEN 1 AND 9 THEN 'Warm'
+            ELSE 'Cold'
+        END AS ScoreCategory
+    FROM Posts p
+    LEFT JOIN CorrelatedAnswersStats pad ON pad.QuestionId = p.Id
+    LEFT JOIN TopUsersByScore tusr ON tusr.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+)
+SELECT DISTINCT
+    cps.PostId,
+    cps.Title,
+    cps.Tags,
+    cps.Score,
+    cps.ViewCount,
+    cps.AnswerCount,
+    cps.AvgAnswerScore,
+    cps.MaxAnswerScore,
+    cps.OwnerDisplayName,
+    cps.OwnerReputation,
+    cps.OwnerTotalPostScore,
+    cps.IsClosed,
+    cps.CreationDate,
+    cps.ViewCategory,
+    cps.ScoreCategory,
+    STRING_AGG(DISTINCT rth.TagName, ', ') AS RecursiveTagPath,
+    CASE
+        WHEN cps.ScoreCategory = 'Hot' AND cps.IsClosed = FALSE THEN 'Promote'
+        WHEN cps.IsClosed = TRUE THEN NULL
+        ELSE 'Review'
+    END AS ActionRecommendation,
+    CHAR_LENGTH(cps.Title) + COALESCE((SELECT AVG(CHAR_LENGTH(Body)) FROM Posts WHERE ParentId = cps.PostId), 0) AS TitleAndBodyLengthMetric,
+    COALESCE(TopComments.CommentSnippet, 'No comments') AS TopCommentSnippet
+FROM CombinedPostsAndUsers cps
+LEFT JOIN RecursiveTagHierarchy rth ON POSITION(rth.TagName IN cps.Tags) > 0
+LEFT JOIN LATERAL (
+    SELECT SUBSTRING(c.Text FROM 1 FOR 100) AS CommentSnippet
+    FROM Comments c
+    WHERE c.PostId = cps.PostId
+    ORDER BY c.Score DESC, c.CreationDate DESC
+    LIMIT 1
+) TopComments ON TRUE
+GROUP BY
+    cps.PostId,
+    cps.Title,
+    cps.Tags,
+    cps.Score,
+    cps.ViewCount,
+    cps.AnswerCount,
+    cps.AvgAnswerScore,
+    cps.MaxAnswerScore,
+    cps.OwnerDisplayName,
+    cps.OwnerReputation,
+    cps.OwnerTotalPostScore,
+    cps.IsClosed,
+    cps.CreationDate,
+    cps.ViewCategory,
+    cps.ScoreCategory,
+    CASE
+        WHEN cps.ScoreCategory = 'Hot' AND cps.IsClosed = FALSE THEN 'Promote'
+        WHEN cps.IsClosed = TRUE THEN NULL
+        ELSE 'Review'
+    END,
+    CHAR_LENGTH(cps.Title) + COALESCE((SELECT AVG(CHAR_LENGTH(Body)) FROM Posts WHERE ParentId = cps.PostId), 0),
+    TopComments.CommentSnippet
+ORDER BY cps.Score DESC, cps.ViewCount DESC
+LIMIT 50;

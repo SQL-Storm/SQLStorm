@@ -1,0 +1,134 @@
+-- {"query": "3545.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2431} 
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Views,0) + COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0)               AS ActivityScore,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1)               AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2)               AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3)               AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1)    AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2)    AS AnswerCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id)                           AS CommentCount,
+        (SELECT
+             SUM(vote)                                                     -- + for up‑votes, – for down‑votes
+         FROM (
+               SELECT COUNT(*) AS vote FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2
+               UNION ALL
+               SELECT -COUNT(*)       FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3
+         ) s)                                                            AS VoteBalance
+    FROM Users u
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.FavoriteCount,0)                                        AS Favorites,
+        CASE
+            WHEN p.Tags IS NOT NULL
+            THEN array_to_string(
+                     ARRAY(
+                         SELECT trim(both '<>' FROM tag)
+                         FROM regexp_split_to_table(p.Tags,'><') AS tag
+                     ), ',')
+            ELSE NULL
+        END                                                               AS TagList,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1                              -- only questions
+      AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '180 days'
+)
+
+/* -------------------------- Main query: top and bottom users -------------------------- */
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.ActivityScore,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.CommentCount,
+    us.VoteBalance,
+    COALESCE(rq.Title,'No recent question')                               AS RecentQuestionTitle,
+    rq.CreationDate                                                       AS RecentQuestionDate,
+    rq.TagList                                                            AS RecentQuestionTags,
+    STRING_AGG(DISTINCT tt.TagName, ', ') FILTER (WHERE tt.rn <= 5)       AS Top5PopularTags,
+    COUNT(DISTINCT pl.RelatedPostId)                                      AS DuplicateCount
+FROM UserStats us
+LEFT JOIN RecentQuestions rq
+       ON rq.OwnerUserId = us.Id AND rq.rn = 1
+LEFT JOIN PostLinks pl
+       ON pl.PostId = rq.Id AND pl.LinkTypeId = 3                       -- duplicate links
+LEFT JOIN LATERAL (
+    SELECT t.TagName, t.rn
+    FROM TopTags t
+    WHERE rq.TagList IS NOT NULL
+      AND POSITION(t.TagName IN rq.TagList) > 0
+    ORDER BY t.rn
+    LIMIT 5
+) tt ON TRUE
+GROUP BY
+    us.Id, us.DisplayName, us.Reputation, us.ActivityScore,
+    us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+    us.QuestionCount, us.AnswerCount, us.CommentCount, us.VoteBalance,
+    rq.Title, rq.CreationDate, rq.TagList
+HAVING us.Reputation > 5000
+ORDER BY us.ActivityScore DESC
+LIMIT 25
+
+UNION ALL
+
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.ActivityScore,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.CommentCount,
+    us.VoteBalance,
+    COALESCE(rq.Title,'No recent question')                               AS RecentQuestionTitle,
+    rq.CreationDate                                                       AS RecentQuestionDate,
+    rq.TagList                                                            AS RecentQuestionTags,
+    STRING_AGG(DISTINCT tt.TagName, ', ') FILTER (WHERE tt.rn <= 5)       AS Top5PopularTags,
+    COUNT(DISTINCT pl.RelatedPostId)                                      AS DuplicateCount
+FROM UserStats us
+LEFT JOIN RecentQuestions rq
+       ON rq.OwnerUserId = us.Id AND rq.rn = 1
+LEFT JOIN PostLinks pl
+       ON pl.PostId = rq.Id AND pl.LinkTypeId = 3
+LEFT JOIN LATERAL (
+    SELECT t.TagName, t.rn
+    FROM TopTags t
+    WHERE rq.TagList IS NOT NULL
+      AND POSITION(t.TagName IN rq.TagList) > 0
+    ORDER BY t.rn
+    LIMIT 5
+) tt ON TRUE
+GROUP BY
+    us.Id, us.DisplayName, us.Reputation, us.ActivityScore,
+    us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+    us.QuestionCount, us.AnswerCount, us.CommentCount, us.VoteBalance,
+    rq.Title, rq.CreationDate, rq.TagList
+HAVING us.Reputation <= 100
+ORDER BY us.ActivityScore ASC
+LIMIT 25;

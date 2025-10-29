@@ -1,0 +1,123 @@
+WITH RECURSIVE RecursiveUserBadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Class,
+        COUNT(b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Badges b
+      ON b.UserId = u.Id
+     AND b.Date <= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName, b.Class
+
+    UNION ALL
+
+    SELECT
+        r.UserId,
+        r.DisplayName,
+        CASE WHEN r.Class IS NULL THEN 0 ELSE r.Class + 1 END AS Class,
+        r.BadgeCount
+    FROM RecursiveUserBadgeSummary r
+    WHERE r.Class < 3 AND r.Class IS NOT NULL
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(p.ViewCount) FILTER (WHERE p.PostTypeId = 1 AND p.ViewCount IS NOT NULL) AS AvgQuestionViews,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM '<([^>]+)>'), ',' ORDER BY SUBSTRING(p.Tags FROM '<([^>]+)>')) AS TagList
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+LatestClosedQuestions AS (
+    SELECT
+        ph.PostId,
+        CAST(ph.Comment AS integer) AS CloseReasonId,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer)
+    WHERE ph.PostHistoryTypeId = 10
+),
+QuestionAnswerWindow AS (
+    SELECT
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank,
+        COUNT(*) OVER (PARTITION BY p.ParentId) AS TotalAnswers
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+UserLastActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        GREATEST(u.LastAccessDate, COALESCE(MAX(p.LastActivityDate), TIMESTAMP '1900-01-01')) AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.LastAccessDate
+)
+SELECT DISTINCT
+    u.DisplayName,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.TotalScore,
+    ups.AvgQuestionViews,
+    CASE 
+        WHEN rbs.Class = 1 THEN 'Gold'
+        WHEN rbs.Class = 2 THEN 'Silver'
+        WHEN rbs.Class = 3 THEN 'Bronze'
+        ELSE 'None'
+    END AS BadgeClass,
+    COALESCE(lcq.CloseReason, 'Not Closed') AS LastCloseReason,
+    lcq.CloseDate,
+    qa.AnswerRank,
+    qa.TotalAnswers,
+    qa.Score AS TopAnswerScore,
+    ulast.LastActivity,
+    STRING_AGG(UPPER(TRIM(tg.trimmed_tag)), ',' ORDER BY tg.trimmed_tag DESC) AS UpperTagsReverse
+FROM Users u
+LEFT JOIN UserPostStats ups ON ups.UserId = u.Id
+LEFT JOIN RecursiveUserBadgeSummary rbs ON rbs.UserId = u.Id
+LEFT JOIN LatestClosedQuestions lcq ON lcq.PostId = (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 ORDER BY p.CreationDate DESC LIMIT 1
+)
+LEFT JOIN QuestionAnswerWindow qa ON qa.QuestionId = (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 ORDER BY p.CreationDate DESC LIMIT 1
+) AND qa.AnswerRank = 1
+LEFT JOIN UserLastActivity ulast ON ulast.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT TRIM(tag) AS trimmed_tag
+    FROM UNNEST(STRING_TO_ARRAY(COALESCE(ups.TagList, ''), ',')) AS t(tag)
+    WHERE tag IS NOT NULL AND tag <> ''
+) tg ON true
+WHERE
+    (COALESCE(ups.QuestionCount, 0) > 10 OR COALESCE(ups.AnswerCount, 0) > 20)
+    AND (ups.TotalScore IS NOT NULL AND ups.TotalScore > 100)
+    AND (rbs.Class IS NOT NULL OR COALESCE(ups.AvgQuestionViews, 0) > 500)
+    AND (
+        lcq.CloseDate IS NULL
+        OR lcq.CloseDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+        OR qa.AnswerRank = 1
+    )
+GROUP BY
+    u.DisplayName,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.TotalScore,
+    ups.AvgQuestionViews,
+    rbs.Class,
+    lcq.CloseReason,
+    lcq.CloseDate,
+    qa.AnswerRank,
+    qa.TotalAnswers,
+    qa.Score,
+    ulast.LastActivity
+ORDER BY ups.TotalScore DESC, ulast.LastActivity DESC
+LIMIT 50;

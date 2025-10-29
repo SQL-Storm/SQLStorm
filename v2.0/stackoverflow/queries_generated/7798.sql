@@ -1,0 +1,242 @@
+-- {"query": "7798.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2057} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN AVG(p.Score) 
+            ELSE 0 
+        END as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) FILTER (WHERE p.Tags IS NOT NULL), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        Reputation,
+        DisplayName,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        TotalScore,
+        AvgPostScore,
+        AllTags,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) as Ranking
+    FROM UserStats
+),
+RecentActivity AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.PostTypeId,
+        COUNT(ph.Id) as HistoryCount,
+        MAX(ph.CreationDate) as LastHistoryDate,
+        STRING_AGG(DISTINCT ph.Comment, ', ') as HistoryComments,
+        STRING_AGG(DISTINCT ph.Text, ' | ') as HistoryTexts
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.CreationDate >= DATEADD(DAY, -30, GETDATE())
+    GROUP BY p.Id, p.Title, p.Score, p.CreationDate, p.OwnerUserId, p.ViewCount, p.AnswerCount, p.CommentCount, p.Tags, p.PostTypeId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COUNT(p.Id) as PostCount,
+        AVG(p.Score) as AvgScore,
+        STRING_AGG(DISTINCT p.OwnerUserId, ', ') as PosterIds,
+        STRING_AGG(DISTINCT p.Title, ' | ') as SampleTitles,
+        CASE 
+            WHEN COUNT(p.Id) > 0 THEN 
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) 
+            ELSE 0 
+        END as MedianScore
+    FROM Tags t
+    LEFT JOIN Posts p ON STRING_SPLIT(t.TagName, ' ') = STRING_SPLIT(p.Tags, ' ')
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+ComplexAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.Reputation,
+        tu.DisplayName,
+        tu.PostCount,
+        tu.CommentCount,
+        tu.BadgeCount,
+        tu.LastPostDate,
+        tu.TotalScore,
+        tu.AvgPostScore,
+        tu.AllTags,
+        tu.Ranking,
+        ra.PostId,
+        ra.Title,
+        ra.Score as PostScore,
+        ra.CreationDate as PostCreationDate,
+        ra.ViewCount,
+        ra.AnswerCount,
+        ra.CommentCount,
+        ra.Tags as PostTags,
+        ra.HistoryCount,
+        ra.LastHistoryDate,
+        ra.HistoryComments,
+        ra.HistoryTexts,
+        ta.TagName,
+        ta.TagCount,
+        ta.TotalScore as TagTotalScore,
+        ta.PostCount as TagPostCount,
+        ta.AvgScore as TagAvgScore,
+        ta.PosterIds,
+        ta.SampleTitles,
+        ta.MedianScore as TagMedianScore,
+        CASE 
+            WHEN ra.PostScore > COALESCE(ta.AvgScore, 0) 
+            THEN 'Above Avg' 
+            ELSE 'Below Avg' 
+        END as ScoreStatus,
+        CASE 
+            WHEN tu.TotalScore > (SELECT AVG(TotalScore) FROM TopUsers) 
+            THEN 'Above Avg User' 
+            ELSE 'Below Avg User' 
+        END as UserPerformance,
+        CASE 
+            WHEN ra.HistoryCount > 10 
+            THEN 'High Activity' 
+            ELSE 'Low Activity' 
+        END as ActivityLevel,
+        ROW_NUMBER() OVER (PARTITION BY tu.UserId ORDER BY ra.CreationDate DESC) as PostRanking,
+        DENSE_RANK() OVER (ORDER BY ta.TagCount DESC) as TagRanking,
+        NTILE(4) OVER (ORDER BY tu.Reputation DESC) as ReputationQuartile,
+        CASE 
+            WHEN tu.BadgeCount > 10 THEN 'Many Badges' 
+            WHEN tu.BadgeCount > 5 THEN 'Some Badges' 
+            ELSE 'Few Badges' 
+        END as BadgeLevel,
+        IIF(tu.PostCount = 0, 'No Posts', 'Has Posts') as PostStatus,
+        ABS(tu.TotalScore - COALESCE(ta.TotalScore, 0)) as ScoreDifference,
+        COALESCE(SUBSTRING(ta.SampleTitles, 1, 100), 'No Titles') as TruncatedTitles,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 
+                FROM PostLinks pl 
+                WHERE pl.PostId = ra.PostId AND pl.LinkTypeId = 3
+            ) THEN 'Duplicate Link' 
+            ELSE 'No Duplicate' 
+        END as DuplicateStatus
+    FROM TopUsers tu
+    LEFT JOIN RecentActivity ra ON tu.UserId = ra.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON ra.Tags LIKE '%' + ta.TagName + '%'
+    WHERE tu.Ranking <= 50
+)
+SELECT 
+    ca.UserId,
+    ca.Reputation,
+    ca.DisplayName,
+    ca.PostCount,
+    ca.CommentCount,
+    ca.BadgeCount,
+    ca.LastPostDate,
+    ca.TotalScore,
+    ca.AvgPostScore,
+    ca.AllTags,
+    ca.Ranking,
+    ca.PostId,
+    ca.Title,
+    ca.PostScore,
+    ca.PostCreationDate,
+    ca.ViewCount,
+    ca.AnswerCount,
+    ca.CommentCount as PostCommentCount,
+    ca.PostTags,
+    ca.HistoryCount,
+    ca.LastHistoryDate,
+    ca.HistoryComments,
+    ca.HistoryTexts,
+    ca.TagName,
+    ca.TagCount,
+    ca.TagTotalScore,
+    ca.TagPostCount,
+    ca.TagAvgScore,
+    ca.PosterIds,
+    ca.SampleTitles,
+    ca.TagMedianScore,
+    ca.ScoreStatus,
+    ca.UserPerformance,
+    ca.ActivityLevel,
+    ca.PostRanking,
+    ca.TagRanking,
+    ca.ReputationQuartile,
+    ca.BadgeLevel,
+    ca.PostStatus,
+    ca.ScoreDifference,
+    ca.TruncatedTitles,
+    ca.DuplicateStatus,
+    DATEDIFF(DAY, ca.PostCreationDate, GETDATE()) as DaysSincePost,
+    CASE 
+        WHEN ca.PostScore > 100 THEN 'Very Popular' 
+        WHEN ca.PostScore > 50 THEN 'Popular' 
+        WHEN ca.PostScore > 10 THEN 'Moderate' 
+        ELSE 'Low' 
+    END as PopularityRating,
+    CASE 
+        WHEN ca.ViewCount > 1000 THEN 'High Views' 
+        WHEN ca.ViewCount > 500 THEN 'Medium Views' 
+        ELSE 'Low Views' 
+    END as ViewRating,
+    CASE 
+        WHEN ca.TagCount > 100 THEN 'High Tag Volume' 
+        WHEN ca.TagCount > 50 THEN 'Medium Tag Volume' 
+        ELSE 'Low Tag Volume' 
+    END as TagVolumeRating,
+    CASE 
+        WHEN ca.PostCount > 100 THEN 'Very Active User' 
+        WHEN ca.PostCount > 50 THEN 'Active User' 
+        ELSE 'Occasional User' 
+    END as UserActivityRating,
+    ABS(ca.PostScore - (SELECT AVG(PostScore) FROM ComplexAnalysis)) as DeviationFromAvgScore,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.PostId = ca.PostId AND v.VoteTypeId = 2), 
+        0
+    ) as UpvoteCount,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.PostId = ca.PostId AND v.VoteTypeId = 3), 
+        0
+    ) as DownvoteCount,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.PostId = ca.PostId AND c.UserId IS NULL) as AnonymousComments,
+    DENSE_RANK() OVER (ORDER BY DATEPART(QUARTER, ca.PostCreationDate)) as QuarterRank,
+    PERCENT_RANK() OVER (ORDER BY ca.Reputation DESC) as ReputationPercentile,
+    CUME_DIST() OVER (ORDER BY ca.TotalScore) as ScoreCumulativeDistribution
+FROM ComplexAnalysis ca
+WHERE ca.PostId IS NOT NULL 
+  AND ca.Title IS NOT NULL
+  AND (ca.ScoreStatus = 'Above Avg' OR ca.UserPerformance = 'Above Avg User')
+ORDER BY ca.Reputation DESC, ca.TotalScore DESC, ca.LastPostDate DESC
+OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY;

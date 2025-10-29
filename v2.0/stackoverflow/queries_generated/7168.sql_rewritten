@@ -1,0 +1,96 @@
+-- {"query": "7168.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2156} 
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT b.Id) AS Badges,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS TotalQuestionScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS TotalAnswerScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+    MAX(p.CreationDate) AS LatestPostDate,
+    MIN(p.CreationDate) AS FirstPostDate,
+    DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), MIN(p.CreationDate)) AS DaysActive,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) AS HighlyViewedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 10 THEN p.Id END) AS HighScoringAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.Id END) AS QuestionsWithAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) AS ClosedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.FavoriteCount > 0 THEN p.Id END) AS FavoritedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags != '' THEN p.Id END) AS TaggedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.ParentId IN (SELECT Id FROM Posts WHERE PostTypeId = 1 AND Score > 10) THEN p.Id END) AS AnswersToHighScoreQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS QuestionsWithAcceptedAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) THEN p.Id END) AS AnsweredWithUpvotes,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND EXISTS (SELECT 1 FROM Posts p2 WHERE p2.ParentId = p.Id AND p2.Score > 0) THEN p.Id END) AS QuestionWithHighScoringAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.OwnerUserId = u.Id AND p.Score > 10 THEN p.Id END) AS UserHighScoreQuestions,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) AS TotalQuestionViews,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.ViewCount ELSE 0 END), 0) AS TotalAnswerViews,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.OwnerUserId = u.Id AND EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = p.Id AND c.UserId = u.Id) THEN p.Id END) AS QuestionsUserCommentedOn,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.OwnerUserId = u.Id AND EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = p.Id AND c.UserId = u.Id) THEN p.Id END) AS AnswersUserCommentedOn,
+    COALESCE(SUM(CASE WHEN p.PostTypeId IN (1,2) AND u.Id = (SELECT UserId FROM Posts WHERE Id = p.ParentId) then p.Score ELSE 0 END), 0) AS UserAnswerScore,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Title IS NOT NULL AND LENGTH(p.Title) > 20 THEN p.Id END) AS LongTitleQuestions,
+    (SELECT COUNT(*) FROM Posts p2 
+     WHERE p2.PostTypeId = 1 
+     AND EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = p2.Id AND pl.LinkTypeId = 3) 
+     AND p2.OwnerUserId = u.Id) AS UserDuplicateQuestions,
+    (SELECT COUNT(*) FROM PostHistory ph 
+     WHERE ph.UserId = u.Id 
+     AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15, 19, 20, 24, 35, 36, 17, 38, 37) 
+     AND ph.CreationDate > DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 30 DAY)) AS RecentEdits,
+    ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) DESC) AS RankByQuestionScore,
+    RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS RankByTotalPosts,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS RankByReputation,
+    NTILE(100) OVER (ORDER BY COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) DESC) AS PercentileByQuestionScore,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 1000 THEN 'Elite'
+        WHEN COUNT(DISTINCT p.Id) > 500 THEN 'Veteran'
+        WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Regular'
+        WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Newbie'
+        ELSE 'Beginner'
+    END AS UserTier,
+    STRING_AGG(DISTINCT CASE 
+        WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags != '' 
+        THEN SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) 
+        ELSE NULL 
+    END, ', ') AS TagList,
+    AVG(CASE 
+        WHEN p.CreationDate >= DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 30 DAY) 
+        THEN COALESCE(p.ViewCount, 0) 
+        ELSE NULL 
+    END) AS AvgRecentViews,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 AND p.Score > 50 THEN 1 ELSE 0 END), 0) AS HighScoreQuestions,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 AND p.Score > 50 THEN 1 ELSE 0 END), 0) AS HighScoreAnswers,
+    (SELECT COUNT(*) FROM Posts p3 
+     WHERE p3.PostTypeId = 1 
+     AND p3.OwnerUserId = u.Id 
+     AND EXISTS (SELECT 1 FROM Posts p4 WHERE p4.ParentId = p3.Id AND p4.Score = (SELECT MAX(p5.Score) FROM Posts p5 WHERE p5.ParentId = p3.Id)) 
+     AND p3.AcceptedAnswerId IS NOT NULL) AS QuestionsWithAcceptedHighestScoreAnswer,
+    EXISTS (SELECT 1 FROM Posts p6 WHERE p6.OwnerUserId = u.Id AND p6.PostTypeId = 1 AND p6.ViewCount > 10000) AS HasViralQuestion,
+    (SELECT COUNT(DISTINCT ph2.PostId) FROM PostHistory ph2 
+     WHERE ph2.UserId = u.Id 
+     AND ph2.PostHistoryTypeId = 10 
+     AND ph2.CreationDate > DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 1 YEAR)) AS RecentCloseVotes,
+    EXISTS (SELECT 1 FROM Comments c WHERE c.UserId = u.Id AND c.CreationDate > DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 7 DAY) AND c.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)) AS RecentActivityInOwnPosts,
+    (SELECT ROUND(AVG(p7.Score), 2) FROM Posts p7 WHERE p7.PostTypeId = 1 AND p7.OwnerUserId = u.Id AND p7.Score > 0) AS AvgUserQuestionScore,
+    (SELECT ROUND(AVG(p8.Score), 2) FROM Posts p8 WHERE p8.PostTypeId = 2 AND p8.OwnerUserId = u.Id AND p8.Score > 0) AS AvgUserAnswerScore,
+    (SELECT COUNT(DISTINCT r.Id) FROM Posts p9 
+     INNER JOIN Posts p10 ON p10.ParentId = p9.Id 
+     INNER JOIN Posts p11 ON p11.Id = p9.AcceptedAnswerId 
+     INNER JOIN Users r ON r.Id = p9.OwnerUserId 
+     WHERE r.Id = u.Id AND p10.Score > 0 AND p11.Score > 0) AS UsersWhoAnsweredTheirs,
+    (SELECT COUNT(DISTINCT c2.Id) FROM Comments c2 
+     WHERE c2.UserId = u.Id 
+     AND EXISTS (SELECT 1 FROM Posts p12 WHERE p12.Id = c2.PostId AND p12.PostTypeId = 1)) AS CommentsOnQuestions,
+    (SELECT COUNT(DISTINCT c3.Id) FROM Comments c3 
+     WHERE c3.UserId = u.Id 
+     AND EXISTS (SELECT 1 FROM Posts p13 WHERE p13.Id = c3.PostId AND p13.PostTypeId = 2)) AS CommentsOnAnswers
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+WHERE u.Id > 0
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) > 0
+ORDER BY TotalQuestionScore DESC, TotalAnswerScore DESC, Reputation DESC
+LIMIT 1000;

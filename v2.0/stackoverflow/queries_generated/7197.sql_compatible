@@ -1,0 +1,202 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as rn,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as score_category,
+        COALESCE(p.Tags, '') AS normalized_tags
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as answer_count,
+        MAX(p.CreationDate) as latest_post_date,
+        STRING_AGG(DISTINCT p.Tags, ', ') as all_tags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostTagAnalysis AS (
+    SELECT 
+        rp.Id,
+        rp.Title,
+        rp.Score,
+        rp.Tags,
+        rp.OwnerUserId,
+        -- normalize tags to array by removing angle brackets and splitting on '><' equivalent
+        (CASE 
+            WHEN rp.Tags IS NULL OR rp.Tags = '' THEN NULL
+            ELSE regexp_split_to_array(replace(replace(rp.Tags, '<', ''), '>', '|'), '\|')
+         END) as tag_array,
+        COUNT(*) as tag_count,
+        MAX(CASE WHEN rp.PostTypeId = 1 THEN 1 ELSE 0 END) as is_question,
+        STRING_AGG(DISTINCT CASE 
+            WHEN rp.PostTypeId = 2 THEN 
+                (SELECT u.DisplayName FROM Users u WHERE u.Id = rp.OwnerUserId LIMIT 1)
+            ELSE NULL 
+        END, ', ') as answerer_names
+    FROM RankedPosts rp
+    WHERE rp.rn <= 5
+    GROUP BY rp.Id, rp.Title, rp.Score, rp.Tags, rp.OwnerUserId, rp.PostTypeId
+),
+ComplexMetrics AS (
+    SELECT 
+        ps.UserId,
+        ps.Reputation,
+        ps.total_posts,
+        ps.question_count,
+        ps.answer_count,
+        ps.latest_post_date,
+        ps.all_tags,
+        CASE 
+            WHEN ps.total_posts > 0 AND ps.answer_count > 0 THEN 
+                ROUND((ps.answer_count * 100.0 / ps.total_posts)::numeric, 2)
+            ELSE 0 
+        END as answer_ratio,
+        CASE 
+            WHEN ps.question_count > 0 THEN ps.Reputation::numeric / ps.question_count
+            ELSE ps.Reputation::numeric
+        END as reputation_per_question,
+        COALESCE((SELECT p.Title FROM Posts p WHERE p.OwnerUserId = ps.UserId AND p.PostTypeId = 1 ORDER BY p.CreationDate DESC LIMIT 1), 'No Questions') as latest_question_title,
+        COALESCE((SELECT p.Title FROM Posts p WHERE p.OwnerUserId = ps.UserId AND p.PostTypeId = 2 ORDER BY p.CreationDate DESC LIMIT 1), 'No Answers') as latest_answer_title,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ps.UserId AND b.Class = 1) as gold_badge_count,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ps.UserId AND b.Class = 2) as silver_badge_count,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ps.UserId AND b.Class = 3) as bronze_badge_count
+    FROM UserStats ps
+)
+SELECT 
+    cm.UserId,
+    cm.Reputation,
+    cm.total_posts,
+    cm.answer_ratio,
+    cm.reputation_per_question,
+    cm.latest_question_title,
+    cm.latest_answer_title,
+    cm.gold_badge_count,
+    cm.silver_badge_count,
+    cm.bronze_badge_count,
+    cm.all_tags,
+    CASE 
+        WHEN cm.gold_badge_count > 10 THEN 'Elite'
+        WHEN cm.gold_badge_count > 5 THEN 'Veteran'
+        WHEN cm.gold_badge_count > 0 THEN 'Contributor'
+        ELSE 'Newbie'
+    END as badge_level,
+    CASE 
+        WHEN cm.answer_ratio > 50 THEN 'Active Answerer'
+        WHEN cm.answer_ratio > 20 THEN 'Moderate Answerer'
+        ELSE 'Occasional Answerer'
+    END as answering_style,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cm.UserId AND 
+        p.CreationDate >= (timestamp '2024-10-01 12:34:56' - INTERVAL '6 months') AND 
+        p.PostTypeId = 1 AND 
+        p.Score > 10) as recent_high_scoring_questions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cm.UserId AND 
+        p.CreationDate >= (timestamp '2024-10-01 12:34:56' - INTERVAL '6 months') AND 
+        p.PostTypeId = 2 AND 
+        p.Score > 10) as recent_high_scoring_answers,
+    COALESCE((SELECT p.Title FROM Posts p WHERE p.OwnerUserId = cm.UserId AND 
+        p.Score = (SELECT MAX(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = cm.UserId) 
+        ORDER BY p.CreationDate DESC LIMIT 1), 'No High Score') as highest_scoring_post,
+    CASE 
+        WHEN cm.total_posts > 100 THEN 'Veteran'
+        WHEN cm.total_posts > 50 THEN 'Experienced'
+        WHEN cm.total_posts > 10 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END as experience_level,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId IN (
+        SELECT Id FROM Posts p WHERE p.OwnerUserId = cm.UserId AND p.PostTypeId = 1
+    )) as linked_questions,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId IN (
+        SELECT Id FROM Posts p WHERE p.OwnerUserId = cm.UserId AND p.PostTypeId = 2
+    )) as linked_answers,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = cm.UserId AND 
+        ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) as edit_count,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = cm.UserId AND 
+        v.VoteTypeId BETWEEN 2 AND 3) as up_down_votes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = cm.UserId AND 
+        v.VoteTypeId = 8) as bounty_count,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = cm.UserId) as comment_count,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cm.UserId AND 
+        p.ViewCount > 5000) as popular_posts_count,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cm.UserId AND 
+        p.AnswerCount > 5 AND p.PostTypeId = 1) as answered_questions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cm.UserId AND 
+        p.CommentCount > 10 AND p.PostTypeId = 1) as commented_questions,
+    CASE 
+        WHEN cm.gold_badge_count > 0 OR cm.silver_badge_count > 0 OR cm.bronze_badge_count > 0 
+        THEN 'Active Contributor' 
+        ELSE 'Inactive'
+    END as activity_status,
+    (SELECT STRING_AGG(pta.Title, ', ') FROM PostTagAnalysis pta WHERE pta.OwnerUserId = cm.UserId AND pta.tag_count > 2) as multi_tagged_posts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cm.UserId AND 
+        p.CreationDate >= (timestamp '2024-10-01 12:34:56' - INTERVAL '1 year') AND 
+        p.Score > 5 AND p.PostTypeId = 1) as yearly_questions,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = cm.UserId AND 
+        p.PostTypeId = 1 AND p.Score > 0) as avg_question_score,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = cm.UserId AND 
+        p.PostTypeId = 2 AND p.Score > 0) as avg_answer_score,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cm.UserId AND 
+        p.CreationDate > (timestamp '2024-10-01 12:34:56' - INTERVAL '30 days')) as recent_posts_30_days,
+    (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = cm.UserId) as last_post_date,
+    (DATE_PART('day', timestamp '2024-10-01 12:34:56' - cm.latest_post_date))::int as days_since_last_post,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cm.UserId AND 
+        p.LastEditDate > (timestamp '2024-10-01 12:34:56' - INTERVAL '7 days')) as edited_posts_last_week,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cm.UserId AND 
+        p.PostTypeId = 1 AND p.AnswerCount = 0) as unanswered_questions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cm.UserId AND 
+        p.PostTypeId = 1 AND p.AnswerCount > 0) as answered_questions_count,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cm.UserId AND 
+        p.PostTypeId = 2 AND p.Score > 10) as high_scoring_answers,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cm.UserId AND 
+        p.PostTypeId = 1 AND p.Score > 100) as high_scoring_questions_count,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = cm.UserId AND 
+        v.VoteTypeId IN (1, 2, 3) AND v.CreationDate >= (timestamp '2024-10-01 12:34:56' - INTERVAL '1 year')) as votes_last_year,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = cm.UserId AND 
+        ph.CreationDate >= (timestamp '2024-10-01 12:34:56' - INTERVAL '30 days') AND 
+        ph.PostHistoryTypeId IN (10, 11)) as recent_closure_actions,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = cm.UserId AND 
+        ph.CreationDate >= (timestamp '2024-10-01 12:34:56' - INTERVAL '30 days') AND 
+        ph.PostHistoryTypeId IN (12, 13)) as recent_deletion_actions,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = cm.UserId AND 
+        ph.CreationDate >= (timestamp '2024-10-01 12:34:56' - INTERVAL '30 days') AND 
+        ph.PostHistoryTypeId IN (32, 33)) as recent_community_actions,
+    COALESCE((SELECT p.Title FROM Posts p WHERE p.OwnerUserId = cm.UserId AND 
+        p.PostTypeId = 1 AND p.AnswerCount > 0 ORDER BY p.AnswerCount DESC LIMIT 1), 'No Answered Questions') as most_answered_question,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cm.UserId AND 
+        p.CreationDate >= (timestamp '2024-10-01 12:34:56' - INTERVAL '1 month') AND 
+        p.PostTypeId = 1) as questions_last_month,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cm.UserId AND 
+        p.CreationDate >= (timestamp '2024-10-01 12:34:56' - INTERVAL '1 month') AND 
+        p.PostTypeId = 2) as answers_last_month,
+    (SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = cm.UserId AND 
+        b.Class = 1 AND b.Date >= (timestamp '2024-10-01 12:34:56' - INTERVAL '6 months')) as recent_gold_badges,
+    (SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = cm.UserId AND 
+        b.Class = 2 AND b.Date >= (timestamp '2024-10-01 12:34:56' - INTERVAL '6 months')) as recent_silver_badges
+FROM ComplexMetrics cm
+WHERE cm.total_posts > 0
+ORDER BY cm.total_posts DESC, cm.Reputation DESC;

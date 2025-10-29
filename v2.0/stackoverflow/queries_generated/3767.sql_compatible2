@@ -1,0 +1,130 @@
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(b.GoldCnt,0)   AS GoldBadges,
+           COALESCE(b.SilverCnt,0) AS SilverBadges,
+           COALESCE(b.BronzeCnt,0) AS BronzeBadges,
+           COALESCE(p.QCnt,0)      AS QuestionCount,
+           COALESCE(p.ACnt,0)      AS AnswerCount,
+           COALESCE(p.AvgScore,0)  AS AvgPostScore,
+           MAX(p.LastAct) FILTER (WHERE p.PostTypeId = 1) AS LastQuestionActivity,
+           MAX(p.LastAct) FILTER (WHERE p.PostTypeId = 2) AS LastAnswerActivity
+    FROM Users u
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCnt,
+               SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCnt,
+               SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCnt
+        FROM Badges
+        GROUP BY UserId
+    ) b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT OwnerUserId,
+               SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QCnt,
+               SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS ACnt,
+               AVG(Score)                                      AS AvgScore,
+               MAX(LastActivityDate)                           AS LastAct,
+               PostTypeId
+        FROM Posts
+        WHERE OwnerUserId IS NOT NULL
+        GROUP BY OwnerUserId, PostTypeId
+    ) p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, b.GoldCnt, b.SilverCnt, b.BronzeCnt, p.QCnt, p.ACnt, p.AvgScore, p.LastAct, p.PostTypeId
+),
+TagStats AS (
+    SELECT t.TagName,
+           t.Count                                     AS TagUseCount,
+           COALESCE(e.EditCnt,0)                       AS EditCount,
+           COALESCE(v.UpVotes,0)                       AS UpVotes,
+           COALESCE(v.DownVotes,0)                     AS DownVotes,
+           (COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0))                     AS NetVotes,
+           ROW_NUMBER() OVER (PARTITION BY t.TagName
+                              ORDER BY (COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0)) DESC) AS RankByNetVotes
+    FROM Tags t
+    LEFT JOIN (
+        SELECT ph.PostId,
+               COUNT(*) AS EditCnt
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (4,5,6)
+        GROUP BY ph.PostId
+    ) e ON e.PostId = t.ExcerptPostId OR e.PostId = t.WikiPostId
+    LEFT JOIN (
+        SELECT p.Tags,
+               SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+               SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts p
+        JOIN Votes v ON v.PostId = p.Id
+        WHERE p.Tags IS NOT NULL
+        GROUP BY p.Tags
+    ) v ON v.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    GROUP BY t.TagName, t.Count, e.EditCnt, v.UpVotes, v.DownVotes
+),
+RecentClosed AS (
+    SELECT p.Id,
+           p.Title,
+           ph.CreationDate      AS ClosedDate,
+           CAST(ph.Comment AS INTEGER)      AS CloseReasonId,
+           cr.Name              AS CloseReasonName,
+           ROW_NUMBER() OVER (PARTITION BY CAST(ph.Comment AS INTEGER)
+                              ORDER BY ph.CreationDate DESC) AS RN
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN CloseReasonTypes cr ON cr.Id = CAST(ph.Comment AS INTEGER)
+    WHERE p.PostTypeId = 1
+      AND ph.PostHistoryTypeId = 10
+    GROUP BY p.Id, p.Title, ph.CreationDate, ph.Comment, cr.Name
+),
+UserActivity AS (
+    SELECT us.Id,
+           us.DisplayName,
+           us.Reputation,
+           us.GoldBadges,
+           us.SilverBadges,
+           us.BronzeBadges,
+           us.QuestionCount,
+           us.AnswerCount,
+           us.AvgPostScore,
+           COALESCE(us.LastQuestionActivity, us.LastAnswerActivity) AS LastActivity,
+           ROW_NUMBER() OVER (ORDER BY COALESCE(us.LastQuestionActivity, us.LastAnswerActivity) DESC) AS ActivityRank,
+           PERCENT_RANK() OVER (ORDER BY us.Reputation) AS RepPctRank
+    FROM UserStats us
+    GROUP BY us.Id, us.DisplayName, us.Reputation, us.GoldBadges, us.SilverBadges, us.BronzeBadges, us.QuestionCount, us.AnswerCount, us.AvgPostScore, us.LastQuestionActivity, us.LastAnswerActivity
+)
+SELECT ua.Id,
+       ua.DisplayName,
+       ua.Reputation,
+       ua.GoldBadges,
+       ua.SilverBadges,
+       ua.BronzeBadges,
+       ua.QuestionCount,
+       ua.AnswerCount,
+       ROUND(CAST(ua.AvgPostScore AS NUMERIC),2) AS AvgScore,
+       ua.LastActivity,
+       ua.ActivityRank,
+       ua.RepPctRank,
+       CASE WHEN ua.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 'AboveAvg' ELSE 'BelowAvg' END AS RepCategory,
+       COALESCE(ts.TagName,'NoTag')          AS TopTag,
+       ts.TagUseCount,
+       ts.NetVotes,
+       rc.Title                              AS RecentClosedTitle,
+       rc.CloseReasonName,
+       rc.RN                                 AS ClosedRank
+FROM UserActivity ua
+LEFT JOIN LATERAL (
+    SELECT ts.TagName, ts.TagUseCount, ts.NetVotes
+    FROM TagStats ts
+    WHERE ts.RankByNetVotes = 1
+    ORDER BY ts.TagUseCount DESC
+    LIMIT 1
+) ts ON TRUE
+LEFT JOIN LATERAL (
+    SELECT rc.Title, rc.CloseReasonName, rc.RN
+    FROM RecentClosed rc
+    WHERE rc.RN = 1
+    ORDER BY rc.ClosedDate DESC
+    LIMIT 1
+) rc ON TRUE
+WHERE ua.ActivityRank <= 100
+ORDER BY ua.ActivityRank
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

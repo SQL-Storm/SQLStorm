@@ -1,0 +1,34 @@
+-- {"query": "5008.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 450} 
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  COUNT(DISTINCT p.Id) AS TotalPosts,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+  AVG(p.Score) AS AvgScorePerPost,
+  MAX(p.LastActivityDate) AS MostRecentActivity,
+  STRING_AGG(DISTINCT tt.Name, ',') FILTER (WHERE tt.Name IS NOT NULL) AS RecentHistoryTypes,
+  COUNT(DISTINCT bh.Id) AS HistoryEntries,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+  SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+  SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+  SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN PostHistory bh ON bh.PostId = p.Id
+    AND bh.PostHistoryTypeId IN (10,11,12,13,16,24,36) -- representative history events
+  LEFT JOIN PostHistoryTypes pht ON pht.Id = bh.PostHistoryTypeId
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+WHERE
+  u.CreationDate >= DATEADD(year, -2, CURRENT_DATE)
+  OR u.LastAccessDate >= DATEADD(year, -1, CURRENT_DATE)
+GROUP BY
+  u.Id, u.DisplayName
+HAVING
+  COUNT(DISTINCT p.Id) > 5
+ORDER BY
+  TotalPosts DESC, MostRecentActivity DESC
+LIMIT 100;

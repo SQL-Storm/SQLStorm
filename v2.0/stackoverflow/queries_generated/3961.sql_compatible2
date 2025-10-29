@@ -1,0 +1,164 @@
+WITH
+recent_activity AS (
+    SELECT
+        u.Id                         AS user_id,
+        MAX(p.CreationDate)          AS last_post_date,
+        MAX(c.CreationDate)          AS last_comment_date,
+        MAX(v.CreationDate)          AS last_vote_date,
+        GREATEST(
+            COALESCE(MAX(p.CreationDate), CAST('1970-01-01' AS timestamp)),
+            COALESCE(MAX(c.CreationDate), CAST('1970-01-01' AS timestamp)),
+            COALESCE(MAX(v.CreationDate), CAST('1970-01-01' AS timestamp))
+        )                            AS most_recent_activity
+    FROM Users u
+    LEFT JOIN Posts      p ON p.OwnerUserId = u.Id
+                           AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90 days'
+    LEFT JOIN Comments   c ON c.UserId = u.Id
+                           AND c.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90 days'
+    LEFT JOIN Votes      v ON v.UserId = u.Id
+                           AND v.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90 days'
+    GROUP BY u.Id
+),
+
+badge_summary AS (
+    SELECT
+        b.UserId                         AS user_id,
+        COUNT(*)                         AS total_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        STRING_AGG(DISTINCT b.Name, ';' ORDER BY b.Name) AS badge_names
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+qa_metrics AS (
+    SELECT
+        q.OwnerUserId                                    AS user_id,
+        COUNT(*)                                         AS questions_asked,
+        COUNT(a.Id)                                      AS answers_given,
+        SUM(CASE WHEN q.AcceptedAnswerId IS NOT NULL
+                 AND q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END) AS accepted_answers,
+        AVG(NULLIF(q.Score,0))                           AS avg_question_score,
+        AVG(NULLIF(a.Score,0))                           AS avg_answer_score,
+        PERCENT_RANK() OVER (PARTITION BY q.OwnerUserId ORDER BY COUNT(a.Id))      AS answer_rate_rank
+    FROM Posts q
+    LEFT JOIN Posts a
+          ON a.ParentId = q.Id
+         AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.OwnerUserId
+),
+
+latest_vote_per_post AS (
+    SELECT
+        p.Id                     AS post_id,
+        (SELECT vt.Name
+         FROM Votes v
+         JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+         WHERE v.PostId = p.Id
+         ORDER BY v.CreationDate DESC
+         LIMIT 1)                AS latest_vote_type
+    FROM Posts p
+),
+
+tag_activity AS (
+    SELECT
+        p.OwnerUserId                                    AS user_id,
+        UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag,
+        COUNT(*)                                         AS posts_per_tag
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL
+      AND p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, tag
+),
+
+qa_union AS (
+    SELECT
+        u.Id                        AS user_id,
+        'question'                  AS entity_type,
+        COUNT(p.Id)                 AS entity_count,
+        SUM(p.Score)                AS total_score,
+        AVG(p.ViewCount)            AS avg_views
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    GROUP BY u.Id
+
+    UNION ALL
+
+    SELECT
+        u.Id,
+        'answer',
+        COUNT(p.Id),
+        SUM(p.Score),
+        NULL::numeric
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    GROUP BY u.Id
+)
+
+SELECT
+    u.Id                                    AS user_id,
+    COALESCE(u.DisplayName, 'Anonymous')    AS display_name,
+    u.Reputation,
+    ra.most_recent_activity,
+    bs.total_badges,
+    bs.gold_badges,
+    bs.silver_badges,
+    bs.bronze_badges,
+    bs.badge_names,
+    qm.questions_asked,
+    qm.answers_given,
+    qm.accepted_answers,
+    qm.avg_question_score,
+    qm.avg_answer_score,
+    qm.answer_rate_rank,
+    RANK() OVER (
+        ORDER BY
+            (u.Reputation * 0.4) +
+            (COALESCE(bs.gold_badges,0) * 100) +
+            (COALESCE(bs.silver_badges,0) * 50) +
+            (COALESCE(bs.bronze_badges,0) * 20) +
+            (COALESCE(qm.avg_answer_score,0) * 10) DESC
+    )                                       AS composite_rank,
+    STRING_AGG(t.tag || ':' || t.posts_per_tag, ', ') FILTER (WHERE t.posts_per_tag IS NOT NULL) 
+                                           AS top_tags,
+    lv.latest_vote_type,
+    qa_q.entity_count      AS question_count,
+    qa_q.total_score       AS question_score_sum,
+    qa_q.avg_views         AS question_avg_views,
+    qa_a.entity_count      AS answer_count,
+    qa_a.total_score       AS answer_score_sum
+FROM Users u
+LEFT JOIN recent_activity ra    ON ra.user_id = u.Id
+LEFT JOIN badge_summary   bs    ON bs.user_id = u.Id
+LEFT JOIN qa_metrics      qm    ON qm.user_id = u.Id
+LEFT JOIN LATERAL (
+    SELECT lv.latest_vote_type
+    FROM latest_vote_per_post lv
+    JOIN Posts p ON p.Id = lv.post_id
+    WHERE p.OwnerUserId = u.Id
+      AND p.PostTypeId = 1
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+) lv ON TRUE
+LEFT JOIN tag_activity t        ON t.user_id = u.Id
+LEFT JOIN (
+    SELECT user_id, entity_count, total_score, avg_views
+    FROM qa_union
+    WHERE entity_type = 'question'
+) qa_q ON qa_q.user_id = u.Id
+LEFT JOIN (
+    SELECT user_id, entity_count, total_score
+    FROM qa_union
+    WHERE entity_type = 'answer'
+) qa_a ON qa_a.user_id = u.Id
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation,
+    ra.most_recent_activity,
+    bs.total_badges, bs.gold_badges, bs.silver_badges, bs.bronze_badges, bs.badge_names,
+    qm.questions_asked, qm.answers_given, qm.accepted_answers,
+    qm.avg_question_score, qm.avg_answer_score, qm.answer_rate_rank,
+    lv.latest_vote_type,
+    qa_q.entity_count, qa_q.total_score, qa_q.avg_views,
+    qa_a.entity_count, qa_a.total_score;

@@ -1,0 +1,213 @@
+-- {"query": "1565.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2774} 
+
+WITH UserEngagementSummary AS (
+    -- CTE 1: Aggregates user activity, badge counts, and calculates derived metrics
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        CAST(U.UpVotes AS NUMERIC) / NULLIF(U.DownVotes, 0) AS UpDownVoteRatio,
+        MAX(P.CreationDate) AS LastPostDate,
+        MIN(P.CreationDate) AS FirstPostDate,
+        AVG(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - P.CreationDate)) / 3600 / 24) AS AvgDaysSincePostCreation,
+        U.Location AS UserLocation,
+        U.WebsiteUrl AS UserWebsite
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes, U.Location, U.WebsiteUrl
+    HAVING COUNT(P.Id) > 5 OR COUNT(C.Id) > 10 -- Focus on more active users
+),
+PostContentAnalysis AS (
+    -- CTE 2: Analyzes post content, edit history, links, and applies window functions
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.Title,
+        P.Tags,
+        P.Body,
+        COALESCE(P.AnswerCount, 0) AS AnswerCount,
+        COALESCE(P.CommentCount, 0) AS CommentCount,
+        COALESCE(P.FavoriteCount, 0) AS FavoriteCount,
+        (
+            SELECT COUNT(DISTINCT PH.Id)
+            FROM PostHistory PH
+            WHERE PH.PostId = P.Id
+              AND PH.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+        ) AS EditCount,
+        (
+            SELECT COUNT(DISTINCT PL.Id)
+            FROM PostLinks PL
+            WHERE PL.PostId = P.Id
+              AND PL.LinkTypeId = 1 -- Linked posts
+        ) AS LinkedPostCount,
+        (
+            SELECT COUNT(DISTINCT PL.Id)
+            FROM PostLinks PL
+            WHERE PL.PostId = P.Id
+              AND PL.LinkTypeId = 3 -- Duplicate posts
+        ) AS DuplicateLinkCount,
+        DENSE_RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS PostTypeScoreRank,
+        LAG(P.Score, 1, 0) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PrevPostScore,
+        LEAD(P.Score, 1, 0) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS NextPostScore,
+        CASE
+            WHEN P.Score >= 50 AND P.ViewCount >= 1000 THEN 'High Impact'
+            WHEN P.Score >= 10 OR P.ViewCount >= 100 THEN 'Medium Impact'
+            ELSE 'Low Impact'
+        END AS ImpactCategory,
+        P.Body LIKE '%performance%' OR P.Title ILIKE '%benchmark%' AS ContainsKeywords,
+        P.ClosedDate IS NOT NULL AS IsClosed,
+        MAX(PH_Activity.CreationDate) OVER (PARTITION BY P.Id) AS LastActivityDateFromHistory -- Latest history entry
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostHistory PH_Activity ON P.Id = PH_Activity.PostId -- Used for LastActivityDateFromHistory window function
+    WHERE P.CreationDate BETWEEN '2020-01-01' AND '2023-12-31'
+),
+PostTagExtraction AS (
+    -- CTE 3: Extracts individual tags from posts for further tag-based analysis
+    SELECT
+        PCA.PostId,
+        PCA.OwnerUserId,
+        UNNEST(string_to_array(SUBSTRING(PCA.Tags, 2, LENGTH(PCA.Tags) - 2), '><')) AS TagName,
+        PCA.Score,
+        PCA.ViewCount
+    FROM PostContentAnalysis PCA
+    WHERE PCA.Tags IS NOT NULL AND LENGTH(PCA.Tags) > 2
+),
+TagPerformanceMetrics AS (
+    -- CTE 4: Calculates performance metrics for each tag
+    SELECT
+        PTE.TagName,
+        COUNT(DISTINCT PTE.PostId) AS QuestionsWithTag,
+        AVG(PTE.Score) AS AvgTagScore,
+        MAX(PTE.ViewCount) AS MaxTagViewCount,
+        SUM(PTE.Score) AS TotalTagScore,
+        NTILE(10) OVER (ORDER BY COUNT(DISTINCT PTE.PostId) DESC, AVG(PTE.Score) DESC) AS TagPopularityDecile
+    FROM PostTagExtraction PTE
+    GROUP BY PTE.TagName
+    HAVING COUNT(DISTINCT PTE.PostId) >= 10 -- Only consider sufficiently used tags
+)
+-- Main Query: Combines all CTEs, applies complex filters, calculations, and includes a set operator
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.TotalPosts,
+    UES.TotalComments,
+    PCA.PostId,
+    PCA.Title,
+    PCA.PostTypeName,
+    PCA.CreationDate AS PostCreationDate,
+    PCA.Score AS PostScore,
+    PCA.ViewCount AS PostViewCount,
+    PCA.EditCount,
+    PCA.LinkedPostCount,
+    PCA.DuplicateLinkCount,
+    PCA.PostTypeScoreRank,
+    PCA.ImpactCategory,
+    PCA.PrevPostScore,
+    PCA.NextPostScore,
+    TPM.TagName AS TopContributingTag,
+    TPM.AvgTagScore,
+    TPM.TagPopularityDecile,
+    (UES.TotalPostScore * COALESCE(UES.UpDownVoteRatio, 1.0)) AS UserWeightedInfluenceScore, -- Complex calculation with NULL handling
+    COALESCE(UES.UserLocation, 'Unknown') AS UserLocation,
+    NULLIF(UES.UserWebsite, '') AS UserWebsite, -- NULLIF example
+    (SELECT AVG(C.Score) FROM Comments C WHERE C.PostId = PCA.PostId AND C.UserId IS NOT NULL) AS AvgCommentScore, -- Correlated subquery in SELECT
+    CASE
+        WHEN UES.Reputation > 5000 AND PCA.ImpactCategory = 'High Impact' THEN 'Elite Contributor'
+        WHEN UES.Reputation > 1000 AND PCA.ImpactCategory IN ('High Impact', 'Medium Impact') THEN 'Valued Contributor'
+        ELSE 'Regular Contributor'
+    END AS ContributorTier,
+    EXISTS (
+        SELECT 1
+        FROM Badges B
+        WHERE B.UserId = UES.UserId
+          AND B.Name ILIKE '%Analyst%'
+          AND B.Date > PCA.CreationDate
+    ) AS HasAnalystBadgeAfterPost
+FROM UserEngagementSummary UES
+JOIN PostContentAnalysis PCA ON UES.UserId = PCA.OwnerUserId
+LEFT JOIN TagPerformanceMetrics TPM ON TPM.TagName = (
+    -- Correlated subquery to find the most popular (by post count) and best-performing tag for a given post
+    SELECT PTE_inner.TagName
+    FROM PostTagExtraction PTE_inner
+    JOIN TagPerformanceMetrics TPM_inner ON PTE_inner.TagName = TPM_inner.TagName
+    WHERE PTE_inner.PostId = PCA.PostId
+    ORDER BY TPM_inner.QuestionsWithTag DESC, TPM_inner.AvgTagScore DESC
+    LIMIT 1
+)
+WHERE UES.Reputation > 500
+  AND PCA.ViewCount > 100
+  AND PCA.Score > 10
+  AND PCA.CreationDate >= '2021-01-01'
+  AND (PCA.ContainsKeywords = TRUE OR PCA.PostTypeName = 'Question' AND PCA.IsClosed = FALSE)
+  AND (UES.GoldBadges > 0 OR UES.SilverBadges > 1 OR UES.BronzeBadges > 5)
+  AND PCA.LastActivityDateFromHistory IS NOT NULL -- NULL logic: ensure there's some history recorded
+  AND NOT EXISTS (
+      -- Correlated subquery in WHERE clause to filter out posts with recent significant negative sentiment (spam/offensive votes)
+      SELECT 1
+      FROM Votes V
+      WHERE V.PostId = PCA.PostId
+        AND V.VoteTypeId IN (4, 12) -- Offensive, Spam
+        AND V.CreationDate > (CURRENT_DATE - INTERVAL '60 days')
+  )
+
+UNION ALL -- Set operator: Combines results with a separate query for older, lower-scoring, potentially problematic posts
+
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    NULL AS TotalPosts,
+    NULL AS TotalComments,
+    P.Id AS PostId,
+    P.Title,
+    PT.Name AS PostTypeName,
+    P.CreationDate AS PostCreationDate,
+    P.Score AS PostScore,
+    P.ViewCount AS PostViewCount,
+    (SELECT COUNT(*) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+    NULL AS LinkedPostCount,
+    NULL AS DuplicateLinkCount,
+    NULL AS PostTypeScoreRank,
+    'Legacy Review / Low Impact' AS ImpactCategory,
+    NULL AS PrevPostScore,
+    NULL AS NextPostScore,
+    NULL AS TopContributingTag,
+    NULL AS AvgTagScore,
+    NULL AS TagPopularityDecile,
+    (U.Reputation * 0.05) AS UserWeightedInfluenceScore, -- Different calculation for legacy posts
+    COALESCE(U.Location, 'N/A') AS UserLocation,
+    NULLIF(U.WebsiteUrl, '') AS UserWebsite,
+    (SELECT AVG(C.Score) FROM Comments C WHERE C.PostId = P.Id AND C.UserId IS NOT NULL) AS AvgCommentScore,
+    'Legacy Review Tier' AS ContributorTier,
+    FALSE AS HasAnalystBadgeAfterPost
+FROM Posts P
+JOIN PostTypes PT ON P.PostTypeId = PT.Id
+LEFT JOIN Users U ON P.OwnerUserId = U.Id
+WHERE P.CreationDate < '2020-01-01' -- Older posts
+  AND P.Score IS NOT NULL AND P.Score < 10 -- Low score
+  AND P.AnswerCount = 0 -- Unanswered
+  AND P.ClosedDate IS NULL -- Not explicitly closed
+  AND NOT EXISTS ( -- Ensures these legacy posts haven't been linked or duplicated in the past
+      SELECT 1 FROM PostLinks PL WHERE PL.PostId = P.Id
+  )
+  AND P.Body ILIKE '%error%' -- String search for error-related legacy posts
+ORDER BY Reputation DESC, PostScore DESC, PostViewCount DESC;

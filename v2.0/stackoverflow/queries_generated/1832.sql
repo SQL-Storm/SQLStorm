@@ -1,0 +1,144 @@
+-- {"query": "1832.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2047} 
+WITH UserEngagement AS (
+    -- CTE 1: Summarizes user activity, reputation metrics, and badge counts
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.Views AS TotalViews,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges,
+        CAST(U.Reputation AS numeric) / NULLIF(EXTRACT(DAY FROM (CURRENT_TIMESTAMP - U.CreationDate)) + 1, 0) AS AvgDailyReputation,
+        CASE
+            WHEN U.AboutMe IS NULL THEN 'No Bio'
+            WHEN LENGTH(U.AboutMe) < 100 THEN 'Short Bio'
+            ELSE 'Long Bio'
+        END AS AboutMeCategory
+    FROM Users AS U
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    WHERE U.Reputation > 5000 -- Filter for higher reputation users
+      AND U.LastAccessDate > CURRENT_TIMESTAMP - INTERVAL '2 years' -- Recently active
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        U.Views, U.UpVotes, U.DownVotes, U.AboutMe
+),
+PostDetailsWithHistory AS (
+    -- CTE 2: Gathers detailed post information including aggregated votes, comments, and the latest edit history
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        COALESCE(P.OwnerDisplayName, 'Community') AS PostOwnerDisplayName, -- Handle NULL OwnerDisplayName
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Tags,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.Body,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+        AVG(C.Score) AS AverageCommentScore,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS LatestEditHistoryDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.UserDisplayName END) AS LatestEditorDisplayName,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN CREASON.Name END) AS CloseReasonName, -- Correlated subquery concept via JOIN & FILTER
+        ROW_NUMBER() OVER (PARTITION BY P.Id ORDER BY P.CreationDate) AS rn -- Just for an example, actual use might differ
+    FROM Posts AS P
+    LEFT JOIN Votes AS V ON P.Id = V.PostId
+    LEFT JOIN Comments AS C ON P.Id = C.PostId
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    LEFT JOIN CloseReasonTypes AS CREASON ON CAST(PH.Comment AS smallint) = CREASON.Id
+        AND PH.PostHistoryTypeId = 10 -- Only join for close reasons
+    WHERE P.PostTypeId IN (1, 2) -- Only Questions and Answers
+      AND P.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '5 years' -- Recent posts
+      AND P.ViewCount IS NOT NULL -- Exclude posts with unknown view counts
+    GROUP BY
+        P.Id, P.PostTypeId, P.Title, P.Score, P.ViewCount, P.OwnerUserId,
+        P.OwnerDisplayName, P.CreationDate, P.LastActivityDate, P.Tags,
+        P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.Body
+    HAVING COUNT(V.Id) > 5 -- At least 5 votes
+),
+TagFrequency AS (
+    -- CTE 3: Analyzes frequency and performance of tags
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(PD.Tags, 2, LENGTH(PD.Tags) - 2), '><'))) AS TagName,
+        COUNT(PD.PostId) AS TagPostCount,
+        AVG(PD.Score) AS TagAvgScore,
+        SUM(PD.ViewCount) AS TagTotalViews
+    FROM PostDetailsWithHistory AS PD
+    WHERE PD.Tags IS NOT NULL AND LENGTH(PD.Tags) > 2
+    GROUP BY 1
+    HAVING COUNT(PD.PostId) > 50 -- Only consider moderately frequent tags
+)
+SELECT
+    UE.DisplayName AS UserDisplayName,
+    UE.Reputation,
+    UE.GoldBadges,
+    UE.AvgDailyReputation,
+    UE.AboutMeCategory,
+    PD.PostId,
+    PD.PostOwnerDisplayName,
+    COALESCE(PD.Title, 'Untitled Post (ID: ' || PD.PostId || ')') AS PostTitle, -- NULL logic with concatenation
+    PD.Score AS PostScore,
+    PD.ViewCount,
+    PD.FavoriteCount,
+    (PD.TotalUpVotes * 1.0) / NULLIF((PD.TotalUpVotes + PD.TotalDownVotes), 0) AS UpvoteRatio,
+    COALESCE(PD.AverageCommentScore, 0) AS AvgCommentScore,
+    PD.PostCreationDate,
+    PD.LatestEditHistoryDate,
+    COALESCE(PD.LatestEditorDisplayName, 'Original Author') AS EditorInfo,
+    PD.CloseReasonName,
+    CASE
+        WHEN PD.ClosedDate IS NOT NULL AND PD.AnswerCount = 0 THEN 'Closed & Unanswered'
+        WHEN PD.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN PD.AcceptedAnswerId IS NOT NULL THEN 'Accepted Answered'
+        WHEN PD.AnswerCount > 0 THEN 'Answered'
+        ELSE 'Open & Unanswered'
+    END AS PostStatus, -- Complicated CASE expression
+    TF.TagName AS MostFrequentTag,
+    TF.TagPostCount,
+    TF.TagAvgScore,
+    LENGTH(PD.Body) AS BodyLength,
+    SUBSTRING(PD.Body, 1, 150) || '...' AS BodySnippet, -- String manipulation
+    -- Correlated Subquery: Find the creation date of the accepted answer for questions
+    (
+        SELECT A.CreationDate
+        FROM Posts AS A
+        WHERE A.Id = P_MAIN.AcceptedAnswerId AND P_MAIN.PostTypeId = 1
+    ) AS AcceptedAnswerCreationDate,
+    -- Window Functions:
+    RANK() OVER (PARTITION BY UE.UserId ORDER BY PD.Score DESC, PD.ViewCount DESC) AS RankWithinUserPosts,
+    NTILE(10) OVER (ORDER BY PD.Score * 0.7 + PD.FavoriteCount * 2 + PD.CommentCount * 0.1 DESC) AS OverallEngagementDecile,
+    LAG(PD.PostCreationDate, 1, '1970-01-01') OVER (PARTITION BY UE.UserId ORDER BY PD.PostCreationDate) AS PrevPostCreationDate,
+    LEAD(PD.PostCreationDate, 1, CURRENT_TIMESTAMP) OVER (PARTITION BY UE.UserId ORDER BY PD.PostCreationDate) AS NextPostCreationDate
+FROM UserEngagement AS UE
+JOIN PostDetailsWithHistory AS PD ON UE.UserId = PD.OwnerUserId
+LEFT JOIN Posts AS P_MAIN ON PD.PostId = P_MAIN.Id -- Re-join Posts for AcceptedAnswerId (more robust than PD.AcceptedAnswerId if not in PD yet)
+LEFT JOIN TagFrequency AS TF ON TF.TagName = (
+    -- Extract the "most popular" tag from the post, for this example simply the first one
+    SELECT TRIM(UNNEST(string_to_array(SUBSTRING(PD.Tags, 2, LENGTH(PD.Tags) - 2), '><')))
+    LIMIT 1
+)
+WHERE PD.Score > 50
+  AND (PD.Tags LIKE '%<sql>%' OR PD.Tags LIKE '%<database>%') -- Complex predicate with string expression
+  AND PD.ViewCount > 1000
+  AND PD.CommentCount IS NOT NULL -- NULL logic
+  AND PD.PostId NOT IN (
+        SELECT PL.PostId FROM PostLinks AS PL WHERE PL.LinkTypeId = 3 -- Exclude duplicate questions
+    )
+ORDER BY
+    OverallEngagementDecile,
+    UE.Reputation DESC,
+    RankWithinUserPosts,
+    PD.PostCreationDate DESC
+LIMIT 1000;

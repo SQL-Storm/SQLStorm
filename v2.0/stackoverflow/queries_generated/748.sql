@@ -1,0 +1,357 @@
+-- {"query": "748.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3112} 
+with recent_posts as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    p.ClosedDate,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    coalesce(nullif(trim(p.OwnerDisplayName), ''), 'anonymous') as OwnerDisplayName
+  from Posts p
+  where p.CreationDate >= (select date_trunc('month', max(CreationDate)) - interval '12 months' from Posts)
+),
+user_activity as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.CreationDate as UserCreationDate,
+    u.DisplayName,
+    u.Location,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views as ProfileViews,
+    count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+    count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+    count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+    max(b.Date) as LastBadgeDate
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.Location, u.UpVotes, u.DownVotes, u.Views
+),
+post_votes as (
+  select
+    v.PostId,
+    count(*) filter (where v.VoteTypeId = 2) as UpVotes,
+    count(*) filter (where v.VoteTypeId = 3) as DownVotes,
+    count(*) filter (where v.VoteTypeId = 5) as Favorites,
+    sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal,
+    count(*) filter (where v.VoteTypeId in (8,9)) as BountyEvents
+  from Votes v
+  group by v.PostId
+),
+comment_stats as (
+  select
+    c.PostId,
+    count(*) as CommentCount,
+    max(c.CreationDate) as LastCommentDate,
+    avg(c.Score) as AvgCommentScore,
+    sum(case when c.Score > 0 then 1 else 0 end) as PositiveComments
+  from Comments c
+  group by c.PostId
+),
+question_answers as (
+  select
+    q.Id as QuestionId,
+    count(a.Id) as AnswerCount,
+    max(a.Score) as MaxAnswerScore,
+    avg(a.Score) filter (where a.Score is not null) as AvgAnswerScore,
+    max(a.CreationDate) as LastAnswerDate,
+    sum(case when a.Id = q.AcceptedAnswerId then 1 else 0 end) as HasAccepted
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  where q.PostTypeId = 1
+  group by q.Id
+),
+post_links_agg as (
+  select
+    pl.PostId,
+    count(*) filter (where pl.LinkTypeId = 1) as LinkedCount,
+    count(*) filter (where pl.LinkTypeId = 3) as DuplicateCount,
+    count(*) as TotalLinks
+  from PostLinks pl
+  group by pl.PostId
+),
+tag_expansion as (
+  select
+    p.Id as PostId,
+    lower(trim(tg)) as tag
+  from recent_posts p
+  cross join lateral unnest(string_to_array(substring(p.Tags, 2, greatest(length(p.Tags)-2,0)), '><')) as tg
+),
+tag_rank as (
+  select
+    te.tag,
+    count(*) as TagUsage,
+    rank() over (order by count(*) desc, min(te.PostId)) as TagPopularityRank
+  from tag_expansion te
+  group by te.tag
+),
+user_recent_window as (
+  select
+    p.OwnerUserId as UserId,
+    p.Id as PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    row_number() over (partition by p.OwnerUserId order by p.CreationDate desc, p.Id desc) as rn,
+    sum(p.Score) over (partition by p.OwnerUserId order by p.CreationDate rows between unbounded preceding and current row) as CumScore
+  from recent_posts p
+  where p.OwnerUserId is not null
+),
+dedup_latest_user_posts as (
+  select urw.*
+  from user_recent_window urw
+  where urw.rn <= 5
+),
+post_history_flags as (
+  select
+    ph.PostId,
+    max(case when ph.PostHistoryTypeId in (10,35) then 1 else 0 end) as WasClosedOrMigrated,
+    max(case when ph.PostHistoryTypeId in (11) then 1 else 0 end) as WasReopened,
+    max(case when ph.PostHistoryTypeId in (12) then 1 else 0 end) as WasDeleted,
+    max(case when ph.PostHistoryTypeId in (13) then 1 else 0 end) as WasUndeleted,
+    max(case when ph.PostHistoryTypeId in (50) then 1 else 0 end) as WasCommunityBump,
+    count(*) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9)) as EditEvents,
+    max(ph.CreationDate) as LastHistoryDate
+  from PostHistory ph
+  group by ph.PostId
+),
+qualified_posts as (
+  select
+    rp.Id,
+    rp.PostTypeId,
+    rp.OwnerUserId,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.Title,
+    rp.Tags,
+    rp.ClosedDate,
+    rp.AcceptedAnswerId,
+    rp.ParentId,
+    rp.OwnerDisplayName,
+    pv.UpVotes as VoteUps,
+    pv.DownVotes as VoteDowns,
+    pv.Favorites as VoteFavorites,
+    pv.BountyTotal,
+    pv.BountyEvents,
+    cs.CommentCount,
+    cs.LastCommentDate,
+    cs.AvgCommentScore,
+    cs.PositiveComments,
+    qa.AnswerCount,
+    qa.MaxAnswerScore,
+    qa.AvgAnswerScore,
+    qa.LastAnswerDate,
+    qa.HasAccepted,
+    pla.LinkedCount,
+    pla.DuplicateCount,
+    pla.TotalLinks,
+    phf.WasClosedOrMigrated,
+    phf.WasReopened,
+    phf.WasDeleted,
+    phf.WasUndeleted,
+    phf.WasCommunityBump,
+    phf.EditEvents,
+    phf.LastHistoryDate
+  from recent_posts rp
+  left join post_votes pv on pv.PostId = rp.Id
+  left join comment_stats cs on cs.PostId = rp.Id
+  left join question_answers qa on qa.QuestionId = rp.Id
+  left join post_links_agg pla on pla.PostId = rp.Id
+  left join post_history_flags phf on phf.PostId = rp.Id
+),
+score_buckets as (
+  select
+    qp.*,
+    case
+      when qp.Score >= 100 then 'S5: legendary'
+      when qp.Score >= 25 then 'S4: great'
+      when qp.Score >= 10 then 'S3: good'
+      when qp.Score >= 1 then 'S2: ok'
+      when qp.Score = 0 then 'S1: neutral'
+      else 'S0: negative'
+    end as ScoreBucket,
+    case
+      when coalesce(qp.AnswerCount,0) = 0 and qp.PostTypeId = 1 then 'unanswered'
+      when coalesce(qp.AnswerCount,0) > 0 and coalesce(qp.HasAccepted,0) = 0 then 'answered-no-accept'
+      when coalesce(qp.HasAccepted,0) = 1 then 'accepted'
+      else 'n/a'
+    end as AnswerStatus
+  from qualified_posts qp
+),
+user_enriched as (
+  select
+    ua.*,
+    case
+      when ua.Reputation >= 100000 then 'diamond'
+      when ua.Reputation >= 25000 then 'platinum'
+      when ua.Reputation >= 10000 then 'gold'
+      when ua.Reputation >= 3000 then 'silver'
+      when ua.Reputation >= 1000 then 'bronze'
+      else 'newbie'
+    end as RepTier,
+    (ua.UpVotes - ua.DownVotes) as NetVotes,
+    coalesce(nullif(trim(ua.Location), ''), 'unknown') as LocationNorm
+  from user_activity ua
+),
+post_with_user as (
+  select
+    sb.*,
+    ue.Reputation,
+    ue.DisplayName as UserDisplayName,
+    ue.RepTier,
+    ue.NetVotes as UserNetVotes,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ue.BronzeBadges,
+    ue.LastBadgeDate,
+    ue.LocationNorm
+  from score_buckets sb
+  left join user_enriched ue on ue.UserId = sb.OwnerUserId
+),
+tagged_posts as (
+  select
+    pwu.*,
+    tr.TagPopularityRank,
+    tr.TagUsage,
+    min(tr.TagPopularityRank) over (partition by pwu.Id) as MinPostTagRank
+  from post_with_user pwu
+  left join tag_expansion te on te.PostId = pwu.Id
+  left join tag_rank tr on tr.tag = te.tag
+),
+activity_windows as (
+  select
+    tp.*,
+    count(*) over (partition by tp.OwnerUserId) as UserPostWindowCount,
+    max(tp.CreationDate) over (partition by tp.OwnerUserId) as UserLastPostDate,
+    avg(tp.Score) over (partition by tp.OwnerUserId) as UserAvgPostScore,
+    percentile_cont(0.9) within group (order by tp.Score) over (partition by tp.OwnerUserId) as UserP90Score
+  from tagged_posts tp
+),
+dup_candidates as (
+  select
+    q1.Id as PostId,
+    q2.Id as CandidateId,
+    q2.Score as CandidateScore,
+    q2.Title as CandidateTitle,
+    similarity := (
+      case
+        when q1.Title is null or q2.Title is null then 0
+        else greatest(0, 1 - (abs(length(q1.Title) - length(q2.Title))::numeric / nullif(greatest(length(q1.Title), length(q2.Title)),0)))
+      end
+    )
+  from recent_posts q1
+  join recent_posts q2 on q1.PostTypeId = q2.PostTypeId and q1.PostTypeId = 1 and q1.Id <> q2.Id
+  where q1.CreationDate >= q2.CreationDate - interval '7 days'
+),
+dup_pick as (
+  select distinct on (dc.PostId)
+    dc.PostId,
+    dc.CandidateId,
+    dc.CandidateScore
+  from dup_candidates dc
+  where dc.similarity > 0.8
+  order by dc.PostId, dc.CandidateScore desc, dc.CandidateId
+),
+final_set as (
+  select
+    aw.*,
+    dp.CandidateId as PossibleDupOf
+  from activity_windows aw
+  left join dup_pick dp on dp.PostId = aw.Id
+),
+-- produce two cohorts and combine with set operator
+high_value as (
+  select
+    f.*,
+    true as HighValueCohort
+  from final_set f
+  where
+    (coalesce(f.VoteUps,0) - coalesce(f.VoteDowns,0)) >= 10
+    or coalesce(f.BountyTotal,0) > 0
+    or (f.PostTypeId = 1 and coalesce(f.AnswerCount,0) >= 3)
+),
+emerging as (
+  select
+    f.*,
+    false as HighValueCohort
+  from final_set f
+  where
+    f.CreationDate >= now() - interval '30 days'
+    and coalesce(f.VoteUps,0) between 1 and 9
+)
+select
+  x.Id,
+  x.PostTypeId,
+  x.OwnerUserId,
+  x.OwnerDisplayName,
+  x.CreationDate,
+  x.Title,
+  x.Tags,
+  x.Score,
+  x.ScoreBucket,
+  x.AnswerStatus,
+  x.ViewCount,
+  x.VoteUps,
+  x.VoteDowns,
+  x.VoteFavorites,
+  x.BountyTotal,
+  x.BountyEvents,
+  x.CommentCount,
+  x.AvgCommentScore,
+  x.PositiveComments,
+  x.AnswerCount,
+  x.MaxAnswerScore,
+  x.AvgAnswerScore,
+  x.LinkedCount,
+  x.DuplicateCount,
+  x.TotalLinks,
+  x.WasClosedOrMigrated,
+  x.WasReopened,
+  x.WasDeleted,
+  x.WasUndeleted,
+  x.EditEvents,
+  x.LastHistoryDate,
+  x.Reputation,
+  x.UserDisplayName,
+  x.RepTier,
+  x.UserNetVotes,
+  x.GoldBadges,
+  x.SilverBadges,
+  x.BronzeBadges,
+  x.LocationNorm,
+  x.TagPopularityRank,
+  x.TagUsage,
+  x.MinPostTagRank,
+  x.UserPostWindowCount,
+  x.UserLastPostDate,
+  x.UserAvgPostScore,
+  x.UserP90Score,
+  x.PossibleDupOf,
+  case when x.HighValueCohort then 'high-value' else 'emerging' end as CohortLabel,
+  coalesce(x.MinPostTagRank, 999999) + (1000 - least(1000, coalesce(x.VoteUps,0))) + (case when x.AnswerStatus = 'accepted' then -500 else 0 end) as ComplexityScore
+from (
+  select * from high_value
+  union all
+  select * from emerging
+) x
+where
+  -- complex predicate with nulls and string ops
+  (
+    x.Title ilike any (array['%sql%','%join%','%index%'])
+    or (x.Tags is not null and position('sql' in lower(x.Tags)) > 0)
+  )
+  and not (x.WasDeleted = 1 and x.WasUndeleted = 0)
+  and coalesce(x.ViewCount,0) >= 10
+order by
+  x.Score desc nulls last,
+  x.ViewCount desc nulls last,
+  x.CreationDate desc
+limit 250;

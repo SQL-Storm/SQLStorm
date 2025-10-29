@@ -1,0 +1,116 @@
+-- {"query": "5567.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 903} 
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= NOW() - INTERVAL '90 days'
+),
+tag_stats AS (
+  SELECT
+    unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag,
+    count(*) AS post_count
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+  GROUP BY 1
+),
+top_tags AS (
+  SELECT tag
+  FROM tag_stats
+  ORDER BY post_count DESC
+  LIMIT 10
+),
+cross_joined AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.CreationDate,
+    q.Score AS PostScore,
+    q.ViewCount,
+    q.Tags,
+    q.OwnerUserId,
+    q.LastActivityDate,
+    q.CommentCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    u.DisplayName AS OwnerDisplayName,
+    v.VoteTypeId,
+    v.CreationDate AS VoteDate,
+    t.Name AS VoteTypeName
+  FROM recent_questions q
+  LEFT JOIN Users u ON q.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = q.PostId
+  LEFT JOIN VoteTypes t ON v.VoteTypeId = t.Id
+  WHERE v.VoteTypeId IN (2, 3) -- UpMod/DownMod as a performance signal
+  AND v.CreationDate >= NOW() - INTERVAL '180 days'
+),
+aggregated AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.CreationDate,
+    q.PostScore,
+    q.ViewCount,
+    q.OwnerDisplayName,
+    AVG(CASE WHEN v.VoteTypeId = 2 THEN 1.0 ELSE -1.0 END) OVER (PARTITION BY q.PostId) AS NetVoteScore,
+    COUNT(DISTINCT t.Id) FILTER (WHERE t.Id IS NOT NULL) OVER (PARTITION BY q.PostId) AS TagCount,
+    STRING_AGG(DISTINCT t.Name, ',') FILTER (WHERE t.Name IS NOT NULL) OVER (PARTITION BY q.PostId) AS AllVoteTypes,
+    q.LastActivityDate,
+    q.CommentCount,
+    q.AnswerCount,
+    q.FavoriteCount
+  FROM cross_joined q
+  LEFT JOIN Tags t ON t.TagName = ANY(string_to_array(substr(q.Tags, 2, length(q.Tags)-2), '><'))
+  GROUP BY
+    q.PostId,
+    q.Title,
+    q.CreationDate,
+    q.PostScore,
+    q.ViewCount,
+    q.OwnerDisplayName,
+    q.LastActivityDate,
+    q.CommentCount,
+    q.AnswerCount,
+    q.FavoriteCount
+),
+ranked AS (
+  SELECT
+    a.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY a.OwnerDisplayName
+      ORDER BY a.NetVoteScore DESC NULLS LAST,
+               a.LastActivityDate DESC NULLS LAST,
+               a.ViewCount DESC
+    ) AS rn
+  FROM aggregated a
+  WHERE a.OwnerDisplayName IS NOT NULL
+)
+SELECT
+  r.PostId,
+  r.Title,
+  r.CreationDate,
+  r.PostScore,
+  r.ViewCount,
+  r.OwnerDisplayName,
+  r.NetVoteScore,
+  r.TagCount,
+  r.AllVoteTypes,
+  r.LastActivityDate,
+  r.CommentCount,
+  r.AnswerCount,
+  r.FavoriteCount,
+  (SELECT STRING_AGG(Name, ';') FROM Badges b WHERE b.UserId = (SELECT Id FROM Users u2 WHERE u2.DisplayName = r.OwnerDisplayName LIMIT 1)) AS OwnerBadges,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = r.PostId) AS RelatedLinks
+FROM ranked r
+WHERE r.rn <= 5
+ORDER BY r.NetVoteScore DESC NULLS LAST, r.LastActivityDate DESC NULLS LAST;

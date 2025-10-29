@@ -1,0 +1,144 @@
+with recursive TagHierarchy as (
+    select t.Id, t.TagName, 1 as Level, array[t.TagName] as AncestorTags
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+  union all
+    select t.Id, t.TagName, th.Level + 1, th.AncestorTags || t.TagName
+    from Tags t
+    join TagHierarchy th on t.Id <> th.Id and NOT t.TagName = any(th.AncestorTags)
+    where th.Level < 3
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        coalesce(sum(v_ct.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(v_ct.DownVotes),0) as TotalDownVotes,
+        rank() over (order by count(distinct p.Id) filter (where p.PostTypeId = 1) desc) as QuestionRank,
+        dense_rank() over (partition by u.Location order by count(distinct p.Id) filter (where p.PostTypeId = 2) desc) as LocationAnswerRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select
+            v.PostId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        group by v.PostId
+    ) v_ct on v_ct.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Location
+),
+LatestPostHistories as (
+    select distinct on (ph.PostId) ph.PostId, ph.CreationDate, ph.PostHistoryTypeId, ph.Comment, ph.UserId, ph.UserDisplayName
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10, 11, 12, 13)
+    order by ph.PostId, ph.CreationDate desc
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId, q.Title, q.CreationDate as QuestionCreationDate,
+        a.Id as AnswerId, a.CreationDate as AnswerCreationDate, a.Score as AnswerScore,
+        (select count(*) from Comments c where c.PostId = a.Id) as AnswerCommentCount,
+        rank() over (partition by q.Id order by a.Score desc) as AnswerRank,
+        case when q.AcceptedAnswerId = a.Id then 1 else 0 end as IsAcceptedAnswer,
+        array_length(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><'), 1) as TagCount,
+        q.Tags
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+HighScoreDuplicates as (
+    select pl.PostId as DuplicatePostId, pl.RelatedPostId as OriginalPostId
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where lt.Name = 'Duplicate'
+      and (select score from Posts where Id = pl.PostId) > 10
+),
+AggregatedUserBadges as (
+    select
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        count(distinct case when b.TagBased = 1 then b.Name end) as DistinctTagBadges
+    from Badges b
+    group by b.UserId
+)
+select 
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    au.GoldBadges,
+    au.SilverBadges,
+    au.BronzeBadges,
+    au.DistinctTagBadges,
+    qa.QuestionId,
+    qa.Title as QuestionTitle,
+    qa.AnswerId,
+    qa.AnswerScore,
+    qa.AnswerCommentCount,
+    qa.AnswerRank,
+    qa.IsAcceptedAnswer,
+    qa.TagCount,
+    coalesce(ltc.Name, 'No Close Action') as LastCloseAction,
+    array_to_string(th.AncestorTags, ' > ') as TagHierarchySample,
+    case 
+        when ua.TotalUpVotes = 0 and ua.TotalDownVotes = 0 then null
+        when ua.TotalDownVotes = 0 then cast(ua.TotalUpVotes as double precision)
+        else cast(ua.TotalUpVotes as double precision) / nullif(ua.TotalDownVotes,0)
+    end as UpDownVoteRatio,
+    concat(substring(u.EmailHash from 1 for 8), repeat('*', 24)) as AnonEmailHash
+from UserActivity ua
+left join AggregatedUserBadges au on au.UserId = ua.UserId
+left join QuestionAnswerStats qa on qa.QuestionId in (
+    select p.Id from Posts p where p.OwnerUserId = ua.UserId and p.PostTypeId = 1 limit 1
+)
+left join LatestPostHistories lph on lph.PostId = qa.QuestionId and lph.PostHistoryTypeId = 10
+left join CloseReasonTypes ltc on ltc.Id = cast(lph.Comment as integer)
+left join TagHierarchy th on th.Level = 1
+join Users u on u.Id = ua.UserId
+where ua.QuestionsCount > 5
+order by ua.QuestionsCount desc, ua.TotalUpVotes desc
+limit 100
+
+union all
+
+select
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    au.GoldBadges,
+    au.SilverBadges,
+    au.BronzeBadges,
+    au.DistinctTagBadges,
+    cast(null as integer) as QuestionId,
+    cast(null as varchar) as QuestionTitle,
+    cast(null as integer) as AnswerId,
+    cast(null as integer) as AnswerScore,
+    cast(null as integer) as AnswerCommentCount,
+    cast(null as integer) as AnswerRank,
+    cast(null as integer) as IsAcceptedAnswer,
+    cast(null as integer) as TagCount,
+    'No Close Action' as LastCloseAction,
+    cast(null as varchar) as TagHierarchySample,
+    case 
+        when ua.TotalUpVotes = 0 and ua.TotalDownVotes = 0 then null
+        when ua.TotalDownVotes = 0 then cast(ua.TotalUpVotes as double precision)
+        else cast(ua.TotalUpVotes as double precision) / nullif(ua.TotalDownVotes,0)
+    end as UpDownVoteRatio,
+    concat(substring(u.EmailHash from 1 for 8), repeat('*', 24)) as AnonEmailHash
+from UserActivity ua
+left join AggregatedUserBadges au on au.UserId = ua.UserId
+join Users u on u.Id = ua.UserId
+where ua.QuestionsCount <= 5
+order by ua.QuestionsCount desc, ua.TotalUpVotes desc
+limit 50;

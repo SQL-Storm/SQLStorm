@@ -1,0 +1,178 @@
+WITH RECURSIVE TagHierarchy AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Id AS RootTagId,
+        0 AS Level
+    FROM Tags t
+    WHERE t.TagName IN ('sql', 'performance', 'optimization', 'query', 'database')
+
+    UNION ALL
+
+    SELECT
+        t_child.Id AS TagId,
+        t_child.TagName,
+        th.RootTagId,
+        th.Level + 1 AS Level
+    FROM TagHierarchy th
+    JOIN Posts p ON EXISTS (
+        SELECT 1
+        FROM (
+            SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag_name
+        ) AS tag_list
+        WHERE tag_list.tag_name = th.TagName
+    )
+    JOIN PostLinks pl ON p.Id = pl.PostId
+    JOIN Posts related_post ON pl.RelatedPostId = related_post.Id
+    JOIN Tags t_related ON EXISTS (
+        SELECT 1
+        FROM (
+            SELECT unnest(string_to_array(substring(related_post.Tags, 2, length(related_post.Tags) - 2), '><')) AS tag_name
+        ) AS related_tags
+        WHERE related_tags.tag_name = t_related.TagName
+    )
+    JOIN Tags t_child ON t_related.TagName = t_child.TagName
+    WHERE th.Level < 3
+),
+RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS RecencyRank,
+        SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS PositiveCommentCount,
+        LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PreviousPostScore,
+        p.Tags,
+        p.CreationDate
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.ViewCount) AS AvgViewCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 -- Only consider questions for this part
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+TagPostCounts AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id ELSE NULL END) AS PositiveScorePostCount,
+        COUNT(DISTINCT CASE WHEN p.AnswerCount > 0 THEN p.Id ELSE NULL END) AS PostsWithAnswers
+    FROM Tags t
+    JOIN Posts p ON EXISTS (
+        SELECT 1
+        FROM (
+            SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag_name
+        ) AS tag_list
+        WHERE tag_list.tag_name = t.TagName
+    )
+    WHERE t.TagName IN (SELECT TagName FROM TagHierarchy)
+    GROUP BY t.TagName
+)
+SELECT
+    RP.PostId,
+    RP.Title,
+    RP.Score,
+    RP.AnswerCount,
+    RP.FavoriteCount,
+    RP.ViewCount,
+    RP.OwnerDisplayName,
+    RP.ScoreRank,
+    RP.RecencyRank,
+    RP.PositiveCommentCount,
+    RP.PreviousPostScore,
+    TH.TagName AS RelatedTag,
+    TPC.PostCount AS RelatedTagPostCount,
+    UA.TotalPosts AS OwnerTotalPosts,
+    UA.TotalScore AS OwnerTotalScore,
+    UA.AvgViewCount AS OwnerAvgViewCount,
+    CASE
+        WHEN RP.Score > 100 AND RP.AnswerCount > 5 THEN 'High Engagement'
+        WHEN RP.Score < 0 THEN 'Negative Score'
+        WHEN RP.ViewCount > 10000 THEN 'High Visibility'
+        ELSE 'Standard'
+    END AS PostEngagementCategory,
+    COALESCE(RP.OwnerUserId, -1) AS SafeOwnerUserId,
+    LPAD(CAST(RP.PostId AS VARCHAR), 10, '0') AS PaddedPostId,
+    'Post: ' || RP.Title AS PostDescription
+FROM RankedPosts RP
+LEFT JOIN TagHierarchy TH ON EXISTS (
+    SELECT 1
+    FROM (
+        SELECT unnest(string_to_array(substring(RP.Tags, 2, length(RP.Tags) - 2), '><')) AS tag_name
+    ) AS rp_tags
+    WHERE rp_tags.tag_name = TH.TagName
+) AND TH.Level > 0
+LEFT JOIN TagPostCounts TPC ON TH.TagName = TPC.TagName
+LEFT JOIN UserActivity UA ON RP.OwnerUserId = UA.UserId
+WHERE RP.ScoreRank <= 10
+  AND RP.RecencyRank <= 50
+  AND RP.PositiveCommentCount > 0
+  AND RP.ViewCount > 500
+  AND RP.OwnerUserId IS NOT NULL
+  AND RP.Score + RP.AnswerCount * 5 > 20
+  AND RP.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365' DAY
+  AND EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        JOIN Posts rp_related ON pl.RelatedPostId = rp_related.Id
+        WHERE pl.PostId = RP.PostId
+        AND pl.LinkTypeId = 1
+        AND rp_related.Score > 0
+  )
+
+UNION
+
+SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ViewCount,
+    u.DisplayName AS OwnerDisplayName,
+    NULL AS ScoreRank,
+    NULL AS RecencyRank,
+    NULL AS PositiveCommentCount,
+    NULL AS PreviousPostScore,
+    t.TagName AS RelatedTag,
+    NULL AS RelatedTagPostCount,
+    NULL AS OwnerTotalPosts,
+    NULL AS OwnerTotalScore,
+    NULL AS OwnerAvgViewCount,
+    'Exclusive Tag Post' AS PostEngagementCategory,
+    COALESCE(p.OwnerUserId, -1) AS SafeOwnerUserId,
+    LPAD(CAST(p.Id AS VARCHAR), 10, '0') AS PaddedPostId,
+    'Community Tag Post: ' || p.Title AS PostDescription
+FROM Posts p
+JOIN Tags t ON EXISTS (
+    SELECT 1
+    FROM (
+        SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag_name
+    ) AS p_tags
+    WHERE p_tags.tag_name = t.TagName
+)
+JOIN Users u ON p.OwnerUserId = u.Id
+WHERE t.TagName = 'sql'
+  AND p.PostTypeId = 1
+  AND p.Score > 50
+  AND NOT EXISTS (SELECT 1 FROM RankedPosts RP WHERE RP.PostId = p.Id)
+ORDER BY Score DESC;

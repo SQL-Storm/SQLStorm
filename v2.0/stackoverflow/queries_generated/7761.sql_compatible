@@ -1,0 +1,158 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        AVG(p.Score) as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ', ') as TagActivity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        Reputation,
+        DisplayName,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        RANK() OVER (ORDER BY Reputation DESC) as RankByReputation,
+        RANK() OVER (ORDER BY PostCount DESC) as RankByPostCount
+    FROM UserActivityStats
+    WHERE PostCount > 0
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question without Accepted Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostCategory,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as TotalInteractions,
+        CASE 
+            WHEN p.Score > 0 AND p.Score < 10 THEN 'Low Score'
+            WHEN p.Score >= 10 AND p.Score < 50 THEN 'Medium Score'
+            WHEN p.Score >= 50 THEN 'High Score'
+            ELSE 'Zero or Negative Score'
+        END as ScoreCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostSequence,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextScore,
+        p.PostTypeId as pa_PostTypeId,
+        p.OwnerUserId as pa_OwnerUserId
+    FROM Posts p
+    WHERE p.CreationDate >= DATE '2015-01-01'
+),
+ActivitySummary AS (
+    SELECT 
+        p.PostId,
+        p.Title,
+        p.Score,
+        p.TotalInteractions,
+        p.ScoreCategory,
+        p.UserPostSequence,
+        u.DisplayName as OwnerName,
+        u.Reputation,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite User'
+            WHEN u.Reputation > 1000 THEN 'Veteran User'
+            WHEN u.Reputation > 100 THEN 'Regular User'
+            ELSE 'New User'
+        END as UserTier,
+        CASE 
+            WHEN p.UserPostSequence = 1 AND p.Score > 100 THEN 'High Impact First Post'
+            WHEN p.UserPostSequence = 1 THEN 'First Post'
+            WHEN p.Score > 100 THEN 'High Impact'
+            ELSE 'Regular'
+        END as PostImpact,
+        COALESCE((p.Score - p.PreviousScore), 0) as ScoreChangeFromPrevious,
+        COALESCE((p.NextScore - p.Score), 0) as ScoreChangeToNext,
+        CASE 
+            WHEN p.Score > 1000 THEN 'Viral Potential'
+            WHEN p.Score > 100 THEN 'Good Potential'
+            WHEN p.Score > 10 THEN 'Average Potential'
+            ELSE 'Low Potential'
+        END as ContentPotential,
+        p.pa_OwnerUserId,
+        p.pa_PostTypeId
+    FROM PostAnalysis p
+    JOIN Users u ON p.OwnerUserId = u.Id
+)
+SELECT 
+    a.PostId,
+    a.Title,
+    a.Score,
+    a.TotalInteractions,
+    a.ScoreCategory,
+    a.OwnerName,
+    a.Reputation,
+    a.UserTier,
+    a.PostImpact,
+    a.ScoreChangeFromPrevious,
+    a.ScoreChangeToNext,
+    a.ContentPotential,
+    t.RankByReputation,
+    t.RankByPostCount,
+    CASE 
+        WHEN t.RankByReputation <= 10 AND a.Score > 100 THEN 'Top Performer'
+        WHEN t.RankByPostCount <= 5 AND a.Score > 50 THEN 'High Activity'
+        WHEN a.Score > 500 AND a.TotalInteractions > 100 THEN 'Star Content'
+        WHEN a.Score > 1000 THEN 'Viral Content'
+        ELSE 'Standard Content'
+    END as ContentClassification,
+    ('User Rank: ' || t.RankByReputation || ' | Post #' || a.UserPostSequence || ' | ' ||
+           CASE WHEN a.PostImpact = 'High Impact First Post' THEN 'First Post - High Impact' ELSE a.PostImpact END) as PostContext,
+    CASE 
+        WHEN a.ScoreChangeFromPrevious > 100 THEN 'Drastic Increase'
+        WHEN a.ScoreChangeFromPrevious < -100 THEN 'Drastic Decrease'
+        WHEN a.ScoreChangeFromPrevious = 0 THEN 'No Change'
+        ELSE 'Stable'
+    END as ScoreTrend,
+    CASE 
+        WHEN a.ScoreCategory = 'High Score' AND a.ContentPotential = 'Viral Potential' THEN 'Premium Quality'
+        WHEN a.ScoreCategory = 'Medium Score' AND a.TotalInteractions > 50 THEN 'Good Quality'
+        WHEN a.ScoreCategory = 'Low Score' AND a.TotalInteractions > 10 THEN 'Underperforming'
+        ELSE 'Average Quality'
+    END as QualityAssessment,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = a.pa_OwnerUserId AND p2.CreationDate >= DATE '2022-01-01') as RecentPostCount,
+    (SELECT AVG(p3.Score) FROM Posts p3 WHERE p3.OwnerUserId = a.pa_OwnerUserId AND p3.CreationDate >= DATE '2022-01-01') as AvgRecentScore,
+    (SELECT MIN(p4.Score) FROM Posts p4 WHERE p4.OwnerUserId = a.pa_OwnerUserId AND p4.PostTypeId = 1) as MinQuestionScore,
+    (SELECT AVG(p5.Score) FROM Posts p5 WHERE p5.OwnerUserId = a.pa_OwnerUserId AND p5.PostTypeId = 2) as AvgAnswerScore,
+    CASE 
+        WHEN a.Score > (SELECT AVG(p6.Score) FROM Posts p6 WHERE p6.PostTypeId = 1) 
+         AND a.TotalInteractions > (SELECT AVG(p7.TotalInteractions) FROM PostAnalysis p7 WHERE p7.pa_PostTypeId = 1) 
+        THEN 'Above Average'
+        WHEN a.Score < (SELECT AVG(p8.Score) FROM Posts p8 WHERE p8.PostTypeId = 1) 
+         AND a.TotalInteractions < (SELECT AVG(p9.TotalInteractions) FROM PostAnalysis p9 WHERE p9.pa_PostTypeId = 1) 
+        THEN 'Below Average'
+        ELSE 'Average'
+    END as PerformanceRating
+FROM ActivitySummary a
+JOIN TopUsers t ON a.OwnerName = t.DisplayName
+WHERE a.ScoreCategory IN ('High Score', 'Medium Score')
+  AND a.OwnerName IS NOT NULL
+  AND a.ContentPotential IN ('Viral Potential', 'Good Potential', 'Average Potential')
+ORDER BY a.Score DESC, a.TotalInteractions DESC, t.RankByReputation ASC
+LIMIT 500;

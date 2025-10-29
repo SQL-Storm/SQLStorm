@@ -1,0 +1,267 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+        date_trunc('month', u.creationdate) as cohort_month,
+        row_number() over (order by u.creationdate desc, u.id desc) as rn_global
+    from users u
+),
+user_activity as (
+    select
+        u.user_id,
+        count(distinct p.id) filter (where p.posttypeid in (1,2)) as total_posts,
+        count(*) filter (where c.id is not null) as total_comments,
+        sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes_cast,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+    from recent_users u
+    left join posts p on p.owneruserid = u.user_id
+    left join comments c on c.userid = u.user_id
+    left join votes v on v.userid = u.user_id
+    group by u.user_id
+),
+question_stats as (
+    select
+        q.owneruserid as user_id,
+        count(*) as questions,
+        sum(coalesce(q.viewcount,0)) as total_views,
+        avg(nullif(q.viewcount,0)) as avg_nonzero_views,
+        sum(case when q.acceptedanswerid is not null then 1 else 0 end) as accepted_q_count,
+        percentile_cont(0.5) within group (order by coalesce(q.score,0)) as median_q_score
+    from posts q
+    where q.posttypeid = 1
+    group by q.owneruserid
+),
+answer_stats as (
+    select
+        a.owneruserid as user_id,
+        count(*) as answers,
+        sum(coalesce(a.score,0)) as answer_score_sum,
+        avg(coalesce(a.score,0)) as avg_answer_score,
+        sum(case when a.score > 0 then 1 else 0 end) as positive_answers
+    from posts a
+    where a.posttypeid = 2
+    group by a.owneruserid
+),
+dup_links as (
+    select
+        pl.postid,
+        pl.relatedpostid,
+        pl.linktypeid,
+        case when pl.linktypeid = 3 then 1 else 0 end as is_duplicate
+    from postlinks pl
+),
+edits_cte as (
+    select
+        ph.userid as user_id,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+        count(*) filter (where ph.posthistorytypeid = 10) as closed_events,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopened_events,
+        max(ph.creationdate) as last_edit_activity
+    from posthistory ph
+    group by ph.userid
+),
+tag_usage as (
+    select
+        p.owneruserid as user_id,
+        lower(trim(t.tag)) as tag,
+        count(*) as tag_uses
+    from posts p
+    cross join lateral unnest(
+        case
+            when p.tags is not null and length(p.tags) > 2
+            then string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+            else cast(array[] as varchar[])
+        end
+    ) as t(tag)
+    group by p.owneruserid, lower(trim(t.tag))
+),
+top_tags as (
+    select user_id, tag, tag_uses,
+           row_number() over (partition by user_id order by tag_uses desc, tag asc) as rn
+    from tag_usage
+),
+user_badges as (
+    select
+        b.userid as user_id,
+        count(*) as badges_total,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        sum(case when b.tagbased = true then 1 else 0 end) as tag_badges
+    from badges b
+    group by b.userid
+),
+post_vote_agg as (
+    select
+        p.owneruserid as user_id,
+        sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as post_net_votes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites_legacy
+    from posts p
+    left join votes v on v.postid = p.id
+    group by p.owneruserid
+),
+comment_quality as (
+    select
+        c.userid as user_id,
+        avg(coalesce(c.score,0)) as avg_comment_score,
+        max(coalesce(c.score,0)) as max_comment_score,
+        sum(case when c.text ~* '\b(thanks|thank you|great)\b' then 1 else 0 end) as gratitude_comments
+    from comments c
+    group by c.userid
+),
+user_rank as (
+    select
+        u.user_id,
+        dense_rank() over (order by coalesce(qs.total_views,0) desc, coalesce(pa.post_net_votes,0) desc, u.reputation desc) as popularity_rank,
+        dense_rank() over (order by coalesce(ast.answer_score_sum,0) desc) as answerer_rank,
+        dense_rank() over (order by coalesce(ua.total_posts,0) desc) as activity_rank
+    from recent_users u
+    left join question_stats qs on qs.user_id = u.user_id
+    left join answer_stats ast on ast.user_id = u.user_id
+    left join post_vote_agg pa on pa.user_id = u.user_id
+    left join user_activity ua on ua.user_id = u.user_id
+),
+growth_windows as (
+    select
+        p.owneruserid as user_id,
+        date_trunc('month', p.creationdate) as month,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        sum(coalesce(p.score,0)) as score_sum
+    from posts p
+    group by p.owneruserid, date_trunc('month', p.creationdate)
+),
+growth_rates as (
+    select
+        g.user_id,
+        sum(g.q_count) as total_q,
+        sum(g.a_count) as total_a,
+        sum(g.score_sum) as total_score,
+        sum(g.a_count) over (partition by g.user_id order by g.month rows between 2 preceding and current row) as a_3mo_moving,
+        sum(g.q_count) over (partition by g.user_id order by g.month rows between 2 preceding and current row) as q_3mo_moving
+    from growth_windows g
+    group by g.user_id
+),
+final as (
+    select
+        u.user_id,
+        u.displayname,
+        u.location_norm,
+        u.reputation,
+        u.cohort_month,
+        ua.total_posts,
+        ua.total_comments,
+        ua.net_votes_cast,
+        ua.bounty_started - ua.bounty_awarded as bounty_net,
+        qs.questions,
+        qs.total_views,
+        qs.avg_nonzero_views,
+        qs.accepted_q_count,
+        qs.median_q_score,
+        ast.answers,
+        ast.answer_score_sum,
+        ast.avg_answer_score,
+        ast.positive_answers,
+        ec.edit_events,
+        ec.closed_events,
+        ec.reopened_events,
+        ec.last_edit_activity,
+        pa.post_net_votes,
+        pa.favorites_legacy,
+        cq.avg_comment_score,
+        cq.max_comment_score,
+        cq.gratitude_comments,
+        ub.badges_total,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        ub.tag_badges,
+        ur.popularity_rank,
+        ur.answerer_rank,
+        ur.activity_rank,
+        gr.total_q,
+        gr.total_a,
+        gr.total_score,
+        gr.a_3mo_moving,
+        gr.q_3mo_moving,
+        tt1.tag as top_tag_1,
+        tt2.tag as top_tag_2,
+        tt3.tag as top_tag_3,
+        case
+            when coalesce(ast.answers,0) > coalesce(qs.questions,0) then 'Answer-heavy'
+            when coalesce(qs.questions,0) > coalesce(ast.answers,0) then 'Question-heavy'
+            when coalesce(ast.answers,0) = 0 and coalesce(qs.questions,0) = 0 then 'Lurker'
+            else 'Balanced'
+        end as contribution_style,
+        case when u.rn_global <= 100 then 'NewlyJoinedTop100' else 'Other' end as cohort_flag
+    from recent_users u
+    left join user_activity ua on ua.user_id = u.user_id
+    left join question_stats qs on qs.user_id = u.user_id
+    left join answer_stats ast on ast.user_id = u.user_id
+    left join edits_cte ec on ec.user_id = u.user_id
+    left join post_vote_agg pa on pa.user_id = u.user_id
+    left join comment_quality cq on cq.user_id = u.user_id
+    left join user_badges ub on ub.user_id = u.user_id
+    left join user_rank ur on ur.user_id = u.user_id
+    left join growth_rates gr on gr.user_id = u.user_id
+    left join top_tags tt1 on tt1.user_id = u.user_id and tt1.rn = 1
+    left join top_tags tt2 on tt2.user_id = u.user_id and tt2.rn = 2
+    left join top_tags tt3 on tt3.user_id = u.user_id and tt3.rn = 3
+)
+select
+    f.*,
+    (
+        select min(a.creationdate) - min(q.creationdate)
+        from posts q
+        join posts a on a.id = q.acceptedanswerid
+        where q.posttypeid = 1
+          and q.owneruserid = f.user_id
+    ) as time_to_first_accept,
+    (
+        select max(ph.creationdate)
+        from posthistory ph
+        where ph.postid in (
+            select p.id
+            from posts p
+            where p.owneruserid = f.user_id
+        ) and ph.posthistorytypeid in (10,35,36,37,38)
+    ) as last_moderation_event,
+    case
+        when coalesce(f.badges_total,0) >= 50
+         and coalesce(f.total_score,0) >= 500
+         and coalesce(f.post_net_votes,0) >= 200
+         and coalesce(f.avg_answer_score,0) > 1.5
+         and coalesce(f.questions,0) + coalesce(f.answers,0) >= 100
+         and (f.top_tag_1 is not null or f.top_tag_2 is not null)
+        then 1 else 0
+    end as is_power_user,
+    trim(both ' ' from coalesce(f.displayname,'') || ' [' ||
+        coalesce(f.top_tag_1,'?') || ',' || coalesce(f.top_tag_2,'?') || ',' || coalesce(f.top_tag_3,'?') || ']'
+    ) as display_with_top_tags,
+    nullif(regexp_replace(coalesce(u.websiteurl,''), '^https?://([^/]+)/?.*$', '\1'), '') as website_domain
+from final f
+left join users u on u.id = f.user_id
+where
+    (
+        (f.popularity_rank <= 500 or f.answerer_rank <= 500 or f.activity_rank <= 500)
+        and coalesce(f.reputation,0) >= 100
+        and (
+            f.contribution_style in ('Answer-heavy','Balanced')
+            or (f.contribution_style = 'Question-heavy' and coalesce(f.accepted_q_count,0) >= 5)
+        )
+    )
+    and not (
+        coalesce(f.post_net_votes,0) < -50
+        and coalesce(f.avg_comment_score,0) < 0
+        and coalesce(f.gratitude_comments,0) = 0
+    )
+order by
+    is_power_user desc,
+    coalesce(f.post_net_votes,0) + coalesce(f.answer_score_sum,0) + coalesce(f.median_q_score,0) desc,
+    f.reputation desc,
+    f.total_views desc
+limit 500;

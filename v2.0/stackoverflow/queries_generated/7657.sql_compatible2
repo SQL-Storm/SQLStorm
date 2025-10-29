@@ -1,0 +1,338 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Advanced'
+            WHEN u.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationTier,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        AVG(p.Score) as AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopQuestions AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        u.DisplayName as OwnerName,
+        p.Tags,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) as RankByScore,
+        ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC, p.Score DESC) as RankByViews,
+        NTILE(4) OVER (ORDER BY p.Score DESC) as ScoreQuartile,
+        CASE 
+            WHEN p.Score > 100 THEN 'High Impact'
+            WHEN p.Score > 50 THEN 'Medium Impact'
+            WHEN p.Score > 10 THEN 'Low Impact'
+            ELSE 'Minimal Impact'
+        END as ImpactLevel
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate >= DATE '2015-01-01'
+        AND p.Score IS NOT NULL
+        AND p.ViewCount > 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Very Popular'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Less Popular'
+        END as PopularityLevel,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        AVG(t.Count) OVER (PARTITION BY t.IsRequired) as AvgCountByRequired
+    FROM Tags t
+    WHERE t.Count > 10
+),
+PostActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.Comment,
+        ph.Text,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as RecentActivity,
+        COUNT(*) OVER (PARTITION BY ph.PostId) as TotalActivity,
+        LAG(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) as PreviousActivityDate,
+        (CAST(ph.CreationDate AS timestamp) - CAST(LAG(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS timestamp)) as ActivityInterval,
+        EXTRACT(EPOCH FROM (CAST(ph.CreationDate AS timestamp) - CAST(LAG(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS timestamp)))/86400.0 AS DaysSinceLastActivity,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'Moderation'
+            WHEN ph.PostHistoryTypeId IN (1, 4, 5, 6, 7, 8, 9) THEN 'Editing'
+            WHEN ph.PostHistoryTypeId IN (14, 15, 19, 20, 35, 36) THEN 'Lock/Unlock'
+            ELSE 'Other'
+        END as ActivityCategory
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= DATE '2018-01-01'
+),
+ComplexUserQuery AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.AvgPostScore,
+        us.TotalScore,
+        us.ReputationTier,
+        us.Views,
+        us.UpVotes,
+        us.DownVotes,
+        CASE 
+            WHEN us.PostCount > 100 AND us.CommentCount > 500 THEN 'Highly Active'
+            WHEN us.PostCount > 50 AND us.CommentCount > 100 THEN 'Active'
+            WHEN us.PostCount > 10 THEN 'Regular'
+            ELSE 'Occasional'
+        END as ActivityLevel,
+        CASE 
+            WHEN us.TotalScore > 10000 THEN 'Super Contributor'
+            WHEN us.TotalScore > 1000 THEN 'Contributor'
+            WHEN us.TotalScore > 100 THEN 'Regular Contributor'
+            ELSE 'Newbie'
+        END as ContributionTier,
+        (us.PostCount * 0.3 + us.CommentCount * 0.1 + us.BadgeCount * 0.2 + us.Reputation * 0.00001) as EngagementScore,
+        ROW_NUMBER() OVER (ORDER BY (us.PostCount * 0.3 + us.CommentCount * 0.1 + us.BadgeCount * 0.2 + us.Reputation * 0.00001) DESC) as EngagementRank
+    FROM UserStats us
+    WHERE us.Views > 1000
+),
+TopTags AS (
+    SELECT 
+        ta.TagName,
+        ta.TagCount,
+        ta.PopularityLevel,
+        ta.PopularityRank,
+        COALESCE(ta.AvgCountByRequired, 0) as AverageCountByRequired,
+        CASE 
+            WHEN ta.TagCount >= 1000 AND ta.TagCount <= 5000 THEN 'Popular Tech'
+            WHEN ta.TagCount > 5000 THEN 'Ultra Popular Tech'
+            WHEN ta.TagCount < 100 THEN 'Niche'
+            ELSE 'General'
+        END as Category
+    FROM TagAnalysis ta
+    WHERE ta.PopularityRank <= 50
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.PostHistoryTypeId,
+        pa.UserId,
+        pa.CreationDate,
+        pa.ActivityCategory,
+        pa.TotalActivity,
+        pa.DaysSinceLastActivity,
+        CASE 
+            WHEN pa.DaysSinceLastActivity IS NULL THEN 'New Post'
+            WHEN pa.DaysSinceLastActivity <= 1 THEN 'Immediate Activity'
+            WHEN pa.DaysSinceLastActivity BETWEEN 2 AND 7 THEN 'Weekly Activity'
+            WHEN pa.DaysSinceLastActivity BETWEEN 8 AND 30 THEN 'Monthly Activity'
+            ELSE 'Inactive'
+        END as ActivityTiming,
+        CASE 
+            WHEN pa.TotalActivity >= 10 THEN 'Highly Active'
+            WHEN pa.TotalActivity >= 5 THEN 'Moderately Active'
+            WHEN pa.TotalActivity >= 1 THEN 'Low Activity'
+            ELSE 'No Activity'
+        END as ActivityLevel,
+        DENSE_RANK() OVER (ORDER BY pa.TotalActivity DESC) as ActivityRank,
+        LAG(pa.CreationDate, 1) OVER (PARTITION BY pa.PostId ORDER BY pa.CreationDate) as PreviousChange,
+        LEAD(pa.CreationDate, 1) OVER (PARTITION BY pa.PostId ORDER BY pa.CreationDate) as NextChange
+    FROM PostActivity pa
+    WHERE pa.RecentActivity <= 5
+),
+CombinedAnalysis AS (
+    SELECT 
+        cu.UserId,
+        cu.DisplayName,
+        cu.Reputation,
+        cu.PostCount,
+        cu.CommentCount,
+        cu.BadgeCount,
+        cu.ContributionTier,
+        cu.ActivityLevel,
+        cu.EngagementScore,
+        cu.EngagementRank,
+        COALESCE(tq.QuestionId, 0) as TopQuestionId,
+        COALESCE(tq.Title, 'No Top Question') as TopQuestionTitle,
+        COALESCE(tq.Score, 0) as TopQuestionScore,
+        COALESCE(tq.ViewCount, 0) as TopQuestionViews,
+        COALESCE(tt.TagName, 'No Top Tag') as TopTag,
+        COALESCE(tt.Category, 'Unknown') as TagCategory,
+        COALESCE(pah.ActivityCategory, 'No Activity') as RecentActivityCategory,
+        COALESCE(pah.ActivityTiming, 'No Timing') as ActivityTiming,
+        COALESCE(pah.ActivityLevel, 'No Level') as ActivityLevelDescription,
+        CASE 
+            WHEN cu.PostCount > 100 AND cu.BadgeCount > 50 THEN 'Elite Contributor'
+            WHEN cu.PostCount > 50 AND cu.CommentCount > 200 THEN 'Community Contributor'
+            WHEN cu.Reputation > 10000 THEN 'Reputation Leader'
+            ELSE 'Regular Member'
+        END as RecognitionStatus
+    FROM ComplexUserQuery cu
+    LEFT JOIN TopQuestions tq ON cu.PostCount > 0
+    LEFT JOIN TopTags tt ON cu.BadgeCount > 0
+    LEFT JOIN PostHistoryAnalysis pah ON cu.UserId IN (
+        SELECT DISTINCT ph.UserId 
+        FROM PostHistory ph 
+        WHERE ph.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = cu.UserId)
+    )
+),
+AggregateResults AS (
+    SELECT 
+        'User Statistics' as ReportType,
+        COUNT(*) as TotalUsers,
+        AVG(Reputation) as AvgReputation,
+        AVG(PostCount) as AvgPosts,
+        AVG(CommentCount) as AvgComments,
+        AVG(BadgeCount) as AvgBadges,
+        COUNT(DISTINCT ContributionTier) as UniqueContributionTiers,
+        COUNT(DISTINCT ActivityLevel) as UniqueActivityLevels,
+        MIN(EngagementScore) as MinEngagement,
+        MAX(EngagementScore) as MaxEngagement,
+        CAST(NULL AS text) as TotalTags,
+        CAST(NULL AS numeric) as AvgTagCount,
+        CAST(NULL AS numeric) as MaxTagCount,
+        CAST(NULL AS numeric) as MinTagCount,
+        CAST(NULL AS numeric) as UniqueCategories,
+        CAST(NULL AS numeric) as UniquePopularityLevels,
+        CAST(NULL AS numeric) as AvgPopularityRank,
+        CAST(NULL AS numeric) as TotalRecords,
+        CAST(NULL AS numeric) as AvgActivity,
+        CAST(NULL AS numeric) as MinRecentActivity,
+        CAST(NULL AS numeric) as AvgDaysSinceLast,
+        CAST(NULL AS numeric) as UniqueActivityCategories,
+        CAST(NULL AS numeric) as UniqueActivityTimings,
+        CAST(NULL AS numeric) as UniqueActivityLevels
+    FROM CombinedAnalysis
+    
+    UNION ALL
+    
+    SELECT 
+        'Tag Analysis' as ReportType,
+        COUNT(*) as TotalUsers,
+        AVG(TagCount) as AvgReputation,
+        MAX(TagCount) as AvgPosts,
+        MIN(TagCount) as AvgComments,
+        COUNT(DISTINCT Category) as AvgBadges,
+        COUNT(DISTINCT PopularityLevel) as UniqueContributionTiers,
+        AVG(PopularityRank) as UniqueActivityLevels,
+        CAST(NULL AS numeric) as MinEngagement,
+        CAST(NULL AS numeric) as MaxEngagement,
+        CAST(COUNT(*) AS text) as TotalTags,
+        AVG(TagCount) as AvgTagCount,
+        MAX(TagCount) as MaxTagCount,
+        MIN(TagCount) as MinTagCount,
+        COUNT(DISTINCT Category) as UniqueCategories,
+        COUNT(DISTINCT PopularityLevel) as UniquePopularityLevels,
+        AVG(PopularityRank) as AvgPopularityRank,
+        CAST(NULL AS numeric) as TotalRecords,
+        CAST(NULL AS numeric) as AvgActivity,
+        CAST(NULL AS numeric) as MinRecentActivity,
+        CAST(NULL AS numeric) as AvgDaysSinceLast,
+        CAST(NULL AS numeric) as UniqueActivityCategories,
+        CAST(NULL AS numeric) as UniqueActivityTimings,
+        CAST(NULL AS numeric) as UniqueActivityLevels
+    FROM TopTags
+    
+    UNION ALL
+    
+    SELECT 
+        'Post History Analysis' as ReportType,
+        COUNT(*) as TotalUsers,
+        AVG(TotalActivity) as AvgReputation,
+        MIN(RecentActivity) as AvgPosts,
+        AVG(DaysSinceLastActivity) as AvgComments,
+        COUNT(DISTINCT ActivityCategory) as AvgBadges,
+        COUNT(DISTINCT ActivityTiming) as UniqueContributionTiers,
+        COUNT(DISTINCT ActivityLevel) as UniqueActivityLevels,
+        CAST(NULL AS numeric) as MinEngagement,
+        CAST(NULL AS numeric) as MaxEngagement,
+        CAST(NULL AS text) as TotalTags,
+        CAST(NULL AS numeric) as AvgTagCount,
+        CAST(NULL AS numeric) as MaxTagCount,
+        CAST(NULL AS numeric) as MinTagCount,
+        CAST(NULL AS numeric) as UniqueCategories,
+        CAST(NULL AS numeric) as UniquePopularityLevels,
+        CAST(NULL AS numeric) as AvgPopularityRank,
+        COUNT(*) as TotalRecords,
+        AVG(TotalActivity) as AvgActivity,
+        MIN(RecentActivity) as MinRecentActivity,
+        AVG(DaysSinceLastActivity) as AvgDaysSinceLast,
+        COUNT(DISTINCT ActivityCategory) as UniqueActivityCategories,
+        COUNT(DISTINCT ActivityTiming) as UniqueActivityTimings,
+        COUNT(DISTINCT ActivityLevel) as UniqueActivityLevels
+    FROM PostHistoryAnalysis
+)
+SELECT 
+    ar.ReportType,
+    ar.TotalUsers,
+    ar.AvgReputation,
+    ar.AvgPosts,
+    ar.AvgComments,
+    ar.AvgBadges,
+    ar.UniqueContributionTiers,
+    ar.UniqueActivityLevels,
+    ar.MinEngagement,
+    ar.MaxEngagement,
+    ar.TotalTags,
+    ar.AvgTagCount,
+    ar.MaxTagCount,
+    ar.MinTagCount,
+    ar.UniqueCategories,
+    ar.UniquePopularityLevels,
+    ar.AvgPopularityRank,
+    ar.TotalRecords,
+    ar.AvgActivity,
+    ar.MinRecentActivity,
+    ar.AvgDaysSinceLast,
+    ar.UniqueActivityCategories,
+    ar.UniqueActivityTimings,
+    ar.UniqueActivityLevels,
+    CASE 
+        WHEN ar.ReportType = 'User Statistics' THEN 'User Performance Report'
+        WHEN ar.ReportType = 'Tag Analysis' THEN 'Tag Performance Report'
+        WHEN ar.ReportType = 'Post History Analysis' THEN 'Post History Report'
+        ELSE 'Generic Report'
+    END as ReportDescription,
+    CASE 
+        WHEN COALESCE(ar.TotalUsers,0) > 1000 THEN 'Large Community'
+        WHEN COALESCE(ar.TotalUsers,0) > 100 THEN 'Medium Community'
+        WHEN COALESCE(ar.TotalUsers,0) > 10 THEN 'Small Community'
+        ELSE 'Tiny Community'
+    END as CommunitySize
+FROM AggregateResults ar
+WHERE ar.ReportType IN ('User Statistics', 'Tag Analysis', 'Post History Analysis')
+ORDER BY 
+    CASE ar.ReportType 
+        WHEN 'User Statistics' THEN 1
+        WHEN 'Tag Analysis' THEN 2
+        WHEN 'Post History Analysis' THEN 3
+    END,
+    COALESCE(ar.TotalUsers,0) DESC,
+    COALESCE(CAST(ar.TotalTags AS numeric),0) DESC,
+    COALESCE(ar.TotalRecords,0) DESC;

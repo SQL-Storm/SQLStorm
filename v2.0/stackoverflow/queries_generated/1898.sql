@@ -1,0 +1,188 @@
+-- {"query": "1898.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2795} 
+
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT PH_Edit.Id) AS TotalEditsMade,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        -- Calculate average post score for the user, excluding community wiki posts
+        AVG(CASE WHEN P.CommunityOwnedDate IS NULL THEN P.Score ELSE NULL END) OVER (PARTITION BY U.Id) AS AvgUserPostScore,
+        -- Rank users by reputation within their creation year
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM U.CreationDate) ORDER BY U.Reputation DESC) AS RankByReputationInYear,
+        -- Total score for all posts by this user
+        SUM(P.Score) AS UserTotalPostScore
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN PostHistory PH_Edit ON U.Id = PH_Edit.UserId
+                                 AND PH_Edit.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.UpVotes, U.DownVotes
+),
+PostDetails AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        P.Body,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.AcceptedAnswerId,
+        -- Calculate a composite popularity score for posts
+        (P.Score * 0.5) + (P.ViewCount * 0.01) + (COALESCE(P.AnswerCount, 0) * 1.0) + (COALESCE(P.FavoriteCount, 0) * 2.0) AS PopularityScore,
+        -- Extract the first tag (if available) robustly handling NULL, empty, or single tags
+        NULLIF(TRIM(BOTH '>' FROM SUBSTRING(P.Tags FROM 2 FOR COALESCE(NULLIF(POSITION('><' IN P.Tags), 0), LENGTH(P.Tags) + 1) - 2)), '') AS PrimaryTag,
+        -- Number of comments for this post
+        COUNT(C.Id) AS PostCommentCount,
+        -- Calculate the difference in days between creation and last activity
+        EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) / (60 * 60 * 24) AS DaysActive,
+        -- Check if the post body contains a specific keyword (case-insensitive)
+        CASE WHEN LOWER(P.Body) LIKE '%benchmark%' OR LOWER(P.Body) LIKE '%performance%' THEN TRUE ELSE FALSE END AS ContainsPerfKeyword,
+        -- Identify if the post was edited by someone other than the owner
+        CASE WHEN P.OwnerUserId IS NOT NULL AND P.LastEditorUserId IS NOT NULL AND P.OwnerUserId <> P.LastEditorUserId THEN TRUE ELSE FALSE END AS EditedByOtherUser
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    GROUP BY P.Id, P.PostTypeId, PT.Name, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount, P.Title, P.Tags, P.Body, P.LastEditDate, P.LastActivityDate, P.ClosedDate, P.AcceptedAnswerId
+),
+PostLifecycleEvents AS (
+    SELECT
+        PH.PostId,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS LastClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate ELSE NULL END) AS LastReopenedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 12 THEN PH.CreationDate ELSE NULL END) AS LastDeletedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 13 THEN PH.CreationDate ELSE NULL END) AS LastUndeletedDate,
+        -- Correlated subquery to find the most frequent close reason for a post
+        (
+            SELECT CR.Name
+            FROM PostHistory PH_CR
+            JOIN CloseReasonTypes CR ON CR.Id = CAST(PH_CR.Comment AS smallint)
+            WHERE PH_CR.PostId = PH.PostId
+              AND PH_CR.PostHistoryTypeId = 10 -- Post Closed
+              AND PH_CR.Comment IS NOT NULL -- Ensure comment contains a close reason ID
+            GROUP BY CR.Name
+            ORDER BY COUNT(*) DESC, CR.Name
+            LIMIT 1
+        ) AS MostFrequentCloseReason,
+        -- Count how many times a post was edited (history types 4,5,6)
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE NULL END) AS EditCountFromHistory
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+TagPerformance AS (
+    SELECT
+        TRIM(BOTH '>' FROM SUBSTRING(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')), 1)) AS TagName,
+        COUNT(P.Id) AS TaggedPostCount,
+        AVG(P.Score) AS AvgTagScore,
+        -- NTILE to categorize tags by their average score into 5 groups
+        NTILE(5) OVER (ORDER BY AVG(P.Score) DESC) AS TagScoreQuintile
+    FROM Posts P
+    WHERE P.Tags IS NOT NULL AND P.Tags != '><' AND P.PostTypeId = 1 -- Only questions have meaningful tags
+    GROUP BY TRIM(BOTH '>' FROM SUBSTRING(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')), 1))
+    HAVING COUNT(P.Id) > 50 -- Only consider tags with a reasonable number of posts
+),
+InitialHighImpactPosts AS (
+    SELECT
+        UE.UserId,
+        UE.DisplayName AS UserDisplayName,
+        UE.Reputation,
+        UE.QuestionsAsked,
+        UE.AnswersProvided,
+        UE.TotalEditsMade,
+        UE.AvgUserPostScore,
+        UE.UserTotalPostScore,
+        PD.PostId,
+        PD.PostTypeName,
+        PD.Title AS PostTitle,
+        PD.PopularityScore,
+        PD.PrimaryTag,
+        PD.PostCommentCount,
+        PD.ContainsPerfKeyword,
+        PD.EditedByOtherUser,
+        LE.MostFrequentCloseReason,
+        LE.EditCountFromHistory,
+        PD.DaysActive,
+        -- Lag/Lead to compare current post's score with the previous/next post by the same user based on creation date
+        LAG(PD.Score, 1, 0) OVER (PARTITION BY UE.UserId ORDER BY PD.PostCreationDate) AS PreviousPostScore,
+        LEAD(PD.Score, 1, 0) OVER (PARTITION BY UE.UserId ORDER BY PD.PostCreationDate) AS NextPostScore,
+        -- Join badges for users who have at least one 'Gold' or 'Silver' badge related to the primary tag of their posts
+        COUNT(DISTINCT B.Id) AS RelevantBadgesCount,
+        COALESCE(NULLIF(U.Location, ''), 'Unknown Location') AS UserLocation,
+        CASE
+            WHEN U.AboutMe IS NOT NULL AND LENGTH(U.AboutMe) > 100 THEN 'Verbose AboutMe'
+            WHEN U.AboutMe IS NOT NULL AND LENGTH(U.AboutMe) <= 100 THEN 'Concise AboutMe'
+            ELSE 'No AboutMe'
+        END AS AboutMeCategory,
+        TP.AvgTagScore AS PrimaryTagAvgScore,
+        TP.TagScoreQuintile
+    FROM UserEngagement UE
+    JOIN Users U ON UE.UserId = U.Id
+    JOIN PostDetails PD ON UE.UserId = PD.OwnerUserId
+    LEFT JOIN PostLifecycleEvents LE ON PD.PostId = LE.PostId
+    LEFT JOIN Badges B ON UE.UserId = B.UserId
+                       AND B.Class IN (1, 2) -- Gold or Silver badges
+                       AND (B.TagBased = FALSE OR (B.TagBased = TRUE AND B.Name = PD.PrimaryTag)) -- Non-tag badge OR tag-based badge matching primary tag
+    LEFT JOIN TagPerformance TP ON PD.PrimaryTag = TP.TagName
+    WHERE
+        UE.Reputation > 5000 -- Filter for users with significant reputation
+        AND UE.QuestionsAsked > 5 -- At least 5 questions
+        AND UE.AnswersProvided > 10 -- At least 10 answers
+        AND PD.PopularityScore > 20 -- Posts with a good popularity score
+        AND PD.PostCreationDate >= '2020-01-01' -- Recent posts
+        AND (
+            PD.PostTypeName = 'Question'
+            OR (PD.PostTypeName = 'Answer' AND PD.AcceptedAnswerId IS NOT NULL) -- Answers that were accepted
+        )
+        AND (
+            LE.LastClosedDate IS NULL -- Not closed
+            OR (LE.LastReopenedDate IS NOT NULL AND LE.LastReopenedDate > LE.LastClosedDate) -- Or was re-opened after being closed
+        )
+        AND (LOWER(PD.Title) LIKE '%sql%' OR LOWER(PD.Title) LIKE '%database%') -- Posts about SQL/database
+        AND (UE.TotalEditsMade > 0 OR PD.EditedByOtherUser = TRUE) -- Either user edited or post was edited by others
+    GROUP BY
+        UE.UserId, UE.DisplayName, UE.Reputation, UE.QuestionsAsked, UE.AnswersProvided, UE.TotalEditsMade, UE.AvgUserPostScore, UE.UserTotalPostScore,
+        PD.PostId, PD.PostTypeName, PD.Title, PD.PopularityScore, PD.PrimaryTag, PD.PostCommentCount, PD.ContainsPerfKeyword,
+        PD.EditedByOtherUser, LE.MostFrequentCloseReason, LE.EditCountFromHistory, PD.DaysActive, PD.Score, PD.PostCreationDate,
+        U.Location, U.AboutMe, TP.AvgTagScore, TP.TagScoreQuintile
+    HAVING COUNT(DISTINCT B.Id) > 0 -- Users must have at least one relevant gold/silver badge
+),
+ProblematicPosts AS (
+    -- Identify posts from users with overall negative post scores, where the specific post is also poorly received
+    SELECT PD.PostId
+    FROM PostDetails PD
+    JOIN UserEngagement UE ON PD.OwnerUserId = UE.UserId
+    WHERE
+        UE.UserTotalPostScore < 0 -- User has a net negative score across all their posts
+        AND PD.Score < -5 -- The specific post has a very low score
+        AND EXISTS (
+            SELECT 1
+            FROM Votes V
+            WHERE V.PostId = PD.PostId AND V.VoteTypeId = 3 -- Check for downvotes
+            GROUP BY V.PostId
+            HAVING COUNT(V.Id) > 5 -- At least 5 downvotes
+        )
+)
+-- Final selection: Retrieve high-impact posts, excluding those identified as problematic
+SELECT *
+FROM InitialHighImpactPosts
+WHERE PostId NOT IN (SELECT PostId FROM ProblematicPosts)
+ORDER BY
+    Reputation DESC,
+    PopularityScore DESC,
+    PostCreationDate DESC;

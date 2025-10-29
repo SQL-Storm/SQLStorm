@@ -1,0 +1,212 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(t.ExcerptPostId, 0) AS ExcerptPostId,
+        COALESCE(t.WikiPostId, 0) AS WikiPostId,
+        CAST(t.TagName AS VARCHAR(1000)) AS FullPath,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = true
+
+    UNION ALL
+
+    SELECT 
+        child.Id,
+        child.TagName,
+        child.Count,
+        COALESCE(child.ExcerptPostId, 0) AS ExcerptPostId,
+        COALESCE(child.WikiPostId, 0) AS WikiPostId,
+        CAST(r.FullPath || ' > ' || child.TagName AS VARCHAR(1000)) AS FullPath,
+        r.Level + 1 AS Level
+    FROM Tags child
+    JOIN RecursiveTagHierarchy r ON child.Id <> r.Id AND child.Count < r.Count AND LENGTH(child.TagName) < LENGTH(r.TagName)
+    WHERE child.IsRequired = true
+),
+UserBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END), 0) AS TagBasedBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+TopActiveUsers AS (
+    SELECT 
+        u.Id, u.DisplayName, u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS Rank
+    FROM Users u
+    WHERE u.Reputation > 5000 AND u.Location IS NOT NULL
+),
+UserPostHistoryEdits AS (
+    SELECT 
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        COUNT(*) AS EditCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+    GROUP BY ph.UserId, ph.PostId, ph.PostHistoryTypeId
+),
+PopularQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        u.DisplayName AS OwnerDisplayName,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS PopularityRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.Score > 50
+      AND p.AnswerCount > 3
+      AND p.ClosedDate IS NULL
+),
+QuestionAnswers AS (
+    SELECT 
+        a.Id,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Score,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate ASC) AS AnswerOrder
+    FROM Posts a
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+),
+CloseReasonCounts AS (
+    SELECT 
+        crt.Name AS CloseReason,
+        COUNT(DISTINCT ph.PostId) AS ClosedCount
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id AND ph.PostHistoryTypeId = 10
+    GROUP BY crt.Name
+),
+DuplicatedLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        ptp1.Name AS PostTypeName,
+        ptp2.Name AS RelatedPostTypeName
+    FROM PostLinks pl
+    JOIN Posts p1 ON pl.PostId = p1.Id
+    JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    JOIN PostTypes ptp1 ON p1.PostTypeId = ptp1.Id
+    JOIN PostTypes ptp2 ON p2.PostTypeId = ptp2.Id
+    WHERE pl.LinkTypeId = 3
+),
+UserVoteStats AS (
+    SELECT 
+        v.UserId,
+        vt.Name AS VoteType,
+        COUNT(*) AS VoteCount
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.UserId, vt.Name
+),
+UserTagProfiles AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        unnest(string_to_array(COALESCE(p.Tags, ''), '><')) AS TagName
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+UserTagAggregates AS (
+    SELECT
+        utp.UserId,
+        utp.TagName,
+        COUNT(*) AS QuestionsCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        MAX(p.ViewCount) AS MaxViewCount
+    FROM UserTagProfiles utp
+    JOIN Posts p ON p.OwnerUserId = utp.UserId AND p.PostTypeId = 1
+    GROUP BY utp.UserId, utp.TagName
+),
+CombinedResults AS (
+    SELECT 
+        pq.Id AS QuestionId,
+        pq.Title AS QuestionTitle,
+        pq.OwnerUserId,
+        pq.OwnerDisplayName,
+        pq.Score AS QuestionScore,
+        pq.ViewCount,
+        pq.AnswerCount,
+        qas.Id AS AnswerId,
+        qas.OwnerUserId AS AnswerOwnerUserId,
+        qas.OwnerDisplayName AS AnswerOwnerDisplayName,
+        qas.Score AS AnswerScore,
+        qas.AnswerOrder,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        ubc.TagBasedBadges,
+        us.Rank AS UserRank,
+        crc.CloseReason,
+        dl.RelatedPostId AS DuplicateOfPostId,
+        vtst.VoteType,
+        vtst.VoteCount,
+        uta.TagName AS UserTopTag,
+        uta.QuestionsCount AS UserTagQuestions,
+        uta.AvgQuestionScore AS UserTagAvgScore
+    FROM PopularQuestions pq
+    LEFT JOIN QuestionAnswers qas ON pq.Id = qas.QuestionId AND qas.AnswerOrder = 1
+    LEFT JOIN UserBadgeCounts ubc ON pq.OwnerUserId = ubc.UserId
+    LEFT JOIN TopActiveUsers us ON pq.OwnerUserId = us.Id
+    LEFT JOIN (
+        SELECT ph.PostId, crt.Name AS CloseReason
+        FROM PostHistory ph
+        JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id AND ph.PostHistoryTypeId = 10
+        WHERE ph.PostId IN (SELECT Id FROM Posts WHERE PostTypeId = 1)
+    ) crc ON crc.PostId = pq.Id
+    LEFT JOIN DuplicatedLinks dl ON dl.PostId = pq.Id
+    LEFT JOIN UserVoteStats vtst ON vtst.UserId = pq.OwnerUserId AND vtst.VoteType = 'UpMod'
+    LEFT JOIN LATERAL (
+        SELECT ut.TagName, ut.QuestionsCount, ut.AvgQuestionScore
+        FROM UserTagAggregates ut
+        WHERE ut.UserId = pq.OwnerUserId
+        ORDER BY ut.QuestionsCount DESC, ut.AvgQuestionScore DESC
+        LIMIT 1
+    ) uta ON TRUE
+)
+SELECT 
+    QuestionId,
+    COALESCE(QuestionTitle, '<no title>') AS QuestionTitle,
+    OwnerUserId,
+    OwnerDisplayName,
+    QuestionScore,
+    ViewCount,
+    AnswerCount,
+    AnswerId,
+    AnswerOwnerUserId,
+    COALESCE(AnswerOwnerDisplayName, '<anon>') AS AnswerOwnerDisplayName,
+    AnswerScore,
+    AnswerOrder,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    TagBasedBadges,
+    UserRank,
+    CloseReason,
+    DuplicateOfPostId,
+    VoteType,
+    VoteCount,
+    UserTopTag,
+    COALESCE(UserTagQuestions, 0) AS UserTagQuestions,
+    COALESCE(UserTagAvgScore, 0.0) AS UserTagAvgScore
+FROM CombinedResults
+WHERE UserRank <= 100
+ORDER BY QuestionScore DESC, ViewCount DESC, UserRank ASC
+LIMIT 100;

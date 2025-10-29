@@ -1,0 +1,107 @@
+WITH
+    user_stats AS (
+        SELECT
+            u.id,
+            u.displayname,
+            u.reputation,
+            COALESCE(SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END), 0) AS up_vote_cnt,
+            COALESCE(SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END), 0) AS down_vote_cnt,
+            COALESCE(SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END), 0) AS gold_badge_cnt,
+            COALESCE(SUM(CASE WHEN b.class = 2 THEN 1 ELSE 0 END), 0) AS silver_badge_cnt,
+            COALESCE(SUM(CASE WHEN b.class = 3 THEN 1 ELSE 0 END), 0) AS bronze_badge_cnt,
+            MAX(p.creationdate) AS last_post_dt,
+            MAX(c.creationdate) AS last_comment_dt,
+            COUNT(*) FILTER (WHERE p.posttypeid = 1) AS question_cnt,
+            COUNT(*) FILTER (WHERE p.posttypeid = 2) AS answer_cnt
+        FROM users u
+        LEFT JOIN votes v   ON v.userid = u.id
+        LEFT JOIN badges b  ON b.userid = u.id
+        LEFT JOIN posts p   ON p.owneruserid = u.id
+        LEFT JOIN comments c ON c.userid = u.id
+        GROUP BY u.id, u.displayname, u.reputation
+    ),
+    tag_rank AS (
+        SELECT
+            t.tagname,
+            t.count,
+            ROW_NUMBER() OVER (ORDER BY t.count DESC) AS rn
+        FROM tags t
+        WHERE t.ismoderatoronly = 0
+    ),
+    user_top_tags AS (
+        SELECT
+            us.id,
+            STRING_AGG(tr.tagname, ', ') FILTER (WHERE tr.rn <= 5) AS top5_tags
+        FROM user_stats us
+        JOIN posts p
+            ON p.owneruserid = us.id
+           AND p.posttypeid = 1
+        JOIN LATERAL (
+            SELECT UNNEST(string_to_array(
+                     SUBSTRING(p.tags, 2, LENGTH(p.tags)-2), '><')) AS tag
+        ) AS pt(tag) ON TRUE
+        JOIN tag_rank tr
+            ON tr.tagname = pt.tag
+        GROUP BY us.id
+    ),
+    closed_posts AS (
+        SELECT
+            ph.postid,
+            CAST(MAX(CASE WHEN ph.posthistorytypeid = 10 THEN ph.comment END) AS INTEGER) AS close_reason_id,
+            MAX(ph.creationdate) AS closed_on
+        FROM posthistory ph
+        WHERE ph.posthistorytypeid = 10
+        GROUP BY ph.postid
+    ),
+    recent_activity AS (
+        SELECT
+            us.id,
+            GREATEST(
+                COALESCE(us.last_post_dt, CAST('1970-01-01' AS TIMESTAMP)),
+                COALESCE(us.last_comment_dt, CAST('1970-01-01' AS TIMESTAMP))
+            ) AS most_recent_dt
+        FROM user_stats us
+    )
+SELECT
+    us.id,
+    us.displayname,
+    us.reputation,
+    us.up_vote_cnt,
+    us.down_vote_cnt,
+    us.gold_badge_cnt,
+    us.silver_badge_cnt,
+    us.bronze_badge_cnt,
+    ROUND(
+        CASE
+            WHEN us.down_vote_cnt = 0 THEN NULL
+            ELSE CAST(us.up_vote_cnt AS NUMERIC) / us.down_vote_cnt
+        END, 2
+    ) AS up_down_ratio,
+    us.question_cnt,
+    us.answer_cnt,
+    COALESCE(ut.top5_tags, '') AS top5_tags,
+    ra.most_recent_dt AS most_recent_activity,
+    COUNT(DISTINCT cp.postid) AS closed_posts_authored,
+    STRING_AGG(DISTINCT crt.name, '; ') FILTER (WHERE crt.name IS NOT NULL) AS close_reasons_encountered
+FROM user_stats us
+LEFT JOIN user_top_tags ut      ON ut.id = us.id
+LEFT JOIN recent_activity ra    ON ra.id = us.id
+LEFT JOIN posts p_auth          ON p_auth.owneruserid = us.id
+LEFT JOIN closed_posts cp       ON cp.postid = p_auth.id
+LEFT JOIN posthistory phc
+       ON phc.postid = cp.postid
+      AND phc.posthistorytypeid = 10
+LEFT JOIN closereasontypes crt
+       ON crt.id = cp.close_reason_id
+GROUP BY
+    us.id, us.displayname, us.reputation,
+    us.up_vote_cnt, us.down_vote_cnt,
+    us.gold_badge_cnt, us.silver_badge_cnt, us.bronze_badge_cnt,
+    us.question_cnt, us.answer_cnt,
+    ut.top5_tags, ra.most_recent_dt
+HAVING
+    us.reputation > 10000 OR us.gold_badge_cnt > 0
+ORDER BY
+    us.reputation DESC,
+    us.gold_badge_cnt DESC,
+    up_down_ratio NULLS LAST;

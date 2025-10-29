@@ -1,0 +1,130 @@
+WITH 
+UserAgg AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(b.Id)                                            AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)           AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)           AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)           AS BronzeBadges,
+        COALESCE(SUM(v.UpVotes),0) - COALESCE(SUM(v.DownVotes),0) AS VoteScore
+    FROM Users u
+    LEFT JOIN Badges b          ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            p.OwnerUserId,
+            SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts      p
+        JOIN Votes      v  ON v.PostId = p.Id
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY p.OwnerUserId
+    ) v ON v.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopUsers AS (
+    SELECT ua.*,
+           ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC, ua.VoteScore DESC) AS rn
+    FROM UserAgg ua
+    WHERE ua.Reputation > 10000
+),
+LatestPost AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Id        AS PostId,
+        p.Title,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+TagInfo AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        COALESCE(e.Title, 'N/A') AS ExcerptTitle,
+        COALESCE(w.Title, 'N/A') AS WikiTitle
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+    WHERE t.IsModeratorOnly = 0
+),
+UserLinkStats AS (
+    SELECT 
+        pl.PostId,
+        COUNT(CASE WHEN lt.Id = 1 THEN 1 END) AS LinkedCount,
+        COUNT(CASE WHEN lt.Id = 3 THEN 1 END) AS DuplicateCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.PostId
+),
+BaseResult AS (
+    SELECT 
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalBadges,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        tu.VoteScore,
+        lp.PostId,
+        lp.Title,
+        lp.CreationDate                                AS LatestQuestionDate,
+        ul.LinkedCount,
+        ul.DuplicateCount,
+        STRING_AGG(DISTINCT ti.TagName, ', ')          AS TopTags,
+        CASE 
+            WHEN tu.GoldBadges   > 0 THEN 'Elite'
+            WHEN tu.SilverBadges > 0 THEN 'Pro'
+            ELSE 'Member'
+        END                                            AS Tier
+    FROM TopUsers tu
+    LEFT JOIN LatestPost lp          ON lp.OwnerUserId = tu.Id AND lp.rn = 1
+    LEFT JOIN UserLinkStats ul      ON ul.PostId = lp.PostId
+    LEFT JOIN (
+            SELECT 
+                p.OwnerUserId,
+                TRIM(BOTH '<>' FROM p.Tags) AS TagsTrimmed
+            FROM Posts p
+            WHERE p.PostTypeId = 1
+         ) posts_tags ON posts_tags.OwnerUserId = tu.Id
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(posts_tags.TagsTrimmed, '><')) AS Tag
+    ) pt ON posts_tags.OwnerUserId = tu.Id
+    LEFT JOIN TagInfo ti           ON ti.TagName = pt.Tag
+    GROUP BY 
+        tu.Id, tu.DisplayName, tu.Reputation, tu.TotalBadges,
+        tu.GoldBadges, tu.SilverBadges, tu.BronzeBadges, tu.VoteScore,
+        lp.PostId, lp.Title, lp.CreationDate,
+        ul.LinkedCount, ul.DuplicateCount
+    HAVING COUNT(ti.TagName) > 0
+)
+SELECT *
+FROM BaseResult
+ORDER BY Reputation DESC
+LIMIT 50
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS VARCHAR),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS VARCHAR),
+    CAST(NULL AS TIMESTAMP),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER),
+    CAST(NULL AS VARCHAR),
+    CAST(NULL AS VARCHAR),
+    CAST(NULL AS VARCHAR)
+FROM (SELECT 1) AS dummy
+WHERE EXISTS (SELECT 1 FROM Users WHERE Reputation > 50000);

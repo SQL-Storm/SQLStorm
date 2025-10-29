@@ -1,0 +1,168 @@
+WITH RECURSIVE RecursiveTagDepths AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        1 AS Depth,
+        CAST(ARRAY[t.TagName] AS VARCHAR[]) AS TagPath
+    FROM Tags t
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    )
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        r.Depth + 1,
+        r.TagPath || t2.TagName
+    FROM RecursiveTagDepths r
+    JOIN Posts p2 ON p2.Tags LIKE '%' || '<' || r.TagName || '>' || '%' AND p2.PostTypeId = 1
+    JOIN Tags t2 ON p2.Tags LIKE '%' || '<' || t2.TagName || '>' || '%' AND t2.Id <> r.Id
+    WHERE NOT t2.TagName = ANY(r.TagPath)
+),
+TopAnswerers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(a.Id) AS TotalAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.CreationDate) AS LastAnswerDate
+    FROM Users u
+    JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    WHERE a.Score IS NOT NULL AND a.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '365 days')
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(a.Id) > 5
+),
+AcceptedAnswersWithDuplicates AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        COALESCE(pl.LinkTypeId, 0) AS LinkTypeId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC NULLS LAST) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId AND a.PostTypeId = 2
+    LEFT JOIN PostLinks pl ON pl.PostId = q.Id AND pl.RelatedPostId = a.Id AND pl.LinkTypeId = 3
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS DistinctBadgeNames,
+        MAX(b.Date) AS MostRecentBadge
+    FROM Badges b
+    GROUP BY b.UserId
+),
+WindowedPostScores AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS MovingAvgScore,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS PostsSoFar,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRecencyRank,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS NextPostScore
+    FROM Posts p
+    WHERE p.Score IS NOT NULL AND p.OwnerUserId IS NOT NULL
+),
+QualifiedUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COALESCE(us.BadgeCount, 0) AS BadgeCount,
+        COALESCE(us.GoldBadges, 0) AS GoldBadges,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(p.Id) AS TotalPosts,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN WindowedPostScores p ON p.OwnerUserId = u.Id
+    LEFT JOIN UserBadgeStats us ON us.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, us.BadgeCount, us.GoldBadges
+    HAVING COUNT(p.Id) >= 10 AND AVG(p.Score) > 0
+),
+AnswerUpvoteRates AS (
+    SELECT
+        a.OwnerUserId,
+        COUNT(v.Id) AS UpvoteCount,
+        COUNT(a.Id) AS AnswerCount,
+        COALESCE(ROUND(CAST(COUNT(v.Id) AS NUMERIC) / NULLIF(COUNT(a.Id),0),4),0) AS UpvotePerAnswerRatio
+    FROM Posts a
+    LEFT JOIN Votes v ON v.PostId = a.Id AND v.VoteTypeId = 2
+    WHERE a.PostTypeId = 2
+    GROUP BY a.OwnerUserId
+)
+SELECT
+    q.QuestionId,
+    q.Title,
+    u.DisplayName AS QuestionOwner,
+    q.AnswerId,
+    auser.DisplayName AS AnswerOwner,
+    q.AnswerScore,
+    q.LinkTypeName,
+    ub.BadgeCount,
+    ub.GoldBadges,
+    ws.MovingAvgScore,
+    ws.PostRecencyRank,
+    au.UpvotePerAnswerRatio,
+    t.Depth AS TagDepth,
+    STRING_AGG(DISTINCT rt.TagName, ',') AS RecursiveTagsPath
+FROM AcceptedAnswersWithDuplicates q
+LEFT JOIN Users u ON u.Id = q.OwnerUserId
+LEFT JOIN Posts a ON a.Id = q.AnswerId
+LEFT JOIN Users auser ON auser.Id = a.OwnerUserId
+LEFT JOIN UserBadgeStats ub ON ub.UserId = q.OwnerUserId
+LEFT JOIN WindowedPostScores ws ON ws.Id = q.AnswerId
+LEFT JOIN AnswerUpvoteRates au ON au.OwnerUserId = a.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT rt_inner.TagName, rt_inner.Depth, rt_inner.TagPath, rt_inner.Id
+    FROM RecursiveTagDepths rt_inner
+    WHERE rt_inner.TagName = ANY(
+        string_to_array(
+            substring(
+                (SELECT p.Tags FROM Posts p WHERE p.Id = q.QuestionId),
+                2,
+                length((SELECT p.Tags FROM Posts p WHERE p.Id = q.QuestionId)) - 2
+            ),
+            '><'
+        )
+    )
+) rt ON TRUE
+LEFT JOIN RecursiveTagDepths t ON t.TagName = rt.TagName
+WHERE q.AnswerRank = 1
+  AND (
+      (COALESCE(ub.GoldBadges,0) >= 1 AND COALESCE(ws.MovingAvgScore,0) >= 5)
+      OR
+      (COALESCE(au.UpvotePerAnswerRatio,0) > 1.5)
+  )
+GROUP BY
+    q.QuestionId,
+    q.Title,
+    u.DisplayName,
+    q.AnswerId,
+    auser.DisplayName,
+    q.AnswerScore,
+    q.LinkTypeName,
+    ub.BadgeCount,
+    ub.GoldBadges,
+    ws.MovingAvgScore,
+    ws.PostRecencyRank,
+    au.UpvotePerAnswerRatio,
+    t.Depth
+ORDER BY q.AnswerScore DESC NULLS LAST, ub.BadgeCount DESC NULLS LAST
+LIMIT 100;

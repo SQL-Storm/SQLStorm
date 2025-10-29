@@ -1,0 +1,164 @@
+-- {"query": "4740.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1447} 
+
+WITH RECURSIVE TagHierarchy AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    t.Id AS RootTagId,
+    0 AS Depth
+  FROM Tags AS t
+  WHERE
+    t.TagName IN ('sql', 'performance', 'optimization', 'database')
+
+  UNION ALL
+
+  SELECT
+    t.Id,
+    t.TagName,
+    th.RootTagId,
+    th.Depth + 1
+  FROM Tags AS t
+  JOIN PostLinks AS pl
+    ON t.Id = pl.RelatedPostId
+  JOIN Posts AS p
+    ON pl.PostId = p.Id
+  JOIN PostTags AS pt
+    ON p.Id = pt.PostId
+  JOIN TagHierarchy AS th
+    ON pt.TagId = th.TagId
+  WHERE
+    th.Depth < 5
+), TagPostCounts AS (
+  SELECT
+    pt.TagId,
+    COUNT(DISTINCT p.Id) AS PostCount
+  FROM PostTags AS pt
+  JOIN Posts AS p
+    ON pt.PostId = p.Id
+  WHERE
+    p.PostTypeId = 1 /* Questions */
+  GROUP BY
+    pt.TagId
+), UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS QuestionCount,
+    COUNT(DISTINCT a.Id) AS AnswerCount,
+    SUM(CASE WHEN c.Score > 5 THEN 1 ELSE 0 END) AS HighScoreCommentCount,
+    MAX(u.CreationDate) AS LastUserCreationDate,
+    AVG(u.Views) AS AverageUserViews
+  FROM Users AS u
+  LEFT JOIN Posts AS p
+    ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+  LEFT JOIN Posts AS a
+    ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+  LEFT JOIN Comments AS c
+    ON u.Id = c.UserId
+  GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation
+), RecentQuestions AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.AnswerCount,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName AS OwnerDisplayName,
+    RANK() OVER (ORDER BY p.CreationDate DESC) AS RankByDate
+  FROM Posts AS p
+  JOIN Users AS u
+    ON p.OwnerUserId = u.Id
+  WHERE
+    p.PostTypeId = 1
+    AND p.CreationDate > DATE('now', '-90 day')
+), TagAnalysis AS (
+  SELECT
+    t.TagName,
+    COALESCE(t.Count, 0) AS TagTotalCount,
+    COALESCE(tpc.PostCount, 0) AS TaggedQuestionCount,
+    (COALESCE(tpc.PostCount, 0) * 1.0 / NULLIF(t.Count, 0)) AS TagQuestionRatio
+  FROM Tags AS t
+  LEFT JOIN TagPostCounts AS tpc
+    ON t.Id = tpc.TagId
+  WHERE
+    t.TagName LIKE '%sql%' OR t.TagName LIKE '%db%'
+)
+SELECT
+  rq.Title,
+  rq.OwnerDisplayName,
+  rq.Score,
+  rq.AnswerCount,
+  rq.ViewCount,
+  DATEDIFF('day', rq.CreationDate, CURRENT_TIMESTAMP) AS AgeInDays,
+  ua.Reputation,
+  ua.HighScoreCommentCount,
+  ta.TagName,
+  ta.TagTotalCount,
+  ta.TaggedQuestionCount,
+  th.TagName AS RelatedTagName,
+  th.Depth AS RelatedTagDepth,
+  CASE
+    WHEN rq.Score > 100 AND rq.AnswerCount > 10 THEN 'Highly Rated'
+    WHEN rq.Score > 20 THEN 'Moderately Rated'
+    ELSE 'Standard'
+  END AS QuestionRating,
+  LENGTH(rq.Title) AS TitleLength,
+  UPPER(SUBSTRING(rq.Title FROM 1 FOR 1)) || LOWER(SUBSTRING(rq.Title FROM 2)) AS FormattedTitle,
+  COALESCE(au.DisplayName, 'Community') AS AnswerOwner,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+  (SELECT COUNT(*) FROM Comments WHERE PostId = rq.Id AND UserId IS NULL) AS AnonymousCommentCount
+FROM RecentQuestions AS rq
+JOIN TagAnalysis AS ta
+  ON ta.TagName IN (SELECT
+      REGEXP_SPLIT_TO_TABLE(REPLACE(REPLACE(rq.Tags, '<', ''), '>', ''), ' ')
+    )
+LEFT JOIN Users AS au
+  ON au.Id = (
+    SELECT
+      OwnerUserId
+    FROM Posts
+    WHERE
+      ParentId = rq.Id
+    ORDER BY
+      Score DESC
+    LIMIT 1
+  )
+LEFT JOIN TagHierarchy AS th
+  ON th.RootTagId = ta.TagName AND th.TagName != ta.TagName
+LEFT JOIN UserActivity AS ua
+  ON rq.OwnerDisplayName = ua.DisplayName
+LEFT JOIN Votes AS v
+  ON rq.Id = v.PostId
+WHERE
+  ua.AverageUserViews > 5000
+  AND ta.TagQuestionRatio < 0.5
+  AND rq.RankByDate <= 100
+  AND rq.ViewCount > 1000
+GROUP BY
+  rq.Id,
+  rq.Title,
+  rq.OwnerDisplayName,
+  rq.Score,
+  rq.AnswerCount,
+  rq.ViewCount,
+  rq.CreationDate,
+  ua.Reputation,
+  ua.HighScoreCommentCount,
+  ta.TagName,
+  ta.TagTotalCount,
+  ta.TaggedQuestionCount,
+  th.TagName,
+  th.Depth,
+  AnswerOwner
+HAVING
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > (SELECT AVG(UpVoteCount) FROM (SELECT COUNT(*) AS UpVoteCount FROM Votes WHERE VoteTypeId = 2 GROUP BY PostId) AS sub)
+ORDER BY
+  rq.Score DESC,
+  rq.ViewCount DESC
+LIMIT 50;

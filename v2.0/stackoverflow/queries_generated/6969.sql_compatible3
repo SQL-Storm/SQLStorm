@@ -1,0 +1,47 @@
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p_latest.Id) AS TotalPosts,
+    SUM(CASE WHEN p_latest.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p_latest.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    SUM(CASE WHEN p_latest.ViewCount > 1000 THEN 1 ELSE 0 END) AS PopularPosts,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    MAX(b.Date) AS LastBadgeEarned,
+    ph.Comment AS LastEditComment,
+    COALESCE(MIN(cl.CreationDate), DATE '1900-01-01') AS FirstClosedDate
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+         Id,
+         OwnerUserId,
+         PostTypeId,
+         ViewCount,
+         CreationDate
+     FROM 
+         Posts) p_latest ON u.Id = p_latest.OwnerUserId
+LEFT JOIN 
+    Votes v ON p_latest.Id = v.PostId
+LEFT JOIN 
+    PostHistory ph ON p_latest.Id = ph.PostId AND ph.PostHistoryTypeId = 11
+LEFT JOIN 
+    (SELECT 
+         PostId, 
+         MIN(CreationDate) AS CreationDate
+     FROM 
+         CloseReasons
+     GROUP BY 
+         PostId) cl ON p_latest.Id = cl.PostId
+WHERE 
+    u.Reputation > 1000
+    AND u.Id NOT IN (SELECT AccountId FROM Users WHERE AccountId IS NOT NULL)
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    ph.Comment
+HAVING 
+    COUNT(DISTINCT CASE WHEN p_latest.PostTypeId = 1 THEN p_latest.Id ELSE NULL END) > 5
+ORDER BY 
+    TotalPosts DESC, 
+    TotalVotes DESC;

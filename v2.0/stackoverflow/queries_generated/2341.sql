@@ -1,0 +1,181 @@
+-- {"query": "2341.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1474} 
+
+WITH RecursiveTagPaths AS (
+    SELECT 
+        Id,
+        TagName,
+        ARRAY[TagName] AS Path,
+        Count
+    FROM Tags
+    WHERE IsModeratorOnly = 0
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        p.Path || t.TagName,
+        t.Count
+    FROM Tags t
+    JOIN RecursiveTagPaths p ON t.Count < p.Count AND t.TagName != ALL(p.Path)
+    WHERE array_length(p.Path, 1) < 3
+),
+UserBadgeCounts AS (
+    SELECT 
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+),
+UserActivityWindow AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        COUNT(P.Id) FILTER (WHERE P.PostTypeId = 1) AS QuestionCount,
+        COUNT(P.Id) FILTER (WHERE P.PostTypeId = 2) AS AnswerCount,
+        COUNT(C.Id) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY U.Id ORDER BY P.CreationDate DESC) AS LastPostRank,
+        SUM(V.BountyAmount) FILTER (WHERE V.VoteTypeId IN (8,9)) AS TotalBountyGiven
+    FROM Users U
+    LEFT JOIN Posts P ON P.OwnerUserId = U.Id
+    LEFT JOIN Comments C ON C.UserId = U.Id
+    LEFT JOIN Votes V ON V.UserId = U.Id
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+QuestionsWithAcceptedAnswers AS (
+    SELECT
+        P.Id,
+        P.Title,
+        P.ViewCount,
+        P.Score,
+        P.Tags,
+        P.AcceptedAnswerId,
+        AA.Score AS AcceptedAnswerScore,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerName,
+        P.ClosedDate,
+        COALESCE(PT.Name, 'Unknown') AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY P.Id ORDER BY P.CreationDate DESC) AS RecentVersionRank
+    FROM Posts P
+    LEFT JOIN Posts AA ON AA.Id = P.AcceptedAnswerId
+    LEFT JOIN Users U ON U.Id = P.OwnerUserId
+    LEFT JOIN PostTypes PT ON PT.Id = P.PostTypeId
+    WHERE P.PostTypeId = 1
+),
+CloseReasonStats AS (
+    SELECT 
+        PHT.Comment AS CloseReasonId,
+        CRT.Name AS CloseReasonName,
+        COUNT(*) AS CloseCount
+    FROM PostHistory PHT
+    JOIN CloseReasonTypes CRT ON CRT.Id::varchar = PHT.Comment
+    WHERE PHT.PostHistoryTypeId = 10
+    GROUP BY PHT.Comment, CRT.Name
+),
+UserLastEditRanks AS (
+    SELECT 
+        PHT.UserId,
+        PHT.PostId,
+        PHT.CreationDate,
+        RANK() OVER (PARTITION BY PHT.PostId ORDER BY PHT.CreationDate DESC) AS EditRank
+    FROM PostHistory PHT
+    WHERE PHT.PostHistoryTypeId IN (4,5,6)
+),
+TopEditors AS (
+    SELECT DISTINCT
+        U.Id AS UserId,
+        U.DisplayName,
+        COALESCE(UB.GoldBadges,0) AS GoldBadges,
+        COALESCE(UB.SilverBadges,0) AS SilverBadges,
+        COALESCE(UB.BronzeBadges,0) AS BronzeBadges,
+        UA.QuestionCount,
+        UA.AnswerCount,
+        UA.CommentCount,
+        UA.TotalBountyGiven,
+        ROW_NUMBER() OVER (ORDER BY UA.Reputation DESC, UA.QuestionCount DESC) AS UserRank
+    FROM Users U
+    LEFT JOIN UserBadgeCounts UB ON UB.UserId = U.Id
+    LEFT JOIN UserActivityWindow UA ON UA.UserId = U.Id
+    WHERE UA.QuestionCount > 10
+),
+DuplicateLinkCounts AS (
+    SELECT 
+        PL.PostId,
+        COUNT(*) AS DuplicateCount
+    FROM PostLinks PL
+    WHERE PL.LinkTypeId = 3
+    GROUP BY PL.PostId
+),
+QuestionSummary AS (
+    SELECT
+        Q.Id,
+        Q.Title,
+        Q.ViewCount,
+        Q.Score,
+        Q.AcceptedAnswerId,
+        Q.AcceptedAnswerScore,
+        Q.OwnerUserId,
+        Q.OwnerName,
+        Q.ClosedDate,
+        COALESCE(DL.DuplicateCount,0) AS DuplicateCount
+    FROM QuestionsWithAcceptedAnswers Q
+    LEFT JOIN DuplicateLinkCounts DL ON DL.PostId = Q.Id
+    WHERE Q.ClosedDate IS NULL
+)
+SELECT 
+    TS.UserRank,
+    TS.DisplayName,
+    TS.Reputation,
+    TS.GoldBadges,
+    TS.SilverBadges,
+    TS.BronzeBadges,
+    TS.QuestionCount,
+    TS.AnswerCount,
+    TS.CommentCount,
+    TS.TotalBountyGiven,
+    QS.Title AS TopQuestionTitle,
+    QS.Score AS TopQuestionScore,
+    QS.ViewCount AS TopQuestionViews,
+    QS.DuplicateCount,
+    CR.CloseReasonName,
+    CONCAT(
+        'Tags Path: ', 
+        ARRAY_TO_STRING(RTP.Path, ' > ')
+    ) AS SampleTagPath,
+    CASE 
+        WHEN QS.AcceptedAnswerScore IS NULL THEN 'No Accepted Answer'
+        WHEN QS.AcceptedAnswerScore > QS.Score THEN 'Accepted answer outperforms question'
+        ELSE 'Accepted answer scores lower or equal'
+    END AS AnswerPerformance,
+    CONCAT(
+        'Reputation * 0.1 + QuestionCount * 2 + AnswerCount * 1.5 = ',
+        ROUND(TS.Reputation * 0.1 + TS.QuestionCount * 2 + TS.AnswerCount * 1.5, 2)
+    ) AS CustomScoreFormula
+
+FROM TopEditors TS
+LEFT JOIN LATERAL (
+    SELECT TOP 1 *
+    FROM QuestionSummary QS
+    WHERE QS.OwnerUserId = TS.UserId
+    ORDER BY QS.Score DESC, QS.ViewCount DESC
+) QS ON TRUE
+LEFT JOIN CloseReasonStats CR ON CR.CloseReasonId = (
+    SELECT PHT.Comment 
+    FROM PostHistory PHT 
+    WHERE PHT.PostId = QS.Id AND PHT.PostHistoryTypeId = 10 
+    ORDER BY PHT.CreationDate DESC LIMIT 1
+)
+LEFT JOIN RecursiveTagPaths RTP ON RTP.Id = (
+    SELECT 
+        COALESCE(
+            CAST(SUBSTRING(QS.Tags FROM '<([^>]+)>') AS int),
+            (SELECT Id FROM Tags ORDER BY RANDOM() LIMIT 1)
+        )
+)
+ORDER BY TS.UserRank
+LIMIT 25;

@@ -1,0 +1,147 @@
+-- {"query": "2045.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1466} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.CreationDate, '1970-01-01'::timestamp) as TagCreationDate,
+        1 as Level
+    from Tags t
+    left join Posts p on t.ExcerptPostId = p.Id
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        rh.TagCreationDate,
+        rh.Level + 1
+    from Tags t
+    inner join RecursiveTagHierarchy rh on t.WikiPostId = rh.Id
+    where rh.Level < 3
+),
+UserActivityRankings as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct case when p.PostTypeId = 1 then p.Id else null end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id else null end) as AnswerCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as TotalDownVotes,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank,
+        row_number() over (partition by null order by count(distinct p.Id) desc) as PostCountRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id and v.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    where u.Reputation > 1000
+    group by u.Id, u.DisplayName, u.Reputation
+),
+RecentEngagedQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        max(v.CreationDate) as LastVoteDate,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpVotes,
+        row_number() over (partition by null order by p.CreationDate desc) as RecentRank
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 -- questions only
+      and p.ClosedDate is null
+      and p.CreationDate >= current_date - interval '180 days'
+    group by p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.Tags, p.OwnerUserId, u.DisplayName
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore,
+        sum(case when a.OwnerUserId is null then 1 else 0 end) as AnonymousAnswers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        max(ph.CreationDate) as CloseDate
+    from PostHistory ph
+    inner join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+    where ph.PostHistoryTypeId = 10 -- post closed
+    group by ph.PostId, crt.Name
+),
+CorrelatedRecentComments as (
+    select 
+        c.PostId,
+        count(*) as RecentCommentsCount,
+        max(c.CreationDate) as LastCommentDate,
+        string_agg(distinct coalesce(c.UserDisplayName, '[anonymous]') || ': ' || left(c.Text, 40), ' | ') as SampleComments
+    from Comments c
+    where c.CreationDate > current_date - interval '30 days'
+    group by c.PostId
+)
+select 
+    q.Id as QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    ua.DisplayName as OwnerDisplayName,
+    ua.ReputationRank,
+    ua.PostCountRank,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    coalesce(ans.AnswerCount, 0) as TotalAnswers,
+    coalesce(round(ans.AvgAnswerScore,2), 0) as AvgAnswerScore,
+    coalesce(ans.MaxAnswerScore, 0) as MaxAnswerScore,
+    coalesce(ans.MinAnswerScore, 0) as MinAnswerScore,
+    coalesce(ans.AnonymousAnswers, 0) as AnonymousAnswerCount,
+    q.Tags,
+    q.LastVoteDate,
+    q.TotalUpVotes as QuestionUpVotes,
+    q.RecentRank,
+    qcr.CloseReason,
+    qcr.CloseDate,
+    crc.RecentCommentsCount,
+    crc.LastCommentDate,
+    crc.SampleComments,
+    rh.TagName,
+    rh.Count as TagCount,
+    rh.TagCreationDate,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    concat(ua.GoldBadges, 'G/', ua.SilverBadges, 'S/', ua.BronzeBadges, 'B') as BadgeSummary,
+    case 
+        when q.ViewCount > 10000 then 'Very Popular'
+        when q.ViewCount between 1000 and 10000 then 'Popular'
+        else 'Less Popular'
+    end as PopularityCategory,
+    lag(q.Score) over (order by q.Score desc) as PrevQuestionScore,
+    lead(q.Score) over (order by q.Score desc) as NextQuestionScore
+from RecentEngagedQuestions q
+left join UserActivityRankings ua on ua.UserId = q.OwnerUserId
+left join AnswerStats ans on ans.QuestionId = q.Id
+left join QuestionCloseReasons qcr on qcr.PostId = q.Id
+left join CorrelatedRecentComments crc on crc.PostId = q.Id
+left join RecursiveTagHierarchy rh on rh.TagName = substring(q.Tags from '<([^>]+)>')
+where ua.PostCountRank <= 100 
+  and (qcr.CloseReason is null or qcr.CloseDate < current_date - interval '90 days')
+order by q.Score desc, q.CreationDate desc
+limit 50;

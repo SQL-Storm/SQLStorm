@@ -1,0 +1,130 @@
+WITH
+UserStats AS (
+    SELECT
+        u.Id                                      AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                     AS TotalAnswers,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2
+                               AND p.Id = q.AcceptedAnswerId)          AS AcceptedAnswers,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 2)                    AS AnswerScoreSum,
+        MAX(p.CreationDate)                                            AS LastAnswerDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts q ON q.Id = p.ParentId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeAgg AS (
+    SELECT
+        b.UserId,
+        STRING_AGG(DISTINCT b.Name, ', ')               AS Badges,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)    AS HasGold,
+        COUNT(*) FILTER (WHERE b.Class = 3)             AS BronzeCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TagScore AS (
+    SELECT
+        t.TagName,
+        SUM(p.Score)                                   AS TagScore,
+        COUNT(p.Id)                                    AS PostsWithTag
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+TopTags AS (
+    SELECT
+        TagName,
+        TagScore,
+        PostsWithTag,
+        RANK() OVER (ORDER BY TagScore DESC)           AS TagRank
+    FROM TagScore
+    WHERE TagScore IS NOT NULL
+),
+Top5Tags AS (
+    SELECT *
+    FROM TopTags
+    WHERE TagRank <= 5
+),
+-- helper to split display name into tags for dialects without string_to_array/ANY semantics
+UserTagMatches AS (
+    SELECT
+      us.UserId,
+      us.DisplayName,
+      tt.TagName,
+      tt.TagScore,
+      tt.PostsWithTag,
+      tt.TagRank
+    FROM UserStats us
+    LEFT JOIN Top5Tags tt
+      ON POSITION(tt.TagName IN us.DisplayName) > 0
+    WHERE us.TotalAnswers > 0
+)
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.TotalAnswers,
+    us.AcceptedAnswers,
+    ROUND(
+        COALESCE(CAST(us.AcceptedAnswers AS NUMERIC) / NULLIF(us.TotalAnswers,0),0),
+        3
+    )                                                AS AcceptanceRate,
+    us.AnswerScoreSum,
+    us.LastAnswerDate,
+    COALESCE(b.Badges, 'None')                       AS Badges,
+    b.HasGold,
+    b.BronzeCount,
+    utm.TagName,
+    utm.TagScore,
+    utm.PostsWithTag,
+    utm.TagRank,
+    CASE
+        WHEN us.Reputation > 20000 THEN 'Legendary'
+        WHEN us.Reputation BETWEEN 10000 AND 20000 THEN 'Expert'
+        WHEN us.Reputation BETWEEN 5000  AND  9999 THEN 'Seasoned'
+        ELSE 'Rising'
+    END                                            AS ReputationBand,
+    (SELECT COUNT(*) FROM Votes v
+        WHERE v.UserId = us.UserId AND v.VoteTypeId = 2)  AS UpVotesGiven,
+    (SELECT COUNT(*) FROM Posts p2
+        WHERE p2.OwnerUserId = us.UserId
+          AND p2.PostTypeId = 1
+          AND p2.ClosedDate IS NOT NULL)                AS ClosedQuestions
+FROM UserStats us
+LEFT JOIN BadgeAgg b      ON b.UserId = us.UserId
+LEFT JOIN UserTagMatches utm ON utm.UserId = us.UserId
+WHERE us.TotalAnswers > 0
+
+UNION ALL
+
+SELECT
+    NULL                                     AS UserId,
+    'Aggregate'                              AS DisplayName,
+    NULL                                     AS Reputation,
+    SUM(us.TotalAnswers)                     AS TotalAnswers,
+    SUM(us.AcceptedAnswers)                  AS AcceptedAnswers,
+    ROUND(
+        COALESCE(CAST(SUM(us.AcceptedAnswers) AS NUMERIC)
+                 / NULLIF(SUM(us.TotalAnswers),0),0),
+        3
+    )                                        AS AcceptanceRate,
+    SUM(us.AnswerScoreSum)                   AS AnswerScoreSum,
+    MAX(us.LastAnswerDate)                   AS LastAnswerDate,
+    NULL                                     AS Badges,
+    NULL                                     AS HasGold,
+    NULL                                     AS BronzeCount,
+    NULL                                     AS TagName,
+    NULL                                     AS TagScore,
+    NULL                                     AS PostsWithTag,
+    NULL                                     AS TagRank,
+    NULL                                     AS ReputationBand,
+    SUM( (SELECT COUNT(*) FROM Votes v
+           WHERE v.UserId = us.UserId AND v.VoteTypeId = 2) ) AS UpVotesGiven,
+    SUM( (SELECT COUNT(*) FROM Posts p2
+           WHERE p2.OwnerUserId = us.UserId
+             AND p2.PostTypeId = 1
+             AND p2.ClosedDate IS NOT NULL) )                AS ClosedQuestions
+FROM UserStats us
+WHERE us.TotalAnswers > 0;

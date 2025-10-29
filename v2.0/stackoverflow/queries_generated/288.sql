@@ -1,0 +1,454 @@
+-- {"query": "288.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 4350} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'none') as website_host,
+        date_trunc('month', u.creationdate) as cohort_month,
+        row_number() over (order by u.creationdate desc, u.id desc) as rn_global,
+        row_number() over (partition by date_trunc('month', u.creationdate) order by u.reputation desc, u.id) as rn_in_cohort
+    from users u
+    where u.creationdate >= now() - interval '3 years'
+),
+posts_enriched as (
+    select
+        p.id,
+        p.posttypeid,
+        p.creationdate,
+        p.owneruserid,
+        p.title,
+        p.tags,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.favoritecount,
+        p.closeddate,
+        p.acceptedanswerid,
+        case when p.posttypeid = 1 then 1 when p.posttypeid = 2 then 1 else 0 end as is_q_or_a,
+        extract(epoch from (now() - coalesce(p.lastactivitydate, p.creationdate))) / 86400.0 as age_days,
+        array_length(string_to_array(coalesce(substring(p.tags, 2, length(p.tags)-2), ''), '><'), 1) as tag_count,
+        (position('java' in lower(coalesce(p.title, ''))) > 0)::int as has_java_in_title,
+        (position('python' in lower(coalesce(p.title, ''))) > 0)::int as has_python_in_title
+    from posts p
+    where p.creationdate >= now() - interval '5 years'
+),
+votes_agg as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+        count(*) as total_votes,
+        min(v.creationdate) as first_vote_at,
+        max(v.creationdate) as last_vote_at
+    from votes v
+    where v.creationdate >= now() - interval '5 years'
+    group by v.postid
+),
+comments_agg as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        sum(case when c.score > 0 then 1 else 0 end) as pos_comments,
+        max(c.creationdate) as last_comment_at
+    from comments c
+    where c.creationdate >= now() - interval '5 years'
+    group by c.postid
+),
+badges_agg as (
+    select
+        b.userid,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        count(*) as total_badges,
+        sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges,
+        min(b.date) as first_badge_at,
+        max(b.date) as last_badge_at
+    from badges b
+    where b.date >= now() - interval '10 years'
+    group by b.userid
+),
+questions_only as (
+    select
+        pe.*,
+        case when pe.posttypeid = 1 then 1 else 0 end as is_question,
+        case when pe.posttypeid = 1 and pe.acceptedanswerid is not null then 1 else 0 end as has_accepted
+    from posts_enriched pe
+    where pe.posttypeid = 1
+),
+answers_only as (
+    select
+        pe.*,
+        case when pe.posttypeid = 2 then 1 else 0 end as is_answer
+    from posts_enriched pe
+    where pe.posttypeid = 2
+),
+link_dupes as (
+    select
+        pl.postid,
+        sum(case when pl.linktypeid = 3 then 1 else 0 end) as dup_links,
+        sum(case when pl.linktypeid = 1 then 1 else 0 end) as plain_links,
+        count(*) as all_links
+    from postlinks pl
+    where pl.creationdate >= now() - interval '5 years'
+    group by pl.postid
+),
+closed_reasons as (
+    select
+        ph.postid,
+        max(ph.creationdate) as last_closed_at,
+        max(case when ph.posthistorytypeid = 10 then try_cast(nullif(ph.comment, '') as int) end) as last_close_reason_raw,
+        max(case when ph.posthistorytypeid = 10 then ph.comment end) as last_close_comment
+    from posthistory ph
+    where ph.posthistorytypeid in (10)
+    group by ph.postid
+),
+close_reason_labeled as (
+    select
+        cr.postid,
+        cr.last_closed_at,
+        case
+            when cr.last_close_reason_raw in (1,101) then 'Duplicate'
+            when cr.last_close_reason_raw in (2,102) then 'Off-topic'
+            when cr.last_close_reason_raw in (3,105) then 'Opinion-based'
+            when cr.last_close_reason_raw in (4,103) then 'Needs details'
+            when cr.last_close_reason_raw in (7,104) then 'Needs focus'
+            else 'Other/Unknown'
+        end as last_close_reason
+    from closed_reasons cr
+),
+user_activity as (
+    select
+        u.id as user_id,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        sum(coalesce(p.score,0)) as total_post_score,
+        avg(nullif(p.score,0)) as avg_nonzero_score,
+        max(p.creationdate) as last_post_at
+    from users u
+    left join posts p on p.owneruserid = u.id and p.creationdate >= now() - interval '5 years'
+    group by u.id
+),
+tag_explode as (
+    select
+        p.id as post_id,
+        unnest(string_to_array(coalesce(substring(p.tags, 2, length(p.tags)-2), ''), '><')) as tag
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= now() - interval '5 years'
+),
+top_tags as (
+    select
+        te.tag,
+        count(*) as tag_usage
+    from tag_explode te
+    group by te.tag
+    having count(*) >= 25
+),
+user_top_tag as (
+    select
+        p.owneruserid as user_id,
+        te.tag,
+        count(*) as uses,
+        row_number() over (partition by p.owneruserid order by count(*) desc, te.tag) as rn
+    from posts p
+    join tag_explode te on te.post_id = p.id
+    group by p.owneruserid, te.tag
+),
+accepted_answerers as (
+    select
+        q.owneruserid as asker_id,
+        a.owneruserid as answerer_id,
+        count(*) as accepts_won
+    from posts q
+    join posts a on a.parentid = q.id and a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+      and a.posttypeid = 2
+      and q.creationdate >= now() - interval '5 years'
+    group by q.owneruserid, a.owneruserid
+),
+user_score_rank as (
+    select
+        u.id as user_id,
+        sum(coalesce(p.score,0)) as score_5y,
+        dense_rank() over (order by sum(coalesce(p.score,0)) desc nulls last) as score_rank
+    from users u
+    left join posts p on p.owneruserid = u.id and p.creationdate >= now() - interval '5 years'
+    group by u.id
+),
+post_quality as (
+    select
+        pe.id as post_id,
+        pe.owneruserid as user_id,
+        pe.posttypeid,
+        pe.creationdate,
+        coalesce(v.upvotes,0) as upvotes,
+        coalesce(v.downvotes,0) as downvotes,
+        coalesce(v.favorites,0) as favorites,
+        coalesce(c.comment_count,0) as comment_count,
+        coalesce(l.dup_links,0) as dup_links,
+        coalesce(l.plain_links,0) as plain_links,
+        case
+            when coalesce(v.upvotes,0) + coalesce(v.downvotes,0) = 0 then null
+            else 1.0 * coalesce(v.upvotes,0) / nullif(coalesce(v.upvotes,0) + coalesce(v.downvotes,0),0)
+        end as upvote_ratio,
+        (coalesce(v.upvotes,0) * 2 + coalesce(v.favorites,0) - coalesce(v.downvotes,0) - coalesce(l.dup_links,0) * 3) as quality_score_raw,
+        (coalesce(v.upvotes,0) - coalesce(v.downvotes,0)) / nullif(greatest(1, extract(epoch from (now() - pe.creationdate)) / 86400.0), 0) as net_votes_per_day,
+        (case when pe.has_java_in_title = 1 then 1 else 0 end) as java_flag,
+        (case when pe.has_python_in_title = 1 then 1 else 0 end) as python_flag
+    from posts_enriched pe
+    left join votes_agg v on v.postid = pe.id
+    left join comments_agg c on c.postid = pe.id
+    left join link_dupes l on l.postid = pe.id
+),
+user_rollup as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        ra.cohort_month,
+        ra.website_host,
+        coalesce(ba.total_badges,0) as total_badges,
+        coalesce(ba.gold_badges,0) as gold_badges,
+        coalesce(ba.silver_badges,0) as silver_badges,
+        coalesce(ba.bronze_badges,0) as bronze_badges,
+        ua.q_count,
+        ua.a_count,
+        ua.total_post_score,
+        ua.avg_nonzero_score,
+        ua.last_post_at,
+        ut.tag as top_tag_candidate,
+        ut.uses as top_tag_uses,
+        row_number() over (partition by u.id order by ut.uses desc nulls last, ut.tag) as tag_choice_rank
+    from users u
+    left join recent_users ra on ra.user_id = u.id
+    left join badges_agg ba on ba.userid = u.id
+    left join user_activity ua on ua.user_id = u.id
+    left join user_top_tag ut on ut.user_id = u.id
+    where u.creationdate >= now() - interval '10 years'
+),
+final_user as (
+    select
+        ur.user_id,
+        ur.displayname,
+        ur.reputation,
+        ur.cohort_month,
+        ur.website_host,
+        ur.total_badges,
+        ur.gold_badges,
+        ur.silver_badges,
+        ur.bronze_badges,
+        coalesce(ur.q_count,0) as q_count,
+        coalesce(ur.a_count,0) as a_count,
+        coalesce(ur.total_post_score,0) as total_post_score,
+        ur.avg_nonzero_score,
+        ur.last_post_at,
+        case when ur.tag_choice_rank = 1 then ur.top_tag_candidate end as top_tag,
+        case when ur.tag_choice_rank = 1 then ur.top_tag_uses end as top_tag_uses
+    from user_rollup ur
+    where ur.tag_choice_rank = 1 or ur.tag_choice_rank is null
+),
+post_labels as (
+    select
+        pq.post_id,
+        case
+            when pq.quality_score_raw >= 20 and pq.upvote_ratio >= 0.8 then 'excellent'
+            when pq.quality_score_raw >= 10 and pq.upvote_ratio >= 0.6 then 'good'
+            when pq.quality_score_raw <= -5 or pq.upvote_ratio < 0.3 then 'poor'
+            else 'average'
+        end as quality_bucket
+    from post_quality pq
+),
+user_post_stats as (
+    select
+        pq.user_id,
+        count(*) filter (where pq.posttypeid = 1) as posts_q,
+        count(*) filter (where pq.posttypeid = 2) as posts_a,
+        avg(pq.upvote_ratio) as avg_upvote_ratio,
+        avg(pq.net_votes_per_day) as avg_votes_per_day,
+        percentile_disc(0.5) within group (order by pq.quality_score_raw) as median_quality,
+        sum(case when pl.quality_bucket = 'excellent' then 1 else 0 end) as cnt_excellent,
+        sum(case when pl.quality_bucket = 'poor' then 1 else 0 end) as cnt_poor
+    from post_quality pq
+    left join post_labels pl on pl.post_id = pq.post_id
+    group by pq.user_id
+),
+question_close_stats as (
+    select
+        q.owneruserid as user_id,
+        count(*) as q_total,
+        sum(case when crl.last_close_reason is not null then 1 else 0 end) as q_closed,
+        sum(case when crl.last_close_reason = 'Duplicate' then 1 else 0 end) as q_closed_dup
+    from questions_only q
+    left join close_reason_labeled crl on crl.postid = q.id
+    group by q.owneruserid
+),
+accepted_gain as (
+    select
+        aa.answerer_id as user_id,
+        sum(aa.accepts_won) as accepts_won
+    from accepted_answerers aa
+    group by aa.user_id
+),
+user_rankings as (
+    select
+        fu.user_id,
+        dense_rank() over (order by coalesce(fu.total_post_score,0) desc, coalesce(fu.reputation,0) desc) as rank_by_score,
+        dense_rank() over (order by coalesce(fu.reputation,0) desc) as rank_by_rep
+    from final_user fu
+),
+thresholds as (
+    select
+        (select avg(total_post_score) from final_user) as avg_total_score,
+        (select percentile_disc(0.9) within group (order by total_post_score) from final_user) as p90_total_score,
+        (select avg(a_count) from final_user) as avg_answers,
+        (select avg(q_count) from final_user) as avg_questions
+),
+filtered_users as (
+    select
+        fu.*,
+        ups.avg_upvote_ratio,
+        ups.avg_votes_per_day,
+        ups.median_quality,
+        ups.cnt_excellent,
+        ups.cnt_poor,
+        qcs.q_total,
+        qcs.q_closed,
+        qcs.q_closed_dup,
+        coalesce(ag.accepts_won,0) as accepts_won,
+        ur.rank_by_score,
+        ur.rank_by_rep,
+        ut.score_5y,
+        ut.score_rank
+    from final_user fu
+    left join user_post_stats ups on ups.user_id = fu.user_id
+    left join question_close_stats qcs on qcs.user_id = fu.user_id
+    left join accepted_gain ag on ag.user_id = fu.user_id
+    left join user_rankings ur on ur.user_id = fu.user_id
+    left join user_score_rank ut on ut.user_id = fu.user_id
+),
+cohort_comp as (
+    select
+        cohort_month,
+        avg(coalesce(total_post_score,0)) as cohort_avg_score,
+        avg(coalesce(a_count,0)) as cohort_avg_answers,
+        avg(coalesce(q_count,0)) as cohort_avg_questions
+    from filtered_users
+    group by cohort_month
+),
+anomalies as (
+    select
+        f.user_id,
+        f.displayname,
+        f.reputation,
+        f.cohort_month,
+        f.website_host,
+        f.total_badges,
+        f.gold_badges,
+        f.silver_badges,
+        f.bronze_badges,
+        f.q_count,
+        f.a_count,
+        f.total_post_score,
+        f.avg_nonzero_score,
+        f.last_post_at,
+        f.top_tag,
+        f.top_tag_uses,
+        f.avg_upvote_ratio,
+        f.avg_votes_per_day,
+        f.median_quality,
+        f.cnt_excellent,
+        f.cnt_poor,
+        f.q_total,
+        f.q_closed,
+        f.q_closed_dup,
+        f.accepts_won,
+        f.rank_by_score,
+        f.rank_by_rep,
+        f.score_5y,
+        f.score_rank,
+        cc.cohort_avg_score,
+        cc.cohort_avg_answers,
+        cc.cohort_avg_questions,
+        case when f.total_post_score > cc.cohort_avg_score * 3 then 1 else 0 end as is_outlier_high_score,
+        case when f.a_count > greatest(5, cc.cohort_avg_answers * 4) then 1 else 0 end as is_outlier_answers,
+        case when f.q_closed > 0 and coalesce(f.q_total,0) > 0 and (1.0 * f.q_closed / nullif(f.q_total,0)) > 0.5 then 1 else 0 end as is_many_closures,
+        case when f.avg_upvote_ratio is not null and f.avg_upvote_ratio < 0.35 then 1 else 0 end as is_low_upvote_ratio
+    from filtered_users f
+    left join cohort_comp cc on cc.cohort_month = f.cohort_month
+),
+ranked as (
+    select
+        a.*,
+        row_number() over (
+            order by
+                (is_outlier_high_score + is_outlier_answers + is_many_closures + is_low_upvote_ratio) desc,
+                total_post_score desc nulls last,
+                reputation desc nulls last
+        ) as anomaly_rank
+    from anomalies a
+),
+tag_summary as (
+    select
+        tt.tag,
+        count(*) as user_count_using_tag,
+        avg(fu.total_post_score) as avg_score_by_tag
+    from user_top_tag utt
+    join final_user fu on fu.user_id = utt.user_id and utt.rn = 1
+    join top_tags tt on tt.tag = utt.tag
+    group by tt.tag
+),
+final_report as (
+    select
+        r.anomaly_rank,
+        r.user_id,
+        r.displayname,
+        r.reputation,
+        r.cohort_month,
+        r.website_host,
+        coalesce(r.top_tag, 'unknown') as top_tag,
+        r.top_tag_uses,
+        r.total_badges,
+        r.gold_badges,
+        r.silver_badges,
+        r.bronze_badges,
+        r.q_count,
+        r.a_count,
+        r.total_post_score,
+        r.avg_nonzero_score,
+        r.avg_upvote_ratio,
+        r.avg_votes_per_day,
+        r.median_quality,
+        r.cnt_excellent,
+        r.cnt_poor,
+        r.q_total,
+        r.q_closed,
+        r.q_closed_dup,
+        r.accepts_won,
+        r.rank_by_score,
+        r.rank_by_rep,
+        r.score_5y,
+        r.score_rank,
+        r.is_outlier_high_score,
+        r.is_outlier_answers,
+        r.is_many_closures,
+        r.is_low_upvote_ratio
+    from ranked r
+)
+select fr.*
+from final_report fr
+where
+    (
+        fr.is_outlier_high_score = 1
+        or fr.is_outlier_answers = 1
+        or fr.is_many_closures = 1
+        or fr.is_low_upvote_ratio = 1
+    )
+and coalesce(fr.avg_upvote_ratio, 0.0) >= 0.0
+order by fr.anomaly_rank, fr.user_id
+limit 200;

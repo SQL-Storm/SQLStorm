@@ -1,0 +1,204 @@
+-- {"query": "4907.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1922} 
+
+WITH
+  PostEdits AS (
+    SELECT
+      ph.PostId,
+      MAX(ph.CreationDate) AS LastEditDate,
+      COUNT(DISTINCT ph.UserId) AS DistinctEditors,
+      SUM(CASE WHEN pht.Name = 'Edit Body' THEN 1 ELSE 0 END) AS BodyEdits,
+      SUM(CASE WHEN pht.Name = 'Edit Title' THEN 1 ELSE 0 END) AS TitleEdits
+    FROM PostHistory AS ph
+    JOIN PostHistoryTypes AS pht
+      ON ph.PostHistoryTypeId = pht.Id
+    WHERE
+      pht.Name IN ('Edit Body', 'Edit Title')
+    GROUP BY
+      ph.PostId
+  ),
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(p.ViewCount) AS TotalViews,
+      SUM(p.AnswerCount) AS TotalAnswersGiven,
+      AVG(p.Score) AS AveragePostScore,
+      MAX(p.CreationDate) AS LatestPostDate,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+      SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedQuestionsCount
+    FROM Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+      AND p.OwnerUserId > 0
+    GROUP BY
+      p.OwnerUserId
+  ),
+  TagPopularity AS (
+    SELECT
+      t.TagName,
+      COUNT(DISTINCT p.Id) AS TaggedPostCount,
+      SUM(p.Score) AS TotalTagScore
+    FROM Tags AS t
+    JOIN Posts AS p
+      ON ',' + t.TagName + ',' LIKE '%,' + t.TagName + ',%'
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      t.TagName
+  ),
+  UserReputationTrend AS (
+    SELECT
+      UserId,
+      CreationDate,
+      Reputation,
+      LAG(Reputation, 1, Reputation) OVER (PARTITION BY UserId ORDER BY CreationDate) AS PreviousReputation,
+      Reputation - LAG(Reputation, 1, Reputation) OVER (PARTITION BY UserId ORDER BY CreationDate) AS ReputationGained
+    FROM PostHistory
+    WHERE
+      PostHistoryTypeId = 2
+      AND UserId IS NOT NULL
+  )
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  COALESCE(upa.TotalPosts, 0) AS TotalPostsOwned,
+  COALESCE(upa.TotalViews, 0) AS TotalViewsReceived,
+  COALESCE(upa.AveragePostScore, 0) AS AvgPostScore,
+  COALESCE(upa.QuestionsCount, 0) AS QuestionsAsked,
+  COALESCE(upa.AnswersCount, 0) AS AnswersProvided,
+  COALESCE(upa.ClosedQuestionsCount, 0) AS ClosedQuestions,
+  COUNT(DISTINCT b.Id) AS TotalBadges,
+  SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+  SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+  SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+  pe.DistinctEditors,
+  pe.BodyEdits,
+  pe.TitleEdits,
+  urt.ReputationGained AS LatestReputationGain,
+  tp.TaggedPostCount,
+  tp.TotalTagScore,
+  CASE
+    WHEN upa.LatestPostDate > DATEADD(year, -1, GETDATE()) THEN 'Active (Last Year)'
+    WHEN upa.LatestPostDate > DATEADD(year, -5, GETDATE()) THEN 'Moderately Active (Last 5 Years)'
+    ELSE 'Inactive (More than 5 Years)'
+  END AS UserActivityLevel,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments AS c
+    WHERE
+      c.UserId = u.Id
+      AND c.Score > 5
+  ) AS HighScoringComments,
+  (
+    SELECT
+      SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END)
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId IN (
+        SELECT
+          p.Id
+        FROM Posts AS p
+        WHERE
+          p.OwnerUserId = u.Id
+      )
+  ) AS DuplicateLinksMade,
+  IIF(
+    u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl != '',
+    'Has Website',
+    'No Website'
+  ) AS WebsiteStatus,
+  CASE
+    WHEN u.AboutMe IS NULL OR u.AboutMe = '' THEN 'No Bio'
+    WHEN LEN(u.AboutMe) < 100 THEN 'Short Bio'
+    ELSE 'Detailed Bio'
+  END AS BioLength,
+  COALESCE(
+    (
+      SELECT
+        AVG(CAST(LEN(c.Text) AS FLOAT))
+      FROM Comments AS c
+      WHERE
+        c.UserId = u.Id
+    ),
+    0
+  ) AS AvgCommentLength,
+  COALESCE(
+    (
+      SELECT
+        COUNT(DISTINCT ph.PostId)
+      FROM PostHistory AS ph
+      WHERE
+        ph.UserId = u.Id
+        AND ph.PostHistoryTypeId IN (10, 12, 14, 19) /* Close, Delete, Lock, Protect */
+    ),
+    0
+  ) AS ModeratorActions,
+  CASE
+    WHEN u.CreationDate < DATEADD(day, -365, GETDATE()) AND u.Reputation < 1000 THEN 'Low Reputation Long-Time User'
+    WHEN u.CreationDate > DATEADD(day, -30, GETDATE()) AND u.Reputation > 5000 THEN 'New High Reputation User'
+    ELSE 'Standard User'
+  END AS UserTier
+FROM Users AS u
+LEFT JOIN UserPostActivity AS upa
+  ON u.Id = upa.OwnerUserId
+LEFT JOIN PostEdits AS pe
+  ON u.Id = pe.PostId
+LEFT JOIN (
+  SELECT
+    UserId,
+    MAX(ReputationGained) AS ReputationGained
+  FROM UserReputationTrend
+  GROUP BY
+    UserId
+) AS urt
+  ON u.Id = urt.UserId
+LEFT JOIN (
+  SELECT
+    p.OwnerUserId,
+    tp.TagName,
+    tp.TaggedPostCount,
+    tp.TotalTagScore
+  FROM Posts AS p
+  JOIN TagPopularity AS tp
+    ON p.Tags LIKE '%' + tp.TagName + '%' /* Simplified join for example, actual tag splitting might be needed */
+  WHERE
+    p.OwnerUserId IS NOT NULL
+) AS tag_per_user
+  ON u.Id = tag_per_user.OwnerUserId
+LEFT JOIN Badges AS b
+  ON u.Id = b.UserId
+LEFT JOIN (
+  SELECT DISTINCT
+    TagName,
+    COUNT(p.Id) AS TaggedPostCount,
+    SUM(p.Score) AS TotalTagScore
+  FROM Posts AS p
+  CROSS APPLY STRING_SPLIT(REPLACE(REPLACE(p.Tags, '<', ','), '>', ','), ',') AS s
+  WHERE
+    p.PostTypeId = 1 AND s.value != ''
+  GROUP BY
+    TagName
+) AS tp
+  ON CAST(u.Id AS VARCHAR(10)) IN (SELECT OwnerUserId FROM Posts WHERE Tags LIKE '%' + tp.TagName + '%') /* This part is a simplified representation and may not be accurate for complex tag usage */
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  upa.TotalPosts,
+  upa.TotalViews,
+  upa.AveragePostScore,
+  upa.QuestionsCount,
+  upa.AnswersCount,
+  upa.ClosedQuestionsCount,
+  pe.DistinctEditors,
+  pe.BodyEdits,
+  pe.TitleEdits,
+  urt.ReputationGained,
+  tp.TaggedPostCount,
+  tp.TotalTagScore,
+  upa.LatestPostDate,
+  u.WebsiteUrl,
+  u.AboutMe,
+  u.CreationDate,
+  u.Reputation;

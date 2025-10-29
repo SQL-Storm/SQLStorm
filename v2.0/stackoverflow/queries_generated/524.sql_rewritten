@@ -1,0 +1,318 @@
+-- {"query": "524.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2697} 
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    u.websiteurl,
+    coalesce(nullif(trim(u.aboutme), ''), 'N/A') as aboutme_sanitized,
+    greatest(u.upvotes - coalesce(u.downvotes, 0), 0) as net_votes_nonneg
+  from users u
+  where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '3 years' from users)
+),
+question_posts as (
+  select
+    p.id as post_id,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.title,
+    p.tags,
+    p.answercount,
+    p.commentcount,
+    p.favoritecount,
+    p.closeddate,
+    p.communityowneddate
+  from posts p
+  where p.posttypeid = 1
+),
+answer_posts as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as answer_date,
+    a.score as answer_score
+  from posts a
+  where a.posttypeid = 2
+),
+votes_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    max(case when v.votetypeid in (8,9) then v.bountyamount else null end) as max_bounty
+  from votes v
+  where v.creationdate >= (select date_trunc('year', cast('2024-10-01 12:34:56' as timestamp)) - interval '5 years')
+  group by v.postid
+),
+latest_edit as (
+  select
+    ph.postid,
+    max(ph.creationdate) as latest_edit_date,
+    max(ph.posthistorytypeid) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit_type
+  from posthistory ph
+  where ph.posthistorytypeid in (4,5,6,24,50,52,53,10,11,12,13,14,15,19,20,35,36)
+  group by ph.postid
+),
+close_reasons as (
+  select
+    ph.postid,
+    max(ph.creationdate) as last_close_event,
+    max(case
+          when ph.posthistorytypeid = 10 then
+            case
+              when ph.comment ~ '^[0-9]+$' then ph.comment
+              else null
+            end
+        end) as last_close_reason_code
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+links as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 1) as linked_count,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_count,
+    max(pl.creationdate) as last_link_date
+  from postlinks pl
+  group by pl.postid
+),
+tag_unroll as (
+  select
+    q.post_id,
+    unnest(string_to_array(substring(coalesce(q.tags,''), 2, greatest(length(coalesce(q.tags,'')) - 2,0)), '><')) as tagname
+  from question_posts q
+),
+tag_rank as (
+  select
+    t.post_id,
+    t.tagname,
+    row_number() over (partition by t.post_id order by coalesce(ta.count, 0) desc, t.tagname) as tag_pop_rank,
+    coalesce(ta.count, 0) as global_tag_count
+  from tag_unroll t
+  left join tags ta on lower(ta.tagname) = lower(t.tagname)
+),
+dominant_tag as (
+  select post_id,
+         min(tagname) keep (dense_rank first order by tag_pop_rank, tagname) as dom_tag
+  from (
+    select post_id, tagname, tag_pop_rank
+    from tag_rank
+    where tag_pop_rank <= 1
+  ) s
+  group by post_id
+),
+answer_latency as (
+  select
+    a.question_id,
+    min(a.answer_date) as first_answer_date,
+    avg(extract(epoch from a.answer_date)) as avg_ans_epoch
+  from answer_posts a
+  group by a.question_id
+),
+accepted_answer_latency as (
+  select
+    q.id as question_id,
+    q.acceptedanswerid,
+    aa.creationdate as accepted_answer_date
+  from posts q
+  left join posts aa on aa.id = q.acceptedanswerid
+  where q.posttypeid = 1
+),
+user_badges as (
+  select
+    b.userid,
+    count(*) as total_badges,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    min(b.date) as first_badge_date,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+comments_agg as (
+  select
+    c.postid,
+    count(*) as comments_count,
+    sum(c.score) as sum_comment_score,
+    max(c.creationdate) as last_comment_date,
+    max(length(c.text)) as max_comment_length
+  from comments c
+  group by c.postid
+),
+question_metrics as (
+  select
+    q.post_id,
+    q.owneruserid as owner_id,
+    q.creationdate as question_date,
+    q.score as question_score,
+    q.viewcount,
+    q.answercount,
+    q.commentcount,
+    q.favoritecount,
+    q.closeddate,
+    q.communityowneddate,
+    va.upvotes,
+    va.downvotes,
+    va.favorites as vote_favorites,
+    va.max_bounty,
+    le.latest_edit_date,
+    le.last_edit_type,
+    cr.last_close_event,
+    cr.last_close_reason_code,
+    l.linked_count,
+    l.duplicate_count,
+    l.last_link_date,
+    al.first_answer_date,
+    aal.accepted_answer_date,
+    ca.comments_count,
+    ca.sum_comment_score,
+    ca.last_comment_date,
+    ca.max_comment_length,
+    dt.dom_tag
+  from question_posts q
+  left join votes_agg va on va.postid = q.post_id
+  left join latest_edit le on le.postid = q.post_id
+  left join close_reasons cr on cr.postid = q.post_id
+  left join links l on l.postid = q.post_id
+  left join answer_latency al on al.question_id = q.post_id
+  left join accepted_answer_latency aal on aal.question_id = q.post_id
+  left join comments_agg ca on ca.postid = q.post_id
+  left join dominant_tag dt on dt.post_id = q.post_id
+),
+owner_enriched as (
+  select
+    qm.*,
+    ru.displayname as owner_name,
+    ru.reputation as owner_reputation,
+    ru.creationdate as owner_created,
+    ru.location as owner_location,
+    ru.websiteurl as owner_website,
+    ru.aboutme_sanitized as owner_about,
+    ru.net_votes_nonneg as owner_net_votes,
+    ub.total_badges,
+    ub.gold_badges,
+    ub.silver_badges,
+    ub.bronze_badges,
+    ub.first_badge_date,
+    ub.last_badge_date
+  from question_metrics qm
+  left join recent_users ru on ru.user_id = qm.owner_id
+  left join user_badges ub on ub.userid = qm.owner_id
+),
+scored as (
+  select
+    oe.*,
+    case
+      when oe.closeddate is not null then 0.1
+      when oe.duplicate_count > 0 then 0.3
+      else 1.0
+    end
+    * (
+      coalesce(oe.question_score, 0) * 1.0
+      + coalesce(oe.upvotes, 0) * 0.7
+      - coalesce(oe.downvotes, 0) * 0.9
+      + coalesce(oe.viewcount, 0) / nullif(ln(least(greatest(extract(epoch from age(cast('2024-10-01 12:34:56' as timestamp), oe.question_date)), 1), 1e9)), 0)
+      + coalesce(oe.vote_favorites, 0) * 1.3
+      + coalesce(oe.max_bounty, 0) * 0.5
+      + coalesce(oe.comments_count, 0) * 0.2
+      + coalesce(oe.sum_comment_score, 0) * 0.4
+    ) as hotness_score,
+    extract(epoch from (coalesce(oe.first_answer_date, cast('2024-10-01 12:34:56' as timestamp)) - oe.question_date)) as time_to_first_answer_sec,
+    extract(epoch from (coalesce(oe.accepted_answer_date, cast('2024-10-01 12:34:56' as timestamp)) - oe.question_date)) as time_to_accept_sec
+  from owner_enriched oe
+),
+ranked as (
+  select
+    s.*,
+    row_number() over (order by s.hotness_score desc nulls last) as global_rank,
+    rank() over (partition by coalesce(lower(s.dom_tag), '__no_tag__') order by s.hotness_score desc nulls last) as tag_rank,
+    dense_rank() over (order by coalesce(s.owner_reputation, -1) desc, s.hotness_score desc nulls last) as rep_bucket_rank,
+    percent_rank() over (order by s.time_to_first_answer_sec nulls last) as p_time_to_first_answer
+  from scored s
+),
+filtered as (
+  select
+    r.*
+  from ranked r
+  where
+    -- Complex predicate block for benchmarking
+    (
+      (r.upvotes is null and r.downvotes is null and r.comments_count is null)
+      or
+      (coalesce(r.upvotes, 0) + coalesce(r.downvotes, 0) + coalesce(r.comments_count, 0) > 10)
+    )
+    and (
+      r.owner_reputation is null
+      or r.owner_reputation >= (
+        select percentile_disc(0.75) within group (order by u.reputation)
+        from users u
+      )
+    )
+    and (
+      r.dom_tag is null
+      or exists (
+        select 1
+        from tags t
+        where lower(t.tagname) = lower(r.dom_tag)
+          and t.count > (select avg(count) from tags)
+      )
+    )
+    and (
+      r.last_close_reason_code is null
+      or r.last_close_reason_code ~ '^(101|102|103|104|105)$'
+    )
+    and (
+      r.owner_website is null
+      or r.owner_website ilike 'http%'
+    )
+)
+select
+  f.post_id,
+  coalesce(f.title, '(no title)') as title,
+  coalesce(f.dom_tag, '(no dominant tag)') as dominant_tag,
+  f.global_rank,
+  f.tag_rank,
+  f.rep_bucket_rank,
+  round(f.hotness_score::numeric, 3) as hotness_score,
+  f.question_score,
+  f.upvotes,
+  f.downvotes,
+  f.viewcount,
+  f.vote_favorites,
+  f.max_bounty,
+  f.comments_count,
+  f.sum_comment_score,
+  f.owner_id,
+  coalesce(f.owner_name, '(anonymous)') as owner_name,
+  f.owner_reputation,
+  f.total_badges,
+  f.gold_badges,
+  f.silver_badges,
+  f.bronze_badges,
+  f.question_date,
+  f.latest_edit_date,
+  f.last_close_event,
+  f.last_close_reason_code,
+  f.first_answer_date,
+  f.accepted_answer_date,
+  f.time_to_first_answer_sec,
+  f.time_to_accept_sec,
+  f.p_time_to_first_answer,
+  case when f.closeddate is not null then 'closed'
+       when f.duplicate_count > 0 then 'duplicate'
+       when f.communityowneddate is not null then 'community'
+       else 'open'
+  end as question_state
+from filtered f
+qualify
+  -- emulate top-k per tag + global cutoff using window and qualify (for engines that support it)
+  (f.tag_rank <= 10) and (f.global_rank <= 1000)
+order by f.hotness_score desc nulls last, f.post_id desc;

@@ -1,0 +1,132 @@
+with UserBadgeCounts as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(case when b.Class = 3 then b.Id end) as BronzeBadges,
+        row_number() over (partition by u.Id order by max(b.Date) desc) as LastBadgeRank,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopPosts as (
+    select 
+        p.Id, 
+        p.Title, 
+        p.OwnerUserId, 
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        case when p.Tags is not null 
+            then cardinality(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'))
+            else 0
+        end as TagCount,
+        rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as PostRank
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+PostWithAnswers as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId as QuestionOwner,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.TagCount,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwner,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.FavoriteCount as AnswerFavoriteCount,
+        a.RankInQuestion,
+        a.IsAccepted,
+        q.Id as QuestionPostId,
+        q.PostRank
+    from 
+        (select * from TopPosts where PostTypeId=1 and PostRank <= 100) q
+        left join lateral (
+            select 
+                a.Id, a.OwnerUserId, a.Score, a.CreationDate, a.FavoriteCount,
+                row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as RankInQuestion,
+                case when a.Id = tp.AcceptedAnswerId then true else false end as IsAccepted,
+                a.ParentId
+            from Posts a
+            left join TopPosts tp on tp.Id = a.ParentId
+            where a.PostTypeId = 2 and a.ParentId = q.Id
+        ) a on true
+),
+LatestCommentsPerPost as (
+    select
+        c.PostId,
+        c.Id as CommentId,
+        c.UserId as CommentUserId,
+        c.CreationDate as CommentDate,
+        c.Score as CommentScore,
+        c.Text as CommentText
+    from (
+        select
+            c.*,
+            row_number() over (partition by c.PostId order by c.CreationDate desc) as rn
+        from Comments c
+    ) c
+    where c.rn = 1
+),
+PostLinkAggregates as (
+    select
+        pl.PostId,
+        count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId end) as LinkedCount,
+        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicateCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+)
+select 
+    q.QuestionId,
+    left(q.Title, 100) || coalesce(' [Tags: ' || array_to_string(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'), ', ') || ']', '') as ShortTitleWithTags,
+    u.DisplayName as QuestionOwnerName,
+    q.QuestionScore,
+    q.QuestionViews,
+    q.TagCount,
+    q.AnswerId,
+    au.DisplayName as AnswerOwnerName,
+    q.AnswerScore,
+    q.AnswerFavoriteCount,
+    q.AnswerCreationDate,
+    q.IsAccepted,
+    c.CommentText as LatestCommentText,
+    c.CommentScore as LatestCommentScore,
+    c.CommentDate as LatestCommentDate,
+    pfa.LinkedCount,
+    pfa.DuplicateCount,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    case 
+        when q.QuestionScore > avg(q.QuestionScore) over () then 'Above Avg Question Score' 
+        else 'Below Avg Question Score' end as QuestionScoreCategory,
+    case 
+        when q.AnswerFavoriteCount is null then 'No favorites'
+        when q.AnswerFavoriteCount > 10 then 'Popular answer'
+        else 'Less popular answer'
+    end as AnswerPopularity,
+    (select count(distinct c2.UserId) from Comments c2 where c2.PostId = q.QuestionId and c2.UserId is not null) as DistinctCommenters,
+    sum(case when q.AnswerOwner is not null then 1 else 0 end) over (partition by q.AnswerOwner order by q.AnswerCreationDate rows between unbounded preceding and current row) as CumulativeAnswersByUser
+from 
+    PostWithAnswers q
+    left join Users u on u.Id = q.QuestionOwner
+    left join Users au on au.Id = q.AnswerOwner
+    left join LatestCommentsPerPost c on c.PostId = q.QuestionId
+    left join Posts p on p.Id = q.QuestionId
+    left join PostLinkAggregates pfa on pfa.PostId = q.QuestionId
+    left join UserBadgeCounts ubc on ubc.UserId = q.QuestionOwner
+where 
+    q.PostRank <= 100
+order by 
+    q.QuestionScore desc,
+    q.AnswerScore desc,
+    q.QuestionId
+limit 50;

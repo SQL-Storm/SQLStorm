@@ -1,0 +1,130 @@
+-- {"query": "3549.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2269} 
+
+/*  Performance‑benchmarking query using CTEs, window functions, outer joins,
+    correlated subqueries, set operators, string handling and NULL logic   */
+
+WITH
+/* Users that either have very high reputation or hold at least three gold badges */
+AllHighPerformers AS (
+    SELECT u.Id
+    FROM   Users u
+    WHERE  u.Reputation > 20000
+
+    UNION
+
+    SELECT b.UserId
+    FROM   Badges b
+    WHERE  b.Class = 1               -- gold badges
+    GROUP  BY b.UserId
+    HAVING COUNT(*) >= 3
+),
+
+/* Basic statistics per user */
+UserStats AS (
+    SELECT
+        u.Id                                     AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVotes,
+        COUNT(b.Id)            FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id)            FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id)            FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        MAX(p.CreationDate)   AS LastPostDate
+    FROM   Users u
+    LEFT   JOIN Badges b   ON b.UserId = u.Id
+    LEFT   JOIN Posts  p   ON p.OwnerUserId = u.Id
+    GROUP  BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+
+/* Rank the high‑performing users by reputation (ties broken by net votes) */
+RankedUsers AS (
+    SELECT
+        us.*,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.NetVotes DESC) AS RepRank
+    FROM   UserStats us
+    WHERE  us.UserId IN (SELECT Id FROM AllHighPerformers)
+),
+
+/* Latest closed question per user (if any) */
+LatestClosedQuestions AS (
+    SELECT
+        p.OwnerUserId                AS UserId,
+        p.Id,
+        p.Title,
+        ph.Comment                   AS CloseReason,
+        p.ClosedDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                           ORDER BY p.ClosedDate DESC) AS rn
+    FROM   Posts p
+    JOIN   PostHistory ph ON ph.PostId = p.Id
+    WHERE  p.PostTypeId = 1               -- question
+      AND  p.ClosedDate IS NOT NULL
+      AND  ph.PostHistoryTypeId = 10      -- Close
+),
+
+/* Extract tag usage per user from the Tags column (stored as <tag1><tag2>…) */
+UserTagUsage AS (
+    SELECT
+        u.Id                         AS UserId,
+        UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag,
+        COUNT(*)                     AS TagUseCount
+    FROM   Users u
+    JOIN   Posts p ON p.OwnerUserId = u.Id
+    WHERE  p.PostTypeId = 1
+      AND  p.Tags IS NOT NULL
+    GROUP  BY u.Id, Tag
+),
+
+/* Global tag popularity (top 5 tags) */
+TopTags AS (
+    SELECT
+        Tag,
+        SUM(TagUseCount) AS TotalUses,
+        ROW_NUMBER() OVER (ORDER BY SUM(TagUseCount) DESC) AS TagRank
+    FROM   UserTagUsage
+    GROUP  BY Tag
+    HAVING ROW_NUMBER() OVER (ORDER BY SUM(TagUseCount) DESC) <= 5
+),
+
+/* Correlated subquery to get the most recent answer score for each user */
+UserLatestAnswerScore AS (
+    SELECT
+        u.Id                               AS UserId,
+        (SELECT COALESCE(a.Score,0)
+         FROM   Posts a
+         WHERE  a.OwnerUserId = u.Id
+           AND  a.PostTypeId = 2               -- answer
+         ORDER  BY a.CreationDate DESC
+         LIMIT  1)                           AS LatestAnswerScore
+    FROM   Users u
+)
+
+SELECT
+    ru.RepRank,
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.NetVotes,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.QuestionCount,
+    ru.AnswerCount,
+    lcq.Title                         AS LatestClosedQuestionTitle,
+    COALESCE(lcq.CloseReason,'Unknown') AS NormalizedCloseReason,
+    ula.LatestAnswerScore,
+    tt.Tag,
+    tt.TotalUses,
+    tt.TagRank
+FROM   RankedUsers ru
+LEFT   JOIN LatestClosedQuestions lcq
+       ON lcq.UserId = ru.UserId
+      AND lcq.rn = 1                         -- pick the latest per user
+LEFT   JOIN UserLatestAnswerScore ula
+       ON ula.UserId = ru.UserId
+LEFT   JOIN TopTags tt
+       ON TRUE                                 -- cross join to attach top‑5 tags to each row
+WHERE  ru.RepRank <= 10                       -- limit to top‑10 high performers
+ORDER  BY ru.RepRank, tt.TagRank;

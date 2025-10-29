@@ -1,0 +1,116 @@
+-- {"query": "4305.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1450} 
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        AVG(p.Score) AS AveragePostScore,
+        MAX(u.Reputation) AS MaxReputation,
+        MIN(u.CreationDate) AS EarliestCreationDate,
+        COUNT(DISTINCT b.Id) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+RecentUserEdits AS (
+    SELECT
+        rpe.UserId,
+        COUNT(DISTINCT rpe.PostId) AS PostsEditedRecently,
+        AVG(rpe.CreationDate) AS AverageEditDate
+    FROM RankedPostEdits rpe
+    WHERE rpe.rn = 1 AND rpe.CreationDate > (SELECT MAX(CreationDate) FROM Posts) - INTERVAL '90 days'
+    GROUP BY rpe.UserId
+),
+PostLinkStats AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl_dup.RelatedPostId) AS DuplicateLinkCount,
+        SUM(CASE WHEN lt.Name = 'Linked' THEN 1 ELSE 0 END) AS LinkedCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    LEFT JOIN PostLinks pl_dup ON pl.PostId = pl_dup.RelatedPostId AND pl_dup.LinkTypeId = 3
+    GROUP BY pl.PostId
+),
+CommentSentiment AS (
+    SELECT
+        c.PostId,
+        COUNT(CASE WHEN c.Score > 0 THEN 1 END) AS PositiveCommentCount,
+        COUNT(CASE WHEN c.Score < 0 THEN 1 END) AS NegativeCommentCount,
+        SUM(LENGTH(c.Text)) AS TotalCommentLength
+    FROM Comments c
+    GROUP BY c.PostId
+)
+SELECT
+    p.Id AS PostId,
+    pt.Name AS PostType,
+    p.Title,
+    COALESCE(uas.DisplayName, p.OwnerDisplayName) AS OwnerDisplayName,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS PostScore,
+    p.AnswerCount,
+    p.CommentCount,
+    COALESCE(cls.DuplicateLinkCount, 0) AS DuplicateLinkCount,
+    COALESCE(cls.LinkedCount, 0) AS LinkedCount,
+    COALESCE(cs.PositiveCommentCount, 0) AS PositiveCommentCount,
+    COALESCE(cs.NegativeCommentCount, 0) AS NegativeCommentCount,
+    CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.FavoriteCount > 100 THEN 'Highly Favorited'
+        ELSE 'Active'
+    END AS PostStatusCategory,
+    CONCAT(
+        p.Tags,
+        CASE WHEN p.Tags IS NULL THEN '' ELSE '' END,
+        CASE WHEN p.Title IS NOT NULL THEN ' - ' || p.Title ELSE '' END
+    ) AS TagAndTitle,
+    CASE
+        WHEN uas.TotalPostsOwned > 1000 AND uas.AveragePostScore > 50 THEN 'Power User'
+        WHEN uas.TotalPostsOwned < 10 AND uas.AveragePostScore < 0 THEN 'Newbie with Negative Score'
+        ELSE 'Standard User'
+    END AS UserActivityLevel,
+    CASE
+        WHEN rue.PostsEditedRecently > 5 AND p.LastEditDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days') THEN 'Recently Edited by Active Editor'
+        WHEN p.LastEditDate IS NULL THEN 'Never Edited'
+        ELSE 'Edited'
+    END AS EditActivity,
+    GREATEST(COALESCE(p.CreationDate, '1970-01-01'), COALESCE(p.LastActivityDate, '1970-01-01'), COALESCE(p.LastEditDate, '1970-01-01')) AS LatestActivityTimestamp,
+    CASE
+        WHEN LENGTH(COALESCE(p.Body, '')) > 10000 THEN 'Very Long Body'
+        WHEN LENGTH(COALESCE(p.Body, '')) < 100 THEN 'Short Body'
+        ELSE 'Medium Body'
+    END AS BodyLengthCategory,
+    COALESCE(p.OwnerUserId, -1) AS SafeOwnerUserId,
+    (p.ViewCount * p.AnswerCount) AS ViewAnswerProduct,
+    RANK() OVER (ORDER BY p.Score DESC) AS RankByScore
+FROM Posts p
+JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN UserActivitySummary uas ON p.OwnerUserId = uas.UserId
+LEFT JOIN RecentUserEdits rue ON p.OwnerUserId = rue.UserId
+LEFT JOIN PostLinkStats cls ON p.Id = cls.PostId
+LEFT JOIN CommentSentiment cs ON p.Id = cs.PostId
+WHERE
+    p.PostTypeId IN (1, 2)
+    AND p.CreationDate > '2023-01-01'
+    AND (p.Score > 10 OR p.AnswerCount > 5)
+    OR (uas.TotalBadges > 20 AND p.PostTypeId = 1)
+    OR EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = p.Id AND c.UserId IS NULL AND c.Text LIKE '%performance%')
+ORDER BY
+    PostStatusCategory,
+    UserActivityLevel DESC,
+    EditActivity,
+    PostCreationDate DESC
+LIMIT 1000;

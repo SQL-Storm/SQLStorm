@@ -1,0 +1,194 @@
+-- {"query": "1613.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2535} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        MAX(P.CreationDate) AS LastPostCreationDate,
+        MAX(PH.CreationDate) AS LastEditContributionDate,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        DATEDIFF('day', U.CreationDate, U.LastAccessDate) AS DaysActiveSinceCreation
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN PostHistory PH ON U.Id = PH.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes
+),
+PostEngagementMetrics AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.OwnerUserId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.AcceptedAnswerId,
+        Q.ClosedDate,
+        MAX(CASE WHEN PH_Close.PostHistoryTypeId = 10 THEN CRT.Name END) AS CloseReason,
+        COUNT(DISTINCT A.Id) AS ActualAnswerCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceived,
+        (CAST(Q.FavoriteCount AS DECIMAL) / NULLIF(Q.ViewCount, 0)) AS FavoriteViewRatio,
+        COALESCE(MAX(A.Score), 0) AS MaxAnswerScore
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN Votes V ON Q.Id = V.PostId
+    LEFT JOIN PostHistory PH_Close ON Q.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes CRT ON CAST(PH_Close.Comment AS SMALLINT) = CRT.Id
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id, Q.Title, Q.OwnerUserId, Q.CreationDate, Q.Score, Q.ViewCount, Q.AnswerCount, Q.FavoriteCount, Q.AcceptedAnswerId, Q.ClosedDate
+),
+PostVersionMetadata AS (
+    SELECT
+        P.Id AS PostId,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEvents,
+        MAX(PH.CreationDate) AS LastHistoryEventDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS HasBeenEdited,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 'Closed'
+                 WHEN PH.PostHistoryTypeId = 11 THEN 'Reopened'
+                 WHEN PH.PostHistoryTypeId = 16 THEN 'CommunityOwned'
+                 ELSE NULL END) AS LatestSignificantStatusChange,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.UserId ELSE NULL END) AS LastEditorUserIdHistory
+    FROM Posts P
+    JOIN PostHistory PH ON P.Id = PH.PostId
+    GROUP BY P.Id
+),
+TagPopularity AS (
+    SELECT
+        TagName,
+        Count AS GlobalTagCount,
+        RANK() OVER (ORDER BY Count DESC) AS TagPopularityRank
+    FROM Tags
+),
+QuestionTagInfo AS (
+    SELECT
+        P.Id AS QuestionId,
+        STRING_AGG(T.TagName, ', ' ORDER BY T.TagName) AS QuestionTagsList,
+        MAX(TP.TagPopularityRank) AS MaxAssociatedTagPopularityRank,
+        MIN(TP.GlobalTagCount) AS MinAssociatedTagGlobalCount
+    FROM Posts P
+    INNER JOIN LATERAL UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS PostTag(Tag) ON TRUE
+    INNER JOIN Tags T ON T.TagName = PostTag.Tag
+    INNER JOIN TagPopularity TP ON T.TagName = TP.TagName
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY P.Id
+),
+ImpactfulPosts AS (
+    -- High score questions
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId AS UserId,
+        'High_Score_Question' AS ImpactType,
+        P.Score AS ImpactValue,
+        P.CreationDate
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Score >= 100
+
+    UNION ALL
+
+    -- Highly favorited questions
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId AS UserId,
+        'Highly_Favorited_Question' AS ImpactType,
+        P.FavoriteCount AS ImpactValue,
+        P.CreationDate
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.FavoriteCount >= 50
+
+    UNION ALL
+
+    -- Accepted answers with high score
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId AS UserId,
+        'Accepted_High_Score_Answer' AS ImpactType,
+        P.Score AS ImpactValue,
+        P.CreationDate
+    FROM Posts P
+    WHERE P.PostTypeId = 2 AND P.Score >= 50 AND P.AcceptedAnswerId IS NULL
+    AND P.Id IN (SELECT Q.AcceptedAnswerId FROM Posts Q WHERE Q.ParentId = P.Id) -- Correlated subquery for accepted answers
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.DaysActiveSinceCreation,
+    UAS.TotalQuestionsOwned,
+    UAS.TotalAnswersOwned,
+    UAS.LastAccessDate,
+    UAS.LastEditContributionDate,
+    PEM.QuestionId,
+    PEM.QuestionTitle,
+    PEM.QuestionCreationDate,
+    PEM.QuestionScore,
+    PEM.ViewCount,
+    PEM.AnswerCount,
+    PEM.FavoriteCount,
+    PEM.FavoriteViewRatio,
+    PEM.CloseReason,
+    PVM.TotalHistoryEvents,
+    PVM.EditCount,
+    PVM.LatestSignificantStatusChange,
+    QTI.QuestionTagsList AS AssociatedTags,
+    QTI.MaxAssociatedTagPopularityRank,
+    (SELECT COUNT(DISTINCT IP.ImpactType) FROM ImpactfulPosts IP WHERE IP.UserId = UAS.UserId) AS DistinctImpactfulPostTypes,
+    CASE
+        WHEN PEM.AcceptedAnswerId IS NULL AND PEM.AnswerCount > 0 THEN 'Unaccepted_Answered'
+        WHEN PEM.AcceptedAnswerId IS NOT NULL AND PEM.CloseReason IS NOT NULL THEN 'Accepted_But_Closed'
+        WHEN PEM.FavoriteViewRatio < 0.001 AND PEM.ViewCount > 1000 THEN 'HighViews_LowInterest'
+        WHEN PEM.QuestionScore < 0 AND PVM.EditCount > 2 THEN 'Controversial_And_Edited'
+        ELSE 'Normal'
+    END AS QuestionStatusCategory,
+    COALESCE(UPPER(SUBSTRING(UAS.Location, 1, 5)), 'UNKNOWN_LOC') AS UserLocationPrefix,
+    (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = UAS.UserId AND B.Class = 1 AND B.TagBased = FALSE) AS GoldBadgesCountNamed,
+    (SELECT AVG(LENGTH(C.Text)) FROM Comments C WHERE C.UserId = UAS.UserId AND C.Score > 0) AS AvgPositiveCommentLength,
+    MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY UAS.UserId) AS HasAnyGoldBadge
+FROM UserActivitySummary UAS
+LEFT JOIN PostEngagementMetrics PEM ON UAS.UserId = PEM.OwnerUserId
+LEFT JOIN PostVersionMetadata PVM ON PEM.QuestionId = PVM.PostId
+LEFT JOIN QuestionTagInfo QTI ON PEM.QuestionId = QTI.QuestionId
+LEFT JOIN Badges B ON UAS.UserId = B.UserId
+WHERE
+    UAS.Reputation > 7500
+    AND (UAS.LastAccessDate < CURRENT_DATE - INTERVAL '18 months' OR UAS.LastEditContributionDate IS NULL)
+    AND (
+        (PEM.ViewCount > 75000 AND PEM.FavoriteViewRatio < 0.003 AND PEM.AcceptedAnswerId IS NULL)
+        OR
+        (PEM.QuestionScore < -5 AND PVM.EditCount > 3 AND PEM.CloseReason IS NOT NULL)
+    )
+    AND QTI.MaxAssociatedTagPopularityRank <= 100 -- Question is related to a top 100 popular tag
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Badges B_inner
+        WHERE B_inner.UserId = UAS.UserId
+          AND B_inner.Name LIKE '%Constituent%'
+          AND B_inner.Date > CURRENT_DATE - INTERVAL '9 months'
+    )
+    AND (
+        SELECT SUM(IP_sub.ImpactValue)
+        FROM ImpactfulPosts IP_sub
+        WHERE IP_sub.UserId = UAS.UserId AND IP_sub.ImpactType = 'High_Score_Question'
+    ) > 200 -- Users who own at least 200 combined score from 'High_Score_Question'
+GROUP BY
+    UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.DaysActiveSinceCreation, UAS.TotalQuestionsOwned,
+    UAS.TotalAnswersOwned, UAS.LastAccessDate, UAS.LastEditContributionDate, PEM.QuestionId, PEM.QuestionTitle,
+    PEM.QuestionCreationDate, PEM.QuestionScore, PEM.ViewCount, PEM.AnswerCount, PEM.FavoriteCount,
+    PEM.FavoriteViewRatio, PEM.CloseReason, PVM.TotalHistoryEvents, PVM.EditCount, PVM.LatestSignificantStatusChange,
+    QTI.QuestionTagsList, QTI.MaxAssociatedTagPopularityRank, UAS.Location
+ORDER BY
+    UAS.Reputation DESC,
+    PEM.FavoriteViewRatio ASC NULLS LAST,
+    UAS.LastAccessDate ASC
+LIMIT 100;

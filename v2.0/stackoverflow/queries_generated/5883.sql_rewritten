@@ -1,0 +1,153 @@
+-- {"query": "5883.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1068} 
+WITH TopUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.ProfileImageUrl,
+    ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn_loc
+  FROM Users u
+  WHERE u.Location IS NOT NULL
+),
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.PostTypeId,
+    pc.CommentCount,
+    pc.LastCommentDate
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CommentCount, MAX(CreationDate) AS LastCommentDate
+    FROM Comments
+    GROUP BY PostId
+  ) pc ON pc.PostId = p.Id
+  WHERE p.PostTypeId = 1 -- questions
+),
+Trending AS (
+  SELECT
+    ra.PostId,
+    ra.OwnerUserId,
+    ra.Title,
+    ra.CreationDate,
+    ra.LastActivityDate,
+    ra.Score,
+    ra.ViewCount,
+    ra.Tags,
+    ra.PostTypeId,
+    ROW_NUMBER() OVER (ORDER BY ra.Score*1.0/NULLIF(ra.ViewCount,0) DESC, ra.LastActivityDate DESC) AS rk
+  FROM RecentActivity ra
+  LEFT JOIN Votes v ON v.PostId = ra.PostId
+  LEFT JOIN PostLinks pl ON pl.PostId = ra.PostId
+  WHERE ra.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    AND ra.PostTypeId = 1
+),
+Agg AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.IsModeratorOnly
+  FROM Tags t
+  WHERE t.Count > 0
+),
+ComplexQuery AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount,
+    u.DisplayName AS TopContributor,
+    u.Reputation AS TopReputation,
+    vtype.Name AS MostCommonVoteType,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate,
+    CASE
+      WHEN u.Location IS NULL THEN 'Unknown'
+      ELSE u.Location
+    END AS UserLocation,
+    CASE
+      WHEN p.PostTypeId = 1 THEN 'Question'
+      WHEN p.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END AS PostKind,
+    p.Title,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    pc.CommentCount,
+    pc.LastCommentDate
+  FROM Trending t
+  LEFT JOIN Posts p ON p.Id = t.PostId
+  LEFT JOIN Users u ON u.Id = t.OwnerUserId
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  LEFT JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN VoteTypes vtype ON vtype.Id = v.VoteTypeId
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE t.rk <= 500
+    AND ph.Id IS NULL -- exclude some edits for variety
+  UNION ALL
+  SELECT
+    t.TagName,
+    t.Count,
+    u.DisplayName,
+    u.Reputation,
+    vtype.Name,
+    NULL,
+    NULL,
+    CASE
+      WHEN p.PostTypeId = 1 THEN 'Question'
+      WHEN p.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END,
+    p.Title,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    pc.CommentCount,
+    pc.LastCommentDate
+  FROM Agg t
+  CROSS JOIN LATERAL (
+    SELECT *
+    FROM Posts p
+    WHERE p.Title ILIKE '%' || t.TagName || '%'
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+  ) p
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN VoteTypes vtype ON vtype.Id = v.VoteTypeId
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE p.Id IS NOT NULL
+)
+SELECT
+  c.Title,
+  c.PostKind,
+  c.ViewCount,
+  c.Score,
+  c.Tags,
+  c.CommentCount,
+  c.LastCommentDate,
+  c.TopContributor,
+  c.TopReputation,
+  c.MostCommonVoteType,
+  c.BadgeName,
+  c.BadgeDate,
+  c.UserLocation
+FROM ComplexQuery c
+ORDER BY c.TopReputation DESC, c.ViewCount DESC
+LIMIT 100;

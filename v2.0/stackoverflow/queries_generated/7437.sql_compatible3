@@ -1,0 +1,276 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Expert'
+            WHEN u.Reputation > 1000 THEN 'Advanced'
+            ELSE 'Beginner'
+        END as ReputationTier,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) as WikiCount,
+        DENSE_RANK() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) as ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY u.CreationDate ASC) as SeniorityRank,
+        LAG(u.CreationDate, 1) OVER (ORDER BY u.CreationDate ASC) as PreviousUserCreationDate,
+        CAST(
+          EXTRACT(EPOCH FROM (u.CreationDate - LAG(u.CreationDate, 1) OVER (ORDER BY u.CreationDate ASC)))/86400
+          AS INTEGER
+        ) as DaysBetweenRegistrations
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        COALESCE(p.ParentId, p.Id) as EffectivePostId,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRankByType,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+        CASE 
+            WHEN p.Score >= 100 THEN 'HighlyVoted'
+            WHEN p.Score >= 50 THEN 'ModeratelyVoted'
+            WHEN p.Score >= 10 THEN 'LowVoted'
+            ELSE 'Unvoted'
+        END as VotingCategory,
+        CASE 
+            WHEN p.ViewCount > 10000 THEN 'Viral'
+            WHEN p.ViewCount > 5000 THEN 'Popular'
+            WHEN p.ViewCount > 1000 THEN 'Notable'
+            ELSE 'Standard'
+        END as PopularityLevel,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementTotal,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'HasAnswers'
+            WHEN p.PostTypeId = 1 THEN 'Unanswered'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as QuestionStatus,
+        LAG(p.CreationDate, 1) OVER (ORDER BY p.CreationDate) as PreviousPostDate,
+        CAST(
+          EXTRACT(EPOCH FROM (p.CreationDate - LAG(p.CreationDate, 1) OVER (ORDER BY p.CreationDate)))/3600
+          AS INTEGER
+        ) as HoursSincePreviousPost,
+        -- build UserTags using a subquery aggregate per owner to avoid window STRING_AGG usage
+        (SELECT STRING_AGG(SUBSTRING(p2.Tags FROM 2 FOR (CHAR_LENGTH(p2.Tags)-2)), ', ' ORDER BY p2.CreationDate)
+         FROM Posts p2
+         WHERE p2.OwnerUserId = p.OwnerUserId
+           AND p2.Tags IS NOT NULL
+           AND CHAR_LENGTH(p2.Tags) > 0
+        ) as UserTags,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate ASC) as PostSequence,
+        CASE WHEN EXISTS(SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 1) THEN 1 ELSE 0 END as HasAcceptedAnswer,
+        CASE WHEN EXISTS(SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) THEN 1 ELSE 0 END as IsDuplicate,
+        CASE WHEN EXISTS(SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 11)) THEN 1 ELSE 0 END as WasClosedOrReopened,
+        COALESCE(p.ClosedDate, p.CommunityOwnedDate) as ImportantDate
+    FROM Posts p
+    WHERE p.CreationDate >= DATE '2015-01-01'
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.TotalScore,
+        uas.TotalViews,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.WikiCount,
+        uas.ScoreRank,
+        uas.SeniorityRank,
+        uas.DaysBetweenRegistrations,
+        uas.ReputationTier,
+        uas.LastPostDate,
+        uas.LastCommentDate,
+        CASE 
+            WHEN uas.PostCount > 0 THEN (uas.TotalScore * 1.0 / uas.PostCount)
+            ELSE 0
+        END as AvgScorePerPost,
+        CASE 
+            WHEN uas.PostCount > 0 THEN (uas.TotalViews * 1.0 / uas.PostCount)
+            ELSE 0
+        END as AvgViewsPerPost,
+        CASE 
+            WHEN uas.QuestionCount > 0 THEN (uas.AnswerCount * 1.0 / uas.QuestionCount)
+            ELSE 0
+        END as AnswersPerQuestion,
+        COALESCE(uas.UpVotes, 0) - COALESCE(uas.DownVotes, 0) as NetVoteBalance,
+        CASE WHEN EXISTS(SELECT 1 FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1 AND p.Score >= 100) THEN 1 ELSE 0 END as HasHighScoreQuestion,
+        CASE WHEN EXISTS(SELECT 1 FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2 AND p.Score >= 50) THEN 1 ELSE 0 END as HasHighScoreAnswer,
+        CASE WHEN EXISTS(SELECT 1 FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 1) THEN 1 ELSE 0 END as HasGoldBadge,
+        CASE WHEN EXISTS(SELECT 1 FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 2) THEN 1 ELSE 0 END as HasSilverBadge,
+        CASE WHEN EXISTS(SELECT 1 FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 3) THEN 1 ELSE 0 END as HasBronzeBadge
+    FROM UserActivityStats uas
+    WHERE uas.PostCount > 0
+),
+DetailedPostAnalysis AS (
+    SELECT 
+        pm.PostId,
+        pm.Title,
+        pm.Score,
+        pm.ViewCount,
+        pm.AnswerCount,
+        pm.CommentCount,
+        pm.FavoriteCount,
+        pm.CreationDate,
+        pm.OwnerUserId,
+        pm.PostTypeId,
+        pm.Tags,
+        pm.ScoreRankByType,
+        pm.ScorePercentile,
+        pm.VotingCategory,
+        pm.PopularityLevel,
+        pm.EngagementTotal,
+        pm.QuestionStatus,
+        pm.HoursSincePreviousPost,
+        pm.UserTags,
+        pm.PostSequence,
+        pm.HasAcceptedAnswer,
+        pm.IsDuplicate,
+        pm.WasClosedOrReopened,
+        pm.ImportantDate,
+        CASE 
+            WHEN pm.QuestionStatus = 'Answered' THEN 'Solved'
+            WHEN pm.QuestionStatus = 'HasAnswers' THEN 'Pending'
+            WHEN pm.QuestionStatus = 'Unanswered' THEN 'Open'
+            ELSE 'Other'
+        END as SolutionStatus,
+        CASE 
+            WHEN CHAR_LENGTH(pm.Tags) > 50 THEN 'MultiTagged'
+            WHEN CHAR_LENGTH(pm.Tags) > 20 THEN 'SingleTagged'
+            WHEN CHAR_LENGTH(pm.Tags) > 5 THEN 'MinimalTagged'
+            ELSE 'Untagged'
+        END as TagComplexity,
+        COALESCE(pm.AnswerCount, 0) * 1.5 + COALESCE(pm.CommentCount, 0) +
+        COALESCE(pm.FavoriteCount, 0) + COALESCE(pm.Score, 0) as EngagementScore,
+        RANK() OVER (PARTITION BY pm.OwnerUserId ORDER BY pm.CreationDate) as UserPostSequence,
+        ROW_NUMBER() OVER (ORDER BY pm.CreationDate DESC) as ReversePostDateOrder,
+        CASE WHEN EXISTS(SELECT 1 FROM Votes v WHERE v.PostId = pm.PostId AND v.VoteTypeId IN (2, 3)) THEN 1 ELSE 0 END as HasVoting,
+        CASE WHEN EXISTS(SELECT 1 FROM Comments c WHERE c.PostId = pm.PostId) THEN 1 ELSE 0 END as HasComments,
+        CASE WHEN EXISTS(SELECT 1 FROM PostLinks pl WHERE pl.PostId = pm.PostId AND pl.LinkTypeId IN (1, 3)) THEN 1 ELSE 0 END as HasLinks,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = pm.PostId AND ph.PostHistoryTypeId IN (1, 2, 3)) as EditHistoryCount,
+        CASE 
+            WHEN pm.VotingCategory = 'HighlyVoted' AND pm.PopularityLevel = 'Viral' THEN 'SuperPopular'
+            WHEN pm.VotingCategory = 'ModeratelyVoted' AND pm.PopularityLevel = 'Popular' THEN 'WellKnown'
+            WHEN pm.VotingCategory = 'LowVoted' AND pm.PopularityLevel = 'Notable' THEN 'Noticeable'
+            ELSE 'Standard'
+        END as PostClassification,
+        COALESCE(pm.Score, 0) - LEAD(pm.Score, 1) OVER (ORDER BY pm.CreationDate DESC) as ScoreChangeFromPrevious,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = pm.PostId AND ph.PostHistoryTypeId IN (10, 11, 12, 13)) as ClosureEventCount,
+        (SELECT COUNT(DISTINCT ph.UserId) FROM PostHistory ph WHERE ph.PostId = pm.PostId AND ph.PostHistoryTypeId IN (24, 25, 26)) as EditorCount,
+        LAG(pm.Score, 1) OVER (ORDER BY pm.CreationDate) as PreviousScore
+    FROM PostMetrics pm
+)
+SELECT 
+    ('User:' || dua.UserId || ' - ' || dua.DisplayName) as UserIdentifier,
+    dua.Reputation,
+    dua.PostCount,
+    dua.CommentCount,
+    dua.BadgeCount,
+    dua.TotalScore,
+    dua.TotalViews,
+    dua.QuestionCount,
+    dua.AnswerCount,
+    dua.WikiCount,
+    dua.ScoreRank,
+    dua.SeniorityRank,
+    dua.DaysBetweenRegistrations,
+    dua.ReputationTier,
+    dua.LastPostDate,
+    dua.LastCommentDate,
+    ROUND(dua.AvgScorePerPost, 2) as AvgScorePerPost,
+    ROUND(dua.AvgViewsPerPost, 2) as AvgViewsPerPost,
+    ROUND(dua.AnswersPerQuestion, 2) as AnswersPerQuestion,
+    dua.NetVoteBalance,
+    CASE WHEN dua.HasHighScoreQuestion = 1 THEN 'Yes' ELSE 'No' END as HasHighScoreQuestion,
+    CASE WHEN dua.HasHighScoreAnswer = 1 THEN 'Yes' ELSE 'No' END as HasHighScoreAnswer,
+    CASE WHEN dua.HasGoldBadge = 1 THEN 'Yes' ELSE 'No' END as HasGoldBadge,
+    CASE WHEN dua.HasSilverBadge = 1 THEN 'Yes' ELSE 'No' END as HasSilverBadge,
+    CASE WHEN dua.HasBronzeBadge = 1 THEN 'Yes' ELSE 'No' END as HasBronzeBadge,
+    CASE 
+        WHEN dua.PostCount > 100 THEN 'HighlyProductive'
+        WHEN dua.PostCount > 50 THEN 'Productive'
+        WHEN dua.PostCount > 10 THEN 'Moderate'
+        ELSE 'Beginner'
+    END as ProductivityLevel,
+    (SELECT COUNT(*) FROM DetailedPostAnalysis dpa WHERE dpa.OwnerUserId = dua.UserId AND dpa.VotingCategory = 'HighlyVoted') as HighlyVotedPosts,
+    (SELECT COUNT(*) FROM DetailedPostAnalysis dpa WHERE dpa.OwnerUserId = dua.UserId AND dpa.PopularityLevel = 'Viral') as ViralPosts,
+    (SELECT COUNT(*) FROM DetailedPostAnalysis dpa WHERE dpa.OwnerUserId = dua.UserId AND dpa.QuestionStatus = 'Answered') as SolvedQuestions,
+    (SELECT COUNT(*) FROM DetailedPostAnalysis dpa WHERE dpa.OwnerUserId = dua.UserId AND dpa.HasLinks = 1) as LinkedPosts,
+    (SELECT COUNT(*) FROM DetailedPostAnalysis dpa WHERE dpa.OwnerUserId = dua.UserId AND dpa.HasComments = 1) as CommentedPosts,
+    CASE 
+        WHEN dua.PostCount > 0 AND dua.QuestionCount > 0 THEN 
+            ROUND((SELECT COUNT(*) FROM DetailedPostAnalysis dpa WHERE dpa.OwnerUserId = dua.UserId AND dpa.QuestionStatus = 'Answered') * 100.0 / dua.QuestionCount, 2)
+        ELSE 0 
+    END as SolveRatePercentage,
+    CASE 
+        WHEN dua.ScoreRank <= 100 THEN 'TopScorer'
+        WHEN dua.ScoreRank <= 500 THEN 'HighScorer'
+        WHEN dua.ScoreRank <= 1000 THEN 'ModerateScorer'
+        ELSE 'RegularScorer'
+    END as ScorerCategory,
+    (SELECT STRING_AGG(SUBSTRING(pm.Tags FROM 2 FOR (CHAR_LENGTH(pm.Tags) - 2)), ', ')
+     FROM Posts pm 
+     WHERE pm.OwnerUserId = dua.UserId 
+       AND pm.Tags IS NOT NULL 
+       AND CHAR_LENGTH(pm.Tags) > 0
+     GROUP BY pm.OwnerUserId
+    ) as UniqueUserTags,
+    (SELECT COUNT(DISTINCT ps.PostId) 
+     FROM DetailedPostAnalysis ps 
+     WHERE ps.OwnerUserId = dua.UserId 
+       AND ps.PostTypeId IN (1, 2) 
+       AND ps.CreationDate > DATE '2022-01-01') as RecentActivityCount,
+    (SELECT COALESCE(MAX(pm.CreationDate), DATE '1900-01-01')
+     FROM Posts pm
+     WHERE pm.OwnerUserId = dua.UserId) as LastActivityDate,
+    CASE 
+        WHEN dua.Reputation > 10000 AND dua.PostCount > 100 THEN 'EliteContributor'
+        WHEN dua.Reputation > 5000 AND dua.PostCount > 50 THEN 'ExperiencedContributor'
+        WHEN dua.Reputation > 1000 AND dua.PostCount > 10 THEN 'IntermediateContributor'
+        ELSE 'NewContributor'
+    END as ContributorTier,
+    (SELECT COUNT(*) 
+     FROM DetailedPostAnalysis dpa 
+     WHERE dpa.OwnerUserId = dua.UserId 
+       AND dpa.QuestionStatus IN ('HasAnswers', 'Answered', 'Open')) as TotalQuestionPosts,
+    (SELECT COUNT(*) 
+     FROM DetailedPostAnalysis dpa 
+     WHERE dpa.OwnerUserId = dua.UserId 
+       AND dpa.QuestionStatus = 'Answer') as TotalAnswerPosts
+FROM ComplexUserAnalysis dua
+WHERE dua.PostCount > 0
+  AND dua.Reputation > 0
+  AND dua.NetVoteBalance >= 0
+  AND dua.LastPostDate >= DATE '2018-01-01'
+ORDER BY dua.ScoreRank ASC, dua.Reputation DESC, dua.LastPostDate DESC
+LIMIT 1000;
