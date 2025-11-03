@@ -112,6 +112,17 @@ print(combined + plot_annotation(theme = theme(legend.position = "top")))
 
 dev.off()
 
+CairoPDF("analysis/pdf/ops_price2.pdf", 7.5, 4)
+ggplot(d, aes(functional_price, ops, color = vendor)) +
+  geom_point() +
+  geom_label_repel(aes(label = model), show.legend = FALSE, size = 3) +
+  scale_x_log10() +
+  labs(x = "Price per 1000 executable queries [USD]", y = "Operators per query [avg]", color = NULL) +
+  theme_common +
+  guides(color = guide_legend(nrow = 1, byrow = TRUE)) +
+  expand_limits(y = 0)
+dev.off()
+
 CairoPDF("maxops.pdf", 16, 12)
 ggplot(d, aes(ops, maxops, color = vendor)) +
   geom_point() +
@@ -163,7 +174,7 @@ select *, case when state = 'success' then complexity else 'high' end as result,
 case when model = 'grok-4-fast-non-reasoning' then 'grok-4-fast' else model end as m,
 round((select price from price_per_model ppm where ppm.prompt = t.prompt and ppm.model = t.model) / (count(*) over (partition by model)) * 1000, 2) as price
 from temp t
-where prompt = 'p1' and state = 'success'
+where prompt = 'p2' and state = 'success'
 order by price
 ")
 d2$result <- factor(d2$result, levels = c("low", "medium", "high"))
@@ -192,7 +203,7 @@ totals <- sqldf("
   from counts
   group by m, price
 ")
-CairoPDF("analysis/pdf/success_fail_price.pdf", 3.3, 6)
+CairoPDF("analysis/pdf/success_fail_price_p2.pdf", 3.3, 6)
 # stacked horizontal bars (use geom_col with x = cnt so stacking is horizontal)
 p <- ggplot(counts, aes(x = cnt, y = reorder(m, -price), fill = result)) +
   geom_col(position = position_stack(reverse = TRUE)) +

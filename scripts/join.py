@@ -53,7 +53,7 @@ def extract_iu(expression):
         if exp == "iuref":
             return expression["iu"]
 
-        elif exp in ["cast", "lower", "upper", "floor", "abs", "extractepoch", "extractyear", "extractmonth", "extractday", "extracthour"]:
+        elif exp in ["cast", "lower", "upper", "floor", "ceil", "abs", "extractepoch", "extractyear", "extractmonth", "extractday", "extracthour", "extractminute"]:
             return extract_iu(expression["input"])
 
         elif exp in ["coalesce"]:
@@ -69,9 +69,9 @@ def extract_iu(expression):
         elif exp in ["concat", "concat_ws", "stringconcat", "trimboth", "datetrunc", "datepart", "arrayaccess", "arraybuild", "arrayappend"]:
             return extract_computation([extract_iu(input) for input in expression["input"]])
 
-        elif exp in ["and", "or"]:
+        elif exp in ["and", "or", "widthbucket"]:
             return extract_const([extract_iu(input) for input in expression["input"]])
-        elif exp in ["add", "sub", "mul", "age", "div", "rem", "round2", "and", "or", "pow"]:
+        elif exp in ["add", "sub", "mul", "age", "div", "rem", "round2", "and", "or", "pow", "logbase"]:
             return extract_const([extract_iu(expression["left"]), extract_iu(expression["right"])])
         elif exp in ["log", "log10", "exp", "sqrt", "not", "neg", "round"]:
             return extract_const([extract_iu(expression["input"])])
@@ -211,18 +211,21 @@ def load_system_representation(plan: dict):
     return raw
 
 
-def analyze_joins(plan: dict, schema: dict, ius: dict, plan_map: dict) -> bool:
+def analyze_joins(plan: dict, schema: dict, ius: dict, plan_map: dict) -> tuple[int, int]:
     label = plan["_label"]
     raw = load_system_representation(plan)
 
-    correct_join = True
+    joins = 0
+    correct_joins = 0
     iu_list = []
     for child in plan["_children"]:
         child_ius = {}
-        correct_join = correct_join and analyze_joins(child, schema, child_ius, plan_map)
+        child_joins, child_correct_joins = analyze_joins(child, schema, child_ius, plan_map)
+        joins += child_joins
+        correct_joins += child_correct_joins
         iu_list.append(child_ius)
 
-    if label != "Result" and isinstance(raw, dict) and correct_join:
+    if label != "Result" and isinstance(raw, dict):
 
         match label:
             case "TableScan":
@@ -241,25 +244,28 @@ def analyze_joins(plan: dict, schema: dict, ius: dict, plan_map: dict) -> bool:
 
             case "Join":
                 assert len(iu_list) == 2
-                correct_join = None
+                correct = None
 
                 if raw["physicalOperator"] in ["singletonjoin"]:
-                    correct_join = True
+                    correct = True
                 elif "condition" in raw:
                     expression = raw["condition"]
                     left, right = extract_equalities(expression)
-                    correct_join = check_join(schema, left, right, iu_list[0], iu_list[1])
+                    correct = check_join(schema, left, right, iu_list[0], iu_list[1])
 
-                    if not correct_join:
+                    if not correct:
                         right_child = plan["_children"][1]
                         if right_child["_label"] == "Select":
                             right_child = right_child["_children"][0]
                         if right_child["_label"] == "ArrayUnnest":
                             correct_join = check_join_with_arrayunnest(left, right, iu_list[0], iu_list[1])
 
-                if correct_join is None:
+                if correct is None:
                     correct_join = False
                     log.print(raw)
+
+                joins += 1
+                correct_joins += 1 if correct else 0
 
             case "GroupJoin":
                 assert len(iu_list) == 2
@@ -267,13 +273,16 @@ def analyze_joins(plan: dict, schema: dict, ius: dict, plan_map: dict) -> bool:
 
                 left = extract_keys(raw["keyLeft"], raw["valuesLeft"])
                 right = extract_keys(raw["keyRight"], raw["valuesRight"])
-                correct_join = check_join(schema, left, right, iu_list[0], iu_list[1])
+                correct = check_join(schema, left, right, iu_list[0], iu_list[1])
 
                 map_groupby_keys(raw["keyLeft"], raw["valuesLeft"], ius, iu_list[0])
                 map_groupby_keys(raw["keyRight"], raw["valuesRight"], ius, iu_list[1])
                 map_groupby_aggregates(raw["aggregatesLeft"], raw["valuesLeft"], ius, iu_list[0])
                 map_groupby_aggregates(raw["aggregatesRight"], raw["valuesRight"], ius, iu_list[1])
                 iu_list = []
+
+                joins += 1
+                correct_joins += 1 if correct else 0
 
             case "PipelineBreakerScan":
                 for o in raw["output"]:
@@ -338,7 +347,7 @@ def analyze_joins(plan: dict, schema: dict, ius: dict, plan_map: dict) -> bool:
             assert iu not in ius
             ius[iu] = l[iu]
 
-    return correct_join
+    return joins, correct_joins
 
 
 def unfold_plan(current: dict, plan_map: dict):
@@ -373,6 +382,8 @@ def analyze(csv_path: str, schema: dict):
     num_errors = 0
     correct_joins = []
     incorrect_joins = []
+    num_joins = 0
+    num_correct_joins = 0
     with log.progress("Loading the data", total=0) as progress:
         with smart_open(csv_path, newline='', encoding='utf-8') as csvfile:
             reader = csv.DictReader(csvfile)
@@ -389,10 +400,12 @@ def analyze(csv_path: str, schema: dict):
                     progress.advance()
                     continue
 
-                correct_join = analyze_plan(row["plan"], schema)
-                log.print_verbose(f"{num_queries} {query} -> {correct_join}")
+                join_count, correct_join_count = analyze_plan(row["plan"], schema)
+                log.print_verbose(f"{num_queries} {query} -> {join_count == correct_join_count}")
+                num_joins += join_count
+                num_correct_joins += correct_join_count
 
-                if correct_join:
+                if join_count == correct_join_count:
                     correct_joins.append(query)
                 else:
                     incorrect_joins.append(query)
@@ -402,6 +415,7 @@ def analyze(csv_path: str, schema: dict):
     log.info(f"Loaded {num_queries} queries with {num_errors} errors.")
     log.info(f"Found {len(correct_joins)} queries with correct joins.")
     log.info(f"Found {len(incorrect_joins)} queries with incorrect joins.")
+    log.info(f"Total joins: {num_joins}, correct joins: {num_correct_joins}, accuracy: {num_correct_joins / num_joins if num_joins > 0 else 0:.2%}")
 
     return correct_joins, incorrect_joins
 
@@ -505,7 +519,7 @@ def main():
 
     correct_joins_csv = os.path.join(args.version, args.dataset, "correct_joins.csv")
     log.info(f"Writing queries with correct joins to {correct_joins_csv} ...")
-    with log.progress("Writing distinct queries", total=len(correct_joins)) as progress:
+    with log.progress("Writing queries with correct joins", total=len(correct_joins)) as progress:
         with smart_open(correct_joins_csv, 'wt', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=["query"])
             writer.writeheader()
@@ -517,7 +531,7 @@ def main():
 
     incorrect_joins_csv = os.path.join(args.version, args.dataset, "incorrect_joins.csv")
     log.info(f"Writing queries with incorrect joins to {incorrect_joins_csv} ...")
-    with log.progress("Writing distinct queries", total=len(incorrect_joins)) as progress:
+    with log.progress("Writing queries with incorrect joins", total=len(incorrect_joins)) as progress:
         with smart_open(incorrect_joins_csv, 'wt', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=["query"])
             writer.writeheader()

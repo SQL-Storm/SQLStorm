@@ -159,7 +159,7 @@ def copy_queries(src_dir, dst_dir, postfix):
                     comment = original_file.readline().strip()
                     comment_available = comment.startswith(f'-- {{"query": "{filename}", ')
 
-                if not comment_available:
+                if comment_available:
                     with open(dst_file_path, 'w', encoding='utf-8') as file:
                         file.write(comment + '\n')
                         for line in content:
