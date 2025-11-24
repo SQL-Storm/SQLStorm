@@ -138,9 +138,27 @@ def rewrite_directory(dir: str, compress: bool, anonymize: Optional[str] = None,
 
             progress.description(base)
 
+            # If output already exists, skip only when the output is newer-or-equal than the input.
+            if os.path.exists(outpath):
+                try:
+                    src_mtime = os.path.getmtime(f)
+                    dst_mtime = os.path.getmtime(outpath)
+                except OSError:
+                    src_mtime = dst_mtime = None
+
+                if src_mtime is not None and dst_mtime is not None and dst_mtime >= src_mtime:
+                    log.info(f"Skipping {f}: target {outpath} is newer or same age")
+                    progress.advance()
+                    continue
+                else:
+                    # Target exists but is older than source: allow overwrite regardless of anonymize default
+                    local_overwrite = True
+            else:
+                local_overwrite = overwrite
+
             log.info(f"Compressing {f} -> {outpath}")
             try:
-                rewrite_file(f, outpath, overwrite=overwrite, anonymize=anonymize)
+                rewrite_file(f, outpath, overwrite=local_overwrite, anonymize=anonymize)
                 if not compress and anonymize is None:
                     os.replace(outpath, f)
             except Exception as e:

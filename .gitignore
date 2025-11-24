@@ -7,6 +7,8 @@ benchmark/
 data/
 db/
 
+.keys
+
 # Exclude results by default, as they can be large
 results/**/*.csv
 analysis/pdf/
