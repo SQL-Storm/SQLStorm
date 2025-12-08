@@ -2,11 +2,14 @@
 import argparse
 import csv
 import os
+import sys
 import glob
 from typing import Dict, Tuple, Optional, List
 
 from log import log
 from util import smart_open
+
+csv.field_size_limit(sys.maxsize)
 
 # Target columns in the exact requested order
 TARGET_FIELDS = [

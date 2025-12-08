@@ -1,0 +1,22 @@
+title: SQLStorm v1.0 Features Benchmark (with Sideway Information Passing)
+repetitions: 1
+warmup: 0
+timeout: 100
+query_seed: 42
+fetch_result: true # needed to compute the number of rows
+fetch_result_limit: 1
+query_plan:
+  retrieve: true
+  system_representation: true
+output: results/v1.0/features_sip
+systems:
+  - title: Umbra
+    dbms: umbradev
+    disabled: false
+    settings:
+      usedirectio: true
+      optimizer.json.types: true
+      optimizer.collectminmaxbounds: true
+      multiway: d
+    parameter:
+      version: "26.01"
